@@ -23,7 +23,7 @@ _IMPORT_ROOT = str(Path(__file__).resolve().parents[2])
 if _IMPORT_ROOT not in sys.path:
     sys.path.insert(0, _IMPORT_ROOT)
 
-from lu_machinery.common.repo_root import MachineryConfigError, machinery_path
+from lu_machinery.common.repo_root import MachineryConfigError, machinery_path, state_root
 from lu_machinery.common.safe_unit_install import (
     InstallError,
     check_unit_dir,
@@ -356,7 +356,9 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     try:
-        public_repo = (args.public_repo or scheduled_worktree_cleanup.default_public_repo()).expanduser().resolve()
+        # The agent's job gets no root settings (its environment is PATH only), so its first
+        # --repo-root carries the state root: batch-state and rollover retention read it from there.
+        public_repo = (args.public_repo or state_root()).expanduser().resolve()
     except MachineryConfigError as exc:
         parser.error(str(exc))
     registry_error = None
@@ -365,9 +367,9 @@ def main(argv: list[str] | None = None) -> int:
         private_repo = (
             args.private_repo.expanduser().resolve()
             if args.private_repo is not None
-            else scheduled_worktree_cleanup.default_private_repo(public_repo).resolve()
+            else scheduled_worktree_cleanup.default_private_repo().resolve()
         )
-    except FleetRepoError as exc:
+    except (FleetRepoError, MachineryConfigError) as exc:
         private_repo = None
         registry_error = str(exc)
 

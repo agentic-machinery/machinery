@@ -714,6 +714,34 @@ def test_next_registry_unavailable_503(monkeypatch):
     assert response.headers.get("retry-after") == "3"
 
 
+def test_next_unreadable_fleet_taxonomy_is_registry_unavailable_503(monkeypatch, tmp_path):
+    """Defect class: an alias registry that cannot be parsed reported as an unknown stream, a 500 or its stale content."""
+    from lu_machinery.orchestration import fleet_taxonomy
+
+    _warm_next_cache()
+    _patch_known_streams(monkeypatch)
+    taxonomy = tmp_path / "fleet_taxonomy.yaml"
+    monkeypatch.setattr(fleet_taxonomy, "DEFAULT_TAXONOMY_PATH", taxonomy)
+    # A readable registry that lacks the name: the stream is unknown (and the parse is cached).
+    taxonomy.write_text("schema_version: 1\nareas:\n  atlas:\n    id: atlas\n    aliases: []\n    epics: []\n", encoding="utf-8")
+    response = client.get("/api/work/v1/next?stream=atlas-intake")
+    assert response.status_code == 400
+    assert response.json()["error"] == "unknown_stream"
+
+    # The same file made malformed is read again and refused on both routes.
+    taxonomy.write_text("schema_version: 1\nareas:\n  atlas:\n    id: atlas\n    aliases: null\n    epics: []\n", encoding="utf-8")
+    response = client.get("/api/work/v1/next?stream=atlas-intake")
+    assert response.status_code == 503, response.text
+    body = response.json()
+    assert body["error"] == "registry_unavailable"
+    assert "fleet_taxonomy.yaml" in body["diagnostic"]
+    assert body["retry_after_s"] > 0
+    assert response.headers.get("retry-after") == "3"
+    projection = client.get("/api/work/v1/projection?stream=atlas-intake")
+    assert projection.status_code == 503, projection.text
+    assert "registry_unavailable" in projection.text
+
+
 def test_projection_membership_and_epic_status():
     """Homed issues carry public-safe stream membership; epics get status=epic."""
     projection = build_projection(_next_sections(), repository_id=REPO)
@@ -1096,10 +1124,10 @@ def test_next_diagnoses_broken_launcher_alias_file(monkeypatch, tmp_path, reques
 
     response = client.get("/api/work/v1/next?stream=infra")
 
-    assert response.status_code == 400
+    assert response.status_code == 503
     body = response.json()
-    assert body["error"] == "unknown_stream"
-    assert body["valid_streams"] == NEXT_STREAMS
+    assert body["error"] == "registry_unavailable"
+    assert response.headers.get("retry-after") == "3"
     assert "launcher_stream_aliases.tsv" in body["diagnostic"]
     assert caplog.records
     warning = next(record for record in caplog.records if record.levelname == "WARNING")

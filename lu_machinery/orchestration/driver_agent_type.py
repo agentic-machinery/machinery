@@ -24,10 +24,11 @@ if __package__ in {None, ""}:  # run as a file (launchers do): the repository ro
 
 from lu_machinery.common import profile
 from lu_machinery.common.repo_root import machinery_path
+from lu_machinery.orchestration.fleet_taxonomy import DEFAULT_TAXONOMY_PATH as DEFAULT_TAXONOMY_PATH  # packaged copy
+from lu_machinery.orchestration.fleet_taxonomy import FleetTaxonomyError, default_taxonomy_path, load_fleet_taxonomy
 
 _PACKAGED_ASSIGNMENTS_PATH = machinery_path("config/area_assignments.yaml")
 DEFAULT_ASSIGNMENTS_PATH = _PACKAGED_ASSIGNMENTS_PATH
-DEFAULT_TAXONOMY_PATH = machinery_path("config/fleet_taxonomy.yaml")
 
 
 def _default_assignments_path() -> Path:
@@ -37,7 +38,7 @@ def _default_assignments_path() -> Path:
 
 
 class DriverAgentConfigError(ValueError):
-    """Raised when ``area_assignments.yaml`` contains malformed driver agent configuration."""
+    """Raised when ``area_assignments.yaml`` or ``fleet_taxonomy.yaml`` holds malformed driver agent configuration."""
 
 
 def _valid_driver_agent_type(entry: object, *, area_label: str) -> str | None:
@@ -61,30 +62,24 @@ def _valid_driver_agent_type(entry: object, *, area_label: str) -> str | None:
 
 
 def _canonical_area_for_alias(lane: str, taxonomy_path: Path) -> str | None:
-    """Map a stream alias to its canonical area id via ``fleet_taxonomy.yaml``."""
+    """Map a stream alias to its canonical area id via ``fleet_taxonomy.yaml``.
+
+    An absent file has no aliases; invalid content raises :class:`DriverAgentConfigError`.
+    """
+    if not taxonomy_path.is_file():
+        return None
     try:
-        data = yaml.safe_load(taxonomy_path.read_text(encoding="utf-8")) or {}
-    except (OSError, yaml.YAMLError):
-        return None
-    areas = data.get("areas") if isinstance(data, dict) else None
-    if not isinstance(areas, dict):
-        return None
-    for area_id, entry in areas.items():
-        if not isinstance(area_id, str) or not isinstance(entry, dict):
-            continue
-        aliases = entry.get("aliases") or []
-        if isinstance(aliases, list) and all(isinstance(item, str) for item in aliases) and lane in aliases:
-            raw_id = entry.get("id")
-            candidate = raw_id if isinstance(raw_id, str) else area_id
-            return candidate.strip() or None
-    return None
+        area = load_fleet_taxonomy(taxonomy_path).alias_to_area.get(lane)
+    except FleetTaxonomyError as exc:
+        raise DriverAgentConfigError(str(exc)) from exc
+    return area.id if area is not None else None
 
 
 def resolve_driver_agent_type(
     lane: str,
     *,
     assignments_path: Path | None = None,
-    taxonomy_path: Path = DEFAULT_TAXONOMY_PATH,
+    taxonomy_path: Path | None = None,
     provider: str = "claude",
 ) -> str | None:
     lane = (lane or "").strip()
@@ -93,11 +88,13 @@ def resolve_driver_agent_type(
     resolved_assignments = _default_assignments_path() if assignments_path is None else assignments_path
     try:
         raw_text = resolved_assignments.read_text(encoding="utf-8")
+    except UnicodeDecodeError as exc:
+        raise DriverAgentConfigError(f"{resolved_assignments} is not UTF-8 text: {exc}") from exc
     except OSError:
         return None
     try:
         data = yaml.safe_load(raw_text)
-    except yaml.YAMLError as exc:
+    except Exception as exc:  # YAMLError, a constructor ValueError (an invalid date), RecursionError
         raise DriverAgentConfigError(f"malformed YAML in {resolved_assignments}: {exc}") from exc
     if data is None:
         return None
@@ -113,7 +110,7 @@ def resolve_driver_agent_type(
     if direct:
         return direct
 
-    canonical = _canonical_area_for_alias(lane, taxonomy_path)
+    canonical = _canonical_area_for_alias(lane, default_taxonomy_path() if taxonomy_path is None else taxonomy_path)
     if canonical and canonical != lane:
         aliased = _valid_driver_agent_type(assignments.get(canonical), area_label=canonical)
         if aliased:
@@ -140,7 +137,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--lane", required=True, help="launcher lane after selector normalisation, e.g. infra")
     parser.add_argument("--provider", default="claude", help="slot prefix used for the slots fallback (default claude)")
     parser.add_argument("--assignments", type=Path, default=None, help="area_assignments.yaml path")
-    parser.add_argument("--taxonomy", type=Path, default=DEFAULT_TAXONOMY_PATH, help="fleet_taxonomy.yaml path")
+    parser.add_argument(
+        "--taxonomy", type=Path, default=None, help="fleet_taxonomy.yaml path (default: the active profile's, else packaged)"
+    )
     args = parser.parse_args(argv)
     try:
         assignments_path = _default_assignments_path() if args.assignments is None else args.assignments

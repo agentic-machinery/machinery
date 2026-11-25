@@ -16,8 +16,10 @@ if __package__ in {None, ""}:  # run as a file (launchers do): the repository ro
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from lu_machinery.common import json_depth, profile
 from lu_machinery.common.repo_root import machinery_path
+from lu_machinery.orchestration.fleet_taxonomy import DEFAULT_TAXONOMY_PATH, default_taxonomy_path
 
-TAXONOMY_PATH = machinery_path("config/fleet_taxonomy.yaml")
+# The packaged copy; readers resolve default_taxonomy_path() at call time.
+TAXONOMY_PATH = DEFAULT_TAXONOMY_PATH
 _PACKAGED_ASSIGNMENTS_PATH = machinery_path("config/area_assignments.yaml")
 ASSIGNMENTS_PATH = _PACKAGED_ASSIGNMENTS_PATH
 
@@ -35,8 +37,8 @@ ASSIGNMENTS_SCHEMA_PATH = (
 )
 
 
-class FleetTaxonomyValidationError(Exception):
-    """Raised when fleet taxonomy or area assignments validation fails."""
+class FleetTaxonomyValidationError(ValueError):
+    """Raised when fleet taxonomy or area assignments validation fails (a ``ValueError``, like the loaders' errors)."""
 
 
 def _load_yaml(path: Path) -> dict[str, Any]:
@@ -48,6 +50,28 @@ def _load_yaml(path: Path) -> dict[str, Any]:
         raise FleetTaxonomyValidationError(f"YAML parse error in {path}: {exc}") from exc
     if not isinstance(data, dict):
         raise FleetTaxonomyValidationError(f"Root of {path} must be a mapping/dict")
+    # JSON Schema (and every reader) expects a JSON tree: a YAML key such as `123` or `true` is not a
+    # string, and an anchor that contains itself is a cycle. Shared acyclic anchors are walked once.
+    done: set[int] = set()
+    on_path: set[int] = set()
+    pending: list[tuple[Any, bool]] = [(data, False)]
+    while pending:
+        node, leaving = pending.pop()
+        if not isinstance(node, (dict, list)):
+            continue
+        if leaving:
+            on_path.discard(id(node))
+            done.add(id(node))
+            continue
+        if id(node) in on_path:
+            raise FleetTaxonomyValidationError(f"{path} has a YAML anchor that contains itself")
+        if id(node) in done:
+            continue
+        if isinstance(node, dict) and not all(isinstance(key, str) for key in node):
+            raise FleetTaxonomyValidationError(f"{path} has a mapping key that is not a string")
+        on_path.add(id(node))
+        pending.append((node, True))
+        pending.extend((child, False) for child in (node.values() if isinstance(node, dict) else node))
     return data
 
 
@@ -154,13 +178,13 @@ def validate_area_assignments_parity(
 
 def validate_fleet_taxonomy(
     *,
-    taxonomy_path: Path = TAXONOMY_PATH,
+    taxonomy_path: Path | None = None,
     assignments_path: Path | None = None,
     taxonomy_schema_path: Path = TAXONOMY_SCHEMA_PATH,
     assignments_schema_path: Path = ASSIGNMENTS_SCHEMA_PATH,
 ) -> dict[str, Any]:
     """Validate both fleet_taxonomy.yaml and area_assignments.yaml."""
-    taxonomy_data = _load_yaml(taxonomy_path)
+    taxonomy_data = _load_yaml(default_taxonomy_path() if taxonomy_path is None else taxonomy_path)
     resolved_assignments = default_assignments_path() if assignments_path is None else assignments_path
     assignments_data = _load_yaml(resolved_assignments)
 
@@ -194,8 +218,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--taxonomy",
         type=Path,
-        default=TAXONOMY_PATH,
-        help="path to fleet_taxonomy.yaml",
+        default=None,
+        help="path to fleet_taxonomy.yaml (default: the active profile's, else packaged)",
     )
     parser.add_argument(
         "--assignments",
@@ -215,7 +239,7 @@ def main(argv: list[str] | None = None) -> int:
             default_assignments_path() if args.assignments is None else args.assignments
         ).resolve()
         summary = validate_fleet_taxonomy(
-            taxonomy_path=args.taxonomy.resolve(),
+            taxonomy_path=(default_taxonomy_path() if args.taxonomy is None else args.taxonomy).resolve(),
             assignments_path=resolved_assignments,
         )
     except (FleetTaxonomyValidationError, profile.ProfileError) as exc:

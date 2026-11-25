@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -20,6 +21,9 @@ class TranscriptTelemetry:
     prev_tokens: int | None
     turn: int | None
     transcript_path: Path
+
+
+_NON_ALNUM = re.compile(r"[^A-Za-z0-9]")
 
 
 def _token_count(value: Any) -> int:
@@ -97,7 +101,18 @@ def parse_transcript_tokens(path: Path) -> TranscriptTelemetry | None:
 
 
 def _claude_project_dir_name(project_root: Path) -> str:
-    return str(project_root.resolve()).replace("/", "-")
+    """Claude Code's directory name for a project: every non-alphanumeric character becomes ``-``.
+
+    Claude Code shortens a name over 200 characters with a hash suffix; such a checkout
+    resolves no transcript here, so its telemetry stays unknown rather than guessed.
+    """
+    return _NON_ALNUM.sub("-", str(project_root.resolve()))
+
+
+def _claude_projects_dir() -> Path:
+    """The Claude projects directory: ``$CLAUDE_CONFIG_DIR/projects``, else ``~/.claude/projects``."""
+    config = os.environ.get("CLAUDE_CONFIG_DIR") or str(Path.home() / ".claude")
+    return Path(config) / "projects"
 
 
 def _newest_jsonl(paths: list[Path]) -> Path | None:
@@ -117,12 +132,12 @@ def resolve_transcript_paths(project_root: Path, *, session: str | None = None) 
 
     When ``session`` is given, resolve from the SessionStart runtime record first.
     Otherwise fall back to resolving EXACTLY
-    ``~/.claude/projects/<flat-root>/<session>.jsonl`` with no fallback
+    ``<projects>/<flat-root>/<session>.jsonl`` with no fallback
     globs and no cross-checkout scan.
 
     When ``session`` is omitted, honour ``LEARN_UKRAINIAN_TRANSCRIPT_PATH`` /
-    ``CLAUDE_TRANSCRIPT_PATH`` (server-global test hook) then scan the
-    checkout's project dir and legacy ``*learn-ukrainian*`` fallbacks.
+    ``CLAUDE_TRANSCRIPT_PATH`` (server-global test hook) then scan only the
+    checkout's own project dir. ``<projects>`` is :func:`_claude_projects_dir`.
     """
     if session:
         # SessionStart's official path is authoritative. A corrupt record must
@@ -132,7 +147,7 @@ def resolve_transcript_paths(project_root: Path, *, session: str | None = None) 
             path = Path(rec["transcript_path"])
             return [path] if path.is_file() else []
 
-        exact = Path.home() / ".claude" / "projects" / _claude_project_dir_name(project_root) / f"{session}.jsonl"
+        exact = _claude_projects_dir() / _claude_project_dir_name(project_root) / f"{session}.jsonl"
         return [exact] if exact.is_file() else []
 
     explicit = os.environ.get("LEARN_UKRAINIAN_TRANSCRIPT_PATH") or os.environ.get("CLAUDE_TRANSCRIPT_PATH")
@@ -140,16 +155,10 @@ def resolve_transcript_paths(project_root: Path, *, session: str | None = None) 
         path = Path(explicit).expanduser()
         return [path] if path.is_file() else []
 
-    projects_dir = Path.home() / ".claude" / "projects"
     candidates: list[Path] = []
-    exact_dir = projects_dir / _claude_project_dir_name(project_root)
+    exact_dir = _claude_projects_dir() / _claude_project_dir_name(project_root)
     if exact_dir.is_dir():
         candidates.extend(exact_dir.glob("*.jsonl"))
-
-    fallback_dirs = sorted(projects_dir.glob("*learn-ukrainian*"))
-    for directory in fallback_dirs:
-        if directory.is_dir():
-            candidates.extend(directory.glob("*.jsonl"))
 
     unique = {path.resolve(): path for path in candidates if path.is_file()}
     return sorted(

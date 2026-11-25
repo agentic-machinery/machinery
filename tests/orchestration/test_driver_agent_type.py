@@ -31,9 +31,11 @@ areas:
   infra:
     id: infra
     aliases: [infra-harness]
+    epics: []
   seminars:
     id: seminars
     aliases: [seminars-folk, seminars-bio]
+    epics: []
 """
 
 
@@ -95,6 +97,7 @@ areas:
   atlas:
     id: atlas
     aliases: [atlas-practice]
+    epics: []
 """,
         encoding="utf-8",
     )
