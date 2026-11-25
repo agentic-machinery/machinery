@@ -475,11 +475,12 @@ def replace(record: dict, path: Path | None = None, *, require_existing: bool = 
     _write(path or record_path(record["task_id"]), record, require_existing=require_existing)
 
 
-def _clear_non_finite_fields(record: dict) -> str | None:
+def clear_non_finite_fields(record: dict) -> str | None:
     """Set each top-level field holding NaN or an infinity to ``None`` (#1440); the first refusal's code, or ``None``.
 
     A provider can report such a number (for example in ``usage``), which the writer refuses, so the failure
-    record clears that field and names it in its error instead. A value this cannot clear (a non-finite key at
+    record clears that field and names it in its error instead; ``dispatch list`` clears its output copy the
+    same way, so one such record never makes the whole listing invalid JSON. A value this cannot clear (a non-finite key at
     the top level) refuses as ``TaskRecordNonFinite``.
     """
     first: str | None = None
@@ -516,7 +517,7 @@ def publish_failed_record(record: dict, path: Path) -> None:
                     and current["run_nonce"] != record["run_nonce"]):
                 raise TaskRecordError("TASK_RECORD_REPLACED: run nonce mismatch")
             record.update(status="cancelled" if record.get("status") == "cancelled" else "crashed",
-                          error=_clear_non_finite_fields(record) or "TASK_RECORD_DAMAGED", finished_at=now())
+                          error=clear_non_finite_fields(record) or "TASK_RECORD_DAMAGED", finished_at=now())
             if record.get("worktree_disposition") != "removed":
                 record.update(worktree_disposition="retained", worktree_disposition_reason="task_record_damaged")
             _write_atomic(path, record, exclusive=False)

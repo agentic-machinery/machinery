@@ -1195,16 +1195,25 @@ def main(argv=None) -> int:
 
 
 def _observe_listed(record: dict) -> dict:
-    """``worker._observe`` for one record of ``dispatch list``: a heal the writer refuses (#1440) leaves that
-    record as stored and names the typed reason, and the other records are still listed.
+    """One row of ``dispatch list``: the record as ``worker._observe`` leaves it, as strict JSON (#1440).
 
-    ``_observe`` updates the dict it heals before writing it, so it gets a copy: a refused heal lists the
-    record as read, never the unwritten ``crashed`` state."""
+    A heal the writer refuses leaves that record as stored, and the other records are still listed.
+    ``_observe`` updates the dict it heals before writing it, so it gets a copy: a refused record is listed as
+    read, never in the unwritten ``crashed`` state. A row holding NaN or an infinity (a record stored before
+    #1440) lists each such top-level field as ``null``, as the settlement fallback records it, so the listing
+    stays valid JSON for strict readers; stderr names the first such field, and the record on disk is
+    unchanged.
+    """
+    task_id = record.get("task_id")
     try:
-        return worker._observe(copy.deepcopy(record))
+        row = worker._observe(copy.deepcopy(record))
     except NonFiniteRecordValue as exc:
-        print(f"dispatcher: task record {record.get('task_id')} not healed: {exc.code}", file=sys.stderr)
-        return record
+        print(f"dispatcher: task record {task_id} not healed: {exc.code}", file=sys.stderr)
+        row = copy.deepcopy(record)
+    cleared = store.clear_non_finite_fields(row)
+    if cleared is not None:
+        print(f"dispatcher: task record {task_id} listed with non-finite fields as null: {cleared}", file=sys.stderr)
+    return row
 
 
 if __name__ == "__main__":

@@ -261,8 +261,10 @@ def test_admission_scan_leaves_a_dead_record_the_writer_refuses_and_reports_only
     assert "; 2 record(s) dead pid, not counted: " in decision.summary()
     assert cli.main(["list"]) == 0  # list heals every record before it filters
     listed = capsys.readouterr()
-    assert {row["task_id"]: row["status"] for row in json.loads(listed.out)} == {
+    rows = {row["task_id"]: row for row in json.loads(listed.out, parse_constant=pytest.fail)}  # strict JSON
+    assert {task_id: row["status"] for task_id, row in rows.items()} == {
         "worker-nan": "running", "worker-raced": "done", "worker-dead": "crashed"}
+    assert rows["worker-nan"]["usage"] is None
     assert 'task record worker-nan not healed: TASK_RECORD_NON_FINITE: ["usage", "input_tokens"]' in listed.err
     assert path.read_bytes() == before
 
