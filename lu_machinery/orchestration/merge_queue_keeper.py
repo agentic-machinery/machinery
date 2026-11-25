@@ -1174,8 +1174,7 @@ def _failed_check_run_ids(check_rows: Sequence[Mapping[str, Any]], head: str) ->
             if isinstance(url, str):
                 match = re.search(r"/actions/runs/([^/?#]+)", url)
                 if match:
-                    raw_id = match[1]
-                    parsed = parse_ascii_positive_int(raw_id) if len(raw_id) <= 19 else None
+                    parsed = parse_ascii_positive_int(match[1])
                     if parsed is not None:
                         found.add(parsed)
                         break
@@ -1398,12 +1397,12 @@ def _load(path: Path) -> dict[str, Any]:
         or not isinstance(data.get("defect_reports", {}), dict)
         or not isinstance(data.get("tracked", {}), dict)
         or not all(
-            isinstance(k, str) and len(k) <= 19 and parse_ascii_positive_int(k) is not None and isinstance(v, dict)
+            isinstance(k, str) and parse_ascii_positive_int(k) is not None and isinstance(v, dict)
             for k, v in data.get("tracked", {}).items()
         )
         or not isinstance(data.get("pending_closeout", {}), dict)
         or not all(
-            isinstance(k, str) and len(k) <= 19 and parse_ascii_positive_int(k) is not None and isinstance(v, dict)
+            isinstance(k, str) and parse_ascii_positive_int(k) is not None and isinstance(v, dict)
             for k, v in data.get("pending_closeout", {}).items()
         )
         or not isinstance(data.get("hold_alerts", {}), dict)
@@ -1414,12 +1413,12 @@ def _load(path: Path) -> dict[str, Any]:
         or not isinstance(data.get("base_ci_alerts", {}), dict)
         or not isinstance(data.get("report_heads", {}), dict)
         or not all(
-            isinstance(k, str) and len(k) <= 19 and parse_ascii_positive_int(k) is not None and isinstance(v, str) and SHA.fullmatch(v)
+            isinstance(k, str) and parse_ascii_positive_int(k) is not None and isinstance(v, str) and SHA.fullmatch(v)
             for k, v in data.get("report_heads", {}).items()
         )
         or not isinstance(data.get("repaired_reenqueues", {}), dict)
         or not all(
-            isinstance(k, str) and len(k) <= 19 and parse_ascii_positive_int(k) is not None and isinstance(v, dict)
+            isinstance(k, str) and parse_ascii_positive_int(k) is not None and isinstance(v, dict)
             for k, v in data.get("repaired_reenqueues", {}).items()
         )
         or not all(isinstance(data.get(name, {}), dict) for name in REQUEUE_STATE)
@@ -2088,12 +2087,12 @@ def _reconcile_closed_tracked(
             )
     candidates: dict[str, dict[str, Any]] = {}
     for key, entry in tracked.items():
-        if not isinstance(key, str) or len(key) > 19 or parse_ascii_positive_int(key) is None:
+        if not isinstance(key, str) or parse_ascii_positive_int(key) is None:
             continue
         if key not in open_numbers or (isinstance(entry, dict) and entry.get("status") == "merge-sent"):
             candidates[key] = dict(entry) if isinstance(entry, dict) else {"number": int(key)}
     for key, entry in pending.items():
-        if not isinstance(key, str) or len(key) > 19 or parse_ascii_positive_int(key) is None:
+        if not isinstance(key, str) or parse_ascii_positive_int(key) is None:
             continue
         if key not in open_numbers:
             candidates.setdefault(key, dict(entry) if isinstance(entry, dict) else {"number": int(key)})
@@ -2485,7 +2484,7 @@ def _repeat_kind(line: str) -> str:
     if line.startswith("merge queue keeper: slow mode,"):
         return "steady"
     number, _, rest = line.partition(" ")
-    if not (number.startswith("#") and len(number) <= 20 and parse_ascii_positive_int(number[1:]) is not None and rest):
+    if not (number.startswith("#") and parse_ascii_positive_int(number[1:]) is not None and rest):
         return "once"
     if rest.startswith("FAILED:") or rest == "squash text unverified":
         return "error"

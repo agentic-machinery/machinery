@@ -156,7 +156,7 @@ def resolve_same_repo_pr_head(pr_number: int, *, repo_root: str) -> tuple[str, s
     """
     from lu_machinery.orchestration.fleet_repos import parse_ascii_positive_int
 
-    number = None if isinstance(pr_number, str) and len(pr_number) > 19 else parse_ascii_positive_int(pr_number)
+    number = parse_ascii_positive_int(pr_number)
     if number is None:
         raise GeminiChangedPathListError(f"refusing to list files for PR {pr_number!r}")
     from lu_machinery.review.target_resolution import (
@@ -169,8 +169,6 @@ def resolve_same_repo_pr_head(pr_number: int, *, repo_root: str) -> tuple[str, s
         slug = _origin_github_repo(Path(repo_root))
     except (TargetResolutionError, OSError, subprocess.TimeoutExpired) as exc:
         raise GeminiChangedPathListError(str(exc)) from exc
-    except UnicodeDecodeError as exc:
-        raise GeminiChangedPathListError("checkout origin is not valid ASCII") from exc
     if slug is None:
         raise GeminiChangedPathListError("checkout origin is not a GitHub owner/name; refusing an unpinned gh pr view")
     raw = _run_changed_path_command(
@@ -323,7 +321,7 @@ def gemini_pr_or_branch_content_error(
         if pr_number is not None:
             from lu_machinery.orchestration.fleet_repos import parse_ascii_positive_int
 
-            parsed_pr = None if isinstance(pr_number, str) and len(pr_number) > 19 else parse_ascii_positive_int(pr_number)
+            parsed_pr = parse_ascii_positive_int(pr_number)
             if parsed_pr is None:
                 raise GeminiChangedPathListError(f"refusing to list files for PR {pr_number!r}")
         if head_sha is not None or parsed_pr is not None:
