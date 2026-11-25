@@ -474,6 +474,51 @@ def test_dismissal_fixes_endpoint_state_and_replays_scanned_comment(dismissal_tr
     assert pub.ENUMS["reason"] == {"completed", "not planned"}
 
 
+@pytest.mark.parametrize(("links", "expected_pr"), [
+    pytest.param("[review]( {pr} \"title\")", 2, id="inline-with-spaces-and-title"),
+    pytest.param("[re\\[view]\n\n[re\\[view]: <{pr}>", 2, id="reference-with-escaped-bracket"),
+    pytest.param("<{pr}>", 2, id="autolink"),
+    pytest.param("({pr}).", 2, id="bare-with-punctuation"),
+    pytest.param("see({pr}).", 2, id="bare-attached-to-opening-parenthesis"),
+    pytest.param("<a href='{pr}'>review</a>", 2, id="html-single-quoted"),
+    pytest.param('<a href="{pr}">review</a>', 2, id="html-double-quoted"),
+    pytest.param("<a href={pr}>review</a>", 2, id="html-unquoted"),
+    pytest.param("\n\n<a\n href='{pr}'>\nreview\n</a>", 2, id="html-block"),
+    pytest.param("{pr}/files", 2, id="files"),
+    pytest.param("<{pr}/commits>", 2, id="commits"),
+    pytest.param("[review]({pr}#discussion_r1)", 2, id="fragment"),
+    pytest.param('<a href="{pr}?tab=files&amp;view=all">review</a>', 2, id="query"),
+    pytest.param("<{pr}> {pr}. {pr}/files", 2, id="same-pr-deduplicated"),
+    pytest.param("<{pr}> https://github.com/unit/public/pull/3/files", None, id="different-prs"),
+    pytest.param("<{pr}> see(https://github.com/unit/public/pull/3).", None, id="different-pr-in-parentheses"),
+    pytest.param("[review]( {pr}.)", None, id="explicit-period-is-part-of-target"),
+    pytest.param("[review]\n\n[review]: <{pr}.>", None, id="reference-period-is-part-of-target"),
+    pytest.param("<a href='{pr}.'>review</a>", None, id="html-period-is-part-of-target"),
+    pytest.param("\n\n[unused]: {pr}", None, id="unused-definition-is-not-a-link"),
+    pytest.param("[review](https://github.com/other/repo/pull/2)", None, id="other-repository"),
+    pytest.param("https://github.com/unit/public/pull/０", None, id="non-ascii-number"),
+    pytest.param("https://github.com/unit/public/pull/02", None, id="leading-zero"),
+    pytest.param("https://github.com/unit/public/pull/12345678901234567890", None, id="oversized-number"),
+])
+def test_dismissal_link_delimiters_bind_exactly_one_pr(dismissal_transport, links, expected_pr):
+    _, writes, calls, options, sender, _ = dismissal_transport
+    comment = "Alert #1 stores public metadata. " + links.format(pr="https://github.com/unit/public/pull/2")
+    options["readback"]["dismissed_comment"] = comment
+    fields = {"repo": "unit/public", "number": 1, "reason": "false positive", "comment": comment}
+
+    if expected_pr is None:
+        with pytest.raises(gate.PublishBlocked, match="DISMISSAL_TRIAGE_REFUSED"):
+            pub.publish("code-scanning-dismiss", runner=sender, **fields)
+        assert calls == writes == []
+    else:
+        answer = pub.publish("code-scanning-dismiss", runner=sender, capture_output=True, text=True, **fields)
+        method_index = calls[0].index("--method") + 1
+        assert calls[0][method_index:method_index + 2] == ["GET", f"repos/unit/public/pulls/{expected_pr}"]
+        assert answer.returncode == 0
+        assert json.loads(answer.stdout)["dismissed_comment"] == comment
+        assert len(writes) == 1
+
+
 @pytest.mark.parametrize(("payload_slug", "accepted"), [("unit/public", True), ("neworg/public", True), ("evil/public", False)])
 def test_dismissal_binds_either_baked_slug_of_the_repository(dismissal_transport, tmp_path, monkeypatch, payload_slug, accepted):
     """Defect class: a payload naming the other baked slug of the same repository is refused, or a slug
@@ -555,6 +600,20 @@ def test_dismissal_binds_either_baked_slug_of_the_repository(dismissal_transport
     {"comment": "Alert #1 public data. https://github.com/other/repo/pull/2"},
     {"comment": "Alert #10 public data. https://github.com/unit/public/pull/2"},
     {"comment": "Alert #1 https://github.com/unit/public/pull/2"},
+    {"comment": "Alert #1 <https://github.com/unit/public/pull/2>"},
+    {"comment": "Alert #1 [](<https://github.com/unit/public/pull/2> \"review\")"},
+    pytest.param(
+        {"comment": "Alert #1 <https://github.com/unit/public/pull/2> ;https://github.com/unit/public/pull/2"},
+        id="semicolon-url-is-not-explanation",
+    ),
+    pytest.param(
+        {"comment": "Alert #1 <https://github.com/unit/public/pull/2> :https://github.com/unit/public/pull/2/files"},
+        id="colon-url-is-not-explanation",
+    ),
+    pytest.param(
+        {"comment": "Alert #1 <https://github.com/unit/public/pull/2> ://HTTPS://github.com/unit/public/pull/2"},
+        id="preceding-delimiter-and-uppercase-url-is-not-explanation",
+    ),
     {"comment": "Alert #1 public data. https://github.com/unit/public/pull/2/other"},
 ])
 def test_dismissal_rejects_open_payload_and_unbound_comments(dismissal_transport, change):
