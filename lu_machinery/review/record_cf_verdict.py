@@ -80,8 +80,6 @@ from lu_machinery.orchestration.fleet_repos import (
     same_repository,
 )
 from lu_machinery.orchestration.integration_sweep import (
-    AUTHOR_FAMILIES_LABEL,
-    AUTHOR_FAMILY_TOKEN,
     CHUNK_VOIDS,
     ITEM_ID_RE,
     MARKER_PREFIX,
@@ -1778,7 +1776,6 @@ def _withheld_comment(fields: Mapping[str, Any], finding_count: int | Literal["u
         app_bot=fields["app_bot"],
         score=fields["score"],
         author_models=fields["author_models"],
-        author_families=fields["author_families"],
         denominator=fields["denominator"],
         coverage=fields["coverage"],
         void=fields["void"],
@@ -1805,7 +1802,6 @@ def build_comment(
     app_bot: bool = False,
     score: int | None = None,
     author_models: Iterable[str | None] = (),
-    author_families: Iterable[str] = (),
     denominator: Iterable[str] | None = None,
     coverage: Iterable[str] | None = None,
     void: str | None = None,
@@ -1844,11 +1840,6 @@ def build_comment(
     # The score is advisory (C-3020): stored for calibration, never read by a gate.
     score_text = f"{score}/10" if score is not None else "absent"
     authors = sorted({author for author in author_models if author})
-    # The families this record resolved for the branch authors, stated so readers need no model list.
-    attested = tuple(author_families)
-    if any(not isinstance(item, str) or not re.fullmatch(AUTHOR_FAMILY_TOKEN, item) for item in attested):
-        raise RecordError("author family is not a marker token")
-    families = sorted(set(attested))
     pair_field = pair_lines = ""
     if scope_commits is not None:
         scope = tuple(sorted(set(scope_commits)))
@@ -1893,7 +1884,6 @@ def build_comment(
         f"Reviewer model: {model}\n"
         f"Review score: {score_text}\n"
         + (f"Authored by: {', '.join(authors)}\n" if authors else "")
-        + (f"{AUTHOR_FAMILIES_LABEL}{', '.join(families)}\n" if families else "")
         + f"Task id: {task_id}\n"
         + coverage_lines
         + pair_lines
@@ -3537,7 +3527,6 @@ def record(
         app_bot=bool(facts.app_bot_commits),
         score=review_score(reply),
         author_models=facts.author_models,
-        author_families=tuple(sorted(facts.author_families)),
         denominator=None if chunk is None else chunk.denominator,
         coverage=None if chunk is None else chunk.coverage,
         void=None if chunk is None else chunk.void,
@@ -3979,7 +3968,7 @@ def republish_withheld(
     )
     reply = repository_relative_reply(reply, task=task, primary_root=review_root)
 
-    def rendered(second: bool, verdict: str, scoped: bool) -> tuple[list[str], list[str]]:
+    def rendered(second: bool, verdict: str, scoped: bool) -> tuple[str, list[str]]:
         """Known forms of this recorded comment, and the full form to publish.
 
         ``scoped`` is the recorded marker's own form: a Low-tier record is unscoped even on a pair branch.
@@ -4009,7 +3998,6 @@ def republish_withheld(
             app_bot=bool(facts.app_bot_commits),
             score=review_score(reply),
             author_models=facts.author_models,
-            author_families=tuple(sorted(facts.author_families)),
             denominator=None if chunk is None else chunk.denominator,
             coverage=None if chunk is None else chunk.coverage,
             void=None if chunk is None else chunk.void,
@@ -4017,18 +4005,15 @@ def republish_withheld(
             scope_commits=tuple(commit.sha for commit in scope.commits) if mixed_pair else None,
             second_review=second,
         )
-        withheld_forms: list[str] = []
-        full_forms: list[str] = []
-        # The current form first; a record posted before the recorder stated author families keeps matching.
-        for fields in (comment_fields, {**comment_fields, "author_families": ()}):
-            withheld_forms.append(_withheld_comment(fields, review.finding_count))
-            full_forms.append(build_comment(**fields))
-            if verdict == review.verdict:
-                if residuals:
-                    full_forms.append(build_comment(**{**fields, "residuals": ()}))
-                elif verdict != "APPROVED":
-                    full_forms.append(build_comment(**fields, repair_withheld=True))
-        return withheld_forms, full_forms
+        comment = build_comment(**comment_fields)
+        withheld = _withheld_comment(comment_fields, review.finding_count)
+        full_forms = [comment]
+        if verdict == review.verdict:
+            if residuals:
+                full_forms.append(build_comment(**{**comment_fields, "residuals": ()}))
+            elif verdict != "APPROVED":
+                full_forms.append(build_comment(**comment_fields, repair_withheld=True))
+        return withheld, full_forms
 
     adapter = GitHubAdapter(Path.cwd())
     login = adapter.identity()
@@ -4061,8 +4046,8 @@ def republish_withheld(
             not second and not reviews_of_record(review.model)
         ):
             raise RecordError("a recorded verdict of this task does not match its record and sealed reply")
-        withheld_forms, full_forms = rendered(second, verdict, scoped=bool(marker.get("review_pair")))
-        if any(item["body"] not in withheld_forms and item["body"] not in full_forms for item in own):
+        withheld, full_forms = rendered(second, verdict, scoped=bool(marker.get("review_pair")))
+        if any(item["body"] != withheld and item["body"] not in full_forms for item in own):
             raise RecordError("a recorded verdict of this task does not match its record and sealed reply")
         comment = full_forms[0]
         check_texts(normalize_repository(github.active), [comment], environment={})
