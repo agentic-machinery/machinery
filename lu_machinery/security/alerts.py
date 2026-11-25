@@ -6,7 +6,8 @@ emits JSON and Prometheus textfile metrics, and renders a fix brief + dispatch
 command routed through the model catalog without ever dispatching.
 
 The same read also records fleet-security enrollment (machinery#1081): whether
-the default branch calls the pinned reusable workflow, whether that call's CI
+the default branch calls the reusable workflow by full SHA or from its host
+repository at the same commit, whether that call's CI
 evidence could be read, and any OSS findings the workflow annotations expose.
 """
 
@@ -57,7 +58,6 @@ METRIC_SCAN_TIMESTAMP = "lu_security_alerts_scan_timestamp_seconds"
 METRIC_FLEET_SECURITY_STATE = "lu_security_alerts_fleet_security_state"
 METRIC_FLEET_SECURITY_FINDINGS = "lu_security_alerts_fleet_security_findings"
 
-# A default-branch workflow is enrolled only when it calls this reusable workflow at a full SHA.
 _FLEET_SECURITY_WORKFLOW_PATH = ".github/workflows/fleet-security.yml"
 FLEET_SECURITY_STATES: tuple[str, ...] = (
     "missing_enrollment",
@@ -542,16 +542,16 @@ def _run_html_url_matches(html_url: Any, allowed_slugs: Sequence[str], run_id: i
     return _slug_matches(slug, allowed_slugs)
 
 
-def _fleet_security_workflow(
+def _fleet_security_host(
     repos: Mapping[str, FleetRepo] | None, *, registry_path: Path | None = None,
-) -> str | None:
+) -> ActiveFleetRepo | None:
     try:
         active = resolve_active_fleet_repo("machinery", repos=repos, registry_path=registry_path)
     except FleetRepoError:
         return None
-    if _split_slug(active.active_github) is None:
+    if _repo_slugs(active.repo) is None:
         return None
-    return f"{active.active_github}/{_FLEET_SECURITY_WORKFLOW_PATH}"
+    return active
 
 
 def _repo_numeric_id(document: Mapping[str, Any]) -> str | None:
@@ -954,6 +954,8 @@ def _read_workflow_callers(
     branch: str,
     timeout: float,
     fleet_workflow: str,
+    *,
+    allow_same_commit: bool,
 ) -> tuple[list[dict[str, str]], list[dict[str, str]], str | None]:
     """Return ``(callers, rejected_pins, error)``. A 404 directory is an empty caller list."""
     endpoint = _repo_api(owner, name, f"contents/.github/workflows?ref={quote(branch, safe='')}")
@@ -1004,7 +1006,9 @@ def _read_workflow_callers(
         if total_decoded > _MAX_WORKFLOW_BYTES:
             return [], [], "pagination_limit"
         workflow_path = f".github/workflows/{filename}"
-        file_callers, file_rejected, pin_error = _pins_in_workflow(text, workflow_path, fleet_workflow)
+        file_callers, file_rejected, pin_error = _pins_in_workflow(
+            text, workflow_path, fleet_workflow, allow_same_commit=allow_same_commit,
+        )
         if pin_error:
             return [], [], pin_error
         for row in file_callers:
@@ -1017,7 +1021,7 @@ def _read_workflow_callers(
 
 
 def _pins_in_workflow(
-    text: str, workflow_path: str, fleet_workflow: str,
+    text: str, workflow_path: str, fleet_workflow: str, *, allow_same_commit: bool,
 ) -> tuple[list[dict[str, str]], list[dict[str, str]], str | None]:
     """Read job-level ``uses`` values. A line inside a script is not a caller."""
     try:
@@ -1043,6 +1047,12 @@ def _pins_in_workflow(
             continue
         if not isinstance(uses, str):
             return [], [], "workflow_file_unreadable"
+        if uses == f"./{_FLEET_SECURITY_WORKFLOW_PATH}":
+            if allow_same_commit:
+                callers.append({"path": workflow_path, "pin": "same_commit"})
+            else:
+                rejected.append({"path": workflow_path, "ref": uses, "reason": "local_workflow_copy"})
+            continue
         target, separator, ref = uses.partition("@")
         if not separator or target != fleet_workflow:
             continue
@@ -1351,8 +1361,8 @@ def read_fleet_security(
     allowed_slugs = _repo_slugs(repo)
     if slug is None or allowed_slugs is None:
         return _fleet_record("inaccessible_evidence", reason="invalid_repository")
-    fleet_workflow = _fleet_security_workflow(repos, registry_path=registry_path)
-    if fleet_workflow is None:
+    host = _fleet_security_host(repos, registry_path=registry_path)
+    if host is None:
         return _fleet_record("inaccessible_evidence", reason="machinery_repository_unavailable")
     owner, name = slug
     described = _github_get(client, _repo_api(owner, name, "").rstrip("/"), timeout)
@@ -1363,7 +1373,13 @@ def read_fleet_security(
     if branch is None:
         return _fleet_record("inaccessible_evidence", reason="invalid_default_branch")
     repo_id = _repo_numeric_id(described.value)
-    callers, rejected, list_error = _read_workflow_callers(client, owner, name, branch, timeout, fleet_workflow)
+    allow_same_commit = _slug_matches(active.active_github, host.repo.slugs) and (
+        host.repo.repository_id is None or repo_id == str(host.repo.repository_id)
+    )
+    callers, rejected, list_error = _read_workflow_callers(
+        client, owner, name, branch, timeout, f"{host.active_github}/{_FLEET_SECURITY_WORKFLOW_PATH}",
+        allow_same_commit=allow_same_commit,
+    )
     if list_error:
         return _fleet_record("inaccessible_evidence", reason=list_error, rejected_pins=rejected)
     if not callers:
@@ -1747,17 +1763,18 @@ def _render_fleet_section(fleet: Mapping[str, Any], *, fleet_workflow: str | Non
     if state == "missing_enrollment":
         lines.append("State: `missing_enrollment`.")
         lines.append(
-            "The default branch has no workflow that calls "
-            f"`{fleet_workflow or _FLEET_SECURITY_WORKFLOW_PATH}` at a full 40-character SHA."
+            "The default branch has no eligible call to "
+            f"`{fleet_workflow or _FLEET_SECURITY_WORKFLOW_PATH}`."
         )
         rejected = fleet.get("rejected_pins")
         if isinstance(rejected, list) and rejected:
             lines.append("These refs are not enrollment:")
             for item in rejected:
                 if isinstance(item, Mapping):
-                    lines.append(
-                        f"- `{_sanitize_md_cell(item.get('path'))}` at `{_sanitize_md_cell(item.get('ref'))}`"
-                    )
+                    line = f"- `{_sanitize_md_cell(item.get('path'))}` at `{_sanitize_md_cell(item.get('ref'))}`"
+                    if item.get("reason"):
+                        line += f" (`{_sanitize_md_cell(item.get('reason'))}`)"
+                    lines.append(line)
         return lines
     if state == "inaccessible_evidence":
         lines.append("State: `inaccessible_evidence`.")
@@ -2115,13 +2132,14 @@ def build_fix_brief(
         owned_paths=owned_paths,
     )
     dispatch_command = shlex.join(dispatch_argv)
+    host = _fleet_security_host(repo_catalog, registry_path=registry_path)
     brief_markdown = _render_brief_markdown(
         active=active,
         generated_at=generated_at,
         worker=worker,
         alerts_payload=alerts_payload,
         fleet_security=fleet_security,
-        fleet_workflow=_fleet_security_workflow(repo_catalog, registry_path=registry_path),
+        fleet_workflow=f"{host.active_github}/{_FLEET_SECURITY_WORKFLOW_PATH}" if host else None,
         owned_paths=owned_paths,
         dispatch_command=dispatch_command,
     )
