@@ -3733,3 +3733,11 @@ def test_write_lifecycle_and_lock_refuse_direct_task_store_and_load_reads_existi
     task_lifecycle.archive_predecessor(archive_bytes, orig_pred_path, orig_pred_sha)
     assert orig_pred_path.read_bytes() == archive_bytes
     assert not list(orig_path.parent.rglob("*.tmp"))
+
+    # A symlink whose target only resolves after normalisation (`closeout.json/`) is refused before any lock or write.
+    before = orig_path.read_bytes()
+    file_target_link = tmp_path / "state-link"
+    file_target_link.symlink_to(f"{orig_path}/")
+    assert task_closeout.main(["bind-pr", "--state-file", str(file_target_link), "--pr", "77", "--now", NOW]) == 2
+    assert orig_path.read_bytes() == before
+    assert not (tmp_path / "state-link.lock").exists()

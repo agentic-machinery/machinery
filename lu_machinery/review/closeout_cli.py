@@ -30,7 +30,12 @@ if __package__ in (None, ""):  # run as a file: put the repository root on sys.p
 from lu_machinery.common import json_depth
 from lu_machinery.common.git_context import sanitized_git_env
 from lu_machinery.common.repo_root import MachineryConfigError
-from lu_machinery.common.task_store_paths import require_not_direct_task_store_path, tasks_dir
+from lu_machinery.common.task_store_paths import (
+    kernel_follows_write_path,
+    require_not_direct_task_store_path,
+    tasks_dir,
+    write_path_argument,
+)
 from lu_machinery.fleet import claude_account_lane, credit_lane
 from lu_machinery.identity import UNKNOWN_AUTHOR_FAMILY, resolve_author_family
 from lu_machinery.review.evidence import compute_target_input_fingerprint
@@ -921,8 +926,6 @@ def _cmd_behavior_proof_receipt(args: argparse.Namespace) -> int:
     """Write the Ukrainian receipt from the frozen proof and the live PR comments."""
     from lu_machinery.review.review_contract import ContractError, build_ukrainian_behavior_receipt
 
-    if not args.state_file.name or args.state_file.name in {".", ".."}:
-        raise CloseoutStateError(f"state_unreadable: invalid state file path {args.state_file}")
     raw_receipt_path = args.state_file.with_name(f"{args.state_file.stem}.ukrainian-behavior-proof-receipt.json")
     _require_writable_path(raw_receipt_path, label="behavior-proof receipt")
     state = _load_state(args.state_file)
@@ -988,6 +991,8 @@ def _cmd_behavior_proof_receipt(args: argparse.Namespace) -> int:
         return 1
     # Re-validate and resolve once before writing so a relative --state-file prints a path reconciliation accepts.
     _require_writable_path(raw_receipt_path, label="behavior-proof receipt")
+    if not kernel_follows_write_path(raw_receipt_path):
+        raise CloseoutStateError(f"receipt_unwritable: a component of {raw_receipt_path} cannot be followed")
     receipt_path = raw_receipt_path.resolve()
     _require_writable_path(receipt_path, label="behavior-proof receipt")
     receipt_bytes = (json.dumps(receipt, ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode()
@@ -1746,7 +1751,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--state-file",
         required=True,
-        type=Path,
+        type=write_path_argument,
         help=(
             "Path to the closeout state JSON file (global argument — must precede the "
             "subcommand). Created on first write; subcommands merge into any existing state. "

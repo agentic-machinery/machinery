@@ -45,7 +45,7 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 from lu_machinery.common import json_depth
-from lu_machinery.common.task_store_paths import is_direct_task_store_path
+from lu_machinery.common.task_store_paths import is_direct_task_store_path, write_path_argument
 from lu_machinery.opsec.prepublish import publication_cli
 from lu_machinery.publish.github import Request, request_run
 from lu_machinery.review.evidence import build_target_manifest
@@ -329,7 +329,7 @@ Related: docs/review-protocol.md; lu_machinery/schemas/code-review-findings.v1.s
 
     parser.add_argument(
         "--receipt-path",
-        type=Path,
+        type=write_path_argument,
         help="Write full receipt JSON to this local path (must not be a forbidden artifact path)",
     )
     parser.add_argument(

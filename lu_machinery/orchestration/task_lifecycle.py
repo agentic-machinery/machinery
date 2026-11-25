@@ -34,7 +34,11 @@ from lu_machinery.common.repo_root import (
     machinery_path,
     state_root_for_checkout,
 )
-from lu_machinery.common.task_store_paths import require_not_direct_task_store_path
+from lu_machinery.common.task_store_paths import (
+    kernel_follows_write_path,
+    require_not_direct_task_store_path,
+    write_path_spelling_error,
+)
 from lu_machinery.github_check_rollup import group_collapsed_by_name
 from lu_machinery.orchestration import fleet_repos, issue_stream_audit, task_identity
 from lu_machinery.review.review_contract import finding_supports_approval, unverified_follow_up_notes
@@ -1333,13 +1337,18 @@ def _validate_lifecycle_write_path(path: Path | str, *, label: str) -> None:
     from where ``path`` resolves. No caller needs one: ``lifecycle_path`` builds from a resolved
     state root, and ``task_closeout`` checks a mutating ``--state-file`` here before resolving it.
     A string keeps a trailing ``/``, ``/.`` or ``/..`` that ``Path`` would drop, so it is checked
-    as given.
+    as given. A component the kernel cannot follow is refused too, so a caller that resolves the
+    path first never writes where its own spelling cannot be read back.
     """
     raw = os.fspath(path)
-    parts = raw.split(os.sep)
-    if parts[-1] in {"", ".", ".."} or ".." in parts:
-        raise LifecycleError(f"invalid {label} path (empty name or '..' component refused): {raw!r}")
+    reason = write_path_spelling_error(raw)
+    if reason is None and ".." in raw.split(os.sep):
+        reason = "'..' component"
+    if reason is not None:
+        raise LifecycleError(f"invalid {label} path ({reason} refused): {raw!r}")
     _require_not_direct_task_store(Path(raw), label=label)
+    if not kernel_follows_write_path(raw):
+        raise LifecycleError(f"invalid {label} path (a component the kernel cannot follow refused): {raw!r}")
 
 
 def write_lifecycle(path: Path, payload: Mapping[str, Any]) -> None:

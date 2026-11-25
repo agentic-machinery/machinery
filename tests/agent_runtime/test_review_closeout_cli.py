@@ -1690,7 +1690,8 @@ def test_closeout_cli_refuses_direct_task_store_writes_and_reads_existing_legacy
     assert not (store / "legacy.review-state.ukrainian-behavior-proof-receipt.json").exists()
 
     # R1 F1/F2 regressions: traversing through an existing regular file and passing a
-    # filename-less directory path both return typed JSON errors instead of tracebacks.
+    # filename-less directory path both end in typed refusals instead of tracebacks; the
+    # filename-less spelling is refused as given, before Path drops its trailing component.
     regular_file = tmp_path / "existing-file"
     regular_file.write_text("not a directory\n", encoding="utf-8")
     file_parent_proc = _run_cli(regular_file / "state.json", "target", "--mode", "local", "--repo-root", str(repo))
@@ -1698,5 +1699,5 @@ def test_closeout_cli_refuses_direct_task_store_writes_and_reads_existing_legacy
     assert "task_store_direct_write_refused" in file_parent_proc.stderr
 
     dot_receipt_proc = _run_cli(Path("."), "behavior-proof", "receipt")
-    assert dot_receipt_proc.returncode == 1
-    assert "state_unreadable" in dot_receipt_proc.stderr
+    assert dot_receipt_proc.returncode == 2
+    assert "not a writable file path" in dot_receipt_proc.stderr

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import os
 import stat
 import threading
@@ -274,6 +275,54 @@ def is_direct_task_store_path(path: Path, *, store_dir: Path | None = None) -> b
         directories.append(candidate.parent)
         directories.append(candidate)
     return any(_is_flat_task_store_dir(directory, forbidden_dirs) for directory in directories)
+
+
+def write_path_spelling_error(raw: str) -> str | None:
+    """Why the string ``raw`` cannot name a file to write, else ``None``.
+
+    Checked on the string as given, because ``Path`` drops a trailing ``/``, ``/.`` or ``/..``
+    (``out.json/`` would become ``out.json``). An unexpanded leading ``~`` (an unknown user or a
+    quoted tilde) is refused rather than becoming a directory named ``~`` in the working directory.
+    """
+    if not raw or raw.rsplit(os.sep, 1)[-1] in {"", ".", ".."}:
+        return "empty file name, or a trailing '/', '.' or '..'"
+    if raw.startswith("~"):
+        return "unexpanded '~' home directory"
+    if "\x00" in raw:
+        return "NUL byte"
+    return None
+
+
+def write_path_argument(value: str) -> Path:
+    """``argparse`` type for a file a CLI writes; refuses what :func:`write_path_spelling_error` names."""
+    reason = write_path_spelling_error(value)
+    if reason is not None:
+        raise argparse.ArgumentTypeError(f"not a writable file path ({reason}): {value!r}")
+    return Path(value)
+
+
+def kernel_follows_write_path(path: Path | str) -> bool:
+    """Whether the kernel can follow ``path``'s nearest existing ancestor (``path`` itself if it exists).
+
+    ``os.path.realpath`` collapses ``missing/..`` and drops a trailing ``/`` in a symlink target, so
+    a spelling the kernel cannot follow (a symlink to ``file.json/`` or to ``missing/../dir``) can
+    still resolve to an existing file. A writer that resolves before writing refuses ``False``, so
+    it never writes where a lookup through the caller's spelling fails. The components below that
+    ancestor do not exist yet, so they hold no symlink; the ancestor must then be a directory, and a
+    ``..`` among them is refused.
+    """
+    raw = os.fspath(path)
+    try:
+        probe = raw if os.path.isabs(raw) else os.path.join(os.getcwd(), raw)
+    except (OSError, ValueError):
+        return False
+    leaf = True
+    while not os.path.lexists(probe):
+        parent, name = os.path.split(probe)
+        if name == ".." or parent == probe:
+            return False
+        probe, leaf = parent, False
+    return os.path.exists(probe) if leaf else os.path.isdir(probe)
 
 
 def require_not_direct_task_store_path(
