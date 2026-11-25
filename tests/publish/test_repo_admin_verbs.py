@@ -560,11 +560,13 @@ def test_unsettled_transfer_blocks_retry_until_reconciled(tmp_path, monkeypatch,
 
 
 def test_pending_transfer_bound_to_original_principal(tmp_path):
-    """Defect class: a pending transfer settled (exit 0) or its journal cleared by a principal other than its starter.
+    """Defect class: an exit 0 or a journal removal resting on a principal read older than the last GitHub read.
 
     The account id changes after the POST, so the first run is unsettled; while GitHub still reports the
     other id, or the journal's binding is missing, unreadable or names another login, a rerun exits 3 and
-    keeps the journal. Only the original login and id settle it.
+    keeps the journal. Only the original login and id settle it. Every exit 0 without a POST (pending
+    settlement, already transferred with no journal, either verb's dry run) re-reads GET /user after its
+    last GitHub read: a switched login or id, or a failed re-read, exits 3 and keeps the journal.
     """
     gh = FakeGitHub()
     other_account = lambda args: answer(args, {"login": PRINCIPAL, "id": 22})  # noqa: E731
@@ -593,10 +595,46 @@ def test_pending_transfer_bound_to_original_principal(tmp_path):
         assert journal(tmp_path).exists()
     journal(tmp_path).write_text(bound)
     journal(tmp_path).chmod(0o600)
+    other_login = lambda args: answer(args, {"login": "someone-else", "id": 7})  # noqa: E731
+
+    def switched(fake, later, dry_run, *, verb="repo-transfer", **fields):
+        """One run whose preflight GET /user is the principal and whose next GET /user answers *later*."""
+        calls, posts = [], len(fake.posts)
+        fake.overrides[("GET", "user", bool(posts))] = lambda args: (
+            calls.append(args) or (answer(args, {"login": PRINCIPAL, "id": 7}) if len(calls) == 1 else later(args))
+        )
+        result, receipt = run(verb, fake, repo="infra-private", dry_run=dry_run, **fields)
+        del fake.overrides[("GET", "user", bool(posts))]
+        assert result.returncode == pub.REPO_ADMIN_UNSETTLED and len(calls) == 2 and len(fake.posts) == posts
+        assert receipt["principal"]["after"] == (None if later is server_error else json.loads(later([]).stdout))
+        return receipt
+
+    # The account switches after the preflight read: the re-read at settlement must still be the starter.
+    for later in (other_account, other_login, server_error):
+        for dry_run in (False, True):
+            assert switched(gh, later, dry_run)["outcome"] == "unreconciled" and journal(tmp_path).exists()
     result, receipt = run("repo-transfer", gh, repo="infra-private")
     assert result.returncode == 0 and receipt["outcome"] == "already-transferred"
+    assert receipt["principal"]["after"] == {"login": PRINCIPAL, "id": 7}
     assert receipt["journal_principal"] == {"login": PRINCIPAL, "id": 7} and not journal(tmp_path).exists()
     assert len(gh.posts) == 1
+    # Already transferred with no journal, and both verbs' dry runs: the same final re-read, nothing created.
+    fresh = FakeGitHub()
+    for later in (other_account, other_login, server_error):
+        for dry_run in (False, True):
+            assert switched(gh, later, dry_run)["outcome"] == "unverified" and not journal(tmp_path).exists()
+        assert switched(fresh, later, True)["outcome"] == "unverified" and not journal(tmp_path).exists()
+        receipt = switched(fresh, later, True, verb="repo-create", name="rehearsal-1")
+        assert receipt["outcome"] == "unverified" and fresh.find(f"{OLD}/rehearsal-1") is None
+    for fake, verb, fields, outcome in (
+        (gh, "repo-transfer", {}, "already-transferred"),
+        (fresh, "repo-transfer", {}, "dry-run"),
+        (fresh, "repo-create", {"name": "rehearsal-1"}, "dry-run"),
+    ):
+        result, receipt = run(verb, fake, repo="infra-private", dry_run=True, **fields)
+        assert result.returncode == 0 and receipt["outcome"] == outcome
+        assert receipt["principal"]["before"] == receipt["principal"]["after"] == {"login": PRINCIPAL, "id": 7}
+    assert len(gh.posts) == 1 and fresh.posts == []
 
 
 def _edit(**changes):

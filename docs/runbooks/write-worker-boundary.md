@@ -321,10 +321,14 @@ stops accidents; it is not authentication, because a worker can drop its own mar
 `LU_PRODUCT_ROOT` set to the product checkout, which their private state directory must stay outside.
 Run both verbs as the destination organization owner with a stored `gh` token that can read every
 repository in that organization. The destination lookup checks for visible collisions only.
+Do not change the gh login while this command runs.
 Run `.venv/bin/python -m lu_machinery.publish <verb> --help` for the checks, receipts and exit codes.
 The exit codes apply to that module entry point. After an interruption, check GitHub for the fixture
 name before trying another create, or rerun the transfer command to reconcile its journal. The
 journal binds the login and account id that started the transfer; only that principal settles it.
+Every exit 0 that sends no POST (an already-transferred repository, with or without a journal, and
+each verb's dry run) re-reads `GET /user` after its last GitHub read and requires that login and id;
+a failed or mismatched re-read exits 3 and keeps the journal.
 
 ## Review contract canary
 

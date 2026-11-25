@@ -2144,6 +2144,7 @@ _REHEARSAL_SUFFIX = "-moved"
 _DESTINATION_OWNER_PRECONDITION = (
     "Operator precondition: run as the destination organization owner with a stored gh token that can read\n"
     "  every repository in that organization. The destination lookup checks for visible collisions only.\n"
+    "  Do not change the gh login while this command runs.\n"
 )
 
 
@@ -2617,6 +2618,15 @@ def _repo_create_checked(fields, plan, receipt, sink, _directory_fd, _directory,
 
     _repo_admin_checks(verb, receipt, sink, capture_output, text, checks)
     if receipt["dry_run"]:
+        # The exit 0 rests on a principal read after the collision reads, as the created path's readback does.
+        reason = _principal_reread(receipt["principal"]["before"], receipt, reader, cwd, environment)
+        if reason:
+            return _repo_admin_settle(
+                verb, receipt, sink, REPO_ADMIN_UNSETTLED, "unverified",
+                f"{reason}, so this run cannot confirm its checks under the named principal; no mutation was sent. "
+                "Rerun under one unchanged gh login",
+                capture_output, text,
+            )
         return _repo_admin_settle(
             verb, receipt, sink, 0, "dry-run", "every check passed; no mutation was sent", capture_output, text,
         )
@@ -2799,14 +2809,43 @@ def _journal_principal(directory_fd, name):
     return {"login": login, "id": user_id}
 
 
+def _same_principal(bound, current):
+    """Whether the *bound* principal (or None) is the *current* login and account id."""
+    return (
+        bound is not None and current is not None and _same_slug(bound["login"], current["login"])
+        and bound["id"] == current["id"]
+    )
+
+
+def _principal_reread(bound, receipt, reader, cwd, environment):
+    """Re-read GET /user after the run's last GitHub read; why it is not *bound* (login and id), or None.
+
+    An exit 0 or a journal removal never rests on a principal read older than the run's last GitHub
+    read; the post-send readbacks keep the same order in ``_repo_admin_readback``.
+    """
+    try:
+        current = _repo_admin_whoami(reader, cwd, environment)
+    except Exception:
+        receipt["principal"]["after"] = None
+        return "the principal could not be re-read after the last GitHub read"
+    receipt["principal"]["after"] = current
+    if not _same_principal(bound, current):
+        return (
+            f"the gh credential authenticated as {current['login']} (id {current['id']}) at the re-read after the "
+            f"last GitHub read, not {bound['login']} (id {bound['id']})"
+        )
+    return None
+
+
 def _repo_transfer_checked(fields, plan, receipt, sink, directory_fd, directory, *, runner, cwd, environment,
                            capture_output, text):
     """Reconcile from the exact destination first, then the fresh source checks, then one journaled transfer.
 
-    Exit contract: 0 verified (or already at the destination, or a passed dry run); 2 refused with nothing
-    sent and no journal left; 75 a rate limit before any POST with no journal; 3 everything else: a POST
-    sent and unsettled, a pending journal not settled by the destination under the login and id it binds, or a
-    journal that could not be removed.
+    Exit contract: 0 verified (or already at the destination, or a passed dry run), always after a principal
+    read that follows the last GitHub read; 2 refused with nothing sent and no journal left; 75 a rate limit
+    before any POST with no journal; 3 everything else: a POST sent and unsettled, a pending journal not
+    settled by the destination under the login and id it binds, a failed or mismatched final principal
+    re-read (the journal is kept), or a journal that could not be removed.
     """
     verb, reader = "repo-transfer", merge_readiness_runner(runner)
     source, destination, repository_id = plan["source"], plan["destination"], plan["repository_id"]
@@ -2867,22 +2906,39 @@ def _repo_transfer_checked(fields, plan, receipt, sink, directory_fd, directory,
     )
     if settled is not None:
         return settled
-    current = receipt["principal"]["before"]
-    if state.get("moved") and pending and (
-        started_by is None or not _same_slug(started_by["login"], current["login"]) or started_by["id"] != current["id"]
-    ):
-        started = (
-            "has no readable principal binding" if started_by is None
-            else f"was started by {started_by['login']} (id {started_by['id']})"
-        )
+    if state.get("unreconciled"):
         return _repo_admin_settle(
-            verb, receipt, sink, REPO_ADMIN_UNSETTLED, "unreconciled",
-            f"repository {repository_id} is at {destination}, private, but the transfer journal {receipt['journal']} "
-            f"{started}, and this run authenticates as {current['login']} (id {current['id']}). Only the principal "
-            "that started the transfer settles it: check the account on GitHub, then rerun as that principal or "
-            "remove the journal by hand; no mutation was sent by this run",
-            capture_output, text,
+            verb, receipt, sink, REPO_ADMIN_UNSETTLED, "unreconciled", unreconciled, capture_output, text,
         )
+    if state.get("moved") or receipt["dry_run"]:
+        # Both exit 0 with no POST: the principal is re-read after the last GitHub read and must be the bound
+        # one (the journal's starter, or with no journal this run's preflight principal), as after a send.
+        before = receipt["principal"]["before"]
+        bound = started_by if pending else before
+        if not _same_principal(bound, before):
+            reason = f"this run authenticates as {before['login']} (id {before['id']})"
+        else:
+            reason = _principal_reread(bound, receipt, reader, cwd, environment)
+        if reason and pending:
+            started = (
+                "has no readable principal binding" if started_by is None
+                else f"was started by {started_by['login']} (id {started_by['id']})"
+            )
+            return _repo_admin_settle(
+                verb, receipt, sink, REPO_ADMIN_UNSETTLED, "unreconciled",
+                f"repository {repository_id} is at {destination}, private, but the transfer journal "
+                f"{receipt['journal']} {started}, and {reason}. Only the principal that started the transfer "
+                "settles it: check the account on GitHub, then rerun as that principal or remove the journal by "
+                "hand; the journal is kept and no mutation was sent by this run",
+                capture_output, text,
+            )
+        if reason:
+            return _repo_admin_settle(
+                verb, receipt, sink, REPO_ADMIN_UNSETTLED, "unverified",
+                f"{reason}, so this run cannot confirm its checks under the named principal; no mutation was sent "
+                "by this run. Rerun under one unchanged gh login",
+                capture_output, text,
+            )
     if state.get("moved"):
         detail = f"repository {repository_id} is at {destination}, private; no mutation was sent"
         if pending and receipt["dry_run"]:
@@ -2890,10 +2946,6 @@ def _repo_transfer_checked(fields, plan, receipt, sink, directory_fd, directory,
         elif pending and not _repo_admin_unjournal(directory_fd, journal_name, receipt):
             detail += f"; the journal {receipt['journal']} could not be removed: remove it by hand"
         return _repo_admin_settle(verb, receipt, sink, 0, "already-transferred", detail, capture_output, text)
-    if state.get("unreconciled"):
-        return _repo_admin_settle(
-            verb, receipt, sink, REPO_ADMIN_UNSETTLED, "unreconciled", unreconciled, capture_output, text,
-        )
     if receipt["dry_run"]:
         return _repo_admin_settle(
             verb, receipt, sink, 0, "dry-run", "every check passed; no mutation was sent", capture_output, text,
@@ -4779,7 +4831,8 @@ def _parse_args(argv):
                 "  One run per fixture name: a lock in the private directory is held from the first read to settlement.\n"
                 + _DESTINATION_OWNER_PRECONDITION
                 + "Outputs: one POST orgs/<owner>/repos (private, auto_init), a readback of the same private repository,\n"
-                "  and GET /user to verify the same login and account id. Receipt JSON on stdout and in a new 0600 file under\n"
+                "  and GET /user to verify the same login and account id (a dry run re-reads GET /user after the name\n"
+                "  lookups the same way). Receipt JSON on stdout and in a new 0600 file under\n"
                 "  ~/.local/state/learn-ukrainian/repo-admin/ of the running account (its password-database home;\n"
                 "  $HOME and $XDG_STATE_HOME are ignored, so every run finds the same journal): repository id and slug,\n"
                 "  rehearsal_destination, principal before and after. repo-transfer --create-receipt takes that file.\n"
@@ -4787,7 +4840,8 @@ def _parse_args(argv):
                 "  mutation; 3 UNSETTLED: the POST was sent and its result is unknown or unverified (an output\n"
                 "  failure after the POST included), or another run holds the lock (in-progress); never\n"
                 "  retry with the same name: check the organization on GitHub and use a new name; a rate limit at\n"
-                "  the POST is 3;\n"
+                "  the POST is 3; a dry run whose final GET /user fails or names another login or id is 3\n"
+                "  (unverified, no mutation);\n"
                 "  75 a rate limit refused a read before the POST.\n"
                 "Related: decision GH-ADMIN-VERBS-1124; repo-transfer; docs/runbooks/write-worker-boundary.md."
             )
@@ -4813,6 +4867,9 @@ def _parse_args(argv):
                 "  with no mutation and clears the journal (a dry run leaves it), but a journal exits 0 or clears only\n"
                 "  when it binds the login and account id of this run (the preflight GET /user of the run that wrote\n"
                 "  it); else a journal for that id exits 3 with no mutation, as does any failed check while it exists.\n"
+                "  Every exit 0 with no POST (already transferred, journal or not, and a dry run) re-reads GET /user\n"
+                "  after its last GitHub read and requires the bound login and account id; a failed or mismatched\n"
+                "  re-read exits 3 and keeps the journal.\n"
                 "  A new send requires no visible destination collision, a private and unarchived source with the\n"
                 "  pinned id, source admin permission, and active destination admin membership. The source slug is\n"
                 "  re-read just before the POST.\n"
@@ -4829,7 +4886,8 @@ def _parse_args(argv):
                 "  and no journal for this repository id; 3 UNSETTLED: the POST was sent and the result is unknown or\n"
                 "  unverified (an output failure after the POST included); a journal for this repository id exists or\n"
                 "  cannot be read and the destination does not settle it, or it binds another login or account id,\n"
-                "  whichever later step fails (unreconciled);\n"
+                "  whichever later step fails (unreconciled); the final GET /user re-read before an exit 0 failed\n"
+                "  or named another login or id (unreconciled with a journal, else unverified; no mutation);\n"
                 "  a refused run could not remove its own journal (journal-retained); or another run holds the lock\n"
                 "  (in-progress). Journals are per repository id: the rehearsal's never blocks the move.\n"
                 "  Never retry: rerun only to reconcile, as the principal that started the transfer (it exits 0 once\n"
