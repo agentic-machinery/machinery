@@ -692,6 +692,17 @@ _CONTEXT_ANNOTATION_RES: tuple[re.Pattern[str], ...] = (
     _GATE_FAILURE_LINE_RE,
     re.compile(r"TruffleHog reported [0-9]+ finding\(s\)\. Secret values are redacted from this log\."),
 )
+_AGGREGATE_FINDING_RE = re.compile(
+    r"fleet-security-finding/v1 (zizmor|trufflehog|trivy-fs|trivy-iac|trivy-image)"
+    r" (critical|high|medium|low|unknown) ([1-9][0-9]{0,8})"
+)
+_AGGREGATE_JOB_NAMES = {
+    "zizmor": "zizmor",
+    "trufflehog": "Secret scan (TruffleHog)",
+    "trivy-fs": "Trivy dependencies and licences",
+    "trivy-iac": "Trivy IaC and misconfiguration",
+    "trivy-image": "Trivy container image",
+}
 
 
 def _is_context_annotation(message: Any) -> bool:
@@ -749,12 +760,27 @@ def _finding(
 
 
 def _parse_oss_finding(message: Any) -> dict[str, Any] | None:
-    """Parse one redacted fleet-security annotation. Unrecognized text is not a finding."""
+    """Parse one fleet-security finding annotation, including a public aggregate."""
     if not isinstance(message, str) or not message.strip():
         return None
     if any(unicodedata.category(ch) in {"Cc", "Cf", "Zl", "Zp"} for ch in message):
         return None
     text = message.strip()
+    matched = _AGGREGATE_FINDING_RE.fullmatch(text)
+    if matched:
+        scanner, severity, count = matched.groups()
+        return {
+            **_finding(
+                scanner=scanner,
+                rule="aggregate",
+                severity=severity,
+                raw_path="withheld",
+                line=None,
+                message=text,
+                repository_file=False,
+            ),
+            "finding_count": int(count),
+        }
     matched = re.fullmatch(r"actionlint \[([^\]]+)\] at (.+):([^:\s]+):([^:\s]+)", text)
     if matched:
         _line_number(matched.group(4))
@@ -1246,6 +1272,7 @@ def _read_caller_evidence(
             if annotation_error:
                 return None, [], annotation_error
             job_findings = 0
+            aggregate_seen = False
             for annotation_page in annotation_pages:
                 rows = annotation_page.value
                 if not isinstance(rows, list):
@@ -1267,6 +1294,12 @@ def _read_caller_evidence(
                     except _UnreadableAnnotation:
                         parsed = None
                     if parsed is None:
+                        return record, [], "annotations_unreadable"
+                    if "finding_count" in parsed:
+                        if job_findings or _AGGREGATE_JOB_NAMES[parsed["scanner"]] != job_name:
+                            return record, [], "annotations_unreadable"
+                        aggregate_seen = True
+                    elif aggregate_seen:
                         return record, [], "annotations_unreadable"
                     caller_findings.append(
                         {

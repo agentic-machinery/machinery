@@ -35,6 +35,18 @@ from lu_machinery.common import json_depth
 from lu_machinery.common.repo_root import product_root
 
 
+def _redact_details(private: bool) -> bool:
+    if os.environ.get("GITHUB_ACTIONS") != "true":
+        return False
+    if private and (event_path := os.environ.get("GITHUB_EVENT_PATH")):
+        try:
+            event = json_depth.loads(Path(event_path).read_bytes(), max_depth=512)
+            return event["repository"]["visibility"] != "private"
+        except (OSError, ValueError, KeyError, TypeError, RecursionError):
+            pass
+    return True
+
+
 def load_pip_audit_ignores(ignore_file: Path) -> list[str]:
     """Load list of suppressed vulnerability IDs from YAML config."""
     if not ignore_file.exists():
@@ -410,7 +422,7 @@ def _resolve_audit_path(path: Path, description: str) -> Path:
         raise LuMachineryAuditWheelError(f"cannot resolve {description}") from exc
 
 
-def _uv_audit_export(repo_root: Path, lock: Path) -> dict[str, dict[str, set[str]]]:
+def _uv_audit_export(repo_root: Path, lock: Path, *, redact: bool) -> dict[str, dict[str, set[str]]]:
     """Export every locked registry version, checking direct sources before excluding them."""
     uv = shutil.which("uv")
     if uv is None:
@@ -479,8 +491,11 @@ def _uv_audit_export(repo_root: Path, lock: Path) -> dict[str, dict[str, set[str
         requirements.setdefault(name, {}).setdefault(version, set()).update(hashes)
     if not exported or exported != registry:
         raise LuMachineryAuditWheelError(f"uv export covered {len(exported)} of {len(registry)} locked registry versions")
-    for name, reason in sorted(excluded.items()):
-        print(f"[audit_dependencies] {name}: {reason}", file=sys.stderr)
+    if redact:
+        print(f"[audit_dependencies] Skipped {len(excluded)} direct-source uv pins.")
+    else:
+        for name, reason in sorted(excluded.items()):
+            print(f"[audit_dependencies] {name}: {reason}", file=sys.stderr)
     return requirements
 
 
@@ -518,7 +533,7 @@ def _checked_audit_report(result: subprocess.CompletedProcess[str], expected: se
     return dependencies
 
 
-def audit_uv_python(repo_root: Path, ignored_ids: list[str]) -> dict[str, list[dict]] | None:
+def audit_uv_python(repo_root: Path, ignored_ids: list[str], *, private: bool = False) -> dict[str, list[dict]] | None:
     """Audit all locked registry versions. Return None only for a legacy checkout."""
     repo_root = _resolve_audit_path(repo_root, "the audit checkout")
     lock = repo_root / "uv.lock"
@@ -526,7 +541,7 @@ def audit_uv_python(repo_root: Path, ignored_ids: list[str]) -> dict[str, list[d
         return None
     # pip-audit accepts one version per name in a run. Split forks across the fewest invocations.
     batches: list[dict[tuple[str, str], set[str]]] = []
-    for name, versions in sorted(_uv_audit_export(repo_root, lock).items()):
+    for name, versions in sorted(_uv_audit_export(repo_root, lock, redact=_redact_details(private)).items()):
         for index, (version, hashes) in enumerate(sorted(versions.items())):
             if index == len(batches):
                 batches.append({})
@@ -553,24 +568,34 @@ def audit_uv_python(repo_root: Path, ignored_ids: list[str]) -> dict[str, list[d
     return {"dependencies": dependencies}
 
 
-def audit_python(repo_root: Path, ignore_file: Path) -> int:
+def audit_python(repo_root: Path, ignore_file: Path, *, private: bool = False) -> int:
     """Run pip-audit on the product dependency lock with suppressions."""
+    redact = _redact_details(private)
+    if redact:
+        print("[audit_dependencies] Reproduce locally: .venv/bin/python -m lu_machinery.ci.audit_dependencies --skip-node")
     ignored_ids = load_pip_audit_ignores(ignore_file)
     options = ["--desc", "--progress-spinner=off"]
     for vuln_id in ignored_ids:
         options.extend(["--ignore-vuln", vuln_id])
 
     try:
-        uv_report = audit_uv_python(repo_root, ignored_ids)
+        uv_report = audit_uv_python(repo_root, ignored_ids, private=private)
         if uv_report is not None:
             dependencies = uv_report["dependencies"]
             findings = 0
             for dependency in dependencies:
                 for vuln in dependency["vulns"]:
-                    print(f"{dependency['name']} {dependency['version']}: {vuln['id']}")
+                    if not redact:
+                        print(f"{dependency['name']} {dependency['version']}: {vuln['id']}")
                     findings += 1
-            print(f"[audit_dependencies] Audited {len(dependencies)} uv registry pins; {findings} findings.")
+            if redact:
+                # pip-audit's report supplies advisory IDs and fixes, but no severity.
+                print(f"[audit_dependencies] uv.lock: unknown={findings}; audited {len(dependencies)} registry pins.")
+            else:
+                print(f"[audit_dependencies] Audited {len(dependencies)} uv registry pins; {findings} findings.")
             return int(findings != 0)
+        if redact:
+            options.extend(["--format", "json"])
         with legacy_python_audit_input(repo_root) as (requirements, process_env):
             cmd = [sys.executable, "-m", "pip_audit", "-r", requirements, *options]
             print(f"[audit_dependencies] Running pip-audit with {len(ignored_ids)} suppressed vulnerability ID(s)...")
@@ -582,12 +607,27 @@ def audit_python(repo_root: Path, ignore_file: Path) -> int:
                     cmd, cwd=repo_root, capture_output=True, text=True, timeout=300, env=process_env
                 )
     except LuMachineryAuditWheelError as exc:
-        print(f"[audit_dependencies] Error: {exc}", file=sys.stderr)
+        detail = "Python audit input or scanner report could not be verified." if redact else str(exc)
+        print(f"[audit_dependencies] Error: {detail}", file=sys.stderr)
         return 1
-    if res.stdout:
-        print(res.stdout)
-    if res.stderr:
-        print(res.stderr, file=sys.stderr)
+    if redact:
+        try:
+            dependencies = json_depth.loads(res.stdout, max_depth=512)["dependencies"]
+            if not isinstance(dependencies, list):
+                raise TypeError("Invalid pip-audit report")
+            vulnerabilities = [row.get("vulns", []) for row in dependencies]
+            if any(not isinstance(rows, list) for rows in vulnerabilities):
+                raise TypeError("Invalid pip-audit vulnerabilities")
+            findings = sum(len(rows) for rows in vulnerabilities)
+        except (AttributeError, KeyError, TypeError, ValueError, RecursionError):
+            print(f"[audit_dependencies] requirements-lock.txt: report unavailable (exit {res.returncode}).")
+        else:
+            print(f"[audit_dependencies] requirements-lock.txt: unknown={findings} (exit {res.returncode}).")
+    else:
+        if res.stdout:
+            print(res.stdout)
+        if res.stderr:
+            print(res.stderr, file=sys.stderr)
 
     return res.returncode
 
@@ -814,8 +854,11 @@ def filter_npm_audit_vulnerabilities(vulns: dict, ignored_list: list[str]) -> tu
     return suppressed_pkgs, unsuppressed
 
 
-def audit_node(repo_root: Path, ignore_file: Path | None = None) -> int:
+def audit_node(repo_root: Path, ignore_file: Path | None = None, *, private: bool = False) -> int:
     """Run npm audit on production dependencies in repository root and site/."""
+    redact = _redact_details(private)
+    if redact:
+        print("[audit_dependencies] Reproduce locally: .venv/bin/python -m lu_machinery.ci.audit_dependencies --skip-python")
     targets = [
         ("root", repo_root),
         ("site", repo_root / "site"),
@@ -839,14 +882,17 @@ def audit_node(repo_root: Path, ignore_file: Path | None = None) -> int:
         res = subprocess.run(cmd, cwd=target_dir, capture_output=True, text=True, timeout=120)
 
         if res.returncode == 0:
-            print(f"[audit_dependencies] npm audit ({label}): found 0 high/critical vulnerabilities.")
+            if redact:
+                print(f"[audit_dependencies] npm audit ({label}): high=0 critical=0.")
+            else:
+                print(f"[audit_dependencies] npm audit ({label}): found 0 high/critical vulnerabilities.")
             continue
 
         try:
             audit_data = json_depth.loads(res.stdout, max_depth=512)
         except (ValueError, TypeError):
             print(f"[audit_dependencies] ERROR: Failed to parse npm audit JSON output in {label}:", file=sys.stderr)
-            if res.stderr:
+            if res.stderr and not redact:
                 print(res.stderr, file=sys.stderr)
             return 1
 
@@ -858,8 +904,10 @@ def audit_node(repo_root: Path, ignore_file: Path | None = None) -> int:
             return 1
 
         if "error" in audit_data:
-            err = audit_data["error"]
-            err_msg = err.get("summary") or err.get("detail") or err.get("code") or str(err)
+            err_msg = "details withheld"
+            if not redact:
+                err = audit_data["error"]
+                err_msg = err.get("summary") or err.get("detail") or err.get("code") or str(err)
             print(f"[audit_dependencies] ERROR: npm audit reported an error in {label}: {err_msg}", file=sys.stderr)
             return 1
 
@@ -890,7 +938,13 @@ def audit_node(repo_root: Path, ignore_file: Path | None = None) -> int:
             pkg: info for pkg, info in unsuppressed.items() if info.get("severity") in {"high", "critical"}
         }
 
-        if high_critical_unsuppressed:
+        if redact:
+            high = sum(info["severity"] == "high" for info in high_critical_unsuppressed.values())
+            critical = len(high_critical_unsuppressed) - high
+            print(f"[audit_dependencies] npm audit ({label}): high={high} critical={critical}.")
+            if high_critical_unsuppressed:
+                exit_code = 1
+        elif high_critical_unsuppressed:
             print(
                 f"[audit_dependencies] ERROR: Found {len(high_critical_unsuppressed)} unsuppressed High/Critical vulnerable package(s) in {label}:",
                 file=sys.stderr,
@@ -939,6 +993,10 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--skip-python", action="store_true", help="Skip Python pip-audit")
     parser.add_argument("--skip-node", action="store_true", help="Skip Node.js npm audit")
+    parser.add_argument(
+        "--private", action="store_true",
+        help="Allow detailed GitHub Actions output when the caller repository visibility is private",
+    )
     args = parser.parse_args(argv)
 
     repo_root = (args.repo_root or product_root()).resolve()
@@ -956,18 +1014,25 @@ def main(argv: list[str] | None = None) -> int:
 
     exit_code = 0
 
-    if not args.skip_python:
-        py_code = audit_python(repo_root, ignore_file)
-        if py_code != 0:
-            print(f"[audit_dependencies] ERROR: pip-audit failed with exit code {py_code}", file=sys.stderr)
-            exit_code = py_code
+    try:
+        if not args.skip_python:
+            py_code = audit_python(repo_root, ignore_file, private=args.private)
+            if py_code != 0:
+                print(f"[audit_dependencies] ERROR: pip-audit failed with exit code {py_code}", file=sys.stderr)
+                exit_code = py_code
 
-    if not args.skip_node:
-        node_code = audit_node(repo_root, npm_ignore_file)
-        if node_code != 0:
-            print(f"[audit_dependencies] ERROR: npm audit failed with exit code {node_code}", file=sys.stderr)
-            if exit_code == 0:
-                exit_code = node_code
+        if not args.skip_node:
+            node_code = audit_node(repo_root, npm_ignore_file, private=args.private)
+            if node_code != 0:
+                print(f"[audit_dependencies] ERROR: npm audit failed with exit code {node_code}", file=sys.stderr)
+                if exit_code == 0:
+                    exit_code = node_code
+    except Exception as exc:
+        if not _redact_details(args.private):
+            raise
+        # Tracebacks can include scanner command arguments or invalid input rows.
+        print(f"[audit_dependencies] ERROR: audit interrupted ({type(exc).__name__}); details withheld.", file=sys.stderr)
+        return 1
 
     if exit_code == 0:
         print("[audit_dependencies] All dependency security audits passed.")
