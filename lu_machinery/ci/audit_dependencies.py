@@ -41,7 +41,8 @@ def _redact_details(private: bool) -> bool:
     if private and (event_path := os.environ.get("GITHUB_EVENT_PATH")):
         try:
             event = json_depth.loads(Path(event_path).read_bytes(), max_depth=512)
-            return event["repository"]["visibility"] != "private"
+            visibility = event["repository"]["visibility"]
+            return not isinstance(visibility, str) or visibility != "private"
         except (OSError, ValueError, KeyError, TypeError, RecursionError):
             pass
     return True
