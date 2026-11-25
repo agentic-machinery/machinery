@@ -1915,3 +1915,77 @@ def publisher_workflows(configured_roots, tmp_path, monkeypatch):
         (product / ".github/workflows" / name).write_text(text)
 
 pytestmark = [pytest.mark.usefixtures('configured_roots')]
+
+
+def test_publish_recovery_and_github_client_reject_non_ascii_slugs_and_digits(tmp_path):
+    """Defect class: non-ASCII URLs, Unicode issue digits, or look-alike repo slugs bypass publisher/recovery/client guards."""
+    import json
+    import subprocess
+
+    from lu_machinery.common import github_client
+    from lu_machinery.opsec.prepublish import PublishBlocked
+    from lu_machinery.publish import github as pub_github
+    from lu_machinery.publish import recovery
+
+    with pytest.raises(PublishBlocked, match="repository identity invalid"):
+        recovery._repo_key("\u00a0learn-ukrainian/machinery")
+    with pytest.raises(PublishBlocked, match="repository identity invalid"):
+        recovery._repo_key("learn-u\u212arainian/machinery")
+
+    def fake_reader(argv, **_kw):
+        return subprocess.CompletedProcess(
+            argv,
+            0,
+            stdout=json.dumps({
+                "state": "open",
+                "number": 42,
+                "node_id": "I_kwDO123",
+                "repository_url": "\u00a0https://api.github.com/repos/learn-ukrainian/machinery",
+                "html_url": "https://github.com/learn-ukrainian/machinery/issues/\u0664\u0662",
+            }),
+            stderr="",
+        )
+
+    assert pub_github._issue_node(fake_reader, "learn-ukrainian/machinery", 42, tmp_path, {}) is None
+    assert pub_github._link_created_issue.__code__ is not None
+
+    # Branch delete refuses a look-alike repository full_name from the remote payload.
+    def lookalike_repo_reader(argv, **_kw):
+        return subprocess.CompletedProcess(
+            argv,
+            0,
+            stdout=json.dumps({"default_branch": "main", "full_name": "learn-u\u212arainian/machinery"}),
+            stderr="",
+        )
+
+    with pytest.raises(PublishBlocked, match="BRANCH_DELETE_REFUSED"):
+        pub_github._publish_branch_delete(
+            {"branch": "topic"},
+            gh_repo="learn-ukrainian/machinery",
+            runner=lookalike_repo_reader,
+            cwd=tmp_path,
+            environment={},
+            capture_output=True,
+            text=True,
+        )
+
+    # github_client._read_command does not rewrite a Unicode-digit pull URL as a numeric PR id.
+    from types import SimpleNamespace
+
+    seen_paths: list[str] = []
+
+    class DummyClient:
+        def request(self, method, path, **_kw):
+            seen_paths.append(path)
+            return SimpleNamespace(value=[], stale=False, error=None)
+
+    github_client._read_command(
+        DummyClient(),
+        "pr",
+        "view",
+        {"--repo": ["learn-ukrainian/machinery"], "--json": ["number"]},
+        ["https://github.com/learn-ukrainian/machinery/pull/\u0664\u0662"],
+        timeout=5,
+        fresh=True,
+    )
+    assert seen_paths and all("/pulls/\u0664\u0662" not in p and "%D9%A4" not in p.split("?", 1)[0] for p in seen_paths)

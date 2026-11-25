@@ -1031,7 +1031,7 @@ def public_repository(slug: str) -> bool:
     configured GitHub name (#12681); a registered row's inactive slug never is.
     """
     from lu_machinery.common.repo_root import configured_github_slug
-    from lu_machinery.orchestration.fleet_repos import FleetRepoError, load_fleet_repos
+    from lu_machinery.orchestration.fleet_repos import FleetRepoError, ascii_repo_slug, load_fleet_repos
 
     if not (isinstance(slug, str) and _GH_REPO.fullmatch(slug)):
         return False
@@ -1043,9 +1043,11 @@ def public_repository(slug: str) -> bool:
         configured = configured_github_slug()
     except (FleetRepoError, OSError, ValueError):
         return False
-    if not configured:
+    slug_folded = ascii_repo_slug(slug, strip=False)
+    configured_folded = ascii_repo_slug(configured, strip=False)
+    if slug_folded is None or configured_folded is None:
         return False
-    return slug.casefold() == configured.casefold() and any(
+    return slug_folded == configured_folded and any(
         repo.default and repo.authorized_visibility == "public" for repo in repos.values()
     )
 
@@ -1070,13 +1072,16 @@ def private_repository(slug: str) -> bool:
 def origin_repository(checkout: Path) -> str | None:
     """The ``OWNER/REPO`` of ``checkout``'s ``origin`` on github.com, read on the host, or None."""
     try:
-        url = subprocess.run(  # fixed argv: the host's Git, no user or system configuration
+        raw_url = subprocess.run(  # fixed argv: the host's Git, no user or system configuration
             ["git", "-C", str(checkout), "config", "--get", "remote.origin.url"], capture_output=True, text=True,
             timeout=30, check=False, stdin=subprocess.DEVNULL,
             env={"PATH": os.defpath, "HOME": "/", "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull},
-        ).stdout.strip()
+        ).stdout
     except (OSError, subprocess.SubprocessError):
         return None
+    if not raw_url.isascii():
+        return None
+    url = raw_url.strip()
     match = re.fullmatch(r"(?:https://github\.com/|git@github\.com:|ssh://git@github\.com/)"
                          r"([A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9._-]{1,100}?)(?:\.git)?/?", url)
     return match.group(1) if match else None
@@ -1129,7 +1134,9 @@ def _gh_parse(argv, environment=None) -> tuple[str | None, list[str]]:
     # gh runs on the host's network with the host's login, so nothing may choose another host: the
     # repository is the worktree's own remote or an OWNER/REPO on github.com given as ``--repo X``,
     # ``--repo=X``, ``-R X`` or GH_REPO. A URL operand or any other repository form names another host.
-    if environment.get("GH_HOST") and environment["GH_HOST"].casefold() != "github.com":
+    if environment.get("GH_HOST") and (
+        not environment["GH_HOST"].isascii() or environment["GH_HOST"].casefold() != "github.com"
+    ):
         return "GH_HOST names another host; only github.com is read", []
     if environment.get("GH_REPO"):  # gh ignores an empty GH_REPO
         if not _GH_REPO.fullmatch(environment["GH_REPO"]):

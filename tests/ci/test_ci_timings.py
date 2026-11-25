@@ -374,4 +374,23 @@ def test_cli_all_limit_fetches_each_event_separately(monkeypatch: pytest.MonkeyP
     )
 
 
+def test_secret_scan_scope_refuses_non_ascii_repository_and_unicode_digits(monkeypatch):
+    """Defect class: non-ASCII repository slugs or Unicode decimal repository IDs pass secret_scan_scope validation."""
+    from lu_machinery.ci import secret_scan_scope
+
+    called = False
+
+    def fail_if_called(_endpoint: str):
+        nonlocal called
+        called = True
+        return {"artifacts": []}
+
+    monkeypatch.setattr(secret_scan_scope, "_github_json", fail_if_called)
+    with pytest.raises(secret_scan_scope.SecretScanScopeError):
+        secret_scan_scope._last_scanned_head("learn-u\u212arainian/machinery", "12345", "refs/heads/main")
+    with pytest.raises(secret_scan_scope.SecretScanScopeError):
+        secret_scan_scope._last_scanned_head("learn-ukrainian/machinery", "\u0661\u0662\u0663", "refs/heads/main")
+    assert called is False
+
+
 pytestmark = [pytest.mark.usefixtures('github_command_boundary')]

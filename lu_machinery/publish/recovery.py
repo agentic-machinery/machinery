@@ -21,7 +21,7 @@ RECOVERY_ACTIONS = frozenset({"run-rerun", "re-enqueue"})
 
 def _repo_key(repo: object) -> str:
     """Canonical host/owner/name so ``owner/name`` and ``github.com/owner/name`` share one row."""
-    if not isinstance(repo, str) or not repo.strip():
+    if not isinstance(repo, str) or not repo.isascii() or not repo.strip():
         raise PublishBlocked("RECOVERY_RECORD_UNAVAILABLE: repository identity invalid")
     normalized = normalize_repository(repo)
     if normalized == "unknown":
@@ -31,7 +31,8 @@ def _repo_key(repo: object) -> str:
 
 def _repo_lookup_keys(repo: object) -> tuple[str, ...]:
     canonical = _repo_key(repo)
-    raw = str(repo).strip().lower()
+    assert isinstance(repo, str)
+    raw = repo.strip().lower()
     slug = canonical.split("/", 1)[1]
     return tuple(dict.fromkeys((canonical, slug, raw)))
 

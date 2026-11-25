@@ -237,3 +237,25 @@ def test_cli_help(capsys):
     assert exc.value.code == 0
     help_text = capsys.readouterr().out
     assert all(value in help_text for value in ["--pr", "--apply", "Outputs:", "Exit codes:", "Related:"])
+
+
+def test_postmerge_criteria_rejects_non_ascii_slugs_and_unicode_digits():
+    """Defect class: non-ASCII closing URLs, look-alike body slugs, or mixed-digit tokens (#4٢) alias real issues."""
+    pr_body = {
+        "closingIssuesReferences": [],
+        "body": "Fixes learn-u\u212arainian/machinery#42, Fixes #4\u0662, Fixes \u00a0#77, Fixes #99",
+    }
+    assert pc.closing_issues(pr_body, "learn-ukrainian/machinery") == [("learn-ukrainian/machinery", 99)]
+
+    with pytest.raises(ValueError, match="invalid closing issue URL"):
+        pc.closing_issues(
+            {"closingIssuesReferences": [{"url": "https://github.com/learn-u\u212arainian/machinery/issues/42"}], "body": ""},
+            "learn-ukrainian/machinery",
+        )
+    with pytest.raises(ValueError, match="invalid closing issue URL"):
+        pc.closing_issues(
+            {"closingIssuesReferences": [{"url": "https://github.com/learn-ukrainian/machinery/issues/\u0664\u0662"}], "body": ""},
+            "learn-ukrainian/machinery",
+        )
+    with pytest.raises(ValueError, match="invalid repository slug"):
+        pc._item_set_key("learn-u\u212arainian/machinery", 42, [])

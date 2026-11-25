@@ -1102,3 +1102,36 @@ def test_provider_diagnostics_and_breakdown_cannot_leak_credentials_or_paths(tmp
         assert "requested_selector" not in task and "substitution" not in task
         assert task["duration_s"] == 30.0
     state_helpers.cache_invalidate()
+
+
+def test_delegate_router_rejects_non_ascii_delivery_pr_repo_and_dor_digits(tmp_path, monkeypatch):
+    """Defect class: non-ASCII delivery_pr slugs, NBSP-padded repository filters/claims, or Unicode issue digits alias real records."""
+    assert delegate_router._task_observations({"delivery_pr": "learn-ukrainian/machinery#42"})["delivery_pr"] == "#42"
+    assert delegate_router._task_observations({"delivery_pr": "learn-u\u212arainian/machinery#42"})["delivery_pr"] is None
+    assert delegate_router._task_observations({"delivery_pr": "#\u0664\u0662"})["delivery_pr"] is None
+
+    assert delegate_router._authoritative_task_repository({"repository_id": "\u00a0learn-ukrainian/machinery"}) is None
+    assert delegate_router._authoritative_task_repository({"repository": "learn-u\u212arainian/machinery"}) is None
+    assert delegate_router._authoritative_task_repository({
+        "repository_id": "learn-ukrainian/machinery",
+        "repository": "\u00a0learn-ukrainian/machinery",
+    }) is None
+
+    # A non-ASCII repository filter must never trim or fail-open to unscoped None.
+    tasks_dir = tmp_path / "tasks"
+    _pin_tasks_dir(monkeypatch, tasks_dir)
+    _write_task(tasks_dir / "t1.json", _task_payload("t1", repository_id="learn-ukrainian/machinery"))
+    assert delegate_router.list_delegate_tasks(repository="learn-ukrainian/machinery")["total"] == 1
+    assert delegate_router.list_delegate_tasks(repository="\u00a0learn-ukrainian/machinery")["total"] == 0
+    assert delegate_router.list_delegate_tasks(repository="\u00a0")["total"] == 0
+
+    links = delegate_router._linked_issues_from_dor({
+        "dor_preflight": {
+            "issues": ["\u0664\u0662", True, 7],
+            "issue_repositories": [
+                {"issue": "\u0664\u0662", "repo": "learn-ukrainian/machinery"},
+                {"issue": 9, "repo": "learn-u\u212arainian/machinery"},
+            ],
+        }
+    })
+    assert links == [{"issue": 7, "repository": delegate_router.public_repository_id()}]

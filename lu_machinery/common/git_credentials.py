@@ -353,6 +353,8 @@ def repository_registry(path: Path) -> dict[str, dict[str, Any]]:
 
         github = entry.get("github", "")
         if github:
+            if not isinstance(github, str) or not github.isascii():
+                raise ValueError("invalid fleet repository registry")
             folded = github.casefold()
             if folded in seen_slugs:
                 raise ValueError("invalid fleet repository registry")
@@ -583,7 +585,7 @@ def verification_credentials(remote: str) -> list[str]:
     unknown, or worker-writable selectors) and grant credentials only to the
     active slug. Redirects stay refused.
     """
-    if not remote.startswith("https://github.com/"):
+    if not isinstance(remote, str) or not remote.isascii() or not remote.startswith("https://github.com/"):
         return []
     cfg_path = default_config_path()
     repositories = repository_registry(cfg_path)

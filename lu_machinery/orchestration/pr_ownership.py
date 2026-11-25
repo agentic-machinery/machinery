@@ -59,6 +59,7 @@ from lu_machinery.common import github_client, json_depth
 from lu_machinery.common.github_client import GitHubRateLimited
 from lu_machinery.common.task_store_paths import tasks_dir
 from lu_machinery.fleet.pr_identity import supervisor_liveness as liveness
+from lu_machinery.orchestration.fleet_repos import ascii_repo_slug, parse_ascii_positive_int
 
 # This package's import name, from the unresolved file location: never from __package__, which a
 # short import spelling (orchestration.x with scripts/ on sys.path) shortens. Its dotted parts
@@ -151,7 +152,12 @@ def state_path() -> Path:
 
 
 def pr_key(repo: str, number: int) -> str:
-    return f"{repo.casefold()}#{number}"
+    folded = ascii_repo_slug(repo, strip=False)
+    if folded is None:
+        raise OwnershipError("repository must be owner/name")
+    if type(number) is not int or number <= 0:
+        raise OwnershipError("PR number must be a positive integer")
+    return f"{folded}#{number}"
 
 
 def _empty() -> dict[str, Any]:
@@ -212,11 +218,7 @@ def decision_custody(handoff: Mapping[str, Any] | None) -> bool:
 
 
 def _valid_repo_slug(value: object) -> TypeGuard[str]:
-    return (
-        isinstance(value, str)
-        and bool(re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", value))
-        and not value.endswith(".git")
-    )
+    return ascii_repo_slug(value, strip=False) is not None
 
 
 def _validate_verdict_receipt(receipt: object, *, pr: int, head: str, repo: str | None = None) -> dict[str, Any]:
@@ -224,8 +226,9 @@ def _validate_verdict_receipt(receipt: object, *, pr: int, head: str, repo: str 
     if not isinstance(receipt, Mapping):
         raise OwnershipError("verdict_receipt must be a JSON object")
     if repo is not None and "repository" in receipt:
-        rec_repo = receipt.get("repository")
-        if not isinstance(rec_repo, str) or rec_repo.casefold() != repo.casefold():
+        rec_slug = ascii_repo_slug(receipt.get("repository"), strip=False)
+        target_slug = ascii_repo_slug(repo, strip=False)
+        if rec_slug is None or target_slug is None or rec_slug != target_slug:
             raise OwnershipError("verdict_receipt repository does not match target repository")
     if type(receipt.get("pr")) is not int or receipt["pr"] != pr:
         raise OwnershipError("verdict_receipt pr does not match target PR")
@@ -260,6 +263,8 @@ def _keeper_custody_digest(
     review_classification: str,
     verdict_receipt: Mapping[str, Any] | None,
 ) -> str:
+    if not _valid_repo_slug(repository):
+        raise OwnershipError("repository must be owner/name")
     binding = {
         "repository": repository.casefold(),
         "pr": pr,
@@ -359,7 +364,7 @@ def load(path: Path) -> dict[str, Any]:
             if type(episode.get("reminders", 0)) is not int:
                 raise TypeError(key)
         for key, handoff in data["handoffs"].items():
-            int(key.rpartition("#")[2])
+            _parse_pr_ref(key, "ownership handoff")
             _at(handoff["accepted_at"])
             if not all(isinstance(handoff[name], str) and handoff[name] for name in ("successor", "head")):
                 raise TypeError(key)
@@ -432,8 +437,8 @@ def _handoff_map(data: Mapping[str, Any]) -> dict[tuple[str, int], str]:
     for key, handoff in data["handoffs"].items():
         if decision_custody(handoff) or keeper_custody(handoff):
             continue
-        repo, _, number = key.rpartition("#")
-        result[(repo, int(number))] = handoff["successor"]
+        repo, number = _parse_pr_ref(key, "ownership handoff")
+        result[(repo.casefold(), number)] = handoff["successor"]
     return result
 
 
@@ -449,6 +454,8 @@ def keeper_custody_for(path: Path | None, repo: str, number: int) -> dict[str, A
 
 def keeper_custodies_for_repo(path: Path | None, repo: str) -> dict[int, dict[str, Any]]:
     """Return ``{pr_number: handoff}`` for every PR in ``repo`` currently under keeper custody."""
+    if not _valid_repo_slug(repo):
+        raise OwnershipError("repository must be owner/name")
     target = path or state_path()
     if not target.exists():
         return {}
@@ -456,7 +463,7 @@ def keeper_custodies_for_repo(path: Path | None, repo: str) -> dict[int, dict[st
     prefix = f"{repo.casefold()}#"
     found: dict[int, dict[str, Any]] = {}
     for key, handoff in data["handoffs"].items():
-        if key.startswith(prefix) and keeper_custody(handoff):
+        if key.isascii() and key.startswith(prefix) and keeper_custody(handoff):
             found[int(handoff["pr"])] = copy.deepcopy(handoff)
     return found
 
@@ -745,13 +752,20 @@ def _with_head_commits(
     from lu_machinery.fleet import pr_owner_check as check
 
     pending = {
-        (row.repo.casefold(), row.number)
+        (row_slug, row.number)
         for row in check.evaluate(open_prs, records, repos, lambda record: live(record) is not False)
+        if (row_slug := ascii_repo_slug(row.repo, strip=False)) is not None
     }
     result: dict[str, list[dict[str, Any]]] = {}
     for slug, prs in open_prs.items():
+        folded_slug = ascii_repo_slug(slug, strip=False)
         result[slug] = [
-            _with_head_commit(slug, pr) if (slug.casefold(), int(pr["number"])) in pending else pr for pr in prs
+            _with_head_commit(slug, pr)
+            if folded_slug is not None
+            and (pr_num := parse_ascii_positive_int(pr.get("number"))) is not None
+            and (folded_slug, pr_num) in pending
+            else pr
+            for pr in prs
         ]
     return result
 
@@ -798,8 +812,12 @@ def findings(
     unobservable: set[tuple[str, int]] = set()
     seated = list(records)
     for slug, prs in open_prs.items():
+        folded_slug = ascii_repo_slug(slug, strip=False)
         for pr in prs:
-            key = (slug.casefold(), int(pr["number"]))
+            pr_num = parse_ascii_positive_int(pr.get("number"))
+            if folded_slug is None or pr_num is None:
+                continue
+            key = (folded_slug, pr_num)
             record = by_id.get(handoffs.get(key))
             if record is not None:
                 successors[key] = record
@@ -825,7 +843,7 @@ def findings(
                 except RecordRepositoryRefusal as exc:
                     unbound_trailers[key] = exc.code
                     continue
-                if named_repo.casefold() != slug.casefold():
+                if ascii_repo_slug(named_repo, strip=False) != folded_slug:
                     continue
                 seated.append({**named, "worktree_branch": branch})
                 if state is None:
@@ -834,7 +852,7 @@ def findings(
     lenient = {(f.repo, f.number): f for f in check.evaluate(open_prs, seated, repos, lambda r: live(r) is not False)}
     result = []
     for row in strict:
-        key = (row.repo.casefold(), row.number)
+        key = (ascii_repo_slug(row.repo, strip=False) or row.repo, row.number)
         successor = live(successors[key]) if key in successors else False
         if successor is True:
             continue  # the owner check never seats a task on a fork PR's branch
@@ -879,7 +897,12 @@ def _observe(handoffs: Mapping[tuple[str, int], str]) -> tuple[set[str], dict[st
     open_prs = check.fetch_fleet_open_prs(repos)
     open_prs = _with_head_commits(open_prs, records, repos)
     rows = _annotate_findings(findings(open_prs, records, repos, handoffs), open_prs)
-    keys = {pr_key(slug, int(pr["number"])) for slug, prs in open_prs.items() for pr in prs}
+    keys = {
+        pr_key(slug, pr_num)
+        for slug, prs in open_prs.items()
+        for pr in prs
+        if (pr_num := parse_ascii_positive_int(pr.get("number"))) is not None
+    }
     return keys, {pr_key(f.repo, f.number): f for f in rows}
 
 
@@ -1009,10 +1032,11 @@ def _gh_pr(
 
 
 def _parse_pr_ref(value: object, source: str) -> tuple[str, int]:
-    repo, _, number = value.partition("#") if isinstance(value, str) else ("", "", "")
-    if not _valid_repo_slug(repo) or not re.fullmatch(r"[1-9][0-9]*", number):
+    repo, sep, raw_number = value.partition("#") if isinstance(value, str) else ("", "", "")
+    number = parse_ascii_positive_int(raw_number) if sep == "#" else None
+    if not _valid_repo_slug(repo) or number is None:
         raise OwnershipError(f"{source} has an invalid PR reference")
-    return repo, int(number)
+    return repo, number
 
 
 def _custody_bindings(data: Mapping[str, Any]) -> Iterator[tuple[str, int, str, str | None, str]]:
@@ -1100,6 +1124,8 @@ def _run_children(
 def _branch_pr_numbers(repo: str, branch: str) -> Iterator[int]:
     from lu_machinery.dispatcher.git import _branch_pulls, _same_repo_pr
 
+    if not _valid_repo_slug(repo):
+        raise OwnershipError("repository must be owner/name")
     seen = set()
     for pr in _branch_pulls(repo, branch):
         number, head, base = pr.get("number"), pr.get("head"), pr.get("base")
@@ -1243,6 +1269,8 @@ def accept(
     reaches the remote. Coordinator custody does not call ``accept``.
     """
     live = live or liveness
+    if not _valid_repo_slug(repo):
+        raise OwnershipError("repository must be owner/name")
     if pr.get("state") != "OPEN":
         raise OwnershipError(f"PR is {pr.get('state')}, not open")
     by_id = {record.get("task_id"): record for record in records}

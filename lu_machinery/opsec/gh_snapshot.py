@@ -36,6 +36,8 @@ def _has_dot_only_segment(value: str) -> bool:
 
 
 def _validate_read_repo(repo_str: str) -> None:
+    if not isinstance(repo_str, str) or not repo_str.isascii():
+        raise PublishBlocked("OPSEC: non-ASCII repository selector refused for reads.")
     if _has_dot_only_segment(repo_str):
         raise PublishBlocked("OPSEC: dot-only segments refused in repository selector.")
     val = repo_str.strip().removesuffix(".git")
@@ -52,7 +54,7 @@ def _validate_read_repo(repo_str: str) -> None:
 
 def _validate_read_environment(environment: dict[str, str]) -> None:
     gh_host = environment.get("GH_HOST")
-    if gh_host and gh_host.strip().lower() != "github.com":
+    if gh_host and (not gh_host.isascii() or gh_host.strip().lower() != "github.com"):
         raise PublishBlocked("OPSEC: non-github.com GH_HOST refused for reads.")
     gh_repo = environment.get("GH_REPO")
     if gh_repo:
@@ -297,7 +299,11 @@ def repository(cwd, environment, explicit=None, reader=subprocess.run):
             check=False,
             timeout=5,
         )
-        return normalize_repository(result.stdout.strip()) if result.returncode == 0 else "unknown"
+        return (
+            normalize_repository(result.stdout.strip())
+            if result.returncode == 0 and result.stdout.isascii()
+            else "unknown"
+        )
     except Exception:
         return "unknown"
 
@@ -321,7 +327,7 @@ def admit(argv, *, cwd, environment, reader=subprocess.run):
                 return FrozenCommand(list(argv), "unknown", False)
             raise PublishBlocked("OPSEC: unresolved API request; use a typed publisher for writes.")
         host = call.host or environment.get("GH_HOST", "github.com")
-        if host.lower() != "github.com":
+        if not isinstance(host, str) or not host.isascii() or host.lower() != "github.com":
             raise PublishBlocked("OPSEC: non-github.com API host refused.")
         host_class, path = github_client._canonical_endpoint(call.endpoint, host)
         if host_class == "rejected":
@@ -478,7 +484,7 @@ def admit(argv, *, cwd, environment, reader=subprocess.run):
     dest = repository(cwd, environment, selectors[-1] if selectors else None, reader)
     if key[0] in {"issue", "pr"} and positional:
         reference = positional[0]
-        if re.fullmatch(r"https://[\w.-]+/[\w.-]+/[\w.-]+/(issues|pull)/[1-9][0-9]*", reference):
+        if re.fullmatch(r"https://[\w.-]+/[\w.-]+/[\w.-]+/(issues|pull)/[1-9][0-9]*", reference, re.ASCII):
             dest = normalize_repository("/".join(reference.removeprefix("https://").split("/")[:3]))
         elif re.fullmatch(r"[1-9][0-9]*", reference) or (
             key[0] == "pr" and re.fullmatch(r"[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*", reference)

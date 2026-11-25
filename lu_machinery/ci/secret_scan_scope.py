@@ -30,6 +30,7 @@ from pathlib import Path
 
 from lu_machinery.ci.check_large_files import prefetch_missing_blobs
 from lu_machinery.common import github_client, json_depth
+from lu_machinery.orchestration.fleet_repos import parse_ascii_positive_int
 
 _SHA_RE = re.compile(r"[0-9a-fA-F]{40}\Z")
 _ZERO_SHA = "0" * 40
@@ -246,7 +247,10 @@ def _last_scanned_head(repository: str, repository_id: str, default_branch_ref: 
     Only successful scans publish this artifact. Untrusted PR/fork artifacts
     are ignored. A bounded metadata search that finds no record fails closed.
     """
-    if not re.fullmatch(r"[\w.-]+/[\w.-]+", repository) or not repository_id.isdecimal():
+    if (
+        not re.fullmatch(r"[\w.-]+/[\w.-]+", repository, re.ASCII)
+        or parse_ascii_positive_int(repository_id) is None
+    ):
         raise SecretScanScopeError(_COVERAGE_RECOVERY)
     if not default_branch_ref.startswith("refs/heads/"):
         raise SecretScanScopeError(_COVERAGE_RECOVERY)

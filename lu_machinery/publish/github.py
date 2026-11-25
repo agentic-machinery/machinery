@@ -1008,9 +1008,11 @@ def _issue_node(read_runner, gh_repo, number, cwd, environment, *, allowed_slugs
     if not isinstance(node_id, str) or not node_id.strip():
         return None
     observed_slugs = []
+    from lu_machinery.orchestration.fleet_repos import parse_ascii_positive_int
+
     repo_url = document.get("repository_url")
     if repo_url is not None:
-        if not isinstance(repo_url, str):
+        if not isinstance(repo_url, str) or not repo_url.isascii():
             return None
         parsed = urlsplit(repo_url.strip())
         if parsed.scheme != "https" or parsed.netloc.lower() != "api.github.com" or not parsed.path.startswith("/repos/"):
@@ -1021,13 +1023,13 @@ def _issue_node(read_runner, gh_repo, number, cwd, environment, *, allowed_slugs
         observed_slugs.append(repo_slug)
     html_url = document.get("html_url")
     if html_url is not None:
-        if not isinstance(html_url, str):
+        if not isinstance(html_url, str) or not html_url.isascii():
             return None
         parsed_html = urlsplit(html_url.strip())
         if parsed_html.scheme != "https" or parsed_html.netloc.lower() != "github.com":
             return None
         parts = [p for p in parsed_html.path.split("/") if p]
-        if len(parts) != 4 or parts[2] != "issues" or not parts[3].isdigit() or int(parts[3]) != number:
+        if len(parts) != 4 or parts[2] != "issues" or parse_ascii_positive_int(parts[3]) != number:
             return None
         html_slug = _github_slug_or_none(f"{parts[0]}/{parts[1]}")
         if html_slug is None:
@@ -1253,7 +1255,7 @@ def _parent_epic_node(read_runner, active, repos, parent, cwd, environment):
 
 def _link_created_issue(created, parent_ref, parent_node, gh_repo, read_runner, runner, cwd, environment):
     """Link the issue ``created`` printed to the stream epic through the ``issue-link`` verb."""
-    match = re.search(r"/issues/(\d+)\s*$", created)
+    match = re.search(r"/issues/([1-9][0-9]*)[ \t\r\n]*$", created)
     number = int(match.group(1)) if match else None
     limited = link = None
     try:
@@ -1290,9 +1292,9 @@ _FENCED_CODE_RE = re.compile(r"(?ms)^[ \t]{0,3}(`{3,}|~{3,})[^\n]*\n.*?(?:^[ \t]
 _INLINE_CODE_RE = re.compile(r"(`+)([^`]*?)\1")
 _HTML_COMMENT_RE = re.compile(r"(?s)<!--.*?-->")
 _CLOSING_ISSUE_RE = re.compile(
-    r"(?i)(?<![A-Za-z0-9_])(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s*:?\s+"
+    r"(?<![A-Za-z0-9_])(?ai:close[sd]?|fix(?:e[sd])?|resolve[sd]?)[ \t\r\n]*:?[ \t\r\n]+"
     r"(?:(?P<url>https://github\.com/(?P<url_repo>[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/issues/(?P<url_num>[1-9][0-9]*))"
-    r"|(?:(?P<slug>[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)?#(?P<num>[1-9][0-9]*)))(?!\d)"
+    r"|(?:(?P<slug>[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)?#(?P<num>[1-9][0-9]*)))(?!\w)"
 )
 _MAX_PR_CLOSING_ISSUES = 20
 
@@ -1515,7 +1517,7 @@ def _resolve_linked_issue_milestone(
 
 def _apply_pr_milestone(created, milestone_number, milestone_title, dest, gh_repo, runner, cwd, environment, temp):
     """Apply the pre-validated milestone to the newly created PR via Issues PATCH."""
-    match = re.search(r"/pull/(\d+)\s*$", created)
+    match = re.search(r"/pull/([1-9][0-9]*)[ \t\r\n]*$", created)
     number = int(match.group(1)) if match else None
     limited = applied = None
     try:
@@ -3885,10 +3887,14 @@ def _publish_branch_delete(fields, *, gh_repo, runner, cwd, environment, capture
     def refuse(reason):
         raise gate.PublishBlocked(f"BRANCH_DELETE_REFUSED: {reason}; nothing was sent.")
 
+    from lu_machinery.orchestration.fleet_repos import ascii_repo_slug
+
+    expected_slug = ascii_repo_slug(gh_repo, strip=False)
     try:
         repo = _dismiss_get(runner, root, cwd, environment, raw_http=raw_http)
         default = repo["default_branch"]
-        if not isinstance(default, str) or not default or str(repo["full_name"]).lower() != gh_repo.lower():
+        repo_slug = ascii_repo_slug(repo["full_name"], strip=False)
+        if not isinstance(default, str) or not default or expected_slug is None or repo_slug != expected_slug:
             raise ValueError("repository identity")
     except github_client.GitHubRateLimited:
         raise
@@ -3907,8 +3913,9 @@ def _publish_branch_delete(fields, *, gh_repo, runner, cwd, environment, capture
         for pull in pulls:
             head, base = pull["head"], pull["base"]
             head_repo = head.get("repo")
+            head_slug = ascii_repo_slug(head_repo.get("full_name"), strip=False) if isinstance(head_repo, dict) else None
             if (head["ref"] == branch and (
-                not isinstance(head_repo, dict) or str(head_repo.get("full_name")).lower() == gh_repo.lower()
+                head_slug is None or head_slug == expected_slug
             )) or base["ref"] == branch:
                 users.append(pull["number"])
     except github_client.GitHubRateLimited:
