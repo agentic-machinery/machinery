@@ -213,15 +213,6 @@ def text_reading_tests(targets: set[str], entries: dict[str, str]) -> list[str]:
     return sorted(text_references(sources, targets) & regular)
 
 
-def selecting(sources: dict[str, bytes]) -> set[str]:
-    """The files whose own edges can select a test: test files and every ``conftest.py``.
-
-    `importing_tests` keeps an edge only when its importer is a test file or a conftest,
-    so the scan parses only these; the other sources stay import targets.
-    """
-    return {path for path in sources if TEST.fullmatch(path) or PurePosixPath(path).name == "conftest.py"}
-
-
 # Import-time contracts of this package, checked on every PR candidate (`import_time_contracts`):
 # a label, the modules its contract tests' subprocesses import (with the modules their code paths
 # import lazily, as traced from those tests), the third-party names their imports may reach, the
@@ -476,7 +467,7 @@ def import_time_contracts(candidate: str, base: str | None = None) -> tuple[list
 
 @lru_cache(maxsize=2)
 def candidate_scan(sources: tuple[tuple[str, bytes], ...], known_paths: tuple[str, ...]) -> dict:
-    """The import scan of the files that can select a test (`selecting`), shared, never mutated.
+    """The candidate's file-dependency scan, shared and never mutated.
 
     Cached by every source byte and indexed path, never by time, so `importing_tests`
     and `text_reading_tests` on one candidate tree parse each file once: the same
@@ -495,7 +486,7 @@ def candidate_scan(sources: tuple[tuple[str, bytes], ...], known_paths: tuple[st
     collecting = gc.isenabled()
     gc.disable()
     try:
-        return components.scan_imports(files, set(known_paths), importers=selecting(files), on_strings=remember)
+        return components.scan_imports(files, set(known_paths), on_strings=remember)
     finally:
         if collecting:
             gc.enable()
@@ -503,20 +494,20 @@ def candidate_scan(sources: tuple[tuple[str, bytes], ...], known_paths: tuple[st
 
 def importing_tests(
     targets: set[str], deleted: set[str], base: str, entries: dict[str, str],
-) -> tuple[list[str], list[str]]:
-    """Tests that import, load, read or run a changed file, by static scan, in two tiers.
+) -> tuple[list[str], list[str], list[str]]:
+    """Tests reached directly, through a direct conftest, or over two file edges.
 
     The first tier is the tests that do so themselves. The second is the tests that
     only share a ``conftest.py`` that does: pytest loads a conftest for every test
     file under its directory, so the code it imports or copies into a fixture is code
-    those tests run. The second tier lists no test twice.
+    those tests run. The third tier follows a second file edge without expanding
+    pytest's implicit conftest scopes. Each test belongs to at most one tier.
 
     A test that loads a computed path also depends on every file under the
     directories its constants name (`components.directory_edges`).
 
-    Direct edges only: the transitive closure spans most of the suite, which the
-    merge group already runs. A deleted file has no edges in the candidate, so its
-    surviving dependents come from a scan of the base tree.
+    The merge group covers longer paths. A deleted file has no edges in the
+    candidate, so its immediate dependents come from a scan of the base tree.
     """
     from lu_machinery.ci import components
     from lu_machinery.common.repo_root import product_root
@@ -528,11 +519,12 @@ def importing_tests(
         tree = tree_entries(base)
         blobs = tuple((name, meta[2]) for name, meta in tree.items() if name.endswith(".py") and meta[1] == "blob")
         sources = components.indexed_python_sources(str(product_root()), blobs, ())
-        scan = components.scan_imports(sources, set(tree), importers=selecting(sources))
+        scan = components.scan_imports(sources, set(tree))
         edges = [*edges, *(edge for edge in scan["file_edges"] if edge[1] in deleted)]
         directories = [*directories, *scan["directory_edges"]]
     regular = {name for name, mode in entries.items() if TEST.fullmatch(name) and mode in {"100644", "100755"}}
-    reached = {importer for importer, target in edges if target in targets} | {
+    file_dependents = {importer for importer, target in edges if target in targets}
+    reached = file_dependents | {
         importer for importer, directory in directories
         if any(target.startswith(directory + "/") for target in targets)
     }
@@ -541,7 +533,8 @@ def importing_tests(
               if PurePosixPath(importer).name == "conftest.py"}
     shared = {name for name in regular
               if any(scope == "." or name.startswith(scope + "/") for scope in scopes)}
-    return sorted(direct), sorted(shared - direct)
+    indirect = {importer for importer, target in edges if target in file_dependents}
+    return sorted(direct), sorted(shared - direct), sorted((indirect & regular) - direct - shared)
 
 
 def plan(base: str, candidate: str, *, importers: bool = True) -> dict:
@@ -701,10 +694,10 @@ def _plan(base: str, candidate: str, *, importers: bool) -> dict:
     # A deferred changed test does not consume the importers' room. Only an
     # infrastructure change or guards that already exhaust the budget stop the scan.
     scan_dependencies = importers and sources and not infrastructure and guard_estimate <= SAFE_SECONDS
-    direct, shared = (
+    direct, shared, indirect = (
         tuple([p for p in tier if p not in run] for tier in importing_tests(sources, deleted, base, selectable))
         if scan_dependencies
-        else ([], [])
+        else ([], [], [])
     )
     imported = direct + shared
     readers = (
@@ -712,8 +705,10 @@ def _plan(base: str, candidate: str, *, importers: bool) -> dict:
         if scan_dependencies
         else []
     )
-    unknown += [p for p in imported + readers if p not in durations]
-    for p in imported + readers:
+    indirect = [p for p in indirect if p not in readers]
+    dependencies = imported + readers + indirect
+    unknown += [p for p in dependencies if p not in durations]
+    for p in dependencies:
         value = durations.get(p, default)
         if type(value) not in {int, float} or not math.isfinite(value) or value < 0:
             raise ValueError("invalid recorded duration")
@@ -727,14 +722,16 @@ def _plan(base: str, candidate: str, *, importers: bool) -> dict:
                 run.add(p)
                 budget += durations.get(p, default)
     used = budget
+    dependency_limit = fill_limit + EXTRA_DEPENDENCY_SECONDS
     # The main pass gives direct importers first choice. In the extra room,
     # choose the cheapest remaining direct evidence, whether an import or a literal.
-    for p in sorted((p for p in direct + readers if p not in run), key=lambda p: (durations.get(p, default), p)):
-        if budget + durations.get(p, default) <= fill_limit + EXTRA_DEPENDENCY_SECONDS:
-            run.add(p)
-            budget += durations.get(p, default)
+    for tier in (direct + readers, indirect):
+        for p in sorted((p for p in tier if p not in run), key=lambda p: (durations.get(p, default), p)):
+            if budget + durations.get(p, default) <= dependency_limit:
+                run.add(p)
+                budget += durations.get(p, default)
     timeout = min(CAP_SECONDS, max(TIMEOUT_SECONDS, math.ceil(budget * VARIANCE_RATIO))) if budget > used else TIMEOUT_SECONDS
-    if not reason and (set(imported) | set(readers)) - run:
+    if not reason and set(dependencies) - run:
         reason = BUDGET_REASON if fill_limit == SAFE_SECONDS else "recorded estimate exceeds 600 second cap"
     # A whole file already covers its pinned ids.
     run = sorted(p for p in run if "::" not in p or guard_file(p) not in run)
@@ -746,8 +743,9 @@ def _plan(base: str, candidate: str, *, importers: bool) -> dict:
         "contract_test_files": contracts,
         "importing_test_files": imported,
         "text_reading_test_files": readers,
+        "indirect_importing_test_files": indirect,
         "run_files": run,
-        "deferred_files": sorted((set(tests) | set(imported) | set(readers)) - set(run)),
+        "deferred_files": sorted((set(tests) | set(dependencies)) - set(run)),
         "reason": reason,
         "estimate_seconds": budget,
         "safe_budget_seconds": SAFE_SECONDS,
