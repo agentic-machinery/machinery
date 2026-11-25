@@ -291,9 +291,10 @@ last-reviewed-head-to-candidate diff, and traces its effects on the frozen
 acceptance criteria and existing contracts, including changed fallbacks,
 fail-open paths, downstream callers and weakened or deleted tests. A new blocker
 names the causal change or unresolved finding ID, the reachable trigger and the
-material impact. Demonstrated P0–P2 regressions caused by the PR and unresolved
-security findings block in every round; other findings are tracked follow-ups
-with owners. Once those checks are answered, the review is complete.
+material impact. Demonstrated material regressions and unresolved security findings
+block in every round. A demonstrated P0–P2 regression caused by the PR or a concrete
+unresolved security finding still blocks when discovered late. Once those checks are
+answered, the review is complete.
 A reviewer that lacks a capability the brief requires (shell, diff access,
 hashing, the `sources` tools) returns INCONCLUSIVE: the verdict line uses the
 `BLOCKED` token and names the missing capability. INCONCLUSIVE still blocks
