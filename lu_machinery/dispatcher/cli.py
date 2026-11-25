@@ -2,6 +2,7 @@
 
 import argparse
 import contextlib
+import copy
 import json
 import math
 import os
@@ -37,6 +38,7 @@ from lu_machinery.dispatcher import (
 from lu_machinery.dispatcher.environment import child_env, probe_env
 from lu_machinery.dispatcher.types import ReviewAccess, StartRefusal, TaskSpec
 from lu_machinery.dispatcher.watchdog import DEFAULT_INITIAL_RESPONSE_TIMEOUT_S, DEFAULT_SILENCE_TIMEOUT_S, deadlines
+from lu_machinery.orchestration.task_record_store import NonFiniteRecordValue
 
 # Grok runs through Cursor's TUI: --agent cursor --model grok-4.7-high (grok-build is the separate Grok TUI).
 ALIASES = dict(sol="codex", gemini="agy", deepseek="opencode")
@@ -1160,7 +1162,7 @@ def main(argv=None) -> int:
         if args.command == "worktrees":
             result = _worktrees(args.repo, args.all)
         elif args.command == "list":
-            result = [worker._observe(record) for record in store.list_tasks(include_archive=args.all)]
+            result = [_observe_listed(record) for record in store.list_tasks(include_archive=args.all)]
             if args.status is not None:
                 result = [record for record in result if record.get("status") == args.status]
         elif args.command == "wait":
@@ -1190,6 +1192,19 @@ def main(argv=None) -> int:
             message = type(exc).__name__
         print(f"dispatcher: {message}", file=sys.stderr)
         return 2
+
+
+def _observe_listed(record: dict) -> dict:
+    """``worker._observe`` for one record of ``dispatch list``: a heal the writer refuses (#1440) leaves that
+    record as stored and names the typed reason, and the other records are still listed.
+
+    ``_observe`` updates the dict it heals before writing it, so it gets a copy: a refused heal lists the
+    record as read, never the unwritten ``crashed`` state."""
+    try:
+        return worker._observe(copy.deepcopy(record))
+    except NonFiniteRecordValue as exc:
+        print(f"dispatcher: task record {record.get('task_id')} not healed: {exc.code}", file=sys.stderr)
+        return record
 
 
 if __name__ == "__main__":

@@ -20,7 +20,7 @@ from types import SimpleNamespace
 import pytest
 
 from lu_machinery.dispatcher import git, host_admission, ownership, store, worker
-from lu_machinery.orchestration import dispatch_admission
+from lu_machinery.orchestration import dead_worker_state, dispatch_admission
 from lu_machinery.orchestration.issue_stream_audit import load_registry as _load_stream_registry
 from lu_machinery.session_supervisor import remote
 from tests.dispatcher.conftest import await_file, run_git
@@ -215,11 +215,15 @@ def test_admission_scan_leaves_a_dead_record_the_writer_refuses_and_reports_only
     """Defect classes: a dead task record already holding NaN makes every admission scan raise (#1440); the admission
     receipt reports a dead record as marked crashed when its heal was refused or declined and nothing was written."""
     monkeypatch.setattr(dispatch_admission, "host_failures", lambda *_a: [])
-    child = subprocess.Popen(["true"])
-    child.wait(timeout=30)
+    # A test-owned PID view: the initial namespace, where every worker pid in this store is dead, for the scan
+    # and for the locked recheck alike, whatever namespace the test runner is in.
+    initial = dead_worker_state.INITIAL_PID_NAMESPACE
+    monkeypatch.setattr(dead_worker_state, "_pid_namespace", lambda process="self": initial)
+    monkeypatch.setattr(dead_worker_state, "_proc_pid_namespace", lambda: initial)
+    monkeypatch.setattr(dispatch_admission, "process_alive", lambda _pid: False)
 
     def dead_worker(task_id, **fields):
-        record = _orchestrator_record(task_id, pid=child.pid, **fields)
+        record = _orchestrator_record(task_id, pid=4_194_305, **fields)  # above the kernel's pid_max
         del record["orchestrator"]
         return record
 
