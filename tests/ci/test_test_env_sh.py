@@ -173,7 +173,9 @@ def _prepare(
 ) -> subprocess.CompletedProcess[str]:
     setup = machinery_path("ci/setup_bubblewrap.sh").read_text()
     # Evaluate the two archive functions only. The setup script never runs.
-    functions = setup[setup.index("download_bubblewrap() {"):setup.index("# dpkg has no lock timeout.")]
+    start = setup.index("download_bubblewrap() {")
+    end = setup.index("\n}\n", setup.index("prepare_bubblewrap_package() {")) + len("\n}\n")
+    functions = setup[start:end]
     return subprocess.run(
         [
             "bash", "-c",
@@ -245,14 +247,16 @@ def test_bubblewrap_cache_hit_rejects_missing_corrupt_or_linked_archive(tmp_path
     assert archive.is_symlink()
 
 
-def test_bubblewrap_installs_only_the_verified_local_archive() -> None:
+def test_bubblewrap_installs_executable_from_verified_archive() -> None:
     """The CI install must not fetch package indexes or resolve other packages."""
     setup = machinery_path("ci/setup_bubblewrap.sh").read_text()
     prepare = 'prepare_bubblewrap_package "$snapshot_url" "$archive" "$deb" "$digest"'
-    install = 'dpkg_with_lock_wait 120 --install -- "$archive"'
-    assert setup.index(prepare) < setup.index(install)
+    extract = 'dpkg-deb --fsys-tarfile "$archive" | tar -xOf - -- ./usr/bin/bwrap'
+    install = 'sudo install -o root -g root -m 0755 -- "$scratch/bwrap" /usr/local/bin/bwrap'
+    assert setup.index(prepare) < setup.index(extract) < setup.index(install)
+    assert "profile v4_ci_bwrap /usr/local/bin/bwrap flags=(default_allow)" in setup
     assert "apt-get" not in setup
-    assert "dpkg --configure" not in setup
+    assert "dpkg --install" not in setup
 
 
 def test_bubblewrap_snapshot_503_falls_back_to_official_security_pool(tmp_path: Path) -> None:

@@ -422,7 +422,7 @@ scan in place; see
 
 Each shard runs on GitHub's Ubuntu 26.04 image and restores the pinned bubblewrap
 package from Actions cache. `lu_machinery/ci/test_env.sh start postgres` verifies
-and installs the package, starts the image's PostgreSQL service, and checks that
+the archive, installs its executable, starts the image's PostgreSQL service, and checks that
 the test DSN reaches the `18/main` cluster. This runs in the background while
 the shard installs locked Python dependencies. `test_env.sh wait` fails the job
 if setup fails. A matched push to `main` can skip pytest after the merge group

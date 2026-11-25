@@ -61,7 +61,7 @@
 #   run under `env -i` with a temporary HOME and TMPDIR, so no runner
 #   credential or user configuration reaches them, and with isolated
 #   interpreters (python -I -B). PATH puts the pinned node and npm symlinks
-#   ahead of /usr/bin:/bin for the launcher fixture's toolchain.
+#   and the verified bubblewrap executable ahead of /usr/bin:/bin.
 # - Every shard starts its own runner PostgreSQL 18 cluster for the Postgres-marked tests
 #   (lu_machinery/ci/test_env.sh start postgres, then wait). Its DSN is passed
 #   through `env -i`; lu_machinery.ci.pg_skip_guard then fails the job when a
@@ -759,6 +759,7 @@ jobs:
             fi
             ln -s "$found" "$toolchain/$tool"
           done
+          ln -s /usr/local/bin/bwrap "$toolchain/bwrap"
           set +e
           env -i PATH="$toolchain:/usr/bin:/bin:$RUNNER_TEMP/trufflehog" HOME="$work/home" TMPDIR="$work/tmp" LU_TEST_WHEEL="$LU_TEST_WHEEL" \
             MACHINERY_GATE_SEMGREP_VENV="$RUNNER_TEMP/semgrep-venv" MACHINERY_GATE_RULES_SOURCE="$RUNNER_TEMP/semgrep-rules" \
@@ -857,6 +858,9 @@ jobs:
               fi
               ln -sfn "$found" "$toolchain/$tool"
             done
+          fi
+          if [ -x /usr/local/bin/bwrap ]; then
+            ln -sfn /usr/local/bin/bwrap "$toolchain/bwrap"
           fi
           set +e
           env -i PATH="$toolchain:/usr/bin:/bin:$RUNNER_TEMP/trufflehog" HOME="$work/home" TMPDIR="$work/tmp" LU_TEST_WHEEL="$LU_TEST_WHEEL" \

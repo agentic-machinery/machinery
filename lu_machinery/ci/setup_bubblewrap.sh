@@ -59,28 +59,6 @@ prepare_bubblewrap_package() {
   )
 }
 
-# dpkg has no lock timeout. Retry only lock failures inside the caller's existing
-# process cap, leaving two seconds for the final attempt and five seconds kill grace.
-dpkg_with_lock_wait() {
-  local cap="$1"
-  shift
-  sudo timeout --kill-after=5 "$cap" env LC_ALL=C bash -c '
-    deadline=$((SECONDS + $1 - 2))
-    shift
-    while true; do
-      err=$(dpkg "$@" 2>&1) && { printf "%s\n" "$err"; exit 0; }
-      rc=$?
-      printf "%s\n" "$err" >&2
-      case "$err" in
-        *"was locked by another process"*) ;;
-        *) exit "$rc" ;;
-      esac
-      [ "$SECONDS" -lt "$deadline" ] || exit "$rc"
-      sleep 1
-    done
-  ' _ "$cap" "$@"
-}
-
 if (( $# > 1 )) || { (( $# == 1 )) && [ "$1" != --package-only ]; }; then
   echo "::error::Usage: setup_bubblewrap.sh [--package-only]" >&2
   exit 1
@@ -115,20 +93,24 @@ if [ "${1:-}" = --package-only ]; then
   exit 0
 fi
 
-# The Ubuntu image supplies this archive's shared libraries and the AppArmor
-# parser. dpkg installs only the verified file and has no archive or index access.
-dpkg_with_lock_wait 120 --install -- "$archive"
+# Keep the runner's stock /usr/bin/bwrap and its AppArmor attachment intact.
+# Install only the executable from the verified archive in a trusted system path.
+(
+  scratch="$(mktemp -d -- "$RUNNER_TEMP/.bwrap-bin.XXXXXXXX")"
+  trap 'rm -rf -- "$scratch"' EXIT
+  dpkg-deb --fsys-tarfile "$archive" | tar -xOf - -- ./usr/bin/bwrap > "$scratch/bwrap"
+  sudo install -o root -g root -m 0755 -- "$scratch/bwrap" /usr/local/bin/bwrap
+)
 
-# Ubuntu-hosted runners require an application-specific userns grant. This
-# profile belongs only to the disposable CI VM.
+# Grant user namespaces only to the CI binary on this disposable runner.
 if [ -f /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
   cat > "${RUNNER_TEMP}/v4-ci-bwrap.apparmor" <<'PROFILE'
 abi <abi/4.0>,
 include <tunables/global>
-profile v4_ci_bwrap /usr/bin/bwrap flags=(unconfined) {
+profile v4_ci_bwrap /usr/local/bin/bwrap flags=(default_allow) {
   userns,
 }
 PROFILE
   sudo apparmor_parser -r "${RUNNER_TEMP}/v4-ci-bwrap.apparmor"
 fi
-/usr/bin/bwrap --unshare-user --unshare-pid --ro-bind / / -- /usr/bin/true
+/usr/local/bin/bwrap --unshare-user --unshare-pid --ro-bind / / -- /usr/bin/true
