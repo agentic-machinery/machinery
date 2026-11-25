@@ -8,6 +8,7 @@ The endpoint cases below exercise that stricter contract with the same inputs.
 from __future__ import annotations
 
 import json
+import secrets
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -16,7 +17,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from test_routing_budget_endpoint import _configure
 
-from lu_machinery.api import state_router
+from lu_machinery.api import state_helpers, state_router
 from lu_machinery.api.lane_health import (
     MAX_ERROR_EXCERPT_CHARS,
     LaneHealthScan,
@@ -36,6 +37,19 @@ _IPV6 = "2001:db8::1"
 _CRED_PASSWORD = "Sup3rSecret9"
 # Assemble synthetic credentials at runtime so source scans do not see secrets.
 _GH_TOKEN = "".join(("ghp_", "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8"))
+
+
+def _isolated_case_root(tmp_path: Path) -> Path:
+    """Give each endpoint case a unique root under ``tmp_path``.
+
+    Long parametrized test names reuse the same truncated ``tmp_path`` across
+    cases when ``tmp_path_retention_policy = "failed"`` removes passed dirs.
+    A unique child directory keeps ctx-scoped TTL cache keys disjoint across
+    cases regardless of execution order.
+    """
+    root = tmp_path / secrets.token_hex(8)
+    root.mkdir(parents=True, exist_ok=True)
+    return root
 
 
 def _write_task(tasks_dir: Path, task_id: str, agent: str, started_at: datetime, stderr_excerpt: str) -> None:
@@ -370,8 +384,9 @@ _REVIEW_SHAPES = [
 @pytest.mark.parametrize("field", ["last_error", "error"])
 def test_endpoint_omits_review_shapes_in_each_diagnostic_field(monkeypatch, tmp_path, excerpt, marker, expected, field):
     """Diagnostic text never escapes HTTP, and source task/diag bytes are preserved."""
-    _configure(monkeypatch, tmp_path, [])
-    tasks_dir = tmp_path / "batch_state" / "tasks"
+    root = _isolated_case_root(tmp_path)
+    _configure(monkeypatch, root, [])
+    tasks_dir = root / "batch_state" / "tasks"
     tasks_dir.mkdir(parents=True)
     now = datetime.now(UTC)
     for index, minutes in enumerate((30, 10)):
@@ -389,7 +404,7 @@ def test_endpoint_omits_review_shapes_in_each_diagnostic_field(monkeypatch, tmp_
         )
 
     app = FastAPI()
-    app.state.ctx = fixture_context(tmp_path)
+    app.state.ctx = fixture_context(root)
     app.middleware("http")(opsec_path_sanitizer_middleware)
     app.include_router(state_router.router, prefix="/api/state")
     response = TestClient(app).get("/api/state/routing-budget")
@@ -415,8 +430,9 @@ def test_endpoint_omits_review_shapes_in_each_diagnostic_field(monkeypatch, tmp_
 )
 @pytest.mark.parametrize("field", ["last_error", "error"])
 def test_endpoint_omits_even_safe_diagnostic_prose(monkeypatch, tmp_path, excerpt, field):
-    _configure(monkeypatch, tmp_path, [])
-    tasks_dir = tmp_path / "batch_state" / "tasks"
+    root = _isolated_case_root(tmp_path)
+    _configure(monkeypatch, root, [])
+    tasks_dir = root / "batch_state" / "tasks"
     tasks_dir.mkdir(parents=True)
     now = datetime.now(UTC)
     for index, minutes in enumerate((30, 10)):
@@ -426,7 +442,7 @@ def test_endpoint_omits_even_safe_diagnostic_prose(monkeypatch, tmp_path, excerp
             state_router, "scan_lane_health", lambda *a, **k: LaneHealthScan(observed=False, error=excerpt)
         )
     app = FastAPI()
-    app.state.ctx = fixture_context(tmp_path)
+    app.state.ctx = fixture_context(root)
     app.middleware("http")(opsec_path_sanitizer_middleware)
     app.include_router(state_router.router, prefix="/api/state")
     response = TestClient(app).get("/api/state/routing-budget")
@@ -453,20 +469,27 @@ def test_endpoint_omits_even_safe_diagnostic_prose(monkeypatch, tmp_path, excerp
 )
 def test_endpoint_omits_diagnostics_at_every_placeholder_boundary(monkeypatch, tmp_path, marker, prefix_text, placeholder, served_prefix):
     """Probe every interior cutoff position through the production handler."""
-    _configure(monkeypatch, tmp_path, [])
-    tasks_dir = tmp_path / "batch_state" / "tasks"
+    root = _isolated_case_root(tmp_path)
+    _configure(monkeypatch, root, [])
+    tasks_dir = root / "batch_state" / "tasks"
     tasks_dir.mkdir(parents=True)
     now = datetime.now(UTC)
     app = FastAPI()
-    app.state.ctx = fixture_context(tmp_path)
+    app.state.ctx = fixture_context(root)
     app.middleware("http")(opsec_path_sanitizer_middleware)
     app.include_router(state_router.router, prefix="/api/state")
+    cache_prefix = f"{root.resolve()}:"
     with TestClient(app) as client:
         for offset in range(1, len(placeholder)):
             prefix = "x" * (MAX_ERROR_EXCERPT_CHARS - len(prefix_text) - offset - 1) + " "
             excerpt = prefix + marker
             for index, minutes in enumerate((30, 10)):
                 _write_task(tasks_dir, f"c-{index}", "claude", now - timedelta(minutes=minutes), excerpt)
+            # Clear the TTL entry before each cutoff probe so every offset runs
+            # synchronously on the cold path instead of serving offset 1's cached
+            # snapshot and spawning detached status-cache-refresh threads that
+            # outlive monkeypatch teardown and poison reused tmp_path cache keys.
+            state_helpers.cache_invalidate(cache_prefix)
             response = client.get("/api/state/routing-budget")
             assert response.status_code == 200
             health = response.json()["agents"]["claude"]["health"]
