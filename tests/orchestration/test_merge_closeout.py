@@ -1309,7 +1309,7 @@ def test_main_missing_catalog_checkout_refuses_exit_2(
     assert exit_code == 2
     assert payload["ok"] is False
     assert "sibling checkout" in payload["error"]
-    assert "learn-ukrainian/machinery" in payload["error"]
+    assert "agentic-machinery/machinery" in payload["error"]
 
 
 @pytest.mark.parametrize("spelling", ["infra-private", "learn-ukrainian/learn-ukrainian-infra-private"])

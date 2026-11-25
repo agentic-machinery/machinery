@@ -54,7 +54,12 @@ from lu_machinery.fleet_comms.review_publication import (
     normalize_verdict,
 )
 from lu_machinery.model_families import canonical_cursor_model
-from lu_machinery.orchestration.fleet_repos import FleetRepo, clear_repository_cache, load_fleet_repos
+from lu_machinery.orchestration.fleet_repos import (
+    FleetRepo,
+    clear_repository_cache,
+    load_fleet_repos,
+    repository_identity,
+)
 from lu_machinery.orchestration.task_record_store import REVIEW_TASK_FLAG_FIELDS, iter_task_records
 from lu_machinery.review.model_catalog import VARIANT_SUFFIX, canonical_model_id, load_model_catalog
 from lu_machinery.review.review_contract import SCHEMA_VERSION, ContractError, parse_reviewer_json
@@ -1019,13 +1024,12 @@ def _publication_lines(path: Path, counts: Counter[str]) -> list[dict[str, Any]]
     return entries
 
 
-def publication_key(entry: Mapping[str, Any]) -> tuple[str, str, int, str, str]:
-    """What makes two ledger lines the same publication: the task, the repository (GitHub's slugs ignore case), the
-    PR, the head and the verdict. A line for another repository or PR is another publication, never a duplicate."""
-    return (entry["task_id"], str(entry["repository"]).lower(), entry["pr"], entry["head"], entry["verdict"])
+def publication_key(entry: Mapping[str, Any]) -> tuple[str, int | str, int, str, str]:
+    """Identify one task's verdict for one PR head, including across a repository rename."""
+    return (entry["task_id"], repository_identity(entry["repository"]), entry["pr"], entry["head"], entry["verdict"])
 
 
-def publication_keys(batch_state_dir: Path) -> set[tuple[str, str, int, str, str]]:
+def publication_keys(batch_state_dir: Path) -> set[tuple[str, int | str, int, str, str]]:
     """The keys of every well-formed ledger line."""
     return {publication_key(e) for e in _publication_lines(batch_state_dir / ROWS_DIR / PUBLICATIONS_FILE, Counter())}
 

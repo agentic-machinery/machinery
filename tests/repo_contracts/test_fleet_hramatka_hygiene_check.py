@@ -166,6 +166,16 @@ def test_private_board_is_read_at_the_active_slug(hermetic_repo, monkeypatch) ->
     kept = hygiene.hygiene_check(reader=reader, **_base_kwargs(repo_root, tasks_dir))
     assert (kept["status"], kept["queue_pointer_ok"]) == ("verified", True)
     assert reads == [(PUBLIC, EPIC), (moved, BOARD)]
+    with monkeypatch.context() as swapped:
+        swapped.setattr(hygiene, "load_fleet_repos", lambda: {
+            "infra-private": FleetRepo("infra-private", moved, "private-infra", "private-infra",
+                                      repository_id=1, visibility="private", alternate_github=PRIVATE,
+                                      transfer_complete=True),
+        })
+        reads.clear()
+        kept = hygiene.hygiene_check(reader=reader, **_base_kwargs(repo_root, tasks_dir))
+        assert (kept["status"], kept["queue_pointer_ok"]) == ("verified", True)
+        assert reads == [(PUBLIC, EPIC), (moved, BOARD)]
     # An explicit --private-repo is the one spelling its pointer may use.
     explicit = hygiene.hygiene_check(reader=reader, private_repo=moved, **_base_kwargs(repo_root, tasks_dir))
     assert explicit["queue_pointer_ok"] is False

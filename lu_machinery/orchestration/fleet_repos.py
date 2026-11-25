@@ -93,6 +93,7 @@ class FleetRepo:
     alternate_github: str | None = None
     sources_server: str | None = None
     admission_policy: str | None = None
+    transfer_complete: bool = False
 
     @property
     def owner(self) -> str:
@@ -111,6 +112,11 @@ class FleetRepo:
     @property
     def has_alternate_slug(self) -> bool:
         return self.alternate_github is not None
+
+    @property
+    def transfer_slugs(self) -> tuple[str, ...]:
+        """Slugs in chronological order, with the original spelling first."""
+        return self.slugs[::-1] if self.transfer_complete else self.slugs
 
     @property
     def authorized_visibility(self) -> str | None:
@@ -178,6 +184,7 @@ def load_fleet_repos(path: Path | None = None) -> dict[str, FleetRepo]:
         repository_id = body.get("repository_id")
         visibility = body.get("visibility")
         alternate_github = body.get("alternate_github")
+        transfer_complete = body.get("transfer_complete", False)
         product_files = {field: body[field] for field in _PRODUCT_FILE_CANONICAL if field in body}
         for field, value in product_files.items():
             if not isinstance(value, str) or not value.strip():
@@ -202,6 +209,8 @@ def load_fleet_repos(path: Path | None = None) -> dict[str, FleetRepo]:
                 raise FleetRepoError(
                     f"fleet_repos[{key!r}] with alternate_github requires repository_id and visibility"
                 )
+        if type(transfer_complete) is not bool or (transfer_complete and alternate_github is None):
+            raise FleetRepoError(f"fleet_repos[{key!r}].transfer_complete must be a boolean and requires an alternate slug when true")
         if _LEARN_UKRAINIAN_SLUG in {github.lower(), str(alternate_github).lower()}:
             for field in _PRODUCT_FILE_CANONICAL:
                 if field not in product_files:
@@ -218,6 +227,7 @@ def load_fleet_repos(path: Path | None = None) -> dict[str, FleetRepo]:
             repository_id=repository_id,
             visibility=visibility,
             alternate_github=alternate_github,
+            transfer_complete=transfer_complete,
             **product_files,
         )
     if defaults != 1:
@@ -630,8 +640,7 @@ def clear_repository_cache() -> None:
     _repository_catalog.cache_clear()
 
 
-def canonical_repository(value: str) -> str:
-    """Canonical owner/name, accepting registry keys and both baked slug spellings."""
+def _canonical_repository_match(value: str) -> tuple[str, FleetRepo | None]:
     if not isinstance(value, str) or not value.isascii():
         # Slugs and keys are ASCII; casefold would map look-alikes such as U+212A onto them.
         raise FleetRepoError("PR repository must be owner/name")
@@ -639,10 +648,21 @@ def canonical_repository(value: str) -> str:
     for repo in _bundled_catalog().values():
         known = {repo.key.casefold(), *(slug.casefold() for slug in repo.slugs)}
         if spelling in known:
-            return repo.github.casefold()
+            return repo.github.casefold(), repo
     if re.fullmatch(r"[a-z0-9_.-]+/[a-z0-9_.-]+", spelling):
-        return spelling
+        return spelling, None
     raise FleetRepoError("PR repository must be owner/name")
+
+
+def canonical_repository(value: str) -> str:
+    """Canonical owner/name, accepting registry keys and both baked slug spellings."""
+    return _canonical_repository_match(value)[0]
+
+
+def repository_identity(value: str) -> int | str:
+    """Use the pinned repository ID when available, otherwise the normalized slug."""
+    slug, row = _canonical_repository_match(value)
+    return row.repository_id if row is not None and row.repository_id is not None else slug
 
 
 _EXACT_SLUG = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
@@ -1038,6 +1058,7 @@ __all__ = [
     "load_fleet_repos",
     "main",
     "pull_request_repository",
+    "repository_identity",
     "repository_slugs",
     "require_active_slug",
     "resolve_active_fleet_repo",

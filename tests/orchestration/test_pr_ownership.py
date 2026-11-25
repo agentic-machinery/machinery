@@ -591,22 +591,31 @@ def test_decision_custody_outside_a_task_is_unchanged(monkeypatch, tmp_path):
     assert receipt["decision_owner"] == "claude-cto" and receipt["pr_state"] == "OPEN"
     assert data["handoffs"][KEY]["successor"] == "claude-cto"
 
-    alternate = "agentic-machinery/machinery"
-    transferred_catalog(monkeypatch, github=MACHINERY, alternate=alternate)
+    current = "agentic-machinery/machinery"
+    transferred = transferred_catalog(monkeypatch, github=current, alternate=MACHINERY)
     path = tmp_path / "state.json"
     historical = own._empty()
-    alternate_key, stable_key = f"{alternate}#42", f"{MACHINERY}#42"
-    historical["handoffs"][alternate_key] = receipt
-    historical["episodes"][alternate_key] = {
+    old_key, current_key = f"{MACHINERY}#42", f"{current}#42"
+    historical["handoffs"][old_key] = receipt
+    historical["episodes"][old_key] = {
         "since": at(30).isoformat(), "alerted_at": None, "notified_at": None,
     }
+    attempt = {"result": "recorded", "postcondition": "true", "at": receipt["accepted_at"]}
+    historical["heal_attempts"][f"{old_key}:{HEAD}"] = attempt
+    historical["outbox"] = own.outbox_entries({"alert": [{
+        "pr": old_key, "since": at(30).isoformat(), "branch": "codex/x", "reason": "owner exited", "last_task": "old",
+    }]})
     path.write_text(json.dumps(historical), encoding="utf-8")
     restored = own.load(path)
-    assert restored["handoffs"] == {stable_key: receipt}
-    assert list(restored["episodes"]) == [stable_key]
-    assert own.pr_key(alternate, 42) == stable_key
-    own.step(restored, {own.pr_key(alternate, 42)}, {}, at(31))
-    assert restored["handoffs"] == {stable_key: receipt}
+    assert restored["handoffs"] == {current_key: receipt}
+    assert list(restored["episodes"]) == [current_key]
+    assert own.pr_key(MACHINERY, 42) == current_key
+    assert restored["heal_attempts"] == {f"{transferred.repository_id}#42:{HEAD}": attempt}
+    assert own.custody_view(restored)["recorded_custody"][0]["by"] == "keeper"
+    own._reconcile_seated_outbox(restored["outbox"], {current_key})
+    assert restored["outbox"] == []
+    own.step(restored, {current_key}, {}, at(31))
+    assert restored["handoffs"] == {current_key: receipt}
     assert restored["history"] == []
 
 
