@@ -1577,13 +1577,10 @@ def utc_date() -> str:
 
 
 def pr_number(output: str) -> int:
-    from lu_machinery.orchestration.fleet_repos import parse_ascii_positive_int
-
-    match = re.search(r"/pull/([0-9]+)(?!\w)", output)
-    parsed = parse_ascii_positive_int(match.group(1)) if match is not None else None
-    if parsed is None:
+    match = re.search(r"/pull/([1-9][0-9]{0,18})(?!\w)", output)
+    if match is None:
         raise CutError(f"no pull request URL in publisher output: {output.strip()[:200]}")
-    return parsed
+    return int(match.group(1))
 
 
 def release_body(cut: Cut, section: str, files: Mapping[str, Path], consumer_lock: Path, ci: str,
