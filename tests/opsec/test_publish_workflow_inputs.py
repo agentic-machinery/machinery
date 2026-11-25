@@ -193,6 +193,7 @@ def test_contexts_must_be_a_json_boolean(contexts):
 @pytest.fixture()
 def fake_catalog(monkeypatch):
     monkeypatch.setattr(gate, "catalog", lambda: CATALOG)
+    monkeypatch.setattr(gate, "_packaged_catalog", lambda: CATALOG)
 
 
 @pytest.mark.usefixtures('configured_roots', 'fake_catalog')
@@ -257,7 +258,7 @@ def test_repository_forms_share_private_classification(form, uppercase, key, pri
 @pytest.mark.parametrize("form", REPOSITORY_FORMS)
 def test_catalog_reference_uses_same_normalization(form, monkeypatch):
     private = {**CATALOG["infra-private"], "github": form.format(repo=CATALOG["infra-private"]["github"]).upper()}
-    monkeypatch.setattr(gate, "catalog", lambda: {"fixture": private})
+    monkeypatch.setattr(gate, "_packaged_catalog", lambda: {"fixture": private})
     assert gate.is_private(CATALOG["infra-private"]["github"])
 
 
@@ -314,7 +315,7 @@ def test_unrecognized_or_wrong_host_reference_is_not_private(reference, syntheti
 @pytest.mark.usefixtures('github_command_boundary')
 def test_invalid_catalog_reference_never_grants_private_exemption(monkeypatch):
     monkeypatch.setattr(
-        gate, "catalog", lambda: {"fixture": {"github": "unknown", "default": False, "role": "private-infra"}}
+        gate, "_packaged_catalog", lambda: {"fixture": {"github": "unknown", "default": False, "role": "private-infra"}}
     )
     assert not gate.is_private("unknown")
 
@@ -680,7 +681,7 @@ def test_internal_lookups_receive_no_override(monkeypatch, tmp_path):
 @pytest.mark.usefixtures('github_command_boundary')
 def test_nondefault_public_catalog_entry_is_not_private(monkeypatch):
     monkeypatch.setattr(
-        gate, "catalog", lambda: {"unit": {"github": "unit/public", "default": False, "role": "public-monorepo"}}
+        gate, "_packaged_catalog", lambda: {"unit": {"github": "unit/public", "default": False, "role": "public-monorepo"}}
     )
     assert not gate.is_private("github.com/unit/public")
 

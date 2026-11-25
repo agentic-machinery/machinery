@@ -201,9 +201,6 @@ def catalog() -> dict:
     return _load_catalog_from_path(path)
 
 
-_DEFAULT_CATALOG_FN = catalog
-
-
 def normalize_hostname(value: str) -> str | None:
     """Return a lowercase ASCII hostname, or None for malformed labels."""
     # Check ASCII before lowercasing: Unicode look-alikes must not normalize in.
@@ -238,18 +235,16 @@ def normalize_repository(value: str, host: str = "github.com") -> str:
 def is_private(destination: str) -> bool:
     """Grant the exemption only to a normalized, configured private repository at its active slug.
 
-    Reads the host-installed packaged ``fleet_repos.yaml`` (never a caller-controlled profile
-    override) unless ``catalog`` was explicitly monkeypatched in tests. A row is private by its
-    declared ``visibility``, else by its ``private-`` role. A dual-slug row (``alternate_github``)
+    Reads the host-installed packaged ``fleet_repos.yaml`` independently of the caller's profile.
+    A row is private by its declared ``visibility``, else by its ``private-`` role.
+    A dual-slug row (``alternate_github``)
     is matched only at the slug the host selector makes active; its inactive slug, and a dual-slug
     row whose selector is missing or untrusted, are not private.
     """
     destination = normalize_repository(destination)
     if destination == "unknown":
         return False
-    use_packaged = catalog is _DEFAULT_CATALOG_FN
-    rows = _packaged_catalog() if use_packaged else catalog()
-    for key, row in rows.items():
+    for key, row in _packaged_catalog().items():
         visibility = row.get("visibility") or ("private" if str(row.get("role", "")).startswith("private-") else None)
         if visibility != "private" or row.get("default"):
             continue
@@ -261,7 +256,7 @@ def is_private(destination: str) -> bool:
                 # Imported here: git_credentials imports this module. SelectorError is a ValueError.
                 from lu_machinery.common.git_credentials import active_slug
 
-                slug, _ = active_slug(row, key=key, registry_path=_PACKAGED_CATALOG_PATH if use_packaged else None)
+                slug, _ = active_slug(row, key=key, registry_path=_PACKAGED_CATALOG_PATH)
             except (ImportError, ValueError, OSError):
                 continue
         if normalize_repository(slug) == destination:

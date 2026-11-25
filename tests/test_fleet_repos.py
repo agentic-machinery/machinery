@@ -524,7 +524,7 @@ def test_opsec_private_exemption_follows_only_the_active_slug(monkeypatch: pytes
     from lu_machinery.opsec import prepublish
 
     _selected(monkeypatch, active, visibility="private")
-    monkeypatch.setattr(prepublish, "catalog", lambda: {
+    monkeypatch.setattr(prepublish, "_packaged_catalog", lambda: {
         "case": {"github": "org/repo", "alternate_github": "neworg/repo", "repository_id": 4242,
                  "visibility": "private", "role": "private-labs", "local_name": "repo"},
         "home": {"github": "home/repo", "role": "public-monorepo", "default": True, "local_name": "home"},
