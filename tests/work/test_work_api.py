@@ -715,14 +715,21 @@ def test_next_registry_unavailable_503(monkeypatch):
 
 
 def test_next_unreadable_fleet_taxonomy_is_registry_unavailable_503(monkeypatch, tmp_path):
-    """Defect class: an alias registry that cannot be parsed reported as an unknown stream or a 500."""
+    """Defect class: an alias registry that cannot be parsed reported as an unknown stream, a 500 or its stale content."""
     from lu_machinery.orchestration import fleet_taxonomy
 
     _warm_next_cache()
     _patch_known_streams(monkeypatch)
-    malformed = tmp_path / "fleet_taxonomy.yaml"
-    malformed.write_text("schema_version: 1\nareas:\n  atlas:\n    id: atlas\n    aliases: null\n", encoding="utf-8")
-    monkeypatch.setattr(fleet_taxonomy, "DEFAULT_TAXONOMY_PATH", malformed)
+    taxonomy = tmp_path / "fleet_taxonomy.yaml"
+    monkeypatch.setattr(fleet_taxonomy, "DEFAULT_TAXONOMY_PATH", taxonomy)
+    # A readable registry that lacks the name: the stream is unknown (and the parse is cached).
+    taxonomy.write_text("schema_version: 1\nareas:\n  atlas:\n    id: atlas\n    aliases: []\n", encoding="utf-8")
+    response = client.get("/api/work/v1/next?stream=atlas-intake")
+    assert response.status_code == 400
+    assert response.json()["error"] == "unknown_stream"
+
+    # The same file made malformed is read again and refused on both routes.
+    taxonomy.write_text("schema_version: 1\nareas:\n  atlas:\n    id: atlas\n    aliases: null\n", encoding="utf-8")
     response = client.get("/api/work/v1/next?stream=atlas-intake")
     assert response.status_code == 503, response.text
     body = response.json()
@@ -733,12 +740,6 @@ def test_next_unreadable_fleet_taxonomy_is_registry_unavailable_503(monkeypatch,
     projection = client.get("/api/work/v1/projection?stream=atlas-intake")
     assert projection.status_code == 503, projection.text
     assert "registry_unavailable" in projection.text
-
-    # A readable registry that lacks the name is still an unknown stream.
-    malformed.write_text("schema_version: 1\nareas:\n  atlas:\n    id: atlas\n    aliases: []\n", encoding="utf-8")
-    response = client.get("/api/work/v1/next?stream=atlas-intake")
-    assert response.status_code == 400
-    assert response.json()["error"] == "unknown_stream"
 
 
 def test_projection_membership_and_epic_status():

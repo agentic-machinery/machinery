@@ -50,6 +50,21 @@ def _load_yaml(path: Path) -> dict[str, Any]:
         raise FleetTaxonomyValidationError(f"YAML parse error in {path}: {exc}") from exc
     if not isinstance(data, dict):
         raise FleetTaxonomyValidationError(f"Root of {path} must be a mapping/dict")
+    # JSON Schema (and every reader) expects JSON data: a YAML key such as `123` or `true` is not a
+    # string. Each node is visited once, so anchors that share or nest a node cannot loop the walk.
+    pending: list[Any] = [data]
+    seen: set[int] = set()
+    while pending:
+        node = pending.pop()
+        if id(node) in seen:
+            continue
+        seen.add(id(node))
+        if isinstance(node, dict):
+            if not all(isinstance(key, str) for key in node):
+                raise FleetTaxonomyValidationError(f"{path} has a mapping key that is not a string")
+            pending.extend(node.values())
+        elif isinstance(node, list):
+            pending.extend(node)
     return data
 
 

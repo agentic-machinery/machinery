@@ -88,11 +88,13 @@ def resolve_driver_agent_type(
     resolved_assignments = _default_assignments_path() if assignments_path is None else assignments_path
     try:
         raw_text = resolved_assignments.read_text(encoding="utf-8")
+    except UnicodeDecodeError as exc:
+        raise DriverAgentConfigError(f"{resolved_assignments} is not UTF-8 text: {exc}") from exc
     except OSError:
         return None
     try:
         data = yaml.safe_load(raw_text)
-    except yaml.YAMLError as exc:
+    except (yaml.YAMLError, RecursionError) as exc:
         raise DriverAgentConfigError(f"malformed YAML in {resolved_assignments}: {exc}") from exc
     if data is None:
         return None

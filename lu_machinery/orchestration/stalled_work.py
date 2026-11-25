@@ -35,7 +35,7 @@ from lu_machinery.orchestration.fleet_repos import (
     resolve_active_fleet_repo,
     resolve_fleet_repo,
 )
-from lu_machinery.orchestration.fleet_taxonomy import default_taxonomy_path
+from lu_machinery.orchestration.fleet_taxonomy import load_fleet_taxonomy
 from lu_machinery.orchestration.integration_sweep import GitHubAdapter, SweepError, lookup_verdict
 from lu_machinery.orchestration.task_record_store import iter_task_records, read_task_record
 from lu_machinery.orchestration.validate_fleet_taxonomy import _load_yaml, default_assignments_path
@@ -125,9 +125,9 @@ def owner_lanes() -> dict[str, str]:
     raw_assignments = _load_yaml(default_assignments_path()).get("assignments")
     if not isinstance(raw_assignments, dict):
         raise ValueError("area_assignments.yaml 'assignments' must be a mapping")
-    raw_areas = _load_yaml(default_taxonomy_path()).get("areas")
-    if not isinstance(raw_areas, dict):
-        raise ValueError("fleet_taxonomy.yaml 'areas' must be a mapping")
+    # The validated taxonomy: an epic two areas claim refuses here (FleetTaxonomyError is a
+    # ValueError), never re-owned by the last area.
+    areas = load_fleet_taxonomy().areas
     assignments: dict[str, list[str]] = {}
     for area, entry in raw_assignments.items():
         if not isinstance(area, str) or not isinstance(entry, dict):
@@ -138,16 +138,11 @@ def owner_lanes() -> dict[str, str]:
         assignments[area] = slots
     lanes = {slot: slot for slots in assignments.values() for slot in slots}
     stream_slots: dict[str, list[str]] = {}
-    for area, spec in raw_areas.items():
-        if not isinstance(area, str) or not isinstance(spec, dict) or area not in assignments:
-            raise ValueError(f"area {area!r} is malformed or missing from area_assignments.yaml")
-        epics = spec.get("epics")
-        if not isinstance(epics, list):
-            raise ValueError(f"fleet_taxonomy.yaml[{area!r}].epics must be a list")
-        for epic in epics:
-            if not isinstance(epic, dict) or type(epic.get("number")) is not int or epic["number"] <= 0:
-                raise ValueError(f"fleet_taxonomy.yaml[{area!r}].epics entry must declare a positive integer 'number'")
-            stream_slots[f"epic:{epic['number']}"] = assignments[area]
+    for area, spec in areas.items():
+        if area not in assignments:
+            raise ValueError(f"area {area!r} is missing from area_assignments.yaml")
+        for epic in spec.epics:
+            stream_slots[f"epic:{epic.number}"] = assignments[area]
     succession, _ = succession_streams()
     for initiator, stream in succession.items():
         slots = stream_slots.get(stream, [])

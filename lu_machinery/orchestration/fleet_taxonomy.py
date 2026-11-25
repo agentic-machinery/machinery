@@ -63,23 +63,26 @@ class TaxonomyRegistry:
 def load_fleet_taxonomy(taxonomy_path: Path | None = None) -> TaxonomyRegistry:
     """Load and index fleet_taxonomy.yaml (default: :func:`default_taxonomy_path`, resolved per call).
 
-    A profile entry that cannot be used raises :class:`FleetTaxonomyError`, like an unreadable file.
+    The file is read on every call and parsed again whenever its bytes change. A profile entry
+    that cannot be used, an unreadable file and invalid content all raise :class:`FleetTaxonomyError`.
     """
     if taxonomy_path is None:
         try:
             taxonomy_path = default_taxonomy_path()
         except profile.ProfileError as exc:
             raise FleetTaxonomyError(f"Fleet taxonomy unavailable: {exc}") from exc
-    return _load_fleet_taxonomy(taxonomy_path.resolve())
+    path = taxonomy_path.resolve()
+    try:
+        content = path.read_bytes()
+    except OSError as exc:
+        raise FleetTaxonomyError(f"Fleet taxonomy file not found or unreadable: {exc}") from exc
+    return _parse_fleet_taxonomy(path, content)
 
 
 @functools.lru_cache(maxsize=16)
-def _load_fleet_taxonomy(path: Path) -> TaxonomyRegistry:
-    if not path.is_file():
-        raise FleetTaxonomyError(f"Fleet taxonomy file not found: {path}")
-
+def _parse_fleet_taxonomy(path: Path, content: bytes) -> TaxonomyRegistry:
     try:
-        raw_data = yaml.safe_load(path.read_text(encoding="utf-8"))
+        raw_data = yaml.safe_load(content.decode("utf-8"))
     except Exception as exc:
         raise FleetTaxonomyError(f"Failed to parse YAML in {path}: {exc}") from exc
 
@@ -90,8 +93,9 @@ def _load_fleet_taxonomy(path: Path) -> TaxonomyRegistry:
     alias_to_area: dict[str, ResolvedArea] = {}
     epic_to_area: dict[int, ResolvedArea] = {}
 
+    # Invalid content refuses the whole file, typed, rather than skipping, crashing on or
+    # silently re-owning a part: the same contract validate_fleet_taxonomy enforces.
     for area_id, area_data in raw_data["areas"].items():
-        # Invalid content refuses the whole file, typed, rather than skipping or crashing on a part.
         if not isinstance(area_id, str) or not isinstance(area_data, dict):
             raise FleetTaxonomyError(f"Invalid taxonomy structure in {path}: area {area_id!r} must be a mapping")
         raw_aliases = area_data.get("aliases", [])
@@ -109,23 +113,21 @@ def _load_fleet_taxonomy(path: Path) -> TaxonomyRegistry:
                 f"Invalid taxonomy structure in {path}: {area_id}.epics must be a list of "
                 "{number: positive integer, name: string}"
             )
-        aliases = tuple(raw_aliases)
-        epics_list = [EpicInfo(number=e["number"], name=e.get("name", "")) for e in raw_epics]
-
         area = ResolvedArea(
             id=area_id,
-            aliases=aliases,
-            epics=tuple(epics_list),
+            aliases=tuple(raw_aliases),
+            epics=tuple(EpicInfo(number=e["number"], name=e.get("name", "")) for e in raw_epics),
         )
         areas_map[area_id] = area
-        alias_to_area[area_id] = area
 
-        for alias in aliases:
-            if alias in alias_to_area and alias_to_area[alias].id != area_id:
+        # Canonical ids and aliases share one namespace, so a name two areas claim is refused
+        # whichever area comes first.
+        for name in (area_id, *area.aliases):
+            if name in alias_to_area and alias_to_area[name].id != area_id:
                 raise FleetTaxonomyError(
-                    f"Duplicate alias '{alias}' found across areas '{alias_to_area[alias].id}' and '{area_id}'"
+                    f"Duplicate alias '{name}' found across areas '{alias_to_area[name].id}' and '{area_id}'"
                 )
-            alias_to_area[alias] = area
+            alias_to_area[name] = area
 
         for epic in area.epics:
             if epic.number in epic_to_area and epic_to_area[epic.number].id != area_id:
