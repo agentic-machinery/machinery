@@ -2096,7 +2096,6 @@ def _read_command(client, kind, action, options, positional, *, timeout, fresh):
         expected_seg = "pull" if kind == "pr" else "issues"
         is_url_like = (
             "://" in number
-            or "github.com/" in number.casefold()
             or "/pull/" in number
             or "/issues/" in number
             or number.startswith("/")
