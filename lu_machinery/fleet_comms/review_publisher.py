@@ -6,10 +6,7 @@ Sol fleet-comms (#5512) PR-G owns the GitHub side of formal review publication:
 * plan via pure ``review_publication.plan_publication`` (stale / idempotent / ready)
 * post one evidence-bearing PR comment and one commit status under
   ``fleet/cross-family-review``
-* record a durable row in ``github_publications`` (schema v1), with the dual-slug
-  selector receipt the repository was resolved with (migration v12; NULL for a
-  single-slug row and for rows written before it). The receipt is provenance,
-  never authority: no reader may use a stored receipt to authorize a write.
+* record a durable row in ``github_publications`` (schema v1)
 
 **Formal-job boundary (honest):** when a plane store is used and the plan is a
 live ``publish``, this module may **materialize the FK-parent**
@@ -35,7 +32,6 @@ from typing import Any
 from lu_machinery.common import github_client
 from lu_machinery.fleet_comms.artifacts import ArtifactStore
 from lu_machinery.fleet_comms.contracts import new_id
-from lu_machinery.fleet_comms.formal_review_jobs import selector_columns, selector_receipt_from_columns
 from lu_machinery.fleet_comms.review_publication import (
     DEFAULT_STATUS_CONTEXT,
     PublicationPlan,
@@ -216,45 +212,27 @@ def post_commit_status(
         )
 
 
-_SELECTOR_COLUMNS = frozenset({"selector_value", "selector_sha256"})
-
-
-def _has_selector_columns(conn: SQLiteConnection) -> bool:
-    """Whether ``github_publications`` has the migration-v12 receipt columns (a caller may pass a pre-v12 store)."""
-    columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(github_publications)")}
-    return columns >= _SELECTOR_COLUMNS
-
-
 def lookup_publication_receipt(
     conn: SQLiteConnection,
     *,
     review_id: str,
     status_context: str = DEFAULT_STATUS_CONTEXT,
 ) -> dict[str, Any] | None:
-    """Return the durable publication row when one already exists.
-
-    ``fleet_repo_selector`` is the stored selector receipt, or None for a single-slug row, a row written before
-    migration v12, or a store not yet migrated to v12.
-    """
+    """Return the durable publication row when one already exists."""
     rid = _single_line(review_id, label="review_id")
     ctx = _single_line(status_context, label="status_context")
-    keys: tuple[str, ...] = ("publication_id", "review_id", "head_sha", "status_context", "published_at")
-    if _has_selector_columns(conn):
-        keys += ("selector_value", "selector_sha256")
-        query = """SELECT publication_id, review_id, head_sha, status_context, published_at, selector_value,
-                          selector_sha256
-                   FROM github_publications WHERE review_id = ? AND status_context = ?"""
-    else:
-        query = """SELECT publication_id, review_id, head_sha, status_context, published_at
-                   FROM github_publications WHERE review_id = ? AND status_context = ?"""
-    row = conn.execute(query, (rid, ctx)).fetchone()
+    row = conn.execute(
+        """SELECT publication_id, review_id, head_sha, status_context, published_at
+           FROM github_publications
+           WHERE review_id = ? AND status_context = ?""",
+        (rid, ctx),
+    ).fetchone()
     if row is None:
         return None
-    receipt = dict(row) if isinstance(row, sqlite3.Row) else dict(zip(keys, row, strict=True))
-    receipt["fleet_repo_selector"] = selector_receipt_from_columns(
-        receipt.pop("selector_value", None), receipt.pop("selector_sha256", None)
-    )
-    return receipt
+    if isinstance(row, sqlite3.Row):
+        return dict(row)
+    keys = ("publication_id", "review_id", "head_sha", "status_context", "published_at")
+    return dict(zip(keys, row, strict=True))
 
 
 def record_publication_receipt(
@@ -264,40 +242,22 @@ def record_publication_receipt(
     head_sha: str,
     status_context: str = DEFAULT_STATUS_CONTEXT,
     publication_id: str | None = None,
-    fleet_repo_selector: Mapping[str, Any] | None = None,
 ) -> str:
-    """Insert one ``github_publications`` row; refuse duplicates.
-
-    ``fleet_repo_selector`` is the selector receipt the publication's repository was resolved with (None for a
-    single-slug row); a malformed receipt is refused before anything is written. An existing row keeps the receipt
-    it was written with. A store not yet migrated to v12 takes a row without a receipt and refuses one with a
-    receipt, which it cannot hold.
-    """
+    """Insert one ``github_publications`` row; refuse duplicates."""
     rid = _single_line(review_id, label="review_id")
     sha = _single_line(head_sha, label="head_sha").lower()
     ctx = _single_line(status_context, label="status_context")
-    try:
-        selector_value, selector_sha256 = selector_columns(fleet_repo_selector)
-    except ValueError as exc:
-        raise ReviewPublisherError(f"invalid_fleet_repo_selector: {exc}") from exc
     existing = lookup_publication_receipt(conn, review_id=rid, status_context=ctx)
     if existing is not None:
         return str(existing["publication_id"])
     pid = publication_id or new_id("publication")
-    if _has_selector_columns(conn):
-        statement = """INSERT INTO github_publications(
-            publication_id, review_id, head_sha, status_context, published_at, selector_value, selector_sha256
-        ) VALUES (?, ?, ?, ?, ?, ?, ?)"""
-        values: tuple[str | None, ...] = (pid, rid, sha, ctx, _utc_now(), selector_value, selector_sha256)
-    elif selector_value is None:
-        statement = """INSERT INTO github_publications(
-            publication_id, review_id, head_sha, status_context, published_at
-        ) VALUES (?, ?, ?, ?, ?)"""
-        values = (pid, rid, sha, ctx, _utc_now())
-    else:
-        raise ReviewPublisherError("receipt_store_not_migrated: github_publications lacks the v12 selector columns")
     try:
-        conn.execute(statement, values)
+        conn.execute(
+            """INSERT INTO github_publications(
+                publication_id, review_id, head_sha, status_context, published_at
+            ) VALUES (?, ?, ?, ?, ?)""",
+            (pid, rid, sha, ctx, _utc_now()),
+        )
         conn.commit()
     except sqlite3.IntegrityError as exc:
         conn.rollback()
@@ -359,7 +319,6 @@ def execute_publication(
     runner: Runner | None = None,
     conn: SQLiteConnection | None = None,
     require_receipt: bool = False,
-    fleet_repo_selector: Mapping[str, Any] | None = None,
 ) -> PublicationResult:
     """Execute a planned publication (or no-op for refuse/skip/dry-run).
 
@@ -374,9 +333,6 @@ def execute_publication(
     require_receipt:
         When True and mutate publishes, refuse if ``conn`` is missing so we never
         post without a durable receipt path.
-    fleet_repo_selector:
-        The selector receipt ``plan.repository`` was resolved with, stored on the
-        ``github_publications`` row (None for a single-slug row). Provenance only.
     """
     if plan.action in {"refuse_stale", "skip_idempotent"}:
         return PublicationResult(
@@ -406,13 +362,6 @@ def execute_publication(
         raise ReviewPublisherError(
             "receipt_required: refuse live publish without plane DB connection"
         )
-    # Refuse a malformed receipt, or one the store cannot hold, before anything reaches GitHub, never after the post.
-    try:
-        selector_value, selector_sha256 = selector_columns(fleet_repo_selector)
-    except ValueError as exc:
-        raise ReviewPublisherError(f"invalid_fleet_repo_selector: {exc}") from exc
-    if conn is not None and selector_value is not None and not _has_selector_columns(conn):
-        raise ReviewPublisherError("receipt_store_not_migrated: github_publications lacks the v12 selector columns")
 
     comment_url = post_pr_comment(
         repository=plan.repository,
@@ -437,7 +386,6 @@ def execute_publication(
             review_id=plan.review_id,
             head_sha=plan.head_sha,
             status_context=plan.status_context,
-            fleet_repo_selector=selector_receipt_from_columns(selector_value, selector_sha256),
         )
     return PublicationResult(
         plan=plan,
@@ -591,15 +539,13 @@ def publish_sealed_verdict(
         and plan.mutate
     ):
         ensure_job_row_for_receipt(store, sealed)
-    receipt = target.selector_receipt()
     result = execute_publication(
         plan,
         runner=runner,
         conn=conn,
         require_receipt=require_receipt,
-        fleet_repo_selector=receipt,
     )
-    return replace(result, fleet_repo_selector=receipt)
+    return replace(result, fleet_repo_selector=target.selector_receipt())
 
 
 def load_sealed_payload_file(path: Path) -> SealedVerdict:

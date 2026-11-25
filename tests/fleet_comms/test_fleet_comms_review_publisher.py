@@ -389,32 +389,6 @@ def test_sealed_verdict_across_a_transfer_publishes_at_the_active_slug(
     assert result.to_dict()["fleet_repo_selector"] == {"selector_value": active, "selector_sha256": "d" * 64}
 
 
-@pytest.mark.parametrize("active", ["org/repo", "neworg/repo", None])
-def test_publication_receipt_row_stores_the_selector_its_repository_was_resolved_with(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, active: str | None,
-) -> None:
-    """Defect class: the selector receipt a dual-slug publication was resolved with is dropped between the resolver
-    and the durable ``github_publications`` row (SELECTOR-DURABLE-RECEIPTS, A01b finding F3), or the row's reader
-    does not expose it; a single-slug repository must store and read no receipt."""
-    repository = _REPO
-    if active is not None:
-        _transferred(monkeypatch, active)
-        repository = "neworg/repo"
-    gh = FakeGh(head=_SHA_A)
-    with ArtifactStore(root=tmp_path / "plane") as store:
-        result = publish_sealed_verdict(
-            _sealed(repository=repository, review_evidence=_approved_evidence()),
-            current_head_sha=_SHA_A, mutate=True, runner=gh, store=store, require_receipt=True,
-        )
-        assert result.status_posted is True
-        expected = None if active is None else {"selector_value": active, "selector_sha256": "d" * 64}
-        assert result.fleet_repo_selector == expected
-        receipt = lookup_publication_receipt(store.connection, review_id="review_deadbeef")
-        assert receipt is not None and receipt["fleet_repo_selector"] == expected
-        columns = store.connection.execute("SELECT selector_value, selector_sha256 FROM github_publications").fetchall()
-        assert [tuple(row) for row in columns] == [(None, None) if expected is None else (active, "d" * 64)]
-
-
 @pytest.mark.parametrize("stored", ["org/repo", "NewOrg/Repo"])
 @pytest.mark.parametrize("active", ["org/repo", "neworg/repo"])
 def test_sealed_verdict_under_the_other_baked_slug_cannot_open_a_second_job(

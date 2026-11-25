@@ -13,17 +13,11 @@ durable provenance (sealed review-pr was removed in #8520).
 
 This module does **not** invoke reviewers, create reviewer-neutral
 snapshots, or resolve reviewers (sealed review-pr was removed in #8520).
-
-SELECTOR-DURABLE-RECEIPTS (migration v12): a sealed verdict is stored with the
-dual-slug selector receipt (value and sha256) its caller resolved the
-repository with. The receipt is provenance, never authority: no reader may use
-a stored receipt to authorize a write.
 """
 
 from __future__ import annotations
 
 import json
-import re
 import sqlite3
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -31,7 +25,6 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from lu_machinery.common.git_credentials import _is_valid_slug as _is_selector_slug
 from lu_machinery.fleet_comms.artifacts import ArtifactStore
 from lu_machinery.fleet_comms.contracts import CompletionState, new_id
 from lu_machinery.fleet_comms.migrations import apply_migrations
@@ -44,40 +37,6 @@ from lu_machinery.fleet_comms.review_publication import (
 
 JOB_STATES = frozenset({"open", "running", "complete", "failed", "blocked"})
 ACTIVE_JOB_STATES = frozenset({"open", "running"})
-
-_SELECTOR_RECEIPT_KEYS = frozenset({"selector_value", "selector_sha256"})
-_SELECTOR_SHA256 = re.compile(r"[0-9a-f]{64}\Z")
-
-
-def selector_columns(receipt: object) -> tuple[str | None, str | None]:
-    """The ``(selector_value, selector_sha256)`` columns of a selector receipt, or ``(None, None)`` for None.
-
-    The one receipt check every durable writer uses (the publication and job rows here, the publication ledger in
-    ``api.model_stats_rows``). The receipt is ``ActiveFleetRepo.selector_receipt()``: exactly a value the selector
-    loader itself accepts as a slug (its own grammar, so ``org/..`` and ``../repo`` are refused) and a lowercase hex
-    sha256. Anything else raises ValueError, so a malformed receipt is never stored.
-    """
-    if receipt is None:
-        return None, None
-    if not isinstance(receipt, Mapping) or set(receipt) != _SELECTOR_RECEIPT_KEYS:
-        raise ValueError("selector receipt must hold exactly selector_value and selector_sha256")
-    value, digest = receipt["selector_value"], receipt["selector_sha256"]
-    if not isinstance(value, str) or not _is_selector_slug(value):
-        raise ValueError("selector_value must be an exact owner/name")
-    if not isinstance(digest, str) or not _SELECTOR_SHA256.match(digest):
-        raise ValueError("selector_sha256 must be a lowercase hex sha256")
-    return value, digest
-
-
-def selector_receipt_from_columns(value: object, digest: object) -> dict[str, str] | None:
-    """The stored selector receipt, or None when the row has none (single-slug, or written before migration v12).
-
-    The writers store both columns or neither; a row holding only one is reported as having no receipt, never as a
-    partial one.
-    """
-    if not isinstance(value, str) or not isinstance(digest, str):
-        return None
-    return {"selector_value": value, "selector_sha256": digest}
 
 
 def _utc_now() -> str:
@@ -129,9 +88,6 @@ class FormalReviewJob:
     sealed_verdict_artifact_id: str | None
     created_at: str
     attempts: tuple[FormalReviewAttempt, ...] = field(default_factory=tuple)
-    # The selector receipt stored with the sealed verdict; None for a single-slug or unregistered repository, a job
-    # without a sealed verdict, or a row written before migration v12.
-    fleet_repo_selector: dict[str, str] | None = None
 
     @property
     def unique_key(self) -> tuple[str, int, str, str]:
@@ -153,7 +109,6 @@ class FormalReviewJob:
             "sealed_verdict_artifact_id": self.sealed_verdict_artifact_id,
             "created_at": self.created_at,
             "attempts": [attempt.to_dict() for attempt in self.attempts],
-            "fleet_repo_selector": self.fleet_repo_selector,
         }
 
 
@@ -407,23 +362,13 @@ class FormalReviewJobService:
         *,
         record_complete_attempt: bool = True,
         raw_capture_artifact_id: str | None = None,
-        fleet_repo_selector: Mapping[str, Any] | None = None,
     ) -> SealedVerdict:
         """Accept a schema-valid sealed verdict and bind it to the job (fail closed).
 
         Provenance (model/family/harness/verdict) is taken **only** from the
         sealed payload. The payload's repository/pr/head/gate/review_id must
-        match the durable job row exactly. ``fleet_repo_selector`` is the
-        selector receipt the caller resolved the repository with (None for a
-        single-slug or unregistered one), stored beside the sealed verdict. The
-        verdict and receipt bind only while the job is still unsealed: an
-        identical re-accept, serial or overlapping, keeps the verdict and
-        receipt stored first, and a different verdict is refused.
+        match the durable job row exactly.
         """
-        try:
-            selector_value, selector_sha256 = selector_columns(fleet_repo_selector)
-        except ValueError as exc:
-            raise FormalReviewJobsError(f"invalid_fleet_repo_selector: {exc}") from exc
         job = self.get_job(review_id, include_attempts=False)
         try:
             if not isinstance(sealed, SealedVerdict):
@@ -462,7 +407,14 @@ class FormalReviewJobService:
             )
 
         if job.sealed_verdict_artifact_id is not None:
-            return self._identical_sealed_verdict(job.review_id, sealed)
+            # Idempotent re-accept of identical payload only.
+            existing = self.load_sealed_verdict(job.review_id)
+            if existing.to_dict() != sealed.to_dict():
+                raise FormalReviewJobsError(
+                    f"sealed_verdict_already_set: job {job.review_id} already holds a "
+                    "different sealed verdict; refuse overwrite"
+                )
+            return existing
 
         payload = json.dumps(sealed.to_dict(), sort_keys=True, separators=(",", ":"))
         artifact = self.store.store_text(
@@ -473,21 +425,18 @@ class FormalReviewJobService:
             mime_type="application/json; charset=utf-8",
         )
         try:
-            # Bind only an unsealed job: an accept that overlapped another one never overwrites what it sealed.
-            bound = self._conn.execute(
+            self._conn.execute(
                 """UPDATE formal_review_jobs
-                   SET sealed_verdict_artifact_id = ?, state = ?, selector_value = ?, selector_sha256 = ?
-                   WHERE review_id = ? AND sealed_verdict_artifact_id IS NULL""",
-                (artifact.artifact_id, "complete", selector_value, selector_sha256, job.review_id),
-            ).rowcount
+                   SET sealed_verdict_artifact_id = ?, state = ?
+                   WHERE review_id = ?""",
+                (artifact.artifact_id, "complete", job.review_id),
+            )
             self._conn.commit()
         except sqlite3.Error as exc:
             self._conn.rollback()
             raise FormalReviewJobsError(
                 f"failed to bind sealed verdict for {job.review_id}: {exc}"
             ) from exc
-        if bound != 1:
-            return self._identical_sealed_verdict(job.review_id, sealed)
 
         if record_complete_attempt:
             self.record_attempt(
@@ -496,16 +445,6 @@ class FormalReviewJobService:
                 raw_capture_artifact_id=raw_capture_artifact_id or artifact.artifact_id,
             )
         return sealed
-
-    def _identical_sealed_verdict(self, review_id: str, sealed: SealedVerdict) -> SealedVerdict:
-        """The verdict already sealed on the job when it is identical to *sealed*; any other one is refused."""
-        existing = self.load_sealed_verdict(review_id)
-        if existing.to_dict() != sealed.to_dict():
-            raise FormalReviewJobsError(
-                f"sealed_verdict_already_set: job {review_id} already holds a "
-                "different sealed verdict; refuse overwrite"
-            )
-        return existing
 
     def load_sealed_verdict(self, review_id: str) -> SealedVerdict:
         """Reload the durable sealed verdict for PR-G ``--review-id`` publish."""
@@ -675,9 +614,6 @@ class FormalReviewJobService:
         sealed_id = None
         if "sealed_verdict_artifact_id" in keys and row["sealed_verdict_artifact_id"] is not None:
             sealed_id = str(row["sealed_verdict_artifact_id"])
-        selector = None
-        if {"selector_value", "selector_sha256"} <= keys:
-            selector = selector_receipt_from_columns(row["selector_value"], row["selector_sha256"])
         return FormalReviewJob(
             review_id=str(row["review_id"]),
             repository=str(row["repository"]),
@@ -691,7 +627,6 @@ class FormalReviewJobService:
             sealed_verdict_artifact_id=sealed_id,
             created_at=str(row["created_at"]),
             attempts=attempts,
-            fleet_repo_selector=selector,
         )
 
     def _require_artifact(self, artifact_id: str) -> None:

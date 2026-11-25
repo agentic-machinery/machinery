@@ -9,10 +9,6 @@ Closes the gap between review asks and Sol milestone 2 (sealed review-pr was rem
 
 Does **not** invoke reviewers or create sealed worktrees (sealed review-pr was removed in #8520).
 Operators/orchestrators call this after a review reply is in hand.
-
-A registered repository (either baked slug of its row) is read at its active slug, and the dual-slug selector
-receipt it was resolved with is stored on the job when the verdict is sealed. Both slugs refer to one job
-for the PR head and gate. The receipt records provenance and confers no authority to write.
 """
 
 from __future__ import annotations
@@ -52,13 +48,6 @@ from lu_machinery.fleet_comms.review_publisher import (
     publish_sealed_verdict,
     split_repository,
 )
-from lu_machinery.orchestration.fleet_repos import (
-    ActiveFleetRepo,
-    FleetRepoError,
-    load_fleet_repos,
-    resolve_payload_fleet_repo,
-    same_repository,
-)
 
 Runner = Callable[..., subprocess.CompletedProcess[str]]
 
@@ -82,11 +71,9 @@ class FinalizeResult:
     published: bool
     publication_summary: str | None
     job_created: bool
-    # The dual-slug selector receipt stored on the seal, if present.
-    fleet_repo_selector: dict[str, str] | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        result = {
+        return {
             "review_id": self.review_id,
             "repository": self.repository,
             "pr_number": self.pr_number,
@@ -98,34 +85,6 @@ class FinalizeResult:
             "publication_summary": self.publication_summary,
             "job_created": self.job_created,
         }
-        if self.fleet_repo_selector is not None:
-            result["fleet_repo_selector"] = self.fleet_repo_selector
-        return result
-
-
-def _github_target(repository: str) -> ActiveFleetRepo | None:
-    """The registered repository bound to its active slug, or None for an unregistered slug.
-
-    *repository* must be exactly the ASCII owner/name the GitHub helpers read: a spelling the repository parser
-    would rewrite (surrounding or inner whitespace of any kind, non-ASCII) is refused, never normalized. A registered
-    row, named by either baked slug in any ASCII case, is read at its active slug; it is refused when the catalog is
-    unreadable or its dual-slug selector is missing or untrusted. An owner/name no registry row names is read as
-    given, with no receipt.
-    """
-    owner, name = split_repository(repository)
-    if f"{owner}/{name}" != repository or not repository.isascii() or any(ch.isspace() for ch in repository):
-        raise FormalReviewFinalizeError(f"invalid_repository: expected an exact ASCII owner/repo, got {repository!r}")
-    try:
-        repos = load_fleet_repos()
-    except FleetRepoError as exc:
-        raise FormalReviewFinalizeError(f"repository_unresolved: {exc}") from exc
-    spelling = repository.casefold()
-    if not any(spelling == slug.casefold() for row in repos.values() for slug in row.slugs):
-        return None
-    try:
-        return resolve_payload_fleet_repo(repository, repos=repos)
-    except FleetRepoError as exc:
-        raise FormalReviewFinalizeError(f"repository_unresolved: {exc}") from exc
 
 
 def resolve_verdict_token(
@@ -220,9 +179,8 @@ def finalize_formal_review_verdict(
         if not value or not str(value).strip():
             raise FormalReviewFinalizeError(f"missing_{label}")
 
-    # Validate repository shape early and bind it to the slug GitHub is read at.
-    target = _github_target(repository)
-    github_repository = target.active_github if target is not None else repository
+    # Validate repository shape early.
+    split_repository(repository)
 
     findings_verdict: str | None = None
     review_evidence: ReviewEvidence | None = None
@@ -274,7 +232,7 @@ def finalize_formal_review_verdict(
     if sha is None:
         try:
             sha = fetch_pr_head_sha(
-                repository=github_repository,
+                repository=repository,
                 pr_number=pr_number,
                 runner=runner,
             )
@@ -289,7 +247,7 @@ def finalize_formal_review_verdict(
     if review_evidence is not None and review_evidence.findings:
         try:
             inventory = fetch_pr_change_inventory(
-                repository=github_repository,
+                repository=repository,
                 pr_number=pr_number,
                 runner=runner,
             )
@@ -304,28 +262,12 @@ def finalize_formal_review_verdict(
     job_created = False
     with FormalReviewJobService(root=plane_root) as service:
         try:
-            job_repository = repository
-            if target is None:
-                existing = service.find_job(
-                    job_repository, pr_number, sha, gate_kind, include_attempts=False
-                )
-            else:
-                # The publisher uses the registry slug as its stable key. Older jobs retain their stored spelling.
-                job_repository = target.repo.github
-                registry_row = {target.repo.key: target.repo}
-                matches = [
-                    candidate
-                    for candidate in service.list_jobs(pr=pr_number, head_sha=sha, gate_kind=gate_kind)
-                    if same_repository(candidate.repository, job_repository, repos=registry_row)
-                ]
-                if len(matches) > 1:
-                    raise FormalReviewFinalizeError(
-                        "formal_job_repository_ambiguous: multiple jobs match this registered repository and PR head"
-                    )
-                existing = matches[0] if matches else None
+            existing = service.find_job(
+                repository, pr_number, sha, gate_kind, include_attempts=False
+            )
             if existing is None:
                 job = service.create_job(
-                    job_repository,
+                    repository,
                     pr_number,
                     sha,
                     gate_kind,
@@ -343,7 +285,7 @@ def finalize_formal_review_verdict(
 
             sealed = build_sealed_verdict(
                 review_id=job.review_id,
-                repository=job.repository,
+                repository=repository,
                 pr_number=pr_number,
                 head_sha=sha,
                 gate_kind=gate_kind,
@@ -353,11 +295,7 @@ def finalize_formal_review_verdict(
                 harness=harness.strip(),
                 review_evidence=review_evidence,
             )
-            service.accept_sealed_verdict(
-                job.review_id,
-                sealed,
-                fleet_repo_selector=target.selector_receipt() if target is not None else None,
-            )
+            service.accept_sealed_verdict(job.review_id, sealed)
         except FormalReviewJobsError as exc:
             # Includes concurrent create races and accept failures.
             raise FormalReviewFinalizeError(str(exc)) from exc
@@ -392,7 +330,6 @@ def finalize_formal_review_verdict(
             published=published,
             publication_summary=publication_summary,
             job_created=job_created,
-            fleet_repo_selector=refreshed.fleet_repo_selector,
         )
 
 

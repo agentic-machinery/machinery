@@ -44,10 +44,10 @@ from typing import Any, cast
 from lu_machinery.agent_runtime.attempt_boundary import CLAUDE_SUBSCRIPTION_ACCOUNT_LABELS
 from lu_machinery.api.opsec_scan import scan_text
 from lu_machinery.common import json_depth
+from lu_machinery.common.git_credentials import _is_valid_slug as _is_selector_slug
 from lu_machinery.common.task_store_paths import read_cached_task_record, tasks_dir
 from lu_machinery.dispatcher.admission import review_typed
 from lu_machinery.dispatcher.types import NEVER_STARTED, StartRefusal
-from lu_machinery.fleet_comms.formal_review_jobs import selector_columns
 from lu_machinery.fleet_comms.review_publication import (
     BLOCKING_PRIORITIES,
     ReviewPublicationError,
@@ -947,16 +947,13 @@ REPOSITORY_SLUG = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9._-]{1,10
 
 
 def _selector_ok(receipt: object) -> bool:
-    """None, or a dict accepted by the shared durable receipt validator."""
+    """The optional receipt uses the selector loader's slug grammar and a lowercase SHA-256."""
     if receipt is None:
         return True
-    if not isinstance(receipt, dict):
+    if not isinstance(receipt, dict) or receipt.keys() != {"selector_value", "selector_sha256"}:
         return False
-    try:
-        selector_columns(receipt)
-    except ValueError:
-        return False
-    return True
+    digest = receipt["selector_sha256"]
+    return _is_selector_slug(receipt["selector_value"]) and isinstance(digest, str) and _SHA256.fullmatch(digest) is not None
 
 
 def _publication_ok(entry: object) -> bool:
@@ -984,8 +981,18 @@ def publication(*, task_id: str, repository: str, pr: int, head: str, verdict: s
     entry: dict[str, Any] = {"schema": PUBLICATION_SCHEMA, "task_id": task_id, "repository": repository, "pr": pr,
                              "head": head, "verdict": verdict, "published_at": published_at}
     if fleet_repo_selector is not None:
-        entry[_PUBLICATION_SELECTOR] = (dict(fleet_repo_selector) if isinstance(fleet_repo_selector, Mapping)
-                                        else fleet_repo_selector)
+        if not isinstance(fleet_repo_selector, Mapping):
+            raise ValueError("publication field has the wrong shape")
+        receipt: dict[str, str] = {}
+        for key, value in dict(fleet_repo_selector).items():
+            if not isinstance(key, str) or not isinstance(value, str):
+                raise ValueError("publication field has the wrong shape")
+            # Match the JSON representation without invoking overridden methods on a string subclass.
+            name = str.__str__(key)
+            if name in receipt:
+                raise ValueError("publication field has the wrong shape")
+            receipt[name] = str.__str__(value)
+        entry[_PUBLICATION_SELECTOR] = receipt
     if not _publication_ok(entry):
         raise ValueError("publication field has the wrong shape")
     return entry

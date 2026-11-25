@@ -3114,16 +3114,23 @@ def test_publication_ledger_keeps_the_selector_receipt_and_still_reads_legacy_li
     """Defect class: the publication ledger drops the selector receipt a dual-slug publication was resolved with
     (SELECTOR-DURABLE-RECEIPTS), rejects a line written before the receipt existed, or stores or trusts a malformed
     receipt; or the receipt changes which lines are one publication."""
-    from collections import Counter
+    from collections import Counter, UserString
+    from types import MappingProxyType
 
     from lu_machinery.api import model_stats_rows
     from tests.review.record_support import recorded_verdict
 
+    class ReceiptText(str):
+        def __str__(self):
+            return "overridden"
+
     _transferred(monkeypatch, active)
     receipt = {"selector_value": active, "selector_sha256": "d" * 64}
+    supplied = {ReceiptText(key): ReceiptText(value) for key, value in receipt.items()}
     comment = recorded_verdict(SHA, "APPROVED")
-    entry, reason = recorder.publication_of("org/repos", 42, comment, fleet_repo_selector=receipt)
+    entry, reason = recorder.publication_of("org/repos", 42, comment, fleet_repo_selector=supplied)
     assert reason == "" and entry is not None and entry["fleet_repo_selector"] == receipt
+    assert all(type(key) is str and type(value) is str for key, value in entry["fleet_repo_selector"].items())
     legacy, _ = recorder.publication_of("org/repos", 41, comment)
     assert legacy is not None and "fleet_repo_selector" not in legacy
     for bad in ({"selector_value": active}, {**receipt, "extra": "x"}, {**receipt, "selector_sha256": "D" * 64},
@@ -3131,9 +3138,6 @@ def test_publication_ledger_keeps_the_selector_receipt_and_still_reads_legacy_li
                 {**receipt, "selector_value": None}):
         assert recorder.publication_of("org/repos", 42, comment, fleet_repo_selector=bad) == (None, "malformed field")
     # A malformed receipt in the second entry must leave the whole batch unwritten.
-    from collections import UserString
-    from types import MappingProxyType
-
     class DuplicateReceiptKeys(dict):
         def items(self):
             return [("selector_value", "invalid"), *super().items()]
