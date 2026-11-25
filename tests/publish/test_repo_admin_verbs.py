@@ -283,6 +283,83 @@ def test_repo_create_unknown_send_is_unsettled(outcome):
     assert receipt["outcome"] in {"ambiguous", "unverified"} and receipt["mutations_sent"] == 1
 
 
+IN_PROGRESS = "Failed to transfer repository. A previous repository operation is still in progress."
+
+
+def client_answer(status, body, error="github_http_error"):
+    """A POST answer in the shared client's own typed shape (its real producer), with a status and a body."""
+    def respond(args):
+        return github_client._result_process(
+            args, github_client.Result(body, status=status, error=error), {}, {"capture_output": True, "text": True},
+        )
+    return respond
+
+
+ADMIN_POSTS = {
+    "repo-create": (["--name", "rehearsal-1"], f"orgs/{OLD}/repos", "repo-create-rehearsal-1-*.json"),
+    "repo-transfer": ([], f"repos/{SOURCE}/transfer", f"repo-transfer-{REPO_ID}-*.json"),
+}
+
+
+@pytest.mark.parametrize("verb", sorted(ADMIN_POSTS))
+@pytest.mark.parametrize("answer_,refused", [
+    (client_answer(422, {"message": IN_PROGRESS, "documentation_url": "https://docs.github.com/rest"}), True),
+    (client_answer(403, {"message": "Must have admin rights to Repository."}), True),
+    (client_answer(502, {"message": "Server Error"}), False),
+    (subprocess.TimeoutExpired(["gh"], 60), False),
+    (client_answer(422, b"not json"), False),
+    (client_answer(422, {"message": ""}), False),
+    (client_answer(413, {"message": "github_response_too_large"}), False),
+    (client_answer(429, None, error="github_rate_limited"), False),
+    (lambda args: subprocess.CompletedProcess(args, 1, json.dumps({"message": IN_PROGRESS}), "HTTP 422"), False),
+])
+def test_github_refusal_of_the_post_is_a_refusal_not_unknown(tmp_path, capsys, verb, answer_, refused):
+    """Defect class: GitHub's definite refusal of the one POST reported as an unknown result, or a lost answer as a refusal.
+
+    Only the client's typed client-error answer with a message is a refusal: exit 2, its status and message in
+    the receipt and on stderr, mutations_sent 0 and, for a transfer, the journal removed after the GET /user
+    re-read. A 5xx, a timeout, a rate limit, the client's own 413, an answer without a readable message or an
+    untyped failure stays unknown: exit 3, and a transfer keeps its journal.
+    """
+    extra, endpoint, pattern = ADMIN_POSTS[verb]
+    argv = [verb, "--repo", "infra-private", "--principal", PRINCIPAL, *extra]
+    gh = FakeGitHub()
+    gh.overrides[("POST", endpoint, False)] = answer_
+    code = pub.main(argv, runner=gh)
+    err = capsys.readouterr().err
+    receipt = json.loads(sorted(state_dir(tmp_path).glob(pattern))[-1].read_text())
+    assert len(gh.posts) == 1
+    if not refused:
+        assert code == pub.REPO_ADMIN_UNSETTLED and receipt["outcome"] == "ambiguous"
+        assert receipt["mutations_sent"] == 1 and "github_refusal" not in receipt
+        assert journal(tmp_path).exists() is (verb == "repo-transfer")
+        return
+    document = answer_(["gh"]).github_result
+    expected = {"status": document.status, "message": document.value["message"]}
+    assert code == 2 and receipt["outcome"] == "refused" and receipt["mutations_sent"] == 0
+    assert receipt["github_refusal"] == expected
+    assert f"HTTP {expected['status']} {json.dumps(expected['message'])}" in receipt["detail"]
+    assert f"HTTP {expected['status']} {json.dumps(expected['message'])}" in err and "_REFUSED: " in err
+    assert "UNSETTLED" not in err
+    if verb == "repo-transfer":
+        # The journal goes only after a GET /user that follows the POST, and nothing blocks a new attempt.
+        assert gh.calls[-1] == ["gh", "api", "--method", "GET", "user"] and not journal(tmp_path).exists()
+        gh.overrides.clear()
+        assert pub.main(argv, runner=gh) == 0 and len(gh.posts) == 2
+        assert json.loads(capsys.readouterr().out)["outcome"] == "transferred"
+
+
+def test_github_refusal_keeps_journal_when_principal_changed(tmp_path):
+    """Defect class: a journal removed on a refusal without the principal re-read after the last GitHub read."""
+    gh = FakeGitHub(after_login="someone-else")
+    gh.overrides[("POST", f"repos/{SOURCE}/transfer", False)] = client_answer(422, {"message": IN_PROGRESS})
+    result, receipt = run("repo-transfer", gh, repo="infra-private")
+    assert result.returncode == pub.REPO_ADMIN_UNSETTLED and receipt["outcome"] == "unreconciled"
+    assert receipt["mutations_sent"] == 0 and receipt["github_refusal"] == {"status": 422, "message": IN_PROGRESS}
+    assert "the refused POST transferred nothing" in receipt["detail"] and "someone-else" in receipt["detail"]
+    assert len(gh.posts) == 1 and journal(tmp_path).exists()
+
+
 def test_real_move_derives_endpoints_from_selector_row(selector):
     """Defect class: transfer endpoints taken from caller input, from a single-slug/unregistered row, or in reverse."""
     gh = FakeGitHub()

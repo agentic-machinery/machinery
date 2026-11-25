@@ -2186,7 +2186,8 @@ def _transfer_checked(fields, source, destination, receipt, sink, temp, *, runne
 # script: worker markers and every caller credential override are refused, and the principal
 # the operator names is verified through the same gh credential before and after the mutation.
 # Static and fresh checks come first, then exactly one mutation; once it is sent, every
-# failure exits REPO_ADMIN_UNSETTLED and a transfer journal refuses a second send.
+# failure exits REPO_ADMIN_UNSETTLED and a transfer journal refuses a second send. Only GitHub's
+# own client-error answer to that POST (``_repo_admin_refusal``) proves nothing changed: exit 2.
 
 REPO_ADMIN_UNSETTLED = 3
 REPO_ADMIN_VERBS = frozenset({"repo-create", "repo-transfer"})
@@ -2604,9 +2605,51 @@ def _repo_admin_refuse_checks(verb, receipt, sink, exc):
     raise _repo_refused(verb, "a fresh read was unreadable, malformed or unknown") from None
 
 
+# GitHub's client errors for a request it validated and did not carry out (documented for the create and
+# transfer endpoints, plus authentication, not-found and conflict answers). Every other status, among them
+# 408, 413 (also this client's own response-size refusal) and 429, and 5xx, leaves the result unknown.
+_REPO_ADMIN_REFUSAL_STATUSES = frozenset({400, 401, 403, 404, 409, 410, 422})
+_REPO_ADMIN_MESSAGE_LIMIT = 500
+
+
+class _RepoAdminRefused(Exception):
+    """GitHub answered the one POST with a client-error refusal: the mutation was not carried out."""
+
+    def __init__(self, status, message):
+        self.status, self.message = status, message
+        # json.dumps quotes GitHub's text and escapes control and non-ASCII characters for the terminal.
+        super().__init__(f"GitHub refused the request with HTTP {status} {json.dumps(message)}")
+
+
+def _repo_admin_refusal(result):
+    """GitHub's typed refusal of a failed POST, else None (the result stays unknown).
+
+    Only the shared client's own observation counts: an HTTP error answer whose status is a refusal
+    status and whose JSON body names a non-empty message. A timeout, a transport failure, a rate limit,
+    a 5xx or an answer without a readable message is not a refusal.
+    """
+    observation = getattr(result, "github_result", None)
+    if not isinstance(observation, github_client.Result) or observation.error != "github_http_error":
+        return None
+    status, document = observation.status, observation.value
+    if type(status) is not int or status not in _REPO_ADMIN_REFUSAL_STATUSES or not isinstance(document, dict):
+        return None
+    message = document.get("message")
+    if not isinstance(message, str) or not message:
+        return None
+    return _RepoAdminRefused(status, message[:_REPO_ADMIN_MESSAGE_LIMIT])
+
+
+def _repo_admin_refused_post(receipt, refused):
+    """Record GitHub's refusal: the refused POST changed nothing, so it is not counted as a mutation."""
+    receipt["mutations_sent"] = 0
+    receipt["github_refusal"] = {"status": refused.status, "message": refused.message}
+
+
 def _repo_admin_post(endpoint, frozen, runner, cwd, environment):
     """Send one POST of the prepared *frozen* body; any failure or malformed answer raises.
 
+    GitHub's refusal raises ``_RepoAdminRefused``; every other failure raises ValueError (result unknown).
     The caller prepares the body and counts the mutation as sent before calling.
     """
     result = _send(
@@ -2614,6 +2657,9 @@ def _repo_admin_post(endpoint, frozen, runner, cwd, environment):
         environment=environment, runner=runner, cwd=cwd, capture_output=True, text=True, check=False, timeout=60,
     )
     if result.returncode:
+        refusal = _repo_admin_refusal(result)
+        if refusal is not None:
+            raise refusal
         raise ValueError("the mutation failed or its result is unknown")
     document = json_depth.loads(result.stdout, max_depth=64)
     if not isinstance(document, dict):
@@ -2762,6 +2808,11 @@ def _repo_create_checked(fields, plan, receipt, sink, _directory_fd, _directory,
             created = _repo_identity(_repo_admin_post(
                 f"orgs/{source.split('/', 1)[0]}/repos", frozen, runner, cwd, environment,
             ))
+        except _RepoAdminRefused as refused:
+            # Nothing was created, and no journal exists: a refusal (exit 2) naming GitHub's status and message.
+            _repo_admin_refused_post(receipt, refused)
+            _repo_admin_settle(verb, receipt, sink, 2, "refused", str(refused), True, True)
+            raise plan["refused"](str(refused)) from None
         except Exception:
             return _repo_admin_settle(
                 verb, receipt, sink, REPO_ADMIN_UNSETTLED, "ambiguous", "the creation's result is unknown",
@@ -2973,7 +3024,8 @@ def _repo_transfer_checked(fields, plan, receipt, sink, directory_fd, directory,
     """Reconcile from the exact destination first, then the fresh source checks, then one journaled transfer.
 
     Exit contract: 0 verified (or already at the destination, or a passed dry run), always after a principal
-    read that follows the last GitHub read; 2 refused with nothing sent and no journal left; 75 a rate limit
+    read that follows the last GitHub read; 2 refused with no journal left, either before the POST or by
+    GitHub's client-error answer to it (status and message in ``github_refusal``); 75 a rate limit
     before any POST with no journal; 3 everything else: a POST sent and unsettled, a pending journal not
     settled by the destination under the visibility, login and id it binds, a failed or mismatched final principal
     re-read before an exit 0 or a journal removal (the journal is kept), or a journal that could not be removed.
@@ -3129,27 +3181,28 @@ def _repo_transfer_send(plan, receipt, sink, directory_fd, journal_name, frozen,
 
     A refusal before the POST removes the journal (exit 2, or 75 for a rate limit) only after the principal,
     re-read after the last GitHub read, is still the journal's starter; a failed or mismatched re-read, or a
-    journal that cannot be removed, keeps it and exits 3. Every failure after the POST is unsettled (exit 3).
+    journal that cannot be removed, keeps it and exits 3. GitHub's client-error refusal of the POST is settled
+    the same way; every other failure after the POST is unsettled (exit 3).
     """
     verb = "repo-transfer"
     source, destination, repository_id, visibility = (
         plan["source"], plan["destination"], plan["repository_id"], plan["visibility"]
     )
 
-    def abandon(reason, limited=None):
+    def abandon(reason, limited=None, unsent="no POST was sent"):
         # Like every journal removal, this one rests on a principal read after the last GitHub read.
         reread = _principal_reread(receipt["principal"]["before"], receipt, reader, cwd, environment)
         if reread:
             return _repo_admin_settle(
                 verb, receipt, sink, REPO_ADMIN_UNSETTLED, "unreconciled",
-                f"{reason}; no POST was sent, but {reread}, so the journal {receipt['journal']} is kept: check the "
+                f"{reason}; {unsent}, but {reread}, so the journal {receipt['journal']} is kept: check the "
                 "account on GitHub, then remove the journal by hand before a new attempt",
                 capture_output, text,
             )
         if not _repo_admin_unjournal(directory_fd, journal_name, receipt):
             return _repo_admin_settle(
                 verb, receipt, sink, REPO_ADMIN_UNSETTLED, "journal-retained",
-                f"{reason}; no POST was sent, but the journal {receipt['journal']} could not be removed: remove it by "
+                f"{reason}; {unsent}, but the journal {receipt['journal']} could not be removed: remove it by "
                 "hand before a new attempt",
                 capture_output, text,
             )
@@ -3193,6 +3246,10 @@ def _repo_transfer_send(plan, receipt, sink, directory_fd, journal_name, frozen,
     receipt["mutations_sent"] = 1
     try:
         acknowledged = _repo_admin_post(f"repos/{source}/transfer", frozen, runner, cwd, environment)
+    except _RepoAdminRefused as refused:
+        # GitHub refused this POST, so it transferred nothing: the journal goes as for a refusal before the POST.
+        _repo_admin_refused_post(receipt, refused)
+        return abandon(str(refused), unsent="the refused POST transferred nothing")
     except Exception:
         return _repo_admin_settle(
             verb, receipt, sink, REPO_ADMIN_UNSETTLED, "ambiguous", "the transfer's result is unknown",
@@ -5005,7 +5062,10 @@ def _parse_args(argv):
                 "  $HOME and $XDG_STATE_HOME are ignored, so every run finds the same journal): repository id and slug,\n"
                 "  rehearsal_destination, principal before and after. repo-transfer --create-receipt takes that file.\n"
                 "Exit codes: 0 created and verified, or dry run passed (no mutation); 2 invalid input or refusal, no\n"
-                "  mutation; 3 UNSETTLED: the POST was sent and its result is unknown or unverified (an output\n"
+                "  mutation, GitHub's client-error answer to the POST included (HTTP 400, 401, 403, 404, 409, 410\n"
+                "  or 422 with a message: github_refusal in the receipt names its status and message, and\n"
+                "  mutations_sent stays 0); 3 UNSETTLED: the POST was sent and its result is unknown (a timeout,\n"
+                "  a 5xx or any other answer) or unverified (an output\n"
                 "  failure after the POST included), or another run holds the lock (in-progress); never\n"
                 "  retry with the same name: check the organization on GitHub and use a new name; a rate limit at\n"
                 "  the POST is 3; a dry run whose final GET /user fails or names another login or id is 3\n"
@@ -5062,13 +5122,18 @@ def _parse_args(argv):
                 "Exit codes: 0 transferred and verified, already transferred, or dry run passed (a journal that could\n"
                 "  not be removed is named in the receipt); 2 invalid input, a caller or registry refusal, or a\n"
                 "  --create-receipt that cannot be loaded (the id is then unknown), or a refusal with no mutation sent\n"
-                "  and no journal for this repository id; 3 UNSETTLED: the POST was sent and the result is unknown or\n"
+                "  and no journal for this repository id, GitHub's client-error answer to the POST included (HTTP\n"
+                "  400, 401, 403, 404, 409, 410 or 422 with a message: github_refusal in the receipt names its status\n"
+                "  and message, mutations_sent stays 0, and the journal is removed after the same GET /user\n"
+                "  re-read as a refusal before the POST); 3 UNSETTLED: the POST was sent and the result is unknown\n"
+                "  (a timeout, a 5xx or any other answer) or\n"
                 "  unverified (an output failure after the POST included); a journal for this repository id exists or\n"
                 "  cannot be read and the destination does not settle it, or it binds another login or account id,\n"
                 "  whichever later step fails (unreconciled: this run sent no request; an earlier one may have, and\n"
                 "  the journal is kept for reconciliation). A failed or mismatched GET /user before an exit 0 that\n"
-                "  sends no POST, or before removing a journal written when no POST was sent, means no request was\n"
-                "  sent (unverified when there is no journal, else unreconciled and that journal is kept). The same\n"
+                "  sends no POST, or before removing a journal written when no POST was sent or GitHub refused it,\n"
+                "  means no mutation was carried out (unverified when there is no journal, else unreconciled and that\n"
+                "  journal is kept). The same\n"
                 "  GET /user after a POST is exit 3 unverified: a request was sent and could not be confirmed,\n"
                 "  and the journal is kept for reconciliation;\n"
                 "  a refused run could not remove its own journal (journal-retained); or another run holds the lock\n"
