@@ -1571,3 +1571,128 @@ def test_validate_fleet_taxonomy_refuses_deeply_nested_acyclic_aliases_without_r
     assert "Not a regular file" in fifo_payload["error"]
     with pytest.raises(fleet_taxonomy.FleetTaxonomyError, match="Not a regular file"):
         fleet_taxonomy.load_fleet_taxonomy(fifo)
+
+
+def test_a_key_written_twice_in_one_config_mapping_merge_key_included_is_refused_by_every_fleet_config_loader(tmp_path):
+    """Defect class: a config key written twice in one source mapping is silently last-wins (R2-YAML-MERGE).
+
+    One rule for the taxonomy, assignments, succession map and lane data loaders: a key written twice
+    is refused, the YAML merge key ``<<`` counts like any other key, and merging (``<<: *a``,
+    ``<<: [*a, *b]``) with explicit overrides stays valid.
+    """
+    from lu_machinery.fleet import ignored_task_output
+    from lu_machinery.ops import driver_lanes
+    from lu_machinery.orchestration import fleet_taxonomy, validate_fleet_taxonomy
+
+    assignments = tmp_path / "area_assignments.yaml"
+    assignments.write_text(
+        "schema_version: 1\nassignments:\n"
+        "  atlas:\n    driver_agent_type: atlas-driver\n    slots: [claude-atlas]\n"
+        "  other:\n    driver_agent_type: other-driver\n    slots: [claude-other]\n",
+        encoding="utf-8",
+    )
+    # Valid in every other respect, so the second ``<<`` is the only reason to refuse.
+    twice = tmp_path / "twice.yaml"
+    twice.write_text(
+        "schema_version: 1\nareas:\n"
+        "  atlas: &a\n    id: atlas\n    aliases: [atlas-alias]\n    epics: []\n"
+        "  other:\n    <<: *a\n    <<: *a\n    id: other\n    aliases: [other-alias]\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(validate_fleet_taxonomy.FleetTaxonomyValidationError, match="duplicate YAML key: '<<'"):
+        validate_fleet_taxonomy.validate_fleet_taxonomy(taxonomy_path=twice, assignments_path=assignments)
+    with pytest.raises(fleet_taxonomy.FleetTaxonomyError, match="duplicate YAML key: '<<'"):
+        fleet_taxonomy.load_fleet_taxonomy(twice)
+    twice_assignments = tmp_path / "twice_assignments.yaml"
+    twice_assignments.write_text(
+        "schema_version: 1\nassignments:\n"
+        "  atlas: &x\n    driver_agent_type: atlas-driver\n    slots: [claude-atlas]\n"
+        "  other:\n    <<: *x\n    <<: *x\n    driver_agent_type: other-driver\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(validate_fleet_taxonomy.FleetTaxonomyValidationError, match="duplicate YAML key: '<<'"):
+        validate_fleet_taxonomy.load_validated_assignments(twice_assignments)
+
+    # One merge key naming several mappings, with explicit overrides, is still valid.
+    merged = tmp_path / "merged.yaml"
+    merged.write_text(
+        "schema_version: 1\nareas:\n"
+        "  atlas: &a\n    id: atlas\n    aliases: [atlas-alias]\n    epics: []\n"
+        "  other:\n    <<: [*a]\n    id: other\n    aliases: [other-alias]\n",
+        encoding="utf-8",
+    )
+    assert validate_fleet_taxonomy.validate_fleet_taxonomy(taxonomy_path=merged, assignments_path=assignments)["ok"]
+    assert fleet_taxonomy.load_fleet_taxonomy(merged).alias_to_area["other-alias"].id == "other"
+
+    # The succession map follows the same rule: an override through one merge key is valid ...
+    header = 'schema: terminal-abandon-succession-map.v1\nstreams:\n  "epic:1": &one\n    initiators: [a-x]\n'
+    succession = tmp_path / "succession.yaml"
+    succession.write_text(header + '  "epic:2":\n    <<: *one\n    initiators: [b-x]\n', encoding="utf-8")
+    assert ignored_task_output.succession_streams(succession)[0] == {"a-x": "epic:1", "b-x": "epic:2"}
+    # ... and a second merge key in one mapping is refused, never last-wins.
+    succession.write_text(
+        header + '  "epic:2": &two\n    initiators: [b-x]\n  "epic:3":\n    <<: *one\n    <<: *two\n',
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="succession map unreadable"):
+        ignored_task_output.succession_streams(succession)
+
+    # Lane data is JSON: a member name written twice is refused too.
+    lanes = tmp_path / "driver_lanes.json"
+    packaged = driver_lanes._PACKAGED_DATA_FILE.read_text(encoding="utf-8")
+    assert packaged.lstrip().startswith("{")
+    lanes.write_text(packaged.replace("{", '{"lanes": [], ', 1), encoding="utf-8")
+    with pytest.raises(driver_lanes.LaneConfigError, match="duplicate JSON key: 'lanes'"):
+        driver_lanes.load_registry(lanes)
+    lanes.write_text(packaged, encoding="utf-8")
+    assert driver_lanes.load_registry(lanes).lanes
+
+
+def test_a_non_regular_config_file_is_refused_without_a_blocking_open_by_every_touched_reader(tmp_path, monkeypatch):
+    """Defect class: a config read that opens a FIFO or other non-regular file blocks (R2-NONREGULAR-PATH).
+
+    Every config read this change adds or touches goes through ``read_regular_file_bytes``, which
+    opens without blocking and checks the opened descriptor, so a file that is regular when
+    inspected and a FIFO when opened is refused too. Each caller keeps its own typed refusal.
+    """
+    import signal
+
+    from lu_machinery.fleet import ignored_task_output
+    from lu_machinery.ops import driver_lanes
+    from lu_machinery.orchestration import fleet_taxonomy, validate_fleet_taxonomy
+
+    fifo = tmp_path / "config.fifo"
+    os.mkfifo(fifo)
+    regular = tmp_path / "regular.yaml"
+    regular.write_text("schema_version: 1\n", encoding="utf-8")
+
+    def _hung(signum, frame):
+        raise AssertionError("a config read blocked on a FIFO")
+
+    class _InspectsRegular:
+        """``os`` whose ``stat`` reports the regular file: the FIFO appears only at open."""
+
+        def __getattr__(self, name):
+            return getattr(os, name)
+
+        @staticmethod
+        def stat(path, *args, **kwargs):
+            return os.stat(regular)
+
+    previous = signal.signal(signal.SIGALRM, _hung)
+    signal.alarm(20)
+    try:
+        for swapped in (False, True):
+            if swapped:  # regular at inspection, a FIFO at open: only the descriptor check can refuse
+                monkeypatch.setattr(validate_fleet_taxonomy, "os", _InspectsRegular())
+            with pytest.raises(ValueError, match="succession map unreadable"):
+                ignored_task_output.succession_streams(fifo)
+            with pytest.raises(driver_lanes.LaneConfigError, match="Not a regular file"):
+                driver_lanes.load_registry(fifo)
+            with pytest.raises(fleet_taxonomy.FleetTaxonomyError, match="Not a regular file"):
+                fleet_taxonomy.load_fleet_taxonomy(fifo)
+            with pytest.raises(validate_fleet_taxonomy.FleetTaxonomyValidationError, match="Not a regular file"):
+                validate_fleet_taxonomy.load_validated_assignments(fifo)
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, previous)

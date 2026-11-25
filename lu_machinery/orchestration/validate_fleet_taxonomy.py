@@ -51,8 +51,17 @@ class FleetTaxonomyValidationError(ValueError):
     """Raised when fleet taxonomy or area assignments validation fails (a ``ValueError``, like the loaders' errors)."""
 
 
+_MERGE_KEY = ("<<",)  # never equal to a SafeLoader key: a constructed key is never a tuple
+
+
 class _NoDuplicateKeySafeLoader(yaml.SafeLoader):
-    """SafeLoader that rejects literal duplicate keys in source mappings while preserving ``<<`` merge overrides."""
+    """SafeLoader with the one fleet-config YAML rule.
+
+    Each source mapping is checked as written, before ``<<`` merges are expanded: a key written twice
+    is refused, and the merge key ``<<`` counts like any other key, so a mapping merges once
+    (``<<: *a`` or ``<<: [*a, *b]``). Explicit keys still override merged ones (YAML merge
+    precedence), and a merge anchor that contains itself is refused.
+    """
 
     def __init__(self, stream: str) -> None:
         super().__init__(stream)
@@ -67,15 +76,16 @@ class _NoDuplicateKeySafeLoader(yaml.SafeLoader):
             self._checked_mapping_nodes.add(node_id)
             seen: set[object] = set()
             for key_node, _ in node.value:
+                key: object
                 if key_node.tag == "tag:yaml.org,2002:merge":
-                    continue
-                key: object = (
-                    "="
-                    if key_node.tag == "tag:yaml.org,2002:value"
-                    else self.construct_object(key_node, deep=True)
-                )
+                    key = _MERGE_KEY
+                elif key_node.tag == "tag:yaml.org,2002:value":
+                    key = "="
+                else:
+                    key = self.construct_object(key_node, deep=True)
                 if key in seen:
-                    raise FleetTaxonomyValidationError(f"duplicate YAML key: {key!r}")
+                    shown = "<<" if key == _MERGE_KEY else key
+                    raise FleetTaxonomyValidationError(f"duplicate YAML key: {shown!r}")
                 seen.add(key)
         self._flattening_nodes.add(node_id)
         try:
@@ -115,7 +125,12 @@ def read_regular_file_bytes(path: Path) -> tuple[Path, bytes]:
     return resolved, content
 
 
-def _load_yaml_bytes(content: bytes, source: Path) -> dict[str, Any]:
+def load_yaml_mapping_bytes(content: bytes, source: Path) -> dict[str, Any]:
+    """Parse fleet config YAML under the one rule (:class:`_NoDuplicateKeySafeLoader`) into a JSON-shaped mapping.
+
+    Every failure, including a root that is not a mapping, a non-string key and a cyclic anchor,
+    raises :class:`FleetTaxonomyValidationError` naming ``source``.
+    """
     try:
         data = yaml.load(content.decode("utf-8"), Loader=_NoDuplicateKeySafeLoader)
     except FleetTaxonomyValidationError:
@@ -151,7 +166,7 @@ def _load_yaml_bytes(content: bytes, source: Path) -> dict[str, Any]:
 
 def _load_yaml(path: Path) -> dict[str, Any]:
     _, content = read_regular_file_bytes(path)
-    return _load_yaml_bytes(content, path)
+    return load_yaml_mapping_bytes(content, path)
 
 
 def _load_schema(path: Path) -> dict[str, Any]:
@@ -286,7 +301,7 @@ def parse_validated_taxonomy_bytes(
     taxonomy_schema_path: Path = TAXONOMY_SCHEMA_PATH,
 ) -> dict[str, Any]:
     """Parse and validate ``fleet_taxonomy.yaml`` bytes under the single taxonomy contract."""
-    data = _load_yaml_bytes(content, path)
+    data = load_yaml_mapping_bytes(content, path)
     validate_taxonomy_data(data, taxonomy_schema_path=taxonomy_schema_path)
     return data
 
@@ -298,7 +313,7 @@ def parse_validated_assignments_bytes(
     assignments_schema_path: Path = ASSIGNMENTS_SCHEMA_PATH,
 ) -> dict[str, Any]:
     """Parse and validate ``area_assignments.yaml`` bytes under the single assignments contract."""
-    data = _load_yaml_bytes(content, path)
+    data = load_yaml_mapping_bytes(content, path)
     validate_assignments_data(data, assignments_schema_path=assignments_schema_path)
     return data
 

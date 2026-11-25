@@ -26,18 +26,20 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
-import yaml
-
 from lu_machinery.common import json_depth, profile
 from lu_machinery.common.repo_root import machinery_path
 from lu_machinery.fleet.regenerable_output import committed_release_pins, is_regenerable_ignored_path
 from lu_machinery.orchestration import worktree_artifacts as artifacts
-from lu_machinery.orchestration.preparation_evidence import UniqueKeyLoader
 from lu_machinery.orchestration.task_record_store import (
     parse_task_record,
     read_task_record_bytes,
     task_archive_lock,
     task_record_path,
+)
+from lu_machinery.orchestration.validate_fleet_taxonomy import (
+    FleetTaxonomyValidationError,
+    load_yaml_mapping_bytes,
+    read_regular_file_bytes,
 )
 
 # Deepest JSON this module reads (json_depth): its own identity cache.
@@ -630,12 +632,12 @@ def succession_streams(path: Path | None = None) -> tuple[dict[str, str], str]:
     two streams refuses the whole map rather than choosing one.
     """
     target = default_succession_map_path() if path is None else path
-    if not stat.S_ISREG(os.stat(target).st_mode):
-        raise ValueError("succession map unreadable")
-    raw = target.read_bytes()
     try:
-        data = yaml.load(raw.decode("utf-8"), Loader=UniqueKeyLoader)  # SafeLoader subclass
-    except Exception as exc:
+        # The fleet-config read and YAML rule: no blocking open of a non-regular file, no key
+        # written twice in one mapping (``<<`` included), no cyclic anchor.
+        _, raw = read_regular_file_bytes(target)
+        data = load_yaml_mapping_bytes(raw, target)
+    except FleetTaxonomyValidationError as exc:
         raise ValueError("succession map unreadable") from exc
     if not isinstance(data, dict) or set(data) != {"schema", "streams"}:
         raise ValueError("succession map invalid")

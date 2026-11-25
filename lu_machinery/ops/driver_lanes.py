@@ -239,14 +239,28 @@ def default_data_path() -> Path:
     return profile.config_path("driver_lanes", default=_PACKAGED_DATA_FILE)
 
 
+def _unique_members(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    """A JSON object whose every member name is written once; a repeated name is refused, never last-wins."""
+    members: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in members:
+            raise ValueError(f"duplicate JSON key: {key!r}")
+        members[key] = value
+    return members
+
+
 def load_registry(path: Path | None = None) -> Registry:
+    # The fleet-config file read: a non-regular file is refused without a blocking open.
+    from lu_machinery.orchestration.validate_fleet_taxonomy import read_regular_file_bytes
+
     try:
         source = path or default_data_path()
     except profile.ProfileError as exc:
         raise LaneConfigError(f"lane data unavailable: {exc}") from exc
     try:
-        data = json_depth.loads(source.read_text(encoding="utf-8"), max_depth=512)
-    except (OSError, ValueError, RecursionError) as exc:  # unreadable, not UTF-8, not JSON, too deep
+        _, raw = read_regular_file_bytes(source)  # its refusal is a ValueError
+        data = json_depth.loads(raw.decode("utf-8"), object_pairs_hook=_unique_members, max_depth=512)
+    except (OSError, ValueError, RecursionError) as exc:  # unreadable, not regular, not UTF-8, not JSON, too deep
         raise LaneConfigError(f"cannot read lane data {source.name}: {exc}") from exc
     return parse_registry(data)
 
