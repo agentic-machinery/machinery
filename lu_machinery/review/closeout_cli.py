@@ -30,7 +30,7 @@ if __package__ in (None, ""):  # run as a file: put the repository root on sys.p
 from lu_machinery.common import json_depth
 from lu_machinery.common.git_context import sanitized_git_env
 from lu_machinery.common.repo_root import MachineryConfigError
-from lu_machinery.common.task_store_paths import tasks_dir
+from lu_machinery.common.task_store_paths import require_not_direct_task_store_path, tasks_dir
 from lu_machinery.fleet import claude_account_lane, credit_lane
 from lu_machinery.identity import UNKNOWN_AUTHOR_FAMILY, resolve_author_family
 from lu_machinery.review.evidence import compute_target_input_fingerprint
@@ -90,7 +90,15 @@ def _load_state(state_file: Path) -> dict:
     return state
 
 
+def _require_writable_path(path: Path, *, label: str) -> None:
+    try:
+        require_not_direct_task_store_path(path, label=label)
+    except ValueError as exc:
+        raise CloseoutStateError(str(exc)) from None
+
+
 def _save_state(state_file: Path, state: dict) -> None:
+    _require_writable_path(state_file, label="closeout state")
     state_file.parent.mkdir(parents=True, exist_ok=True)
     state_file.write_text(json.dumps(state, indent=2, sort_keys=True), encoding="utf-8")
 
@@ -910,6 +918,8 @@ def _cmd_behavior_proof_receipt(args: argparse.Namespace) -> int:
     """Write the Ukrainian receipt from the frozen proof and the live PR comments."""
     from lu_machinery.review.review_contract import ContractError, build_ukrainian_behavior_receipt
 
+    raw_receipt_path = args.state_file.with_name(f"{args.state_file.stem}.ukrainian-behavior-proof-receipt.json")
+    _require_writable_path(raw_receipt_path, label="behavior-proof receipt")
     state = _load_state(args.state_file)
     if state.get("baseline") is None:
         print(json.dumps({"error": "no frozen baseline yet — run `freeze` first"}), file=sys.stderr)

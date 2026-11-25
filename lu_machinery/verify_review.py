@@ -45,6 +45,7 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 from lu_machinery.common import json_depth
+from lu_machinery.common.task_store_paths import is_direct_task_store_path
 from lu_machinery.opsec.prepublish import publication_cli
 from lu_machinery.publish.github import Request, request_run
 from lu_machinery.review.evidence import build_target_manifest
@@ -144,7 +145,9 @@ def _receipt_path_allowed(path: Path) -> bool:
         return False
     if "review" in parts and path.name.endswith("-review.md"):
         return False
-    return "telemetry" not in parts
+    if "telemetry" in parts:
+        return False
+    return not is_direct_task_store_path(path)
 
 
 def _load_behavior_proof_state(
@@ -534,7 +537,8 @@ def main(argv: list[str] | None = None) -> int:
                     {
                         "error": (
                             "receipt_path_forbidden: do not write receipts under "
-                            "status/, audit/*-review.md, review/*-review.md, or telemetry/"
+                            "status/, audit/*-review.md, review/*-review.md, telemetry/, "
+                            "or directly in the task store (use <task>.artifacts/ instead)"
                         )
                     },
                     ensure_ascii=False,
