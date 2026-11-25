@@ -22,10 +22,10 @@ refused for that lane only: it is logged and the lane is not started. ``env``
 adds environment variables to the lane's tmux session. Values never appear in
 printed plans. ``cwd`` (with a ``wrapper`` only, since the generic launcher is a
 checkout-relative path) starts the lane's pane in that absolute existing
-directory instead of the checkout, for a lane whose session runs elsewhere (the
-CTO workspace)::
+directory instead of the checkout. The keeper starts the pane before invoking
+the wrapper, so the CTO workspace wrapper uses ``--here``::
 
-    {"lanes": {"cto": {"wrapper": "<lu-start-cto path>", "cwd": "<workspace directory>"}}}
+    {"lanes": {"cto": {"wrapper": ["<lu-start-cto path>", "--here"], "cwd": "<workspace directory>"}}}
 """
 
 from __future__ import annotations

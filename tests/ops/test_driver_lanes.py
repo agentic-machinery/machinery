@@ -248,8 +248,12 @@ def test_lane_cwd_override_needs_a_wrapper_and_an_absolute_existing_directory(tm
     workspace = tmp_path / "cto-workspace"
     workspace.mkdir()
     cto = dl.load_registry().by_session("cto")
-    overrides = dl.load_local_config(write_local(tmp_path, {"cto": {"wrapper": "lu-start-cto", "cwd": str(workspace)}}))
-    assert dl.launch_plan(cto, repo_root=tmp_path / "checkout", local=overrides).cwd == str(workspace)
+    overrides = dl.load_local_config(
+        write_local(tmp_path, {"cto": {"wrapper": ["lu-start-cto", "--here"], "cwd": str(workspace)}})
+    )
+    launch = dl.launch_plan(cto, repo_root=tmp_path / "checkout", local=overrides)
+    assert launch.cwd == str(workspace)
+    assert launch.argv == ("lu-start-cto", "--here")
     assert dl.launch_plan(cto, repo_root=tmp_path / "checkout", local={}).cwd == str(tmp_path / "checkout")
     for entry in ({"cwd": str(workspace)}, {"wrapper": "lu-start-cto", "cwd": "cto-workspace"},
                   {"wrapper": "lu-start-cto", "cwd": str(tmp_path / "absent")},

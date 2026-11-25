@@ -933,7 +933,7 @@ pytestmark = [pytest.mark.usefixtures('configured_roots'), pytest.mark.usefixtur
 # --------------------------------------------------------------------------- DETACH step 4b: CTO workspace
 
 # The workspace lu-start-cto template: the checkout template above with a LAUNCHER policy
-# line, LC_WORKSPACE_ROOT exported, and the installed package wrapper as the launch.
+# line, LC_WORKSPACE_ROOT set for the launch, and the installed package wrapper.
 _WORKSPACE_TEMPLATE = r"""#!/usr/bin/env bash
 set -euo pipefail
 REPO=@REPO@
@@ -967,15 +967,15 @@ CLAUDE_CONFIG_DIR=$DIR claude auth status 2>/dev/null | grep -q '"loggedIn": tru
   || { echo "refused: account $ACCT is not logged in; run: CLAUDE_CONFIG_DIR=$DIR claude, then /login" >&2; exit 4; }
 printf '%s\n' "$ACCT" > "$ACCT_FILE"
 export CLAUDE_CONFIG_DIR=$DIR
-export LC_WORKSPACE_ROOT=$REPO
 echo "CTO seat: Claude account $ACCT ($DIR)"
 
 LAUNCH=("$LAUNCHER" --epic epics --model "$MODEL" --effort "$EFFORT" "$KICK" -- --dangerously-skip-permissions --append-system-prompt "$(cat "$ROLE")")
 if [ "$HERE" = 1 ]; then
-  cd "$REPO" && exec "${LAUNCH[@]}"
+  cd "$REPO" && LC_WORKSPACE_ROOT="$REPO" exec "${LAUNCH[@]}"
 fi
 tmux has-session -t =cto 2>/dev/null && { echo "refused: tmux session cto exists (use --here inside it)" >&2; exit 3; }
-tmux new-session -d -s cto -c "$REPO" -e "CLAUDE_CONFIG_DIR=$DIR" -e "LC_WORKSPACE_ROOT=$REPO" "'$LAUNCHER' --epic epics --model $MODEL --effort $EFFORT \"$KICK\" -- --dangerously-skip-permissions --append-system-prompt \"\$(cat '$ROLE')\"; exec bash"
+env -u LC_WORKSPACE_ROOT tmux new-session -d -s cto -c "$REPO" -e "CLAUDE_CONFIG_DIR=$DIR" \
+  bash -c 'LC_WORKSPACE_ROOT="$1" "${@:2}"; exec bash' bash "$REPO" "${LAUNCH[@]}"
 echo "started; attach with: tmux attach -t cto"
 """
 
