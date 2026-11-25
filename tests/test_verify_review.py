@@ -1463,6 +1463,47 @@ def test_cli_receipt_path_refuses_direct_task_store_and_allows_task_artifacts(tm
         assert code_conv_ok == EXIT_CLEAN
         assert conv_allowed.is_file()
 
+    # Closed-list rows outside the task store: a dangling symlink, a directory at the target and a
+    # `missing/..` spelling are refused before anything is created; a spelling over the kernel's path
+    # limit is refused as given; an OSError while writing is a typed refusal, not a traceback.
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    dangling = outside / "dangling.json"
+    dangling.symlink_to(outside / "dangling-target.json")
+    dir_target = outside / "dir-target.json"
+    dir_target.mkdir()
+    for refused in (dangling, dir_target, outside / "missing" / ".." / "receipt.json"):
+        capsys.readouterr()
+        code_refused = verify_review_cli.main(
+            ["--review-file", str(review), *_cli_envelope_args(repo), "--receipt-path", str(refused)]
+        )
+        assert code_refused == EXIT_INVALID, f"expected EXIT_INVALID for {refused}"
+        assert "receipt_path_unwritable" in capsys.readouterr().err
+    capsys.readouterr()
+    with pytest.raises(SystemExit) as too_long:
+        verify_review_cli.main(
+            ["--review-file", str(review), *_cli_envelope_args(repo), "--receipt-path", f"{outside}{'/' * 5000}r.json"]
+        )
+    assert too_long.value.code == 2
+    assert "path limit" in capsys.readouterr().err
+
+    disk_full = outside / "disk-full.json"
+    original_write_text = Path.write_text
+
+    def _write_text(self, *args, **kwargs):
+        if self == disk_full:
+            raise OSError(28, "No space left on device")
+        return original_write_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "write_text", _write_text)
+    code_full = verify_review_cli.main(
+        ["--review-file", str(review), *_cli_envelope_args(repo), "--receipt-path", str(disk_full)]
+    )
+    assert code_full == EXIT_INVALID
+    assert "receipt_path_unwritable" in capsys.readouterr().err
+    assert sorted(path.name for path in outside.iterdir()) == ["dangling.json", "dir-target.json"]
+    assert list(dir_target.iterdir()) == []
+
 
 def test_cli_issue_mode_posts_opt_in_comment(tmp_path, monkeypatch, capsys):
     repo = _init_repo(tmp_path)

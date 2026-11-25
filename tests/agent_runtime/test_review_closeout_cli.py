@@ -1701,3 +1701,24 @@ def test_closeout_cli_refuses_direct_task_store_writes_and_reads_existing_legacy
     dot_receipt_proc = _run_cli(Path("."), "behavior-proof", "receipt")
     assert dot_receipt_proc.returncode == 2
     assert "not a writable file path" in dot_receipt_proc.stderr
+
+    # Closed-list rows outside the task store: a dangling symlink, a directory at the target, a
+    # `missing/..` spelling and a spelling over the kernel's path limit each end in a typed refusal
+    # with nothing created (the last is passed as a string so Path cannot collapse its separators).
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    dangling = outside / "dangling.json"
+    dangling.symlink_to(outside / "dangling-target.json")
+    dir_target = outside / "dir-target.json"
+    dir_target.mkdir()
+    for refused, returncode, reason in (
+        (dangling, 1, "state_unwritable"),
+        (dir_target, 1, "state_unreadable"),
+        (outside / "missing" / ".." / "state.json", 1, "state_unwritable"),
+        (f"{outside}{'/' * 5000}state.json", 2, "path limit"),
+    ):
+        refused_proc = _run_cli(refused, "target", "--mode", "local", "--repo-root", str(repo))
+        assert refused_proc.returncode == returncode, f"expected exit {returncode} for {str(refused)[:80]}"
+        assert reason in refused_proc.stderr
+    assert sorted(path.name for path in outside.iterdir()) == ["dangling.json", "dir-target.json"]
+    assert list(dir_target.iterdir()) == []

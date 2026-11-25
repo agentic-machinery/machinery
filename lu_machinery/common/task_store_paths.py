@@ -283,6 +283,8 @@ def write_path_spelling_error(raw: str) -> str | None:
     Checked on the string as given, because ``Path`` drops a trailing ``/``, ``/.`` or ``/..``
     (``out.json/`` would become ``out.json``). An unexpanded leading ``~`` (an unknown user or a
     quoted tilde) is refused rather than becoming a directory named ``~`` in the working directory.
+    A spelling at or over the kernel's path limit is refused too: no lookup through it succeeds,
+    while ``Path`` would collapse its repeated separators into a shorter path that does.
     """
     if not raw or raw.rsplit(os.sep, 1)[-1] in {"", ".", ".."}:
         return "empty file name, or a trailing '/', '.' or '..'"
@@ -290,6 +292,12 @@ def write_path_spelling_error(raw: str) -> str | None:
         return "unexpanded '~' home directory"
     if "\x00" in raw:
         return "NUL byte"
+    try:
+        path_max = os.pathconf(os.sep, "PC_PATH_MAX")
+    except (OSError, ValueError):
+        return "the kernel's path length limit is unavailable"
+    if len(os.fsencode(raw)) >= path_max:
+        return f"{len(os.fsencode(raw))} bytes, at or over the kernel's {path_max}-byte path limit"
     return None
 
 
@@ -303,6 +311,10 @@ def write_path_argument(value: str) -> Path:
 
 def kernel_follows_write_path(path: Path | str) -> bool:
     """Whether the kernel can follow ``path``'s nearest existing ancestor (``path`` itself if it exists).
+
+    An existing ``path`` must not be a directory (or a symlink to one), and a dangling symlink is
+    refused. Any other existing file (a FIFO, ``/dev/null``, ``/dev/stdout``) is written as the
+    kernel opens it, as any Unix tool would.
 
     ``os.path.realpath`` collapses ``missing/..`` and drops a trailing ``/`` in a symlink target, so
     a spelling the kernel cannot follow (a symlink to ``file.json/`` or to ``missing/../dir``) can
@@ -330,7 +342,12 @@ def kernel_follows_write_path(path: Path | str) -> bool:
         except (OSError, ValueError):
             # ENAMETOOLONG, ENOTDIR, EACCES or ELOOP on the spelling itself: a later lookup through it fails too.
             return False
-        return os.path.exists(probe) if leaf else os.path.isdir(probe)
+        if not leaf:
+            return os.path.isdir(probe)
+        try:
+            return not stat.S_ISDIR(os.stat(probe).st_mode)
+        except (OSError, ValueError):
+            return False
 
 
 def require_not_direct_task_store_path(
@@ -339,6 +356,6 @@ def require_not_direct_task_store_path(
     """Refuse writing a non-record file directly inside the task store or its archive."""
     if is_direct_task_store_path(path, store_dir=store_dir):
         raise ValueError(
-            f"task_store_direct_write_refused: refusing to write {label} directly in the task store "
-            f"({path}); write it under <task>.artifacts/ instead"
+            f"task_store_direct_write_refused: refusing to write {label} directly in the task store, or at a "
+            f"path whose place relative to it cannot be checked ({path}); write it under <task>.artifacts/ instead"
         )

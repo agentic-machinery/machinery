@@ -3745,3 +3745,17 @@ def test_write_lifecycle_and_lock_refuse_direct_task_store_and_load_reads_existi
     too_long = f"{orig_path.parent}{'/' * 5000}{orig_path.name}"
     assert task_closeout.main(["bind-pr", "--state-file", too_long, "--pr", "77", "--now", NOW]) == 2
     assert orig_path.read_bytes() == before
+
+    # A dangling symlink outside the store and a directory at the target are refused before any lock or write.
+    dangling_outside = tmp_path / "dangling-ledger.json"
+    dangling_outside.symlink_to(tmp_path / "dangling-ledger-target.json")
+    dir_target = tmp_path / "dir-ledger.json"
+    dir_target.mkdir()
+    for refused in (dangling_outside, dir_target):
+        with pytest.raises(task_lifecycle.LifecycleError, match="a directory at the target, or a component"):
+            task_lifecycle.write_lifecycle(refused, ledger)
+        assert task_closeout.main(["bind-pr", "--state-file", str(refused), "--pr", "77", "--now", NOW]) == 2
+    assert not (tmp_path / "dangling-ledger-target.json").exists()
+    assert not (tmp_path / "dangling-ledger.json.lock").exists()
+    assert not (tmp_path / "dir-ledger.json.lock").exists()
+    assert list(dir_target.iterdir()) == []

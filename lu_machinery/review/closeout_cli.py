@@ -104,6 +104,10 @@ def _require_writable_path(path: Path, *, label: str) -> None:
 
 def _save_state(state_file: Path, state: dict) -> None:
     _require_writable_path(state_file, label="closeout state")
+    if not kernel_follows_write_path(state_file):
+        raise CloseoutStateError(
+            f"state_unwritable: {state_file} is a directory, or a component of it cannot be followed"
+        )
     try:
         state_file.parent.mkdir(parents=True, exist_ok=True)
         state_file.write_text(json.dumps(state, indent=2, sort_keys=True), encoding="utf-8")
@@ -992,7 +996,9 @@ def _cmd_behavior_proof_receipt(args: argparse.Namespace) -> int:
     # Re-validate and resolve once before writing so a relative --state-file prints a path reconciliation accepts.
     _require_writable_path(raw_receipt_path, label="behavior-proof receipt")
     if not kernel_follows_write_path(raw_receipt_path):
-        raise CloseoutStateError(f"receipt_unwritable: a component of {raw_receipt_path} cannot be followed")
+        raise CloseoutStateError(
+            f"receipt_unwritable: {raw_receipt_path} is a directory, or a component of it cannot be followed"
+        )
     receipt_path = raw_receipt_path.resolve()
     _require_writable_path(receipt_path, label="behavior-proof receipt")
     receipt_bytes = (json.dumps(receipt, ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode()

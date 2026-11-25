@@ -1338,7 +1338,8 @@ def _validate_lifecycle_write_path(path: Path | str, *, label: str) -> None:
     state root, and ``task_closeout`` checks a mutating ``--state-file`` here before resolving it.
     A string keeps a trailing ``/``, ``/.`` or ``/..`` that ``Path`` would drop, so it is checked
     as given. A component the kernel cannot follow is refused too, so a caller that resolves the
-    path first never writes where its own spelling cannot be read back.
+    path first never writes where its own spelling cannot be read back, and so is an existing
+    directory at the target.
     """
     raw = os.fspath(path)
     reason = write_path_spelling_error(raw)
@@ -1348,7 +1349,10 @@ def _validate_lifecycle_write_path(path: Path | str, *, label: str) -> None:
         raise LifecycleError(f"invalid {label} path ({reason} refused): {raw!r}")
     _require_not_direct_task_store(Path(raw), label=label)
     if not kernel_follows_write_path(raw):
-        raise LifecycleError(f"invalid {label} path (a component the kernel cannot follow refused): {raw!r}")
+        raise LifecycleError(
+            f"invalid {label} path (a directory at the target, or a component the kernel cannot follow, "
+            f"refused): {raw!r}"
+        )
 
 
 def write_lifecycle(path: Path, payload: Mapping[str, Any]) -> None:

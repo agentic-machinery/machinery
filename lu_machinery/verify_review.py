@@ -45,7 +45,11 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 from lu_machinery.common import json_depth
-from lu_machinery.common.task_store_paths import is_direct_task_store_path, write_path_argument
+from lu_machinery.common.task_store_paths import (
+    is_direct_task_store_path,
+    kernel_follows_write_path,
+    write_path_argument,
+)
 from lu_machinery.opsec.prepublish import publication_cli
 from lu_machinery.publish.github import Request, request_run
 from lu_machinery.review.evidence import build_target_manifest
@@ -539,6 +543,20 @@ def main(argv: list[str] | None = None) -> int:
                             "receipt_path_forbidden: do not write receipts under "
                             "status/, audit/*-review.md, review/*-review.md, telemetry/, "
                             "or directly in the task store (use <task>.artifacts/ instead)"
+                        )
+                    },
+                    ensure_ascii=False,
+                ),
+                file=sys.stderr,
+            )
+            return EXIT_INVALID
+        if not kernel_follows_write_path(args.receipt_path):
+            print(
+                json.dumps(
+                    {
+                        "error": (
+                            f"receipt_path_unwritable: {args.receipt_path} is a directory, "
+                            "or a component of it cannot be followed"
                         )
                     },
                     ensure_ascii=False,
