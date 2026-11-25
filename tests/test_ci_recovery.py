@@ -856,6 +856,8 @@ def test_cancelled_merge_group_no_artifact_recovers_via_dequeue_and_enqueue(setu
         "run_id": 123,
         "job_ids": [] if mode == "zero-cancelled-jobs" else [456],
         "tested_sha": TESTED,
+        "diagnosis": "infrastructure",
+        "undermines_approval": False,
         "failure_evidence": "merge-group run cancelled by GitHub during repository transfer; no test node failed",
         "unrelated_to_diff": "GitHub cancelled the in-flight merge-group run before CI Gate uploaded ci-queue-candidate",
     }
@@ -923,6 +925,11 @@ def test_cancelled_merge_group_no_artifact_recovers_via_dequeue_and_enqueue(setu
         ("artifact-missing-name", "RECOVERY_LOOKUP_UNKNOWN"),
         ("artifact-blank-name", "RECOVERY_LOOKUP_UNKNOWN"),
         ("failed-tests-in-evidence", "RECOVERY_TEST_FAILURE_FORBIDDEN"),
+        ("missing-infra-diagnosis", "RECOVERY_INFRA_DIAGNOSIS_REQUIRED"),
+        ("missing-undermines-approval", "RECOVERY_REVIEW_DISPOSITION_REQUIRED"),
+        ("empty-jobs-missing-infra-diagnosis", "RECOVERY_INFRA_DIAGNOSIS_REQUIRED"),
+        ("conflicting-pr-association", "RECOVERY_PR_UNKNOWN"),
+        ("pr-merge-conflicting-pr-association", "RECOVERY_PR_UNKNOWN"),
         ("queue-disabled", "RECOVERY_QUEUE_REQUIRED"),
         ("unready-pr", "OPSEC: merge refused"),
         ("unapproved-pr", "RECOVERY_APPROVAL_MISSING"),
@@ -932,7 +939,7 @@ def test_cancelled_merge_group_no_artifact_recovers_via_dequeue_and_enqueue(setu
     ],
 )
 def test_cancelled_merge_group_no_artifact_refuses_on_failure_or_invalid_state(setup, case, expected_error):
-    """Defect class: still-queued PR, failing job/step, wrong workflow, incomplete pagination/rows, non-cancelled run, failed_tests, or unmet merge gates refuse without spending allowance."""
+    """Defect class: still-queued PR, failing job/step, wrong workflow, incomplete pagination/rows, non-cancelled run, missing infra diagnosis, conflicting PR identity, failed_tests, or unmet merge gates refuse without spending allowance."""
     root, transport = setup
     transport.event = "merge_group"
     transport.conclusion = "cancelled"
@@ -948,6 +955,8 @@ def test_cancelled_merge_group_no_artifact_refuses_on_failure_or_invalid_state(s
         "run_id": 123,
         "job_ids": [456],
         "tested_sha": TESTED,
+        "diagnosis": "infrastructure",
+        "undermines_approval": False,
         "failure_evidence": "cancelled by GitHub",
         "unrelated_to_diff": "repository transfer cancelled run",
     }
@@ -998,6 +1007,18 @@ def test_cancelled_merge_group_no_artifact_refuses_on_failure_or_invalid_state(s
         transport.artifacts_response = {"total_count": 1, "artifacts": [{"id": 77, "name": "   ", "expired": False}]}
     elif case == "failed-tests-in-evidence":
         transport.proof["failed_tests"] = ["tests/test_x.py::test_fail"]
+    elif case == "missing-infra-diagnosis":
+        del transport.proof["diagnosis"]
+    elif case == "missing-undermines-approval":
+        del transport.proof["undermines_approval"]
+    elif case == "empty-jobs-missing-infra-diagnosis":
+        transport.jobs = [
+            {"id": 100, "status": "completed", "conclusion": "success", "steps": [{"name": "pytest", "conclusion": "success"}]},
+        ]
+        transport.proof["job_ids"] = []
+        del transport.proof["diagnosis"]
+    elif case in {"conflicting-pr-association", "pr-merge-conflicting-pr-association"}:
+        transport.associations = [{"number": 99}]
     elif case == "queue-disabled":
         transport.merge_queue_enabled = False
     elif case == "unready-pr":
@@ -1017,7 +1038,7 @@ def test_cancelled_merge_group_no_artifact_refuses_on_failure_or_invalid_state(s
             job_ids=[456, 457], diagnosis="infrastructure", undermines_approval=False, failed_tests=[]
         )
 
-    if case == "pr-merge-failing-job":
+    if case in {"pr-merge-failing-job", "pr-merge-conflicting-pr-association"}:
         with pytest.raises(gate.PublishBlocked, match=expected_error):
             pub.publish(
                 "pr-merge",

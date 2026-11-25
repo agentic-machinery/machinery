@@ -921,6 +921,15 @@ def _prepare_recovery(verb, fields, dest, cwd, environment, runner):
         except Exception:
             raise gate.PublishBlocked(unknown) from None
 
+    def _merge_group_associations_consistent(associations: object, pr_number: int) -> bool:
+        return associations in (None, []) or (
+            isinstance(associations, list)
+            and len(associations) == 1
+            and isinstance(associations[0], dict)
+            and type(associations[0].get("number")) is int
+            and associations[0]["number"] == pr_number
+        )
+
     if verb == "run-rerun":
         run_id = fields["number"]
         run = fetch("run", number=run_id)
@@ -932,10 +941,15 @@ def _prepare_recovery(verb, fields, dest, cwd, environment, runner):
             return None
         if run.get("status") != "completed" or run.get("conclusion") not in {"failure", "cancelled", "timed_out", "action_required"}:
             raise gate.PublishBlocked("RECOVERY_RUN_INVALID: completed failed run required")
-        if isinstance(associations, list) and len(associations) == 1:
+        if run.get("event") == "merge_group":
+            branch_pr = extract_pr_number(run.get("head_branch", ""))
+            number = (
+                branch_pr
+                if type(branch_pr) is int and branch_pr > 0 and _merge_group_associations_consistent(associations, branch_pr)
+                else None
+            )
+        elif isinstance(associations, list) and len(associations) == 1 and isinstance(associations[0], dict):
             number = associations[0].get("number")
-        elif run.get("event") == "merge_group":
-            number = extract_pr_number(run.get("head_branch", ""))
         else:
             number = None
         if type(number) is not int or number <= 0:
@@ -961,6 +975,8 @@ def _prepare_recovery(verb, fields, dest, cwd, environment, runner):
             raise gate.PublishBlocked("RECOVERY_RUN_INVALID: completed failed run required")
         if extract_pr_number(run.get("head_branch", "")) != number:
             raise gate.PublishBlocked("RECOVERY_PR_UNKNOWN: merge_group run does not identify this PR")
+        if not _merge_group_associations_consistent(run.get("pull_requests"), number):
+            raise gate.PublishBlocked("RECOVERY_PR_UNKNOWN: merge_group run has conflicting PR associations")
         if not isinstance(head, str) or not recovery.SHA.fullmatch(head):
             raise gate.PublishBlocked("RECOVERY_HEAD_UNKNOWN: open PR head required")
         action = "re-enqueue"
@@ -1023,7 +1039,7 @@ def _prepare_recovery(verb, fields, dest, cwd, environment, runner):
         if (
             not jobs_complete
             or not recovery.cancelled_merge_group_without_failure(
-                failed_run, jobs_check, required_workflow=required_workflow
+                failed_run, jobs_check, required_workflow=required_workflow, pr_number=number
             )
             or any(
                 isinstance(job, dict) and job.get("conclusion") in failure_conclusions
@@ -1040,7 +1056,7 @@ def _prepare_recovery(verb, fields, dest, cwd, environment, runner):
             head,
             authenticated_login=login,
             run_id=run_id,
-            require_infra_diagnosis=require_infra_diagnosis,
+            require_infra_diagnosis=True,
             allow_empty_jobs=True,
         )
         cancelled_no_artifact = True
@@ -1065,12 +1081,13 @@ def _prepare_recovery(verb, fields, dest, cwd, environment, runner):
         candidate_matches = [row for row in listing["artifacts"] if row.get("name") == "ci-queue-candidate"]
         if not candidate_matches:
             if jobs_complete and recovery.cancelled_merge_group_without_failure(
-                failed_run, jobs, required_workflow=required_workflow
+                failed_run, jobs, required_workflow=required_workflow, pr_number=number
             ):
                 cancelled_no_artifact = True
             else:
                 raise gate.PublishBlocked("RECOVERY_LOOKUP_UNKNOWN: live evidence unavailable")
     if cancelled_no_artifact:
+        recovery.require_infra_diagnosis_evidence(evidence)
         action = "re-enqueue"
         evidence = {**evidence, "recovery_mode": recovery.CANCELLED_MERGE_GROUP_RECOVERY_MODE}
     elif failed_run.get("event") == "merge_group":
@@ -5290,7 +5307,8 @@ def _parse_args(argv):
                 "  It consumes the one PR-head recovery allowance for reruns before sending the write.\n"
                 "  A completed cancelled merge_group run of the configured CI workflow with no failing job or step and\n"
                 "  no ci-queue-candidate artifact recovers instead through the same one-per-head allowance by enqueueing\n"
-                "  once at the approved PR head after the merge-readiness gates pass (when still queued, it refuses with\n"
+                "  once at the approved PR head after the merge-readiness gates pass and the posted evidence carries\n"
+                "  diagnosis=\"infrastructure\" and undermines_approval=false (when still queued, it refuses with\n"
                 "  RECOVERY_STILL_QUEUED without consuming the allowance so the owner can run pr-dequeue manually).\n"
                 "  An unclassified run lookup failure stays RECOVERY_LOOKUP_UNKNOWN, sends no write and consumes no allowance.\n"
                 "Exit codes: 0 request accepted, job results unverified; 1 gh failure;\n"
