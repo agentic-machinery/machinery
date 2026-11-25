@@ -289,19 +289,23 @@ def classify_task_object(
     task_id = record.get("task_id")
     review_flagged = (any(record.get(name) not in (None, False, "", []) for name in REVIEW_TASK_FLAG_FIELDS)
                       or bool(record.get("review_mode") or record.get("type") == "review"))
-    legacy = "schema_version" not in record and (
+    record_markers = (
         any(key in record for key in (
             "run_nonce", "worktree_path", "cwd", "acp_runtime_paths", "worktree_prep",
-            "review_attempt", "review_contract", "worktree_branch", "branch", "authoring_review_admission"
+            "review_attempt", "review_contract", "worktree_branch", "branch", "authoring_review_admission",
+            "parent_task_id", "parent_run_nonce",
         )) or ("agent" in record and "status" in record)
         # Review flags alone (a PR number, review mode or profile) also mark review tools' receipts:
         # closeout, landing-report, resolver and scope output. A legacy record that lacks a task_id
         # still names its repository, status or agent, as every run record does.
         or (review_flagged and any(key in record for key in ("task_id", "repository", "status", "agent")))
     )
+    legacy = "schema_version" not in record and record_markers
     receipt = ("schema" in record and "schema_version" not in record
                and isinstance(task_id, str) and not candidate_task_record_names(task_id, (path.name,)))
-    if (receipt and not legacy) or not ("task_id" in record or isinstance(record.get("schema_version"), int) or legacy):
+    if (receipt and not legacy) or not (
+        "task_id" in record or isinstance(record.get("schema_version"), int) or record_markers
+    ):
         return None
     if "schema_version" in record and (type(record["schema_version"]) is not int
                                        or record["schema_version"] not in {1, 2}):

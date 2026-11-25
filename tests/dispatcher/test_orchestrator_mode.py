@@ -2334,6 +2334,112 @@ def test_scope_runtime_max_stop_labels_timeout_not_client_cancel(task_store, tmp
     assert "RuntimeMaxSec" in late["error"]
 
 
+def test_scan_turn_children_skips_foreign_json_and_fails_closed_on_damaged_records(
+    task_store, tmp_path, monkeypatch
+):
+    """Defect class: foreign non-record JSON objects (such as *-ac-policy.json, receipts, or []) in hot or
+    archived task stores are counted as unreadable by _scan_turn_children, blocking turn completion and lease
+    release; damaged, non-strict, non-object or invalid-identity files must still fail closed."""
+    cli = _fake_driver_state_cli(tmp_path, {"n1": _fresh_note("n1")})
+    monkeypatch.setenv(store.DRIVER_STATE_CLI_ENV, str(cli))
+    envelope = {"monitor": "http://127.0.0.1:8765", "lease": {"stream_id": STREAM}}
+    releases: list[tuple] = []
+    monkeypatch.setattr(host_admission, "release_turn", lambda lease, **kwargs: releases.append((lease, kwargs)))
+    monkeypatch.setattr(worker, "_provider_alive", lambda _record: False)
+
+    turn = _settled(**{**_LAUNCHED, "launch_unit": "lu-worker-turn", "turn_lease": envelope})
+    _write(turn)
+    full_nonce = "a1b2c3d4e5f60718293a4b5c6d7e8f90"
+    _write(dict(
+        schema_version=2, task_id="child-settled", agent="claude", mode="workspace-write",
+        status="done", run_nonce=full_nonce, parent_task_id=turn["task_id"],
+        parent_run_nonce=turn["run_nonce"], parent_stream=STREAM,
+        launch_mode="scope", pid=_DEAD_PID, process_start="boot:1",
+        launch_unit="lu-worker-child-settled", worktree_disposition="removed",
+    ))
+
+    # Foreign non-record JSON files in hot and archive stores must be skipped, not counted unreadable.
+    (task_store / "child-ac-policy.json").write_text(
+        json.dumps({"schema": "ac-policy.v1", "rules": []}), encoding="utf-8"
+    )
+    (task_store / "turn.review-state.json").write_text(
+        json.dumps({"round": 1, "pr": 42}), encoding="utf-8"
+    )
+    (task_store / "other-receipt.json").write_text(
+        json.dumps({"schema": "proof.v1", "task_id": "unrelated-task"}), encoding="utf-8"
+    )
+    (task_store / "review-findings.json").write_text(
+        json.dumps({"schema_version": "code-review-findings.v1", "findings": []}), encoding="utf-8"
+    )
+    (task_store / "empty-list.json").write_text("[]", encoding="utf-8")
+    arch_dir = task_store / "archive"
+    arch_dir.mkdir()
+    (arch_dir / "archived-ac-policy.json").write_text(
+        json.dumps({"schema": "ac-policy.v1", "archived": True}), encoding="utf-8"
+    )
+    (arch_dir / "archived-empty-list.json").write_text("[]", encoding="utf-8")
+
+    scan_clean = worker._scan_turn_children(turn)
+    assert scan_clean == {
+        "children": [{"task_id": "child-settled", "run_nonce": full_nonce, "status": "done"}],
+        "live": [],
+        "unknown": [],
+        "unreadable": [],
+    }
+    worker._enforce_delivery(turn)
+    store.replace(turn)
+    worker._release_stream(turn, evidence_lost=False)
+    assert turn["status"] == "done"
+    assert "unreadable_child_records" not in turn
+    assert len(releases) == 1
+
+    # Damaged, non-strict, non-object, symlinked, and invalid-identity/invalid-schema files fail closed.
+    (task_store / "bad-truncated.json").write_text("{", encoding="utf-8")
+    (task_store / "bad-blank.json").write_text("   \n", encoding="utf-8")
+    (task_store / "bad-array.json").write_text("[1, 2]", encoding="utf-8")
+    (task_store / "bad-scalar.json").write_text("123", encoding="utf-8")
+    (task_store / "bad-foreign-nan.json").write_text('{"x": NaN}', encoding="utf-8")
+    (task_store / "bad-legacy-no-id.json").write_text(
+        json.dumps({"agent": "claude", "status": "running"}), encoding="utf-8"
+    )
+    # R1-F1 defect class: a .json symlink to a regular foreign JSON file must still fail closed.
+    foreign_target = tmp_path / "external-foreign.json"
+    foreign_target.write_text(json.dumps({"schema": "ac-policy.v1", "rules": []}), encoding="utf-8")
+    (task_store / "bad-symlink-foreign.json").symlink_to(foreign_target)
+    (arch_dir / "arch-symlink-foreign.json").symlink_to(foreign_target)
+    # R1-F2 defect class: a partial child record with an invalid string schema_version and lifecycle fields
+    # (missing task_id) must fail closed rather than being classified foreign.
+    partial_bad_schema = json.dumps({
+        "schema_version": "2", "parent_task_id": turn["task_id"], "status": "running", "run_nonce": "rn-partial",
+    })
+    (task_store / "bad-partial-schema.json").write_text(partial_bad_schema, encoding="utf-8")
+    (arch_dir / "arch-partial-schema.json").write_text(partial_bad_schema, encoding="utf-8")
+    (arch_dir / "arch-array-record.json").write_text('[{"task_id": "c1"}]', encoding="utf-8")
+    (arch_dir / "arch-foreign-inf.json").write_text('{"x": Infinity}', encoding="utf-8")
+    (arch_dir / "arch-legacy-no-id.json").write_text(
+        json.dumps({"agent": "claude", "status": "done"}), encoding="utf-8"
+    )
+
+    scan_bad = worker._scan_turn_children(turn)
+    assert scan_bad["unreadable"] == sorted([
+        "bad-truncated.json",
+        "bad-blank.json",
+        "bad-array.json",
+        "bad-scalar.json",
+        "bad-foreign-nan.json",
+        "bad-legacy-no-id.json",
+        "bad-symlink-foreign.json",
+        "bad-partial-schema.json",
+        "archive/arch-symlink-foreign.json",
+        "archive/arch-partial-schema.json",
+        "archive/arch-array-record.json",
+        "archive/arch-foreign-inf.json",
+        "archive/arch-legacy-no-id.json",
+    ])
+    refusal = worker._child_state_refusal(scan_bad)
+    assert refusal is not None and refusal.startswith("orchestrator_orphaned_children:")
+
+
 def _release(box, task_id):
     (box.tasks / f"{task_id}.release").write_text("go")
 
