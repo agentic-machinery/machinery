@@ -372,19 +372,17 @@ class CanonicalPublicRepository:
         if destination == "unknown":
             return None
         gate.catalog()  # An unreadable allowlist refuses the push, as before.
-        # The destination must be its row's active slug: the default head read below is then the
-        # destination's own, so the excluded history is already in the repository pushed to.
         try:
             entry = _fleet_catalog_entry(destination, self.environment)
         except gate.PublishBlocked:
             # An inactive or ambiguous spelling, a malformed row or an untrusted selector proves no public history.
             return None
-        if entry is not None:
-            # Keep the registered-destination rule: exactly one public row.
-            if not str(entry[1].get("role", "")).startswith("public-"):
-                return None
-            self.repo = gate.normalize_repository(entry[0].active_github)
-            return self
+        if entry is not None and gate.normalize_repository(entry[0].repo.github) == destination:
+            # Keep the registered-destination rule at the row's baked github slug: exactly one public row.
+            return self if str(entry[1].get("role", "")).startswith("public-") else None
+        # Any other spelling, a moved row's active alternate slug included, proves neither live public
+        # visibility nor the push receiver, so like an unregistered destination it may only exclude
+        # the history of a verified public fork parent.
         if gate.normalize_repository(destination) != destination:
             return None
         host, owner, name = destination.split("/")
