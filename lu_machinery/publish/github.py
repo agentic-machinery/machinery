@@ -3621,20 +3621,17 @@ def _dismiss_preflight(fields, gh_repo, dest, runner, cwd, environment, *, temp=
 
     links: list[str] = []
     prose: list[str] = []
+    https_scheme_case = str.maketrans("HTPS", "htps")
 
     def record_text(content: str, *, bare_links: bool) -> None:
         for word in content.split():
-            scheme_end = word.find("://")
-            start = scheme_end - len("https")
-            if (
-                start < 0
-                or word[start:scheme_end].lower() != "https"
-                or (start > 0 and word[start - 1] not in "([{\"'“‘*_~")
-            ):
+            start = word.translate(https_scheme_case).find("https://")
+            if start == -1:
                 prose.append(word)
                 continue
+            # URL text cannot explain the dismissal, even when it cannot bind a PR.
             prose.append(word[:start])
-            if bare_links:
+            if bare_links and (start == 0 or word[start - 1] in "([{\"'“‘*_~"):
                 candidate = word[start:].partition("<")[0]
                 links.append(candidate.rstrip(".,;:!?*)]}_\"'”’~…"))
 

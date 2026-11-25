@@ -602,6 +602,18 @@ def test_dismissal_binds_either_baked_slug_of_the_repository(dismissal_transport
     {"comment": "Alert #1 https://github.com/unit/public/pull/2"},
     {"comment": "Alert #1 <https://github.com/unit/public/pull/2>"},
     {"comment": "Alert #1 [](<https://github.com/unit/public/pull/2> \"review\")"},
+    pytest.param(
+        {"comment": "Alert #1 <https://github.com/unit/public/pull/2> ;https://github.com/unit/public/pull/2"},
+        id="semicolon-url-is-not-explanation",
+    ),
+    pytest.param(
+        {"comment": "Alert #1 <https://github.com/unit/public/pull/2> :https://github.com/unit/public/pull/2/files"},
+        id="colon-url-is-not-explanation",
+    ),
+    pytest.param(
+        {"comment": "Alert #1 <https://github.com/unit/public/pull/2> ://HTTPS://github.com/unit/public/pull/2"},
+        id="preceding-delimiter-and-uppercase-url-is-not-explanation",
+    ),
     {"comment": "Alert #1 public data. https://github.com/unit/public/pull/2/other"},
 ])
 def test_dismissal_rejects_open_payload_and_unbound_comments(dismissal_transport, change):
