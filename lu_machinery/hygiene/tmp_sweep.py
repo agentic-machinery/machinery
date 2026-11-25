@@ -90,7 +90,12 @@ from lu_machinery.hygiene.tmp_sweep_ledger import (
     utc_iso,
     validate_state_dir,
 )
-from lu_machinery.orchestration.task_record_store import _is_dispatcher_sidecar, parse_task_record, task_record_path
+from lu_machinery.orchestration.task_record_store import (
+    _is_dispatcher_sidecar,
+    classify_task_object,
+    parse_task_record,
+    task_record_path,
+)
 from lu_machinery.orchestration.tmp_leak_sweep import (
     _process_state,
     _process_vanished,
@@ -219,7 +224,8 @@ def _carries_task_identity(path: Path, raw: bytes) -> bool:
         return False
     bare = {key: value for key, value in data.items() if key not in {"schema", "schema_version"}}
     try:
-        return parse_task_record(path, json.dumps(bare).encode()) is not None
+        # Classify the decoded object: re-encoding turns a valid out-of-range number into Infinity (#1440).
+        return classify_task_object(path, bare) is not None
     except ValueError:
         return True
 
