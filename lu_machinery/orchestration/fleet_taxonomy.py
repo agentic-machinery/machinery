@@ -73,10 +73,10 @@ def load_fleet_taxonomy(taxonomy_path: Path | None = None) -> TaxonomyRegistry:
             taxonomy_path = default_taxonomy_path()
         except profile.ProfileError as exc:
             raise FleetTaxonomyError(f"Fleet taxonomy unavailable: {exc}") from exc
-    path = taxonomy_path.resolve()
     try:
+        path = taxonomy_path.resolve()
         content = path.read_bytes()
-    except OSError as exc:
+    except (OSError, RuntimeError) as exc:
         raise FleetTaxonomyError(f"Fleet taxonomy file not found or unreadable: {exc}") from exc
     return _parse_fleet_taxonomy(path, content)
 

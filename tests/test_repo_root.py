@@ -1451,6 +1451,14 @@ def test_registry_loaders_resolve_profile_config_at_call_time(unconfigured, tmp_
         assert driver_agent_type.main(["--lane", "beta-area"]) == 2
         _, _, external_roster = fleet_router._fleet_seat_roster()
         assert external_roster == "unavailable"
+
+        # F2 (PR 1476 r1): YAML constructor failures (e.g. !!int "") in profile succession map raise ValueError.
+        (profile_b.parent / "terminal_abandon_succession.yaml").write_text(
+            'schema: terminal-abandon-succession-map.v1\nstreams:\n  "epic:1":\n    initiators: [!!int ""]\n',
+            encoding="utf-8",
+        )
+        with pytest.raises(ValueError, match="succession map unreadable"):
+            ignored_task_output.succession_streams()
     finally:
         git_credentials.repository_registry.cache_clear()
 

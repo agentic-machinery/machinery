@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import functools
+import os
 import sys
 from pathlib import Path
 
@@ -59,10 +60,15 @@ def _parse_assignments(path: Path, content: bytes) -> dict[str, tuple[str, tuple
 def _canonical_area_for_alias(lane: str, taxonomy_path: Path) -> str | None:
     """Map a stream alias to its canonical area id via ``fleet_taxonomy.yaml``.
 
-    An absent file has no aliases; invalid content raises :class:`DriverAgentConfigError`.
+    An absent file has no aliases; unreadable paths, dangling symlinks and invalid content
+    raise :class:`DriverAgentConfigError`.
     """
-    if not taxonomy_path.exists() and not taxonomy_path.is_symlink():
+    try:
+        os.lstat(taxonomy_path)
+    except FileNotFoundError:
         return None
+    except OSError as exc:
+        raise DriverAgentConfigError(f"cannot inspect {taxonomy_path}: {exc}") from exc
     try:
         area = load_fleet_taxonomy(taxonomy_path).alias_to_area.get(lane)
     except FleetTaxonomyError as exc:
@@ -82,15 +88,18 @@ def resolve_driver_agent_type(
         return None
     resolved_assignments = _default_assignments_path() if assignments_path is None else assignments_path
     try:
-        content = resolved_assignments.read_bytes()
+        os.lstat(resolved_assignments)
     except FileNotFoundError:
-        if resolved_assignments.is_symlink():
-            raise DriverAgentConfigError(f"{resolved_assignments} is a dangling symlink") from None
         return None
     except OSError as exc:
+        raise DriverAgentConfigError(f"cannot inspect {resolved_assignments}: {exc}") from exc
+    try:
+        content = resolved_assignments.read_bytes()
+        resolved_key = resolved_assignments.resolve()
+    except (OSError, RuntimeError) as exc:
         raise DriverAgentConfigError(f"cannot read {resolved_assignments}: {exc}") from exc
 
-    assignments = _parse_assignments(resolved_assignments.resolve(), content)
+    assignments = _parse_assignments(resolved_key, content)
 
     if lane in assignments:
         return assignments[lane][0]

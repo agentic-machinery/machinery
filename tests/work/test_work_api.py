@@ -771,6 +771,16 @@ def test_next_and_projection_refuse_taxonomy_area_key_id_mismatch_503(monkeypatc
     assert projection.status_code == 503, projection.text
     assert "registry_unavailable" in projection.text
 
+    # Duplicate YAML area key hiding an earlier invalid entry is also refused on both routes.
+    taxonomy.write_text(
+        "schema_version: 1\nareas:\n"
+        "  atlas:\n    id: other\n    aliases: [review-alias]\n    epics: []\n"
+        "  atlas:\n    id: atlas\n    aliases: [review-alias]\n    epics: []\n",
+        encoding="utf-8",
+    )
+    assert client.get("/api/work/v1/next?stream=review-alias").status_code == 503
+    assert client.get("/api/work/v1/projection?stream=review-alias").status_code == 503
+
 
 def test_projection_membership_and_epic_status():
     """Homed issues carry public-safe stream membership; epics get status=epic."""

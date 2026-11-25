@@ -148,6 +148,49 @@ def test_present_assignments_file_without_assignments_mapping_raises_config_erro
     assert resolve_driver_agent_type("atlas", assignments_path=absent) is None
     assert main(["--lane", "atlas", "--assignments", str(absent)]) == 1
 
+    # Unreadable explicit taxonomy directory must fail closed (exit 2) rather than falling back to slot lookup.
+    valid_assignments = tmp_path / "valid_assignments.yaml"
+    valid_assignments.write_text(
+        "schema_version: 1\nassignments:\n"
+        "  atlas:\n    driver_agent_type: atlas-driver\n    slots: []\n"
+        "  infra:\n    driver_agent_type: infra-driver\n    slots: [claude-review-alias]\n",
+        encoding="utf-8",
+    )
+    locked_dir = tmp_path / "locked"
+    locked_dir.mkdir()
+    locked_taxonomy = locked_dir / "fleet_taxonomy.yaml"
+    locked_taxonomy.write_text(
+        "schema_version: 1\nareas:\n  atlas:\n    id: atlas\n    aliases: [review-alias]\n    epics: []\n",
+        encoding="utf-8",
+    )
+    assert (
+        resolve_driver_agent_type(
+            "review-alias", assignments_path=valid_assignments, taxonomy_path=locked_taxonomy
+        )
+        == "atlas-driver"
+    )
+    locked_dir.chmod(0o000)
+    try:
+        with pytest.raises(DriverAgentConfigError):
+            resolve_driver_agent_type(
+                "review-alias", assignments_path=valid_assignments, taxonomy_path=locked_taxonomy
+            )
+        assert (
+            main(
+                [
+                    "--lane",
+                    "review-alias",
+                    "--assignments",
+                    str(valid_assignments),
+                    "--taxonomy",
+                    str(locked_taxonomy),
+                ]
+            )
+            == 2
+        )
+    finally:
+        locked_dir.chmod(0o755)
+
 
 def test_unreadable_file_returns_none(tmp_path: Path) -> None:
     assert resolve_driver_agent_type("infra", assignments_path=tmp_path / "absent.yaml") is None

@@ -17,6 +17,7 @@ if __package__ in {None, ""}:  # run as a file (launchers do): the repository ro
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from lu_machinery.common import json_depth, profile
 from lu_machinery.common.repo_root import machinery_path
+from lu_machinery.orchestration.preparation_evidence import UniqueKeyLoader
 
 # The packaged copies; readers resolve the active profile at call time unless overridden.
 _PACKAGED_TAXONOMY_PATH = machinery_path("config/fleet_taxonomy.yaml")
@@ -51,7 +52,7 @@ class FleetTaxonomyValidationError(ValueError):
 
 def _load_yaml_bytes(content: bytes, source: Path) -> dict[str, Any]:
     try:
-        data = yaml.safe_load(content.decode("utf-8"))
+        data = yaml.load(content.decode("utf-8"), Loader=UniqueKeyLoader)
     except Exception as exc:
         raise FleetTaxonomyValidationError(f"YAML parse error in {source}: {exc}") from exc
     if not isinstance(data, dict):
@@ -82,20 +83,20 @@ def _load_yaml_bytes(content: bytes, source: Path) -> dict[str, Any]:
 
 
 def _load_yaml(path: Path) -> dict[str, Any]:
-    if not path.is_file():
-        raise FleetTaxonomyValidationError(f"File not found: {path}")
     try:
         content = path.read_bytes()
-    except OSError as exc:
+    except (OSError, RuntimeError) as exc:
         raise FleetTaxonomyValidationError(f"Cannot read {path}: {exc}") from exc
     return _load_yaml_bytes(content, path)
 
 
 def _load_schema(path: Path) -> dict[str, Any]:
-    if not path.is_file():
-        raise FleetTaxonomyValidationError(f"Schema file not found: {path}")
     try:
-        data = json_depth.loads(path.read_text(encoding="utf-8"), max_depth=512)
+        raw = path.read_text(encoding="utf-8")
+    except (OSError, RuntimeError) as exc:
+        raise FleetTaxonomyValidationError(f"Cannot read schema {path}: {exc}") from exc
+    try:
+        data = json_depth.loads(raw, max_depth=512)
     except Exception as exc:
         raise FleetTaxonomyValidationError(f"JSON parse error in schema {path}: {exc}") from exc
     if not isinstance(data, dict):
@@ -115,13 +116,12 @@ def _compiled_validator(schema_path: Path, content: bytes) -> Draft202012Validat
 
 
 def _schema_validator(schema_path: Path) -> Draft202012Validator:
-    if not schema_path.is_file():
-        raise FleetTaxonomyValidationError(f"Schema file not found: {schema_path}")
     try:
-        content = schema_path.read_bytes()
-    except OSError as exc:
+        resolved = schema_path.resolve()
+        content = resolved.read_bytes()
+    except (OSError, RuntimeError) as exc:
         raise FleetTaxonomyValidationError(f"Cannot read schema {schema_path}: {exc}") from exc
-    return _compiled_validator(schema_path.resolve(), content)
+    return _compiled_validator(resolved, content)
 
 
 def _validate_against_schema(data: dict[str, Any], *, schema_path: Path, label: str) -> None:
@@ -341,7 +341,7 @@ def main(argv: list[str] | None = None) -> int:
             taxonomy_path=(default_taxonomy_path() if args.taxonomy is None else args.taxonomy).resolve(),
             assignments_path=resolved_assignments,
         )
-    except (FleetTaxonomyValidationError, profile.ProfileError) as exc:
+    except (FleetTaxonomyValidationError, profile.ProfileError, OSError, RuntimeError) as exc:
         if args.json:
             print(json.dumps({"ok": False, "error": str(exc)}, sort_keys=True))
         else:
