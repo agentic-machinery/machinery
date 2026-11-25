@@ -64,9 +64,14 @@ def safe_mode_file() -> Path:
     return path
 
 
+def is_worker(environment: Mapping[str, str]) -> bool:
+    """True when the environment carries a dispatched worker's or a write boundary's marker."""
+    return any(environment.get(marker) for marker in _WORKER_MARKERS)
+
+
 def is_cto_caller(environment: Mapping[str, str], initiator: str | None = None) -> bool:
     """True when the caller is the CTO seat, by explicit initiator or by its launcher environment."""
-    if any(environment.get(marker) for marker in _WORKER_MARKERS):
+    if is_worker(environment):
         return False
     name = " ".join(str(initiator or "").split())
     if name == CTO_SEAT or name.startswith(f"{CTO_SEAT}-"):

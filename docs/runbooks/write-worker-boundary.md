@@ -304,6 +304,33 @@ These apply to the read-only review dispatches the boundary still contains.
 - A Unix socket that a host service first creates after launch, outside `/tmp`, `/run` and `/dev/shm`,
   is not masked. No such service is known on the fleet host.
 
+## Operator-only repository verbs
+
+No protected executor holds a GitHub principal whose credential write workers cannot read: a write
+worker runs as the dispatching user with that user's `gh` login (above), and the broker relays only
+`github-read` and `fleet-publish`. The publisher's `repo-create` and `repo-transfer` verbs
+(decision GH-ADMIN-VERBS-1124) therefore run only from an operator-run script. They refuse a process
+carrying `LEARN_UKRAINIAN_DISPATCH_TASK_ID` or `LU_WRITE_BOUNDARY_BROKER`, refuse every caller
+credential override (`GH_TOKEN`, `GITHUB_TOKEN`, `GH_ENTERPRISE_TOKEN`, `GITHUB_ENTERPRISE_TOKEN`,
+`GH_CONFIG_DIR`, `XDG_CONFIG_HOME`), require both the process and transport `HOME` to exactly match
+the account's password-database home
+(`gh` reads its stored login through it, and the client its rate-limit budget), and verify the
+`--principal` the operator names with `GET /user` through the same `gh` credential before and after the
+mutation. Both reads must report the same login and account id. The marker refusal
+stops accidents; it is not authentication, because a worker can drop its own markers. Both verbs need
+`LU_PRODUCT_ROOT` set to the product checkout, which their private state directory must stay outside.
+Run both verbs as the destination organization owner with a stored `gh` token that can read every
+repository in that organization. The destination lookup checks for visible collisions only.
+Do not change the gh login while this command runs.
+Run `.venv/bin/python -m lu_machinery.publish <verb> --help` for the checks, receipts and exit codes.
+The exit codes apply to that module entry point. After an interruption, check GitHub for the fixture
+name before trying another create, or rerun the transfer command to reconcile its journal. The
+journal binds the login and account id that started the transfer; only that principal settles it.
+Every exit 0 that sends no POST (an already-transferred repository, with or without a journal, and
+each verb's dry run) and every journal removal (a refusal before the POST included) re-reads
+`GET /user` after its last GitHub read and requires that login and id; a failed or mismatched re-read
+exits 3 and keeps the journal.
+
 ## Review contract canary
 
 Once per release cut, run the supported host command at the exact release
