@@ -695,14 +695,14 @@ def test_dead_pid_does_not_count_and_is_handed_to_the_sweeper(tmp_path, probe):
         "workspace-write",
         tasks,
         pid_alive=lambda pid: pid == 11,
-        on_dead=lambda _path, state: swept.append(state["task_id"]),
+        on_dead=lambda _path, state: swept.append(state["task_id"]) or True,  # True: the sweeper wrote it
         thresholds=_LIMITS,
     )
 
     assert decision.admitted
     assert decision.live_task_ids == ("alive",)
     assert sorted(swept) == ["dead-reader", "dead-writer"]
-    assert decision.swept
+    assert sorted(decision.swept_task_ids) == ["dead-reader", "dead-writer"]
     assert "2 record(s) marked crashed" in decision.summary()
 
 
@@ -712,7 +712,7 @@ def test_report_only_evaluation_names_dead_records_without_sweeping(tmp_path, pr
 
     decision = adm.evaluate("workspace-write", tasks, pid_alive=lambda _pid: False, thresholds=_LIMITS)
 
-    assert not decision.swept
+    assert decision.swept_task_ids == ()
     assert decision.dead_task_ids == ("dead",)
     assert "1 record(s) dead pid, not counted: dead" in decision.summary()
 

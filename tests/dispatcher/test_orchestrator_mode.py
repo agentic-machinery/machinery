@@ -209,21 +209,45 @@ def test_entry_refuses_a_turn_without_a_turn_id_its_own_tree_or_a_bounded_deadli
 # --- admission -----------------------------------------------------------------------------------------------------
 
 
-def test_admission_scan_leaves_a_dead_record_the_writer_refuses_and_goes_on(task_store, monkeypatch, capsys):
-    """Defect class (#1440): a dead task record already holding NaN makes every admission scan raise."""
+def test_admission_scan_leaves_a_dead_record_the_writer_refuses_and_reports_only_what_it_wrote(
+    task_store, monkeypatch, capsys,
+):
+    """Defect classes: a dead task record already holding NaN makes every admission scan raise (#1440); the admission
+    receipt reports a dead record as marked crashed when its heal was refused or declined and nothing was written."""
     monkeypatch.setattr(dispatch_admission, "host_failures", lambda *_a: [])
     child = subprocess.Popen(["true"])
     child.wait()
-    record = {**_orchestrator_record("worker-nan", pid=child.pid), "usage": {"input_tokens": float("nan")}}
-    del record["orchestrator"]
+
+    def dead_worker(task_id, **fields):
+        record = _orchestrator_record(task_id, pid=child.pid, **fields)
+        del record["orchestrator"]
+        return record
+
     path = store.record_path("worker-nan")
-    path.write_text(json.dumps(record))  # as the writer stored it before #1440
+    path.write_text(json.dumps(dead_worker("worker-nan", usage={"input_tokens": float("nan")})))  # as stored pre-#1440
     before = path.read_bytes()
+    _write(dead_worker("worker-raced"))
+    _write(dead_worker("worker-dead"))
+    real_mark = host_admission.mark_dead_worker_terminal
+
+    def settled_first(record_path, state, **kwargs):  # its supervisor settles it between the scan and the heal
+        if state["task_id"] == "worker-raced":
+            _write({**state, "status": "done", "finished_at": store.now()})
+        return real_mark(record_path, state, **kwargs)
+
+    monkeypatch.setattr(host_admission, "mark_dead_worker_terminal", settled_first)
     decision = host_admission.evaluate("workspace-write", sweep=True)
     assert decision.admitted, decision.failures
     assert path.read_bytes() == before
     assert ('dead task record worker-nan.json not healed: TASK_RECORD_NON_FINITE: ["usage", "input_tokens"]'
             in capsys.readouterr().err)
+    assert store.read("worker-raced")["status"] == "done"
+    assert store.read("worker-dead")["status"] == "crashed"
+    assert sorted(decision.dead_task_ids) == ["worker-dead", "worker-nan", "worker-raced"]
+    assert decision.swept_task_ids == ("worker-dead",)
+    assert decision.to_record()["swept_crashed"] == ["worker-dead"]
+    assert "; 1 record(s) marked crashed: worker-dead;" in decision.summary()
+    assert "; 2 record(s) dead pid, not counted: " in decision.summary()
 
 
 def test_a_turn_takes_no_write_slot_but_keeps_the_host_checks(task_store, monkeypatch):

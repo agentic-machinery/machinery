@@ -21,7 +21,7 @@ every check passes. Read-only dispatches are exempt.
   :data:`PIDLESS_CLOCK_SKEW_S` in the future holds no slot (logged), so a bad
   clock cannot pin one. A dead pid, or a pid-less record whose dispatcher is
   provably gone, never holds a slot; the caller may sweep it to ``crashed``
-  through ``on_dead``.
+  through ``on_dead``, which returns ``True`` only when it wrote the record.
 * **Subscription meter limits (#1129).** A metered write dispatch needs a free
   slot under ``DISPATCH_MAX_LIVE_WRITE_WORKERS_PER_METER`` and enough time
   since its meter's last launch reservation. Recent rate limiting and known
@@ -407,7 +407,8 @@ class AdmissionDecision:
     probe: HostProbe | None = None
     live_task_ids: tuple[str, ...] = ()
     dead_task_ids: tuple[str, ...] = ()
-    swept: bool = False
+    # The dead records ``on_dead`` confirmed it wrote ``crashed``; a declined or refused heal is not here.
+    swept_task_ids: tuple[str, ...] = ()
     failures: tuple[str, ...] = field(default_factory=tuple)
     pool: pool_headroom.PoolCheck | None = None
     slots: SlotQueueProbe | None = None
@@ -483,11 +484,12 @@ class AdmissionDecision:
                 " — /proc is not available on this platform, so only the worker cap is enforced"
                 if self.meter is None else " — /proc is not available on this platform"
             )
-        if self.dead_task_ids:
-            verb = "marked crashed" if self.swept else "dead pid, not counted"
-            text += f"; {len(self.dead_task_ids)} record(s) {verb}: {', '.join(self.dead_task_ids[:5])}"
-            if len(self.dead_task_ids) > 5:
-                text += " …"
+        unswept = list(self.dead_task_ids)
+        for task_id in self.swept_task_ids:
+            unswept.remove(task_id)
+        for ids, verb in ((self.swept_task_ids, "marked crashed"), (unswept, "dead pid, not counted")):
+            if ids:
+                text += f"; {len(ids)} record(s) {verb}: {', '.join(ids[:5])}" + (" …" if len(ids) > 5 else "")
         return text
 
     def refusal_line(self) -> str:
@@ -588,7 +590,7 @@ class AdmissionDecision:
             "meter_telemetry": self.meter_telemetry,
             "meter_defer": str(self.meter.defer) if self.meter and self.meter.defer is not None else None,
             "meter_refused": self.meter_refused,
-            "swept_crashed": list(self.dead_task_ids) if self.swept else [],
+            "swept_crashed": list(self.swept_task_ids),
             "psi_shadow": self.psi_shadow,
         }
 
@@ -2182,7 +2184,7 @@ def evaluate(
     *,
     pid_alive: Callable[[int], bool] | None = None,
     record_liveness: Callable[[dict[str, Any]], bool | None] | None = None,
-    on_dead: Callable[[Path, dict[str, Any]], None] | None = None,
+    on_dead: Callable[[Path, dict[str, Any]], bool] | None = None,
     thresholds: Thresholds | None = None,
     disk_guard: bool = True,
     record_shadow: bool = True,
@@ -2195,8 +2197,9 @@ def evaluate(
     """Decide whether a ``mode`` dispatch may start a worker on this host now.
 
     ``on_dead`` receives every active record whose pid is dead or whose
-    dispatcher is provably gone (the caller marks it ``crashed``); without it
-    the records are only reported. The disk is only measured; only the
+    dispatcher is provably gone (the caller marks it ``crashed``) and returns
+    ``True`` only when it wrote the record; ``swept_task_ids`` and the receipt's
+    ``swept_crashed`` list only those. Without it the records are only reported. The disk is only measured; only the
     refuse watermark refuses. Report-only callers pass ``record_shadow=False`` to keep PSI diagnostics
     without reading or writing journal state or changing the admission decision.
     ``disk_guard=False``
@@ -2218,9 +2221,14 @@ def evaluate(
         tasks_dir, pid_alive=pid_alive, record_liveness=record_liveness, now=clock,
         meter=meter, min_interval_s=limits.min_meter_launch_interval_s,
     )
+    dead_ids = [(str(state.get("task_id") or path.stem), path, state) for path, state in scan.dead]
+    # Only a confirmed write is reported as swept: on_dead may decline (the record changed, or death is
+    # no longer proved) or be refused by the writer (#1440).
+    swept_ids: list[str] = []
     if on_dead is not None:
-        for path, state in scan.dead:
-            on_dead(path, state)
+        for task_id, path, state in dead_ids:
+            if on_dead(path, state) is True:
+                swept_ids.append(task_id)
     probe = probe_host()
     failures: list[str] = []
     live = len(scan.live_task_ids)
@@ -2300,8 +2308,8 @@ def evaluate(
         thresholds=limits,
         probe=probe,
         live_task_ids=scan.live_task_ids,
-        dead_task_ids=tuple(str(state.get("task_id") or path.stem) for path, state in scan.dead),
-        swept=on_dead is not None,
+        dead_task_ids=tuple(task_id for task_id, _path, _state in dead_ids),
+        swept_task_ids=tuple(swept_ids),
         failures=tuple(failures),
         pool=pool,
         slots=slots,
