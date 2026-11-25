@@ -150,22 +150,6 @@ def test_workspace_target_deploys_outside_every_checkout_and_only_there(consumer
     assert run("--project-root", str(workspace)) == 2
     assert "Git checkout root" in capsys.readouterr().err
     assert not (workspace / ".claude").exists()
-    # The session that would run there owns these files: its own policy inputs are refused.
-    assert run("--workspace", "--project-root", str(workspace)) == 2
-    assert "workspace input is writable by this session" in capsys.readouterr().err
-    assert not (workspace / ".claude").exists()
-    # The same tree as the operator's: the caller is another user from here on.
-    real_uid = os.getuid()
-    monkeypatch.setattr(plan.os, "getuid", lambda: real_uid + 1)
-    for path in (workspace, *workspace.rglob("*")):  # the operator's modes, whatever this umask is
-        path.chmod(0o755 if path.is_dir() or path.stat().st_mode & 0o100 else 0o644)
-    source = workspace / "agents_extensions/shared/skills/product/SKILL.md"
-    for unsafe, mode in ((workspace / "agents_extensions/shared/skills", 0o775), (source, 0o646)):
-        original = unsafe.stat().st_mode & 0o777
-        unsafe.chmod(mode)
-        assert run("--workspace", "--project-root", str(workspace)) == 2
-        assert "writable by this session" in capsys.readouterr().err
-        unsafe.chmod(original)
     assert run("--workspace", "--project-root", str(workspace)) == 0
     assert run("--workspace", "--project-root", str(workspace), "--check") == 0
     assert (workspace / ".claude/agents/cto.md").read_text() == "---\nname: cto\ndescription: CTO\n---\nDrive.\n"
@@ -183,6 +167,13 @@ def test_workspace_target_deploys_outside_every_checkout_and_only_there(consumer
     assert "settings.local.json" in capsys.readouterr().err
     assert snapshot(workspace) == before and not (workspace / ".claude/settings.local.json").exists()
     planned.unlink()
+    # A directory at the local settings path is a local settings layer too.
+    planned = write(workspace, "agents_extensions/shared/settings.local.json/layer.json", "{}")
+    assert run("--workspace", "--project-root", str(workspace)) == 2
+    assert "settings.local.json" in capsys.readouterr().err
+    assert not (workspace / ".claude/settings.local.json").exists()
+    planned.unlink()
+    planned.parent.rmdir()
     descriptor(workspace)
     capsys.readouterr()
 

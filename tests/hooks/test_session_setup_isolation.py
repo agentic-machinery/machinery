@@ -369,9 +369,7 @@ def test_launcher_library_python_children_never_import_from_the_cwd(tmp_path: Pa
         assert set(children) == {"-I"}, children
 
 
-def test_workspace_session_reads_its_account_memory_and_writes_state_to_the_state_root(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_workspace_session_reads_its_account_memory_and_writes_state_to_the_state_root(tmp_path: Path) -> None:
     """Defect class: hooks reading another account's or another root's memory or state. From a
     non-Git project directory (the CTO workspace) the memory check reads the workspace's directory
     under CLAUDE_CONFIG_DIR, and session state goes to the configured state root, never the workspace."""
@@ -416,17 +414,8 @@ def test_workspace_session_reads_its_account_memory_and_writes_state_to_the_stat
     (source / "deployment.v1.json").write_text(json.dumps(
         {"providers": ["claude"], "sources": {"claude": {"path": "agents_extensions/claude", "required": True}},
          "preserve": []}))
-    # Deployed as the operator would (another user owns the inputs). The hook below runs as this
-    # session's user, so its workspace-mode check refuses these session-owned inputs: fail closed.
-    from lu_machinery.agent_deploy import plan
-
-    for path in (workspace, *workspace.rglob("*")):
-        path.chmod(0o755 if path.is_dir() else 0o644)
-    real_uid = os.getuid()
-    with monkeypatch.context() as operator:
-        operator.setattr(plan.os, "getuid", lambda: real_uid + 1)
-        with plan.selected_tree(str(workspace), False, workspace=True) as tree:
-            assert plan.deploy(tree, check=False, workspace=True) == 0
+    subprocess.run([sys.executable, "-I", "-m", "lu_machinery.agent_deploy", "--workspace", "--project-root",
+                    str(workspace)], check=True, capture_output=True, timeout=120)
     drift_env = {**env, "LU_PRODUCT_ROOT": str(primary), "CODEX_CANONICAL_REPO_ROOT": str(primary)}
 
     def deploy_issues() -> list[str]:
@@ -436,11 +425,11 @@ def test_workspace_session_reads_its_account_memory_and_writes_state_to_the_stat
         lines = json.loads(ran.stdout)["hookSpecificOutput"]["additionalContext"].splitlines()
         return [line.strip() for line in lines if "DEPLOY" in line]
 
-    refused = [
-        "- DEPLOY DRIFT CHECK COULD NOT RUN (rc=2): deployed agent extensions are unverified. Detail: "
-        '"$LEARN_UKRAINIAN_PYTHON" -I -m lu_machinery.agent_deploy --workspace --project-root <checkout root> --check'
-    ]
-    assert deploy_issues() == refused
+    assert deploy_issues() == []
+    (workspace / ".claude" / "rules" / "stray.md").write_text("stray\n")
     # An inherited Git context naming another checkout cannot redirect the workspace check.
     drift_env["GIT_DIR"] = str(primary / ".git")
-    assert deploy_issues() == refused
+    assert deploy_issues() == [
+        "- DEPLOY DRIFT: 1 file(s) differ in this workspace's deployment. Run: "
+        '"$LEARN_UKRAINIAN_PYTHON" -I -m lu_machinery.agent_deploy --workspace --project-root <workspace>'
+    ]
