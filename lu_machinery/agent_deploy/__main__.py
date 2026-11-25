@@ -26,9 +26,10 @@ Outputs: enabled provider files and .deploy-state/agent-deploy.v1.json; check wr
 checkout's.
 --workspace targets a directory that is neither a Git checkout nor inside one: its descriptor and sources are
 read from that directory, as from a checkout, and must enable the claude provider (so its mandatory hook settings
-are required). Workspace mode also refuses modified or missing deployed outputs, workspace-supplied hooks, and
-unapproved Claude settings keys, env overrides or extra hooks. It needs an explicit --project-root (never
-LU_PRODUCT_ROOT, which names the product) and refuses --inputs-commit (a workspace has no commits).
+are required). Workspace mode also refuses modified or missing deployed outputs, workspace-supplied hooks, plugins,
+workflows, root .mcp.json, frontmatter hooks/mcpServers, and unapproved Claude settings keys, env overrides or extra
+hooks. It needs an explicit --project-root (never LU_PRODUCT_ROOT, which names the product) and refuses
+--inputs-commit (a workspace has no commits).
 Exit codes: 0 verified/applied; 1 drift or application failure; 2 invalid/unsafe input.
 Recovery after an interrupted fresh apply followed by source edits:
   Keep a copy of the desired source edits. Restore the product sources and installed

@@ -290,6 +290,41 @@ def test_workspace_settings_tamper_refused(consumer, release, tmp_path, monkeypa
     extra_hook.unlink()
     extra_hook.parent.rmdir()
 
+    # F2: workspace-sourced plugins, workflows, root .mcp.json and frontmatter hooks/mcpServers are refused.
+    for rel, body, expected_err in (
+        ("agents_extensions/shared/plugins/evil/hooks.json", "{}\n", "workspace source cannot supply plugins: plugins/evil/hooks.json"),
+        ("agents_extensions/shared/workflows/evil.js", "console.log(1)\n", "workspace source cannot supply workflows: workflows/evil.js"),
+        ("agents_extensions/shared/skills/evil/SKILL.md",
+         "---\nname: evil\ndescription: Evil\nhooks:\n  PreToolUse:\n    - matcher: Bash\n      hooks:\n        - type: command\n          command: true\n---\nBody.\n",
+         "workspace frontmatter cannot declare hooks: skills/evil/SKILL.md"),
+        ("agents_extensions/shared/agents/evil.md",
+         "---\r\nname: evil\r\ndescription: Evil\r\nhooks:\r\n  SessionStart: []\r\n---\r\nBody.\r\n",
+         "workspace frontmatter cannot declare hooks: agents/evil.md"),
+        ("agents_extensions/shared/agents/mcp.md",
+         "---\nname: mcp\ndescription: MCP\nmcpServers:\n  evil:\n    command: /bin/sh\n---\nBody.\n",
+         "workspace frontmatter cannot declare mcpServers: agents/mcp.md"),
+        ("agents_extensions/shared/.mcp.json", "{}\n", "workspace source cannot supply control file: .mcp.json"),
+        (".mcp.json", "{}\n", "must not hold .mcp.json"),
+    ):
+        planted = write(workspace, rel, body)
+        before = snapshot(workspace)
+        assert run("--workspace", "--project-root", str(workspace)) == 2
+        assert expected_err in capsys.readouterr().err, rel
+        assert snapshot(workspace) == before
+        planted.unlink()
+        parent = planted.parent
+        while parent != workspace and parent != workspace / "agents_extensions/shared":
+            if any(parent.iterdir()):
+                break
+            parent.rmdir()
+            parent = parent.parent
+    descriptor(workspace, preserve=[".agent/tmp", ".claude/plugins"])
+    before = snapshot(workspace)
+    assert run("--workspace", "--project-root", str(workspace)) == 2
+    assert "workspace cannot preserve provider discovery path: .claude/plugins" in capsys.readouterr().err
+    assert snapshot(workspace) == before
+    descriptor(workspace)
+
     # Legitimate approved env update and release upgrade still apply cleanly when deployed outputs are untampered.
     upgraded_settings = {**clean_settings, "env": {"CLAUDE_CODE_FILE_READ_MAX_OUTPUT_TOKENS": "32000", "PYTHONDONTWRITEBYTECODE": "1"}}
     source_settings.write_text(json.dumps(upgraded_settings))
@@ -303,7 +338,13 @@ def test_workspace_settings_tamper_refused(consumer, release, tmp_path, monkeypa
     guard_script = repo_root / "agents_extensions/shared/hooks/guard-primary-checkout-write.py"
     primary = tmp_path / "primary-anchor"
     primary.mkdir()
-    subprocess.run(["git", "init", "-q", "-b", "main", str(primary)], check=True, env=git_environment())
+    subprocess.run(
+        ["git", "init", "-q", "-b", "main", str(primary)],
+        check=True,
+        capture_output=True,
+        timeout=30,
+        env=git_environment(),
+    )
     dispatch = primary / ".worktrees/dispatch/claude/task-1"
     dispatch.mkdir(parents=True)
     outside_link = tmp_path / "link-into-ws"
@@ -337,6 +378,7 @@ def test_workspace_settings_tamper_refused(consumer, release, tmp_path, monkeypa
         workspace / "agents_extensions/shared/settings.json",
         workspace / "agents_extensions/deployment.v1.json",
         workspace / ".deploy-state/agent-deploy.v1.json",
+        workspace.parent / ".git",
         outside_link,
         inside_link,
     ):
@@ -349,10 +391,23 @@ def test_workspace_settings_tamper_refused(consumer, release, tmp_path, monkeypa
         "rm -f agents_extensions/deployment.v1.json",
         "rm -f .claude/sett*.json",
         "git init",
+        f"touch {workspace.parent}/.git",
+        f"touch {workspace.parent}/.gi*",
         f"rm -f {inside_link}",
     ):
         res = run_guard({"tool_name": "Bash", "cwd": str(workspace), "tool_input": {"command": command}})
         assert res.returncode == 2, (command, res.returncode, res.stderr)
+
+    # F1: even if a bogus .git marker already exists in a workspace ancestor, workspace protection stays active.
+    bogus_ancestor_git = workspace.parent / ".git"
+    bogus_ancestor_git.write_text("")
+    try:
+        res = run_guard({"tool_name": "Write", "cwd": str(workspace), "tool_input": {"file_path": str(workspace / ".claude/settings.json")}})
+        assert res.returncode == 2 and "protected_cto_workspace" in res.stderr, (res.returncode, res.stderr)
+        res = run_guard({"tool_name": "Bash", "cwd": str(workspace), "tool_input": {"command": "echo x > .claude/settings.json"}})
+        assert res.returncode == 2, (res.returncode, res.stderr)
+    finally:
+        bogus_ancestor_git.unlink()
 
     # Legitimate writes to external scratch or a dispatch worktree remain allowed.
     for payload in (

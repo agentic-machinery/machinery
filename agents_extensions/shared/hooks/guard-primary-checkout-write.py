@@ -262,17 +262,24 @@ def _protected_repo_roots(wc) -> tuple[Path, ...]:
     return tuple(dict.fromkeys((primary, product_primary)))
 
 
-def _has_git_marker(directory: Path) -> bool:
-    """Return True if ``directory/.git`` exists; only ``FileNotFoundError`` proves absence."""
+def _is_valid_git_checkout(resolved: Path, wc, protected_roots: tuple[Path, ...]) -> bool:
+    """True only when ``resolved`` belongs to a protected repo or is itself a valid Git checkout root.
+
+    Never walks mutable ancestor ``.git`` markers (which a session could create with
+    ``touch <parent>/.git``). Any ``NotAGitRepositoryError`` or I/O error keeps the directory
+    protected (fail closed).
+    """
+    if any(wc.classify_repo_path(resolved, cwd=root) != "outside_repo" for root in protected_roots):
+        return True
     try:
-        os.lstat(directory / ".git")
-    except FileNotFoundError:
+        wc.resolve_main_root_without_git(resolved)
+    except wc.NotAGitRepositoryError:
         return False
     return True
 
 
-def _protected_workspace_roots() -> tuple[Path, ...]:
-    """Non-Git project/product directories (the CTO workspace) outside every Git checkout.
+def _protected_workspace_roots(wc, protected_roots: tuple[Path, ...]) -> tuple[Path, ...]:
+    """Non-Git project/product directories (the CTO workspace) outside valid Git checkouts.
 
     A non-Git CTO workspace holds deployed settings, hooks, rules, ``.deploy-state/`` and
     ``agents_extensions/`` policy inputs, while ``worktree_containment`` classifies paths
@@ -304,7 +311,7 @@ def _protected_workspace_roots() -> tuple[Path, ...]:
             if strict_input:
                 raise ValueError("CLAUDE_PROJECT_DIR must name an existing directory")
             continue
-        if any(_has_git_marker(ancestor) for ancestor in (resolved, *resolved.parents)):
+        if _is_valid_git_checkout(resolved, wc, protected_roots):
             continue
         if resolved == Path("/"):
             raise ValueError("a non-Git workspace cannot be the filesystem root")
@@ -316,20 +323,28 @@ def _is_within_root(path: Path, root: Path) -> bool:
     return path == root or path.is_relative_to(root)
 
 
+def _targets_workspace_ancestor_git(path: Path, workspace_root: Path) -> bool:
+    """True when ``path`` is ``.git`` (or inside ``.git``) at ``workspace_root`` or any ancestor."""
+    return any(_is_within_root(path, ancestor / ".git") for ancestor in (workspace_root, *workspace_root.parents))
+
+
 def _evaluate_workspace_write(target: Path, wc, workspace_root: Path) -> object | None:
-    """Refuse writes whose resolved target or parent entry sits inside a non-Git workspace."""
+    """Refuse writes inside a non-Git workspace or creating/mutating ``.git`` at any ancestor."""
     message = (
         f"The non-Git CTO workspace ({workspace_root}) holds deployed settings, hooks and "
         "policy inputs and is read-only to the session. Do write work in a dispatch worktree "
         "or scratch outside the workspace."
     )
     canonical = wc.canonicalize(target)
-    if _is_within_root(canonical, workspace_root):
+    if _is_within_root(canonical, workspace_root) or _targets_workspace_ancestor_git(canonical, workspace_root):
         return _UndecidableWrite("protected_cto_workspace", message)
     lexical = Path(os.path.normpath(os.fspath(target)))
     if lexical != Path("/") and lexical.name not in {"", ".", ".."}:
         parent_canonical = wc.canonicalize(lexical.parent)
-        if _is_within_root(parent_canonical, workspace_root):
+        entry_canonical = parent_canonical / lexical.name
+        if _is_within_root(parent_canonical, workspace_root) or _targets_workspace_ancestor_git(
+            entry_canonical, workspace_root
+        ):
             return _UndecidableWrite("protected_cto_workspace", message)
     return None
 
@@ -340,11 +355,13 @@ def _glob_may_reach_workspace(word: str, base: str, wc, workspace_root: Path) ->
     prefix_raw = Path(*parts[:first]) if first else Path(".")
     prefix = wc.canonicalize(_resolve(str(prefix_raw), getattr(word, "base", None) or base, expand_user=False))
     directory_glob = first < len(parts) - 1 or "**" in word
-    if _is_within_root(prefix, workspace_root):
+    if _is_within_root(prefix, workspace_root) or _targets_workspace_ancestor_git(prefix, workspace_root):
         return True
     if prefix in workspace_root.parents:
-        return directory_glob or _final_component_matches(
-            parts[-1], workspace_root.relative_to(prefix).parts[0]
+        return (
+            directory_glob
+            or _final_component_matches(parts[-1], workspace_root.relative_to(prefix).parts[0])
+            or _final_component_matches(parts[-1], ".git")
         )
     return False
 
@@ -3797,7 +3814,7 @@ def _main(payload: dict | None) -> int:
         return _block_uncertain("product_root_unavailable")
 
     try:
-        protected_workspaces = _protected_workspace_roots()
+        protected_workspaces = _protected_workspace_roots(wc, protected_roots)
     except Exception:
         return _block_uncertain("workspace_root_unavailable")
 

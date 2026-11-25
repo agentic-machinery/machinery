@@ -25,6 +25,8 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+import yaml
+
 from lu_machinery.common import json_depth
 from lu_machinery.common.safe_open import UnsafeEntryError, safe_open_below
 from lu_machinery.lint.lint_agent_skills import _parse_frontmatter, metadata_errors
@@ -90,6 +92,12 @@ WORKSPACE_CLAUDE_SETTINGS_ENV_KEYS = frozenset({
     "CLAUDE_CODE_MAX_OUTPUT_TOKENS",
     "PYTHONDONTWRITEBYTECODE",
 })
+# Workspace source subtrees and filenames that can execute hooks/commands or register MCP outside release.v1.json.
+WORKSPACE_FORBIDDEN_SOURCE_PREFIXES = ("hooks/", "plugins/", "workflows/")
+WORKSPACE_FORBIDDEN_SOURCE_NAMES = frozenset({".mcp.json", "mcp_config.json", "mcp.json"})
+# Markdown frontmatter subtrees where Claude Code loads inline hooks or MCP servers.
+WORKSPACE_FRONTMATTER_PREFIXES = ("skills/", "agents/", "commands/", "output-styles/")
+WORKSPACE_FORBIDDEN_FRONTMATTER_KEYS = frozenset({"hooks", "mcpservers"})
 
 
 class Invalid(ValueError):
@@ -533,6 +541,29 @@ def release_inputs() -> tuple[dict[str, Output], dict[str, Any], str]:
     return result, inventory, identity
 
 
+def _validate_workspace_frontmatter(path: str, blob: bytes) -> None:
+    """Refuse inline ``hooks`` or ``mcpServers`` frontmatter in workspace skills/agents/commands."""
+    try:
+        text = blob.decode("utf-8").lstrip("\ufeff").replace("\r\n", "\n").replace("\r", "\n")
+    except UnicodeDecodeError as exc:
+        raise Invalid("non-UTF-8 workspace markdown: " + path) from exc
+    opener = re.match(r"^---[ \t]*\n", text)
+    if opener is None:
+        return
+    closer = re.search(r"\n---[ \t]*(?:\n|$)", text[opener.end():])
+    if closer is None:
+        raise Invalid("unterminated workspace frontmatter: " + path)
+    try:
+        data = yaml.safe_load(text[opener.end():opener.end() + closer.start()])
+    except yaml.YAMLError as exc:
+        raise Invalid("invalid workspace frontmatter: " + path) from exc
+    if not isinstance(data, dict):
+        raise Invalid("workspace frontmatter must be a mapping: " + path)
+    for key in data:
+        if str(key).casefold() in WORKSPACE_FORBIDDEN_FRONTMATTER_KEYS:
+            raise Invalid(f"workspace frontmatter cannot declare {key}: {path}")
+
+
 def _validate_workspace_claude_settings(settings: dict[str, Any], requirements: list[dict[str, Any]]) -> None:
     """Enforce the strict release-bound policy on a non-Git workspace's ``.claude/settings.json``."""
     unknown = sorted(set(settings) - WORKSPACE_CLAUDE_SETTINGS_KEYS)
@@ -615,6 +646,10 @@ def build(tree: Tree, inputs: Tree | CommitInputs | None = None, *, workspace: b
             raise Invalid("preserve must name a subtree within an enabled target")
         if path == ".codex/skills" or path.startswith(".codex/skills/"):
             raise Invalid("legacy Codex discovery cannot be preserved")
+        if workspace and path != ".claude/settings.local.json" and path.split("/")[1].casefold() in {
+            name.casefold() for name in DISCOVERY.get(path.split("/")[0], ())
+        }:
+            raise Invalid("workspace cannot preserve provider discovery path: " + path)
     shared, inventory, release = release_inputs()
     def replaces(provider: str, path: str) -> bool:
         return any(path == p or path.startswith(p + "/") for p in inventory["provider_replacements"].get(provider, []))
@@ -671,8 +706,15 @@ def build(tree: Tree, inputs: Tree | CommitInputs | None = None, *, workspace: b
             if path in destination or (path in shared and
                     (shared[path].owner == "fleet" or not replaces(group, path))):
                 raise Invalid("duplicate fleet/product logical path: " + path)
-            if workspace and path.startswith("hooks/"):
-                raise Invalid("workspace source cannot supply hooks: " + path)
+            if workspace:
+                for forbidden_prefix in WORKSPACE_FORBIDDEN_SOURCE_PREFIXES:
+                    if path.startswith(forbidden_prefix):
+                        kind = forbidden_prefix.rstrip("/")
+                        raise Invalid(f"workspace source cannot supply {kind}: {path}")
+                if PurePosixPath(path).name.casefold() in WORKSPACE_FORBIDDEN_SOURCE_NAMES:
+                    raise Invalid("workspace source cannot supply control file: " + path)
+                if path.endswith(".md") and path.startswith(WORKSPACE_FRONTMATTER_PREFIXES):
+                    _validate_workspace_frontmatter(path, blob)
             if path.startswith("hooks/") and not mode & 0o111:
                 raise Invalid("product hook is not executable: " + path)
             destination[path] = Output(blob, 0o755 if mode & 0o111 else 0o644, "product", source + "/" + path)
@@ -752,6 +794,8 @@ def build(tree: Tree, inputs: Tree | CommitInputs | None = None, *, workspace: b
         if workspace and (any(path == local or path.startswith(local + "/") for path in outputs)
                           or tree.has_entry(local)):
             raise Invalid("a workspace target must not hold .claude/settings.local.json")
+        if workspace and tree.has_entry(".mcp.json"):
+            raise Invalid("a workspace target must not hold .mcp.json")
         configs = (".claude/settings.json",) if workspace else (".claude/settings.json", local)
         for config in configs:
             planned = outputs.get(config)
