@@ -9,11 +9,14 @@ from urllib.parse import parse_qs, urlsplit
 
 import pytest
 
+from lu_machinery.common import git_credentials
+from lu_machinery.fleet import pr_owner_check
 from lu_machinery.fleet_comms.authority import AuthorityService
 from lu_machinery.orchestration import merge_queue_keeper as keeper
 from lu_machinery.orchestration import pr_ownership as own
 from lu_machinery.orchestration.fleet_repos import FleetRepo
 from lu_machinery.publish import recovery
+from tests.test_fleet_repos import transferred_catalog
 
 REPO = "learn-ukrainian/learn-ukrainian.github.io"
 KEY = own.pr_key(REPO, 42)
@@ -127,7 +130,7 @@ def test_accepted_successor_owns_from_another_branch_while_live():
     assert find(fork, records, {(REPO.casefold(), 42): "succ"}) == []
 
 
-def test_running_task_on_another_branch_is_not_ownerless_when_the_head_names_it():
+def test_running_task_on_another_branch_is_not_ownerless_when_the_head_names_it(monkeypatch):
     """Defect class: a live owner reported as ownerless.
 
     A running task whose PR is on a different branch, with that task's trailer on the PR head,
@@ -148,6 +151,27 @@ def test_running_task_on_another_branch_is_not_ownerless_when_the_head_names_it(
     assert find(prs, [worker]) == []
     (row,) = find(prs, [{**worker, "repo": "machinery"}])
     assert row.unknown and row.reason == "task_repository_conflict"
+
+    alternate = "agentic-machinery/machinery"
+    transferred = transferred_catalog(monkeypatch, github=MACHINERY, alternate=alternate)
+    repos = {transferred.key: transferred}
+    worker["repository"] = MACHINERY
+    for active in (MACHINERY, alternate):
+        selector = git_credentials.SelectorState({transferred.key: active}, "d" * 64)
+        monkeypatch.setattr(git_credentials, "load_selector", lambda selector=selector, **_kwargs: selector)
+        monkeypatch.setattr(pr_owner_check, "fetch_open_prs", lambda slug, active=active: prs if slug == active else [])
+        open_prs = pr_owner_check.fetch_fleet_open_prs(repos)
+        assert open_prs == {active: prs}
+
+        def read_head(args, *, active=active, **_kwargs):
+            assert args == ["gh", "api", f"repos/{active}/git/commits/{HEAD}"]
+            return SimpleNamespace(
+                returncode=0, stdout=json.dumps({"message": "rebuild the branch\n\nX-Agent: codex/worker-1"}),
+            )
+
+        monkeypatch.setattr(own.github_client, "run", read_head)
+        open_prs = own._with_head_commits(open_prs, [worker], repos, is_live)
+        assert own.findings(open_prs, [worker], repos, {}, is_live) == []
 
 
 def fake_proc(monkeypatch, files):
@@ -554,7 +578,7 @@ def test_accept_refuses_when_publish_branch_is_null(monkeypatch):
     assert caught.value.code == "publish_branch_required" and data["handoffs"] == {}
 
 
-def test_decision_custody_outside_a_task_is_unchanged(monkeypatch):
+def test_decision_custody_outside_a_task_is_unchanged(monkeypatch, tmp_path):
     monkeypatch.delenv(own.TASK_ENV, raising=False)
     data = own._empty()
     pr = {"state": "OPEN", "headRefOid": HEAD, "headRefName": "codex/x", "isCrossRepository": False}
@@ -565,6 +589,24 @@ def test_decision_custody_outside_a_task_is_unchanged(monkeypatch):
     )
     assert receipt["decision_owner"] == "claude-cto" and receipt["pr_state"] == "OPEN"
     assert data["handoffs"][KEY]["successor"] == "claude-cto"
+
+    alternate = "agentic-machinery/machinery"
+    transferred_catalog(monkeypatch, github=MACHINERY, alternate=alternate)
+    path = tmp_path / "state.json"
+    historical = own._empty()
+    alternate_key, stable_key = f"{alternate}#42", f"{MACHINERY}#42"
+    historical["handoffs"][alternate_key] = receipt
+    historical["episodes"][alternate_key] = {
+        "since": at(30).isoformat(), "alerted_at": None, "notified_at": None,
+    }
+    path.write_text(json.dumps(historical), encoding="utf-8")
+    restored = own.load(path)
+    assert restored["handoffs"] == {stable_key: receipt}
+    assert list(restored["episodes"]) == [stable_key]
+    assert own.pr_key(alternate, 42) == stable_key
+    own.step(restored, {own.pr_key(alternate, 42)}, {}, at(31))
+    assert restored["handoffs"] == {stable_key: receipt}
+    assert restored["history"] == []
 
 
 def test_accept_refuses_while_a_live_task_owns_the_branch_or_successor_is_not_live():
@@ -659,6 +701,7 @@ def world(tmp_path, monkeypatch):
     monkeypatch.setattr(own, "_rerun_allowance", lambda *a: "unspent")
     repo = fleet_repos.FleetRepo("public", REPO, "learn-ukrainian", "public-monorepo", True)
     monkeypatch.setattr(fleet_repos, "load_fleet_repos", lambda: {"public": repo})
+    monkeypatch.setattr(fleet_repos, "_repository_catalog", lambda _path: {"public": repo})
     return path
 
 
@@ -999,6 +1042,7 @@ def test_keeper_transfer_binds_exact_pr_and_allows_worker_exit_while_ci_pending(
     monkeypatch.setattr(own, "_gh_pr", lambda repo, n: pr_open)
     monkeypatch.setattr(own, "_rerun_allowance", lambda *a: "unspent")
     monkeypatch.setattr(fleet_repos, "load_fleet_repos", lambda: FLEET)
+    monkeypatch.setattr(fleet_repos, "_repository_catalog", lambda _path: FLEET)
     monkeypatch.setenv(own.TASK_ENV, "worker-1")
     assert own.main(["keeper-transfer", "--pr", "42", "--repo", REPO, "--nonce", "nonce-abc", "--trivial"]) == 0
     cli_ack = json.loads(capsys.readouterr().out)
@@ -1146,6 +1190,7 @@ def run_pr_store(tmp_path, monkeypatch, capsys):
     monkeypatch.setenv("LU_TASKS_DIR", str(tasks))
     monkeypatch.delenv(own.TASK_ENV, raising=False)
     monkeypatch.setattr(fleet_repos, "load_fleet_repos", lambda: FLEET)
+    monkeypatch.setattr(fleet_repos, "_repository_catalog", lambda _path: FLEET)
     branches = {}
     prs = {}
 

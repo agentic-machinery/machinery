@@ -20,6 +20,7 @@ from typing import Any
 
 import pytest
 
+from lu_machinery.common import git_credentials
 from lu_machinery.dispatcher import store
 from lu_machinery.orchestration import dead_worker_state, task_record_store, worktree_claims
 from lu_machinery.orchestration import stale_task_records as str_mod
@@ -94,7 +95,9 @@ def _hermetic(tmp_path, monkeypatch):
         monkeypatch.delenv(key, raising=False)
     # The allowlisted fetch URL of SLUG is the tmp bare repository, not GitHub.
     target = str_mod.FetchTarget(key=SCAN_KEY, url=str(tmp_path / "origin.git"))
+    real_fetch_target = str_mod.fleet_fetch_target
     monkeypatch.setattr(str_mod, "fleet_fetch_target", lambda slug: target if slug == SLUG else None)
+    return real_fetch_target
 
 
 @pytest.fixture
@@ -745,6 +748,14 @@ def test_git_error_text_never_carries_credentials(tasks_dir, mixed, monkeypatch,
 
 
 def test_gh_error_text_never_carries_credentials(monkeypatch):
+    from tests.test_fleet_repos import transferred_catalog
+
+    transferred_catalog(monkeypatch, github=SLUG)
+    monkeypatch.setattr(
+        git_credentials, "load_selector",
+        lambda **_kwargs: git_credentials.SelectorState({"case": SLUG}, "d" * 64),
+    )
+
     def failing_gh(*_args, **_kwargs):
         return subprocess.CompletedProcess(["gh"], 1, "", f"error: https://user:{SECRET}@api.github.com denied\n")
 
@@ -752,6 +763,35 @@ def test_gh_error_text_never_carries_credentials(monkeypatch):
     index = str_mod.build_pull_index(SLUG, oldest_start=None, pager=str_mod.gh_pull_page, max_pages=1)
     assert index.error and "https://api.github.com denied" in index.error
     assert SECRET not in index.error
+
+
+@pytest.mark.parametrize("active", ["org/repo", "neworg/repo"])
+def test_stale_records_use_active_remote_for_both_historical_slugs(tmp_path, monkeypatch, active, _hermetic):
+    """Defect class: after a transfer, historical task records lose checkout or PR evidence."""
+    from tests.test_fleet_repos import transferred_catalog
+
+    row = transferred_catalog(monkeypatch)
+    monkeypatch.setattr(
+        git_credentials, "load_selector",
+        lambda **_kwargs: git_credentials.SelectorState({row.key: active}, "d" * 64),
+    )
+    (tmp_path / ".git").mkdir()
+    monkeypatch.setattr(str_mod, "state_root", lambda: tmp_path)
+    assert str_mod.default_repo_checkouts() == dict.fromkeys(row.slugs, tmp_path)
+
+    def list_pulls(args, **_kwargs):
+        assert args[2].startswith(f"repos/{active}/pulls?")
+        return subprocess.CompletedProcess(args, 0, json.dumps([{
+            "number": 42, "state": "open", "head": {"ref": "restore/x", "repo": {"full_name": active}},
+        }]), "")
+
+    monkeypatch.setattr(str_mod.github_client, "run", list_pulls)
+    for recorded in ("org/repo", "neworg/repo"):
+        assert _hermetic(recorded) == str_mod.FetchTarget(key=row.key, url=f"https://github.com/{active}.git")
+        assert str_mod._repository_checkout(recorded) == tmp_path
+        index = str_mod.build_pull_index(recorded, oldest_start=None, pager=str_mod.gh_open_pull_page, max_pages=1)
+        assert index.error is None
+        assert [pr["number"] for pr in index.open_by_branch["restore/x"]] == [42]
 
 
 def test_failed_remote_inventory_keeps_every_record_of_the_repository_out_of_class_c(tasks_dir, mixed, monkeypatch):

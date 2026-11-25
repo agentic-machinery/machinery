@@ -27,7 +27,14 @@ from lu_machinery.fleet.ignored_task_output import succession_streams
 from lu_machinery.fleet.pr_identity import RecordRepositoryRefusal, record_repository
 from lu_machinery.fleet_comms.authority import AuthorityService
 from lu_machinery.orchestration import stale_task_records as stale
-from lu_machinery.orchestration.fleet_repos import FleetRepo, MissingFleetCheckout, load_fleet_repos, resolve_fleet_repo
+from lu_machinery.orchestration.fleet_repos import (
+    FleetRepo,
+    FleetRepoError,
+    MissingFleetCheckout,
+    load_fleet_repos,
+    resolve_active_fleet_repo,
+    resolve_fleet_repo,
+)
 from lu_machinery.orchestration.integration_sweep import GitHubAdapter, SweepError, lookup_verdict
 from lu_machinery.orchestration.task_record_store import iter_task_records, read_task_record
 from lu_machinery.orchestration.validate_fleet_taxonomy import TAXONOMY_PATH, _load_yaml, default_assignments_path
@@ -401,13 +408,18 @@ def scan(
             }
         )
 
-    for slug, checkout in checkouts.items():
-        group = groups[slug]
+    for stored_slug, checkout in checkouts.items():
+        group = groups[stored_slug]
         terminal = [c for c in group if c.record.get("status") in TERMINAL]
         live = [c for c in group if c.record.get("status") not in TERMINAL]
         terminal_count += len(terminal)
         if checkout is None:
-            errors.append(f"{slug}: missing_fleet_checkout")
+            errors.append(f"{stored_slug}: missing_fleet_checkout")
+            continue
+        try:
+            slug = resolve_active_fleet_repo(stored_slug, repos=repos).active_github
+        except FleetRepoError:
+            errors.append(f"{stored_slug}: repository_resolution_failed")
             continue
         facts = stale.collect_repo_facts(slug, checkout, stale.fleet_fetch_target(slug))
         if facts.error or facts.fetch_error:

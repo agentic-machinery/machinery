@@ -17,6 +17,7 @@ from typing import get_args
 from lu_machinery import cto_safe_mode
 from lu_machinery.ai_agent_bridge.routing_guard import SAVANT_PROVIDER
 from lu_machinery.common.git_context import validate_plain_branch_name
+from lu_machinery.common.git_credentials import active_slug
 from lu_machinery.dispatcher import (
     admission,
     agy_sandbox,
@@ -620,6 +621,8 @@ def _dispatch(args) -> int:
     with admission.record_refusal(args, agent, StartRefusal.CAPACITY):
         host_admission.check_turn_child_cap(linkage)
     repo, info = git.resolve_repo(args.repo)
+    with admission.record_refusal(args, agent, StartRefusal.ELIGIBILITY):
+        github: str = active_slug(info)[0] if info.get("alternate_github") is not None else info.get("github", "")
     # Absent unless given, so an omitted --read-path leaves every other route's advisory binding unchanged.
     read_paths = getattr(args, "read_path", [])
     if agent == "opencode" and args.provider == SAVANT_PROVIDER:
@@ -693,7 +696,7 @@ def _dispatch(args) -> int:
             if args.cwd:
                 raise ValueError("review admission: --pr cannot borrow an existing worktree (--cwd)")
             try:
-                review_pr = _pr(info["github"], args.branch or "", args.pr)
+                review_pr = _pr(github, args.branch or "", args.pr)
             except RecordError as exc:
                 raise ValueError(f"review admission: {exc}") from None
             raw_pr_branch = review_pr.get("headRefName")
@@ -811,11 +814,11 @@ def _dispatch(args) -> int:
             if review_pr.get("headRefOid") != sha or (args.pinned_head and args.pinned_head != sha):
                 raise ValueError("review admission: checkout does not match the PR head SHA")
             if args.review_mode != "red_team" and not args.trial_role and not is_ukrainian_review(vars(args)):
-                _, tier = _pr_files_and_tier(GitHubAdapter(repo), info["github"], args.pr)
+                _, tier = _pr_files_and_tier(GitHubAdapter(repo), github, args.pr)
                 low_tier = tier == "low"
                 if low_tier:
                     try:
-                        current_pr = _pr(info["github"], pr_branch, args.pr)
+                        current_pr = _pr(github, pr_branch, args.pr)
                     except RecordError as exc:
                         raise ValueError(f"review admission: {exc}") from None
                     if (current_pr.get("headRefOid"), current_pr.get("headRefName")) != (sha, pr_branch):
@@ -847,7 +850,7 @@ def _dispatch(args) -> int:
     if args.subject_seat or args.subject_family or (args.mode == "read-only" and args.owned_path):
         with admission.record_refusal(args, agent, StartRefusal.REVIEW_SETUP):
             exclusion = checks.check_review_subjects(agent, args.model, args.subject_seat, args.subject_family,
-                                                    args.owned_path, review=review, repository=info["github"])
+                                                    args.owned_path, review=review, repository=github)
         args.subject_seat, args.subject_family = sorted(exclusion.seats), sorted(exclusion.families)
         if (exclusion.seats or exclusion.families) and (
             (args.review_profile or "").strip().casefold() == "ukrainian" or args.language_lane

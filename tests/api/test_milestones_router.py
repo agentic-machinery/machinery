@@ -3,26 +3,55 @@
 from __future__ import annotations
 
 import json
+import shutil
 import subprocess
 from pathlib import Path
 
+import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from lu_machinery.api import milestones_router as milestones
 from lu_machinery.api import state_helpers
 from lu_machinery.api.monitor_context import fixture_context
-from lu_machinery.common import github_client
+from lu_machinery.common import git_credentials, github_client
 from lu_machinery.github_rest_cache import GitHubRestCache
 from lu_machinery.orchestration.fleet_repos import FleetRepo
 
 
-def test_milestone_percent_and_private_counts_only(tmp_path, monkeypatch):
-    """Defect classes: wrong completion denominator and private milestone/issue text leakage."""
+@pytest.mark.parametrize("active", ["learn-ukrainian/machinery", "agentic-machinery/machinery"])
+def test_machinery_page_renders_the_active_changelog_repository(tmp_path, monkeypatch, active):
+    """Defect class: the dashboard links to the baked repository after a selector flip."""
+    from lu_machinery.api import main
+    from lu_machinery.api.product_contribution import ProductContribution
+
+    root = tmp_path / "dashboards"
+    root.mkdir()
+    shutil.copyfile(Path(main.__file__).with_name("dashboards") / "index.html", root / "index.html")
+    monkeypatch.setattr(
+        git_credentials, "load_selector",
+        lambda **_kwargs: git_credentials.SelectorState({"machinery": active}, "d" * 64),
+    )
+    app = main.create_app(fixture_context(tmp_path), product=ProductContribution())
+    response = TestClient(app).get("/machinery")
+    assert response.status_code == 200
+    assert f'data-repository="{active}"' in response.text
+
+
+@pytest.mark.parametrize("public_slug", ["fixture/public", "new-owner/public"])
+def test_milestone_percent_and_private_counts_only(tmp_path, monkeypatch, public_slug):
+    """Milestone lookups and issue links follow the selector while private details stay withheld."""
     repos = {
-        "public": FleetRepo("public", "fixture/public", "public", "public-content", True),
+        "public": FleetRepo(
+            "public", "fixture/public", "public", "public-content", True,
+            alternate_github="new-owner/public", repository_id=42, visibility="public",
+        ),
         "private": FleetRepo("private", "fixture/private", "private", "private-infra"),
     }
+    monkeypatch.setattr(
+        git_credentials, "load_selector",
+        lambda **_kwargs: git_credentials.SelectorState({"public": public_slug}, "d" * 64),
+    )
     calls = []
     milestone = {
         "number": 1, "state": "open", "title": "Ship <progress>", "description": "First line\nSecond line",
@@ -73,13 +102,14 @@ def test_milestone_percent_and_private_counts_only(tmp_path, monkeypatch):
         assert data["refresh_seconds"] == 300
         assert float(response.headers["X-Snapshot-Age-S"]) >= 0
         public, private = data["repositories"]
+        assert public["repository"] == public_slug
         item = public["milestones"][0]
         assert (item["open_issues"], item["closed_issues"], item["percent_complete"]) == (2, 6, 75.0)
         assert item["description_first_line"] == "First line"
         assert item["due_on"] == "2030-01-01T00:00:00Z"
         assert [issue["number"] for issue in item["issues"]] == [7, 8]
         assert item["issues"][0] == {"number": 7, "title": "Work 7", "labels": ["bug"],
-                                     "url": "https://github.com/fixture/public/issues/7"}
+                                     "url": f"https://github.com/{public_slug}/issues/7"}
         assert private["milestones"] == [{
             "number": None, "title": None, "description_first_line": None, "due_on": None,
             "open_issues": 2, "closed_issues": 6, "percent_complete": 75.0, "issues_status": "withheld", "issues": [],
@@ -88,6 +118,9 @@ def test_milestone_percent_and_private_counts_only(tmp_path, monkeypatch):
         assert "private-description" not in response.text
         assert "private-link" not in response.text
         assert len(calls) == 3  # One milestones list each; only the public repo needs issue details.
+        assert {path.split("?", 1)[0] for path, _ in calls} == {
+            f"repos/{public_slug}/milestones", f"repos/{public_slug}/issues", "repos/fixture/private/milestones",
+        }
         warm = client.get("/api/milestones").json()["repositories"]
         for original, refreshed in zip(data["repositories"], warm, strict=True):
             assert original["age_seconds"] >= 0

@@ -362,18 +362,24 @@ def record_changelog(
     """
     if f"\n## [{version}]" in text:
         return text
+    from lu_machinery.orchestration.fleet_repos import repository_slugs
+
     unreleased = _UNRELEASED
-    link = f"[Unreleased]: https://github.com/{repo}/compare/v{previous}...HEAD\n"
-    if text.count(unreleased) != 1 or text.count(link) != 1:
+    accepted_links = {
+        f"[Unreleased]: https://github.com/{slug}/compare/v{previous}...HEAD\n" for slug in repository_slugs(repo)
+    }
+    lines = text.splitlines(keepends=True)
+    current_links = [index for index, line in enumerate(lines) if line.startswith("[Unreleased]:")]
+    if text.count(unreleased) != 1 or len(current_links) != 1 or lines[current_links[0]] not in accepted_links:
         raise CutError("CHANGELOG.md lacks one Unreleased heading and its compare link to the previous tag")
     unreleased_must_be_empty(text)
     heading = f'<a id="v{version}"></a>\n## [{version}] - {date}' + (" [YANKED]" if yanked else "")
     section = f"{heading}\n\n{notes.rstrip()}\n\n"
-    links = (
+    lines[current_links[0]] = (
         f"[Unreleased]: https://github.com/{repo}/compare/v{version}...HEAD\n"
         f"[{version}]: https://github.com/{repo}/compare/v{since or previous}...v{version}\n"
     )
-    return text.replace(unreleased, unreleased + section, 1).replace(link, links, 1)
+    return "".join(lines).replace(unreleased, unreleased + section, 1)
 
 
 def version_of(name: str, text: str) -> dict[str, str]:

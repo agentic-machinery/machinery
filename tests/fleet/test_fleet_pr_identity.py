@@ -210,6 +210,18 @@ def test_resolve_repo_slug_fails_closed_without_a_checkout(tmp_path) -> None:
     assert pr_identity.resolve_repo_slug(tmp_path / "missing") is None
 
 
+@pytest.mark.parametrize("recorded", ["org/repo", "neworg/repo"])
+def test_historical_and_active_task_slugs_bind_the_same_repository(monkeypatch, recorded) -> None:
+    """Defect class: either registered slug can appear in durable task records."""
+    from tests.test_fleet_repos import transferred_catalog
+
+    row = transferred_catalog(monkeypatch)
+    repos = {row.key: row}
+    assert pr_identity.record_repository(
+        {"repository": recorded, "repository_id": "org/repo", "repo": row.key}, repos,
+    ) == "org/repo"
+
+
 # --- identity agreement: one probe, two fail-closed directions (#7127) -------
 
 

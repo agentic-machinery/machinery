@@ -1127,7 +1127,10 @@ def test_release_milestone_setting_accepts_omitted_or_valid_and_refuses_invalid(
         release_cut.configured_release_milestone({"release_milestone": bad}, repo_label="machinery")
 
 
-def test_release_prs_pass_configured_milestones_and_dry_run_reports_them(tmp_path, monkeypatch, capsys):
+@pytest.mark.parametrize("machinery_repo", [REPO, "agentic-machinery/machinery"])
+def test_release_prs_pass_configured_milestones_and_dry_run_reports_them(
+    tmp_path, monkeypatch, capsys, machinery_repo,
+):
     """Defect class: release_cut opens adopt/post-release PRs without the repo's configured release_milestone."""
     from lu_machinery.opsec.prepublish import PublishBlocked
     from lu_machinery.publish import github as publish_github
@@ -1159,7 +1162,7 @@ def test_release_prs_pass_configured_milestones_and_dry_run_reports_them(tmp_pat
 
     cut = Cut(
         work=work, dry_run=False, machinery_remote=str(tmp_path / "machinery.git"),
-        product_remote=str(tmp_path / "product.git"), machinery_repo=REPO,
+        product_remote=str(tmp_path / "product.git"), machinery_repo=machinery_repo,
         product_repo="learn-ukrainian/learn-ukrainian.github.io", host_python=Path(sys.executable), primary=tmp_path,
         alert=False, x_agent="claude/claude-opus-5-5", version="0.1.22", previous="0.1.21", baseline="0.1.21",
         git_identity=("-c", "user.name=Release Cut", "-c", "user.email=release-cut@example.invalid"),
@@ -1180,6 +1183,10 @@ def test_release_prs_pass_configured_milestones_and_dry_run_reports_them(tmp_pat
     cut.publisher = fake_publisher
 
     assert cut.post_release("### Changed\n\n- Note\n") == 701
+    assert published_calls[-1][published_calls[-1].index("--repo") + 1] == machinery_repo
+    changelog = (machinery / "CHANGELOG.md").read_text(encoding="utf-8")
+    assert changelog.count(f"[Unreleased]: https://github.com/{machinery_repo}/compare/v0.1.22...HEAD\n") == 1
+    assert f"[0.1.22]: https://github.com/{machinery_repo}/compare/v0.1.21...v0.1.22\n" in changelog
     assert "--milestone" in published_calls[-1]
     assert published_calls[-1][published_calls[-1].index("--milestone") + 1] == "v0.11.0 - CI and GitHub budget reliability"
 
@@ -1192,14 +1199,14 @@ def test_release_prs_pass_configured_milestones_and_dry_run_reports_them(tmp_pat
     def fake_resolve(repo: str, milestone: str, **_kwargs):
         if milestone == "bad-milestone":
             raise PublishBlocked("MILESTONE_REFUSED: milestone 'bad-milestone' does not exist")
-        return (13, milestone) if repo == REPO else (9, milestone)
+        return (13, milestone) if repo == machinery_repo else (9, milestone)
 
     monkeypatch.setattr(publish_github, "resolve_repo_milestone", fake_resolve)
     cut.product_milestone = None
     cut.report_release_milestones(include_adopt=True)
     out = capsys.readouterr().out
     assert "adopt (learn-ukrainian/learn-ukrainian.github.io)=none" in out
-    assert "post-release (learn-ukrainian/machinery)=v0.11.0 - CI and GitHub budget reliability (#13)" in out
+    assert f"post-release ({machinery_repo})=v0.11.0 - CI and GitHub budget reliability (#13)" in out
 
     cut.machinery_milestone = "bad-milestone"
     with pytest.raises(CutError, match="MILESTONE_REFUSED"):
