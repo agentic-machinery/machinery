@@ -264,6 +264,23 @@ def parse_task_record(path: Path, raw: bytes, *, display_unknown_schema: bool = 
             raise ValueError(f"task record {path} is not a JSON object")
         _report_foreign(path, raw)
         return None
+    parsed = classify_task_object(path, record, display_unknown_schema=display_unknown_schema)
+    if parsed is None:
+        if constants:
+            raise ValueError(f"task record {path} holds non-JSON constant {constants[0]}")
+        _report_foreign(path, raw)
+    return parsed
+
+
+def classify_task_object(
+    path: Path, record: dict[str, Any], *, display_unknown_schema: bool = False
+) -> dict[str, Any] | None:
+    """Classify an already decoded JSON object read from ``path``, as :func:`parse_task_record` does.
+
+    Returns the record, ``None`` for an object that makes no record claim, or raises the
+    parser's refusals. It reports nothing: a reader that holds file bytes calls
+    :func:`parse_task_record`, which also refuses text that is not strict JSON.
+    """
     task_id = record.get("task_id")
     review_flagged = (any(record.get(name) not in (None, False, "", []) for name in REVIEW_TASK_FLAG_FIELDS)
                       or bool(record.get("review_mode") or record.get("type") == "review"))
@@ -280,9 +297,6 @@ def parse_task_record(path: Path, raw: bytes, *, display_unknown_schema: bool = 
     receipt = ("schema" in record and "schema_version" not in record
                and isinstance(task_id, str) and not candidate_task_record_names(task_id, (path.name,)))
     if (receipt and not legacy) or not ("task_id" in record or isinstance(record.get("schema_version"), int) or legacy):
-        if constants:
-            raise ValueError(f"task record {path} holds non-JSON constant {constants[0]}")
-        _report_foreign(path, raw)
         return None
     if "schema_version" in record and (type(record["schema_version"]) is not int
                                        or record["schema_version"] not in {1, 2}):
