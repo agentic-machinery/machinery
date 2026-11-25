@@ -11,7 +11,9 @@ import re
 import shutil
 import subprocess
 import yaml
+from lu_machinery.common import repo_root
 from lu_machinery.docs import catalogue as cat
+from lu_machinery.docs import find as docs_find
 from lu_machinery.docs.catalogue import main
 from lu_machinery.docs.catalogue import repository_check
 from lu_machinery.docs.catalogue import store_literal_errors
@@ -200,6 +202,38 @@ def test_check_fails_on_an_unclaimed_store_and_suggests_a_stub(tmp_path, capsys)
     data['entries'].append(store('data-fresh', ['data/fresh.db']))
     recatalogue(repo, data)
     assert main(['check', '--repo', str(repo)]) == 0
+
+
+def test_owner_keys_come_from_package_without_consumer_registry_copies(tmp_path, monkeypatch):
+    repo = make_repo(
+        tmp_path / 'consumer',
+        catalogue(
+            entry('knowledge', ['docs/knowledge/**'], owner='fixture-stream'),
+            entry('guide', ['docs/guide/**'], owner='fixture-area'),
+        ),
+        {'docs/guide/index.md': '# Sailing handbook\n'},
+    )
+    git(repo, 'rm', '-f', '--', 'scripts/config/issue_streams.yaml', 'scripts/config/area_assignments.yaml')
+
+    package = tmp_path / 'package'
+    config = package / 'config'
+    config.mkdir(parents=True)
+    (config / 'issue_streams.yaml').write_text('streams: {fixture-stream: {}}\n', encoding='utf-8')
+    (config / 'area_assignments.yaml').write_text('assignments: {fixture-area: {}}\n', encoding='utf-8')
+    monkeypatch.setattr(repo_root, '_MACHINERY_ROOT', package)
+    profile_path = tmp_path / 'profile.v1.json'
+    profile_path.write_text(json.dumps({
+        'schema': 'lu-machinery.profile', 'version': 1, 'profile_id': 'fixture',
+        'github_slug': 'fixture/consumer', 'config': {},
+    }), encoding='utf-8')
+    monkeypatch.setenv('LU_PROFILE_PATH', str(profile_path))
+    monkeypatch.setenv('LU_GITHUB_SLUG', 'fixture/consumer')
+    monkeypatch.delenv('LEARN_UKRAINIAN_GITHUB_SLUG', raising=False)
+
+    assert main(['check', '--repo', str(repo)]) == 0
+    result = docs_find.find('sailing handbook', family='guide', repo=repo)
+    assert not result['coverage']['incomplete']
+    assert result['hits'][0]['path'] == 'docs/guide/index.md'
 
 
 @pytest.mark.usefixtures('configured_roots')

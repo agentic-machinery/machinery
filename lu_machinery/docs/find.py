@@ -513,7 +513,7 @@ class State:
         return entry.get('superseded_by')
 
 
-_STATE_CACHE: OrderedDict[str, State] = OrderedDict()
+_STATE_CACHE: OrderedDict[tuple[Path, str, frozenset[str]], State] = OrderedDict()
 _STATE_CACHE_SIZE = 4
 _STATE_LOCK = threading.Lock()
 
@@ -521,22 +521,25 @@ _STATE_LOCK = threading.Lock()
 def load_state(repo: Path) -> State:
     """Validate the catalogue against the index; memoised in memory by the exact inputs.
 
-    Every input is read from the index, as every search is: the catalogue and schema like the
-    owner registries, so two checkouts of one commit answer alike whatever their working trees
-    hold (unstaged edits, untracked or ignored files, mtimes). The memo key hashes every index
-    record, so any change to an input is a fresh validation. Nothing is written to disk.
+    The catalogue, schema and any tracked owner registries come from the index.
+    Missing registries can resolve outside it, so the memo key includes the
+    effective owner keys as well as every index record. Nothing is written to disk.
     """
     files = cat.index_entries(repo)
+    try:
+        owners = cat.owner_keys(repo)
+    except (ValueError, OSError, subprocess.SubprocessError) as exc:
+        return State(repo, None, cat.Report(), files, load_error=f'{type(exc).__name__}: {cat.error_message(exc)[:200]}')
     digest = hashlib.sha256()
     for path, entry in files.items():
         digest.update(f'{entry.mode} {entry.oid}\t'.encode() + path.encode('utf-8') + b'\0')
-    key = f'{repo}\0{digest.hexdigest()}'
+    key = (repo, digest.hexdigest(), frozenset(owners))
     with _STATE_LOCK:
         if key in _STATE_CACHE:
             _STATE_CACHE.move_to_end(key)
             return _STATE_CACHE[key]
     raw = {rel: _index_blob(repo, files.get(rel)) for rel in (cat.CATALOGUE_PATH, cat.SCHEMA_PATH)}
-    state = _build_state(repo, files, raw)
+    state = _build_state(repo, files, raw, owners)
     with _STATE_LOCK:
         _STATE_CACHE[key] = state
         while len(_STATE_CACHE) > _STATE_CACHE_SIZE:
@@ -555,11 +558,10 @@ def _index_blob(repo: Path, entry: cat.IndexEntry | None) -> bytes:
         return b''
 
 
-def _build_state(repo: Path, files: dict[str, cat.IndexEntry], raw: dict[str, bytes]) -> State:
+def _build_state(repo: Path, files: dict[str, cat.IndexEntry], raw: dict[str, bytes], owners: set[str]) -> State:
     try:
         catalogue = cat.parse(raw[cat.CATALOGUE_PATH])
         schema = json_depth.loads(raw[cat.SCHEMA_PATH].decode('utf-8'), max_depth=512)
-        owners = cat.owner_keys(repo)
     except (cat.CatalogueLoadError, ValueError, OSError, subprocess.SubprocessError) as exc:
         return State(repo, None, cat.Report(), files, load_error=f'{type(exc).__name__}: {str(exc)[:200]}')
     report = cat.validate(catalogue, schema, list(files), owners)
