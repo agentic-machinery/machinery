@@ -317,18 +317,20 @@ def test_github_refusal_of_the_post_is_a_refusal_not_unknown(tmp_path, capsys, v
     """Defect class: GitHub's definite refusal of the one POST reported as an unknown result, or a lost answer as a refusal.
 
     Only the client's typed client-error answer with a message is a refusal: exit 2, its status and message in
-    the receipt and on stderr, mutations_sent 0 and, for a transfer, the journal removed after the GET /user
+    the receipt (on stdout and in its file) and on stderr, mutations_sent 0 and, for a transfer, the journal
+    removed after the GET /user
     re-read. A 5xx, a timeout, a rate limit, the client's own 413, an answer without a readable message or an
     untyped failure stays unknown: exit 3, and a transfer keeps its journal.
     """
     extra, endpoint, pattern = ADMIN_POSTS[verb]
     argv = [verb, "--repo", "infra-private", "--principal", PRINCIPAL, *extra]
     gh = FakeGitHub()
-    gh.overrides[("POST", endpoint, False)] = answer_
+    # The same answer to every POST of this test (the fake keys overrides on whether a POST was already sent).
+    gh.overrides[("POST", endpoint, False)] = gh.overrides[("POST", endpoint, True)] = answer_
     code = pub.main(argv, runner=gh)
-    err = capsys.readouterr().err
+    out, err = capsys.readouterr()
     receipt = json.loads(sorted(state_dir(tmp_path).glob(pattern))[-1].read_text())
-    assert len(gh.posts) == 1
+    assert len(gh.posts) == 1 and json.loads(out) == receipt
     if not refused:
         assert code == pub.REPO_ADMIN_UNSETTLED and receipt["outcome"] == "ambiguous"
         assert receipt["mutations_sent"] == 1 and "github_refusal" not in receipt
@@ -342,10 +344,19 @@ def test_github_refusal_of_the_post_is_a_refusal_not_unknown(tmp_path, capsys, v
     assert f"HTTP {expected['status']} {json.dumps(expected['message'])}" in err and "_REFUSED: " in err
     assert "UNSETTLED" not in err
     if verb == "repo-transfer":
-        # The journal goes only after a GET /user that follows the POST, and nothing blocks a new attempt.
+        # The journal goes only after a GET /user that follows the POST.
         assert gh.calls[-1] == ["gh", "api", "--method", "GET", "user"] and not journal(tmp_path).exists()
+    # A receipt file that cannot be written still leaves the whole receipt on stdout.
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(pub, "_write_transfer_receipt", lambda sink, receipt: False)
+        assert pub.main(argv, runner=gh) == 2 and len(gh.posts) == 2
+        out, err = capsys.readouterr()
+        assert json.loads(out)["github_refusal"] == expected and "RECEIPT_UNWRITTEN" in err
+    if verb == "repo-transfer":
+        # Nothing blocks a new attempt.
+        assert not journal(tmp_path).exists()
         gh.overrides.clear()
-        assert pub.main(argv, runner=gh) == 0 and len(gh.posts) == 2
+        assert pub.main(argv, runner=gh) == 0 and len(gh.posts) == 3
         assert json.loads(capsys.readouterr().out)["outcome"] == "transferred"
 
 

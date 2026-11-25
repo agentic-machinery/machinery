@@ -2646,6 +2646,12 @@ def _repo_admin_refused_post(receipt, refused):
     receipt["github_refusal"] = {"status": refused.status, "message": refused.message}
 
 
+def _repo_admin_post_refusal(verb, receipt, sink, refused, capture_output, text):
+    """Settle GitHub's refusal of the POST: exit 2, the receipt on stdout and in its file, the refusal on stderr."""
+    _stderr_note(str(_repo_refused(verb, str(refused))))
+    return _repo_admin_settle(verb, receipt, sink, 2, "refused", str(refused), capture_output, text)
+
+
 def _repo_admin_post(endpoint, frozen, runner, cwd, environment):
     """Send one POST of the prepared *frozen* body; any failure or malformed answer raises.
 
@@ -2811,8 +2817,7 @@ def _repo_create_checked(fields, plan, receipt, sink, _directory_fd, _directory,
         except _RepoAdminRefused as refused:
             # Nothing was created, and no journal exists: a refusal (exit 2) naming GitHub's status and message.
             _repo_admin_refused_post(receipt, refused)
-            _repo_admin_settle(verb, receipt, sink, 2, "refused", str(refused), True, True)
-            raise plan["refused"](str(refused)) from None
+            return _repo_admin_post_refusal(verb, receipt, sink, refused, capture_output, text)
         except Exception:
             return _repo_admin_settle(
                 verb, receipt, sink, REPO_ADMIN_UNSETTLED, "ambiguous", "the creation's result is unknown",
@@ -3189,7 +3194,7 @@ def _repo_transfer_send(plan, receipt, sink, directory_fd, journal_name, frozen,
         plan["source"], plan["destination"], plan["repository_id"], plan["visibility"]
     )
 
-    def abandon(reason, limited=None, unsent="no POST was sent"):
+    def abandon(reason, limited=None, unsent="no POST was sent", refused=None):
         # Like every journal removal, this one rests on a principal read after the last GitHub read.
         reread = _principal_reread(receipt["principal"]["before"], receipt, reader, cwd, environment)
         if reread:
@@ -3207,6 +3212,9 @@ def _repo_transfer_send(plan, receipt, sink, directory_fd, journal_name, frozen,
                 capture_output, text,
             )
         receipt.pop("journal_reconciled", None)
+        if refused is not None:
+            # GitHub's answer: the receipt is returned on the caller's stdout like every other settled POST.
+            return _repo_admin_post_refusal(verb, receipt, sink, refused, capture_output, text)
         _repo_admin_settle(verb, receipt, sink, 2, "refused", reason, True, True)
         if limited is not None:
             raise limited
@@ -3249,7 +3257,7 @@ def _repo_transfer_send(plan, receipt, sink, directory_fd, journal_name, frozen,
     except _RepoAdminRefused as refused:
         # GitHub refused this POST, so it transferred nothing: the journal goes as for a refusal before the POST.
         _repo_admin_refused_post(receipt, refused)
-        return abandon(str(refused), unsent="the refused POST transferred nothing")
+        return abandon(str(refused), unsent="the refused POST transferred nothing", refused=refused)
     except Exception:
         return _repo_admin_settle(
             verb, receipt, sink, REPO_ADMIN_UNSETTLED, "ambiguous", "the transfer's result is unknown",
