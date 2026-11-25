@@ -13,7 +13,10 @@ only outcome is a published capability failure
 A terminal run that is not ``done``, has no reply, and whose record proves
 no provider ran (``provider_pgid`` absent or null, and no result digest)
 carries no verdict. One supervisor-attested provider failure with no
-result can be recovered by a later, published review (#1071). Other
+result can be recovered by a later, published review (#1071). A
+schema-bound native Codex run the supervisor settled as ``rate_limited``
+with no result carries no verdict once a later run of its seat at the same
+head publishes its own bound verdict (LINEAGE-RATELIMIT-1124). Other
 missing replies refuse. Neither kind of no-result run can own a verdict.
 The approval carry-over and the repair-verification round
 (``scripts/review/repair_round.py``) both apply it before anything else. Ported from the carry-over's reviewed reader (#11907) so the two
@@ -30,6 +33,7 @@ import hashlib
 import logging
 import os
 import stat
+from collections import Counter
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
@@ -659,6 +663,148 @@ def provider_crash_recovery(
     return ProviderCrashRecovery(failed, replacement)
 
 
+_LOWER_SHA256 = frozenset("0123456789abcdef")
+
+
+def _attested_rate_limit(run: ReviewRun) -> bool:
+    """Recognize a schema-bound native Codex review the supervisor settled as ``rate_limited``, with no result.
+
+    The supervisor sets that status from the provider's parsed terminal event and returns before it
+    writes ``provider_terminal_failure``. With an output schema bound there is no format-correction
+    launch, so no earlier decision can hide behind the missing reply (designated approval
+    LINEAGE-RATELIMIT-1124). Settlement evidence must have the shapes the supervisor writes: a
+    terminal failure flag that is absent, null or false, no terminal status or error, no
+    never-started reason, and child-task lists that are absent or empty.
+    """
+    record = run.record
+    pgid, returncode, schema = record.get("provider_pgid"), record.get("returncode"), record.get("output_schema_sha256")
+    return (
+        run.reply is None
+        and record.get("status") == "rate_limited"
+        and record.get("agent") == "codex"
+        and _supervised_review_binding(run)
+        and type(pgid) is int and pgid > 0
+        and type(returncode) is int and returncode > 0
+        and "result_sha256" in record and record["result_sha256"] is None
+        and _lower_sha256(schema)
+        and isinstance(record.get("output_schema_path"), str) and bool(record["output_schema_path"])
+        and any(record.get("provider_terminal_failure") is value for value in (None, False))
+        and not any(key in record for key in ("provider_terminal_status", "provider_terminal_error"))
+        and record.get("never_started_reason") is None
+        and all(record.get(key) is None or record.get(key) == [] for key in ("orphaned_child_tasks", "unknown_child_tasks"))
+    )
+
+
+def _lower_sha256(value: object) -> bool:
+    return isinstance(value, str) and len(value) == 64 and set(value) <= _LOWER_SHA256
+
+
+def _rate_limit_retried(
+    run: ReviewRun, runs: Sequence[ReviewRun], comments: Sequence[Mapping[str, Any]], login: str
+) -> bool:
+    """Whether a rate-limited run's retry, started after it settled, published its own bound verdict.
+
+    The retry is a finished run that started strictly after the attempt settled and settled after its
+    own start. It is the only record with its task id and nonce, and the only one with its task id and
+    start (the key its markers carry). It has its own reply digest (``_read_run`` checks the reply
+    against it) and the attempt's repository, integer PR, review branch, full SHA, reviewer family and
+    normalized profile. Every trusted marker the recorder's login posted for it equals what its record
+    re-derives (head, verdict, model, family and profile), as in the lineage's own run check. Any
+    verdict counts: a genuine ``CHANGES_REQUESTED`` also proves the retry happened. The skipped run
+    fills no seat, and damaged evidence (an unparseable or out-of-range time, an untrusted or edited
+    marker) is never a retry.
+    """
+    if not _attested_rate_limit(run):
+        return False
+    try:
+        return _bound_retry(run, runs, comments, login)
+    except (LineageRefused, recorder.RecordError, OverflowError):
+        return False
+
+
+def _bound_retry(run: ReviewRun, runs: Sequence[ReviewRun], comments: Sequence[Mapping[str, Any]], login: str) -> bool:
+    record = run.record
+    settled = _timestamp(record.get("finished_at"))
+    begun = _timestamp(record.get("started_at"))
+    sha, repository, number = record.get("worktree_base_sha"), record.get("repository"), record.get("pr")
+    if (
+        settled is None or begun is None or settled < begun
+        or not isinstance(repository, str) or type(number) is not int
+    ):
+        return False
+    branch = recorder._review_branch(dict(record))
+    family = recorder.reviewer_identity(record)[1]
+    profile = _profile(record)
+    markers = [marker for _, marker in _trusted_markers(comments, login)]
+    identity = (sha, repository, number, branch, family, profile)
+    # A candidate's task id and nonce must name exactly one record, as bound_published_run requires. Only a
+    # string nonce can bind a retry, so a sibling's malformed nonce is neither counted nor a candidate.
+    nonces = [(item, item.record.get("run_nonce")) for item in runs]
+    seen = Counter((item.task_id, nonce) for item, nonce in nonces if isinstance(nonce, str))
+    # A marker names its run by task id and start, so that pair must also name exactly one record.
+    publications = Counter((item.task_id, _start_or_none(item.record)) for item in runs)
+    return any(
+        _binds_retry(retry, settled, identity, markers, publications)
+        for retry, nonce in nonces
+        if isinstance(nonce, str)
+        and retry.task_id != run.task_id
+        and nonce != record.get("run_nonce")
+        and seen[(retry.task_id, nonce)] == 1
+    )
+
+
+def _start_or_none(record: Mapping[str, Any]) -> str | None:
+    try:
+        return _started(record)
+    except OverflowError:
+        return None
+
+
+def _binds_retry(
+    retry: ReviewRun,
+    settled: datetime,
+    identity: tuple[Any, ...],
+    markers: Sequence[Mapping[str, Any]],
+    publications: Counter[tuple[str, str | None]],
+) -> bool:
+    """Whether ``retry`` is a bound, published retry of the attempt ``identity`` names; damaged evidence binds nothing."""
+    sha, repository, number, branch, family, profile = identity
+    try:
+        retry_start = _timestamp(retry.record.get("started_at"))
+        retry_finish = _timestamp(retry.record.get("finished_at"))
+        evidence = _finished_verdict(retry)
+        if (
+            retry_start is None
+            or retry_start <= settled
+            or retry_finish is None
+            or retry_finish < retry_start
+            or evidence is None
+            or not _supervised_review_binding(retry)
+            or not _lower_sha256(retry.record.get("result_sha256"))
+            or retry.record.get("repository") != repository
+            or type(retry.record.get("pr")) is not int
+            or retry.record.get("pr") != number
+            or recorder._review_branch(dict(retry.record)) != branch
+            or _profile(retry.record) != profile
+        ):
+            return False
+    except (recorder.RecordError, OverflowError):
+        return False
+    retry_sha, verdict, _, model, retry_family, started = evidence
+    if publications[(retry.task_id, started)] != 1:
+        return False
+    published = [marker for marker in markers if marker["task"] == retry.task_id and marker["started"] == started]
+    return (
+        (retry_sha, retry_family) == (sha, family)
+        and bool(published)
+        and all(
+            (marker["sha"], marker["verdict"], marker["model"], marker["family"], _profile(marker))
+            == (sha, verdict, model, family, profile)
+            for marker in published
+        )
+    )
+
+
 def check_lineage(
     *,
     runs: Sequence[ReviewRun],
@@ -677,7 +823,8 @@ def check_lineage(
     supersedes it (:func:`superseded_runs`), and any other run's reply must
     carry no verdict at all. A terminal run that is not ``done`` and whose reply
     is missing counts as carrying no verdict when :func:`_provider_never_ran`
-    holds, or when a later replacement has a published verdict. Every other
+    holds, or when a later replacement has a published verdict (an attested
+    provider crash, or an attested Codex rate limit, :func:`_rate_limit_retried`). Every other
     missing reply is refused, and a ``done`` run is unchanged. A published
     verdict that names a run without a result is refused. A finished run may instead have exactly
     one capability-failure event that its record and reply re-derive
@@ -710,7 +857,11 @@ def check_lineage(
         if status not in TERMINAL_TASK_STATUSES:
             raise LineageRefused(f"review task {run.task_id} is not terminal (status {status!r})")
         if run.reply is None:
-            if run is recovered or (status != "done" and _provider_never_ran(run.record)):
+            if (
+                run is recovered
+                or (status != "done" and _provider_never_ran(run.record))
+                or _rate_limit_retried(run, runs, comments, login)
+            ):
                 continue
             raise LineageRefused(f"review task {run.task_id} ({status}) has no reply on record")
         if status != "done":
