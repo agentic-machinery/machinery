@@ -14,6 +14,7 @@ from typing import Any
 
 import pytest
 
+from lu_machinery.common import git_credentials
 from lu_machinery.fleet import hramatka_hygiene_check as hygiene
 from lu_machinery.orchestration.fleet_repos import FleetRepo
 from tests.helpers.product_tree import configured_roots  # noqa: F401
@@ -136,6 +137,35 @@ def test_verified_when_epic_clean_pointer_present_no_zombies(hermetic_repo) -> N
     assert receipt["queue_pointer_ok"] is True
     assert receipt["zombie_worktrees"] == []
     assert receipt["reasons"] == []
+
+
+def test_private_board_is_read_at_the_active_slug(hermetic_repo, monkeypatch) -> None:
+    """Defect class: reader acts on the baked slug after the selector flips to the alternate."""
+    repo_root, tasks_dir = hermetic_repo
+    moved = "moved-owner/private-infra"
+    repos = {"infra-private": FleetRepo("infra-private", PRIVATE, "private-infra", "private-infra",
+                                        repository_id=1, visibility="private", alternate_github=moved)}
+    monkeypatch.setattr(hygiene, "load_fleet_repos", lambda: repos)
+    monkeypatch.setattr(git_credentials, "load_selector", lambda **_kwargs: git_credentials.SelectorState(
+        {"infra-private": moved}, "d" * 64))
+    body = f"Planning queue: private BOARD [{moved}#{BOARD}].\n"
+    reads: list[tuple[str, int]] = []
+    fixture = _reader({(PUBLIC, EPIC): {"number": EPIC, "body": body}, (moved, BOARD): {"number": BOARD, "body": ""}})
+
+    def reader(repo: str, number: int) -> dict[str, Any]:
+        reads.append((repo, number))
+        return fixture(repo, number)
+
+    receipt = hygiene.hygiene_check(reader=reader, **_base_kwargs(repo_root, tasks_dir))
+
+    assert receipt["status"] == "verified"
+    assert reads == [(PUBLIC, EPIC), (moved, BOARD)]
+    # Without a trusted selector the transferred row is unknown: no read of the slug it may have left.
+    monkeypatch.setattr(git_credentials, "load_selector", lambda **_kwargs: (_ for _ in ()).throw(
+        git_credentials.SelectorError("fleet repository selector unavailable")))
+    reads.clear()
+    unknown = hygiene.hygiene_check(reader=reader, **_base_kwargs(repo_root, tasks_dir))
+    assert unknown["status"] == "unknown" and reads == []
 
 
 def test_cli_exit_zero_on_verified(hermetic_repo, capsys) -> None:

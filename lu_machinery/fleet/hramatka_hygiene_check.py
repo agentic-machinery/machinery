@@ -45,7 +45,7 @@ from lu_machinery.common import github_client, json_depth
 from lu_machinery.common.repo_root import main_checkout_root, product_root
 from lu_machinery.common.task_store_paths import tasks_dir as default_tasks_dir
 from lu_machinery.fleet import pr_identity
-from lu_machinery.orchestration.fleet_repos import FleetRepoError, load_fleet_repos
+from lu_machinery.orchestration.fleet_repos import FleetRepoError, load_fleet_repos, resolve_active_fleet_repo
 from lu_machinery.orchestration.task_record_store import read_task_record
 
 POLICY_VERSION = "hramatka-hygiene-v1"
@@ -406,8 +406,10 @@ def hygiene_check(
 
     if private_repo is None:
         try:
-            private_repo = load_fleet_repos()["infra-private"].github
-        except (FleetRepoError, KeyError):
+            # The board lives at the row's active slug; an unknown row or a transferred row without a
+            # trusted selector is unknown, never the slug it may have left.
+            private_repo = resolve_active_fleet_repo("infra-private", repos=load_fleet_repos()).active_github
+        except FleetRepoError:
             return _receipt(
                 status=Status.UNKNOWN,
                 epic_charter_ok=None,
@@ -415,7 +417,7 @@ def hygiene_check(
                 zombie_worktrees=[],
                 zombie_worktrees_detectable=False,
                 df=None,
-                reasons=["private board repository is unavailable in the fleet registry"],
+                reasons=["private board repository is unavailable in the fleet registry or its host selector"],
                 high_water_percent=high_water_percent,
             )
 

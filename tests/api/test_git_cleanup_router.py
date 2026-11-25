@@ -12,6 +12,7 @@ from fastapi.testclient import TestClient
 from lu_machinery.api import delegate_router, git_hygiene_router, state_helpers
 from lu_machinery.api.main import app
 from lu_machinery.api.monitor_context import fixture_context
+from lu_machinery.common import git_credentials
 from lu_machinery.orchestration.fleet_repos import FleetRepo
 
 
@@ -366,7 +367,19 @@ def _three_repo_registry(monkeypatch) -> dict:
     }
     monkeypatch.setattr(git_hygiene_router, "load_fleet_repos", lambda: catalog)
     monkeypatch.setattr(git_hygiene_router, "_UNKNOWN_SINCE", {})
+    _select_slugs(monkeypatch, catalog)
     return catalog
+
+
+def _select_slugs(monkeypatch, catalog: dict, chosen: dict[str, str] | None = None) -> None:
+    """The test's own host selector (CI hosts have none): each transferred row's chosen slug, default its github.
+
+    Read at every resolution, so a row the test swaps into ``catalog`` later is selected too.
+    """
+    monkeypatch.setattr(git_credentials, "load_selector", lambda **_kwargs: git_credentials.SelectorState(
+        {key: (chosen or {}).get(key, row.github) for key, row in catalog.items() if row.alternate_github},
+        "d" * 64,
+    ))
 
 
 def test_pull_requests_route_hides_private_repo_titles_and_branches(monkeypatch, tmp_path: Path) -> None:
@@ -537,6 +550,10 @@ def test_pull_request_heading_uses_loaded_repositories(monkeypatch, tmp_path: Pa
     state_helpers.cache_invalidate()
     aged = client.get("/api/git/pull-requests").json()
     assert [repo["live_workers"] for repo in aged["repositories"]] == [None, None, None]
+    # A case-only alternate is no valid transfer: the selector refuses it, so that project is unknown, never read.
+    assert (aged["repositories"][0]["status"], aged["repositories"][0]["reason"]) == (
+        "unknown", "repository_resolution_failed")
+    catalog["machinery"] = FleetRepo("machinery", "new-owner/machinery", "machinery", "public-machinery", default=True)
     monkeypatch.setattr(git_hygiene_router, "active_snapshot", real_snapshot)
     # gh exits 1 when any one repository cannot be resolved; the others still read.
     call["code"] = 1
@@ -890,7 +907,8 @@ def test_pull_requests_and_live_workers_reject_kelvin_sign_slug_folding(tmp_path
     assert [row["live_workers"] for row in enriched["repositories"]] == [1, 0]
     assert enriched["live_workers_unattributed"] == 2
 
-    # compute_pull_requests filters non-ASCII alternate slugs before folding into the matching set.
+    # A row whose alternate is a non-ASCII look-alike never resolves to an active slug, so compute_pull_requests
+    # neither reads it nor folds the look-alike into its matching set: the project is unknown, with no PRs.
     _write_task_record(tasks, _KEPT, repository="learn-ukrainian/other")
     dual = {
         "machinery": FleetRepo(
@@ -903,6 +921,7 @@ def test_pull_requests_and_live_workers_reject_kelvin_sign_slug_folding(tmp_path
         ),
     }
     monkeypatch.setattr(git_hygiene_router, "load_fleet_repos", lambda: dual)
+    _select_slugs(monkeypatch, dual)
     node = _open_pr(f"agy/{_KEPT}", 7)
     monkeypatch.setattr(
         git_hygiene_router.github_client,
@@ -914,4 +933,37 @@ def test_pull_requests_and_live_workers_reject_kelvin_sign_slug_folding(tmp_path
         ),
     )
     computed = git_hygiene_router.compute_pull_requests(tmp_path, tasks_dir=tasks)
-    assert computed["repositories"][0]["pull_requests"][0]["task_reference"] is None
+    (row,) = computed["repositories"]
+    assert (row["status"], row["reason"], row["pull_requests"]) == ("unknown", "repository_resolution_failed", [])
+    assert _KEPT not in json.dumps(computed)
+
+
+def test_pull_requests_read_each_project_at_its_active_slug(monkeypatch, tmp_path: Path) -> None:
+    """Defect class: reader acts on the baked slug after the selector flips to the alternate."""
+    catalog = _three_repo_registry(monkeypatch)
+    queries: list[str] = []
+    node = _open_pr("codex/one", 1)
+    repos = {f"r{i}": {"isPrivate": False, "pullRequests": {"totalCount": 1, "nodes": [node]}} for i in range(3)}
+
+    def github_run(args, **_kwargs):
+        queries.append(args[-1])
+        return SimpleNamespace(returncode=0, stdout=json.dumps({"data": repos}))
+
+    monkeypatch.setattr(git_hygiene_router.github_client, "run", github_run)
+    _select_slugs(monkeypatch, catalog, {"infra-private": "alt-owner/Private-Infra"})
+    flipped = git_hygiene_router.compute_pull_requests(tmp_path)["repositories"]
+    assert 'r2: repository(owner: "alt-owner", name: "Private-Infra")' in queries[-1]
+    assert "other-owner" not in queries[-1]
+    assert (flipped[2]["repository"], flipped[2]["status"]) == ("alt-owner/Private-Infra", "ok")
+    # The baked slug stays the read while the selector keeps it active.
+    _select_slugs(monkeypatch, catalog)
+    baked = git_hygiene_router.compute_pull_requests(tmp_path)["repositories"]
+    assert 'r2: repository(owner: "other-owner", name: "private-infra")' in queries[-1]
+    assert baked[2]["repository"] == "other-owner/private-infra"
+    # Without a trusted selector the transferred row is unknown and not read; the others still are.
+    monkeypatch.setattr(git_credentials, "load_selector", lambda **_kwargs: (_ for _ in ()).throw(
+        git_credentials.SelectorError("fleet repository selector unavailable")))
+    missing = git_hygiene_router.compute_pull_requests(tmp_path)["repositories"]
+    assert "r2:" not in queries[-1] and "private-infra" not in queries[-1].casefold()
+    assert [(row["status"], row["reason"]) for row in missing] == [
+        ("ok", None), ("ok", None), ("unknown", "repository_resolution_failed")]
