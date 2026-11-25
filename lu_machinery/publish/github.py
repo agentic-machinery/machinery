@@ -3604,21 +3604,94 @@ def _dismiss_sarif_result(document, number):
 
 
 def _dismiss_preflight(fields, gh_repo, dest, runner, cwd, environment, *, temp=None, raw_graphql=False):
+    from html.parser import HTMLParser
+
+    from markdown_it import MarkdownIt
+
+    from lu_machinery.orchestration.fleet_repos import parse_ascii_positive_int
+
     comment, number = fields["comment"], fields["number"]
     # Require an explanation in addition to an exact alert identifier and PR URL.
     identifier = rf"(?i)\balert\s+#{number}\b"
     if not re.search(identifier, comment):
         raise ValueError("comment must identify its alert")
-    links = re.findall(r"https://[^\s<>()]+", comment)
     known = _repository_slugs(gh_repo)
     if not known:
         raise ValueError("the repository is not an exact owner/name or the fleet registry is unreadable")
-    slugs = "|".join(re.escape(slug) for slug in known)
-    pattern = rf"https://github\.com/(?:{slugs})/pull/([1-9][0-9]*)(?:#[A-Za-z0-9_-]+)?"
-    prs = {int(match[1]) for link in links if (match := re.fullmatch(pattern, link))}
-    explanation = re.sub(identifier, "", re.sub(r"https://[^\s<>()]+", "", comment)).strip(" .,:;\n")
+
+    links: list[str] = []
+    prose: list[str] = []
+
+    def record_text(content: str, *, bare_links: bool) -> None:
+        for word in content.split():
+            candidate = word.lstrip("([{\"'“‘")
+            if candidate.lower().startswith("https://"):
+                if bare_links:
+                    links.append(candidate.rstrip(".,;:!?*)]}_\"'”’~…"))
+            else:
+                prose.append(word)
+
+    class AnchorParser(HTMLParser):
+        in_anchor = False
+
+        def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+            if tag == "a":
+                self.in_anchor = True
+                href = next((value for name, value in attrs if name == "href"), None)
+                if href is not None:
+                    links.append(href)
+
+        def handle_endtag(self, tag: str) -> None:
+            if tag == "a":
+                self.in_anchor = False
+
+        def handle_data(self, data: str) -> None:
+            record_text(data, bare_links=False)
+
+    html = AnchorParser()
+    for block in MarkdownIt("commonmark").parse(comment):
+        if block.type == "html_block":
+            html.feed(block.content)
+        elif block.type in {"code_block", "fence"}:
+            record_text(block.content, bare_links=False)
+        in_markdown_link = False
+        for token in block.children or ():
+            if token.type == "link_open":
+                in_markdown_link = True
+                href = token.attrGet("href")
+                if isinstance(href, str):
+                    links.append(href)
+            elif token.type == "link_close":
+                in_markdown_link = False
+            elif token.type == "html_inline":
+                html.feed(token.content)
+            elif token.type in {"text", "code_inline"}:
+                record_text(
+                    token.content,
+                    bare_links=token.type == "text" and not in_markdown_link and not html.in_anchor,
+                )
+    html.close()
+
+    invalid_comment = "comment needs an explanation and one same-repository merged PR"
+    github_prefix = "https://github.com/"
+    prs: set[int] = set()
+    for link in links:
+        if not link.lower().startswith(github_prefix):
+            continue
+        path = link[len(github_prefix):].partition("#")[0].partition("?")[0]
+        parts = path.split("/", 4)
+        if len(parts) < 3 or "/".join(parts[:2]) not in known or parts[2] != "pull":
+            continue
+        segment = parts[3] if len(parts) >= 4 else ""
+        pr_number = parse_ascii_positive_int(segment) if len(segment) <= 19 else None
+        if pr_number is None:
+            raise ValueError(invalid_comment)
+        if len(parts) == 4 or parts[4] in {"files", "commits"}:
+            prs.add(pr_number)
+
+    explanation = re.sub(identifier, "", " ".join(prose))
     if dest.partition("/")[0] != "github.com" or len(prs) != 1 or not any(char.isalpha() for char in explanation):
-        raise ValueError("comment needs an explanation and one same-repository merged PR")
+        raise ValueError(invalid_comment)
     root = f"repos/{gh_repo}"
 
     def get(suffix, **options):
