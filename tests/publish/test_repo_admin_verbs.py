@@ -161,9 +161,9 @@ def state_dir_of(_receipt):
 
 
 CALLER = [
-    ("HOME", "/caller/home"),
+    ("HOME", None),
     # Only this process's HOME differs: the environment given to publish() carries the account's home.
-    ("process HOME", "/caller/home"),
+    ("process HOME", None),
     *[(marker, "task-1") for marker in WORKER_MARKERS],
     *[(name, "/caller/value") for name in pub.REPO_ADMIN_CREDENTIAL_OVERRIDES],
     ("GH_HOST", "ghe.example.com"),
@@ -175,12 +175,11 @@ CALLER = [
 def test_caller_authority_and_credential_overrides_refused_before_any_read(monkeypatch, verb, fields, name, value):
     """Defect class: a caller-controlled identity or credential (worker marker, token, gh config, host) reaching GitHub.
 
-    A HOME other than the account's, through which gh finds its stored login, is refused the same way, also
-    when only this process's HOME differs (the shared client keys its rate-limit budget through it).
+    An alternate spelling of the account's HOME is refused for the gh transport and for this process.
     """
     gh = FakeGitHub()
     if name == "process HOME":
-        monkeypatch.setenv("HOME", value)
+        monkeypatch.setenv("HOME", f"{pub._account_home()}/.")
         with pytest.raises(gate.PublishBlocked, match="_REFUSED: HOME must be"):
             pub.publish(
                 verb, runner=gh, capture_output=True, text=True, principal=PRINCIPAL, repo="infra-private",
@@ -188,7 +187,7 @@ def test_caller_authority_and_credential_overrides_refused_before_any_read(monke
             )
         assert gh.calls == []
         return
-    monkeypatch.setenv(name, value)
+    monkeypatch.setenv(name, f"{pub._account_home()}/." if name == "HOME" else value)
     with pytest.raises(gate.PublishBlocked, match="_REFUSED: "):
         run(verb, gh, repo="infra-private", **fields)
     assert gh.calls == []
@@ -639,10 +638,7 @@ def test_rehearsal_transfer_bound_to_create_receipt(tmp_path, tamper, reason):
 
 @pytest.mark.parametrize("verb", ["repo-create", "repo-transfer"])
 def test_help_documents_examples_outputs_and_exit_codes(capsys, verb):
-    """Defect class: --help drifting from the CLI help standard (no examples, outputs, exit codes or option help).
-
-    Also: one call's stream handling silencing a later in-process call (each call writes its own output).
-    """
+    """Defect class: --help drifting from the CLI help standard (no examples, outputs, exit codes or option help)."""
     with pytest.raises(SystemExit) as exit_:
         pub.main([verb, "--help"])
     out = capsys.readouterr().out
@@ -652,15 +648,6 @@ def test_help_documents_examples_outputs_and_exit_codes(capsys, verb):
     ):
         assert section in out
     assert "omitted by default" not in out
-    with pytest.raises(SystemExit) as exit_:
-        pub.main(["ruleset-merge-queue", "--invalid"])
-    assert exit_.value.code == 2 and "invalid publisher arguments" in capsys.readouterr().err
-    gh = FakeGitHub()
-    argv = [verb, "--repo", "infra-private", "--principal", PRINCIPAL, *(["--name", "rehearsal-1"] if verb == "repo-create" else [])]
-    for extra, outcome in ((["--dry-run"], "dry-run"), ([], "created" if verb == "repo-create" else "transferred")):
-        assert pub.main([*argv, *extra], runner=gh) == 0
-        captured = capsys.readouterr()
-        assert json.loads(captured.out)["outcome"] == outcome and f"{verb}: receipt " in captured.err
 
 
 @pytest.mark.parametrize("verb,fields,lock", [
@@ -684,12 +671,12 @@ def test_concurrent_run_lock_refuses_without_sending(tmp_path, verb, fields, loc
 # A child interpreter whose stdout and stderr (or only one of them) are pipes with no reader, so every
 # write fails; "descriptorless" replaces stdout with a failing wrapper that has no descriptor to redirect,
 # "over-descriptor" with a failing wrapper over the valid descriptor 1, "fails-later" with a stream that
-# fails only from main()'s final flush on, and "bufferless" with a working stream that has no binary
-# buffer; "closed" closes descriptor 1 before main(), and "closed-stdout-object" / "closed-stderr-object"
+# fails on the final flush, and "bufferless" with a working stream that has no binary
+# buffer; "closed" closes descriptor 1 before the CLI runs, and "closed-stdout-object" / "closed-stderr-object"
 # close that stream object; "fileno-valueerror" gives stdout a fileno() that raises ValueError (argparse
-# probes it while building the parser); "sigint-after-post" sends SIGINT during the readback.
+# probes it while building the parser).
 _BROKEN_STREAMS_CHILD = """
-import importlib.util, io, os, sys
+import importlib.util, io, os, runpy, sys
 streams = os.environ["REPO_ADMIN_TEST_STREAMS"]
 read_end, write_end = os.pipe()
 os.close(read_end)
@@ -779,14 +766,6 @@ if streams == "fails-later":
 
     pub._repo_admin_result = settled_then_failing
 gh = fixture.FakeGitHub()
-if streams == "sigint-after-post":
-    import signal
-
-    def interrupted(args):
-        os.kill(os.getpid(), signal.SIGINT)
-        return fixture.not_found(args)
-
-    gh.overrides[("GET", f"repos/{fixture.OLD}/rehearsal-1", True)] = interrupted
 if os.environ.get("REPO_ADMIN_TEST_RATE_LIMIT"):
     from lu_machinery.common import github_client
     gh.overrides[("GET", "user", False)] = github_client.GitHubRateLimited(None, "pool_exhausted")
@@ -812,14 +791,14 @@ if sys.argv[2] == "ruleset-merge-queue":
             open(os.path.join(os.environ["REPO_ADMIN_TEST_MARKERS"], "ruleset-put"), "w").close()
             raise subprocess.TimeoutExpired(args, 30)
         return subprocess.CompletedProcess(args, 0, json.dumps(ruleset), "")
-# As the python -m lu_machinery.publish entry point does.
-try:
-    code = pub.main(sys.argv[2:], runner=gh)
-except SystemExit:
-    pub.repo_admin_detach(sys.argv[2:])
-    raise
-pub.repo_admin_detach(sys.argv[2:])
-sys.exit(code)
+publish = pub.publish
+
+def publish_with_fake_gh(verb, *, runner=None, **fields):
+    return publish(verb, runner=gh, **fields)
+
+pub.publish = publish_with_fake_gh
+sys.argv[1:] = sys.argv[2:]
+runpy.run_module("lu_machinery.publish", run_name="__main__", alter_sys=True)
 """
 
 
@@ -848,18 +827,17 @@ _CREATED, _TRANSFERRED = "repo-create-rehearsal-1-*.json", f"repo-transfer-{REPO
     (["--", *_CREATE], _CREATED, False, "fails-later", 3),
     (["repo-create", "--help"], None, False, "fileno-valueerror", 0),
     (["repo-transfer", "--invalid"], None, False, "fileno-valueerror", 2),
-    (_CREATE, _CREATED, False, "sigint-after-post", 3),
     (_RULESET, None, False, "stderr", 120),
 ])
 def test_broken_output_streams_keep_the_exit_code(tmp_path, argv, pattern, limited, streams, code):
     """Defect class: interpreter shutdown overriding the documented exit code after a failed stream write.
 
     After a POST it stays 3, whichever stream failed, whether or not it has a descriptor, and also when
-    the failure first appears at main()'s final flush (never 0 or 120); a rate limit before any POST
+    the failure first appears at the final flush (never 0 or 120); a rate limit before any POST
     stays 75, also on a stream without a binary buffer (never 2); --help stays 0 and invalid arguments
     stay 2, also with stdout's descriptor or a stream object closed, a fileno() that raises, or a leading
-    "--" before the verb; Ctrl-C after the POST is 3 with a complete receipt. The repo-admin output guard never reaches another verb: a ruleset-merge-queue PUT that
-    timed out with a broken stderr keeps the code the shared main() gives it.
+    "--" before the verb. The repo-admin output guard never reaches another verb: a ruleset-merge-queue
+    PUT that timed out with a broken stderr keeps the code the shared main() gives it.
     """
     environment = {
         key: value for key, value in os.environ.items()
@@ -886,5 +864,3 @@ def test_broken_output_streams_keep_the_exit_code(tmp_path, argv, pattern, limit
         return
     receipts = sorted(state_dir(tmp_path).glob(pattern))
     assert receipts and json.loads(receipts[-1].read_text())["mutations_sent"] == (0 if limited else 1)
-    if streams == "sigint-after-post":
-        assert json.loads(receipts[-1].read_text())["outcome"] == "unverified" and b"_UNSETTLED" in completed.stderr

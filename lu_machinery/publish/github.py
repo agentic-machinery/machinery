@@ -21,7 +21,7 @@ import time
 import zipfile
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, NoReturn
+from typing import NoReturn
 from urllib.parse import quote
 
 import yaml
@@ -2196,9 +2196,8 @@ def _repo_admin_authority(verb, environment):
     # and the shared client keys its rate-limit budget on that login through this process's home. Both must
     # be the account's own home (the journal's too), so a caller HOME selects no other login or budget.
     home = _account_home()
-    for value in (environment.get("HOME"), str(Path.home())):
-        if not value or os.path.realpath(value) != os.path.realpath(home):
-            raise _repo_refused(verb, f"HOME must be the account's home directory {home}, where gh keeps its login")
+    if environment.get("HOME") != home or os.environ.get("HOME") != home:
+        raise _repo_refused(verb, f"HOME must be exactly the account's home directory {home}, where gh keeps its login")
 
 
 def _repo_admin_row(verb, key):
@@ -2288,115 +2287,34 @@ def _repo_matches(identity, slug, repository_id):
     )
 
 
-def _devnull_stream(name):
-    """Replace ``sys.<name>`` with a /dev/null text stream, which interpreter shutdown cannot fail to flush."""
-    with contextlib.suppress(Exception):
-        setattr(sys, name, open(os.devnull, "w", encoding="utf-8"))  # noqa: SIM115 - lives until exit
-
-
-def _silence_stream(name):
-    """Make the failed ``sys.<name>`` stream harmless, so interpreter shutdown cannot fail on it.
-
-    A failed write leaves data that CPython flushes again at exit, turning the exit code into 120.
-    Its descriptor, if any, is pointed at /dev/null, the remedy the Python ``signal`` documentation
-    gives for a broken pipe (Note on SIGPIPE). The failed object itself is replaced too, since it
-    can fail again whatever its descriptor holds. A descriptor that was closed is reused by the
-    /dev/null open, so it is kept open, never closed a second time.
-    """
-    with contextlib.suppress(Exception):
-        descriptor = getattr(sys, name).fileno()
-        devnull = os.open(os.devnull, os.O_WRONLY)
-        if devnull != descriptor:
-            try:
-                os.dup2(devnull, descriptor)
-            finally:
-                os.close(devnull)
-    _devnull_stream(name)
-
-
-# The current repo-admin run: whether it sent a mutation and which output streams failed. A failed output
-# in a run that sent a mutation makes it unsettled. main() opens the run before it builds its parser,
-# publish() opens one for a direct caller, and a nested open joins the run already open.
-_REPO_ADMIN_RUN: contextvars.ContextVar[dict[str, Any] | None] = contextvars.ContextVar("repo_admin_run", default=None)
+_REPO_ADMIN_RUN: contextvars.ContextVar[dict[str, bool]] = contextvars.ContextVar("repo_admin_run")
 
 
 @contextlib.contextmanager
 def _repo_admin_run():
-    if _REPO_ADMIN_RUN.get() is not None:
-        yield
-        return
-    token = _REPO_ADMIN_RUN.set({"sent": False, "failed": []})
+    state = {"sent": False, "failed": False}
+    token = _REPO_ADMIN_RUN.set(state)
     try:
-        yield
+        yield state
     finally:
         _REPO_ADMIN_RUN.reset(token)
 
 
-def _repo_admin_state():
-    """The open run's state; outside a run, a fresh one nothing reads."""
-    return _REPO_ADMIN_RUN.get() or {"sent": False, "failed": []}
-
-
 def _stream_write(name, text):
-    """Write and flush *text* to ``sys.<name>``; False when it cannot be written. It never raises."""
+    """Write and flush to the caller's stream, recording a failure in this publication."""
     try:
         stream = getattr(sys, name)
         stream.write(text)
         stream.flush()
         return True
     except Exception:
-        _repo_admin_state()["failed"].append(name)
-        _silence_stream(name)
+        _REPO_ADMIN_RUN.get()["failed"] = True
         return False
 
 
 def _stderr_note(message):
     """One stderr line; a failed write is recorded for the exit code, never raised."""
     return _stream_write("stderr", message + "\n")
-
-
-def _repo_admin_flush():
-    """Flush both streams through the guarded writer, so interpreter shutdown has nothing left to fail on."""
-    for name in ("stdout", "stderr"):
-        _stream_write(name, "")
-
-
-def _repo_admin_settled(code):
-    """*code* after a final guarded flush of both streams: any output failure once a mutation was sent is 3."""
-    _repo_admin_flush()
-    state = _repo_admin_state()
-    return REPO_ADMIN_UNSETTLED if state["sent"] and state["failed"] else code
-
-
-def _repo_admin_argv(argv):
-    """Whether argparse dispatches *argv* to repo-create or repo-transfer.
-
-    argparse's own tokenizer reads the verb (the first positional, after any ``--``), never a copy of it.
-    The probe writes nothing, and runs with both streams on /dev/null (restored after), since building a
-    parser probes ``sys.stdout``, which may be unusable here.
-    """
-    try:
-        with open(os.devnull, "w", encoding="utf-8") as devnull, contextlib.redirect_stdout(devnull), \
-                contextlib.redirect_stderr(devnull):
-            probe = argparse.ArgumentParser(add_help=False, allow_abbrev=False, exit_on_error=False)
-            probe.add_argument("-h", "--help", action="store_true")
-            probe.add_argument("rest", nargs=argparse.PARSER)  # how a subparsers action takes its verb
-            known, _ = probe.parse_known_args(list(argv))
-    except Exception:
-        return False
-    return not known.help and known.rest[:1] != [] and known.rest[0] in REPO_ADMIN_VERBS
-
-
-def repo_admin_detach(argv):
-    """After ``main(argv)`` returned or exited for a repo-admin verb: replace both streams with /dev/null.
-
-    Only the ``python -m lu_machinery.publish`` entry point calls this, after ``main()`` settled the
-    code with its last guarded flush, so the interpreter's shutdown flush cannot turn that code into
-    120. In-process callers of ``main()`` keep their streams; for any other verb it does nothing.
-    """
-    if _repo_admin_argv(argv):
-        for name in ("stdout", "stderr"):
-            _devnull_stream(name)
 
 
 def _repo_admin_limited(verb, exc, capture_output, text):
@@ -2416,17 +2334,13 @@ def _repo_admin_limited(verb, exc, capture_output, text):
         _stream_write("stdout", limited.stdout)
         _stream_write("stderr", limited.stderr)
         limited.stdout = limited.stderr = None
-    _repo_admin_flush()
     return limited
 
 
 def _repo_admin_result(verb, receipt, code, capture_output, text):
-    """The command result; it never raises. Any output failure after a mutation exits unsettled.
-
-    Both streams are flushed here, so nothing is left for interpreter shutdown to fail on.
-    """
+    """Send the receipt and record whether this run sent a mutation."""
     encoded = json.dumps(receipt, indent=2, sort_keys=True) + "\n"
-    state = _repo_admin_state()
+    state = _REPO_ADMIN_RUN.get()
     state["sent"] = bool(receipt["mutations_sent"])
     if not capture_output and not _stream_write("stdout", encoded):
         _stderr_note(f"{verb.upper().replace('-', '_')}_STDOUT_UNWRITTEN: the receipt is only in its file.")
@@ -2435,7 +2349,6 @@ def _repo_admin_result(verb, receipt, code, capture_output, text):
             f"{verb.upper().replace('-', '_')}_UNSETTLED: {receipt['detail'] or 'the result is unknown'}; "
             "do not retry. Reconcile the state on GitHub first (see --help)."
         )
-    code = _repo_admin_settled(code)
     return subprocess.CompletedProcess(
         ["github", verb], code,
         (encoded if text else encoded.encode("utf-8")) if capture_output else None,
@@ -2520,9 +2433,7 @@ def _repo_admin(verb, fields, *, runner, cwd, environment, capture_output, text)
             fields, plan, receipt, sink, held["directory"], directory, runner=runner, cwd=cwd,
             environment=environment, capture_output=capture_output, text=text,
         )
-    except BaseException as exc:
-        if not isinstance(exc, Exception) and not receipt["mutations_sent"]:
-            raise  # An interrupt before the POST stops with nothing sent.
+    except Exception as exc:
         if not receipt["mutations_sent"] and verb == "repo-transfer" and not isinstance(
             exc, github_client.GitHubRateLimited
         ) and _repo_admin_journal_possible(plan["repository_id"]):
@@ -2548,10 +2459,7 @@ def _repo_admin(verb, fields, *, runner, cwd, environment, capture_output, text)
                 return _repo_admin_limited(verb, exc, capture_output, text)
             raise
         if receipt["outcome"] in {None, "created", "transferred"}:
-            receipt["outcome"], receipt["detail"] = "unverified", (
-                "a local step failed after the mutation was sent" if isinstance(exc, Exception)
-                else "the run was interrupted after the mutation was sent"
-            )
+            receipt["outcome"], receipt["detail"] = "unverified", "a local step failed after the mutation was sent"
         _write_transfer_receipt(sink, receipt)
         return _repo_admin_result(verb, receipt, REPO_ADMIN_UNSETTLED, capture_output, text)
     finally:
@@ -4020,11 +3928,17 @@ def publish(
             fields, runner=runner, cwd=cwd, environment=environment, capture_output=capture_output, text=text
         )
     if verb in REPO_ADMIN_VERBS:
-        with _repo_admin_run():
-            return _repo_admin(
+        with _repo_admin_run() as state:
+            result = _repo_admin(
                 verb, fields, runner=runner, cwd=cwd, environment=environment, capture_output=capture_output,
                 text=text,
             )
+            # Account for failures that first appear after the receipt was written.
+            for name in ("stdout", "stderr"):
+                _stream_write(name, "")
+            if state["sent"] and state["failed"]:
+                result.returncode = REPO_ADMIN_UNSETTLED
+            return result
     dest = "unknown" if verb == "gist-create" else repository(cwd, environment, fields.get("repo"))
     if dest == "unknown" and verb != "gist-create":
         raise gate.PublishBlocked("OPSEC: publisher repository unresolved; provide --repo.")
@@ -4542,31 +4456,10 @@ def loads(value: str) -> object:
 
 
 def main(argv=None, *, runner=None):
-    argv = list(sys.argv[1:] if argv is None else argv)
-    if not _repo_admin_argv(argv):
-        return _main(argv, runner=runner)
-    # repo-create and repo-transfer: one run from before the parser is built to the settled exit code.
-    with _repo_admin_run():
-        try:
-            try:
-                code = _main(argv, runner=runner)
-            except Exception:
-                # Only building or parsing raises here (_main settles every publish error itself), when a
-                # stream argparse probes or writes is unusable. Nothing was sent: replace both streams,
-                # record them as failed output, and run again.
-                for name in ("stdout", "stderr"):
-                    _repo_admin_state()["failed"].append(name)
-                    _devnull_stream(name)
-                code = _main(argv, runner=runner)
-        except SystemExit:
-            # --help (0) or invalid input (2): a broken stream is replaced, so it cannot make the code 120.
-            _repo_admin_flush()
-            raise
-        # Settled after the last output; a failure there after a mutation is unsettled, never 0.
-        return _repo_admin_settled(code)
+    return _run_args(_parse_args(argv), runner=runner)
 
 
-def _main(argv, *, runner=None):
+def _parse_args(argv):
     parser = PublisherParser(
         description="Publish GitHub changes through closed, scanned fields.\nUse for public writes; raw gh reads use native CLI arguments.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -4811,7 +4704,7 @@ def _main(argv, *, runner=None):
                 "Checks before the mutation: LU_PRODUCT_ROOT names the product checkout, which the private\n"
                 "  directory below must stay outside (unset: exit 2); no worker marker; none of GH_TOKEN,\n"
                 "  GITHUB_TOKEN, GH_ENTERPRISE_TOKEN, GITHUB_ENTERPRISE_TOKEN, GH_CONFIG_DIR, XDG_CONFIG_HOME set;\n"
-                "  GH_HOST unset or github.com; HOME is the account's password-database home (gh reads its stored\n"
+                "  GH_HOST unset or github.com; HOME exactly matches the account's password-database home (gh reads its stored\n"
                 "  login, and the client its rate-limit budget, through it); GET /user is --principal; the principal\n"
                 "  is an active admin of the source organization; both names are free.\n"
                 "  One run per fixture name: a lock in the private directory is held from the first read to settlement.\n"
@@ -4822,9 +4715,9 @@ def _main(argv, *, runner=None):
                 "  rehearsal_destination, principal before and after. repo-transfer --create-receipt takes that file.\n"
                 "Exit codes: 0 created and verified, or dry run passed (no mutation); 2 invalid input or refusal, no\n"
                 "  mutation; 3 UNSETTLED: the POST was sent and its result is unknown or unverified (an output\n"
-                "  failure or Ctrl-C after the POST included), or another run holds the lock (in-progress); never\n"
+                "  failure after the POST included), or another run holds the lock (in-progress); never\n"
                 "  retry with the same name: check the organization on GitHub and use a new name; a rate limit at\n"
-                "  the POST is 3; Ctrl-C before the POST stops with nothing sent;\n"
+                "  the POST is 3;\n"
                 "  75 a rate limit refused a read before the POST.\n"
                 "Related: decision GH-ADMIN-VERBS-1124; repo-transfer; docs/runbooks/write-worker-boundary.md."
             )
@@ -4862,14 +4755,13 @@ def _main(argv, *, runner=None):
                 "  not be removed is named in the receipt); 2 invalid input, a caller or registry refusal, or a\n"
                 "  --create-receipt that cannot be loaded (the id is then unknown), or a refusal with no mutation sent\n"
                 "  and no journal for this repository id; 3 UNSETTLED: the POST was sent and the result is unknown or\n"
-                "  unverified (an output failure or Ctrl-C after the POST included); a journal for this repository id exists or\n"
+                "  unverified (an output failure after the POST included); a journal for this repository id exists or\n"
                 "  cannot be read and the destination does not settle it, whichever later step fails (unreconciled);\n"
                 "  a refused run could not remove its own journal (journal-retained); or another run holds the lock\n"
                 "  (in-progress). Journals are per repository id: the rehearsal's never blocks the move.\n"
                 "  Never retry: rerun only to reconcile (it exits 0 once the id is at the\n"
                 "  destination); if GitHub still shows it at the source, confirm no transfer is pending and remove\n"
                 "  the journal by hand. Do not flip the selector until reconciled. A rate limit at the POST is 3;\n"
-                "  Ctrl-C before the POST stops with nothing sent (a journal it leaves is reconciled as above);\n"
                 "  75 a rate limit refused a read before the POST.\n"
                 "Related: decision GH-ADMIN-VERBS-1124; repo-create; lu_machinery/config/fleet_repos.yaml."
             )
@@ -5077,26 +4969,21 @@ def _main(argv, *, runner=None):
         action="store_true",
         help="Wrap paginated pages in an array (default off; unsupported for shaped diagnostic reads)",
     )
-    args = vars(parser.parse_args(argv))
+    return vars(parser.parse_args(argv))
+
+
+def _run_args(args, *, runner=None):
     verb = args.pop("verb")
     try:
         if verb == "read":
-            code = read(args.pop("name"), runner=runner, **args).returncode
-        else:
-            code = publish(verb, runner=runner, **args).returncode
+            return read(args.pop("name"), runner=runner, **args).returncode
+        return publish(verb, runner=runner, **args).returncode
     except gate.PublishBlocked as exc:
-        if verb not in REPO_ADMIN_VERBS:
-            print(str(exc), file=sys.stderr)
-            return 2
-        _stderr_note(str(exc))
-        code = 2
+        message = str(exc)
     except Exception:
-        if verb not in REPO_ADMIN_VERBS:
-            print("OPSEC: publisher transport unavailable.", file=sys.stderr)
-            return 2
-        _stderr_note("OPSEC: publisher transport unavailable.")
-        code = 2
-    return code
+        message = "OPSEC: publisher transport unavailable."
+    print(message, file=sys.stderr, flush=verb in REPO_ADMIN_VERBS)
+    return 2
 
 
 class Request:

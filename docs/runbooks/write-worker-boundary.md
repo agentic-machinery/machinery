@@ -312,13 +312,16 @@ worker runs as the dispatching user with that user's `gh` login (above), and the
 (decision GH-ADMIN-VERBS-1124) therefore run only from an operator-run script. They refuse a process
 carrying `LEARN_UKRAINIAN_DISPATCH_TASK_ID` or `LU_WRITE_BOUNDARY_BROKER`, refuse every caller
 credential override (`GH_TOKEN`, `GITHUB_TOKEN`, `GH_ENTERPRISE_TOKEN`, `GITHUB_ENTERPRISE_TOKEN`,
-`GH_CONFIG_DIR`, `XDG_CONFIG_HOME`), refuse a `HOME` other than the account's password-database home
+`GH_CONFIG_DIR`, `XDG_CONFIG_HOME`), require both the process and transport `HOME` to exactly match
+the account's password-database home
 (`gh` reads its stored login through it, and the client its rate-limit budget), and verify the
 `--principal` the operator names with `GET /user` through the same `gh` credential before and after the
 mutation. The marker refusal
 stops accidents; it is not authentication, because a worker can drop its own markers. Both verbs need
 `LU_PRODUCT_ROOT` set to the product checkout, which their private state directory must stay outside.
-Run `--help` on either verb for the checks, receipts and exit codes.
+Run `.venv/bin/python -m lu_machinery.publish <verb> --help` for the checks, receipts and exit codes.
+The exit codes apply to that module entry point. After an interruption, check GitHub for the fixture
+name before trying another create, or rerun the transfer command to reconcile its journal.
 
 ## Review contract canary
 
