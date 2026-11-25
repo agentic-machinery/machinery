@@ -1740,16 +1740,15 @@ def scan_record_candidates(directory: Path) -> list[Path]:
 def strict_task_inventory_in(tasks_dir: Path, *, include_archive: bool = True) -> list[dict[str, Any]]:
     """Return every verified task record under ``tasks_dir`` (and archive) while holding ``task_archive_lock``.
 
-    A JSON object without an int ``schema_version`` that ``parse_task_record`` classifies as
-    foreign (it returns ``None``: no record claim, such as a policy, build or receipt file), or
-    exactly ``[]``, is skipped, as ``list_tasks(strict=True)`` skips it. Any other ``None`` (text
-    that is not JSON, such as bare record members, another array or scalar, such as an array
-    holding a record, or an object carrying the dispatcher's int ``schema_version``) is refused.
-    Fails closed on any directory traversal error,
-    unreachable existing archive entry, dangling symlink, non-regular ``.json`` candidate (FIFO,
-    socket, device, directory), damaged record claim the parser refuses (a broken JSON object, a
-    blank or zero-filled file under a v2 record name, an invalid schema or identity), record
-    without a valid ``task_id``, or misnamed record that is not an exact copy of its named sibling.
+    A file ``parse_task_record`` calls foreign (it returns ``None``) is skipped only when its bytes
+    decode to a JSON object (the parser alone classifies objects: a policy, build or receipt file
+    makes no record claim) or to exactly ``[]``. Any other ``None`` (text that is not JSON, such as
+    bare record members, or another array or scalar, such as an array holding a record) is refused.
+    Fails closed on any directory traversal error, unreachable existing archive entry, dangling
+    symlink, non-regular ``.json`` candidate (FIFO, socket, device, directory), damaged record claim
+    the parser refuses (a broken JSON object, a blank or zero-filled file under a v2 record name, an
+    invalid schema or identity), record without a valid ``task_id``, or misnamed record that is not
+    an exact copy of its named sibling.
     """
     records: list[dict[str, Any]] = []
     with task_record_store.task_archive_lock(tasks_dir):
@@ -1775,17 +1774,13 @@ def strict_task_inventory_in(tasks_dir: Path, *, include_archive: bool = True) -
             except (OSError, ValueError, RecursionError):
                 raise ValueError(f"unreadable task record {listed.name}") from None
             if parsed is None:
-                # The parser also returns None for text that is not JSON and for arrays or scalars,
-                # so bare record members or an array holding a record would hide a live child. An int
-                # schema_version is the dispatcher's record marker, so such an object is never foreign.
+                # The parser also returns None for text that is not JSON and for every array or scalar,
+                # so bare record members or an array holding a record would hide a live child.
                 try:
-                    foreign = json_depth.loads(raw.decode("utf-8"), max_depth=task_record_store._JSON_MAX_DEPTH)
-                except (ValueError, RecursionError):
-                    foreign = None
-                if not (
-                    foreign == []
-                    or (isinstance(foreign, dict) and not isinstance(foreign.get("schema_version"), int))
-                ):
+                    decoded = json_depth.loads(raw.decode("utf-8"), max_depth=task_record_store._JSON_MAX_DEPTH)
+                except ValueError:
+                    decoded = None
+                if not (isinstance(decoded, dict) or decoded == []):
                     raise ValueError(f"unreadable task record {listed.name}")
                 continue
             if not _is_valid_run_identity(parsed.get("task_id")):

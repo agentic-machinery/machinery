@@ -1902,6 +1902,61 @@ def test_strict_inventory_skips_foreign_json_beside_records(tmp_path):
     assert adm.count_turn_children(tasks, "turn-parent", "nonce-turn-parent") == 1
 
 
+_CLOSEOUT_REPORT = {
+    "apply": True, "branch_status": {}, "criterion_receipts": [], "errors": [], "lifecycle_observations": [],
+    "matched_worktrees": [], "ok": True, "pr": 7,
+}
+
+
+@pytest.mark.parametrize(
+    ("suffix", "receipt"),
+    [
+        pytest.param(".closeout.json", _CLOSEOUT_REPORT, id="closeout"),
+        pytest.param(".closeout-final.json", _CLOSEOUT_REPORT, id="closeout-final"),
+        pytest.param(".merge-closeout.json", _CLOSEOUT_REPORT, id="merge-closeout"),
+        pytest.param(
+            ".landing-report.json",
+            {
+                "ci": "green", "enqueued": True, "failed_jobs": [], "implementation_changes": [], "merged": True,
+                "new_review_rounds": 0, "new_tasks_or_prs": [], "pr": 7, "residual_owner": "none", "residuals": [],
+                "review": "APPROVE",
+            },
+            id="landing-report",
+        ),
+        pytest.param(
+            ".resolver-red_team.json",
+            {
+                "advisory": True, "branch_facts": {}, "catalog_reviewed_on": "2026-01-01", "claude_account": "a",
+                "fail_closed_reason": None, "limitation": None, "policy_version": "v1", "quorum": [],
+                "quorum_rule": "single", "resolved_risk": "high", "review_mode": "red_team", "routing_snapshot": {},
+                "selected": {}, "substitution_note": None, "trace": [],
+            },
+            id="resolver-red_team",
+        ),
+        pytest.param(
+            ".scope.json",
+            {
+                "frozen_files": [], "frozen_non_test_loc": 1, "intended_behavior": "x", "issue_ref": "#1",
+                "non_goals": [], "owner_boundary": "x", "review_profile": "infra", "risk": "critical", "target": "x",
+            },
+            id="scope",
+        ),
+    ],
+)
+def test_strict_inventory_skips_review_tool_receipts_without_identity(tmp_path, suffix, receipt):
+    """Defect class: a review tool's receipt (a PR number or review flag, no task_id) reads as a legacy record claim.
+
+    The key sets are the live store's closeout, landing-report, resolver and scope receipts, with
+    synthetic values; none names a task_id, repository, status or agent, so none claims a run.
+    """
+    tasks = tmp_path / "tasks"
+    _record(tasks, "turn-child", parent_task_id="turn-parent", parent_run_nonce="nonce-turn-parent")
+    (tasks / f"turn-child{suffix}").write_text(json.dumps(receipt), encoding="utf-8")
+
+    assert [record["task_id"] for record in adm.strict_task_inventory_in(tasks)] == ["turn-child"]
+    assert adm.count_turn_children(tasks, "turn-parent", "nonce-turn-parent") == 1
+
+
 @pytest.mark.parametrize(
     ("name", "raw"),
     [
@@ -1918,6 +1973,7 @@ def test_strict_inventory_skips_foreign_json_beside_records(tmp_path):
             id="array-of-record",
         ),
         pytest.param("lost-identity.json", b'{"schema_version": 2, "status": "running"}', id="int-schema-object"),
+        pytest.param("note-list.json", b'["note"]', id="non-empty-foreign-array"),
     ],
 )
 def test_strict_inventory_still_refuses_record_claims_that_fail_to_parse(tmp_path, name, raw):
