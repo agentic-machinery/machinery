@@ -678,10 +678,18 @@ def test_research_observability_refuses_non_ascii_report_repository(tmp_path: Pa
     from lu_machinery.research import observability
 
     monkeypatch.setattr(observability, "github_slug", lambda: "learn-ukrainian/machinery")
+    monkeypatch.setattr(observability.isa, "load_registry", lambda *_a, **_kw: {})
+    assert (
+        observability._membership_report_matches_active_profile(
+            {"repository": "learn-ukrainian/machinery", "streams": {}},
+            tmp_path / "streams.yaml",
+        )
+        is True
+    )
     assert (
         observability._membership_report_matches_active_profile(
             {"repository": "learn-u\u212arainian/machinery", "streams": {}},
-            tmp_path / "missing.yaml",
+            tmp_path / "streams.yaml",
         )
         is False
     )

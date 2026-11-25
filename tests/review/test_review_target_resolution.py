@@ -485,8 +485,9 @@ def test_review_readers_refuse_non_ascii_slugs_and_keys(tmp_path, monkeypatch):
         capture_output=True,
         timeout=30,
     )
-    assert tr._origin_github_repo(repo) is None
-    with pytest.raises(TargetResolutionError, match="canonical review repository mismatch"):
+    with pytest.raises(TargetResolutionError, match="not an exact owner/name"):
+        tr._origin_github_repo(repo)
+    with pytest.raises(TargetResolutionError, match="not an exact owner/name"):
         tr.live_canonical_branch_head(repo, "topic", repository="learn-u\u212arainian/machinery")
 
     # repair_round
