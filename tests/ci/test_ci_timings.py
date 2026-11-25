@@ -525,6 +525,9 @@ def test_machinery_readers_refuse_overlong_digit_captures_without_unbounded_int(
         for comment in (
             f"Dismiss alert #7 fixed in https://github.com/learn-ukrainian/machinery/pull/{huge}",
             f"Dismiss alert #7 fixed in https://github.com/learn-ukrainian/machinery/pull/42 and https://github.com/learn-ukrainian/machinery/pull/{huge}",
+            "Dismiss alert #7 fixed in https://github.com/learn-ukrainian/machinery/pull/42 and https://github.com/learn-ukrainian/machinery/pull/0",
+            "Dismiss alert #7 fixed in https://github.com/learn-ukrainian/machinery/pull/42 and https://github.com/learn-ukrainian/machinery/pull/042",
+            "Dismiss alert #7 fixed in https://github.com/learn-ukrainian/machinery/pull/42 and https://github.com/learn-ukrainian/machinery/pull/\u0664\u0662",
         ):
             with pytest.raises(ValueError, match="comment needs an explanation and one same-repository merged PR"):
                 publish_github._dismiss_preflight(
