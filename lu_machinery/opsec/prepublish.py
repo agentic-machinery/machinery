@@ -9,9 +9,11 @@ owns destination admission, blocking policy and masked diagnostics.
 
 from __future__ import annotations
 
+import errno
 import importlib.util
 import os
 import re
+import stat
 import subprocess
 import sys
 import unicodedata
@@ -146,17 +148,181 @@ def _minimal_checkout_has_profile() -> bool:
     return False
 
 
-def _catalog_path() -> Path:
-    """Resolve ``fleet_repos.yaml`` at call time via the active profile, else the packaged copy."""
+_MAX_CATALOG_BYTES = 256 * 1024
+_UNTRUSTED_CATALOG_MESSAGE = "OPSEC: profile repository allowlist is caller-writable or untrusted; write refused."
+
+
+class _UntrustedCatalogError(PublishBlocked):
+    """A profile-declared repository catalog failed host-ownership or non-writability checks."""
+
+
+def _is_readonly_mount(fd: int) -> bool:
+    st_rdonly = getattr(os, "ST_RDONLY", 0)
+    if not st_rdonly:
+        return False
+    return bool(os.fstatvfs(fd).f_flag & st_rdonly)
+
+
+def _is_writable_by_caller(info: os.stat_result, path: Path, *, euid: int) -> bool:
+    mode = stat.S_IMODE(info.st_mode)
+    if mode & (stat.S_IWGRP | stat.S_IWOTH):
+        return True
+    if info.st_uid == euid and (mode & stat.S_IWUSR):
+        return True
+    if euid == 0:
+        return False
+    if os.access in os.supports_effective_ids:
+        return bool(os.access(path, os.W_OK, effective_ids=True))
+    return bool(os.access(path, os.W_OK))
+
+
+def _validate_trusted_path_shape(path: Path) -> None:
+    raw = os.fspath(path)
+    if (
+        not raw
+        or "\x00" in raw
+        or "\\" in raw
+        or raw != raw.strip()
+        or any(unicodedata.category(ch) in {"Cc", "Cf", "Zl", "Zp"} for ch in raw)
+        or not os.path.isabs(raw)
+        or not path.parts
+        or path.parts[0] != "/"
+        or len(path.parts) < 2
+        or any(part in ("", ".", "..") for part in path.parts[1:])
+    ):
+        raise _UntrustedCatalogError(_UNTRUSTED_CATALOG_MESSAGE)
+    for part in (path, *path.parents):
+        try:
+            if stat.S_ISLNK(os.lstat(part).st_mode):
+                raise _UntrustedCatalogError(_UNTRUSTED_CATALOG_MESSAGE)
+        except FileNotFoundError:
+            continue
+        except OSError:
+            raise _UntrustedCatalogError(_UNTRUSTED_CATALOG_MESSAGE) from None
+
+
+def _assert_ancestors_not_caller_controlled(parent: Path, *, euid: int) -> None:
+    for ancestor in (parent, *parent.parents):
+        try:
+            anc_st = os.lstat(ancestor)
+        except OSError:
+            raise _UntrustedCatalogError(_UNTRUSTED_CATALOG_MESSAGE) from None
+        if stat.S_ISLNK(anc_st.st_mode) or not stat.S_ISDIR(anc_st.st_mode):
+            raise _UntrustedCatalogError(_UNTRUSTED_CATALOG_MESSAGE)
+        mode = stat.S_IMODE(anc_st.st_mode)
+        if mode & (stat.S_IWGRP | stat.S_IWOTH):
+            raise _UntrustedCatalogError(_UNTRUSTED_CATALOG_MESSAGE)
+        if anc_st.st_uid != 0:
+            raise _UntrustedCatalogError(_UNTRUSTED_CATALOG_MESSAGE)
+        if euid != 0 and _is_writable_by_caller(anc_st, ancestor, euid=euid):
+            raise _UntrustedCatalogError(_UNTRUSTED_CATALOG_MESSAGE)
+
+
+def _read_host_trusted_file(path: Path, *, read_bytes: bool, max_bytes: int = _MAX_CATALOG_BYTES) -> bytes:
+    """Verify *path* is a host-owned, non-writable-by-caller regular file; optionally read its bytes."""
+    _validate_trusted_path_shape(path)
+    parent = path.parent
+    euid = os.geteuid()
+    parent_lstat = os.lstat(parent)
+    if stat.S_ISLNK(parent_lstat.st_mode) or not stat.S_ISDIR(parent_lstat.st_mode):
+        raise _UntrustedCatalogError(_UNTRUSTED_CATALOG_MESSAGE)
+
+    dir_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    try:
+        dir_fd = os.open(parent, dir_flags)
+    except FileNotFoundError:
+        raise
+    except OSError as exc:
+        if exc.errno in (errno.ELOOP, errno.ENOTDIR):
+            raise _UntrustedCatalogError(_UNTRUSTED_CATALOG_MESSAGE) from None
+        raise
+
+    try:
+        dir_st = os.fstat(dir_fd)
+        if (dir_st.st_dev, dir_st.st_ino) != (parent_lstat.st_dev, parent_lstat.st_ino):
+            raise _UntrustedCatalogError(_UNTRUSTED_CATALOG_MESSAGE)
+        if not stat.S_ISDIR(dir_st.st_mode) or dir_st.st_uid not in (0, euid):
+            raise _UntrustedCatalogError(_UNTRUSTED_CATALOG_MESSAGE)
+        if _is_writable_by_caller(dir_st, parent, euid=euid):
+            raise _UntrustedCatalogError(_UNTRUSTED_CATALOG_MESSAGE)
+
+        file_lstat = os.lstat(path.name, dir_fd=dir_fd)
+        if stat.S_ISLNK(file_lstat.st_mode) or not stat.S_ISREG(file_lstat.st_mode):
+            raise _UntrustedCatalogError(_UNTRUSTED_CATALOG_MESSAGE)
+
+        file_flags = (
+            os.O_RDONLY
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_NONBLOCK", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+        )
+        try:
+            file_fd = os.open(path.name, file_flags, dir_fd=dir_fd)
+        except FileNotFoundError:
+            raise
+        except OSError as exc:
+            if exc.errno in (errno.ELOOP, errno.ENOTDIR, errno.EISDIR, errno.ENXIO, errno.ENODEV):
+                raise _UntrustedCatalogError(_UNTRUSTED_CATALOG_MESSAGE) from None
+            raise
+
+        try:
+            file_st = os.fstat(file_fd)
+            if (file_st.st_dev, file_st.st_ino) != (file_lstat.st_dev, file_lstat.st_ino):
+                raise _UntrustedCatalogError(_UNTRUSTED_CATALOG_MESSAGE)
+            if not stat.S_ISREG(file_st.st_mode) or file_st.st_uid not in (0, euid):
+                raise _UntrustedCatalogError(_UNTRUSTED_CATALOG_MESSAGE)
+            if _is_writable_by_caller(file_st, path, euid=euid):
+                raise _UntrustedCatalogError(_UNTRUSTED_CATALOG_MESSAGE)
+            if euid != 0 and (file_st.st_uid == euid or dir_st.st_uid == euid):
+                if not (_is_readonly_mount(file_fd) and _is_readonly_mount(dir_fd)):
+                    raise _UntrustedCatalogError(_UNTRUSTED_CATALOG_MESSAGE)
+            else:
+                _assert_ancestors_not_caller_controlled(parent, euid=euid)
+            if not read_bytes:
+                return b""
+            if file_st.st_size > max_bytes:
+                raise ValueError("catalog exceeds size limit")
+            os.set_blocking(file_fd, True)
+            with os.fdopen(file_fd, "rb") as handle:
+                file_fd = -1
+                raw = handle.read(max_bytes + 1)
+        finally:
+            if file_fd >= 0:
+                os.close(file_fd)
+    finally:
+        os.close(dir_fd)
+
+    if len(raw) > max_bytes or b"\x00" in raw:
+        raise ValueError("catalog invalid or exceeds size limit")
+    return raw
+
+
+def _resolve_catalog_source() -> tuple[Path, Path | None]:
+    """Return ``(catalog_path, profile_path)``; ``profile_path`` is ``None`` for the packaged default."""
     default = _PACKAGE / "config" / "fleet_repos.yaml"
     try:
         # Imported here: minimal workflow checkouts omit common/profile.py.
-        from lu_machinery.common.profile import config_path
+        from lu_machinery.common.profile import load_profile
     except ModuleNotFoundError as exc:
         if exc.name not in _MINIMAL_CHECKOUT_OMITTED_MODULES or _minimal_checkout_has_profile():
             raise
-        return default
-    return config_path("fleet_repos", default=default)
+        return default, None
+    active = load_profile()
+    if active is None:
+        return default, None
+    relative = active.config.get("fleet_repos")
+    if relative is None:
+        return default, None
+    return active.owner_root.joinpath(*relative.split("/")), active.path
+
+
+def _read_catalog_text() -> str:
+    """Read the packaged catalog or a verified host-owned, non-writable profile catalog."""
+    catalog_path, profile_path = _resolve_catalog_source()
+    if profile_path is None:
+        return catalog_path.read_text(encoding="utf-8")
+    _read_host_trusted_file(profile_path, read_bytes=False)
+    return _read_host_trusted_file(catalog_path, read_bytes=True).decode("utf-8")
 
 
 def catalog() -> dict:
@@ -172,7 +338,7 @@ def catalog() -> dict:
             return super().construct_mapping(node, deep=deep)
 
     try:
-        data = yaml.load(_catalog_path().read_text(encoding="utf-8"), Loader=UniqueLoader)
+        data = yaml.load(_read_catalog_text(), Loader=UniqueLoader)
         repos = data["repos"] if isinstance(data, dict) else None
         if (
             not isinstance(repos, dict)
@@ -181,6 +347,8 @@ def catalog() -> dict:
         ):
             raise ValueError
         return repos
+    except _UntrustedCatalogError:
+        raise
     except Exception:
         raise PublishBlocked("OPSEC: repository allowlist unavailable; write refused.") from None
 
@@ -221,16 +389,23 @@ def is_private(destination: str) -> bool:
 
     A row is private by its declared ``visibility``, else by its ``private-`` role. A dual-slug row
     (``alternate_github``) is matched only at the slug the host selector makes active; its inactive
-    slug, and a dual-slug row whose selector is missing or untrusted, are not private.
+    slug, and a dual-slug row whose selector is missing or untrusted, are not private. A profile
+    catalog that fails host-ownership or non-writability checks is refused (treated as public).
     """
     destination = normalize_repository(destination)
     if destination == "unknown":
         return False
-    for key, row in catalog().items():
+    try:
+        rows = catalog()
+    except _UntrustedCatalogError:
+        return False
+    for key, row in rows.items():
         visibility = row.get("visibility") or ("private" if str(row.get("role", "")).startswith("private-") else None)
         if visibility != "private" or row.get("default"):
             continue
-        slug = row["github"]
+        slug = row.get("github")
+        if not isinstance(slug, str):
+            continue
         if row.get("alternate_github") is not None:
             try:
                 # Imported here: git_credentials imports this module. SelectorError is a ValueError.
