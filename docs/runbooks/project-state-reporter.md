@@ -40,7 +40,19 @@ Templates live in `packaging/systemd/`:
 - `learn-ukrainian-project-state-reporter.service` (oneshot)
 - `learn-ukrainian-project-state-reporter.timer` (5-minute cadence)
 
-### One-line operator install
+### Operator install
+
+The service names no checkout. It reads every root from the required host
+settings file `~/.config/learn-ukrainian/machinery.env` and does not start
+without it. Set at least:
+
+```bash
+LEARN_UKRAINIAN_PYTHON=<interpreter whose environment has lu_machinery installed>
+LU_PRODUCT_ROOT=<product checkout the reporter reads>
+LEARN_UKRAINIAN_PRIMARY_REPO_ROOT=<primary checkout>  # or LEARN_UKRAINIAN_STATE_ROOT
+```
+
+Then install the unit files unchanged:
 
 ```bash
 install -Dm644 packaging/systemd/learn-ukrainian-project-state-reporter.{service,timer} \
@@ -48,8 +60,7 @@ install -Dm644 packaging/systemd/learn-ukrainian-project-state-reporter.{service
   systemctl --user enable --now learn-ukrainian-project-state-reporter.timer
 ```
 
-Set `WorkingDirectory` / the wrapper path to the primary checkout if the
-template `%h/projects/learn-ukrainian` placeholder differs. Prefer leaving
+Prefer leaving
 `LU_MONITOR_HOST_ID` unset on the API host (in-process fill), or set
 `LU_MONITOR_HOST_ID=host-teacher` — never `host-job`.
 

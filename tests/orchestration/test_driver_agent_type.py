@@ -8,6 +8,7 @@ import pytest
 
 from lu_machinery.orchestration.driver_agent_type import (
     DEFAULT_TAXONOMY_PATH,
+    DriverAgentConfigError,
     main,
     resolve_driver_agent_type,
 )
@@ -21,8 +22,6 @@ assignments:
   seminars:
     driver_agent_type: curriculum-orchestrator
     slots: [claude-folk, claude-bio]
-  broken:
-    slots: [claude-broken]
 """
 
 TAXONOMY_FIXTURE = """
@@ -31,9 +30,11 @@ areas:
   infra:
     id: infra
     aliases: [infra-harness]
+    epics: []
   seminars:
     id: seminars
     aliases: [seminars-folk, seminars-bio]
+    epics: []
 """
 
 
@@ -95,6 +96,7 @@ areas:
   atlas:
     id: atlas
     aliases: [atlas-practice]
+    epics: []
 """,
         encoding="utf-8",
     )
@@ -116,10 +118,112 @@ def test_unknown_alias_fails_closed(assignments: Path, taxonomy: Path) -> None:
     )
 
 
-def test_unknown_lane_and_missing_type_return_none(assignments: Path) -> None:
+def test_unknown_lane_returns_none_and_missing_driver_agent_type_raises(assignments: Path, tmp_path: Path) -> None:
     assert resolve_driver_agent_type("nope", assignments_path=assignments) is None
-    assert resolve_driver_agent_type("broken", assignments_path=assignments) is None
     assert resolve_driver_agent_type("", assignments_path=assignments) is None
+
+    broken = tmp_path / "missing_type.yaml"
+    broken.write_text(
+        "schema_version: 1\nassignments:\n  broken:\n    slots: [claude-broken]\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(DriverAgentConfigError, match="driver_agent_type"):
+        resolve_driver_agent_type("broken", assignments_path=broken)
+    assert main(["--lane", "broken", "--assignments", str(broken)]) == 2
+
+
+def test_present_assignments_file_without_assignments_mapping_raises_config_error_and_exits_2(tmp_path: Path) -> None:
+    """Defect class (F7): present assignments file missing the required 'assignments' mapping exits 1 instead of 2."""
+    typo_assignments = tmp_path / "typo_assignments.yaml"
+    typo_assignments.write_text(
+        "schema_version: 1\nassignment:\n  atlas:\n    driver_agent_type: atlas-driver\n    slots: [claude-atlas]\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(DriverAgentConfigError, match="assignments"):
+        resolve_driver_agent_type("atlas", assignments_path=typo_assignments)
+    assert main(["--lane", "atlas", "--assignments", str(typo_assignments)]) == 2
+
+    # Absent explicit file still returns None / exits 1.
+    absent = tmp_path / "absent.yaml"
+    assert resolve_driver_agent_type("atlas", assignments_path=absent) is None
+    assert main(["--lane", "atlas", "--assignments", str(absent)]) == 1
+
+    # Unreadable explicit taxonomy directory must fail closed (exit 2) rather than falling back to slot lookup.
+    valid_assignments = tmp_path / "valid_assignments.yaml"
+    valid_assignments.write_text(
+        "schema_version: 1\nassignments:\n"
+        "  atlas:\n    driver_agent_type: atlas-driver\n    slots: []\n"
+        "  infra:\n    driver_agent_type: infra-driver\n    slots: [claude-review-alias]\n",
+        encoding="utf-8",
+    )
+    locked_dir = tmp_path / "locked"
+    locked_dir.mkdir()
+    locked_taxonomy = locked_dir / "fleet_taxonomy.yaml"
+    locked_taxonomy.write_text(
+        "schema_version: 1\nareas:\n  atlas:\n    id: atlas\n    aliases: [review-alias]\n    epics: []\n",
+        encoding="utf-8",
+    )
+    assert (
+        resolve_driver_agent_type(
+            "review-alias", assignments_path=valid_assignments, taxonomy_path=locked_taxonomy
+        )
+        == "atlas-driver"
+    )
+    locked_dir.chmod(0o000)
+    try:
+        with pytest.raises(DriverAgentConfigError):
+            resolve_driver_agent_type(
+                "review-alias", assignments_path=valid_assignments, taxonomy_path=locked_taxonomy
+            )
+        assert (
+            main(
+                [
+                    "--lane",
+                    "review-alias",
+                    "--assignments",
+                    str(valid_assignments),
+                    "--taxonomy",
+                    str(locked_taxonomy),
+                ]
+            )
+            == 2
+        )
+    finally:
+        locked_dir.chmod(0o755)
+
+    # Dangling parent symlink must also fail closed (exit 2) for both taxonomy and assignments.
+    dangling_parent = tmp_path / "dangling-parent"
+    dangling_parent.symlink_to(tmp_path / "gone-dir")
+    with pytest.raises(DriverAgentConfigError):
+        resolve_driver_agent_type(
+            "review-alias",
+            assignments_path=valid_assignments,
+            taxonomy_path=dangling_parent / "fleet_taxonomy.yaml",
+        )
+    assert (
+        main(
+            [
+                "--lane",
+                "review-alias",
+                "--assignments",
+                str(valid_assignments),
+                "--taxonomy",
+                str(dangling_parent / "fleet_taxonomy.yaml"),
+            ]
+        )
+        == 2
+    )
+    with pytest.raises(DriverAgentConfigError):
+        resolve_driver_agent_type("atlas", assignments_path=dangling_parent / "area_assignments.yaml")
+    assert main(["--lane", "atlas", "--assignments", str(dangling_parent / "area_assignments.yaml")]) == 2
+
+    # A valid symlinked parent directory whose target file is genuinely absent still returns None / exits 1.
+    real_dir = tmp_path / "real-dir"
+    real_dir.mkdir()
+    good_parent = tmp_path / "good-parent"
+    good_parent.symlink_to(real_dir)
+    assert resolve_driver_agent_type("atlas", assignments_path=good_parent / "absent.yaml") is None
+    assert main(["--lane", "atlas", "--assignments", str(good_parent / "absent.yaml")]) == 1
 
 
 def test_unreadable_file_returns_none(tmp_path: Path) -> None:

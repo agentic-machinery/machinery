@@ -26,18 +26,20 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
-import yaml
-
-from lu_machinery.common import json_depth
-from lu_machinery.common.repo_root import machinery_path
+from lu_machinery.common import json_depth, profile
+from lu_machinery.common.repo_root import MachineryConfigError, machinery_path
 from lu_machinery.fleet.regenerable_output import committed_release_pins, is_regenerable_ignored_path
 from lu_machinery.orchestration import worktree_artifacts as artifacts
-from lu_machinery.orchestration.preparation_evidence import UniqueKeyLoader
 from lu_machinery.orchestration.task_record_store import (
     parse_task_record,
     read_task_record_bytes,
     task_archive_lock,
     task_record_path,
+)
+from lu_machinery.orchestration.validate_fleet_taxonomy import (
+    FleetTaxonomyValidationError,
+    load_yaml_mapping_bytes,
+    read_regular_file_bytes,
 )
 
 # Deepest JSON this module reads (json_depth): its own identity cache.
@@ -55,7 +57,8 @@ MAX_RESIDUE_RECEIPT_BYTES = 10 * 1024 * 1024
 MAX_DETACHED_BUNDLE_BYTES = MAX_PRESERVED_BYTES
 
 # Reviewed creator-initiator -> canonical stream map for lane succession (#10617).
-SUCCESSION_MAP = machinery_path("config/terminal_abandon_succession.yaml")
+_PACKAGED_SUCCESSION_MAP = machinery_path("config/terminal_abandon_succession.yaml")
+SUCCESSION_MAP = _PACKAGED_SUCCESSION_MAP
 _SUCCESSION_STREAM = re.compile(r"epic:[1-9][0-9]*")
 _SUCCESSION_INITIATOR = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 
@@ -615,16 +618,26 @@ def creation_inventory(worktree: Path, *, primary: Path, task_id: str, run_nonce
     }
 
 
+def default_succession_map_path() -> Path:
+    """Resolve ``terminal_abandon_succession.yaml`` at call time via the active profile, else the packaged copy."""
+    if SUCCESSION_MAP != _PACKAGED_SUCCESSION_MAP:
+        return SUCCESSION_MAP
+    return profile.config_path("terminal_abandon_succession", default=_PACKAGED_SUCCESSION_MAP)
+
+
 def succession_streams(path: Path | None = None) -> tuple[dict[str, str], str]:
     """Load the reviewed initiator -> stream map and the SHA-256 of its exact bytes.
 
     Exact keys only; a malformed file, duplicate key or an initiator listed under
     two streams refuses the whole map rather than choosing one.
     """
-    raw = (SUCCESSION_MAP if path is None else path).read_bytes()
     try:
-        data = yaml.load(raw.decode("utf-8"), Loader=UniqueKeyLoader)  # SafeLoader subclass
-    except (UnicodeDecodeError, yaml.YAMLError) as exc:
+        target = default_succession_map_path() if path is None else path
+        # The fleet-config read and YAML rule: no blocking open of a non-regular file, no key
+        # written twice in one mapping (``<<`` included), no cyclic anchor.
+        _, raw = read_regular_file_bytes(target)
+        data = load_yaml_mapping_bytes(raw, target)
+    except (MachineryConfigError, FleetTaxonomyValidationError) as exc:
         raise ValueError("succession map unreadable") from exc
     if not isinstance(data, dict) or set(data) != {"schema", "streams"}:
         raise ValueError("succession map invalid")

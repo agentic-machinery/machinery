@@ -42,7 +42,7 @@ _IMPORT_ROOT = str(Path(__file__).resolve().parents[2])
 if _IMPORT_ROOT not in sys.path:
     sys.path.insert(0, _IMPORT_ROOT)
 from lu_machinery.common import github_client, json_depth
-from lu_machinery.common.repo_root import MachineryConfigError, state_root
+from lu_machinery.common.repo_root import MachineryConfigError, main_checkout_root, product_root, repos_root, state_root
 from lu_machinery.common.task_scratch import recover_orphans as recover_task_scratch
 from lu_machinery.dispatcher.store import retention_hold_disposition
 from lu_machinery.hygiene import fetch_refspecs, home_session_retention_check
@@ -72,14 +72,35 @@ SELF_CGROUP = Path("/proc/self/cgroup")
 
 
 def default_public_repo() -> Path:
-    return state_root()
+    """The configured product checkout (``LU_PRODUCT_ROOT``), anchored at its primary checkout.
+
+    Raises :class:`MachineryConfigError` when no product checkout is configured.
+    """
+    return main_checkout_root(product_root())
 
 
-def default_private_repo(public_repo: Path) -> Path:
+def default_private_repo() -> Path:
+    """The fleet registry's ``infra-private`` checkout under the configured repositories root.
+
+    Raises :class:`FleetRepoError` for a missing or unsafe registry entry and
+    :class:`MachineryConfigError` when no repositories root is configured.
+    """
     repo = load_fleet_repos().get("infra-private")
     if repo is None or not re.fullmatch(r"[A-Za-z0-9_-]+", repo.local_name):
-        raise FleetRepoError("fleet registry must give infra-private a sibling checkout name")
-    return public_repo.parent / repo.local_name
+        raise FleetRepoError("fleet registry must give infra-private a checkout name")
+    return repos_root() / repo.local_name
+
+
+def git_backed_state_root(*repo_roots: Path) -> Path | None:
+    """The state root when it is a Git checkout apart from ``repo_roots``, else ``None``.
+
+    Such a checkout owns the task store, so it alone runs retained-worktree settlement and must be
+    swept as a repository too.
+    """
+    state = state_root()
+    if not (state / ".git").exists() or state.resolve() in {root.resolve() for root in repo_roots}:
+        return None
+    return state
 
 
 def default_state_dir() -> Path:
@@ -1651,7 +1672,11 @@ Related:
         action="append",
         type=Path,
         default=None,
-        help="Repository root to sweep. Repeatable; default: configured public and private repositories. Example: .",
+        help=(
+            "Repository root to sweep. Repeatable; default: the product checkout (LU_PRODUCT_ROOT) and the "
+            "fleet registry's infra-private checkout under the repositories root (LU_REPOS_ROOT), with the "
+            "batch_state and rollover sweeps on the state root in place of the product checkout. Example: ."
+        ),
     )
     parser.add_argument(
         "--git-maintenance", action="store_true",
@@ -1804,7 +1829,16 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
-        repo_roots = args.repo_root or [public := default_public_repo(), default_private_repo(public)]
+        if args.repo_root:
+            repo_roots = state_roots = args.repo_root
+        else:
+            public = default_public_repo()
+            private = default_private_repo()
+            state = git_backed_state_root(public, private)
+            repo_roots = [public, *([state] if state is not None else []), private]
+            # batch_state/ and .agent/ live under the state root, which a detached plane keeps apart
+            # from the product checkout.
+            state_roots = [state_root(), private]
     except (MachineryConfigError, FleetRepoError) as exc:
         parser.error(str(exc))
     receipt = build_receipt(repo_roots, apply=bool(args.apply), **({"git_maintenance": True} if args.git_maintenance else {}))
@@ -1814,9 +1848,9 @@ def main(argv: list[str] | None = None) -> int:
         return 1 if receipt["summary"]["errors"] else 0
     home_session_retention = home_session_retention_check.build_report()
     receipt["home_session_retention"] = home_session_retention
-    receipt["batch_state_retention"] = batch_state_retention_reports(repo_roots, apply=bool(args.apply))
+    receipt["batch_state_retention"] = batch_state_retention_reports(state_roots, apply=bool(args.apply))
     receipt["claude_session_scratch"] = sweep_sessions(
-        rollover_roots=[Path(root) / ".agent/thread-rollovers/claude" for root in repo_roots],
+        rollover_roots=[Path(root) / ".agent/thread-rollovers/claude" for root in state_roots],
         apply=bool(args.apply),
     )
     receipt["summary"]["errors"] += receipt["claude_session_scratch"]["summary"]["errors"]
