@@ -554,6 +554,16 @@ def test_native_hook_roots_admit_a_dedicated_non_git_state_root_beside_the_git_a
         monkeypatch.setenv(rr.LU_STATE_ROOT_ENV, str(refused))
         with pytest.raises(rr.ProductRootError, match="no hook context resolves"):
             rr.native_hook_roots(workspace)
+    # An unsearchable directory whose `.git` lookup fails with EACCES must fail closed, not appear non-Git.
+    if os.geteuid() != 0:
+        unsearchable = _primary_checkout(tmp_path / "unsearchable-other")
+        unsearchable.chmod(0o600)
+        try:
+            monkeypatch.setenv(rr.LU_STATE_ROOT_ENV, str(unsearchable))
+            with pytest.raises(rr.ProductRootError, match="no hook context resolves"):
+                rr.native_hook_roots(workspace)
+        finally:
+            unsearchable.chmod(0o755)
     # The alias is the generated hook command's checkout state root: named non-Git, it refuses there and here.
     monkeypatch.delenv(rr.LU_STATE_ROOT_ENV)
     monkeypatch.setenv(rr.STATE_ROOT_ENV, str(state))

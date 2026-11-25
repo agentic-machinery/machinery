@@ -68,6 +68,15 @@ _CTO_WORKSPACE_TEMPLATE = "067bc1879e47adab40f3b6a97069b5820960f7dd64382d8fb1ac7
 _CTO_PACKAGE_WRAPPER = Path(__file__).resolve().parents[1] / "start-claude-cto.sh"
 
 
+def _has_git_marker(directory: str) -> bool:
+    """Return True if ``directory/.git`` exists; only ``FileNotFoundError`` proves absence."""
+    try:
+        os.lstat(os.path.join(directory, ".git"))
+    except FileNotFoundError:
+        return False
+    return True
+
+
 def cto_wrapper_signature(wrapper: Path, root: Path, entrypoint: Path, args: list[str]) -> str:
     """Bind the supported wrapper template and its expanded launch intent, without executing it.
 
@@ -136,7 +145,7 @@ def cto_wrapper_signature(wrapper: Path, root: Path, entrypoint: Path, args: lis
                 or not os.access(_CTO_PACKAGE_WRAPPER, os.X_OK)
                 or repo != workspace
                 or repo != os.getcwd()
-                or any(os.path.lexists(os.path.join(ancestor, ".git")) for ancestor in (repo, *map(str, Path(repo).parents)))
+                or any(_has_git_marker(ancestor) for ancestor in (repo, *map(str, Path(repo).parents)))
                 or entrypoint != _CTO_PACKAGE_WRAPPER
             ):
                 raise ValueError("unsupported workspace intent")

@@ -920,6 +920,15 @@ _HOOK_ROOTS_SCRIPT = (
 _HOOK_ROOTS_ENV = ("PATH", PRODUCT_ROOT_ENV, "CLAUDE_PROJECT_DIR", PRIMARY_ROOT_ENV, STATE_ROOT_ENV)
 
 
+def _has_git_marker(directory: Path) -> bool:
+    """Return True if ``directory/.git`` exists; only ``FileNotFoundError`` proves absence."""
+    try:
+        os.lstat(directory / ".git")
+    except FileNotFoundError:
+        return False
+    return True
+
+
 def native_hook_roots(invocation_dir: Path) -> tuple[Path, Path]:
     """The product and shared-state roots for ``invocation_dir`` by the one hook rule; read-only.
 
@@ -952,10 +961,10 @@ def native_hook_roots(invocation_dir: Path) -> tuple[Path, Path]:
                 if configured is not None:
                     resolved = resolve_path(configured)
                     ancestors = (configured, *configured.parents, resolved, *resolved.parents)
-                    if not any(os.path.lexists(ancestor / ".git") for ancestor in ancestors):
+                    if not any(_has_git_marker(ancestor) for ancestor in ancestors):
                         continue
             env[ENV_ALIASES[name]] = setting[1]
-    except (MachineryConfigError, OSError) as exc:
+    except (MachineryConfigError, OSError, RuntimeError) as exc:
         raise ProductRootError(f"no hook context resolves from {invocation_dir}: {exc}") from None
     try:
         # Fixed /bin/bash argv; the library path and directory are arguments, never shell text.
