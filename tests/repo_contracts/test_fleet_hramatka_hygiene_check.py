@@ -160,6 +160,15 @@ def test_private_board_is_read_at_the_active_slug(hermetic_repo, monkeypatch) ->
 
     assert receipt["status"] == "verified"
     assert reads == [(PUBLIC, EPIC), (moved, BOARD)]
+    # The epic's existing pointer names the board by the slug it left (GitHub redirects it): still the board.
+    reads.clear()
+    fixture = _reader({(PUBLIC, EPIC): {"number": EPIC, "body": CLEAN_BODY}, (moved, BOARD): {"number": BOARD, "body": ""}})
+    kept = hygiene.hygiene_check(reader=reader, **_base_kwargs(repo_root, tasks_dir))
+    assert (kept["status"], kept["queue_pointer_ok"]) == ("verified", True)
+    assert reads == [(PUBLIC, EPIC), (moved, BOARD)]
+    # An explicit --private-repo is the one spelling its pointer may use.
+    explicit = hygiene.hygiene_check(reader=reader, private_repo=moved, **_base_kwargs(repo_root, tasks_dir))
+    assert explicit["queue_pointer_ok"] is False
     # Without a trusted selector the transferred row is unknown: no read of the slug it may have left.
     monkeypatch.setattr(git_credentials, "load_selector", lambda **_kwargs: (_ for _ in ()).throw(
         git_credentials.SelectorError("fleet repository selector unavailable")))

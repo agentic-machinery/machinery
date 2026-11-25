@@ -967,3 +967,10 @@ def test_pull_requests_read_each_project_at_its_active_slug(monkeypatch, tmp_pat
     assert "r2:" not in queries[-1] and "private-infra" not in queries[-1].casefold()
     assert [(row["status"], row["reason"]) for row in missing] == [
         ("ok", None), ("ok", None), ("unknown", "repository_resolution_failed")]
+    # A whole failed read keeps that refusal: only the projects it queried take the read's reason.
+    monkeypatch.setattr(git_hygiene_router.github_client, "run", lambda *_a, **_k: (_ for _ in ()).throw(
+        subprocess.TimeoutExpired("gh", 1)))
+    timed_out = git_hygiene_router.compute_pull_requests(tmp_path)
+    assert timed_out["reason"] == "github_timeout"
+    assert [row["reason"] for row in timed_out["repositories"]] == [
+        "github_timeout", "github_timeout", "repository_resolution_failed"]

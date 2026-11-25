@@ -141,10 +141,10 @@ def _gh_issue(
     return data
 
 
-def _pointer_pattern(private_repo: str, private_board: int) -> re.Pattern[str]:
-    short = re.escape(f"{private_repo}#{private_board}")
-    long = re.escape(f"{private_repo}/issues/{private_board}")
-    return re.compile(f"{short}|{long}")
+def _pointer_pattern(private_repos: tuple[str, ...], private_board: int) -> re.Pattern[str]:
+    """The board pointer at any of ``private_repos`` (a transferred row's registered spellings)."""
+    forms = [re.escape(f"{repo}{sep}{private_board}") for repo in private_repos for sep in ("#", "/issues/")]
+    return re.compile("|".join(forms))
 
 
 def _count_task_list_items(body: str) -> tuple[int, int]:
@@ -404,11 +404,15 @@ def hygiene_check(
     if reader is _gh_issue:
         reader = functools.partial(_gh_issue, cwd=repo_root)
 
+    # An explicit --private-repo is the one spelling the pointer may use.
+    pointer_repos: tuple[str, ...] = () if private_repo is None else (private_repo,)
     if private_repo is None:
         try:
-            # The board lives at the row's active slug; an unknown row or a transferred row without a
-            # trusted selector is unknown, never the slug it may have left.
-            private_repo = resolve_active_fleet_repo("infra-private", repos=load_fleet_repos()).active_github
+            # The board is read at the row's active slug; an unknown row or a transferred row without a
+            # trusted selector is unknown, never the slug it may have left. The epic's pointer is a stored
+            # document: GitHub redirects a transferred repository's links, so either registered slug names it.
+            active = resolve_active_fleet_repo("infra-private", repos=load_fleet_repos())
+            private_repo, pointer_repos = active.active_github, active.repo.slugs
         except FleetRepoError:
             return _receipt(
                 status=Status.UNKNOWN,
@@ -441,7 +445,7 @@ def hygiene_check(
     if not epic_charter_ok:
         reasons.append(f"public epic #{public_epic} still has {unchecked} live (unchecked) checkbox item(s)")
 
-    queue_pointer_ok = bool(_pointer_pattern(private_repo, private_board).search(body))
+    queue_pointer_ok = bool(_pointer_pattern(pointer_repos, private_board).search(body))
     if not queue_pointer_ok:
         reasons.append(f"public epic #{public_epic} is missing the {private_repo}#{private_board} pointer")
 

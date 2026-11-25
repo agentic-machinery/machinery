@@ -732,13 +732,9 @@ def _unreadable_row(entry: dict[str, Any], reason: str, observed_at: str, *, pri
             "pull_requests": [], "default_branch": None, "pin": None, "unknown_since": since}
 
 
-def _unknown_pull_requests(
-    reason: str, observed_at: str, targets: list[tuple[str, str, str, str]] | None = None,
-) -> dict[str, Any]:
-    """A whole failed read still lists every registered project, each unknown since its first failure."""
-    rows = [_unreadable_row({"repository": f"{owner}/{name}", "name": display, "key": key}, reason, observed_at)
-            for key, owner, name, display in targets or []]
-    return {"status": "unknown", "reason": reason, "observed_at": observed_at, "repositories": rows}
+def _unknown_pull_requests(reason: str, observed_at: str) -> dict[str, Any]:
+    """No reading and no registry to list projects from (``compute_pull_requests`` lists them when it can)."""
+    return {"status": "unknown", "reason": reason, "observed_at": observed_at, "repositories": []}
 
 
 def _locked_version(text: str) -> str | None:
@@ -921,14 +917,16 @@ def compute_pull_requests(project_root: Path, *, tasks_dir: Path | None = None) 
     repositories: list[tuple[str, str, bool] | None] = [
         (owner, name, key == SELF_KEY) if ok else None for ok, (key, owner, name, _display) in zip(valid, targets, strict=True)
     ]
-    if not any(valid):
-        rows = [_unreadable_row({"repository": f"{owner}/{name}", "name": display, "key": key}, str(reason), observed_at)
-                for (key, owner, name, display), reason in zip(targets, refused, strict=True)]
-        heading = "invalid_repository" if "invalid_repository" in refused else "repository_resolution_failed"
-        return {"status": "unknown", "reason": heading, "observed_at": observed_at, "repositories": rows}
 
     def unknown(reason: str) -> dict[str, Any]:
-        return _unknown_pull_requests(reason, observed_at, targets)
+        # A whole failed read: every project is unknown, and one refused before the read keeps its own reason.
+        rows = [_unreadable_row({"repository": f"{owner}/{name}", "name": display, "key": key}, own or reason,
+                                observed_at)
+                for (key, owner, name, display), own in zip(targets, refused, strict=True)]
+        return {"status": "unknown", "reason": reason, "observed_at": observed_at, "repositories": rows}
+
+    if not any(valid):
+        return unknown("invalid_repository" if "invalid_repository" in refused else "repository_resolution_failed")
 
     try:
         proc = github_client.run(
