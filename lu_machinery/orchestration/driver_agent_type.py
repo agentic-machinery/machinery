@@ -18,6 +18,7 @@ import functools
 import os
 import stat
 import sys
+from collections.abc import Callable
 from pathlib import Path
 
 if __package__ in {None, ""}:  # run as a file (launchers do): the repository root holds the package
@@ -45,6 +46,16 @@ def _default_assignments_path() -> Path:
 
 class DriverAgentConfigError(ValueError):
     """Raised when ``area_assignments.yaml`` or ``fleet_taxonomy.yaml`` holds malformed driver agent configuration."""
+
+
+def _registry_path(explicit: Path | None, default: Callable[[], Path]) -> Path:
+    """``explicit``, else the active profile's path, with a profile refusal typed like any other registry refusal."""
+    if explicit is not None:
+        return explicit
+    try:
+        return default()
+    except profile.ProfileError as exc:
+        raise DriverAgentConfigError(str(exc)) from exc
 
 
 @functools.lru_cache(maxsize=16)
@@ -110,7 +121,7 @@ def resolve_driver_agent_type(
     lane = (lane or "").strip()
     if not lane:
         return None
-    resolved_assignments = _default_assignments_path() if assignments_path is None else assignments_path
+    resolved_assignments = _registry_path(assignments_path, _default_assignments_path)
     if not _inspect_optional_registry_path(resolved_assignments):
         return None
     try:
@@ -123,7 +134,7 @@ def resolve_driver_agent_type(
     if lane in assignments:
         return assignments[lane][0]
 
-    canonical = _canonical_area_for_alias(lane, default_taxonomy_path() if taxonomy_path is None else taxonomy_path)
+    canonical = _canonical_area_for_alias(lane, _registry_path(taxonomy_path, default_taxonomy_path))
     if canonical and canonical != lane and canonical in assignments:
         return assignments[canonical][0]
 
@@ -144,14 +155,14 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
     try:
-        assignments_path = _default_assignments_path() if args.assignments is None else args.assignments
+        assignments_path = _registry_path(args.assignments, _default_assignments_path)
         agent_type = resolve_driver_agent_type(
             args.lane,
             assignments_path=assignments_path,
             taxonomy_path=args.taxonomy,
             provider=args.provider,
         )
-    except (profile.ProfileError, DriverAgentConfigError) as exc:
+    except DriverAgentConfigError as exc:
         print(f"profile/config error: {exc}", file=sys.stderr)
         return 2
     if not agent_type:

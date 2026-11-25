@@ -631,13 +631,13 @@ def succession_streams(path: Path | None = None) -> tuple[dict[str, str], str]:
     Exact keys only; a malformed file, duplicate key or an initiator listed under
     two streams refuses the whole map rather than choosing one.
     """
-    target = default_succession_map_path() if path is None else path
     try:
+        target = default_succession_map_path() if path is None else path
         # The fleet-config read and YAML rule: no blocking open of a non-regular file, no key
         # written twice in one mapping (``<<`` included), no cyclic anchor.
         _, raw = read_regular_file_bytes(target)
         data = load_yaml_mapping_bytes(raw, target)
-    except FleetTaxonomyValidationError as exc:
+    except (profile.ProfileError, FleetTaxonomyValidationError) as exc:
         raise ValueError("succession map unreadable") from exc
     if not isinstance(data, dict) or set(data) != {"schema", "streams"}:
         raise ValueError("succession map invalid")

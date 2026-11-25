@@ -237,10 +237,14 @@ def _load_roster() -> tuple[frozenset[str], bool]:
     from lu_machinery.common import profile
     from lu_machinery.ops import driver_lanes
 
-    assignments = Path(agent_identity.default_assignments_path())
+    # An unusable profile entry leaves that roster source unavailable, so the roster is incomplete.
+    try:
+        assignments: Path | None = Path(agent_identity.default_assignments_path())
+    except profile.ProfileError:
+        assignments = None
     try:
         lane_data: Path | None = Path(driver_lanes.default_data_path())
-    except profile.ProfileError:  # an unusable profile entry leaves the lane roster unavailable
+    except profile.ProfileError:
         lane_data = None
     key: list[object] = []
     for path in (assignments, lane_data):
@@ -253,8 +257,12 @@ def _load_roster() -> tuple[frozenset[str], bool]:
     cached = _ROSTER_CACHE.get(tuple(key))
     if cached is not None:
         return cached
-    slots = agent_identity._load_registry_slots(assignments)
-    external, external_availability = load_external_recipients(assignments)
+    slots: tuple[str, ...] = ()
+    external: tuple[str, ...] = ()
+    external_availability: Literal["available", "unavailable"] = "unavailable"
+    if assignments is not None:
+        slots = agent_identity._load_registry_slots(assignments)
+        external, external_availability = load_external_recipients(assignments)
     lanes: tuple[str, ...] = ()
     if lane_data is not None:
         with contextlib.suppress(Exception):

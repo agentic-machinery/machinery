@@ -1696,3 +1696,46 @@ def test_a_non_regular_config_file_is_refused_without_a_blocking_open_by_every_t
     finally:
         signal.alarm(0)
         signal.signal(signal.SIGALRM, previous)
+
+
+def test_a_profile_refusal_on_a_default_config_path_is_each_callers_own_typed_refusal(tmp_path, monkeypatch):
+    """Defect class: a default config path resolved outside the caller's error translation (PR1479-F1).
+
+    A refused profile entry (a FIFO, a symlink, a bad profile) must surface as the same typed refusal
+    the caller gives for an explicit path, never as a bare ``ProfileError`` or an exception from a
+    fail-open reader.
+    """
+    from lu_machinery.fleet import ignored_task_output
+    from lu_machinery.fleet_comms import authority
+    from lu_machinery.ops import driver_lanes
+    from lu_machinery.orchestration import driver_agent_type, fleet_taxonomy, validate_fleet_taxonomy
+
+    def _refused(name, **_kwargs):
+        raise profile.ProfileError(f"consumer config {name!r} is not a regular file")
+
+    monkeypatch.setattr(profile, "config_path", _refused)
+    assignments = tmp_path / "area_assignments.yaml"
+    assignments.write_text(
+        "schema_version: 1\nassignments:\n  atlas:\n    driver_agent_type: atlas-driver\n    slots: [claude-atlas]\n",
+        encoding="utf-8",
+    )
+
+    for kwargs in ({}, {"assignments_path": assignments}):  # the second reaches the taxonomy default
+        with pytest.raises(driver_agent_type.DriverAgentConfigError, match="not a regular file"):
+            driver_agent_type.resolve_driver_agent_type("atlas-alias", **kwargs)
+    assert driver_agent_type.main(["--lane", "atlas-alias"]) == 2
+    with pytest.raises(validate_fleet_taxonomy.FleetTaxonomyValidationError, match="not a regular file"):
+        validate_fleet_taxonomy.load_validated_assignments()
+    with pytest.raises(validate_fleet_taxonomy.FleetTaxonomyValidationError, match="not a regular file"):
+        validate_fleet_taxonomy.validate_fleet_taxonomy()
+    with pytest.raises(fleet_taxonomy.FleetTaxonomyError, match="not a regular file"):
+        fleet_taxonomy.load_fleet_taxonomy()
+    with pytest.raises(ValueError, match="succession map unreadable"):
+        ignored_task_output.succession_streams()
+    with pytest.raises(driver_lanes.LaneConfigError, match="not a regular file"):
+        driver_lanes.load_registry()
+    # The recipient roster is fail-open by design: a refused source leaves it incomplete, never raises.
+    monkeypatch.setattr(authority, "_ROSTER_CACHE", {})
+    names, complete = authority._load_roster()
+    assert complete is False
+    assert authority.DURABLE_CTO_RECIPIENT in names

@@ -235,8 +235,8 @@ def _systemd_exec_start(home: Path) -> subprocess.CompletedProcess[str]:
     """Run the unit's ExecStart the way systemd does.
 
     Environment= and EnvironmentFile= (``-`` marks it optional), ``%h``, a ``${NAME}`` word
-    expanded to exactly one argument (empty when unset), and a user unit's default working
-    directory, the home directory.
+    expanded to exactly one argument (empty when unset), ``$$`` as a literal ``$``, and a user
+    unit's default working directory, the home directory.
     """
     unit = _unit_lines()
     env: dict[str, str] = {}
@@ -256,7 +256,7 @@ def _systemd_exec_start(home: Path) -> subprocess.CompletedProcess[str]:
     (command,) = unit["ExecStart"]
     (cwd,) = unit.get("WorkingDirectory", ["%h"])
     argv = [
-        env.get(match.group(1), "") if (match := re.fullmatch(r"\$\{(\w+)\}", word)) else word
+        env.get(match.group(1), "") if (match := re.fullmatch(r"\$\{(\w+)\}", word)) else word.replace("$$", "$")
         for word in shlex.split(command.replace("%h", str(home)))
     ]
     return subprocess.run(
@@ -394,6 +394,29 @@ def test_systemd_exec_start_runs_with_the_configured_roots(tmp_path: Path, layou
         "primary": str(layout["primary"]),
         "slug": CONFIGURED_SLUG,
     }
+
+
+def test_reporter_unit_starts_a_configured_interpreter_whose_path_holds_an_equals_sign(tmp_path: Path, layout) -> None:
+    """Defect class: the unit hands the configured interpreter path to a program that reparses it (PR1479-F2).
+
+    ``env`` takes any argument holding ``=`` for an assignment, so such an interpreter never started.
+    """
+    home = _systemd_home(tmp_path)
+    record = tmp_path / "started.json"
+    stand_in = _executable(
+        tmp_path / "venv=review" / "python",
+        f"#!{sys.executable}\nimport json, os, sys\n"
+        "if 'run_project_state_reporter.sh' in ''.join(sys.argv[3:4]):\n"
+        "    os.execv(sys.executable, [sys.executable, *sys.argv[1:]])\n"
+        f"json.dump(sys.argv[1:], open({str(record)!r}, 'w'))\n",
+    )
+    env_file = home / ".config" / "learn-ukrainian" / "machinery.env"
+    env_file.parent.mkdir(parents=True)
+    configured = {**_configured(layout, "public"), rr.INTERPRETER_ENV: str(stand_in)}
+    env_file.write_text("".join(f"{key}={value}\n" for key, value in configured.items()), encoding="utf-8")
+    result = _systemd_exec_start(home)
+    assert result.returncode == 0, result.stderr
+    assert json.loads(record.read_text(encoding="utf-8"))[-3:] == ["-m", "lu_machinery.api.project_state_local", "report"]
 
 
 @pytest.mark.parametrize("repo", sorted(REPOS))
@@ -567,7 +590,8 @@ def test_reporter_unit_takes_every_root_from_the_required_settings_file(tmp_path
     """Defect class: a packaged unit that hardcodes where the product checkout or its interpreter lives."""
     unit = _unit_lines()
     assert unit["ExecStart"] == [
-        "/usr/bin/env ${LEARN_UKRAINIAN_PYTHON} -I -c 'import os,sys; from importlib.resources import files; "
+        "/bin/sh -c 'exec \"$${LEARN_UKRAINIAN_PYTHON:?is not set}\" -I -c \"$$0\" \"$$@\"' "
+        "'import os,sys; from importlib.resources import files; "
         'os.execvp("bash", ["bash", "--noprofile", "--norc", str(files("lu_machinery.orchestration")'
         '.joinpath("run_project_state_reporter.sh")), *sys.argv[1:]])\''
     ]

@@ -9,6 +9,7 @@ import json
 import os
 import stat
 import sys
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -49,6 +50,16 @@ ASSIGNMENTS_SCHEMA_PATH = machinery_path("schemas/area-assignments.v1.schema.jso
 
 class FleetTaxonomyValidationError(ValueError):
     """Raised when fleet taxonomy or area assignments validation fails (a ``ValueError``, like the loaders' errors)."""
+
+
+def _registry_path(explicit: Path | None, default: Callable[[], Path]) -> Path:
+    """``explicit``, else the active profile's path, with a profile refusal typed like any other registry refusal."""
+    if explicit is not None:
+        return explicit
+    try:
+        return default()
+    except profile.ProfileError as exc:
+        raise FleetTaxonomyValidationError(str(exc)) from exc
 
 
 _MERGE_KEY = ("<<",)  # never equal to a SafeLoader key: a constructed key is never a tuple
@@ -324,8 +335,7 @@ def load_validated_assignments(
     assignments_schema_path: Path = ASSIGNMENTS_SCHEMA_PATH,
 ) -> dict[str, Any]:
     """Read and validate ``area_assignments.yaml`` from disk under the single assignments contract."""
-    resolved = default_assignments_path() if assignments_path is None else assignments_path
-    data = _load_yaml(resolved)
+    data = _load_yaml(_registry_path(assignments_path, default_assignments_path))
     validate_assignments_data(data, assignments_schema_path=assignments_schema_path)
     return data
 
@@ -360,9 +370,8 @@ def validate_fleet_taxonomy(
     assignments_schema_path: Path = ASSIGNMENTS_SCHEMA_PATH,
 ) -> dict[str, Any]:
     """Validate both fleet_taxonomy.yaml and area_assignments.yaml."""
-    taxonomy_data = _load_yaml(default_taxonomy_path() if taxonomy_path is None else taxonomy_path)
-    resolved_assignments = default_assignments_path() if assignments_path is None else assignments_path
-    assignments_data = _load_yaml(resolved_assignments)
+    taxonomy_data = _load_yaml(_registry_path(taxonomy_path, default_taxonomy_path))
+    assignments_data = _load_yaml(_registry_path(assignments_path, default_assignments_path))
 
     alias_to_area, epic_to_area = validate_taxonomy_data(
         taxonomy_data, taxonomy_schema_path=taxonomy_schema_path

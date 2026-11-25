@@ -11,8 +11,10 @@ Environment=PATH=/usr/local/bin:/usr/bin:/bin
 # the state root (LEARN_UKRAINIAN_STATE_ROOT or LEARN_UKRAINIAN_PRIMARY_REPO_ROOT).
 # Without the file the unit does not start; without an interpreter or product root it fails.
 EnvironmentFile=%h/.config/learn-ukrainian/machinery.env
-# The wrapper is the installed package resource; it changes to LU_PRODUCT_ROOT itself.
-ExecStart=/usr/bin/env ${LEARN_UKRAINIAN_PYTHON} -I -c 'import os,sys; from importlib.resources import files; os.execvp("bash", ["bash", "--noprofile", "--norc", str(files("lu_machinery.orchestration").joinpath("run_project_state_reporter.sh")), *sys.argv[1:]])'
+# The wrapper is the installed package resource; it changes to LU_PRODUCT_ROOT itself. The shell
+# runs the interpreter by its quoted path, so any absolute path works (env would take a path
+# holding "=" for an assignment). "$$" is systemd's literal "$".
+ExecStart=/bin/sh -c 'exec "$${LEARN_UKRAINIAN_PYTHON:?is not set}" -I -c "$$0" "$$@"' 'import os,sys; from importlib.resources import files; os.execvp("bash", ["bash", "--noprofile", "--norc", str(files("lu_machinery.orchestration").joinpath("run_project_state_reporter.sh")), *sys.argv[1:]])'
 
 [Install]
 WantedBy=multi-user.target
