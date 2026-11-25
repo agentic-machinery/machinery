@@ -191,6 +191,13 @@ def _item_set_key(repository: str, number: int, items: list[dict]) -> str:
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
 
 
+def _parse_positive_pr_arg(raw: str) -> int:
+    parsed = parse_ascii_positive_int(raw) if len(raw) <= 19 else None
+    if parsed is None:
+        raise argparse.ArgumentTypeError(f"invalid positive ASCII PR number: {raw!r}")
+    return parsed
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Report outstanding acceptance criteria for a merged PR's issues.\n"
@@ -204,7 +211,7 @@ def main(argv: list[str] | None = None) -> int:
         "Exit codes: 0 = no outstanding items; 1 = outstanding items; 2 = read/write or state error.\n"
         "Related: docs/best-practices/task-quality.md; #11213.",
     )
-    parser.add_argument("--pr", type=int, required=True, help="Merged PR number, e.g. 123, in the current repository.")
+    parser.add_argument("--pr", type=_parse_positive_pr_arg, required=True, help="Merged PR number, e.g. 123, in the current repository.")
     parser.add_argument("--apply", action="store_true", help="Apply reopen, comment and escalation actions (default: dry-run).")
     args = parser.parse_args(argv)
     try:

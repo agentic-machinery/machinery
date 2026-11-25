@@ -522,6 +522,16 @@ def test_machinery_readers_refuse_overlong_digit_captures_without_unbounded_int(
             release_cut.pr_number(f"https://github.com/o/r/pull/{huge}")
         assert release_cut.pr_number("https://github.com/o/r/pull/42") == 42
 
+        from lu_machinery.review import closeout_cli
+
+        with pytest.raises(SystemExit) as exc_info:
+            closeout_cli.main(["target", "--mode", "pr", "--pr", "1" * 20])
+        assert exc_info.value.code == 2
+        with pytest.raises(SystemExit) as exc_info:
+            postmerge_criteria.main(["--pr", "1" * 20])
+        assert exc_info.value.code == 2
+        assert relations.parse_issue_work_id(f"work:public:learn-ukrainian/machinery:issue:{huge}") is None
+
         for comment in (
             f"Dismiss alert #7 fixed in https://github.com/learn-ukrainian/machinery/pull/{huge}",
             f"Dismiss alert #7 fixed in https://github.com/learn-ukrainian/machinery/pull/42 and https://github.com/learn-ukrainian/machinery/pull/{huge}",
@@ -529,6 +539,9 @@ def test_machinery_readers_refuse_overlong_digit_captures_without_unbounded_int(
             "Dismiss alert #7 fixed in https://github.com/learn-ukrainian/machinery/pull/42 and https://github.com/learn-ukrainian/machinery/pull/042",
             "Dismiss alert #7 fixed in https://github.com/learn-ukrainian/machinery/pull/42 and https://github.com/learn-ukrainian/machinery/pull/\u0664\u0662",
             "Dismiss alert #7 fixed in https://github.com/learn-ukrainian/machinery/pull/42 and https://github.com/learn-ukrainian/machinery/pull/0/files",
+            "Dismiss alert #7 fixed in https://github.com/learn-ukrainian/machinery/pull/42 and HTTPS://github.com/learn-ukrainian/machinery/pull/0/files",
+            "Dismiss alert #7 fixed in <https://github.com/learn-ukrainian/machinery/pull/42> and <https://github.com/learn-ukrainian/machinery/pull/42.>",
+            "Dismiss alert #7 fixed in <https://github.com/learn-ukrainian/machinery/pull/42> and [bad](https://github.com/learn-ukrainian/machinery/pull/42.)",
             "Dismiss alert #7 fixed in https://github.com/learn-ukrainian/machinery/pull/42/files",
         ):
             with pytest.raises(ValueError, match="comment needs an explanation and one same-repository merged PR"):
@@ -547,22 +560,23 @@ def test_machinery_readers_refuse_overlong_digit_captures_without_unbounded_int(
             fetched_endpoints.append(argv)
             raise LookupError("reached_pr_fetch")
 
-        with pytest.raises(LookupError, match="reached_pr_fetch"):
-            publish_github._dismiss_preflight(
-                {
-                    "number": 7,
-                    "comment": (
-                        "Dismiss alert #7 fixed in https://github.com/learn-ukrainian/machinery/pull/42 "
-                        "see https://github.com/learn-ukrainian/machinery/pull/42/files"
-                    ),
-                },
-                "learn-ukrainian/machinery",
-                "github.com/learn-ukrainian/machinery",
-                _stop_on_fetch,
-                Path("."),
-                {},
-            )
-        assert fetched_endpoints == [["gh", "api", "--method", "GET", "repos/learn-ukrainian/machinery/pulls/42"]]
+        for comment in (
+            "Dismiss alert #7 fixed in https://github.com/learn-ukrainian/machinery/pull/42 "
+            "see https://github.com/learn-ukrainian/machinery/pull/42/files",
+            "Dismiss alert #7 fixed in <https://github.com/learn-ukrainian/machinery/pull/42>. "
+            "See https://github.com/learn-ukrainian/machinery/pull/42.",
+        ):
+            fetched_endpoints.clear()
+            with pytest.raises(LookupError, match="reached_pr_fetch"):
+                publish_github._dismiss_preflight(
+                    {"number": 7, "comment": comment},
+                    "learn-ukrainian/machinery",
+                    "github.com/learn-ukrainian/machinery",
+                    _stop_on_fetch,
+                    Path("."),
+                    {},
+                )
+            assert fetched_endpoints == [["gh", "api", "--method", "GET", "repos/learn-ukrainian/machinery/pulls/42"]]
     finally:
         sys.set_int_max_str_digits(prev_limit)
 
