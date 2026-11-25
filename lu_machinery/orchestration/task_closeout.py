@@ -1317,12 +1317,11 @@ def cmd_carrier(args: argparse.Namespace) -> int:
 def cmd_recover_local(args: argparse.Namespace) -> int:
     from lu_machinery.orchestration.lifecycle_observation import recover
 
-    task_lifecycle._require_not_direct_task_store(Path(args.state_file).expanduser(), label="lifecycle ledger")
-
+    state_file = _state_file(args)
     child_pr = None
     merged_pr = None
     if args.associate_child:
-        ledger = task_lifecycle.load_lifecycle(Path(args.state_file))
+        ledger = task_lifecycle.load_lifecycle(state_file)
         try:
             merged_pr = GhGitHubAdapter(args.repo_root)._read_pr(
                 ledger["identity"]["repository"], ledger["pr"]["number"]
@@ -1334,7 +1333,7 @@ def cmd_recover_local(args: argparse.Namespace) -> int:
         child_pr = merged_pr
     receipt, replayed = recover(
         args.repo_root,
-        state_file=Path(args.state_file),
+        state_file=state_file,
         task_file=Path(args.task_record),
         manifest_file=Path(args.preserved_manifest),
         push_file=Path(args.push_record),
