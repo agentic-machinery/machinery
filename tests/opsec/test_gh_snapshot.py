@@ -523,6 +523,11 @@ def test_publish_github_and_client_url_repo_mismatch_guards(tmp_path):
         "Fixes https://github.com/learn-u\u212arainian/machinery/issues/42", "learn-ukrainian/machinery"
     ) == []
     assert pub_github._pr_closing_issues("Fixes #4\u0662", "learn-ukrainian/machinery") == []
+    assert pub_github._pr_closing_issues("Fixes #" + "9" * 4301, "learn-ukrainian/machinery") == []
+    with pytest.raises(PublishBlocked, match="repository allowlist malformed"):
+        pub_github._catalog_fleet_repos({
+            "\u212ait": {"github": "learn-ukrainian/machinery", "role": "public-labs", "default": True},
+        })
     assert (
         pub_github._created_resource_number(
             "\u00a0https://github.com/learn-ukrainian/machinery/pull/42\n", kind="pull"

@@ -1084,7 +1084,7 @@ def _catalog_fleet_repos(raw_catalog=None):
     repos = {}
     defaults = 0
     for key, row in raw_catalog.items():
-        if not isinstance(key, str) or not key.strip() or not isinstance(row, dict):
+        if not isinstance(key, str) or not key.isascii() or not key.strip() or not isinstance(row, dict):
             raise gate.PublishBlocked("OPSEC: repository allowlist malformed; write refused.")
         github = row.get("github")
         if not isinstance(github, str):
@@ -1323,6 +1323,8 @@ def _strip_markdown_code(text: str) -> str:
 
 def _pr_closing_issues(body: str, gh_repo: str) -> list[int]:
     """Same-repository issue numbers referenced by GitHub closing keywords in *body*."""
+    from lu_machinery.orchestration.fleet_repos import parse_ascii_positive_int
+
     cleaned = _strip_markdown_code(body)
     found: list[int] = []
     for match in _CLOSING_ISSUE_RE.finditer(cleaned):
@@ -1330,13 +1332,13 @@ def _pr_closing_issues(body: str, gh_repo: str) -> list[int]:
             ref_repo = match.group("url_repo")
             if not same_repository(ref_repo, gh_repo):
                 continue
-            number = int(match.group("url_num"))
+            number = parse_ascii_positive_int(match.group("url_num"))
         else:
             ref_repo = match.group("slug")
             if ref_repo is not None and not same_repository(ref_repo, gh_repo):
                 continue
-            number = int(match.group("num"))
-        if number not in found:
+            number = parse_ascii_positive_int(match.group("num"))
+        if number is not None and number not in found:
             found.append(number)
     return found
 
