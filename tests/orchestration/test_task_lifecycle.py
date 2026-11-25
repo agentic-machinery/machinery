@@ -3718,6 +3718,8 @@ def test_write_lifecycle_and_lock_refuse_direct_task_store_and_load_reads_existi
         dotdot_pred_path, dotdot_pred_sha = task_lifecycle.predecessor_archive_path(dotdot_path, archive_bytes)
         with pytest.raises(task_lifecycle.LifecycleError, match=refused_dotdot):
             task_lifecycle.archive_predecessor(archive_bytes, dotdot_pred_path, dotdot_pred_sha)
+        # The CLI checks a mutating --state-file before resolving it, so the same spelling is refused there too.
+        assert task_closeout.main(["bind-pr", "--state-file", str(dotdot_path), "--pr", "77", "--now", NOW]) == 2
     assert list(nested_artifact.iterdir()) == []
     assert not (store / "t2.artifacts" / "sub").exists()
     assert not (tmp_path / "not-created" / "sub").exists()
