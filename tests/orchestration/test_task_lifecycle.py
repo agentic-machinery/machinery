@@ -3696,18 +3696,38 @@ def test_write_lifecycle_and_lock_refuse_direct_task_store_and_load_reads_existi
     rc_carrier = task_closeout.main(["carrier", "--state-file", str(legacy)])
     assert rc_carrier == 0
 
-    # R2 F4 regression: allowed artifact paths that traverse a directory symlink followed by `..`
-    # stage temporary files in the resolved artifact parent and succeed for ledger, lock, and archive.
+    # F4 regression (R2 F4 and PR1478-F4): a '..' component is refused before anything is created,
+    # because lexical normalisation and the kernel disagree on `symlink/..` and `missing/..`; an
+    # allowed symlinked artifact path with missing components writes where a lookup through the
+    # caller's own spelling finds the ledger, lock and archive.
     nested_artifact = store / "t2.artifacts" / "nested"
     nested_artifact.mkdir(parents=True)
     missing_container = tmp_path / "not-created" / "via"
     missing_container.parent.mkdir()
     missing_container.symlink_to(nested_artifact)
-    via_symlink_ledger = missing_container / ".." / "sub" / "closeout.json"
-    with task_lifecycle.lifecycle_lock(via_symlink_ledger):
-        task_lifecycle.write_lifecycle(via_symlink_ledger, ledger)
-    assert (store / "t2.artifacts" / "sub" / "closeout.json").is_file()
-    via_archive_bytes = b'{"prev": 2}\n'
-    via_pred_path, via_pred_sha = task_lifecycle.predecessor_archive_path(via_symlink_ledger, via_archive_bytes)
-    task_lifecycle.archive_predecessor(via_archive_bytes, via_pred_path, via_pred_sha)
-    assert (store / "t2.artifacts" / "sub" / "predecessors" / via_pred_path.name).read_bytes() == via_archive_bytes
+    refused_dotdot = r"'\.\.' component refused"
+    archive_bytes = b'{"prev": 2}\n'
+    for dotdot_path in (
+        missing_container / ".." / "sub" / "closeout.json",
+        missing_container / "missing" / ".." / "out" / "closeout.json",
+    ):
+        with pytest.raises(task_lifecycle.LifecycleError, match=refused_dotdot):
+            task_lifecycle.write_lifecycle(dotdot_path, ledger)
+        with pytest.raises(task_lifecycle.LifecycleError, match=refused_dotdot), task_lifecycle.lifecycle_lock(dotdot_path):
+            pass
+        dotdot_pred_path, dotdot_pred_sha = task_lifecycle.predecessor_archive_path(dotdot_path, archive_bytes)
+        with pytest.raises(task_lifecycle.LifecycleError, match=refused_dotdot):
+            task_lifecycle.archive_predecessor(archive_bytes, dotdot_pred_path, dotdot_pred_sha)
+    assert list(nested_artifact.iterdir()) == []
+    assert not (store / "t2.artifacts" / "sub").exists()
+    assert not (tmp_path / "not-created" / "sub").exists()
+
+    orig_path = missing_container / "missing" / "out" / "closeout.json"
+    with task_lifecycle.lifecycle_lock(orig_path):
+        task_lifecycle.write_lifecycle(orig_path, ledger)
+    assert task_lifecycle.load_lifecycle(orig_path)["lifecycle_id"] == ledger["lifecycle_id"]
+    assert orig_path.with_suffix(".json.lock").is_file()
+    orig_pred_path, orig_pred_sha = task_lifecycle.predecessor_archive_path(orig_path, archive_bytes)
+    task_lifecycle.archive_predecessor(archive_bytes, orig_pred_path, orig_pred_sha)
+    assert orig_pred_path.read_bytes() == archive_bytes
+    assert not list(orig_path.parent.rglob("*.tmp"))

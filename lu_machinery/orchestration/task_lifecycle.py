@@ -1323,25 +1323,27 @@ def _require_not_direct_task_store(path: Path, *, label: str = "lifecycle ledger
         raise LifecycleError(str(exc)) from None
 
 
-def _validated_lifecycle_target(path: Path, *, label: str) -> tuple[Path, Path]:
+def _validate_lifecycle_write_path(path: Path, *, label: str) -> None:
+    """Refuse a lifecycle write path that is malformed, has a ``..`` component or targets the task store.
+
+    Writers create, stage and publish through ``path`` itself, so a later lookup through the
+    same spelling finds what was written. A ``..`` component is refused because lexical
+    normalisation (``realpath``, or ``tempfile.mkstemp``'s ``abspath`` of ``dir``) collapses
+    ``missing/..`` or ``symlink/..`` where the kernel does not, which can move the write away
+    from where ``path`` resolves. No caller needs one: ``lifecycle_path`` builds from a resolved
+    state root, and every ``--state-file`` is resolved before it reaches a writer.
+    """
+    if not path.name or path.name in {".", ".."} or ".." in path.parts:
+        raise LifecycleError(f"invalid {label} path (empty name or '..' component refused): {path}")
     _require_not_direct_task_store(path, label=label)
-    if not path.name or path.name in {".", ".."}:
-        raise LifecycleError(f"invalid {label} path: {path}")
-    try:
-        resolved_parent = Path(os.path.realpath(path.parent))
-    except (OSError, ValueError) as exc:
-        raise LifecycleError(f"invalid {label} path {path}: {exc}") from None
-    target = resolved_parent / path.name
-    _require_not_direct_task_store(target, label=label)
-    return resolved_parent, target
 
 
 def write_lifecycle(path: Path, payload: Mapping[str, Any]) -> None:
-    resolved_parent, target = _validated_lifecycle_target(path, label="lifecycle ledger")
+    _validate_lifecycle_write_path(path, label="lifecycle ledger")
     ledger = validate_lifecycle(payload)
-    resolved_parent.mkdir(parents=True, exist_ok=True)
+    path.parent.mkdir(parents=True, exist_ok=True)
     encoded = json.dumps(ledger, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
-    fd, tmp_name = tempfile.mkstemp(prefix=f".{target.name}.", suffix=".tmp", dir=resolved_parent)
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
     tmp_path = Path(tmp_name)
     closed_fd = False
     try:
@@ -1349,7 +1351,7 @@ def write_lifecycle(path: Path, payload: Mapping[str, Any]) -> None:
             closed_fd = True
             handle.write(encoded)
             handle.flush()
-        os.replace(tmp_path, target)
+        os.replace(tmp_path, path)
     finally:
         if not closed_fd:
             with suppress(OSError):
@@ -1360,13 +1362,11 @@ def write_lifecycle(path: Path, payload: Mapping[str, Any]) -> None:
 @contextmanager
 def lifecycle_lock(path: Path, *, blocking: bool = True) -> Iterator[None]:
     """Hold the ledger's exclusive lock; non-blocking callers refuse a held lock."""
-    _require_not_direct_task_store(path, label="lifecycle ledger")
-    if not path.name or path.name in {".", ".."}:
-        raise LifecycleError(f"invalid lifecycle ledger path: {path}")
+    _validate_lifecycle_write_path(path, label="lifecycle ledger")
     lock_path = path.with_suffix(path.suffix + ".lock")
-    resolved_parent, lock_target = _validated_lifecycle_target(lock_path, label="lifecycle lock")
-    resolved_parent.mkdir(parents=True, exist_ok=True)
-    with lock_target.open("a+", encoding="utf-8") as handle:
+    _validate_lifecycle_write_path(lock_path, label="lifecycle lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+", encoding="utf-8") as handle:
         try:
             fcntl.flock(handle, fcntl.LOCK_EX if blocking else fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as exc:
@@ -1391,9 +1391,9 @@ def predecessor_archive_path(path: Path, raw: bytes) -> tuple[Path, str]:
 
 def archive_predecessor(raw: bytes, archive_path: Path, archive_sha256: str) -> None:
     """Store predecessor bytes once, never overwriting a different archive."""
-    resolved_parent, target = _validated_lifecycle_target(archive_path, label="predecessor archive")
-    resolved_parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_name = tempfile.mkstemp(prefix=f".{target.name}.", suffix=".tmp", dir=resolved_parent)
+    _validate_lifecycle_write_path(archive_path, label="predecessor archive")
+    archive_path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{archive_path.name}.", suffix=".tmp", dir=archive_path.parent)
     tmp_path = Path(tmp_name)
     closed_fd = False
     try:
@@ -1403,13 +1403,13 @@ def archive_predecessor(raw: bytes, archive_path: Path, archive_sha256: str) -> 
             handle.flush()
             os.fsync(handle.fileno())
         with suppress(FileExistsError):
-            os.link(tmp_path, target)
+            os.link(tmp_path, archive_path)
     finally:
         if not closed_fd:
             with suppress(OSError):
                 os.close(fd)
         tmp_path.unlink(missing_ok=True)
-    stored = target.read_bytes()
+    stored = archive_path.read_bytes()
     if stored != raw or "sha256:" + hashlib.sha256(stored).hexdigest() != archive_sha256:
         raise EvidencePolicyError(
             "PREDECESSOR_ARCHIVE_CONFLICT", f"archive {archive_path} does not hold the predecessor bytes"
