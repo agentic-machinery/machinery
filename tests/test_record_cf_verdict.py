@@ -770,6 +770,36 @@ def test_republish_withheld_posts_the_sealed_security_reply(monkeypatch, low_rev
 
 
 
+def test_marker_attests_author_families():
+    """Defect class: marker readers re-derive author families from their own model lists, which drift.
+
+    GUARD-FAMILY-1125: a reader without ``grok-4.7-high`` refused a valid approval. The sweep reads the families a
+    record states (AUTHORFAM-EXPAND-1125: readers ship before the recorder writes the line); old records still parse.
+    """
+    from tests.review.record_support import recorded_verdict
+
+    authored = "Authored by: " + ", ".join(sorted((CURRENT_SOL, "grok-4.7-high"))) + "\n"
+    line = "Author families: openai, xai\n"
+    fields = dict(
+        sha=SHA, task_id="review-one", started="2026-09-23T12:00:00.000001+00:00", verdict="APPROVED",
+        model="claude-opus-5-5", family="anthropic", reply="VERDICT: APPROVE",
+        author_models=(CURRENT_SOL, "grok-4.7-high"),
+    )
+    for legacy in (recorder.build_comment(**fields), recorder.build_comment(**fields, withheld_findings=0)):
+        stated = legacy.replace(authored, authored + line)
+        assert stated != legacy and stated.endswith(legacy.rsplit("\n", 1)[1])
+        new, old = sweep.parse_marker(stated), sweep.parse_marker(legacy)
+        assert new["author_families"] == ("openai", "xai") and "author_families" not in old
+        assert {key: value for key, value in new.items() if key != "author_families"} == old
+        for body in (stated, legacy):
+            assert sweep.lookup_verdict([{**recorded_verdict(SHA, "APPROVED"), "body": body}], SHA, "fleet").state == (
+                "APPROVED"
+            )
+        for bad in ("xai, openai", "openai, openai", "Open AI", "openai,xai", ""):
+            assert sweep.parse_marker(stated.replace(line, f"Author families: {bad}\n")) is None
+        assert sweep.parse_marker(stated.replace(line, line + line)) is None
+
+
 def test_republish_withheld_refuses_malformed_later_trusted_marker(low_review, tmp_path):
     """A malformed later verdict must prevent republication out of order."""
     tasks, comments, statuses, _files, _admit = low_review
