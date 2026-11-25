@@ -218,8 +218,15 @@ def test_non_record_json_beside_the_records_never_blocks_removal_but_a_truncated
     tasks.mkdir()
     tree = tmp_path / "worker"
     (tasks / "worker.json").write_text(json.dumps({"task_id": "worker", "status": "done", "worktree_path": str(tree)}))
-    (tasks / "other.cli-proof.json").write_text(json.dumps([{"worktree": str(tree), "ok": True}]))
+    (tasks / "other.cli-proof.json").write_text(json.dumps({"proofs": [{"worktree": str(tree), "ok": True}]}))
     assert worktree_claims.active_worktree_claim_refusal(tree, tasks_dir=tasks, repo_root=tmp_path) is None
+    # An array is not foreign: it may hold a record, so it refuses as a damaged one does (#1440).
+    (tasks / "other.cli-proof.json").write_text(json.dumps([{"worktree": str(tree), "ok": True}]))
+    assert (
+        worktree_claims.active_worktree_claim_refusal(tree, tasks_dir=tasks, repo_root=tmp_path)
+        == f"task record {tasks / 'other.cli-proof.json'} unreadable; refusing worktree removal"
+    )
+    (tasks / "other.cli-proof.json").unlink()
     (tasks / "other.json").write_text('{"task_id": "other", "status": "running", "worktree_path": ')
     assert (
         worktree_claims.active_worktree_claim_refusal(tree, tasks_dir=tasks, repo_root=tmp_path)
