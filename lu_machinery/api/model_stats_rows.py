@@ -896,13 +896,13 @@ def _write_all(fd: int, data: bytes) -> None:
         view = view[os.write(fd, view):]
 
 
-def _append_line(path: Path, line: Mapping[str, Any]) -> None:
+def _append_line(path: Path, line: bytes) -> None:
     """Append one whole line; a fragment an earlier failed append left is closed first, so it stays one bad line."""
     fd = _open(path, os.O_RDWR | os.O_APPEND | os.O_CREAT)
     try:
         size = os.fstat(fd).st_size
         open_fragment = size > 0 and os.pread(fd, 1, size - 1) != b"\n"
-        _write_all(fd, (b"\n" if open_fragment else b"") + _line(line))
+        _write_all(fd, (b"\n" if open_fragment else b"") + line)
     finally:
         os.close(fd)
 
@@ -917,7 +917,7 @@ def append_row(batch_state_dir: Path, row: Mapping[str, Any] | Callable[[], Mapp
     with _locked(batch_state_dir, wait_s) as path:
         line = row() if callable(row) else row
         if line is not None:
-            _append_line(path, line)
+            _append_line(path, _line(line))
 
 
 def record_settled(path: Path, record: Mapping[str, Any], batch_state_dir: Path, source_mtime_ns: int) -> None:
@@ -947,11 +947,7 @@ REPOSITORY_SLUG = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9._-]{1,10
 
 
 def _selector_ok(receipt: object) -> bool:
-    """None, or a plain dict the durable review stores' one receipt check (``selector_columns``) accepts.
-
-    A ledger line is JSON: any other mapping type is refused before a batch writes anything, never discovered by the
-    serializer after earlier lines were appended (``publication`` copies a caller's mapping into a dict first).
-    """
+    """None, or a dict accepted by the shared durable receipt validator."""
     if receipt is None:
         return True
     if not isinstance(receipt, dict):
@@ -1032,26 +1028,36 @@ def record_publications(batch_state_dir: Path, entries: Iterable[Mapping[str, An
     """Append, under ``rows.lock``, each entry the ledger does not hold yet (by ``publication_key``); the count added.
 
     Every entry is checked before anything is written: one malformed entry raises ValueError and writes nothing.
-    What is checked is the entry's own JSON line read back, and that same snapshot is what is written, so a value
-    JSON cannot hold, or a mapping that serializes differently from what it shows, is refused before the first line.
+    Each entry is validated from the exact JSON bytes that will be written.
     TimeoutError when ``wait_s`` passes before the lock is free; OSError when the ledger cannot be written.
     """
+    def unique_members(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        members = dict(pairs)
+        if len(members) != len(pairs):
+            raise ValueError("duplicate publication object key")
+        return members
+
     checked = []
     for entry in entries:
         try:
-            snapshot = json_depth.loads(_line(dict(entry)), max_depth=_JSON_MAX_DEPTH)
+            row = dict(entry)
+            # JSON encodes integer subclasses as plain integers. The ledger requires a built-in int for PRs.
+            if not _count_value(row.get("pr")):
+                raise ValueError("publication PR must be an integer in range")
+            line = _line(row)
+            snapshot = json_depth.loads(line, max_depth=_JSON_MAX_DEPTH, object_pairs_hook=unique_members)
         except (TypeError, ValueError, RecursionError) as exc:
             raise ValueError("publication field has the wrong shape") from exc
         if not _publication_ok(snapshot):
             raise ValueError("publication field has the wrong shape")
-        checked.append(snapshot)
+        checked.append((publication_key(snapshot), line))
     with _locked(batch_state_dir, wait_s) as rows_file:
         path = rows_file.with_name(PUBLICATIONS_FILE)
         present = {publication_key(e) for e in _publication_lines(path, Counter())}
         added = 0
-        for entry in checked:
-            if (key := publication_key(entry)) not in present:
-                _append_line(path, entry)
+        for key, line in checked:
+            if key not in present:
+                _append_line(path, line)
                 present.add(key)
                 added += 1
         return added

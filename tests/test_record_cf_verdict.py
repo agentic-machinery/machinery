@@ -3130,14 +3130,21 @@ def test_publication_ledger_keeps_the_selector_receipt_and_still_reads_legacy_li
                 {**receipt, "selector_value": "../x"}, {**receipt, "selector_value": "org/.."},
                 {**receipt, "selector_value": None}):
         assert recorder.publication_of("org/repos", 42, comment, fleet_repo_selector=bad) == (None, "malformed field")
-    # A batch whose later line carries a receipt mapping JSON cannot hold is refused before any line is written.
+    # A malformed receipt in the second entry must leave the whole batch unwritten.
+    from collections import UserString
     from types import MappingProxyType
 
-    from collections import UserString
+    class DuplicateReceiptKeys(dict):
+        def items(self):
+            return [("selector_value", "invalid"), *super().items()]
 
-    for unserializable in (MappingProxyType(receipt), {UserString(key): value for key, value in receipt.items()}):
+    for invalid_receipt in (
+        MappingProxyType(receipt),
+        {UserString(key): value for key, value in receipt.items()},
+        DuplicateReceiptKeys(receipt),
+    ):
         with pytest.raises(ValueError):
-            model_stats_rows.record_publications(tmp_path, [legacy, {**entry, "fleet_repo_selector": unserializable}])
+            model_stats_rows.record_publications(tmp_path, [legacy, {**entry, "fleet_repo_selector": invalid_receipt}])
     assert model_stats_rows.read_publications(tmp_path)[0] == {}
     assert model_stats_rows.record_publications(tmp_path, [legacy, entry]) == 2
     # The receipt is no part of the publication key: the same publication without it is a duplicate.
