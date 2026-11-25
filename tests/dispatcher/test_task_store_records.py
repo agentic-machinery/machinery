@@ -16,6 +16,7 @@ from lu_machinery.review import review_lineage
 from tests.dispatcher.conftest import run_git
 from tests.helpers import current_sol
 from tests.helpers.product_tree import configured_roots  # noqa: F401
+from tests.test_fleet_repos import transferred_catalog
 
 CURRENT_SOL = current_sol()
 
@@ -702,6 +703,50 @@ def test_pr_successor_refused_when_parent_or_successor_record_missing(tmp_path, 
     (tmp_path / "tasks/parent.json").unlink()
     missing_parent, _code = worker.wait("pr-review", "r1", reply=True)
     assert ("result" in missing_parent, missing_parent["result_unavailable"]) == (False, "parent_record_unavailable")
+
+
+def test_review_record_repository_fields_can_straddle_transfer(monkeypatch):
+    """A historical repository_id and current repository field are consistent for one fleet row."""
+    moved = transferred_catalog(monkeypatch)
+    assert worker._record_repo_id({
+        "repository_id": moved.github, "repository": moved.alternate_github,
+    }) == moved.github
+
+
+def test_review_ownership_finds_historical_acceptance_by_current_slug(tmp_path, monkeypatch):
+    """The review's current slug must find the ledger key stored under the old slug."""
+    moved = transferred_catalog(monkeypatch)
+    _review_with_pr_successor(tmp_path, monkeypatch, handoff_repo=moved.github)
+
+    assert worker._review_pr_ownership_refusal(
+        {"pr": 1277}, moved.alternate_github, "successor", not_owner="caller_not_parent",
+    ) is None
+
+
+def test_running_author_reads_exact_head_review_reply_across_transfer(tmp_path, monkeypatch):
+    """A running author's review can name the current slug while the author record names the old slug."""
+    moved = transferred_catalog(monkeypatch)
+    _review_of_takeover(tmp_path, monkeypatch)
+    record_path = tmp_path / "tasks" / "author-review.json"
+    review = json.loads(record_path.read_text())
+    record_path.write_text(json.dumps({**review, "repository_id": moved.alternate_github}))
+    monkeypatch.setenv(ownership.TASK_ID_ENV, "author")
+
+    record, code = worker.wait("author-review", "r1", reply=True)
+    assert (code, record.get("result"), record.get("result_unavailable")) == (0, REPLY, None)
+
+
+def test_pr_successor_reads_exact_head_review_reply_across_transfer(tmp_path, monkeypatch):
+    """An accepted successor on the current slug can read the original exact-head review."""
+    moved = transferred_catalog(monkeypatch)
+    _review_with_pr_successor(
+        tmp_path, monkeypatch, review_repo=moved.github, handoff_repo=moved.github,
+        successor_repo=moved.alternate_github,
+    )
+    monkeypatch.setenv(ownership.TASK_ID_ENV, "successor")
+
+    record, code = worker.wait("pr-review", "r1", reply=True)
+    assert (code, record.get("result"), record.get("result_unavailable")) == (0, REPLY, None)
 
 
 def test_review_reply_slug_readers_reject_kelvin_sign_lookalikes(tmp_path, monkeypatch):

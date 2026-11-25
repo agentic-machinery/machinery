@@ -42,6 +42,7 @@ from lu_machinery.dispatcher.types import TaskSpec
 from lu_machinery.orchestration.execution_safe_git import GIT as EXECUTION_SAFE_GIT
 from lu_machinery.orchestration.execution_safe_git import run_git as execution_safe_git
 from lu_machinery.orchestration.execution_safe_git import safe_git_env
+from lu_machinery.orchestration.fleet_repos import ascii_repo_slug, parse_ascii_positive_int, same_repository
 from lu_machinery.storage.topology import STORE_FILES
 
 # Default trees excluded from dispatch worktrees.
@@ -1149,7 +1150,8 @@ def _repo_and_base(record: dict) -> tuple[str | None, str]:
 
 def _accepted_prs(task_id: str, repo: str) -> list[int]:
     """Numbers of ``repo`` pull requests this task accepted through ``pr_ownership``, current or since cleared."""
-    if not isinstance(repo, str) or not repo or not repo.isascii():
+    target = ascii_repo_slug(repo, strip=False)
+    if target is None:
         return []
     from lu_machinery.orchestration import pr_ownership
 
@@ -1164,22 +1166,21 @@ def _accepted_prs(task_id: str, repo: str) -> list[int]:
         if entry.get("event") == "accepted" and entry.get("successor") == task_id
         and not pr_ownership.decision_custody(entry)
     ]
-    target = repo.casefold()
     accepted: set[int] = set()
     for key in keys:
         if not isinstance(key, str) or not key.isascii():
             continue
-        key_repo, sep, key_num = key.rpartition("#")
-        if sep == "#" and key_repo == target and key_num.isdigit():
-            number = int(key_num)
-            if number > 0:
-                accepted.add(number)
+        key_repo, _, key_num = key.rpartition("#")
+        number = parse_ascii_positive_int(key_num)
+        if number is not None and same_repository(ascii_repo_slug(key_repo, strip=False), target):
+            accepted.add(number)
     return sorted(accepted)
 
 
 def _same_repo_pr(pr: dict, repo: str) -> bool:
     """Whether a REST pull-request object has both head and base strictly in ``repo``."""
-    if not isinstance(repo, str) or not repo or not repo.isascii():
+    target = ascii_repo_slug(repo, strip=False)
+    if target is None:
         return False
     head = pr.get("head")
     base = pr.get("base")
@@ -1187,9 +1188,7 @@ def _same_repo_pr(pr: dict, repo: str) -> bool:
     base_repo = base.get("repo") if isinstance(base, dict) else None
     head_name = head_repo.get("full_name") if isinstance(head_repo, dict) else None
     base_name = base_repo.get("full_name") if isinstance(base_repo, dict) else None
-    return (isinstance(head_name, str) and isinstance(base_name, str)
-            and head_name.isascii() and base_name.isascii()
-            and head_name.casefold() == base_name.casefold() == repo.casefold())
+    return all(same_repository(ascii_repo_slug(name, strip=False), target) for name in (head_name, base_name))
 
 
 def _branch_pulls(repo: str, branch: str) -> list[dict]:

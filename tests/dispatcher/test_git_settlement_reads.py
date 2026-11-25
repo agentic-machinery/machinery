@@ -27,6 +27,7 @@ import pytest
 from lu_machinery.common import github_client, github_usage
 from lu_machinery.dispatcher import git
 from lu_machinery.orchestration import pr_ownership
+from tests.test_fleet_repos import transferred_catalog
 
 REPO = "org/repo"
 BRANCH = "agy/settle+reads"
@@ -286,3 +287,14 @@ def test_settlement_slug_readers_reject_kelvin_sign_lookalikes(tmp_path, monkeyp
     monkeypatch.setattr(git, "_gh", lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("_gh must not run")))
     with pytest.raises(ValueError, match="owner/repo"):
         git._branch_pulls(kelvin_slug, BRANCH)
+
+
+def test_rest_pr_identity_matches_both_transferred_repository_slugs(monkeypatch):
+    """A PR row can use the current repository slug while the lookup still uses its old slug."""
+    moved = transferred_catalog(monkeypatch, github=REPO, alternate="new-org/new-repo")
+    pr = _pr(42, merged=True, repo=moved.alternate_github)
+    pr["base"]["repo"]["full_name"] = moved.alternate_github
+
+    assert git._same_repo_pr(pr, REPO)
+    pr["head"]["repo"]["full_name"] = "fork-owner/fork-repo"
+    assert not git._same_repo_pr(pr, REPO)

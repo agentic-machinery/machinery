@@ -61,6 +61,7 @@ from lu_machinery.dispatcher.watchdog import (
     liveness_paths,
 )
 from lu_machinery.fleet import claude_account_lane
+from lu_machinery.orchestration.fleet_repos import ascii_repo_slug, same_repository
 from lu_machinery.review.model_catalog import advisory_role_policy
 from lu_machinery.review.product_hooks import attempt_hooks
 
@@ -2823,15 +2824,13 @@ def _read_status_record(task_id: str) -> dict | None:
 
 
 def _record_repo_id(record: dict) -> str | None:
-    """The record's non-empty ``repository_id``, or None when missing or conflicting with ``repository``."""
-    repo_id = _text(record.get("repository_id"))
-    if not repo_id or not repo_id.isascii():
+    """The record's normalized ``repository_id`` slug, unless it conflicts with ``repository``."""
+    repo_id = ascii_repo_slug(record.get("repository_id"), strip=False)
+    if repo_id is None:
         return None
     repo = record.get("repository")
-    if repo is not None:
-        repo_text = _text(repo)
-        if not repo_text or not repo_text.isascii() or repo_text.casefold() != repo_id.casefold():
-            return None
+    if repo is not None and not same_repository(ascii_repo_slug(repo, strip=False), repo_id):
+        return None
     return repo_id
 
 
@@ -2854,7 +2853,8 @@ def _worktree_head(tree: object) -> str | None:
 
 def _review_pr_ownership_refusal(record: dict, repo_id: str, caller: str, *, not_owner: str) -> str | None:
     """Require recorded task acceptance of the review's exact repository and PR."""
-    if not isinstance(repo_id, str) or not repo_id or not repo_id.isascii():
+    repo = ascii_repo_slug(repo_id, strip=False)
+    if repo is None:
         return not_owner
     pr_number = record.get("pr")
     if type(pr_number) is not int or pr_number <= 0:
@@ -2863,7 +2863,7 @@ def _review_pr_ownership_refusal(record: dict, repo_id: str, caller: str, *, not
 
     try:
         data = pr_ownership.load(pr_ownership.state_path())
-        handoff = data["handoffs"].get(f"{repo_id.casefold()}#{pr_number}")
+        handoff = data["handoffs"].get(pr_ownership.pr_key(repo, pr_number))
         owner = (
             handoff["successor"]
             if isinstance(handoff, dict)
@@ -2909,7 +2909,7 @@ def _own_review_reply(record: dict, nonce: str | None) -> dict:
         }
         holder_repo = _record_repo_id(holder)
         repo_id = _record_repo_id(record)
-        if not holder_repo or not repo_id or holder_repo != repo_id:
+        if repo_id is None or not same_repository(holder_repo, repo_id):
             return {"result_unavailable": "review_not_of_parent_branch"}
         if review_branch not in branches:
             # Read-only --pr admission binds the repository, PR number, branch and pinned commit before
@@ -2946,13 +2946,7 @@ def _own_review_reply(record: dict, nonce: str | None) -> dict:
             holder_branch = _text(holder["publish_branch"])
         else:
             holder_branch = _text(holder.get("worktree_branch"))
-        if (
-            not holder_repo
-            or not holder_repo.isascii()
-            or not repo_id.isascii()
-            or holder_repo.casefold() != repo_id.casefold()
-            or review_branch != holder_branch
-        ):
+        if not same_repository(holder_repo, repo_id) or review_branch != holder_branch:
             return {"result_unavailable": "review_not_of_successor_branch"}
         head_unavailable = "successor_head_unavailable"
     head = _worktree_head(holder.get("worktree_path"))

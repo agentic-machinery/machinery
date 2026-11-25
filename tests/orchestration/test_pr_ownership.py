@@ -10,6 +10,7 @@ from urllib.parse import parse_qs, urlsplit
 import pytest
 
 from lu_machinery.common import git_credentials
+from lu_machinery.dispatcher import git
 from lu_machinery.fleet import pr_owner_check
 from lu_machinery.fleet_comms.authority import AuthorityService
 from lu_machinery.orchestration import merge_queue_keeper as keeper
@@ -1247,6 +1248,26 @@ def _branch_pull(repo, branch, number):
         "number": number, "state": "open", "head": {"ref": branch, "repo": {"full_name": repo}},
         "base": {"repo": {"full_name": repo}},
     }
+
+
+def test_ownership_branch_discovery_accepts_rest_rows_across_transfer(monkeypatch):
+    """A current branch probe can see a PR row bound to the previous spelling of its repository."""
+    moved = transferred_catalog(monkeypatch)
+    branch = "codex/transferred"
+    monkeypatch.setattr(git, "_branch_pulls", lambda _repo, _branch: [_branch_pull(moved.github, branch, 42)])
+
+    assert list(own._branch_pr_numbers(moved.alternate_github, branch)) == [42]
+
+
+def test_keeper_accepts_exact_head_verdict_receipt_written_before_transfer(monkeypatch):
+    """A repository move preserves a valid keeper verdict receipt's repository binding and payload."""
+    moved = transferred_catalog(monkeypatch)
+    receipt = {
+        "repository": moved.github, "pr": 42, "head": HEAD,
+        "task": "review-1", "verdict": "APPROVED", "status": "posted",
+    }
+
+    assert own._validate_verdict_receipt(receipt, pr=42, head=HEAD, repo=moved.alternate_github) == receipt
 
 
 def test_run_prs_does_not_omit_live_children_open_prs_on_recorded_branches(run_pr_store):
