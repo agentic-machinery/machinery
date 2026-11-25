@@ -9,6 +9,24 @@ this file.
 
 ## [Unreleased]
 
+<a id="v0.1.76"></a>
+## [0.1.76] - 2026-11-25
+
+### Fixed
+
+- Add ASCII slug/int helpers and guard PR 1 machinery readers (supersedes #1442) ([#1447](https://github.com/agentic-machinery/machinery/pull/1447))
+- Guard PR 2 machinery readers against non-ASCII slugs and digits ([#1449](https://github.com/agentic-machinery/machinery/pull/1449))
+- Guard PR 3 machinery readers and close F9/postmerge follow-ups (supersedes #1451) ([#1453](https://github.com/agentic-machinery/machinery/pull/1453))
+- Resolve 3e readers at the active slug and type deep selector refusals (supersedes #1448) ([#1452](https://github.com/agentic-machinery/machinery/pull/1452))
+- Report GitHub's refusal of a repo-transfer or repo-create POST as a refusal ([#1459](https://github.com/agentic-machinery/machinery/pull/1459))
+- Credit merged delivery across repository transfers ([#1460](https://github.com/agentic-machinery/machinery/pull/1460))
+- Recognize same-commit fleet-security enrollment ([#1463](https://github.com/agentic-machinery/machinery/pull/1463))
+- Typed refusals for malformed repository and PR inputs (supersedes #1461) ([#1466](https://github.com/agentic-machinery/machinery/pull/1466))
+- One fail-closed rule for every task-store reader (supersedes #1443) ([#1462](https://github.com/agentic-machinery/machinery/pull/1462))
+- Parse dismissal comment PR links ([#1467](https://github.com/agentic-machinery/machinery/pull/1467))
+- Accept links across repository transfers ([#1470](https://github.com/agentic-machinery/machinery/pull/1470))
+- Bound parse_ascii_positive_int to 19 digits and catch non-UTF-8 origin decode ([#1469](https://github.com/agentic-machinery/machinery/pull/1469))
+
 <a id="v0.1.75"></a>
 ## [0.1.75] - 2026-11-25
 
@@ -1737,7 +1755,8 @@ First release: the machinery extracted from learn-ukrainian as the installable `
 - Rollover confirms replacement bindings without a self-answered quiz. ([#65](https://github.com/learn-ukrainian/machinery/pull/65))
 - Deploy derives release identity from packaged bytes. ([#145](https://github.com/learn-ukrainian/machinery/pull/145))
 
-[Unreleased]: https://github.com/learn-ukrainian/machinery/compare/v0.1.75...HEAD
+[Unreleased]: https://github.com/agentic-machinery/machinery/compare/v0.1.76...HEAD
+[0.1.76]: https://github.com/agentic-machinery/machinery/compare/v0.1.75...v0.1.76
 [0.1.75]: https://github.com/learn-ukrainian/machinery/compare/v0.1.74...v0.1.75
 [0.1.74]: https://github.com/learn-ukrainian/machinery/compare/v0.1.73...v0.1.74
 [0.1.73]: https://github.com/learn-ukrainian/machinery/compare/v0.1.71...v0.1.73
