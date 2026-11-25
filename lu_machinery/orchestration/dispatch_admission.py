@@ -1740,9 +1740,13 @@ def scan_record_candidates(directory: Path) -> list[Path]:
 def strict_task_inventory_in(tasks_dir: Path, *, include_archive: bool = True) -> list[dict[str, Any]]:
     """Return every verified task record under ``tasks_dir`` (and archive) while holding ``task_archive_lock``.
 
-    Fails closed on any directory traversal error, unreachable existing archive entry, dangling
-    symlink, non-regular ``.json`` candidate (FIFO, socket, device, directory), corrupt or
-    non-object record, or misnamed record that is not an exact copy of its named sibling.
+    A file ``parse_task_record`` classifies as foreign (it returns ``None``: valid JSON that makes
+    no record claim, such as a policy, build or receipt file) is skipped, as
+    ``list_tasks(strict=True)`` skips it. Fails closed on any directory traversal error,
+    unreachable existing archive entry, dangling symlink, non-regular ``.json`` candidate (FIFO,
+    socket, device, directory), damaged record claim the parser refuses (a broken JSON object, a
+    blank or zero-filled file under a v2 record name, an invalid schema or identity), record
+    without a valid ``task_id``, or misnamed record that is not an exact copy of its named sibling.
     """
     records: list[dict[str, Any]] = []
     with task_record_store.task_archive_lock(tasks_dir):
@@ -1767,7 +1771,9 @@ def strict_task_inventory_in(tasks_dir: Path, *, include_archive: bool = True) -
                 raise ValueError(f"unreadable task record {listed.name}") from None
             except (OSError, ValueError, RecursionError):
                 raise ValueError(f"unreadable task record {listed.name}") from None
-            if not isinstance(parsed, dict) or not _is_valid_run_identity(parsed.get("task_id")):
+            if parsed is None:
+                continue
+            if not _is_valid_run_identity(parsed.get("task_id")):
                 raise ValueError(f"unreadable task record {listed.name}")
             records.append(parsed)
     return records

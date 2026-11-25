@@ -1587,8 +1587,9 @@ def test_handoff_receipt_verifies_driver_state_note_and_non_done_outcomes(task_s
             store.record_handoff_receipt("turn-verify", turn["run_nonce"], STREAM, bad_ref, outcome="done")
 
     # Unreadable archived history (corrupt record, dangling archive symlink, dangling record symlink,
-    # non-object JSON array, or FIFO symlink target) fails closed in both handoff verification and
-    # strict_task_inventory without blocking (F3, F11, F16).
+    # zero-filled record, or FIFO symlink target) fails closed in both handoff verification and
+    # strict_task_inventory without blocking (F3, F11, F16). A non-object JSON file makes no record
+    # claim: the record parser calls it foreign and the strict inventory skips it, as list_tasks does.
     archive_dir = task_store / "archive"
     archive_dir.mkdir(exist_ok=True)
     bad_archive = archive_dir / "corrupt-prior.json"
@@ -1605,11 +1606,15 @@ def test_handoff_receipt_verifies_driver_state_note_and_non_done_outcomes(task_s
     dangling_rec.unlink()
     array_rec = archive_dir / "array-child.json"
     array_rec.write_text("[]", encoding="utf-8")
-    with pytest.raises(ValueError, match=r"unreadable task record array-child\.json"):
+    assert [r["task_id"] for r in store.strict_task_inventory(include_archive=True)] == ["turn-verify"]
+    array_rec.unlink()
+    zeroed_rec = archive_dir / "zeroed-child.json"
+    zeroed_rec.write_bytes(b"\x00" * 64)
+    with pytest.raises(ValueError, match=r"unreadable task record zeroed-child\.json"):
         store.strict_task_inventory(include_archive=True)
     with pytest.raises(ValueError, match="orchestrator_handoff_note_unverified"):
         store.record_handoff_receipt("turn-verify", turn["run_nonce"], STREAM, "note-done", outcome="done")
-    array_rec.unlink()
+    zeroed_rec.unlink()
     fifo_target = tmp_path / "handoff-check.fifo"
     os.mkfifo(fifo_target)
     fifo_link = archive_dir / "fifo-child.json"
