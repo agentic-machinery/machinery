@@ -128,6 +128,16 @@ def _record_task_id(record: Mapping[str, Any], fallback: str) -> str:
     return recorded if type(recorded) is str and REVIEW_TASK_ID.fullmatch(recorded) and ".." not in recorded else fallback
 
 
+def _repository_key(value: object) -> str | None:
+    if type(value) is not str:
+        return None
+    # The dispatcher stores an absolute origin for file transport. Paths compare verbatim.
+    if value.isprintable() and Path(value).is_absolute():
+        return value
+    hosted = normalize_repository(value)
+    return hosted if hosted != "unknown" else None
+
+
 def _require_record_shape(task_id: str, record: Mapping[str, Any], *, reply: str | None = None) -> None:
     """Check the ledger's wire types before interpreting any review evidence."""
     if type(task_id) is not str or not REVIEW_TASK_ID.fullmatch(task_id) or ".." in task_id:
@@ -146,9 +156,8 @@ def _require_record_shape(task_id: str, record: Mapping[str, Any], *, reply: str
     status = record.get("status")
     if "status" in record and (type(status) is not str or not status.strip()):
         raise invalid("status", "a non-empty string")
-    repository = record.get("repository")
-    if "repository" in record and (type(repository) is not str or normalize_repository(repository) == "unknown"):
-        raise invalid("repository", "a recognizable repository name when present")
+    if "repository" in record and _repository_key(record["repository"]) is None:
+        raise invalid("repository", "a hosted repository name or an absolute file origin")
 
     for field in (
         "agent", "model", "resolved_model", "resolved_model_source", "run_nonce", "mode",
@@ -358,7 +367,7 @@ def _warn_identical_copies(copies: list[tuple[str, str]]) -> None:
 
 def _review_records(task_root: Path, *, repository: str) -> list[tuple[Path, dict[str, Any]]]:
     paths = [*sorted((task_root / ARCHIVE_DIR_NAME).glob("*.json")), *sorted(task_root.glob("*.json"))]
-    repository = normalize_repository(repository)
+    target_repository = _repository_key(repository)
     records = []
     copies: list[tuple[str, str]] = []
     try:
@@ -386,10 +395,9 @@ def _review_records(task_root: Path, *, repository: str) -> list[tuple[Path, dic
                 continue
             if record.get("status") in ("dry_run", "dry-run"):
                 continue
-            recorded_repository = record.get("repository")
             if "repository" not in record:
                 continue
-            if type(recorded_repository) is str and normalize_repository(recorded_repository) not in (repository, "unknown"):
+            if _repository_key(record["repository"]) not in (target_repository, None):
                 continue
             # An invalid repository or role cannot establish that this is another repository's work or a non-review.
             _require_record_shape(_record_task_id(record, path.stem), record)
