@@ -233,7 +233,7 @@ def test_repo_create_preflight_refusals(name, change, reason):
     assert gh.posts == []
 
 
-def test_repo_create_sends_once_and_receipt_binds_id(tmp_path):
+def test_repo_create_sends_once_and_receipt_binds_id(tmp_path, monkeypatch):
     """Defect class: a duplicate or missing creation, or a receipt that does not bind the created id."""
     gh = FakeGitHub()
     result, receipt = run("repo-create", gh, repo="infra-private", name="rehearsal-1", dry_run=True)
@@ -248,6 +248,21 @@ def test_repo_create_sends_once_and_receipt_binds_id(tmp_path):
     files = sorted(state_dir(tmp_path).glob("repo-create-rehearsal-1-*.json"))
     assert len(files) == 2 and all(path.stat().st_mode & 0o777 == 0o600 for path in files)
     assert json.loads(files[-1].read_text()) == receipt
+    # repo-create keeps bounded polling until the expected private readback arrives (AC-4 unchanged).
+    sleeps = []
+    monkeypatch.setattr(pub, "_transfer_sleep", sleeps.append)
+    delayed = FakeGitHub()
+    create_polls = []
+
+    def public_then_private(args):
+        create_polls.append(args)
+        return answer(args, repository(901, f"{OLD}/rehearsal-2", private=len(create_polls) > 1))
+
+    delayed.overrides[("GET", f"repos/{OLD}/rehearsal-2", True)] = public_then_private
+    result, receipt = run("repo-create", delayed, repo="infra-private", name="rehearsal-2")
+    assert result.returncode == 0 and receipt["outcome"] == "created"
+    assert len(delayed.posts) == 1 and len(create_polls) == 2 and sleeps == list(pub.TRANSFER_VERIFY_DELAYS[:2])
+    assert receipt["principal"]["before"] == receipt["principal"]["after"] == {"login": PRINCIPAL, "id": 7}
 
 
 @pytest.mark.parametrize("outcome", [
@@ -269,18 +284,18 @@ def test_repo_create_unknown_send_is_unsettled(outcome):
 
 
 def test_real_move_derives_endpoints_from_selector_row(selector):
-    """Defect class: transfer endpoints taken from caller input, from a non-private row, or in reverse."""
+    """Defect class: transfer endpoints taken from caller input, from a single-slug/unregistered row, or in reverse."""
     gh = FakeGitHub()
     result, receipt = run("repo-transfer", gh, repo="infra-private", dry_run=True)
     assert result.returncode == 0 and gh.posts == []
-    assert (receipt["mode"], receipt["source"], receipt["destination"], receipt["repository_id"]) == (
-        "move", SOURCE, DESTINATION, REPO_ID,
+    assert (receipt["mode"], receipt["source"], receipt["destination"], receipt["repository_id"], receipt["visibility"]) == (
+        "move", SOURCE, DESTINATION, REPO_ID, "private",
     )
     for key, slug, reason in [
         ("infra-private", DESTINATION, "already names"),
         ("infra-private", None, "selector cannot bind"),
         ("single", SOURCE, "no alternate_github"),
-        ("public-move", SOURCE, "not a private repository"),
+        ("public", f"{OLD}/public", "no alternate_github"),
         ("nope", SOURCE, "not a repository key"),
     ]:
         selector["slug"] = slug
@@ -288,6 +303,235 @@ def test_real_move_derives_endpoints_from_selector_row(selector):
         with pytest.raises(gate.PublishBlocked, match=reason):
             run("repo-transfer", gh, repo=key)
         assert gh.posts == []
+    # repo-create stays private-only: it still refuses public dual-slug rows.
+    with pytest.raises(gate.PublishBlocked, match="not a private repository"):
+        run("repo-create", FakeGitHub(), repo="public-move", name="rehearsal-1")
+
+
+def test_public_row_transfer_pins_id_and_preserves_visibility(tmp_path, selector, monkeypatch):
+    """Defect class: public dual-slug row refused, or transferred without id pinning, unchanged visibility, and readback."""
+    pub_source, pub_dest, pub_id = f"{OLD}/pub", f"{NEW}/pub", 222
+    pub_journal = state_dir(tmp_path) / f"repo-transfer-{pub_id}.pending"
+    selector["slug"] = pub_source
+
+    def public_gh():
+        gh = FakeGitHub()
+        gh.repos = {pub_source: repository(pub_id, pub_source, private=False)}
+        return gh
+
+    # Dry run passes with pinned id and visibility="public", sending no POST and leaving no journal.
+    gh = public_gh()
+    result, receipt = run("repo-transfer", gh, repo="public-move", dry_run=True)
+    assert result.returncode == 0 and receipt["outcome"] == "dry-run"
+    assert (receipt["mode"], receipt["source"], receipt["destination"], receipt["repository_id"], receipt["visibility"]) == (
+        "move", pub_source, pub_dest, pub_id, "public",
+    )
+    assert gh.posts == [] and not pub_journal.exists()
+
+    # Rehearsal --create-receipt remains private-only and refuses public rows before opening any receipt.
+    with pytest.raises(gate.PublishBlocked, match="requires a private registry row"):
+        run("repo-transfer", public_gh(), repo="public-move", create_receipt=str(tmp_path / "missing.json"))
+
+    # Preflight refusals on a public row: wrong id, flipped visibility, destination collision, archived, non-admin.
+    for mutate, reason in (
+        (lambda g: g.repos[pub_source].update(id=999), "not the pinned"),
+        (lambda g: g.repos[pub_source].update(private=True, visibility="private"), "is not public"),
+        (lambda g: g.repos[pub_source].update(private=False, visibility="private"), "is not public"),
+        (lambda g: g.repos.update({pub_dest: repository(5, pub_dest, private=False)}), "holds repository 5"),
+        (lambda g: g.repos[pub_source].update(archived=True), "is archived"),
+        (lambda g: g.repos[pub_source].update(permissions={"admin": False}), "not an admin"),
+    ):
+        gh = public_gh()
+        mutate(gh)
+        with pytest.raises(gate.PublishBlocked, match=reason):
+            run("repo-transfer", gh, repo="public-move")
+        assert gh.posts == [] and not pub_journal.exists()
+
+    # Async 202 acceptance (minimal-repository omitting visibility, private=False) settles once destination appears public.
+    sleeps = []
+    monkeypatch.setattr(pub, "_transfer_sleep", sleeps.append)
+    gh = public_gh()
+    gh.overrides[("POST", f"repos/{pub_source}/transfer", False)] = lambda args: answer(
+        args, {"id": pub_id, "full_name": pub_source, "private": False},
+    )
+    polls = []
+
+    def appear_public_on_second(args):
+        polls.append(args)
+        if len(polls) >= 2:
+            gh.repos.pop(pub_source, None)
+            moved = repository(pub_id, pub_dest, private=False)
+            gh.repos[pub_dest] = moved
+            return answer(args, moved)
+        return not_found(args)
+
+    gh.overrides[("GET", f"repos/{pub_dest}", True)] = appear_public_on_second
+    result, receipt = run("repo-transfer", gh, repo="public-move")
+    assert result.returncode == 0 and receipt["outcome"] == "transferred" and receipt["visibility"] == "public"
+    assert gh.posts == [(f"repos/{pub_source}/transfer", {"new_owner": NEW, "new_name": "pub"})]
+    assert len(polls) == 2 and sleeps == list(pub.TRANSFER_VERIFY_DELAYS[:2])
+    assert gh.calls[-1] == ["gh", "api", "--method", "GET", "user"]
+    assert receipt["principal"]["before"] == receipt["principal"]["after"] == {"login": PRINCIPAL, "id": 7}
+    assert gh.find(pub_dest)["id"] == pub_id and gh.find(pub_dest)["visibility"] == "public"
+    assert not pub_journal.exists()
+
+    # Rerun reconciles as already-transferred with visibility="public" and zero new POSTs.
+    del gh.overrides[("GET", f"repos/{pub_dest}", True)]
+    result, receipt = run("repo-transfer", gh, repo="public-move")
+    assert result.returncode == 0 and receipt["outcome"] == "already-transferred"
+    assert "public" in receipt["detail"] and len(gh.posts) == 1
+
+    # Visibility flip in POST 202 answer (private=True or visibility="private"/None) exits 3 unverified and keeps journal.
+    for bad_ack in (
+        {"id": pub_id, "full_name": pub_source, "private": True},
+        {"id": pub_id, "full_name": pub_source, "private": False, "visibility": "private"},
+        {"id": pub_id, "full_name": pub_source, "private": False, "visibility": None},
+    ):
+        gh = public_gh()
+        gh.overrides[("POST", f"repos/{pub_source}/transfer", False)] = lambda args, doc=bad_ack: answer(args, doc)
+        result, receipt = run("repo-transfer", gh, repo="public-move")
+        assert result.returncode == pub.REPO_ADMIN_UNSETTLED and receipt["outcome"] == "unverified"
+        assert "pinned public repository" in receipt["detail"] and pub_journal.exists()
+        pub_journal.unlink()
+
+    # Transient visibility mismatch on poll 1 followed by a matching public response on poll 2 must stop
+    # immediately on poll 1, exit 3 unverified, and keep the journal (never overwrite evidence with poll 2).
+    for first_doc in (
+        repository(pub_id, pub_dest, private=True),
+        {**repository(pub_id, pub_dest, private=False), "visibility": "private"},
+        {"id": pub_id, "full_name": pub_dest, "private": True, "visibility": None, "archived": False},
+    ):
+        sleeps = []
+        monkeypatch.setattr(pub, "_transfer_sleep", sleeps.append)
+        gh = public_gh()
+        mismatch_polls = []
+
+        def mismatch_then_match(args, bad=first_doc, calls=mismatch_polls):
+            calls.append(args)
+            if len(calls) == 1:
+                return answer(args, bad)
+            return answer(args, repository(pub_id, pub_dest, private=False))
+
+        gh.overrides[("GET", f"repos/{pub_dest}", True)] = mismatch_then_match
+        result, receipt = run("repo-transfer", gh, repo="public-move")
+        assert result.returncode == pub.REPO_ADMIN_UNSETTLED and receipt["outcome"] == "unverified"
+        assert "unexpected visibility" in receipt["detail"]
+        assert len(gh.posts) == 1 and len(mismatch_polls) == 1 and sleeps == list(pub.TRANSFER_VERIFY_DELAYS[:1])
+        assert pub_journal.exists()
+        pub_journal.unlink()
+
+    # Visibility flipped to private at destination readback exits 3 unverified, keeps journal, and stays unreconciled
+    # until destination is observed public with the pinned id.
+    gh = public_gh()
+    gh.overrides[("GET", f"repos/{pub_dest}", True)] = lambda args: answer(
+        args, repository(pub_id, pub_dest, private=True),
+    )
+    result, receipt = run("repo-transfer", gh, repo="public-move")
+    assert result.returncode == pub.REPO_ADMIN_UNSETTLED and receipt["outcome"] == "unverified"
+    assert len(gh.posts) == 1 and pub_journal.exists()
+    original_journal = pub_journal.read_text()
+    gh.overrides.clear()
+    gh.repos = {pub_dest: repository(pub_id, pub_dest, private=True)}
+    result, receipt = run("repo-transfer", gh, repo="public-move")
+    assert result.returncode == pub.REPO_ADMIN_UNSETTLED and receipt["outcome"] == "unreconciled"
+    assert "does not show it public" in receipt["detail"] and len(gh.posts) == 1 and pub_journal.exists()
+    # The destination and catalog can agree with each other while disagreeing with the pending transfer.
+    public_row = CATALOG["public-move"]
+    with monkeypatch.context() as catalog_change:
+        catalog_change.setitem(CATALOG, "public-move", {**public_row, "visibility": "private", "role": "private-labs"})
+        for dry_run in (False, True):
+            result, receipt = run("repo-transfer", gh, repo="public-move", dry_run=dry_run)
+            assert result.returncode == pub.REPO_ADMIN_UNSETTLED and receipt["outcome"] == "unreconciled"
+            assert "binds public visibility" in receipt["detail"]
+            assert len(gh.posts) == 1 and pub_journal.read_text() == original_journal
+    assert json.loads(original_journal)["visibility"] == "public"
+    gh.repos = {pub_dest: repository(pub_id, pub_dest, private=False)}
+    result, receipt = run("repo-transfer", gh, repo="public-move")
+    assert result.returncode == 0 and receipt["outcome"] == "already-transferred"
+    assert len(gh.posts) == 1 and not pub_journal.exists()
+
+
+@pytest.mark.parametrize("repo_key,slug,repo_id,expected_visibility,changed_doc", [
+    ("public-move", f"{OLD}/pub", 222, "public", repository(222, f"{OLD}/pub", private=True)),
+    (
+        "public-move", f"{OLD}/pub", 222, "public",
+        {**repository(222, f"{OLD}/pub", private=False), "visibility": "private"},
+    ),
+    (
+        "public-move", f"{OLD}/pub", 222, "public",
+        {**repository(222, f"{OLD}/pub", private=True), "visibility": "public"},
+    ),
+    ("infra-private", SOURCE, REPO_ID, "private", repository(REPO_ID, SOURCE, private=False)),
+    (
+        "infra-private", SOURCE, REPO_ID, "private",
+        {**repository(REPO_ID, SOURCE, private=True), "visibility": "public"},
+    ),
+])
+def test_transfer_refuses_visibility_change_between_check_and_post(
+    tmp_path, selector, repo_key, slug, repo_id, expected_visibility, changed_doc,
+):
+    """Defect class: source visibility flipping between preflight check and pre-POST re-read reaching POST."""
+    selector["slug"] = slug
+    expected_private = expected_visibility == "private"
+    gh = FakeGitHub()
+    gh.repos = {slug: repository(repo_id, slug, private=expected_private)}
+    reads = []
+
+    def respond(args):
+        reads.append(args)
+        if len(reads) == 1:
+            return answer(args, repository(repo_id, slug, private=expected_private))
+        return answer(args, changed_doc)
+
+    gh.overrides[("GET", f"repos/{slug}", False)] = respond
+    pending_journal = state_dir(tmp_path) / f"repo-transfer-{repo_id}.pending"
+    with pytest.raises(gate.PublishBlocked, match=f"no longer holds the pinned {expected_visibility} repository"):
+        run("repo-transfer", gh, repo=repo_key)
+    assert len(reads) == 2 and gh.posts == [] and not pending_journal.exists()
+    assert gh.calls[-1] == ["gh", "api", "--method", "GET", "user"]
+
+
+def test_unregistered_and_single_slug_public_repositories_refused(monkeypatch, selector):
+    """Defect class: an unregistered public repository, single-slug public row, or visibility/role mismatch admitted."""
+    unregistered_slug = f"{OLD}/unregistered-public"
+    gh = FakeGitHub()
+    gh.repos = {
+        unregistered_slug: repository(777, unregistered_slug, private=False),
+        f"{OLD}/public": repository(778, f"{OLD}/public", private=False),
+    }
+
+    # Unregistered alias and raw owner/name slug are refused before any GitHub call.
+    for key, reason in (
+        ("unregistered-public", "not a repository key"),
+        (unregistered_slug, "invalid publisher field repo"),
+        ("public", "no alternate_github"),
+    ):
+        selector["slug"] = unregistered_slug
+        with pytest.raises(gate.PublishBlocked, match=reason):
+            run("repo-transfer", gh, repo=key)
+    assert gh.calls == [] and gh.posts == []
+
+    # Dual-slug rows whose declared visibility disagrees with their role prefix fail closed.
+    bad_catalog = {
+        **CATALOG,
+        "pub-bad-role": {
+            "github": f"{OLD}/pub-bad", "alternate_github": f"{NEW}/pub-bad",
+            "repository_id": 333, "visibility": "public", "local_name": "pub-bad", "role": "private-labs",
+        },
+        "priv-bad-role": {
+            "github": f"{OLD}/priv-bad", "alternate_github": f"{NEW}/priv-bad",
+            "repository_id": 334, "visibility": "private", "local_name": "priv-bad", "role": "public-labs",
+        },
+        "pub-no-prefix": {
+            "github": f"{OLD}/pub-raw", "alternate_github": f"{NEW}/pub-raw",
+            "repository_id": 335, "visibility": "public", "local_name": "pub-raw", "role": "machinery",
+        },
+    }
+    monkeypatch.setattr(gate, "catalog", lambda: bad_catalog)
+    for key in ("pub-bad-role", "priv-bad-role", "pub-no-prefix"):
+        with pytest.raises(gate.PublishBlocked, match="visibility matching its role"):
+            run("repo-transfer", gh, repo=key)
+    assert gh.calls == [] and gh.posts == []
 
 
 def _second_source_read(gh, second):
@@ -509,6 +753,24 @@ def test_transfer_settles_after_async_accept(tmp_path, monkeypatch):
         assert len(gh.posts) == 1 and polls == [] and sleeps == [] and journal(tmp_path).exists()
         journal(tmp_path).unlink()
 
+    # Transient public visibility on destination poll 1 followed by private on poll 2 stops on poll 1 and keeps journal.
+    sleeps = []
+    monkeypatch.setattr(pub, "_transfer_sleep", sleeps.append)
+    gh = FakeGitHub()
+    mismatch_polls = []
+
+    def public_then_private(args):
+        mismatch_polls.append(args)
+        return answer(args, repository(REPO_ID, DESTINATION, private=len(mismatch_polls) > 1))
+
+    gh.overrides[("GET", f"repos/{DESTINATION}", True)] = public_then_private
+    result, receipt = run("repo-transfer", gh, repo="infra-private")
+    assert result.returncode == pub.REPO_ADMIN_UNSETTLED and receipt["outcome"] == "unverified"
+    assert "unexpected visibility" in receipt["detail"]
+    assert len(gh.posts) == 1 and len(mismatch_polls) == 1 and sleeps == list(pub.TRANSFER_VERIFY_DELAYS[:1])
+    assert journal(tmp_path).exists()
+    journal(tmp_path).unlink()
+
 
 def _applied_then(gh, reply):
     """A POST answer that applies the transfer and then answers *reply* (a document or an exception)."""
@@ -689,13 +951,17 @@ def test_pending_transfer_bound_to_original_principal(tmp_path):
         assert result.returncode == pub.REPO_ADMIN_UNSETTLED and receipt["outcome"] == "unreconciled"
         assert "(id 7)" in receipt["detail"] and "(id 22)" in receipt["detail"] and journal(tmp_path).exists()
     bound = journal(tmp_path).read_text()
-    assert json.loads(bound)["principal"] == {"login": PRINCIPAL, "id": 7}
+    bound_principal = {"login": PRINCIPAL, "id": 7}
+    assert json.loads(bound)["principal"] == bound_principal
     del gh.overrides[("GET", "user", True)]
     for content, mode in [
         ("{}", 0o600),
         ("not json", 0o600),
-        (json.dumps({"principal": {"login": "someone-else", "id": 7}}), 0o600),
-        (json.dumps({"principal": {"login": PRINCIPAL, "id": True}}), 0o600),
+        (json.dumps({"principal": {"login": "someone-else", "id": 7}, "visibility": "private"}), 0o600),
+        (json.dumps({"principal": {"login": PRINCIPAL, "id": True}, "visibility": "private"}), 0o600),
+        (json.dumps({"principal": bound_principal}), 0o600),
+        (json.dumps({"principal": bound_principal, "visibility": ["private"]}), 0o600),
+        (json.dumps({"principal": bound_principal, "visibility": "internal"}), 0o600),
         (bound, 0o644),
     ]:
         journal(tmp_path).write_text(content)
