@@ -1874,8 +1874,10 @@ def test_fleet_repos_validates_declared_product_files(tmp_path, monkeypatch):
 def test_strict_inventory_skips_foreign_json_beside_records(tmp_path):
     """Defect class: a strict reader refuses the whole store over a file the record parser calls foreign.
 
-    Policy, build and receipt JSON written beside task records make no record claim; the strict
-    inventory skips them exactly as ``list_tasks(strict=True)`` does, so the turn child count works.
+    Policy, build and receipt JSON objects written beside task records make no record claim, even
+    with a ``status`` or a string ``schema_version`` as the live store's build and receipt files
+    carry; the strict inventory skips them exactly as ``list_tasks(strict=True)`` does, so the turn
+    child count works.
     """
     tasks = tmp_path / "tasks"
     child = _record(tasks, "turn-child", parent_task_id="turn-parent", parent_run_nonce="nonce-turn-parent")
@@ -1884,10 +1886,14 @@ def test_strict_inventory_skips_foreign_json_beside_records(tmp_path):
     (tasks / "atlas-01a193ab-parent11943-ac-policy.json").write_text(
         json.dumps({"criteria": [{"id": "AC-1", "applies": True}]}), encoding="utf-8"
     )
-    (tasks / "turn-child.base-build.json").write_text(json.dumps({"head": "0" * 40, "ok": True}), encoding="utf-8")
-    (archive / "turn-child.behavior-receipt.json").write_text(
+    (tasks / "turn-child.base-build.json").write_text(json.dumps({"status": "ok", "level": "a1"}), encoding="utf-8")
+    (tasks / "turn-child.behavior-receipt.json").write_text(
+        json.dumps({"schema_version": "code-review-receipt.v1", "exit_code": 0}), encoding="utf-8"
+    )
+    (archive / "turn-child.review-receipt.json").write_text(
         json.dumps({"schema": "behavior-receipt.v1", "task_id": "turn-child"}), encoding="utf-8"
     )
+    (archive / "empty-list.json").write_text("[]", encoding="utf-8")
 
     records = adm.strict_task_inventory_in(tasks)
 
@@ -1903,6 +1909,15 @@ def test_strict_inventory_skips_foreign_json_beside_records(tmp_path):
         pytest.param("bad-schema.json", b'{"task_id": "bad-schema", "schema_version": "2"}', id="invalid-schema"),
         pytest.param("zeroed-child.json", b"\x00" * 64, id="v2-name-zero-filled"),
         pytest.param("emptied-child.json", b"", id="v2-name-empty"),
+        pytest.param(
+            "bare-members.json", b'"task_id": "bare-members", "schema_version": 2, "status": "running"', id="bare-members"
+        ),
+        pytest.param(
+            "array-record.json",
+            b'[{"task_id": "array-record", "schema_version": 2, "status": "running"}]',
+            id="array-of-record",
+        ),
+        pytest.param("lost-identity.json", b'{"schema_version": 2, "status": "running"}', id="int-schema-object"),
     ],
 )
 def test_strict_inventory_still_refuses_record_claims_that_fail_to_parse(tmp_path, name, raw):
