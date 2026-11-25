@@ -933,16 +933,34 @@ def record_settled(path: Path, record: Mapping[str, Any], batch_state_dir: Path,
 # The published-verdict ledger (#902): one line per verdict the recorder published on a PR as the review of record,
 # in ``<batch_state>/model-stats/publications.jsonl``. Its one writer is ``record_cf_verdict`` (each ``record`` and
 # the one-shot ``import-publications``); the statistics read it and never reach GitHub. A review without a line is
-# of unknown publication.
+# of unknown publication. A line of a dual-slug repository also carries ``fleet_repo_selector``, the selector receipt
+# (value and sha256) the writer resolved the repository with (SELECTOR-DURABLE-RECEIPTS); lines without it (single-slug
+# rows, lines written before it) read as having none. The receipt is provenance, never authority: no reader may use
+# it to authorize a write, and it is no part of what makes two lines the same publication.
 PUBLICATION_SCHEMA = "review-publication.v1"
 PUBLICATIONS_FILE = "publications.jsonl"
 PUBLISHED_VERDICTS = frozenset({"APPROVED", "CHANGES_REQUESTED", "BLOCKED"})
 _PUBLICATION_KEYS = frozenset({"schema", "task_id", "repository", "pr", "head", "verdict", "published_at"})
+_PUBLICATION_SELECTOR = "fleet_repo_selector"
 REPOSITORY_SLUG = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9._-]{1,100}\Z")
+_SELECTOR_SHA256 = re.compile(r"[0-9a-f]{64}\Z")
+
+
+def _selector_ok(receipt: object) -> bool:
+    """None, or exactly a selector value (owner/name) and its lowercase hex sha256."""
+    if receipt is None:
+        return True
+    if not isinstance(receipt, dict) or receipt.keys() != {"selector_value", "selector_sha256"}:
+        return False
+    value, digest = receipt["selector_value"], receipt["selector_sha256"]
+    return (isinstance(value, str) and REPOSITORY_SLUG.fullmatch(value) is not None
+            and isinstance(digest, str) and _SELECTOR_SHA256.fullmatch(digest) is not None)
 
 
 def _publication_ok(entry: object) -> bool:
-    if not isinstance(entry, dict) or entry.keys() != _PUBLICATION_KEYS:
+    if not isinstance(entry, dict) or entry.keys() - {_PUBLICATION_SELECTOR} != _PUBLICATION_KEYS:
+        return False
+    if not _selector_ok(entry.get(_PUBLICATION_SELECTOR)):
         return False
     pr, repository = entry["pr"], entry["repository"]
     return (entry["schema"] == PUBLICATION_SCHEMA and valid_task_id(entry["task_id"])
@@ -953,14 +971,19 @@ def _publication_ok(entry: object) -> bool:
 
 
 def publication(*, task_id: str, repository: str, pr: int, head: str, verdict: str,
-                published_at: object) -> dict[str, Any]:
+                published_at: object, fleet_repo_selector: Mapping[str, Any] | None = None) -> dict[str, Any]:
     """One ledger line: which review task's verdict was published on which PR head, and when GitHub stored it.
 
-    ``published_at`` is GitHub's comment time as read back (any value; only an ISO timestamp is accepted). Raises
-    ValueError when a field has the wrong shape, so a malformed line is never written.
+    ``published_at`` is GitHub's comment time as read back (any value; only an ISO timestamp is accepted).
+    ``fleet_repo_selector`` is the selector receipt the writer resolved a dual-slug repository with; the line carries
+    it only when it is not None. Raises ValueError when a field has the wrong shape, so a malformed line is never
+    written.
     """
-    entry = {"schema": PUBLICATION_SCHEMA, "task_id": task_id, "repository": repository, "pr": pr, "head": head,
-             "verdict": verdict, "published_at": published_at}
+    entry: dict[str, Any] = {"schema": PUBLICATION_SCHEMA, "task_id": task_id, "repository": repository, "pr": pr,
+                             "head": head, "verdict": verdict, "published_at": published_at}
+    if fleet_repo_selector is not None:
+        entry[_PUBLICATION_SELECTOR] = (dict(fleet_repo_selector) if isinstance(fleet_repo_selector, Mapping)
+                                        else fleet_repo_selector)
     if not _publication_ok(entry):
         raise ValueError("publication field has the wrong shape")
     return entry

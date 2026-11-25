@@ -97,13 +97,14 @@ def test_v10_migration_is_idempotent_and_has_authority_tables(tmp_path: Path) ->
 
     The pinned version is deliberately a literal, not ``MIGRATIONS[-1]``
     compared to itself: adding a migration must be a conscious edit here,
-    with the new tables asserted below. Head is 11 since #513 moved alert
-    lifecycle metadata into the Fleet authority store.
+    with the new tables asserted below. Head is 12 since
+    SELECTOR-DURABLE-RECEIPTS added the selector receipt columns to
+    github_publications and formal_review_jobs.
     """
     connection = sqlite3.connect(tmp_path / "comms.sqlite3")
     try:
-        assert apply_migrations(connection) == MIGRATIONS[-1].version == 11
-        assert apply_migrations(connection) == 11, "re-applying the ledger must be an idempotent no-op"
+        assert apply_migrations(connection) == MIGRATIONS[-1].version == 12
+        assert apply_migrations(connection) == 12, "re-applying the ledger must be an idempotent no-op"
         tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
         assert {"routing_reservations", "routing_reservation_decisions", "routing_circuit_state"} <= tables
         assert {
@@ -114,6 +115,9 @@ def test_v10_migration_is_idempotent_and_has_authority_tables(tmp_path: Path) ->
             "v4_authorship_receipts",
         } <= tables
         assert {"bottleneck_alert_state", "bottleneck_alert_scan_control"} <= tables
+        for table in ("github_publications", "formal_review_jobs"):
+            columns = {row[1] for row in connection.execute(f"PRAGMA table_info({table})")}
+            assert {"selector_value", "selector_sha256"} <= columns
         # The V4 authority tables must carry the columns their writers rely
         # on, including the repair-7 request correlation used to derive an
         # observation's verification tool ids and to audit provenance.

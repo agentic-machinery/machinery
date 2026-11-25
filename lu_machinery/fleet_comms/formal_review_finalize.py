@@ -9,6 +9,10 @@ Closes the gap between review asks and Sol milestone 2 (sealed review-pr was rem
 
 Does **not** invoke reviewers or create sealed worktrees (sealed review-pr was removed in #8520).
 Operators/orchestrators call this after a review reply is in hand.
+
+A registered repository (either baked slug of its row) is read at its active slug, and the dual-slug selector
+receipt it was resolved with is stored on the job when the verdict is sealed. The receipt is provenance, never
+authority: no reader may use a stored receipt to authorize a write.
 """
 
 from __future__ import annotations
@@ -48,6 +52,12 @@ from lu_machinery.fleet_comms.review_publisher import (
     publish_sealed_verdict,
     split_repository,
 )
+from lu_machinery.orchestration.fleet_repos import (
+    FleetRepoError,
+    load_fleet_repos,
+    resolve_fleet_repo_by_slug,
+    resolve_payload_fleet_repo,
+)
 
 Runner = Callable[..., subprocess.CompletedProcess[str]]
 
@@ -71,9 +81,12 @@ class FinalizeResult:
     published: bool
     publication_summary: str | None
     job_created: bool
+    # The dual-slug selector value and sha256 the repository was resolved with; None for a single-slug or an
+    # unregistered repository.
+    fleet_repo_selector: dict[str, str] | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        result = {
             "review_id": self.review_id,
             "repository": self.repository,
             "pr_number": self.pr_number,
@@ -85,6 +98,31 @@ class FinalizeResult:
             "publication_summary": self.publication_summary,
             "job_created": self.job_created,
         }
+        if self.fleet_repo_selector is not None:
+            result["fleet_repo_selector"] = self.fleet_repo_selector
+        return result
+
+
+def _github_target(repository: str) -> tuple[str, dict[str, str] | None]:
+    """The slug GitHub is read at and the selector receipt it was resolved with.
+
+    A registered row, named by either baked slug, is read at its active slug; it is refused when the catalog is
+    unreadable or its dual-slug selector is missing or untrusted. An unregistered owner/name is read as given, with
+    no receipt.
+    """
+    try:
+        repos = load_fleet_repos()
+    except FleetRepoError as exc:
+        raise FormalReviewFinalizeError(f"repository_unresolved: {exc}") from exc
+    try:
+        resolve_fleet_repo_by_slug(repository, repos=repos)
+    except FleetRepoError:
+        return repository, None
+    try:
+        active = resolve_payload_fleet_repo(repository, repos=repos)
+    except FleetRepoError as exc:
+        raise FormalReviewFinalizeError(f"repository_unresolved: {exc}") from exc
+    return active.active_github, active.selector_receipt()
 
 
 def resolve_verdict_token(
@@ -181,6 +219,7 @@ def finalize_formal_review_verdict(
 
     # Validate repository shape early.
     split_repository(repository)
+    github_repository, selector = _github_target(repository)
 
     findings_verdict: str | None = None
     review_evidence: ReviewEvidence | None = None
@@ -232,7 +271,7 @@ def finalize_formal_review_verdict(
     if sha is None:
         try:
             sha = fetch_pr_head_sha(
-                repository=repository,
+                repository=github_repository,
                 pr_number=pr_number,
                 runner=runner,
             )
@@ -247,7 +286,7 @@ def finalize_formal_review_verdict(
     if review_evidence is not None and review_evidence.findings:
         try:
             inventory = fetch_pr_change_inventory(
-                repository=repository,
+                repository=github_repository,
                 pr_number=pr_number,
                 runner=runner,
             )
@@ -295,7 +334,7 @@ def finalize_formal_review_verdict(
                 harness=harness.strip(),
                 review_evidence=review_evidence,
             )
-            service.accept_sealed_verdict(job.review_id, sealed)
+            service.accept_sealed_verdict(job.review_id, sealed, fleet_repo_selector=selector)
         except FormalReviewJobsError as exc:
             # Includes concurrent create races and accept failures.
             raise FormalReviewFinalizeError(str(exc)) from exc
@@ -330,6 +369,7 @@ def finalize_formal_review_verdict(
             published=published,
             publication_summary=publication_summary,
             job_created=job_created,
+            fleet_repo_selector=selector,
         )
 
 

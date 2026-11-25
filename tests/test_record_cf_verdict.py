@@ -3078,7 +3078,9 @@ def test_publication_import_reads_the_active_slug_and_stores_the_registry_slug(t
         return
     assert run()["added"] == 1
     assert read == [active]
-    assert [entry["repository"] for entry in _ledger(tmp_path)] == ["org/repos"]
+    assert [(entry["repository"], entry["fleet_repo_selector"]) for entry in _ledger(tmp_path)] == [
+        ("org/repos", {"selector_value": active, "selector_sha256": "d" * 64}),
+    ]
 
 
 @pytest.mark.usefixtures('configured_roots', 'recorder_matcher')
@@ -3102,4 +3104,36 @@ def test_recorded_verdict_posts_at_the_active_slug_and_names_the_selector(monkey
     assert written == [active, active]
     assert reads == [("org/repos", active)]  # records matched at the registry slug, GitHub read at the active one
     assert result["fleet_repo_selector"] == {"selector_value": active, "selector_sha256": "d" * 64}
-    assert [entry["repository"] for entry in _ledger(tmp_path)] == ["org/repos"]
+    assert [(entry["repository"], entry["fleet_repo_selector"]) for entry in _ledger(tmp_path)] == [
+        ("org/repos", result["fleet_repo_selector"]),
+    ]
+
+
+@pytest.mark.parametrize("active", _BAKED)
+def test_publication_ledger_keeps_the_selector_receipt_and_still_reads_legacy_lines(tmp_path, monkeypatch, active):
+    """Defect class: the publication ledger drops the selector receipt a dual-slug publication was resolved with
+    (SELECTOR-DURABLE-RECEIPTS), rejects a line written before the receipt existed, or stores or trusts a malformed
+    receipt; or the receipt changes which lines are one publication."""
+    from collections import Counter
+
+    from lu_machinery.api import model_stats_rows
+    from tests.review.record_support import recorded_verdict
+
+    _transferred(monkeypatch, active)
+    receipt = {"selector_value": active, "selector_sha256": "d" * 64}
+    comment = recorded_verdict(SHA, "APPROVED")
+    entry, reason = recorder.publication_of("org/repos", 42, comment, fleet_repo_selector=receipt)
+    assert reason == "" and entry is not None and entry["fleet_repo_selector"] == receipt
+    legacy, _ = recorder.publication_of("org/repos", 41, comment)
+    assert legacy is not None and "fleet_repo_selector" not in legacy
+    for bad in ({"selector_value": active}, {**receipt, "extra": "x"}, {**receipt, "selector_sha256": "D" * 64},
+                {**receipt, "selector_value": "../x"}, {**receipt, "selector_value": None}):
+        assert recorder.publication_of("org/repos", 42, comment, fleet_repo_selector=bad) == (None, "malformed field")
+    assert model_stats_rows.record_publications(tmp_path, [legacy, entry]) == 2
+    # The receipt is no part of the publication key: the same publication without it is a duplicate.
+    assert model_stats_rows.record_publications(tmp_path, [{k: v for k, v in entry.items() if k != "fleet_repo_selector"}]) == 0
+    with (tmp_path / model_stats_rows.ROWS_DIR / model_stats_rows.PUBLICATIONS_FILE).open("ab") as stream:
+        stream.write((json.dumps({**entry, "pr": 43, "fleet_repo_selector": {"selector_value": active}}) + "\n").encode())
+    published, counts = model_stats_rows.read_publications(tmp_path)
+    assert sorted(published["prior-review"], key=lambda line: line["pr"]) == [legacy, entry]
+    assert counts == Counter({"lines": 2, "malformed_lines": 1, "tasks": 1})

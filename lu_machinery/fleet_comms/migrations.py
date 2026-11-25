@@ -613,6 +613,16 @@ _V11_STATEMENTS = (
 )""",
 )
 
+# SELECTOR-DURABLE-RECEIPTS: the dual-slug selector receipt (value and selector_sha256) a publication or a sealed
+# verdict was resolved with; provenance only, never authority. Rows written before this migration, and rows of a
+# single-slug repository, keep NULL in both columns.
+_V12_STATEMENTS = (
+    "ALTER TABLE github_publications ADD COLUMN selector_value TEXT",
+    "ALTER TABLE github_publications ADD COLUMN selector_sha256 TEXT",
+    "ALTER TABLE formal_review_jobs ADD COLUMN selector_value TEXT",
+    "ALTER TABLE formal_review_jobs ADD COLUMN selector_sha256 TEXT",
+)
+
 MIGRATIONS = (
     Migration(version=1, name="fleet-comms-v1-contracts", statements=_V1_STATEMENTS),
     Migration(
@@ -657,6 +667,7 @@ MIGRATIONS = (
         statements=_V10_STATEMENTS,
     ),
     Migration(version=11, name="fleet-comms-v11-alert-consumers", statements=_V11_STATEMENTS),
+    Migration(version=12, name="fleet-comms-v12-fleet-repo-selector-receipts", statements=_V12_STATEMENTS),
 )
 
 # During the pre-merge #6159 soak, one development build applied the v5
