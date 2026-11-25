@@ -490,3 +490,99 @@ def test_gh_snapshot_and_prepublish_reject_non_ascii_urls_hosts_and_whitespace(t
             cwd=tmp_path,
             environment={},
         )
+
+
+def test_publish_github_and_client_url_repo_mismatch_guards(tmp_path):
+    """Defect class: non-ASCII publisher payloads/URLs or cross-repo URL operands bypass publish/github and github_client guards."""
+    import json
+    import subprocess
+    from types import SimpleNamespace
+
+    from lu_machinery.common import github_client
+    from lu_machinery.publish import github as pub_github
+
+    def fake_reader(argv, **_kw):
+        return subprocess.CompletedProcess(
+            argv,
+            0,
+            stdout=json.dumps({
+                "state": "open",
+                "number": 42,
+                "node_id": "I_kwDO123",
+                "repository_url": "\u00a0https://api.github.com/repos/learn-ukrainian/machinery",
+                "html_url": "https://github.com/learn-ukrainian/machinery/issues/\u0664\u0662",
+            }),
+            stderr="",
+        )
+
+    assert pub_github._issue_node(fake_reader, "learn-ukrainian/machinery", 42, tmp_path, {}) is None
+    assert pub_github._pr_closing_issues(
+        "Fixes https://GitHub.com/learn-ukrainian/machinery/issues/42", "learn-ukrainian/machinery"
+    ) == [42]
+    assert pub_github._pr_closing_issues(
+        "Fixes https://github.com/learn-u\u212arainian/machinery/issues/42", "learn-ukrainian/machinery"
+    ) == []
+    assert pub_github._pr_closing_issues("Fixes #4\u0662", "learn-ukrainian/machinery") == []
+    assert (
+        pub_github._created_resource_number(
+            "\u00a0https://github.com/learn-ukrainian/machinery/pull/42\n", kind="pull"
+        )
+        is None
+    )
+    assert (
+        pub_github._created_resource_number(
+            "https://github.com/learn-u\u212arainian/machinery/pull/42\n", kind="pull"
+        )
+        is None
+    )
+    assert (
+        pub_github._created_resource_number(
+            "https://github.com/learn-ukrainian/machinery/issues/4\u0662\n", kind="issues"
+        )
+        is None
+    )
+    assert (
+        pub_github._created_resource_number(
+            "https://GitHub.com/learn-ukrainian/machinery/pull/42\n", kind="pull"
+        )
+        == 42
+    )
+
+    def lookalike_repo_reader(argv, **_kw):
+        return subprocess.CompletedProcess(
+            argv,
+            0,
+            stdout=json.dumps({"default_branch": "main", "full_name": "learn-u\u212arainian/machinery"}),
+            stderr="",
+        )
+
+    with pytest.raises(PublishBlocked, match="BRANCH_DELETE_REFUSED"):
+        pub_github._publish_branch_delete(
+            {"branch": "topic"},
+            gh_repo="learn-ukrainian/machinery",
+            runner=lookalike_repo_reader,
+            cwd=tmp_path,
+            environment={},
+            capture_output=True,
+            text=True,
+        )
+
+    # F9: URL operand naming a different ASCII repository than --repo is refused before any request.
+    seen_paths: list[str] = []
+
+    class DummyClient:
+        def request(self, method, path, **_kw):
+            seen_paths.append(path)
+            return SimpleNamespace(value=[], stale=False, error=None)
+
+    res = github_client._read_command(
+        DummyClient(),
+        "pr",
+        "view",
+        {"--repo": ["learn-ukrainian/machinery"], "--json": ["number"]},
+        ["https://github.com/other/repo/pull/5"],
+        timeout=5,
+        fresh=True,
+    )
+    assert res.status == 400 and res.error == "github_invalid_command" and res.reason == "repository_mismatch"
+    assert seen_paths == []

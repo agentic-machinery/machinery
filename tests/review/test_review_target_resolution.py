@@ -463,3 +463,77 @@ def test_resolve_review_target_requires_explicit_mode_args(tmp_path):
         resolve_review_target("pr", repo)
     with __import__("pytest").raises(TargetResolutionError):
         resolve_review_target("bogus-mode", repo)
+
+
+def test_review_readers_refuse_non_ascii_slugs_and_keys(tmp_path, monkeypatch):
+    """Defect class: non-ASCII slugs or keys fold into real repositories in target_resolution, repair_round, and record_cf_verdict."""
+    import pytest
+
+    from lu_machinery.review import record_cf_verdict as rcv
+    from lu_machinery.review import repair_round as rr
+    from lu_machinery.review import target_resolution as tr
+
+    # target_resolution
+    assert tr.spells_private_repo(" infra-private ") is True
+    assert tr.spells_private_repo("\u00a0infra-private") is False
+    assert tr.spells_private_repo("infra-pri\u212aate") is False
+
+    repo = _init_repo(tmp_path)
+    subprocess.run(
+        ["git", "-C", str(repo), "remote", "add", "origin", "https://github.com/learn-u\u212arainian/machinery.git"],
+        check=True,
+        capture_output=True,
+        timeout=30,
+    )
+    assert tr._origin_github_repo(repo) is None
+    with pytest.raises(TargetResolutionError, match="canonical review repository mismatch"):
+        tr.live_canonical_branch_head(repo, "topic", repository="learn-u\u212arainian/machinery")
+
+    # repair_round
+    with pytest.raises(rr.RepairRefused):
+        rr.lineage_keys("learn-u\u212arainian/machinery", 42, "topic", [1])
+    assert (
+        rr._same_round(
+            {"repository": "learn-u\u212arainian/machinery", "pr": 42, "approved_head": "a" * 40, "candidate_head": "b" * 40},
+            repository="learn-ukrainian/machinery",
+            number=42,
+            approved="a" * 40,
+            candidate="b" * 40,
+        )
+        is False
+    )
+    assert rr.repair_heads(tmp_path, repository="learn-u\u212arainian/machinery", number=42, branch="topic") == frozenset()
+    assert rr.receipt_at(tmp_path, repository="learn-u\u212arainian/machinery", number=42, branch="topic", head="b" * 40) is None
+
+    # record_cf_verdict: non-ASCII row["repo"] key must not match ASCII fleet key via casefold.
+    from datetime import UTC, datetime
+
+    from lu_machinery.api import model_stats_rows
+    from lu_machinery.orchestration.fleet_repos import FleetRepo
+
+    monkeypatch.setattr(
+        rcv,
+        "load_fleet_repos",
+        lambda: {"kit": FleetRepo(key="kit", github="org/kit", local_name="kit", role="public-labs", default=True)},
+    )
+    monkeypatch.setattr(
+        model_stats_rows,
+        "read_rows",
+        lambda _dir: ([{"role": "review", "pr": 42, "repo": "\u212ait", "finished_at": "2026-11-25T10:00:00Z"}], []),
+    )
+
+    class StubAdapter:
+        def identity(self):
+            return "bot"
+
+        def comments(self, _repo, _num):
+            return []
+
+    summary = rcv.import_publications(
+        days=7,
+        dry_run=True,
+        task_root=tmp_path / "tasks",
+        now=datetime(2026, 11, 25, 12, 0, tzinfo=UTC),
+        adapter=StubAdapter(),
+    )
+    assert summary["rows_unregistered_repo"] == 1 and summary["prs"] == 0
