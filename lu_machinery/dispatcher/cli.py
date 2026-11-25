@@ -57,6 +57,14 @@ _DISPATCH = f"{Path(__file__).absolute().parents[1].name}/dispatch.py"
 _CLI = f"-m {Path(__file__).absolute().parents[1].name}.dispatcher.cli"
 
 
+def _finite_seconds(text: str) -> float:
+    """A float of seconds; nan and inf are refused here because the value lands in the task record."""
+    value = float(text)
+    if not math.isfinite(value):
+        raise argparse.ArgumentTypeError(f"must be a finite number of seconds, got {text!r}")
+    return value
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Run provider CLIs in detached dispatch worktrees.\nUse for new tasks; legacy tasks retain their supervisor.",
@@ -227,7 +235,7 @@ def build_parser() -> argparse.ArgumentParser:
         "Excluded: " + ", ".join(sorted(git.SPARSE_EXCLUDE_DEFAULT)),
     )
     dispatch.add_argument(
-        "--hard-timeout", type=float, default=7200, help="Deadline seconds; 0 disables (default: 7200)"
+        "--hard-timeout", type=_finite_seconds, default=7200, help="Deadline seconds; 0 disables (default: 7200)"
     )
     dispatch.add_argument(
         "--silence-timeout", type=int, default=DEFAULT_SILENCE_TIMEOUT_S, metavar="SECS",

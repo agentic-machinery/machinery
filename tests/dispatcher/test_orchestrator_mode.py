@@ -189,8 +189,6 @@ def test_entry_refuses_a_caller_inside_a_dispatched_task(task_store, cto_seat, m
     [
         (["--task-id", "worker-1"], "a turn's --task-id starts with 'turn-'"),  # T6: its tree would not read as a turn's
         (["--task-id", "turn-1", "--worktree", "/trees/elsewhere"], "takes no --worktree path"),  # T6
-        (["--task-id", "turn-1", "--hard-timeout", "nan"], "orchestrator_timeout_refused"),  # T5
-        (["--task-id", "turn-1", "--hard-timeout", "inf"], "orchestrator_timeout_refused"),  # T5
         (["--task-id", "turn-1", "--hard-timeout", "0"], "orchestrator_timeout_refused"),  # T5: 0 disables a deadline
         (["--task-id", "turn-1", "--hard-timeout", "86400"], "orchestrator_timeout_refused"),  # T5
     ],

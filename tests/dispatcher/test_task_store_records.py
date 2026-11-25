@@ -841,4 +841,36 @@ def test_review_reply_slug_readers_reject_kelvin_sign_lookalikes(tmp_path, monke
     assert ("result" in direct_conflict, direct_conflict["result_unavailable"]) == (False, "review_not_of_parent_branch")
 
 
+@pytest.mark.parametrize(
+    ("fields", "path"),
+    [
+        ({"hard_timeout": float("nan")}, '["hard_timeout"]'),
+        ({"usage": {"cost_usd": [1.0, float("inf")]}}, '["usage", "cost_usd", 1]'),
+        ({"options": {float("-inf"): "x"}}, '["options", "-inf"]'),
+    ],
+)
+def test_task_record_write_refuses_non_finite_numbers_and_names_the_field(tmp_path, fields, path):
+    """Defect class (#1440): a task record is written with NaN or Infinity, which strict JSON readers refuse."""
+    target = tmp_path / "worker.json"
+    record = {"task_id": "worker", "run_nonce": "nonce", "status": "failed"}
+    store.replace(dict(record), target)
+    before = target.read_bytes()
+    with pytest.raises(store.TaskRecordError) as refused:
+        store.replace({**record, **fields}, target)
+    assert refused.value.code == f"TASK_RECORD_NON_FINITE: {path}"
+    assert target.read_bytes() == before
+    assert sorted(entry.name for entry in tmp_path.iterdir()) == ["worker.json", "worker.json.lock"]
+
+
+@pytest.mark.parametrize("value", ["nan", "inf", "-inf", "1e400"])
+def test_dispatch_refuses_a_non_finite_hard_timeout_at_parse_time(value, capsys):
+    """Defect class (#1440): ``--hard-timeout nan`` or ``inf`` reaches the task record as a non-finite number."""
+    argv = ["dispatch", "--agent", "codex", "--model", "m", "--prompt", "p"]
+    assert cli.build_parser().parse_args([*argv, "--hard-timeout=7200.5"]).hard_timeout == 7200.5
+    with pytest.raises(SystemExit) as exited:
+        cli.build_parser().parse_args([*argv, f"--hard-timeout={value}"])
+    assert exited.value.code == 2
+    assert f"--hard-timeout: must be a finite number of seconds, got {value!r}" in capsys.readouterr().err
+
+
 pytestmark = pytest.mark.usefixtures("configured_roots")

@@ -19,6 +19,7 @@ from lu_machinery.common.git_context import validate_plain_branch_name
 from lu_machinery.common.task_store_paths import tasks_dir
 from lu_machinery.dispatcher.types import ReviewAttempt, StartRefusal
 from lu_machinery.orchestration.task_record_store import (
+    NonFiniteRecordValue,
     TaskIdentityMismatch,
     is_identical_copy,
     iter_task_records,
@@ -26,6 +27,7 @@ from lu_machinery.orchestration.task_record_store import (
     misnamed_record_refusal,
     parse_task_record,
     read_task_record_bytes,
+    record_json,
     relocated_result_file,
     task_archive_lock,
     task_state_lock,
@@ -302,12 +304,15 @@ def _write_atomic(path: Path, record: dict, exclusive: bool) -> None:
     # A PID transfers the slot to the supervisor. Every terminal path releases it.
     if record.get("pid") is not None or record.get("status") not in ACTIVE:
         record.pop("admission_hold", None)
+    try:
+        text = record_json(record) + "\n"
+    except NonFiniteRecordValue as exc:
+        raise TaskRecordError(exc.code) from exc
     # Stage beside the record so the atomic replacement stays on one filesystem.
     name = path.with_name(f".{path.stem}.{uuid.uuid4().hex}.tmp")
     try:
         with open(name, "x", opener=lambda p, f: os.open(p, f, 0o600)) as stream:
-            json.dump(record, stream, indent=2)
-            stream.write("\n")
+            stream.write(text)
             stream.flush()
             os.fsync(stream.fileno())
             version = os.fstat(stream.fileno()).st_mtime_ns
