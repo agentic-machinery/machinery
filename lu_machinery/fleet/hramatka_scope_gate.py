@@ -20,7 +20,7 @@ from enum import StrEnum
 from lu_machinery.common import json_depth, profile
 from lu_machinery.common.repo_root import machinery_path
 from lu_machinery.orchestration import issue_stream_audit
-from lu_machinery.orchestration.fleet_repos import FleetRepoError, load_fleet_repos
+from lu_machinery.orchestration.fleet_repos import FleetRepoError, load_fleet_repos, resolve_active_fleet_repo
 from lu_machinery.publish.github import read
 
 PUBLIC_REPOSITORY = "learn-ukrainian/learn-ukrainian.github.io"
@@ -76,10 +76,11 @@ class ScopeGateConfig:
 
 
 def _default_scope_gate() -> ScopeGateConfig:
-    try:
-        private_repository = load_fleet_repos()["infra-private"].github
-    except KeyError as exc:
-        raise FleetRepoError("fleet registry is missing the infra-private repository") from exc
+    repos = load_fleet_repos()
+    if "infra-private" not in repos:
+        raise FleetRepoError("fleet registry is missing the infra-private repository")
+    # The board lives at the row's active slug; a transferred row without a trusted selector fails closed.
+    private_repository = resolve_active_fleet_repo("infra-private", repos=repos).active_github
     return ScopeGateConfig(
         stream_name=HRAMATKA_STREAM,
         public_repository=PUBLIC_REPOSITORY,

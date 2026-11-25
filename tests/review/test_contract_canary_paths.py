@@ -271,6 +271,16 @@ def runner_roots(tmp_path, configured_roots, monkeypatch):
     monkeypatch.setattr(dispatch_git, "resolve_repo", lambda key: (
         source, {"github": "example/machinery", "key": key},
     ))
+    # The runner reads the row's active slug: the test owns its transferred row and its host selector
+    # (CI hosts have none), which keeps the baked slug active.
+    from lu_machinery.common import git_credentials
+    from lu_machinery.orchestration import fleet_repos
+
+    row = fleet_repos.FleetRepo("machinery", "example/machinery", "machinery", "public-machinery", repository_id=1,
+                                visibility="public", alternate_github="example-moved/machinery")
+    monkeypatch.setattr(fleet_repos, "load_fleet_repos", lambda *_args, **_kwargs: {"machinery": row})
+    monkeypatch.setattr(git_credentials, "load_selector", lambda **_kwargs: git_credentials.SelectorState(
+        {"machinery": "example/machinery"}, "d" * 64))
     monkeypatch.setenv("LEARN_UKRAINIAN_PYTHON", sys.executable)
     monkeypatch.delenv("LEARN_UKRAINIAN_DISPATCH_TASK_ID", raising=False)
     # The space check reads the default refuse level and a roomy disk, never the host's.
@@ -519,6 +529,34 @@ def test_runner_resolves_pr_head_once_before_planning(runner_roots, monkeypatch,
     assert len(reads) == 1
     assert "--repo" in reads[0] and "example/machinery" in reads[0]
     assert "--pinned-head " + "d" * 40 in capsys.readouterr().out
+
+
+def test_runner_reads_and_clones_the_active_slug(runner_roots, monkeypatch, capsys):
+    """Defect class: reader acts on the baked slug after the selector flips to the alternate."""
+    from lu_machinery.common import git_credentials, github_client
+
+    reads = []
+
+    def read(argv, **kwargs):
+        reads.append(argv)
+        return subprocess.CompletedProcess(argv, 0, json.dumps({"headRefOid": "d" * 40}), "")
+
+    monkeypatch.setattr(github_client, "run", read)
+    monkeypatch.setattr(git_credentials, "load_selector", lambda **_kwargs: git_credentials.SelectorState(
+        {"machinery": "example-moved/machinery"}, "d" * 64))
+    assert canary.main(["run", "--repo", "machinery", "--pr", "42", "--dry-run"]) == 0
+    out = capsys.readouterr().out
+    assert reads == [["gh", "pr", "view", "42", "--repo", "example-moved/machinery", "--json", "headRefOid"]]
+    assert "https://github.com/example-moved/machinery.git" in out
+    assert "example/machinery" not in out
+    # Without a trusted selector the transferred row fails closed before any read or plan.
+    monkeypatch.setattr(git_credentials, "load_selector", lambda **_kwargs: (_ for _ in ()).throw(
+        git_credentials.SelectorError("fleet repository selector unavailable")))
+    reads.clear()
+    assert canary.main(["run", "--repo", "machinery", "--pr", "42", "--dry-run"]) == 2
+    refused = capsys.readouterr()
+    assert "selector" in refused.err and refused.out == ""
+    assert reads == []
 
 
 @pytest.mark.parametrize("outcome", [
