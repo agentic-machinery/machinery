@@ -49,8 +49,11 @@ if echo "$COMMAND" | grep -qE '^python3?[[:space:]]'; then
   while [ ! -e "$_root/.git" ]; do
     _parent="$(dirname "$_root")"
     if [ "$_parent" = "$_root" ]; then
-      printf 'enforce-venv: no checkout root above the tool directory\n' >&2
-      exit 2
+      # Outside every checkout (the CTO workspace): no checkout can name the
+      # interpreter, so the hook rule's own roots decide (the configured product,
+      # else the project directory, under the configured primary anchor).
+      _root=""
+      break
     fi
     _root="$_parent"
   done
@@ -63,7 +66,10 @@ if echo "$COMMAND" | grep -qE '^python3?[[:space:]]'; then
   PYTHON_BIN="$CONTEXT_PROJECT_PYTHON"
 
   PRIMARY_ROOT=""
-  if PRIMARY_ROOT="$(project_primary_root_resolve "$CHECKOUT" 2>/dev/null)"; then
+  if [ -z "$CHECKOUT" ]; then
+    # The interpreter came from the anchor; so does its version pin.
+    PYTHON_VERSION_FILE="$LEARN_UKRAINIAN_PRIMARY_REPO_ROOT/.python-version"
+  elif PRIMARY_ROOT="$(project_primary_root_resolve "$CHECKOUT" 2>/dev/null)"; then
     PYTHON_VERSION_FILE="$PRIMARY_ROOT/.python-version"
   else
     PYTHON_VERSION_FILE=""

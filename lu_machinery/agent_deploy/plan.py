@@ -87,6 +87,14 @@ def digest(blob: bytes) -> str:
     return hashlib.sha256(blob).hexdigest()
 
 
+def _entry_exists(directory: int, name: str) -> bool:
+    try:
+        os.stat(name, dir_fd=directory, follow_symlinks=False)
+    except FileNotFoundError:
+        return False
+    return True
+
+
 def encoded(value: object) -> bytes:
     return (json.dumps(value, sort_keys=True, indent=2, ensure_ascii=False) + "\n").encode()
 
@@ -160,6 +168,13 @@ class Tree:
         try:
             with self.directory(path):
                 return True
+        except FileNotFoundError:
+            return False
+
+    def has_entry(self, path: str) -> bool:
+        try:
+            with self.parent(path) as (directory, name):
+                return _entry_exists(directory, name)
         except FileNotFoundError:
             return False
 
@@ -365,7 +380,14 @@ class CommitInputs:
 
 
 @contextlib.contextmanager
-def selected_tree(selected: str | None, check: bool) -> Iterator[Tree]:
+def selected_tree(selected: str | None, check: bool, *, workspace: bool = False) -> Iterator[Tree]:
+    """Hold the selected target's directory and its per-target lock.
+
+    A consumer target (the default) must be its Git checkout's root. A workspace target
+    (``workspace=True``, the CTO workspace) is the opposite: a generated directory that is
+    neither a checkout nor inside one, so no ancestor ``.git`` can make Claude Code load a
+    checkout's project instructions, and a checkout can never be selected by accident.
+    """
     if selected is None:
         raise Invalid("--project-root or LU_PRODUCT_ROOT is required")
     if selected != "/":
@@ -373,22 +395,35 @@ def selected_tree(selected: str | None, check: bool) -> Iterator[Tree]:
     path = Path(selected)
     if not path.is_absolute():
         raise Invalid("project root must be absolute")
+    if workspace and path == Path("/"):
+        raise Invalid("a workspace target cannot be the filesystem root")
     relative(str(path)[1:])
     # Open each component: resolve() would silently accept symlink targets.
     base = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
     try:
+        if workspace and _entry_exists(base, ".git"):
+            raise Invalid("a workspace target must be outside every Git checkout: / has a .git entry")
+        walked = ""
         for component in path.parts[1:]:
             child = os.open(component, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=base)
             os.close(base)
             base = child
+            walked += "/" + component
+            # Checked on the held descriptors, so no path swap can hide a checkout.
+            if workspace and _entry_exists(base, ".git"):
+                raise Invalid(f"a workspace target must be outside every Git checkout: {walked} has a .git entry")
         tree = Tree(base)
-        result = subprocess.run(
-            ["git", "-C", f"/proc/self/fd/{base}", "rev-parse", "--show-toplevel"],
-            pass_fds=(base,), capture_output=True, text=True, check=False,
-            env={k: v for k, v in os.environ.items() if not k.startswith("GIT_")},
-        )
-        if result.returncode or result.stdout.strip() != str(path):
-            raise Invalid("project root must be the Git checkout root")
+        if not workspace:
+            try:
+                result = subprocess.run(
+                    ["git", "-C", f"/proc/self/fd/{base}", "rev-parse", "--show-toplevel"],
+                    pass_fds=(base,), capture_output=True, text=True, check=False, timeout=30,
+                    env={k: v for k, v in os.environ.items() if not k.startswith("GIT_")},
+                )
+            except subprocess.TimeoutExpired as exc:
+                raise Invalid("project root check timed out") from exc
+            if result.returncode or result.stdout.strip() != str(path):
+                raise Invalid("project root must be the Git checkout root")
         # flock on the checkout inode needs no lockfile and writes nothing in check mode.
         fcntl.flock(base, (fcntl.LOCK_SH if check else fcntl.LOCK_EX) | fcntl.LOCK_NB)
         yield tree
@@ -470,7 +505,7 @@ def release_inputs() -> tuple[dict[str, Output], dict[str, Any], str]:
     return result, inventory, identity
 
 
-def build(tree: Tree, inputs: Tree | CommitInputs | None = None) -> Plan:
+def build(tree: Tree, inputs: Tree | CommitInputs | None = None, *, workspace: bool = False) -> Plan:
     """The plan for ``tree``, composed from ``inputs`` (the descriptor and product sources); default: ``tree``."""
     inputs = tree if inputs is None else inputs
     entry = inputs.read(DESCRIPTOR)
@@ -482,6 +517,8 @@ def build(tree: Tree, inputs: Tree | CommitInputs | None = None) -> Plan:
     providers, sources, preserve = (descriptor[key] for key in ("providers", "sources", "preserve"))
     if not isinstance(providers, list) or not providers or any(p not in TARGETS for p in providers) or len(set(providers)) != len(providers):
         raise Invalid("invalid enabled providers")
+    if workspace and "claude" not in providers:
+        raise Invalid("a workspace target must enable the claude provider")
     if not isinstance(sources, dict) or set(sources) - {"shared", *providers}:
         raise Invalid("invalid source groups")
     roots = {TARGETS[p] for p in providers}
@@ -626,7 +663,12 @@ def build(tree: Tree, inputs: Tree | CommitInputs | None = None) -> Plan:
     # is preserved. Only recognized control files are read; runtime scratch
     # remains excluded from the target inventory below.
     if "claude" in providers:
-        for config in (".claude/settings.json", ".claude/settings.local.json"):
+        local = ".claude/settings.local.json"
+        if workspace and (any(path == local or path.startswith(local + "/") for path in outputs)
+                          or tree.has_entry(local)):
+            raise Invalid("a workspace target must not hold .claude/settings.local.json")
+        configs = (".claude/settings.json",) if workspace else (".claude/settings.json", local)
+        for config in configs:
             planned = outputs.get(config)
             existing = tree.read(config) if planned is None else None
             control_blob = planned.blob if planned is not None else existing[0] if existing is not None else None
@@ -740,8 +782,9 @@ def preflight(tree: Tree, plan: Plan, old: dict[str, Any], check: bool) -> list[
     return problems
 
 
-def deploy(tree: Tree, *, check: bool, print_manifest: bool = False, inputs_commit: str | None = None) -> int:
-    plan = build(tree, CommitInputs(tree, inputs_commit) if inputs_commit is not None else None)
+def deploy(tree: Tree, *, check: bool, print_manifest: bool = False, inputs_commit: str | None = None,
+           workspace: bool = False) -> int:
+    plan = build(tree, CommitInputs(tree, inputs_commit) if inputs_commit is not None else None, workspace=workspace)
     old = old_state(tree)
     problems = preflight(tree, plan, old, check)
     if problems:

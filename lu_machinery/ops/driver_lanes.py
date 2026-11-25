@@ -20,7 +20,12 @@ list of command words. Every word must be plain (letters, digits and
 the pane as an argument vector that no shell parses. A malformed lane entry is
 refused for that lane only: it is logged and the lane is not started. ``env``
 adds environment variables to the lane's tmux session. Values never appear in
-printed plans.
+printed plans. ``cwd`` (with a ``wrapper`` only, since the generic launcher is a
+checkout-relative path) starts the lane's pane in that absolute existing
+directory instead of the checkout. The keeper starts the pane before invoking
+the wrapper, so the CTO workspace wrapper uses ``--here``::
+
+    {"lanes": {"cto": {"wrapper": ["<lu-start-cto path>", "--here"], "cwd": "<workspace directory>"}}}
 """
 
 from __future__ import annotations
@@ -269,7 +274,13 @@ def _local_entry(entry: Any) -> dict[str, Any]:
         isinstance(k, str) and ENV_KEY_RE.match(k) and isinstance(v, str) for k, v in env.items()
     ):
         raise LaneConfigError("env must map variable names to strings")
-    return {"wrapper": None if wrapper is None else parse_wrapper(wrapper), "env": dict(env)}
+    cwd = entry.get("cwd")
+    if cwd is not None:
+        if wrapper is None:
+            raise LaneConfigError("cwd needs a wrapper: the generic launcher is relative to the checkout")
+        if not isinstance(cwd, str) or not os.path.isabs(cwd) or not WRAPPER_WORD_RE.match(cwd) or not os.path.isdir(cwd):
+            raise LaneConfigError("cwd must be an absolute existing directory with a plain path")
+    return {"wrapper": None if wrapper is None else parse_wrapper(wrapper), "env": dict(env), "cwd": cwd}
 
 
 def load_local_config(path: Path) -> dict[str, dict[str, Any]]:
@@ -336,7 +347,7 @@ def launch_plan(
     return LaunchPlan(
         session=lane.session,
         argv=wrapper or generic_argv(lane),
-        cwd=str(repo_root),
+        cwd=override.get("cwd") or str(repo_root),
         env=env,
         wrapper=bool(wrapper),
     )

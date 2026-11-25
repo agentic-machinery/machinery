@@ -928,3 +928,269 @@ def test_fresh_infra_stream_capsule_is_registered(tmp_path: Path, monkeypatch) -
     supervisor.close_driver(role=LaunchRole.DRIVER, lease=lease)
 
 pytestmark = [pytest.mark.usefixtures('configured_roots'), pytest.mark.usefixtures('hermetic_monitor'), pytest.mark.usefixtures('isolated_monitor_state')]
+
+
+# --------------------------------------------------------------------------- DETACH step 4b: CTO workspace
+
+# The workspace lu-start-cto template: the checkout template above with a LAUNCHER policy
+# line, LC_WORKSPACE_ROOT set for the launch, and the installed package wrapper.
+_WORKSPACE_TEMPLATE = r"""#!/usr/bin/env bash
+set -euo pipefail
+REPO=@REPO@
+CFG=@CFG@
+LAUNCHER=@LAUNCHER@
+ROLE=$CFG/CTO-ROLE-PROMPT.txt
+ACCT_FILE=$CFG/claude-account
+MODEL=@MODEL@
+EFFORT=@EFFORT@
+KICK=@KICK@
+
+HERE=0
+ACCT=""
+for arg in "$@"; do
+  case "$arg" in
+    --here) HERE=1 ;;
+    a|b) ACCT=$arg ;;
+    -h|--help) sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) echo "unknown argument: $arg (usage: lu-start-cto [a|b] [--here])" >&2; exit 2 ;;
+  esac
+done
+[ -r "$ROLE" ] || { echo "missing $ROLE" >&2; exit 4; }
+pgrep -f "operator-appointed CTO AND cross-epic" >/dev/null && { echo "refused: a CTO process is still running" >&2; exit 3; }
+if [ -z "$ACCT" ]; then
+  ACCT=$(tr -d '[:space:]' < "$ACCT_FILE" 2>/dev/null || true)
+  [ "$ACCT" = b ] || ACCT=a
+fi
+if [ "$ACCT" = b ]; then DIR=@ACCOUNT@; else DIR=@ACCOUNT@; fi
+[ -s "$DIR/.credentials.json" ] || { echo "refused: account $ACCT ($DIR) is not logged in" >&2; exit 4; }
+CLAUDE_CONFIG_DIR=$DIR claude auth status 2>/dev/null | grep -q '"loggedIn": true' \
+  || { echo "refused: account $ACCT is not logged in; run: CLAUDE_CONFIG_DIR=$DIR claude, then /login" >&2; exit 4; }
+printf '%s\n' "$ACCT" > "$ACCT_FILE"
+export CLAUDE_CONFIG_DIR=$DIR
+echo "CTO seat: Claude account $ACCT ($DIR)"
+
+LAUNCH=("$LAUNCHER" --epic epics --model "$MODEL" --effort "$EFFORT" "$KICK" -- --dangerously-skip-permissions --append-system-prompt "$(cat "$ROLE")")
+cd -- "$REPO"
+if [ "$HERE" = 1 ]; then
+  LC_WORKSPACE_ROOT="$REPO" exec "${LAUNCH[@]}"
+fi
+tmux has-session -t =cto 2>/dev/null && { echo "refused: tmux session cto exists (use --here inside it)" >&2; exit 3; }
+# Enter REPO in the pane so a tmux config-client cwd cannot override it.
+# Propagate caller root/interpreter settings (clearing stale server values when
+# unset) and override a reused server's workspace selector with an empty value.
+# Escape trailing semicolons in tmux arguments.
+ROOT_ENV_VARS=(
+  LU_PRIMARY_REPO_ROOT LEARN_UKRAINIAN_PRIMARY_REPO_ROOT
+  LU_STATE_ROOT LEARN_UKRAINIAN_STATE_ROOT
+  LU_PRODUCT_ROOT
+  LU_PYTHON LEARN_UKRAINIAN_PYTHON
+  LU_REPOS_ROOT LU_PROFILE_PATH
+  LU_GITHUB_SLUG LEARN_UKRAINIAN_GITHUB_SLUG
+)
+TMUX_ARGS=(
+  new-session -d -s cto -e "CLAUDE_CONFIG_DIR=$DIR" -e "LC_WORKSPACE_ROOT="
+)
+for var in "${ROOT_ENV_VARS[@]}"; do
+  TMUX_ARGS+=(-e "$var=${!var:-}")
+done
+TMUX_ARGS+=(
+  bash -c 'unset LC_WORKSPACE_ROOT; for v in LU_PRIMARY_REPO_ROOT LEARN_UKRAINIAN_PRIMARY_REPO_ROOT LU_STATE_ROOT LEARN_UKRAINIAN_STATE_ROOT LU_PRODUCT_ROOT LU_PYTHON LEARN_UKRAINIAN_PYTHON LU_REPOS_ROOT LU_PROFILE_PATH LU_GITHUB_SLUG LEARN_UKRAINIAN_GITHUB_SLUG; do [ -n "${!v:-}" ] || unset "$v"; done; cd -- "$1" || exit; LC_WORKSPACE_ROOT="$1" "${@:2}"; exec bash'
+  bash "$REPO" "${LAUNCH[@]}"
+)
+for index in "${!TMUX_ARGS[@]}"; do
+  if [[ "${TMUX_ARGS[index]}" == *';' ]]; then
+    TMUX_ARGS[index]="${TMUX_ARGS[index]%;}\\;"
+  fi
+done
+env -u LC_WORKSPACE_ROOT tmux "${TMUX_ARGS[@]}"
+echo "created tmux session cto; attach with: tmux attach -t cto"
+"""
+
+
+def _workspace_roots(tmp_path: Path) -> tuple[Path, Path, Path]:
+    """A non-Git workspace, a non-Git state root and a real primary checkout, all outside each other."""
+    workspace, state, primary = tmp_path / "cto-workspace", tmp_path / "state", tmp_path / "primary"
+    workspace.mkdir()
+    state.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "main", str(primary)], check=True, timeout=30,
+                   env={"PATH": os.defpath, "HOME": str(tmp_path), "GIT_CONFIG_NOSYSTEM": "1"})
+    return workspace, state, primary
+
+
+def test_cto_workspace_launch_supervisor_and_driver_state_from_a_non_git_directory(tmp_path: Path) -> None:
+    """Defect class: workspace mode widening the session root, interpreter or trust anchor, or
+    silently falling back to a product root. From a non-Git workspace with LU_STATE_ROOT outside
+    every checkout and LU_PRODUCT_ROOT unset, the package wrapper's dry run, the supervisor claim
+    and the driver-state hook all run; every ambiguous root refuses before a side effect."""
+    from tests.lib.test_session_supervisor_shell import _build_fake_project
+
+    workspace, state, primary = _workspace_roots(tmp_path)
+    wrapper = machinery_path("start-claude-cto.sh")
+    argv_file = tmp_path / "argv"
+    base = launcher_environment(tmp_path=tmp_path)
+    for name in ("LU_PRODUCT_ROOT", "LEARN_UKRAINIAN_PRIMARY_REPO_ROOT", "LEARN_UKRAINIAN_STATE_ROOT", "LU_PYTHON"):
+        base.pop(name, None)
+    env = {**base, "LC_WORKSPACE_ROOT": str(workspace), "LU_PRIMARY_REPO_ROOT": str(primary),
+           "LU_STATE_ROOT": str(state), "LEARN_UKRAINIAN_PYTHON": sys.executable, "LAUNCHER_DRY_RUN": "1",
+           "LAUNCHER_DRY_RUN_ARGV_FILE": str(argv_file), "LU_CLAUDE_CAP_OVERRIDE": "1"}
+
+    def launch(entry: Path = wrapper, cwd: Path = workspace, args: tuple[str, ...] = ("--epic", "epics", "kick"),
+               **changes: str | None):
+        run_env = {**env, **{k: v for k, v in changes.items() if v is not None}}
+        for name in (k for k, v in changes.items() if v is None):
+            run_env.pop(name, None)
+        return subprocess.run([str(entry), *args], cwd=cwd, env=run_env,
+                              capture_output=True, text=True, check=False, timeout=60)
+
+    result = launch()
+    assert result.returncode == 0, result.stdout + result.stderr
+    argv = argv_file.read_bytes().split(b"\0")[:-1]
+    assert argv[0] == b"claude" and argv[argv.index(b"--agent") + 1] == b"cto"
+    assert f"would deploy agent extensions (workspace {workspace})" in result.stdout
+    assert f"LEARN_UKRAINIAN_PRIMARY_REPO_ROOT={primary}" in result.stdout
+    assert "would bind cto after lease" in result.stdout
+    assert not list(workspace.iterdir()) and not list(state.iterdir())
+
+    nested = primary / "workspace"
+    nested.mkdir()
+    unsafe_name = tmp_path / "workspace\u200b"
+    unsafe_name.mkdir()
+    primary_alias = tmp_path / "primary-alias"
+    primary_alias.symlink_to(primary, target_is_directory=True)
+    package_alias = tmp_path / "package-alias"
+    package_alias.symlink_to(wrapper.parent, target_is_directory=True)
+    stray, second = tmp_path / "stray-state", tmp_path / "second-checkout"
+    (stray / ".git").mkdir(parents=True)
+    subprocess.run(["git", "init", "-q", str(second)], check=True, timeout=30,
+                   env={"PATH": os.defpath, "HOME": str(tmp_path), "GIT_CONFIG_NOSYSTEM": "1"})
+    second_nested = second / "nested-state"
+    second_nested.mkdir()
+    primary_nested = primary / "nested-state"
+    primary_nested.mkdir()
+    second_nested_link = tmp_path / "second-nested-link"
+    second_nested_link.symlink_to(second_nested, target_is_directory=True)
+    for state_root in (workspace, tmp_path / "absent-state", stray, second, second_nested, primary_nested, second_nested_link):
+        refused = launch(LU_STATE_ROOT=str(state_root))
+        assert refused.returncode == 3 and "state root does not validate" in refused.stderr, (state_root, refused.stderr)
+    refused = launch(args=("--epic", "infra"))
+    assert refused.returncode == 2 and "fixes the lane 'epics'" in refused.stderr, refused.stderr
+    for changes, cwd, message in (
+        ({"LU_PRIMARY_REPO_ROOT": None}, workspace, "needs LU_PRIMARY_REPO_ROOT"),
+        ({}, state, "LC_WORKSPACE_ROOT_CWD"),
+        ({"LC_WORKSPACE_ROOT": str(nested)}, nested, "outside every Git checkout"),
+        ({"LC_WORKSPACE_ROOT": str(unsafe_name)}, unsafe_name, "control/format characters in path"),
+        ({"LEARN_UKRAINIAN_STATE_ROOT": str(state)}, workspace, "not LEARN_UKRAINIAN_STATE_ROOT"),
+        ({"LU_PRODUCT_ROOT": str(workspace)}, workspace, "cannot be the CTO workspace"),
+        ({"LU_PRIMARY_REPO_ROOT": str(primary_alias)}, workspace, "by its physical path"),
+        ({"LC_WORKSPACE_ROOT": None}, workspace, "LC_WORKSPACE_ROOT_REQUIRED"),
+    ):
+        refused = launch(cwd=cwd, **changes)
+        assert refused.returncode == 3 and message in refused.stderr, (changes, refused.stderr)
+        assert "would exec" not in refused.stdout
+    refused = launch(entry=machinery_path("start-kube-dojo-driver.sh"), args=())
+    assert refused.returncode == 3 and "LC_WORKSPACE_ROOT_UNSUPPORTED" in refused.stderr, refused.stderr
+    refused = launch(entry=package_alias / wrapper.name)
+    assert refused.returncode == 3 and "absolute physical path" in refused.stderr, refused.stderr
+
+    # Supervisor start: the capsule lands under the state root, the lease receipt in the workspace.
+    project, _capture = _build_fake_project(tmp_path)
+    claim = subprocess.run(
+        ["bash", "-c", 'set -euo pipefail; source "$1/lu_machinery/lib/session_supervisor.sh"; '
+         'claim_session_supervisor_env epic:10453 claude claude-code cto-task claude-1 "$2" start-claude-cto.sh epics; '
+         'printf "%s\\n" "$SESSION_SUPERVISOR_CAPSULE_PATH"', "claim", str(project), str(workspace)],
+        cwd=workspace, capture_output=True, text=True, check=False, timeout=30,
+        env={**base, "LU_PRIMARY_REPO_ROOT": str(project), "LU_STATE_ROOT": str(state),
+             "LU_PYTHON": str(project / ".venv/bin/python")},
+    )
+    assert claim.returncode == 0, claim.stdout + claim.stderr
+    assert Path(claim.stdout.splitlines()[-1]).is_relative_to(state / ".agent/session-capsules")
+    assert (workspace / ".claude/epics-epic/session-lease.env").is_file()
+    assert not (workspace / ".agent").exists() and not (project / ".agent").exists()
+
+    # Driver state: the pinned pointer in the workspace is injected for this project directory.
+    hook_env = {**base, "CLAUDE_PROJECT_DIR": str(workspace), "LU_STATE_ROOT": str(state),
+                "LEARN_UKRAINIAN_PRIMARY_REPO_ROOT": str(primary), "SESSION_EPIC": "epics",
+                "SESSION_HANDOFF_AGENT": "claude-epics",
+                "LU_DRIVER_STATE_FILE": str(workspace / ".claude/epics-epic/DRIVER-STATE.md")}
+    for command, stdin in ((["init", "--epic", "epics"], ""), (["claude-hook"], json.dumps(
+            {"hook_event_name": "UserPromptSubmit", "session_id": "s", "cwd": str(workspace)}))):
+        ran = subprocess.run([sys.executable, "-I", "-m", "lu_machinery.driver_state", *command], cwd=workspace,
+                             input=stdin, env=hook_env, capture_output=True, text=True, check=False, timeout=60)
+        assert ran.returncode == 0, ran.stdout + ran.stderr
+    assert "PINNED DRIVER STATE" in json.loads(ran.stdout)["hookSpecificOutput"]["additionalContext"]
+
+
+def test_cto_successor_signature_binds_the_launch_mode(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Defect class: a supervisory successor replay crossing launch modes or entrypoints. The
+    workspace template is admitted only for a workspace launch whose LC_WORKSPACE_ROOT, REPO and
+    working directory agree and whose entrypoint is the package wrapper; the checkout template
+    never inside a workspace launch, nor the workspace template outside one."""
+    from lu_machinery.session_supervisor import SupervisorError, cto_wrapper_signature
+
+    workspace, _state, _primary = _workspace_roots(tmp_path)
+    config = tmp_path / "policy"
+    config.mkdir()
+    (config / "CTO-ROLE-PROMPT.txt").write_text("role;\n")
+    package_wrapper = machinery_path("start-claude-cto.sh")
+    args = ["--epic", "epics", "--model", "claude-opus-5-5", "--effort", "high", "kick", "--",
+            "--dangerously-skip-permissions", "--append-system-prompt", "role;"]
+
+    written = iter(range(1, 100))
+
+    def template(launcher: Path | str, repo: Path = workspace) -> Path:
+        """A wrapper file of its own per call, so each row is checked with its own contents."""
+        source = _WORKSPACE_TEMPLATE
+        for key, value in {"REPO": str(repo), "CFG": str(config), "LAUNCHER": str(launcher),
+                           "MODEL": "claude-opus-5-5", "EFFORT": "high", "KICK": "kick",
+                           "ACCOUNT": str(tmp_path / "account")}.items():
+            source = source.replace("@" + key + "@", shlex.quote(value))
+        path = tmp_path / f"lu-start-cto-{next(written)}"
+        path.write_text(source)
+        return path
+
+    monkeypatch.chdir(workspace)
+    monkeypatch.setenv("LC_WORKSPACE_ROOT", str(workspace))
+    assert len(cto_wrapper_signature(template(package_wrapper), workspace, package_wrapper, args)) == 64
+    stray = workspace / "start-claude-cto.sh"
+    stray.write_text("#!/usr/bin/env bash\n")
+    other = tmp_path / "other"
+    other.mkdir()
+    alias = tmp_path / "workspace-alias"
+    alias.symlink_to(workspace)
+    renamed = tmp_path / "cto-launcher"
+    renamed.symlink_to(package_wrapper)
+    stale = tmp_path / "stale-package-link"
+    stale.symlink_to(tmp_path / "removed-package")
+    live = tmp_path / "live-package-link"
+    live.symlink_to(package_wrapper.parent, target_is_directory=True)
+    for wrapper, root, entry in (
+        (template(stray), workspace, stray),  # a wrapper copy outside the package
+        (template(package_wrapper), workspace, stray),  # an entrypoint other than the named launcher
+        (template(package_wrapper, other), other, package_wrapper),  # REPO is not LC_WORKSPACE_ROOT
+        (template(package_wrapper, alias), workspace, package_wrapper),  # REPO spelled through a symlink
+        (template(renamed), workspace, package_wrapper),  # LAUNCHER resolves there under another name
+        (template(f"{package_wrapper}/"), workspace, package_wrapper),  # exec of this spelling fails
+        (template(f"{package_wrapper.parent}//{package_wrapper.name}"), workspace, package_wrapper),
+        (template(f"{package_wrapper.parent}/./{package_wrapper.name}"), workspace, package_wrapper),
+        (template(f"{stale}/{package_wrapper.name}"), workspace, package_wrapper),  # a path exec cannot reach
+        (template(f"{live}/{package_wrapper.name}"), workspace, package_wrapper),  # not the canonical path
+        (template(package_wrapper), workspace, live / package_wrapper.name),
+    ):
+        with pytest.raises(SupervisorError, match="cto-wrapper-unsupported"):
+            cto_wrapper_signature(wrapper, root, entry, args)
+    monkeypatch.setenv("LC_WORKSPACE_ROOT", str(alias))
+    with pytest.raises(SupervisorError, match="cto-wrapper-unsupported"):
+        cto_wrapper_signature(template(package_wrapper, alias), workspace, package_wrapper, args)
+    monkeypatch.setenv("LC_WORKSPACE_ROOT", str(workspace))
+    monkeypatch.chdir(tmp_path)
+    with pytest.raises(SupervisorError, match="cto-wrapper-unsupported"):
+        cto_wrapper_signature(template(package_wrapper), workspace, package_wrapper, args)
+    monkeypatch.chdir(workspace)
+    (workspace / ".git").mkdir()  # the admitted workspace has since become a checkout
+    with pytest.raises(SupervisorError, match="cto-wrapper-unsupported"):
+        cto_wrapper_signature(template(package_wrapper), workspace, package_wrapper, args)
+    (workspace / ".git").rmdir()
+    monkeypatch.chdir(workspace)
+    monkeypatch.delenv("LC_WORKSPACE_ROOT")
+    with pytest.raises(SupervisorError, match="cto-wrapper-unsupported"):
+        cto_wrapper_signature(template(package_wrapper), workspace, package_wrapper, args)

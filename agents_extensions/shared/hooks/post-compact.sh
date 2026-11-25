@@ -29,11 +29,12 @@ source "$(dirname "${BASH_SOURCE[0]}")/context-rollover-lib.sh" \
 # run_bounded, whose interpreter is chosen from the result.
 _HOOK_TIMEOUT_BIN="$(command -v timeout 2>/dev/null || command -v gtimeout 2>/dev/null || true)"
 git_common_dir() {
+  local dir="${1:-$PROJECT_DIR}"
   if [ -n "$_HOOK_TIMEOUT_BIN" ]; then
-    "$_HOOK_TIMEOUT_BIN" -s KILL 2 git -C "$PROJECT_DIR" rev-parse --path-format=absolute \
+    "$_HOOK_TIMEOUT_BIN" -s KILL 2 git -C "$dir" rev-parse --path-format=absolute \
       --git-common-dir 2>/dev/null
   else
-    git -C "$PROJECT_DIR" rev-parse --path-format=absolute --git-common-dir 2>/dev/null
+    git -C "$dir" rev-parse --path-format=absolute --git-common-dir 2>/dev/null
   fi
 }
 # One interpreter (R66) and code root (machinery #100 R51, R62, R69): the release the
@@ -44,15 +45,17 @@ BOUNDED_RUNNER=""
 post_compact_bootstrap() {
   [ -n "$BOUNDED_PYTHON" ] && return 0
   context_machinery_bootstrap "${LU_PRODUCT_ROOT:-${CLAUDE_PROJECT_DIR:-}}" || exit 1
-  GIT_COMMON_DIR=$(git_common_dir) || GIT_COMMON_DIR=""
-  PRIMARY_ROOT=""
-  if [ -n "$GIT_COMMON_DIR" ] && [ "$(basename "$GIT_COMMON_DIR")" = ".git" ]; then
-    PRIMARY_ROOT=$(dirname "$GIT_COMMON_DIR")
-  fi
-  if [ -n "${CODEX_CANONICAL_REPO_ROOT:-}" ]; then
+  local session_project="${CLAUDE_PROJECT_DIR:-$PROJECT_DIR}" git_common
+  if context_outside_checkouts "$session_project"; then
+    CANONICAL_ROOT=$(context_state_root "$session_project") || exit 1
+  elif [ -n "${CODEX_CANONICAL_REPO_ROOT:-}" ]; then
     CANONICAL_ROOT="$CODEX_CANONICAL_REPO_ROOT"
   else
-    CANONICAL_ROOT="${PRIMARY_ROOT:-$PROJECT_DIR}"
+    git_common=$(git_common_dir) || git_common=""
+    CANONICAL_ROOT="$PROJECT_DIR"
+    if [ -n "$git_common" ] && [ "$(basename "$git_common")" = ".git" ]; then
+      CANONICAL_ROOT=$(dirname "$git_common")
+    fi
   fi
   BOUNDED_PYTHON="$CONTEXT_PROJECT_PYTHON"
   BOUNDED_RUNNER="${SESSION_BOUNDED_RUNNER:-$MACHINERY_DIR/lu_machinery/agent_runtime/bounded_command.py}"
@@ -219,12 +222,26 @@ else
     --repo-root "$CANONICAL_ROOT" detect --agent "$HANDOFF_AGENT" 2>&1) || true
 fi
 
-# 3. Key reminders. Claude keys its per-project directory by the checkout
-# path with every character outside [A-Za-z0-9-] replaced by '-'. The memory
-# directory belongs to the primary checkout, resolved exactly as
-# session-setup.sh resolves it (CANONICAL_ROOT, above), so a worktree session
-# names the same directory.
-CLAUDE_PROJECT_KEY=$(printf '%s' "$CANONICAL_ROOT" | sed 's/[^A-Za-z0-9-]/-/g')
+# 3. Key reminders. Claude keys its per-project directory by its project
+# directory's Git root (one for a checkout and its worktrees), or by the
+# directory itself outside every checkout (the CTO workspace), with every
+# character outside [A-Za-z0-9-] replaced by '-', under its configuration
+# directory (CLAUDE_CONFIG_DIR, one per account, else ~/.claude); resolved
+# exactly as session-setup.sh resolves it.
+MEMORY_PROJECT="${CLAUDE_PROJECT_DIR:-$PROJECT_DIR}"
+MEMORY_GIT_COMMON=""
+if ! context_outside_checkouts "$MEMORY_PROJECT"; then
+  MEMORY_GIT_COMMON=$(git_common_dir "$MEMORY_PROJECT") || MEMORY_GIT_COMMON=""
+fi
+if [ -n "$MEMORY_GIT_COMMON" ] && [ "$(basename "$MEMORY_GIT_COMMON")" = ".git" ]; then
+  MEMORY_PROJECT=$(dirname "$MEMORY_GIT_COMMON")
+fi
+CLAUDE_PROJECT_KEY=$(printf '%s' "$MEMORY_PROJECT" | sed 's/[^A-Za-z0-9-]/-/g')
+if [ -n "${CLAUDE_CONFIG_DIR:-}" ]; then
+  MEMORY_BASE="$CLAUDE_CONFIG_DIR"
+else
+  MEMORY_BASE='$HOME/.claude'
+fi
 NOTE_LANE="$(context_handoff_note_lane)"
 if [ -n "$NOTE_LANE" ]; then
   CONTEXT="$CONTEXT
@@ -242,6 +259,6 @@ KEY REMINDERS:
   - Project interpreter only: $BOUNDED_PYTHON
   - Pre-commit: ruff + /simplify + cross-family code review (non-Gemini seat)
   - Read audit/ and review/ files before fixing modules
-  - MEMORY: \$HOME/.claude/projects/$CLAUDE_PROJECT_KEY/memory/MEMORY.md"
+  - MEMORY: $MEMORY_BASE/projects/$CLAUDE_PROJECT_KEY/memory/MEMORY.md"
 emit_context "CONTEXT RESTORED AFTER COMPACTION:$CONTEXT"
 exit 0

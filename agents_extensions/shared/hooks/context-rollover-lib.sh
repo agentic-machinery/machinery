@@ -222,9 +222,16 @@ context_live_usage() {
 
 # Canonical checkout that owns runtime state (.agent/): CODEX_CANONICAL_REPO_ROOT
 # when set, else the git common dir's checkout, so linked worktrees share the
-# primary checkout's session records and rollover leases.
+# primary checkout's session records and rollover leases. A project directory
+# outside every checkout (the CTO workspace) owns no runtime state: the
+# configured state root does (context_state_root).
 context_canonical_root() {
-  local project_dir="$1" git_common_dir
+  local project_dir="$1" session_project git_common_dir
+  session_project="${CLAUDE_PROJECT_DIR:-$project_dir}"
+  if context_outside_checkouts "$session_project"; then
+    context_state_root "$session_project"
+    return
+  fi
   if [ -n "${CODEX_CANONICAL_REPO_ROOT:-}" ]; then
     printf '%s\n' "$CODEX_CANONICAL_REPO_ROOT"
     return 0
@@ -237,6 +244,39 @@ context_canonical_root() {
   fi
 }
 
+# True when <dir> is an existing directory outside every checkout: no .git entry
+# (directory, file or symlink) at its physical path or any ancestor, the rule the
+# launcher and the deployer's workspace mode use. Decided from the filesystem only,
+# so an inherited GIT_DIR or GIT_WORK_TREE cannot make a workspace look like one.
+context_outside_checkouts() {
+  local dir
+  dir="$(_context_physical_dir "${1:-}")" || return 1
+  while :; do
+    [ ! -e "$dir/.git" ] && [ ! -L "$dir/.git" ] || return 1
+    [ -n "$dir" ] && [ "$dir" != / ] || return 0
+    dir="${dir%/*}"
+  done
+}
+
+# The runtime-state root for a project directory outside every checkout: the
+# configured state root by the one Python rule (common/repo_root.py state_root:
+# LU_STATE_ROOT, else the configured primary), run by the hook's resolved
+# interpreter. It never answers the directory itself, whose .agent no other
+# reader would find; when the rule does not resolve it says why and returns 1.
+context_state_root() {
+  local project_dir="$1" state
+  if [ -z "${CONTEXT_PROJECT_PYTHON:-}" ]; then
+    context_machinery_bootstrap "$project_dir" >/dev/null || return 1
+  fi
+  if ! state="$(project_python_run "$CONTEXT_PROJECT_PYTHON" -c \
+      'from lu_machinery.common.repo_root import state_root; print(state_root())' 2>/dev/null)" \
+      || [[ "$state" != /* ]]; then
+    echo "${0##*/}: HOOK-BOOTSTRAP-FAILED: no runtime-state root for $project_dir (set LU_STATE_ROOT or LU_PRIMARY_REPO_ROOT)" >&2
+    return 1
+  fi
+  printf '%s\n' "$state"
+}
+
 # Canonical session record path: an explicit existing override, else
 # <canonical checkout>/.agent/sessions/<session id>.json.
 context_session_record_file() {
@@ -245,7 +285,9 @@ context_session_record_file() {
     printf '%s\n' "$LEARN_UKRAINIAN_SESSION_RECORD"
     return 0
   fi
-  printf '%s\n' "$(context_canonical_root "$project_dir")/.agent/sessions/$session_id.json"
+  local root
+  root="$(context_canonical_root "$project_dir")" || return 1
+  printf '%s\n' "$root/.agent/sessions/$session_id.json"
 }
 
 # Effective rollover mode for this session. operator_restart applies only when

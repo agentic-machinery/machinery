@@ -8,7 +8,8 @@ closes that observation gap for every shell call. The payload's
 ``hook_event_name`` selects the phase:
 
 * PreToolUse snapshots ``git status`` of each protected primary checkout that
-  owns the payload cwd or the project directory.
+  owns the payload cwd or the project directory (for a project directory outside
+  every checkout, the configured primary and the product's primary).
 * PostToolUse (and Claude's PostToolUseFailure, where Claude routes a non-zero
   exit) compares again. Paths dirty now but not before are recorded with the
   command, session and tool-use ids outside the repository, and the hook exits
@@ -26,6 +27,7 @@ Threat model and cost: ``scripts/guardrails/primary_dirt_audit.py``.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import shlex
 import sys
@@ -48,14 +50,35 @@ _CLEANUP_MODULE = "lu_machinery.hygiene.primary_dirt_cleanup"
 PHASES = {"PreToolUse": "pre", "PostToolUse": "post", "PostToolUseFailure": "post"}
 
 
-def _repo_root() -> Path:
-    from lu_machinery.common.repo_root import configure_native_hook_roots, product_root
-    from lu_machinery.guardrails.worktree_containment import resolve_main_root
+def _audit_roots(project_dir: str) -> list[str]:
+    """The directories, besides the tool's cwd, whose protected primary checkouts this call audits.
+
+    A project directory inside a Git checkout is itself the candidate, and an unset one is
+    the product's primary checkout (unchanged since #11253). A project directory outside
+    every checkout (the CTO workspace) owns no primary, so the configured primary checkout
+    and, when the product is a checkout, its primary stand in for it: a session there must
+    not leave the checkouts it can reach unaudited. Raises when no candidate resolves.
+    """
+    from lu_machinery.common.repo_root import configure_native_hook_roots, configured_primary_root, product_root
+    from lu_machinery.guardrails.worktree_containment import NotAGitRepositoryError, resolve_main_root
 
     # The direct hook boundary: missing roots come from the working directory by the
     # shared shell rule, whichever harness started this hook.
     configure_native_hook_roots(Path.cwd())
-    return resolve_main_root(product_root())
+    if project_dir:
+        try:
+            resolve_main_root(project_dir)
+        except NotAGitRepositoryError:
+            primary = configured_primary_root()
+            if primary is None:
+                raise
+            roots = [str(primary)]
+            # Without a product checkout the hook rule names the workspace itself.
+            with contextlib.suppress(NotAGitRepositoryError):
+                roots.append(str(resolve_main_root(product_root())))
+            return roots
+    product = str(resolve_main_root(product_root()))
+    return [project_dir or product]
 
 
 def _load_audit():
@@ -107,7 +130,7 @@ def _report(records: list[dict], session_id: str) -> str:
             "files this call created (only those; dry run first, then --apply):"
         )
         lines.append(
-            f"    .venv/bin/python -m {_CLEANUP_MODULE} "
+            f"    {shlex.quote(sys.executable)} -m {_CLEANUP_MODULE} "
             f"--session {shlex.quote(session_id)} --record {shlex.quote(record['record_id'])} [--apply]"
         )
         if any(entry["kind"] == "tracked" for entry in entries):
@@ -142,11 +165,10 @@ def main() -> int:
 
     cwd = _payload_cwd(payload)
     try:
-        repo_root = _repo_root()
+        candidates = [cwd, *_audit_roots(os.environ.get("CLAUDE_PROJECT_DIR", ""))]
     except Exception as exc:
         sys.stderr.write(f"BLOCKED: audit product root unavailable: {exc}\n")
         return 2
-    candidates = [cwd, os.environ.get("CLAUDE_PROJECT_DIR") or str(repo_root)]
 
     if phase == "pre":
         try:

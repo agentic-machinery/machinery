@@ -839,3 +839,34 @@ def test_hook_driver_without_tmpdir_uses_the_system_temporary_directory(release,
     assert result.returncode == 0, result.stderr
     assert json.loads(result.stdout) == {"decision": "allow"}
     assert result.stderr == ""
+
+
+def test_workspace_session_audits_the_configured_primary_and_names_its_interpreter(release, product, tmp_path):
+    """Defect class: a guard silently skipping the protected checkouts a non-Git project directory
+    (the CTO workspace) can reach, or failing before its diagnostic. With LU_PRODUCT_ROOT unset and a
+    dedicated non-Git LU_STATE_ROOT, the native audit hook records dirt in the configured primary
+    instead of blocking every call, and enforce-venv blocks bare python with the anchor's interpreter."""
+    workspace, state = tmp_path / "cto-workspace", tmp_path / "state"
+    workspace.mkdir()
+    state.mkdir()
+    python = str(release.parent / "venv/bin/python")
+    env = {"PATH": "/usr/bin:/bin", "HOME": str(tmp_path), "CLAUDE_PROJECT_DIR": str(workspace),
+           "LU_STATE_ROOT": str(state), "LEARN_UKRAINIAN_PRIMARY_REPO_ROOT": str(product),
+           "LEARN_UKRAINIAN_PYTHON": python, "XDG_STATE_HOME": str(tmp_path / "xdg")}
+    audit = shlex.split(native_hook_command("claude-audit-hook"))
+    payload = {"tool_name": "Bash", "tool_input": {"command": "touch x"}, "cwd": str(workspace),
+               "hook_event_name": "PreToolUse", "session_id": "workspace", "tool_use_id": "audit"}
+    before = subprocess.run(audit, check=False, input=json.dumps(payload), text=True, capture_output=True,
+                            cwd=workspace, env=env, timeout=60)
+    assert before.returncode == 0, before.stderr
+    (product / "workspace-dirt").write_text("fixture")
+    payload["hook_event_name"] = "PostToolUse"
+    after = subprocess.run(audit, check=False, input=json.dumps(payload), text=True, capture_output=True,
+                           cwd=workspace, env=env, timeout=60)
+    assert after.returncode == 2 and "workspace-dirt" in after.stderr and str(product) in after.stderr, after.stderr
+
+    venv = subprocess.run(["bash", str(release / HOOKS / "enforce-venv.sh")], check=False, text=True,
+                          input=json.dumps({"tool_input": {"command": "python -V"}, "cwd": str(workspace)}),
+                          capture_output=True, cwd=workspace, env=env, timeout=60)
+    assert venv.returncode == 2, venv.stderr
+    assert f"Run this command instead:\n  {python} -V" in venv.stderr, venv.stderr

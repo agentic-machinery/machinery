@@ -920,6 +920,15 @@ _HOOK_ROOTS_SCRIPT = (
 _HOOK_ROOTS_ENV = ("PATH", PRODUCT_ROOT_ENV, "CLAUDE_PROJECT_DIR", PRIMARY_ROOT_ENV, STATE_ROOT_ENV)
 
 
+def _has_git_marker(directory: Path) -> bool:
+    """Return True if ``directory/.git`` exists; only ``FileNotFoundError`` proves absence."""
+    try:
+        os.lstat(directory / ".git")
+    except FileNotFoundError:
+        return False
+    return True
+
+
 def native_hook_roots(invocation_dir: Path) -> tuple[Path, Path]:
     """The product and shared-state roots for ``invocation_dir`` by the one hook rule; read-only.
 
@@ -936,13 +945,26 @@ def native_hook_roots(invocation_dir: Path) -> tuple[Path, Path]:
     library = machinery_path("lib/project_interpreter.sh")
     env = {name: os.environ[name] for name in _HOOK_ROOTS_ENV if name in os.environ}
     # The shell rule reads the compatibility names only: hand it the value of whichever name is set
-    # (a conflict between the two refuses here, before the rule runs).
+    # (a conflict between the two refuses here, before the rule runs). The rule's state-root check
+    # is the checkout layout's: a state root that is a checkout must be the hook anchor. A dedicated
+    # non-Git LU_STATE_ROOT (the detached layout) is not a checkout and not an anchor, so it is not
+    # handed over; ``configure_native_hook_roots`` still validates it through :func:`state_root`.
+    # An alias set in the environment is copied above unchanged: the generated hook command sees it
+    # too, and the rule refuses it there and here alike.
     try:
         for name in (LU_PRIMARY_ROOT_ENV, LU_STATE_ROOT_ENV):
             setting = _setting(name, None)
-            if setting is not None:
-                env[ENV_ALIASES[name]] = setting[1]
-    except MachineryConfigError as exc:
+            if setting is None:
+                continue
+            if name == LU_STATE_ROOT_ENV:
+                configured = configured_state_root()
+                if configured is not None:
+                    resolved = resolve_path(configured)
+                    ancestors = (configured, *configured.parents, resolved, *resolved.parents)
+                    if not any(_has_git_marker(ancestor) for ancestor in ancestors):
+                        continue
+            env[ENV_ALIASES[name]] = setting[1]
+    except (MachineryConfigError, OSError, RuntimeError) as exc:
         raise ProductRootError(f"no hook context resolves from {invocation_dir}: {exc}") from None
     try:
         # Fixed /bin/bash argv; the library path and directory are arguments, never shell text.

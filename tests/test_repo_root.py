@@ -522,6 +522,55 @@ def test_a_configured_product_cannot_hide_a_bad_invocation_git(unconfigured, tmp
     hooks.require_hook_config(good, home)
 
 
+def test_native_hook_roots_admit_a_dedicated_non_git_state_root_beside_the_git_anchor(unconfigured, tmp_path, monkeypatch):
+    """Defect class: the hook boundary refusing the detached layout (a dedicated non-Git LU_STATE_ROOT
+    beside a Git primary anchor) or admitting a malformed state root. Every Python hook re-runs this
+    rule, so a refusal here refused every driver-state and audit hook from the CTO workspace."""
+    primary = _primary_checkout(tmp_path / "primary")
+    workspace, state = tmp_path / "cto-workspace", tmp_path / "state"
+    workspace.mkdir()
+    state.mkdir()
+    monkeypatch.setenv(rr.PRIMARY_ROOT_ENV, str(primary))
+    monkeypatch.setenv("CLAUDE_PROJECT_DIR", str(workspace))
+    monkeypatch.setenv(rr.LU_STATE_ROOT_ENV, str(state))
+    assert rr.native_hook_roots(workspace) == (workspace, primary.resolve())
+    # A state root that is a checkout or inside any checkout must still be refused; a stray .git still refuses.
+    other = _primary_checkout(tmp_path / "other")
+    other_sub = other / "nested-state"
+    other_sub.mkdir()
+    primary_sub = primary / "nested-state"
+    primary_sub.mkdir()
+    link_to_other_sub = tmp_path / "link-to-other-sub"
+    link_to_other_sub.symlink_to(other_sub, target_is_directory=True)
+    outside = tmp_path / "outside-target"
+    outside.mkdir()
+    link_inside_other = other / "link-to-outside"
+    link_inside_other.symlink_to(outside, target_is_directory=True)
+    stray = tmp_path / "stray"
+    (stray / ".git").mkdir(parents=True)
+    stray_sub = stray / "nested-state"
+    stray_sub.mkdir()
+    for refused in (other, other_sub, primary_sub, link_to_other_sub, link_inside_other, stray, stray_sub):
+        monkeypatch.setenv(rr.LU_STATE_ROOT_ENV, str(refused))
+        with pytest.raises(rr.ProductRootError, match="no hook context resolves"):
+            rr.native_hook_roots(workspace)
+    # An unsearchable directory whose `.git` lookup fails with EACCES must fail closed, not appear non-Git.
+    if os.geteuid() != 0:
+        unsearchable = _primary_checkout(tmp_path / "unsearchable-other")
+        unsearchable.chmod(0o600)
+        try:
+            monkeypatch.setenv(rr.LU_STATE_ROOT_ENV, str(unsearchable))
+            with pytest.raises(rr.ProductRootError, match="no hook context resolves"):
+                rr.native_hook_roots(workspace)
+        finally:
+            unsearchable.chmod(0o755)
+    # The alias is the generated hook command's checkout state root: named non-Git, it refuses there and here.
+    monkeypatch.delenv(rr.LU_STATE_ROOT_ENV)
+    monkeypatch.setenv(rr.STATE_ROOT_ENV, str(state))
+    with pytest.raises(rr.ProductRootError, match="no hook context resolves"):
+        rr.native_hook_roots(workspace)
+
+
 def test_the_native_hook_contract_bytes_match_the_product_contract():
     """Defect class: the installed hook resolver block or tail drifting from the product's coordinated contract.
 

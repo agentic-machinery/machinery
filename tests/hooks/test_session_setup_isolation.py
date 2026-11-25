@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import json
 import os
+import platform
+import re
 import shutil
 import subprocess
 import sys
@@ -366,3 +368,93 @@ def test_launcher_library_python_children_never_import_from_the_cwd(tmp_path: Pa
         children = child_log.read_text(encoding="utf-8").splitlines()
         assert children, f"the site started no Python child: {result.stdout}{result.stderr}"
         assert set(children) == {"-I"}, children
+
+
+def test_workspace_session_reads_its_account_memory_and_writes_state_to_the_state_root(tmp_path: Path) -> None:
+    """Defect class: hooks reading another account's or another root's memory or state. From a
+    non-Git project directory (the CTO workspace) the memory check reads the workspace's directory
+    under CLAUDE_CONFIG_DIR, and session state goes to the configured state root, never the workspace."""
+    primary = _scratch_project(tmp_path)
+    (primary / ".python-version").write_text(platform.python_version() + "\n")
+    workspace, state, home, account = (tmp_path / name for name in ("cto-workspace", "state", "home", "account-b"))
+    for path in (workspace, state, home):
+        path.mkdir()
+    key = re.sub(r"[^A-Za-z0-9-]", "-", str(workspace))
+    memory = account / "projects" / key / "memory" / "MEMORY.md"
+    memory.parent.mkdir(parents=True)
+    memory.write_text("note\n" * 160)
+    stray = home / ".claude" / "projects" / key / "memory" / "MEMORY.md"
+    stray.parent.mkdir(parents=True)
+    stray.write_text("note\n")
+    env = {
+        "PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": str(home), "CLAUDE_CONFIG_DIR": str(account),
+        "SESSION_START_BUDGET_SECONDS": "60", "LEARN_UKRAINIAN_PYTHON": sys.executable,
+        "LEARN_UKRAINIAN_CLAUDEX_RUN_ID": "isolation-probe-run", "LEARN_UKRAINIAN_CLAUDEX_LAUNCH_GENERATION": "1",
+        "CLAUDE_CODE_FILE_READ_MAX_OUTPUT_TOKENS": "1", "CLAUDE_PROJECT_DIR": str(workspace),
+        "LEARN_UKRAINIAN_PRIMARY_REPO_ROOT": str(primary), "LU_STATE_ROOT": str(state),
+    }
+    result = subprocess.run(["bash", str(_HOOK)], cwd=workspace, env=env, input=_STDIN, capture_output=True,
+                            text=True, timeout=120, check=False)
+    assert result.returncode == 0, result.stderr
+    context = json.loads(result.stdout)["hookSpecificOutput"]["additionalContext"]
+    assert "MEMORY.md is 160 lines" in context, context
+    assert "PYTHON VERSION PIN MISSING" not in context
+    assert "VENV WRONG PYTHON" not in context
+    assert "PRIMARY-ON-MAIN CHECK CRASHED" not in context
+    assert (state / ".agent" / "sessions" / "isolation-probe.json").is_file()
+    assert not (workspace / ".agent").exists() and not (primary / ".agent").exists()
+
+    # The drift check verifies the workspace's own deployment, in workspace mode, also with a
+    # product root configured and an inherited Codex canonical root.
+    inventory = json.loads(machinery_root().joinpath("agent_deploy", "release.v1.json").read_text())
+    settings: dict = {}
+    for requirement in inventory["required_hooks"]["claude"][".claude/settings.json"]:
+        node = settings
+        for key in requirement["path"][:-1]:
+            node = node.setdefault(key, {})
+        node.setdefault(requirement["path"][-1], []).append({**requirement["group"], "hooks": requirement["hooks"]})
+    source = workspace / "agents_extensions"
+    (source / "claude").mkdir(parents=True)
+    (source / "claude" / "settings.json").write_text(json.dumps(settings))
+    (source / "deployment.v1.json").write_text(json.dumps(
+        {"providers": ["claude"], "sources": {"claude": {"path": "agents_extensions/claude", "required": True}},
+         "preserve": []}))
+    subprocess.run([sys.executable, "-I", "-m", "lu_machinery.agent_deploy", "--workspace", "--project-root",
+                    str(workspace)], check=True, capture_output=True, timeout=120)
+    drift_env = {**env, "LU_PRODUCT_ROOT": str(primary), "CODEX_CANONICAL_REPO_ROOT": str(primary)}
+    drift_payload = json.dumps({"session_id": "workspace-with-product", "source": "startup"})
+
+    def deploy_issues() -> list[str]:
+        ran = subprocess.run(["bash", str(_HOOK)], cwd=workspace, env=drift_env, input=drift_payload, capture_output=True,
+                             text=True, timeout=120, check=False)
+        assert ran.returncode == 0, ran.stderr
+        lines = json.loads(ran.stdout)["hookSpecificOutput"]["additionalContext"].splitlines()
+        assert not any("PYTHON VERSION PIN MISSING" in line or "VENV WRONG PYTHON" in line for line in lines)
+        return [line.strip() for line in lines if "DEPLOY" in line]
+
+    assert deploy_issues() == []
+    record = state / ".agent" / "sessions" / "workspace-with-product.json"
+    assert record.is_file()
+    assert not (primary / ".agent" / "sessions" / record.name).exists()
+    record_reader = subprocess.run(
+        ["bash", "-c", 'source "$1"; context_machinery_bootstrap "$LU_PRODUCT_ROOT" && '
+         'context_session_record_file "$PROJECT_DIR" workspace-with-product',
+         "record-reader", str(_HOOK.with_name("context-rollover-lib.sh"))],
+        cwd=workspace, env=drift_env, capture_output=True, text=True, timeout=30, check=True,
+    )
+    assert record_reader.stdout.strip() == str(record)
+    detect = tmp_path / "detect-root.py"
+    detect.write_text('import sys\nprint(sys.argv[sys.argv.index("--repo-root") + 1])\n')
+    compact = subprocess.run(
+        ["bash", str(_HOOK.with_name("post-compact.sh"))], cwd=workspace,
+        env={**drift_env, "THREAD_ROLLOVER_SCRIPT": str(detect)}, input=drift_payload, capture_output=True,
+        text=True, timeout=30, check=True,
+    )
+    assert f"Thread rollover health (read-only): {state}" in json.loads(compact.stdout)["additionalContext"]
+    (workspace / ".claude" / "rules" / "stray.md").write_text("stray\n")
+    # An inherited Git context naming another checkout cannot redirect the workspace check.
+    drift_env["GIT_DIR"] = str(primary / ".git")
+    assert deploy_issues() == [
+        "- DEPLOY DRIFT: 1 file(s) differ in this workspace's deployment. Run: "
+        '"$LEARN_UKRAINIAN_PYTHON" -I -m lu_machinery.agent_deploy --workspace --project-root <workspace>'
+    ]
