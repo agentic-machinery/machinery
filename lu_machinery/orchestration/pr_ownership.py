@@ -59,6 +59,7 @@ from lu_machinery.common import github_client, json_depth
 from lu_machinery.common.github_client import GitHubRateLimited
 from lu_machinery.common.task_store_paths import tasks_dir
 from lu_machinery.fleet.pr_identity import supervisor_liveness as liveness
+from lu_machinery.orchestration.fleet_repos import canonical_repository
 
 # This package's import name, from the unresolved file location: never from __package__, which a
 # short import spelling (orchestration.x with scripts/ on sys.path) shortens. Its dotted parts
@@ -151,7 +152,8 @@ def state_path() -> Path:
 
 
 def pr_key(repo: str, number: int) -> str:
-    return f"{repo.casefold()}#{number}"
+    """The persisted key shared by both registered spellings of a repository."""
+    return f"{canonical_repository(repo)}#{number}"
 
 
 def _empty() -> dict[str, Any]:
@@ -351,6 +353,16 @@ def load(path: Path) -> dict[str, Any]:
     ):
         raise OwnershipError("ownership state malformed")
     try:
+        # Both historical spellings represent the same PR. Preserve the receipt payload
+        # and its digest, and refuse to choose between conflicting records.
+        for table in ("episodes", "handoffs"):
+            canonical = {}
+            for spelling, record in data[table].items():
+                key = pr_key(*_parse_pr_ref(spelling, "ownership state"))
+                if key in canonical:
+                    raise OwnershipError("ownership state has conflicting repository aliases")
+                canonical[key] = record
+            data[table] = canonical
         for key, episode in data["episodes"].items():
             _at(episode["since"])
             for name in ("alerted_at", "notified_at"):
@@ -453,7 +465,7 @@ def keeper_custodies_for_repo(path: Path | None, repo: str) -> dict[int, dict[st
     if not target.exists():
         return {}
     data = load(target)
-    prefix = f"{repo.casefold()}#"
+    prefix = f"{canonical_repository(repo)}#"
     found: dict[int, dict[str, Any]] = {}
     for key, handoff in data["handoffs"].items():
         if key.startswith(prefix) and keeper_custody(handoff):
@@ -482,7 +494,7 @@ def _end_ownerless_episode(
 
 
 def accepted_handoffs(path: Path | None = None) -> dict[tuple[str, int], str]:
-    """(casefolded repo, PR number) -> accepted successor task id, for the owner check.
+    """(canonical repo, PR number) -> accepted successor task id, for the owner check.
 
     Decision custody names a person, not a task, and is left out.
     """
@@ -798,8 +810,9 @@ def findings(
     unobservable: set[tuple[str, int]] = set()
     seated = list(records)
     for slug, prs in open_prs.items():
+        repository = canonical_repository(slug)
         for pr in prs:
-            key = (slug.casefold(), int(pr["number"]))
+            key = (repository, int(pr["number"]))
             record = by_id.get(handoffs.get(key))
             if record is not None:
                 successors[key] = record
@@ -825,7 +838,7 @@ def findings(
                 except RecordRepositoryRefusal as exc:
                     unbound_trailers[key] = exc.code
                     continue
-                if named_repo.casefold() != slug.casefold():
+                if named_repo.casefold() != repository:
                     continue
                 seated.append({**named, "worktree_branch": branch})
                 if state is None:
@@ -834,7 +847,7 @@ def findings(
     lenient = {(f.repo, f.number): f for f in check.evaluate(open_prs, seated, repos, lambda r: live(r) is not False)}
     result = []
     for row in strict:
-        key = (row.repo.casefold(), row.number)
+        key = (canonical_repository(row.repo), row.number)
         successor = live(successors[key]) if key in successors else False
         if successor is True:
             continue  # the owner check never seats a task on a fork PR's branch
@@ -1269,7 +1282,7 @@ def accept(
         releasing_repair = True
     # A decision owner is a person, and keeper custody is not a task acceptance.
     seated = (
-        {(repo.casefold(), number): previous["successor"]}
+        {(canonical_repository(repo), number): previous["successor"]}
         if previous and not decision_custody(previous) and not keeper_custody(previous) else {}
     )
 
@@ -1387,7 +1400,7 @@ def transfer_to_keeper(
         raise OwnershipError("PR is already under keeper custody with a different binding or state")
     if decision_custody(previous):
         raise OwnershipError("PR is already under recorded decision custody")
-    seated = {(repo.casefold(), number): previous["successor"]} if previous else {}
+    seated = {(canonical_repository(repo), number): previous["successor"]} if previous else {}
 
     def ownership(record: Mapping[str, Any]) -> bool | None:
         target = {repo: [{**pr, "number": number}]}
