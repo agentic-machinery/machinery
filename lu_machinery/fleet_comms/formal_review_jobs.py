@@ -31,6 +31,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from lu_machinery.common.git_credentials import _is_valid_slug as _is_selector_slug
 from lu_machinery.fleet_comms.artifacts import ArtifactStore
 from lu_machinery.fleet_comms.contracts import CompletionState, new_id
 from lu_machinery.fleet_comms.migrations import apply_migrations
@@ -45,22 +46,23 @@ JOB_STATES = frozenset({"open", "running", "complete", "failed", "blocked"})
 ACTIVE_JOB_STATES = frozenset({"open", "running"})
 
 _SELECTOR_RECEIPT_KEYS = frozenset({"selector_value", "selector_sha256"})
-_SELECTOR_VALUE = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\Z")
 _SELECTOR_SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 
 
 def selector_columns(receipt: object) -> tuple[str | None, str | None]:
     """The ``(selector_value, selector_sha256)`` columns of a selector receipt, or ``(None, None)`` for None.
 
-    The receipt is ``ActiveFleetRepo.selector_receipt()``: exactly an owner/name value and a lowercase hex sha256.
-    Anything else raises ValueError, so a malformed receipt is never half-stored.
+    The one receipt check every durable writer uses (the publication and job rows here, the publication ledger in
+    ``api.model_stats_rows``). The receipt is ``ActiveFleetRepo.selector_receipt()``: exactly a value the selector
+    loader itself accepts as a slug (its own grammar, so ``org/..`` and ``../repo`` are refused) and a lowercase hex
+    sha256. Anything else raises ValueError, so a malformed receipt is never stored.
     """
     if receipt is None:
         return None, None
     if not isinstance(receipt, Mapping) or set(receipt) != _SELECTOR_RECEIPT_KEYS:
         raise ValueError("selector receipt must hold exactly selector_value and selector_sha256")
     value, digest = receipt["selector_value"], receipt["selector_sha256"]
-    if not isinstance(value, str) or not _SELECTOR_VALUE.match(value):
+    if not isinstance(value, str) or not _is_selector_slug(value):
         raise ValueError("selector_value must be an exact owner/name")
     if not isinstance(digest, str) or not _SELECTOR_SHA256.match(digest):
         raise ValueError("selector_sha256 must be a lowercase hex sha256")
@@ -413,8 +415,10 @@ class FormalReviewJobService:
         sealed payload. The payload's repository/pr/head/gate/review_id must
         match the durable job row exactly. ``fleet_repo_selector`` is the
         selector receipt the caller resolved the repository with (None for a
-        single-slug or unregistered one), stored beside the sealed verdict; an
-        idempotent re-accept keeps the receipt stored first.
+        single-slug or unregistered one), stored beside the sealed verdict. The
+        verdict and receipt bind only while the job is still unsealed: an
+        identical re-accept, serial or overlapping, keeps the verdict and
+        receipt stored first, and a different verdict is refused.
         """
         try:
             selector_value, selector_sha256 = selector_columns(fleet_repo_selector)
@@ -458,14 +462,7 @@ class FormalReviewJobService:
             )
 
         if job.sealed_verdict_artifact_id is not None:
-            # Idempotent re-accept of identical payload only.
-            existing = self.load_sealed_verdict(job.review_id)
-            if existing.to_dict() != sealed.to_dict():
-                raise FormalReviewJobsError(
-                    f"sealed_verdict_already_set: job {job.review_id} already holds a "
-                    "different sealed verdict; refuse overwrite"
-                )
-            return existing
+            return self._identical_sealed_verdict(job.review_id, sealed)
 
         payload = json.dumps(sealed.to_dict(), sort_keys=True, separators=(",", ":"))
         artifact = self.store.store_text(
@@ -476,18 +473,21 @@ class FormalReviewJobService:
             mime_type="application/json; charset=utf-8",
         )
         try:
-            self._conn.execute(
+            # Bind only an unsealed job: an accept that overlapped another one never overwrites what it sealed.
+            bound = self._conn.execute(
                 """UPDATE formal_review_jobs
                    SET sealed_verdict_artifact_id = ?, state = ?, selector_value = ?, selector_sha256 = ?
-                   WHERE review_id = ?""",
+                   WHERE review_id = ? AND sealed_verdict_artifact_id IS NULL""",
                 (artifact.artifact_id, "complete", selector_value, selector_sha256, job.review_id),
-            )
+            ).rowcount
             self._conn.commit()
         except sqlite3.Error as exc:
             self._conn.rollback()
             raise FormalReviewJobsError(
                 f"failed to bind sealed verdict for {job.review_id}: {exc}"
             ) from exc
+        if bound != 1:
+            return self._identical_sealed_verdict(job.review_id, sealed)
 
         if record_complete_attempt:
             self.record_attempt(
@@ -496,6 +496,16 @@ class FormalReviewJobService:
                 raw_capture_artifact_id=raw_capture_artifact_id or artifact.artifact_id,
             )
         return sealed
+
+    def _identical_sealed_verdict(self, review_id: str, sealed: SealedVerdict) -> SealedVerdict:
+        """The verdict already sealed on the job when it is identical to *sealed*; any other one is refused."""
+        existing = self.load_sealed_verdict(review_id)
+        if existing.to_dict() != sealed.to_dict():
+            raise FormalReviewJobsError(
+                f"sealed_verdict_already_set: job {review_id} already holds a "
+                "different sealed verdict; refuse overwrite"
+            )
+        return existing
 
     def load_sealed_verdict(self, review_id: str) -> SealedVerdict:
         """Reload the durable sealed verdict for PR-G ``--review-id`` publish."""

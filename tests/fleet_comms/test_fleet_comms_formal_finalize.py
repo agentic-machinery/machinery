@@ -309,7 +309,8 @@ def test_finalize_reads_the_active_slug_and_stores_its_selector_receipt(
 ) -> None:
     """Defect class: the finalizer reads a transferred repository's PR at the slug it was given instead of the
     selector's active slug, or seals the verdict without the selector receipt it relied on
-    (SELECTOR-DURABLE-RECEIPTS, A01b finding F3); a single-slug repository must store no receipt."""
+    (SELECTOR-DURABLE-RECEIPTS, A01b finding F3), including through a spelling the GitHub parser rewrites into the
+    registered slug; a single-slug repository must store no receipt."""
     from lu_machinery.common import git_credentials
     from lu_machinery.fleet_comms import formal_review_finalize
     from lu_machinery.orchestration import fleet_repos
@@ -328,6 +329,13 @@ def test_finalize_reads_the_active_slug_and_stores_its_selector_receipt(
             lambda **_kwargs: git_credentials.SelectorState({"case": active}, "d" * 64),
         )
         gh = FakeGh()
+        for rewritten in (f"{named}\u00a0", f" {named}", named.replace("/", "/ ")):
+            with pytest.raises(FormalReviewFinalizeError, match="invalid_repository"):
+                finalize_formal_review_verdict(
+                    pr_number=300, model=_MODEL, family="zhipu", harness="opencode", verdict="BLOCKED",
+                    repository=rewritten, plane_root=tmp_path / "plane", runner=gh,
+                )
+        assert gh.calls == []
         result = finalize_formal_review_verdict(
             pr_number=300, model=_MODEL, family="zhipu", harness="opencode", verdict="BLOCKED",
             repository=named, plane_root=tmp_path / "plane", runner=gh,

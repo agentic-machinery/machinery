@@ -55,7 +55,6 @@ from lu_machinery.fleet_comms.review_publisher import (
 from lu_machinery.orchestration.fleet_repos import (
     FleetRepoError,
     load_fleet_repos,
-    resolve_fleet_repo_by_slug,
     resolve_payload_fleet_repo,
 )
 
@@ -106,17 +105,21 @@ class FinalizeResult:
 def _github_target(repository: str) -> tuple[str, dict[str, str] | None]:
     """The slug GitHub is read at and the selector receipt it was resolved with.
 
-    A registered row, named by either baked slug, is read at its active slug; it is refused when the catalog is
-    unreadable or its dual-slug selector is missing or untrusted. An unregistered owner/name is read as given, with
-    no receipt.
+    *repository* must be exactly the ASCII owner/name the GitHub helpers read: a spelling the repository parser
+    would rewrite (surrounding or inner whitespace of any kind, non-ASCII) is refused, never normalized. A registered
+    row, named by either baked slug in any ASCII case, is read at its active slug; it is refused when the catalog is
+    unreadable or its dual-slug selector is missing or untrusted. An owner/name no registry row names is read as
+    given, with no receipt.
     """
+    owner, name = split_repository(repository)
+    if f"{owner}/{name}" != repository or not repository.isascii() or any(ch.isspace() for ch in repository):
+        raise FormalReviewFinalizeError(f"invalid_repository: expected an exact ASCII owner/repo, got {repository!r}")
     try:
         repos = load_fleet_repos()
     except FleetRepoError as exc:
         raise FormalReviewFinalizeError(f"repository_unresolved: {exc}") from exc
-    try:
-        resolve_fleet_repo_by_slug(repository, repos=repos)
-    except FleetRepoError:
+    spelling = repository.casefold()
+    if not any(spelling == slug.casefold() for row in repos.values() for slug in row.slugs):
         return repository, None
     try:
         active = resolve_payload_fleet_repo(repository, repos=repos)
@@ -217,8 +220,7 @@ def finalize_formal_review_verdict(
         if not value or not str(value).strip():
             raise FormalReviewFinalizeError(f"missing_{label}")
 
-    # Validate repository shape early.
-    split_repository(repository)
+    # Validate repository shape early and bind it to the slug GitHub is read at.
     github_repository, selector = _github_target(repository)
 
     findings_verdict: str | None = None

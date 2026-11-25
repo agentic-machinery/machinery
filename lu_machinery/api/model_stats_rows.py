@@ -47,6 +47,7 @@ from lu_machinery.common import json_depth
 from lu_machinery.common.task_store_paths import read_cached_task_record, tasks_dir
 from lu_machinery.dispatcher.admission import review_typed
 from lu_machinery.dispatcher.types import NEVER_STARTED, StartRefusal
+from lu_machinery.fleet_comms.formal_review_jobs import selector_columns
 from lu_machinery.fleet_comms.review_publication import (
     BLOCKING_PRIORITIES,
     ReviewPublicationError,
@@ -943,18 +944,15 @@ PUBLISHED_VERDICTS = frozenset({"APPROVED", "CHANGES_REQUESTED", "BLOCKED"})
 _PUBLICATION_KEYS = frozenset({"schema", "task_id", "repository", "pr", "head", "verdict", "published_at"})
 _PUBLICATION_SELECTOR = "fleet_repo_selector"
 REPOSITORY_SLUG = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9._-]{1,100}\Z")
-_SELECTOR_SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 
 
 def _selector_ok(receipt: object) -> bool:
-    """None, or exactly a selector value (owner/name) and its lowercase hex sha256."""
-    if receipt is None:
-        return True
-    if not isinstance(receipt, dict) or receipt.keys() != {"selector_value", "selector_sha256"}:
+    """None, or a receipt the durable review stores' one receipt check (``selector_columns``) accepts."""
+    try:
+        selector_columns(receipt)
+    except ValueError:
         return False
-    value, digest = receipt["selector_value"], receipt["selector_sha256"]
-    return (isinstance(value, str) and REPOSITORY_SLUG.fullmatch(value) is not None
-            and isinstance(digest, str) and _SELECTOR_SHA256.fullmatch(digest) is not None)
+    return True
 
 
 def _publication_ok(entry: object) -> bool:

@@ -3127,7 +3127,8 @@ def test_publication_ledger_keeps_the_selector_receipt_and_still_reads_legacy_li
     legacy, _ = recorder.publication_of("org/repos", 41, comment)
     assert legacy is not None and "fleet_repo_selector" not in legacy
     for bad in ({"selector_value": active}, {**receipt, "extra": "x"}, {**receipt, "selector_sha256": "D" * 64},
-                {**receipt, "selector_value": "../x"}, {**receipt, "selector_value": None}):
+                {**receipt, "selector_value": "../x"}, {**receipt, "selector_value": "org/.."},
+                {**receipt, "selector_value": None}):
         assert recorder.publication_of("org/repos", 42, comment, fleet_repo_selector=bad) == (None, "malformed field")
     assert model_stats_rows.record_publications(tmp_path, [legacy, entry]) == 2
     # The receipt is no part of the publication key: the same publication without it is a duplicate.

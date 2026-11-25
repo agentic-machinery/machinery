@@ -216,6 +216,15 @@ def post_commit_status(
         )
 
 
+_SELECTOR_COLUMNS = frozenset({"selector_value", "selector_sha256"})
+
+
+def _has_selector_columns(conn: SQLiteConnection) -> bool:
+    """Whether ``github_publications`` has the migration-v12 receipt columns (a caller may pass a pre-v12 store)."""
+    columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(github_publications)")}
+    return columns >= _SELECTOR_COLUMNS
+
+
 def lookup_publication_receipt(
     conn: SQLiteConnection,
     *,
@@ -224,26 +233,26 @@ def lookup_publication_receipt(
 ) -> dict[str, Any] | None:
     """Return the durable publication row when one already exists.
 
-    ``fleet_repo_selector`` is the stored selector receipt, or None for a single-slug row or a row written before
-    migration v12.
+    ``fleet_repo_selector`` is the stored selector receipt, or None for a single-slug row, a row written before
+    migration v12, or a store not yet migrated to v12.
     """
     rid = _single_line(review_id, label="review_id")
     ctx = _single_line(status_context, label="status_context")
-    row = conn.execute(
-        """SELECT publication_id, review_id, head_sha, status_context, published_at, selector_value, selector_sha256
-           FROM github_publications
-           WHERE review_id = ? AND status_context = ?""",
-        (rid, ctx),
-    ).fetchone()
+    keys: tuple[str, ...] = ("publication_id", "review_id", "head_sha", "status_context", "published_at")
+    if _has_selector_columns(conn):
+        keys += ("selector_value", "selector_sha256")
+        query = """SELECT publication_id, review_id, head_sha, status_context, published_at, selector_value,
+                          selector_sha256
+                   FROM github_publications WHERE review_id = ? AND status_context = ?"""
+    else:
+        query = """SELECT publication_id, review_id, head_sha, status_context, published_at
+                   FROM github_publications WHERE review_id = ? AND status_context = ?"""
+    row = conn.execute(query, (rid, ctx)).fetchone()
     if row is None:
         return None
-    keys = (
-        "publication_id", "review_id", "head_sha", "status_context", "published_at", "selector_value",
-        "selector_sha256",
-    )
     receipt = dict(row) if isinstance(row, sqlite3.Row) else dict(zip(keys, row, strict=True))
     receipt["fleet_repo_selector"] = selector_receipt_from_columns(
-        receipt.pop("selector_value"), receipt.pop("selector_sha256")
+        receipt.pop("selector_value", None), receipt.pop("selector_sha256", None)
     )
     return receipt
 
@@ -261,7 +270,8 @@ def record_publication_receipt(
 
     ``fleet_repo_selector`` is the selector receipt the publication's repository was resolved with (None for a
     single-slug row); a malformed receipt is refused before anything is written. An existing row keeps the receipt
-    it was written with.
+    it was written with. A store not yet migrated to v12 takes a row without a receipt and refuses one with a
+    receipt, which it cannot hold.
     """
     rid = _single_line(review_id, label="review_id")
     sha = _single_line(head_sha, label="head_sha").lower()
@@ -274,13 +284,20 @@ def record_publication_receipt(
     if existing is not None:
         return str(existing["publication_id"])
     pid = publication_id or new_id("publication")
+    if _has_selector_columns(conn):
+        statement = """INSERT INTO github_publications(
+            publication_id, review_id, head_sha, status_context, published_at, selector_value, selector_sha256
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)"""
+        values: tuple[str | None, ...] = (pid, rid, sha, ctx, _utc_now(), selector_value, selector_sha256)
+    elif selector_value is None:
+        statement = """INSERT INTO github_publications(
+            publication_id, review_id, head_sha, status_context, published_at
+        ) VALUES (?, ?, ?, ?, ?)"""
+        values = (pid, rid, sha, ctx, _utc_now())
+    else:
+        raise ReviewPublisherError("receipt_store_not_migrated: github_publications lacks the v12 selector columns")
     try:
-        conn.execute(
-            """INSERT INTO github_publications(
-                publication_id, review_id, head_sha, status_context, published_at, selector_value, selector_sha256
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
-            (pid, rid, sha, ctx, _utc_now(), selector_value, selector_sha256),
-        )
+        conn.execute(statement, values)
         conn.commit()
     except sqlite3.IntegrityError as exc:
         conn.rollback()
@@ -389,12 +406,13 @@ def execute_publication(
         raise ReviewPublisherError(
             "receipt_required: refuse live publish without plane DB connection"
         )
-    if conn is not None:
-        # Refuse a malformed receipt before anything reaches GitHub, not after the post.
-        try:
-            selector_columns(fleet_repo_selector)
-        except ValueError as exc:
-            raise ReviewPublisherError(f"invalid_fleet_repo_selector: {exc}") from exc
+    # Refuse a malformed receipt, or one the store cannot hold, before anything reaches GitHub, never after the post.
+    try:
+        selector_value, _ = selector_columns(fleet_repo_selector)
+    except ValueError as exc:
+        raise ReviewPublisherError(f"invalid_fleet_repo_selector: {exc}") from exc
+    if conn is not None and selector_value is not None and not _has_selector_columns(conn):
+        raise ReviewPublisherError("receipt_store_not_migrated: github_publications lacks the v12 selector columns")
 
     comment_url = post_pr_comment(
         repository=plan.repository,

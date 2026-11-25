@@ -56,6 +56,7 @@ def test_selector_receipt_migration_keeps_existing_rows_and_is_idempotent(tmp_pa
                 " VALUES ('publication_old', 'review_old', ?, ?, ?)", (head, DEFAULT_STATUS_CONTEXT, moment),
             )
             conn.commit()
+            assert lookup_publication_receipt(conn, review_id="review_old")["fleet_repo_selector"] is None
     with ArtifactStore(root=root) as store:
         conn = store.connection
         assert migrations.apply_migrations(conn) == MIGRATIONS[-1].version == 12
