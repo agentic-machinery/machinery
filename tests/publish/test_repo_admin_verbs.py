@@ -469,6 +469,24 @@ def test_public_row_transfer_pins_id_and_preserves_visibility(tmp_path, selector
     assert result.returncode == 0 and receipt["outcome"] == "already-transferred"
     assert "public" in receipt["detail"] and len(gh.posts) == 1
 
+    with monkeypatch.context() as swapped:
+        swapped.setattr(gate, "catalog", lambda: {
+            **CATALOG,
+            "public-move": {
+                **CATALOG["public-move"], "github": pub_dest, "alternate_github": pub_source, "transfer_complete": True,
+            },
+        })
+        selector["slug"] = pub_dest
+        result, receipt = run("repo-transfer", gh, repo="public-move")
+        assert result.returncode == 0 and receipt["outcome"] == "already-transferred"
+        assert (receipt["source"], receipt["destination"], receipt["mutations_sent"]) == (pub_source, pub_dest, 0)
+        assert len(gh.posts) == 1 and not pub_journal.exists()
+        moved = public_gh()
+        with pytest.raises(gate.PublishBlocked, match="marks the transfer of public-move complete"):
+            run("repo-transfer", moved, repo="public-move")
+        assert moved.posts == [] and not pub_journal.exists()
+    selector["slug"] = pub_source
+
     # Visibility flip in POST 202 answer (private=True or visibility="private"/None) exits 3 unverified and keeps journal.
     for bad_ack in (
         {"id": pub_id, "full_name": pub_source, "private": True},

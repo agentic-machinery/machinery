@@ -2311,6 +2311,11 @@ def test_publication_ledger_writes_only_well_formed_lines_and_trusts_no_damaged_
     ledger = batch_state / rows.ROWS_DIR / rows.PUBLICATIONS_FILE
     assert not ledger.exists()
     assert rows.record_publications(batch_state, [good]) == 1
+    current = {**good, "repository": "agentic-machinery/machinery"}
+    assert rows.publication_key(good) == rows.publication_key(current) == (
+        "t-review", 1445647449, 3, "a" * 40, "APPROVED",
+    )
+    assert rows.record_publications(batch_state, [current]) == 0
     with ledger.open("ab") as stream:
         stream.write(b'{"schema": "review-publication.v1", "task_id": "t-review"}\nnot json\n')
     later = {**good, "verdict": "CHANGES_REQUESTED"}
@@ -2363,7 +2368,7 @@ def test_publication_ledger_writes_only_well_formed_lines_and_trusts_no_damaged_
     assert token_use["waste"]["supplemental_review"]["share"] == 26 / 71
     assert token_use["by_work"]["unclassified_review"]["tokens"] == 27
     registry = fleet_repos._CONFIG_PATH.read_text(encoding="utf-8")
-    assert "github: learn-ukrainian/machinery" in registry
+    assert "\n    github: agentic-machinery/machinery\n" in registry
     catalog = tmp_path / "fleet_repos.yaml"
     monkeypatch.setattr(fleet_repos, "_CONFIG_PATH", catalog)
 
@@ -2376,7 +2381,7 @@ def test_publication_ledger_writes_only_well_formed_lines_and_trusts_no_damaged_
 
     unreadable, valid = (0, 1, 1, True), (1, 0, 0, True)
     for text, expected in (
-            (registry.replace("github: learn-ukrainian/machinery", "github: learn-ukrainian-machinery"), unreadable),
+            (registry.replace("github: agentic-machinery/machinery\n", "github: agentic-machinery-machinery\n"), unreadable),
             (registry, valid), ("repos: [", unreadable), (registry, valid)):
         catalog.write_text(text, encoding="utf-8")
         assert collected() == expected, text[:40]

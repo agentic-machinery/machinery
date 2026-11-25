@@ -182,15 +182,22 @@ def test_every_registered_repository_resolves_to_a_sibling_checkout_path(tmp_pat
     assert {"kube-dojo", "kubedojo-labs", "machinery"} <= set(catalog)
     assert catalog["machinery"].repository_id == 1445647449
     assert catalog["machinery"].visibility == "public"
-    assert catalog["machinery"].alternate_github == "agentic-machinery/machinery"
+    assert catalog["machinery"].github == "agentic-machinery/machinery"
+    assert catalog["machinery"].alternate_github == "learn-ukrainian/machinery"
+    assert catalog["machinery"].local_name == "machinery"
     assert catalog["infra-private"].repository_id == 1282510453
     assert catalog["infra-private"].visibility == "private"
-    assert catalog["infra-private"].alternate_github == "agentic-machinery/machinery-infra"
+    assert catalog["infra-private"].github == "agentic-machinery/machinery-infra"
+    assert catalog["infra-private"].alternate_github == "learn-ukrainian/learn-ukrainian-infra-private"
+    assert catalog["infra-private"].local_name == "learn-ukrainian-infra-private"
     for key in ("machinery", "infra-private"):
         row = catalog[key]
+        assert row.transfer_complete
+        assert row.transfer_slugs == (row.alternate_github, row.github)
         for slug in row.slugs:
             assert resolve_fleet_repo_by_slug(slug, repos=catalog) == row
             assert canonical_repository(slug) == row.github.casefold()
+            assert fleet_repos.repository_identity(slug) == row.repository_id
 
 
 def _write_readonly_selector(base_dir: Path, payload: object, *, dir_mode: int = 0o500, file_mode: int = 0o400) -> tuple[Path, Path, str]:
