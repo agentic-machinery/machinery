@@ -364,20 +364,20 @@ def main(argv: list[str] | None = None) -> int:
         help="write to this file, e.g. rules.md (default: stdout)",
     )
     args = parser.parse_args(argv)
-    seat = resolve_seat(args.seat, lane=args.lane, provider=args.provider)
     try:
+        seat = resolve_seat(args.seat, lane=args.lane, provider=args.provider)
         rendered = _render(args.format, seat, args.root)
+        if args.output:
+            args.output.parent.mkdir(parents=True, exist_ok=True)
+            args.output.write_text(rendered, encoding="utf-8")
+        else:
+            sys.stdout.write(rendered)
     except RulesCoreMissing as exc:
         print(f"rules_core: {exc}", file=sys.stderr)
         return 3
-    except RulesCoreError as exc:
+    except (RulesCoreError, ValueError, OSError) as exc:
         print(f"rules_core: {exc}", file=sys.stderr)
         return 2
-    if args.output:
-        args.output.parent.mkdir(parents=True, exist_ok=True)
-        args.output.write_text(rendered, encoding="utf-8")
-    else:
-        sys.stdout.write(rendered)
     return 0
 
 
