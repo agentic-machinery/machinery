@@ -517,6 +517,7 @@ def _rate_limited_run():
         ("retry-at-another-head", False),
         ("retry-for-another-pr", False),
         ("retry-by-another-family", False),
+        ("retry-published-under-another-profile", False),
         ("unpublished-retry", False),
     ],
 )
@@ -536,7 +537,14 @@ def test_a_rate_limited_codex_run_is_skipped_only_beside_its_bound_published_ret
         limited = _bound(limited, nonce="a" * 32, result_sha256=None, finished_at=started(5))
     head = APPROVED if case == "retry-at-another-head" else EARLY
     family = "anthropic" if case == "retry-by-another-family" else "openai"
-    run, comment = review("rl-r1", head, ORPHAN_REJECTION, minute=1, family=family, publish=case != "unpublished-retry")
+    profile = "ukrainian" if case == "retry-published-under-another-profile" else "code"
+    run, comment = review(
+        "rl-r1", head, ORPHAN_REJECTION, minute=1, family=family, profile=profile, publish=case != "unpublished-retry"
+    )
+    if profile == "ukrainian":
+        # The marker names the Ukrainian profile; the damaged record lost its profile fields and reads as code.
+        run = ReviewRun(run.task_id, {k: v for k, v in run.record.items()
+                                      if k not in ("review_profile", "sources_mcp_call_count")}, run.reply)
     retry = (
         _bound(run, nonce="b" * 32, result_sha256="cd" * 32, pr=1379 if case == "retry-for-another-pr" else RATE_LIMIT_PR),
         comment,

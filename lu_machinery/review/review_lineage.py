@@ -671,7 +671,9 @@ def _attested_rate_limit(run: ReviewRun) -> bool:
     The supervisor sets that status from the provider's parsed terminal event and returns before it
     writes ``provider_terminal_failure``. With an output schema bound there is no format-correction
     launch, so no earlier decision can hide behind the missing reply (designated approval
-    LINEAGE-RATELIMIT-1124).
+    LINEAGE-RATELIMIT-1124). Settlement evidence must have the shapes the supervisor writes: a
+    terminal failure flag that is absent, null or false, no terminal status or error, no
+    never-started reason, and child-task lists that are absent or empty.
     """
     record = run.record
     pgid, returncode, schema = record.get("provider_pgid"), record.get("returncode"), record.get("output_schema_sha256")
@@ -683,14 +685,17 @@ def _attested_rate_limit(run: ReviewRun) -> bool:
         and type(pgid) is int and pgid > 0
         and type(returncode) is int and returncode > 0
         and "result_sha256" in record and record["result_sha256"] is None
-        and isinstance(schema, str) and len(schema) == 64 and set(schema) <= _LOWER_SHA256
+        and _lower_sha256(schema)
         and isinstance(record.get("output_schema_path"), str) and bool(record["output_schema_path"])
         and any(record.get("provider_terminal_failure") is value for value in (None, False))
-        and "provider_terminal_status" not in record
-        and not record.get("never_started_reason")
-        and not record.get("orphaned_child_tasks")
-        and not record.get("unknown_child_tasks")
+        and not any(key in record for key in ("provider_terminal_status", "provider_terminal_error"))
+        and record.get("never_started_reason") is None
+        and all(record.get(key) is None or record.get(key) == [] for key in ("orphaned_child_tasks", "unknown_child_tasks"))
     )
+
+
+def _lower_sha256(value: object) -> bool:
+    return isinstance(value, str) and len(value) == 64 and set(value) <= _LOWER_SHA256
 
 
 def _rate_limit_retried(
@@ -698,55 +703,78 @@ def _rate_limit_retried(
 ) -> bool:
     """Whether a rate-limited run's retry, started after it settled, published its own bound verdict.
 
-    The retry must match the run's repository, PR, review branch, full SHA, reviewer family and
-    normalized profile, and its published verdict must bind to its own nonce, reply digest and
-    trusted publication (:func:`bound_published_run`). Any verdict counts: a genuine
-    ``CHANGES_REQUESTED`` also proves the retry happened. The skipped run fills no seat.
+    The retry is a finished run with its own nonce and reply digest (``_read_run`` checks the reply
+    against that digest), started strictly after the attempt settled, for the same repository, PR,
+    review branch and full SHA. Its reviewer family and normalized profile equal the attempt's. Every
+    trusted marker the recorder's login posted for it equals what its record re-derives: head,
+    verdict, model, family and profile, as in the lineage's own run check. Any verdict counts: a
+    genuine ``CHANGES_REQUESTED`` also proves the retry happened. The skipped run fills no seat, and
+    damaged evidence (an unparseable or out-of-range time, an untrusted or edited marker) is never
+    a retry.
     """
     if not _attested_rate_limit(run):
         return False
+    try:
+        return _bound_retry(run, runs, comments, login)
+    except (LineageRefused, recorder.RecordError, OverflowError):
+        return False
+
+
+def _bound_retry(run: ReviewRun, runs: Sequence[ReviewRun], comments: Sequence[Mapping[str, Any]], login: str) -> bool:
     record = run.record
     settled = _timestamp(record.get("finished_at"))
-    started = _timestamp(record.get("started_at"))
-    repository, number = record.get("repository"), record.get("pr")
+    begun = _timestamp(record.get("started_at"))
+    sha, repository, number = record.get("worktree_base_sha"), record.get("repository"), record.get("pr")
     if (
-        settled is None or started is None or settled < started
+        settled is None or begun is None or settled < begun
         or not isinstance(repository, str) or type(number) is not int
     ):
         return False
+    branch = recorder._review_branch(dict(record))
+    family = recorder.reviewer_identity(record)[1]
+    profile = _profile(record)
+    markers = [marker for _, marker in _trusted_markers(comments, login)]
+    identity = (sha, repository, number, branch, family, profile)
+    return any(
+        _binds_retry(retry, settled, identity, markers)
+        for retry in runs
+        if retry.task_id != run.task_id and retry.record.get("run_nonce") != record.get("run_nonce")
+    )
+
+
+def _binds_retry(
+    retry: ReviewRun, settled: datetime, identity: tuple[Any, ...], markers: Sequence[Mapping[str, Any]]
+) -> bool:
+    """Whether ``retry`` is a bound, published retry of the attempt ``identity`` names; damaged evidence binds nothing."""
+    sha, repository, number, branch, family, profile = identity
     try:
-        branch = recorder._review_branch(dict(record))
-        family = recorder.reviewer_identity(record)[1]
-    except recorder.RecordError:
-        return False
-    for retry in runs:
-        if retry.task_id == run.task_id or retry.record.get("run_nonce") == record.get("run_nonce"):
-            continue
         retry_start = _timestamp(retry.record.get("started_at"))
+        evidence = _finished_verdict(retry)
         if (
             retry_start is None
             or retry_start <= settled
-            or retry.record.get("worktree_base_sha") != record.get("worktree_base_sha")
-            or _profile(retry.record) != _profile(record)
+            or evidence is None
             or not _supervised_review_binding(retry)
+            or not _lower_sha256(retry.record.get("result_sha256"))
+            or retry.record.get("repository") != repository
+            or retry.record.get("pr") != number
+            or recorder._review_branch(dict(retry.record)) != branch
+            or _profile(retry.record) != profile
         ):
-            continue
-        evidence = {
-            "task_id": retry.task_id,
-            "run_nonce": retry.record.get("run_nonce"),
-            "reviewed_sha": record.get("worktree_base_sha"),
-            "reply_sha256": retry.record.get("result_sha256"),
-        }
-        try:
-            _, marker = bound_published_run(
-                evidence, runs=runs, comments=comments, login=login,
-                repository=repository, number=number, branch=branch,
-            )
-        except (LineageRefused, recorder.RecordError):
-            continue
-        if marker["family"] == family:
-            return True
-    return False
+            return False
+    except (recorder.RecordError, OverflowError):
+        return False
+    retry_sha, verdict, _, model, retry_family, started = evidence
+    published = [marker for marker in markers if marker["task"] == retry.task_id and marker["started"] == started]
+    return (
+        (retry_sha, retry_family) == (sha, family)
+        and bool(published)
+        and all(
+            (marker["sha"], marker["verdict"], marker["model"], marker["family"], _profile(marker))
+            == (sha, verdict, model, family, profile)
+            for marker in published
+        )
+    )
 
 
 def check_lineage(
