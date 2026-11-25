@@ -57,11 +57,11 @@ _DISPATCH = f"{Path(__file__).absolute().parents[1].name}/dispatch.py"
 _CLI = f"-m {Path(__file__).absolute().parents[1].name}.dispatcher.cli"
 
 
-def _finite_seconds(text: str) -> float:
-    """A float of seconds; nan and inf are refused here because the value lands in the task record."""
+def finite_number(text: str) -> float:
+    """A float; a spelling of NaN or an infinity is refused at parse time, since the value reaches a task record (#1440)."""
     value = float(text)
     if not math.isfinite(value):
-        raise argparse.ArgumentTypeError(f"must be a finite number of seconds, got {text!r}")
+        raise argparse.ArgumentTypeError(f"must be a finite number, got {text!r}")
     return value
 
 
@@ -156,8 +156,10 @@ def build_parser() -> argparse.ArgumentParser:
         ("trial-role", None, "Shadow trial role, e.g. review; read-only, with --trial-qualified-task and --pinned-head (default: none)"),
         ("trial-qualified-task", None, "Successful qualified non-trial task on the same input, head and role, e.g. qualified-42 (default: none)"),
     ):
-        dispatch.add_argument(f"--{flag}", default=default, required=flag in {"agent", "model"}, help=help_text,
-                              **({"type": _no_non_finite} if flag in {"max-budget-usd", "max-tokens"} else {}))
+        if flag in {"max-budget-usd", "max-tokens"}:
+            dispatch.add_argument(f"--{flag}", default=default, help=help_text, type=_no_non_finite)
+        else:
+            dispatch.add_argument(f"--{flag}", default=default, required=flag in {"agent", "model"}, help=help_text)
     dispatch.add_argument(
         "--contributor-mode",
         choices=("on", "off"),
@@ -250,7 +252,7 @@ def build_parser() -> argparse.ArgumentParser:
         "Excluded: " + ", ".join(sorted(git.SPARSE_EXCLUDE_DEFAULT)),
     )
     dispatch.add_argument(
-        "--hard-timeout", type=_finite_seconds, default=7200, help="Deadline seconds; 0 disables (default: 7200)"
+        "--hard-timeout", type=finite_number, default=7200, help="Deadline seconds; 0 disables (default: 7200)"
     )
     dispatch.add_argument(
         "--silence-timeout", type=int, default=DEFAULT_SILENCE_TIMEOUT_S, metavar="SECS",

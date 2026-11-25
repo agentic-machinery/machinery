@@ -24,7 +24,7 @@ from typing import Any
 
 from lu_machinery.common import json_depth
 from lu_machinery.common.repo_root import MachineryConfigError, state_root
-from lu_machinery.dispatcher.cli import ALIASES
+from lu_machinery.dispatcher.cli import ALIASES, finite_number
 from lu_machinery.orchestration.execution_safe_git import run_git
 from lu_machinery.orchestration.task_record_store import (
     iter_task_records,
@@ -858,7 +858,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     dispatch.add_argument(
         "--max-budget-usd",
-        type=float,
+        type=finite_number,
         help="Pass through to dispatch v2: spend cap in USD for a Claude API-key account, at most its configured "
         "amount (default: that amount).",
     )

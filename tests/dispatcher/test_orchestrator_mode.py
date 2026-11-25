@@ -209,6 +209,23 @@ def test_entry_refuses_a_turn_without_a_turn_id_its_own_tree_or_a_bounded_deadli
 # --- admission -----------------------------------------------------------------------------------------------------
 
 
+def test_admission_scan_leaves_a_dead_record_the_writer_refuses_and_goes_on(task_store, monkeypatch, capsys):
+    """Defect class (#1440): a dead task record already holding NaN makes every admission scan raise."""
+    monkeypatch.setattr(dispatch_admission, "host_failures", lambda *_a: [])
+    child = subprocess.Popen(["true"])
+    child.wait()
+    record = {**_orchestrator_record("worker-nan", pid=child.pid), "usage": {"input_tokens": float("nan")}}
+    del record["orchestrator"]
+    path = store.record_path("worker-nan")
+    path.write_text(json.dumps(record))  # as the writer stored it before #1440
+    before = path.read_bytes()
+    decision = host_admission.evaluate("workspace-write", sweep=True)
+    assert decision.admitted, decision.failures
+    assert path.read_bytes() == before
+    assert ('dead task record worker-nan.json not healed: TASK_RECORD_NON_FINITE: ["usage", "input_tokens"]'
+            in capsys.readouterr().err)
+
+
 def test_a_turn_takes_no_write_slot_but_keeps_the_host_checks(task_store, monkeypatch):
     """Defect class: turns starve workers of write slots, or the slot exemption skips host admission."""
     monkeypatch.setenv("DISPATCH_MAX_LIVE_WRITE_WORKERS", "1")
