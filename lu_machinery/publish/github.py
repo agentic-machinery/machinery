@@ -2570,11 +2570,17 @@ def _repo_admin_post(endpoint, frozen, runner, cwd, environment):
     return document
 
 
-def _repo_admin_readback(slug, repository_id, principal_before, reader, cwd, environment, *, visibility="private"):
+def _repo_admin_readback(
+    slug, repository_id, principal_before, reader, cwd, environment, *,
+    visibility="private", fail_on_visibility_mismatch=False,
+):
     """Re-read *slug* within ``TRANSFER_VERIFY_DELAYS`` (8 reads over 180 s) until it matches, then re-read the principal.
 
     GitHub runs repository transfers asynchronously (202 Accepted), so the destination slug may not appear
-    immediately after the POST. Nothing here writes; every failure raises ValueError with its reason and
+    immediately after the POST. When *fail_on_visibility_mismatch* is True (transfer destination readback),
+    observing the pinned *repository_id* at *slug* with mismatched visibility stops polling immediately so
+    the caller exits unsettled and retains the journal; ``repo-create`` keeps bounded polling for the
+    expected private match. Nothing here writes; every failure raises ValueError with its reason and
     the caller reports it as unsettled while keeping any transfer journal.
     """
     detail = "the readback did not show the expected repository"
@@ -2589,7 +2595,8 @@ def _repo_admin_readback(slug, repository_id, principal_before, reader, cwd, env
             identity = _repo_identity(document) if document is not None else None
         except ValueError:
             if (
-                isinstance(document, dict)
+                fail_on_visibility_mismatch
+                and isinstance(document, dict)
                 and type(document.get("id")) is int and document["id"] == repository_id
                 and _same_slug(document.get("full_name"), slug)
                 and (
@@ -2606,7 +2613,7 @@ def _repo_admin_readback(slug, repository_id, principal_before, reader, cwd, env
         if identity is not None:
             if _repo_matches(identity, slug, repository_id, visibility):
                 break
-            if _same_slug(identity["full_name"], slug) and identity["id"] == repository_id:
+            if fail_on_visibility_mismatch and _same_slug(identity["full_name"], slug) and identity["id"] == repository_id:
                 raise ValueError(
                     f"the readback found repository {repository_id} at {slug} with unexpected visibility "
                     f"(private={identity['private']}, visibility={identity['visibility']!r}); expected {visibility}"
@@ -3129,7 +3136,7 @@ def _repo_transfer_send(plan, receipt, sink, directory_fd, journal_name, frozen,
     try:
         receipt["principal"]["after"] = _repo_admin_readback(
             destination, repository_id, receipt["principal"]["before"], reader, cwd, environment,
-            visibility=visibility,
+            visibility=visibility, fail_on_visibility_mismatch=True,
         )
     except Exception as exc:
         return _repo_admin_settle(

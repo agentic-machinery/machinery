@@ -233,7 +233,7 @@ def test_repo_create_preflight_refusals(name, change, reason):
     assert gh.posts == []
 
 
-def test_repo_create_sends_once_and_receipt_binds_id(tmp_path):
+def test_repo_create_sends_once_and_receipt_binds_id(tmp_path, monkeypatch):
     """Defect class: a duplicate or missing creation, or a receipt that does not bind the created id."""
     gh = FakeGitHub()
     result, receipt = run("repo-create", gh, repo="infra-private", name="rehearsal-1", dry_run=True)
@@ -248,6 +248,21 @@ def test_repo_create_sends_once_and_receipt_binds_id(tmp_path):
     files = sorted(state_dir(tmp_path).glob("repo-create-rehearsal-1-*.json"))
     assert len(files) == 2 and all(path.stat().st_mode & 0o777 == 0o600 for path in files)
     assert json.loads(files[-1].read_text()) == receipt
+    # repo-create keeps bounded polling until the expected private readback arrives (AC-4 unchanged).
+    sleeps = []
+    monkeypatch.setattr(pub, "_transfer_sleep", sleeps.append)
+    delayed = FakeGitHub()
+    create_polls = []
+
+    def public_then_private(args):
+        create_polls.append(args)
+        return answer(args, repository(901, f"{OLD}/rehearsal-2", private=len(create_polls) > 1))
+
+    delayed.overrides[("GET", f"repos/{OLD}/rehearsal-2", True)] = public_then_private
+    result, receipt = run("repo-create", delayed, repo="infra-private", name="rehearsal-2")
+    assert result.returncode == 0 and receipt["outcome"] == "created"
+    assert len(delayed.posts) == 1 and len(create_polls) == 2 and sleeps == list(pub.TRANSFER_VERIFY_DELAYS[:2])
+    assert receipt["principal"]["before"] == receipt["principal"]["after"] == {"login": PRINCIPAL, "id": 7}
 
 
 @pytest.mark.parametrize("outcome", [
