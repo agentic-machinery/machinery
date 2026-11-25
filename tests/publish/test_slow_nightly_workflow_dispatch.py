@@ -479,6 +479,7 @@ def test_dismissal_fixes_endpoint_state_and_replays_scanned_comment(dismissal_tr
     pytest.param("[re\\[view]\n\n[re\\[view]: <{pr}>", 2, id="reference-with-escaped-bracket"),
     pytest.param("<{pr}>", 2, id="autolink"),
     pytest.param("({pr}).", 2, id="bare-with-punctuation"),
+    pytest.param("see({pr}).", 2, id="bare-attached-to-opening-parenthesis"),
     pytest.param("<a href='{pr}'>review</a>", 2, id="html-single-quoted"),
     pytest.param('<a href="{pr}">review</a>', 2, id="html-double-quoted"),
     pytest.param("<a href={pr}>review</a>", 2, id="html-unquoted"),
@@ -489,6 +490,7 @@ def test_dismissal_fixes_endpoint_state_and_replays_scanned_comment(dismissal_tr
     pytest.param('<a href="{pr}?tab=files&amp;view=all">review</a>', 2, id="query"),
     pytest.param("<{pr}> {pr}. {pr}/files", 2, id="same-pr-deduplicated"),
     pytest.param("<{pr}> https://github.com/unit/public/pull/3/files", None, id="different-prs"),
+    pytest.param("<{pr}> see(https://github.com/unit/public/pull/3).", None, id="different-pr-in-parentheses"),
     pytest.param("[review]( {pr}.)", None, id="explicit-period-is-part-of-target"),
     pytest.param("[review]\n\n[review]: <{pr}.>", None, id="reference-period-is-part-of-target"),
     pytest.param("<a href='{pr}.'>review</a>", None, id="html-period-is-part-of-target"),
@@ -510,7 +512,8 @@ def test_dismissal_link_delimiters_bind_exactly_one_pr(dismissal_transport, link
         assert calls == writes == []
     else:
         answer = pub.publish("code-scanning-dismiss", runner=sender, capture_output=True, text=True, **fields)
-        assert calls[0][calls[0].index("--method") + 1:][:2] == ["GET", f"repos/unit/public/pulls/{expected_pr}"]
+        method_index = calls[0].index("--method") + 1
+        assert calls[0][method_index:method_index + 2] == ["GET", f"repos/unit/public/pulls/{expected_pr}"]
         assert answer.returncode == 0
         assert json.loads(answer.stdout)["dismissed_comment"] == comment
         assert len(writes) == 1

@@ -3624,12 +3624,19 @@ def _dismiss_preflight(fields, gh_repo, dest, runner, cwd, environment, *, temp=
 
     def record_text(content: str, *, bare_links: bool) -> None:
         for word in content.split():
-            candidate = word.lstrip("([{\"'“‘")
-            if candidate.lower().startswith("https://"):
-                if bare_links:
-                    links.append(candidate.rstrip(".,;:!?*)]}_\"'”’~…"))
-            else:
+            scheme_end = word.find("://")
+            start = scheme_end - len("https")
+            if (
+                start < 0
+                or word[start:scheme_end].lower() != "https"
+                or (start > 0 and word[start - 1] not in "([{\"'“‘*_~")
+            ):
                 prose.append(word)
+                continue
+            prose.append(word[:start])
+            if bare_links:
+                candidate = word[start:].partition("<")[0]
+                links.append(candidate.rstrip(".,;:!?*)]}_\"'”’~…"))
 
     class AnchorParser(HTMLParser):
         in_anchor = False
