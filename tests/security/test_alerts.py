@@ -602,6 +602,14 @@ def test_fleet_security_states_stay_distinct(tmp_path: Path) -> None:
         {"annotation_level": "warning", "message": "1 trivy-fs licence disposition(s) matched no finding"},
         runner_line,
     ]
+    redacted_scanners = (
+        ("zizmor", "zizmor", "high"),
+        ("Secret scan (TruffleHog)", "trufflehog", "critical"),
+        ("Trivy dependencies and licences", "trivy-fs", "high"),
+        ("Trivy IaC and misconfiguration", "trivy-iac", "medium"),
+        ("Trivy container image", "trivy-image", "low"),
+    )
+    redacted = False
     unpinned_text = (
         "name: security\n"
         "on: [push]\n"
@@ -677,8 +685,23 @@ def test_fleet_security_states_stay_distinct(tmp_path: Path) -> None:
                 value={"total_count": 1, "workflow_runs": [_completed_run(slug)]},
             )
         if path == "repos/org/clean/actions/runs/5/jobs":
+            if redacted:
+                return _jobs("org/clean", conclusion="success", total=2, jobs=[
+                    _job("org/clean", 8, "fleet-security / zizmor", "success", 8),
+                    _job("org/clean", 9, "fleet-security / Fleet security gate", "success", 9),
+                ])
             return _jobs("org/clean", conclusion="success", total=1, jobs=[_job("org/clean", 9, "fleet-security / Fleet security gate", "success", 9)])
         if path == "repos/org/dirty/actions/runs/5/jobs":
+            if redacted:
+                return _jobs(
+                    "org/dirty",
+                    conclusion="failure",
+                    total=len(redacted_scanners) + 1,
+                    jobs=[
+                        _job("org/dirty", number, f"fleet-security / {name}", "failure", number)
+                        for number, (name, _, _) in enumerate(redacted_scanners, start=30)
+                    ] + [_job("org/dirty", 9, "fleet-security / Fleet security gate", "failure", 9)],
+                )
             return _jobs(
                 "org/dirty",
                 conclusion="failure",
@@ -712,12 +735,14 @@ def test_fleet_security_states_stay_distinct(tmp_path: Path) -> None:
                 conclusion="failure",
                 total=3,
                 jobs=[
-                    _job("org/partial", 16, "fleet-security / ShellCheck", "failure", 16),
+                    _job("org/partial", 16, "fleet-security / zizmor" if redacted else "fleet-security / ShellCheck", "failure", 16),
                     _job("org/partial", 17, "fleet-security / Trivy dependencies and licences", "failure", 17),
                     _job("org/partial", 18, "fleet-security / Fleet security gate", "failure", 18),
                 ],
             )
         if path == "repos/org/partial/check-runs/16/annotations":
+            if redacted:
+                return Result(status=200, value=[{"message": "fleet-security-finding/v1 zizmor high 1"}, runner_line])
             return Result(status=200, value=[{"message": "ShellCheck SC2086 (warning) at scripts/run.sh:10:1"}, runner_line])
         if path == "repos/org/partial/check-runs/17/annotations":
             return Result(status=200, value=[{**runner_line, "message": "Process completed with exit code 22."}])
@@ -740,10 +765,27 @@ def test_fleet_security_states_stay_distinct(tmp_path: Path) -> None:
                 status=200,
                 value=[{"annotation_level": "warning", "message": "1 trivy-fs licence disposition(s) matched no finding"}],
             )
+        if redacted and path == "repos/org/clean/check-runs/8/annotations":
+            return Result(status=200, value=[])
         if path == "repos/org/dirty/check-runs/8/annotations":
             return Result(status=200, value=dirty_annotations)
         if path == "repos/org/dirty/check-runs/9/annotations":
+            if redacted:
+                return Result(status=200, value=[
+                    {
+                        "annotation_level": "failure",
+                        "message": f"Job {'secret-scan' if scanner == 'trufflehog' else scanner} finished with result failure, expected success",
+                    }
+                    for _, scanner, _ in redacted_scanners
+                ] + [runner_line])
             return Result(status=200, value=[gate_failure, runner_line])
+        if redacted:
+            for number, (_, scanner, severity) in enumerate(redacted_scanners, start=30):
+                if path == f"repos/org/dirty/check-runs/{number}/annotations":
+                    return Result(status=200, value=[
+                        {"annotation_level": "failure", "message": f"fleet-security-finding/v1 {scanner} {severity} 3"},
+                        runner_line,
+                    ])
         if path == "repos/org/broken/check-runs/11/annotations":
             return Result(status=200, value=[runner_line])
         if path == "repos/org/noisy/check-runs/12/annotations":
@@ -806,6 +848,18 @@ def test_fleet_security_states_stay_distinct(tmp_path: Path) -> None:
     assert findings[3]["path"] == ".github/workflows/nightly tasks.yml"
     assert findings[4]["path"] is None
     assert (findings[5]["path"], findings[5]["line"], findings[5]["location"]) == ("Dockerfile", None, "Dockerfile")
+
+    redacted = True
+    for key in ("clean", "dirty", "partial"):
+        repo = FleetRepo(key=key, github=f"org/{key}", local_name=key, role="public-app")
+        evidence = read_fleet_security(_FakeGitHubClient(respond), repo, timeout=1.0, repos={"machinery": _MACHINERY})
+        original = report["repositories"][key]["fleet_security"]
+        assert (evidence["state"], evidence["reason"]) == (original["state"], original["reason"])
+        if key == "dirty":
+            assert [(row["scanner"], row["severity"], row["finding_count"], row["path"]) for row in evidence["findings"]] == [
+                (scanner, severity, 3, None) for _, scanner, severity in redacted_scanners
+            ]
+    redacted = False
 
     prom = tmp_path / "states.prom"
     write_prometheus_textfile(prom, report)

@@ -39,7 +39,14 @@ def _run_hook(
     """
     repo = tmp_path / "repo"
     repo.mkdir(parents=True)
-    shutil.copytree(Path(os.environ["LEARN_UKRAINIAN_PRIMARY_REPO_ROOT"]) / ".git", repo / ".git")
+    # The Git transport copies committed objects and refs without transient maintenance files.
+    subprocess.run(
+        ["git", "clone", "--quiet", "--no-local", "--no-checkout", "--",
+         os.environ["LEARN_UKRAINIAN_PRIMARY_REPO_ROOT"], str(repo)],
+        check=True,
+        capture_output=True,
+        timeout=30,
+    )
     canary = repo / "lu_machinery/session_canary"
     canary.mkdir(parents=True)
     # Use the current tree's canary sources, with untouched dependencies from

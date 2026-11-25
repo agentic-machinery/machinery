@@ -123,7 +123,7 @@ def test_audit_python_no_lockfile(tmp_path: Path):
 
 
 @patch("subprocess.run")
-def test_audit_python_success(mock_run: MagicMock, tmp_path: Path, monkeypatch):
+def test_audit_python_success(mock_run: MagicMock, tmp_path: Path, monkeypatch, capsys):
     req_file = tmp_path / "requirements-lock.txt"
     req_file.write_text("package==1.0.0\n", encoding="utf-8")
     ignore_file = tmp_path / "ignore.yaml"
@@ -165,6 +165,7 @@ def test_audit_python_success(mock_run: MagicMock, tmp_path: Path, monkeypatch):
     monkeypatch.setattr("lu_machinery.ci.audit_dependencies.shutil.which", lambda _: "uv")
 
     incomplete_report = False
+    fixture_finding = False
 
     def uv_or_audit(argv, **_kwargs):
         if argv[0] == "uv":
@@ -186,14 +187,25 @@ def test_audit_python_success(mock_run: MagicMock, tmp_path: Path, monkeypatch):
         else:
             assert pins == f"package==2.0.0 --hash=sha256:{digest}\n"
             audited = [] if incomplete_report else [("package", "2.0.0")]
-        return MagicMock(returncode=0, stdout=json.dumps({
-            "dependencies": [{"name": name, "version": version, "vulns": []} for name, version in audited],
+        vulns = [{"id": "PYSEC-SYNTHETIC-UV"}] if fixture_finding else []
+        return MagicMock(returncode=int(bool(vulns and audited)), stdout=json.dumps({
+            "dependencies": [{"name": name, "version": version, "vulns": vulns} for name, version in audited],
         }))
 
     mock_run.reset_mock()
     mock_run.side_effect = uv_or_audit
     assert audit_python(tmp_path, ignore_file) == 0
     assert mock_run.call_count == 3
+    capsys.readouterr()
+    monkeypatch.setenv("GITHUB_ACTIONS", "true")
+    fixture_finding = True
+    assert audit_python(tmp_path, ignore_file) == 1
+    public = capsys.readouterr()
+    assert "uv.lock: unknown=3; audited 3 registry pins." in public.out
+    assert "Reproduce locally:" in public.out
+    for private_value in ("PYSEC-SYNTHETIC-UV", "1.0.0", "2.0.0", "git-dep", "torch", "lu-machinery"):
+        assert private_value not in public.out + public.err
+    fixture_finding = False
     incomplete_report = True
     assert audit_python(tmp_path, ignore_file) == 1
     mock_run.reset_mock()
@@ -209,15 +221,37 @@ def test_audit_python_success(mock_run: MagicMock, tmp_path: Path, monkeypatch):
 
 
 @patch("subprocess.run")
-def test_audit_python_failure(mock_run: MagicMock, tmp_path: Path):
+def test_audit_python_failure(mock_run: MagicMock, tmp_path: Path, monkeypatch, capsys):
     req_file = tmp_path / "requirements-lock.txt"
     req_file.write_text("package==1.0.0\n", encoding="utf-8")
     ignore_file = tmp_path / "ignore.yaml"
 
-    mock_run.return_value = MagicMock(returncode=1, stdout="Found 1 known vulnerability", stderr="")
+    event_path = tmp_path / "event.json"
+    monkeypatch.setenv("GITHUB_EVENT_PATH", str(event_path))
+    row = "fixture-legacy-package 1.0.0 PYSEC-SYNTHETIC-LEGACY"
+    dependencies = [{"name": "fixture-legacy-package", "version": "1.0.0", "vulns": [{"id": "PYSEC-SYNTHETIC-LEGACY"}]}]
+    report = json.dumps({"dependencies": dependencies})
 
-    res = audit_python(tmp_path, ignore_file)
-    assert res == 1
+    for visibility in ("local", "public", "internal", "private", ""):
+        if visibility == "local":
+            monkeypatch.delenv("GITHUB_ACTIONS", raising=False)
+        else:
+            monkeypatch.setenv("GITHUB_ACTIONS", "true")
+        event_path.write_text(json.dumps({"repository": {"visibility": visibility}}), encoding="utf-8")
+        detailed = visibility in {"local", "private"}
+        mock_run.return_value = MagicMock(returncode=1, stdout=row if detailed else report, stderr=row)
+        assert audit_python(tmp_path, ignore_file, private=True) == 1
+        public = capsys.readouterr()
+        assert (row in public.out + public.err) is detailed
+        assert ("--format" in mock_run.call_args.args[0]) is not detailed
+        if not detailed:
+            assert "requirements-lock.txt: unknown=1 (exit 1)" in public.out
+            assert "Reproduce locally:" in public.out
+            assert "fixture-legacy-package" not in public.out + public.err
+
+    event_path.write_text('{"repository":{"visibility":"private"}}', encoding="utf-8")
+    assert audit_python(tmp_path, ignore_file) == 1
+    assert "requirements-lock.txt: unknown=1 (exit 1)" in capsys.readouterr().out
 
 
 def test_lu_machinery_requirement_resolves_from_machinery_lock_not_pypi(tmp_path: Path, monkeypatch) -> None:
@@ -444,6 +478,7 @@ def test_unrecognized_requirement_line_fails_closed(line: str, tmp_path: Path, m
     )
     (tmp_path / "requirements-lock.txt").write_text(f"requests==2.32.0\n{line}\n", encoding="utf-8")
     monkeypatch.setenv("LU_MACHINERY_WHEELHOUSE", str(wheelhouse))
+    monkeypatch.delenv("GITHUB_ACTIONS", raising=False)
     with patch("subprocess.run") as refused_run:
         assert audit_python(tmp_path, tmp_path / "ignore.yaml") == 1
     refused_run.assert_not_called()
@@ -513,7 +548,7 @@ def test_audit_node_suppressed(mock_run: MagicMock, tmp_path: Path):
 
 
 @patch("subprocess.run")
-def test_audit_node_unsuppressed_fails(mock_run: MagicMock, tmp_path: Path):
+def test_audit_node_unsuppressed_fails(mock_run: MagicMock, tmp_path: Path, monkeypatch, capsys):
     import json
 
     (tmp_path / "package.json").write_text("{}", encoding="utf-8")
@@ -543,8 +578,18 @@ def test_audit_node_unsuppressed_fails(mock_run: MagicMock, tmp_path: Path):
 
     mock_run.return_value = MagicMock(returncode=1, stdout=audit_json, stderr="")
 
-    res = audit_node(tmp_path)
-    assert res == 1
+    monkeypatch.delenv("GITHUB_ACTIONS", raising=False)
+    assert audit_node(tmp_path) == 1
+    assert "unsuppressed-pkg" in capsys.readouterr().err
+
+    monkeypatch.setenv("GITHUB_ACTIONS", "true")
+    assert audit_node(tmp_path) == 1
+    captured = capsys.readouterr()
+    assert "npm audit (root): high=1 critical=0." in captured.out
+    assert "npm audit (site): high=1 critical=0." in captured.out
+    assert "Reproduce locally:" in captured.out
+    for private_value in ("unsuppressed-pkg", "GHSA-xxxx-yyyy-zzzz"):
+        assert private_value not in captured.out + captured.err
 
 
 @patch("subprocess.run")

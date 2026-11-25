@@ -10,10 +10,9 @@
 # - Least privilege: workflow permissions are empty; every job takes only
 #   contents: read, checks out with persist-credentials: false, and runs every
 #   scanner under env -i so no runner credential reaches a scanner.
-# - Redacted evidence: raw scanner stderr is withheld to a temp file and never
-#   printed. Logs, annotations and step-summary receipts emit only counts,
-#   repo-relative paths, line/column numbers, rule/detector/CVE/AVD/license IDs
-#   and severities, never secret values or source snippets.
+# - Scanner stderr stays in temporary files. In GitHub Actions, security
+#   findings are counts unless the caller opts in and has private visibility.
+#   Detailed findings never include secret values or source snippets.
 # - Fail closed: missing targets, invalid paths, zero matched files/packages/
 #   configs, floating image tags, malformed scanner JSON, scanner errors and an
 #   invocation enabling zero checks all fail the workflow.
@@ -22,6 +21,10 @@ name: Fleet Security
 on:
   workflow_call:
     inputs:
+      private:
+        description: Allow detailed findings. Set from github.event.repository.visibility == 'private'.
+        type: boolean
+        default: false
       runs-on:
         description: JSON runner label or label array for every job (Linux x64)
         type: string
@@ -143,13 +146,21 @@ on:
         type: string
         default: ''
       trivy-ignored-licenses:
-        description: Optional comma-separated SPDX licence IDs to ignore in trivy fs
+        description: Private caller only. Optional comma-separated SPDX licence IDs to ignore in Trivy fs and image scans.
         type: string
         default: ''
       trivy-fs-license-dispositions:
         description: >-
-          Optional newline-separated target|PkgName|Name tuples for exact Trivy fs
-          licence dispositions. Accepted findings and unused tuples are recorded.
+          Private caller only. Optional newline-separated target|PkgName|Name tuples
+          for exact Trivy fs licence dispositions.
+        type: string
+        default: ''
+      trivy-license-policy-file:
+        description: >-
+          Optional repository-relative JSON file in the checked-out revision, with
+          dispositions (an array of target|PkgName|Name strings for Trivy fs) and
+          ignored_licenses (an array of SPDX licence IDs for Trivy fs and image).
+          Supply this file in place of inline licence inputs.
         type: string
         default: ''
 
@@ -213,6 +224,7 @@ permissions: {}
 # Single source of pinned scanner releases and rule bundles for every caller.
 # Upstream evidence lives in .github/workflows/pins.txt; bump them together.
 env:
+  FLEET_SECURITY_PRIVATE: ${{ inputs.private && github.event.repository.visibility == 'private' }}
   ACTIONLINT_VERSION: "1.7.12"
   ACTIONLINT_LINUX_AMD64_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
   SHELLCHECK_VERSION: "0.11.0"
@@ -992,11 +1004,17 @@ jobs:
           import subprocess
           import sys
           import unicodedata
+          from collections import Counter
           from pathlib import Path
 
           work = Path(sys.argv[1])
           root = Path.cwd().resolve()
           version = os.environ["ZIZMOR_VERSION"]
+
+          redact = os.environ.get("GITHUB_ACTIONS") == "true" and os.environ.get("FLEET_SECURITY_PRIVATE") != "true"
+          if redact:
+              print('Reproduce locally: zizmor --offline --no-progress --format=json -- "$TARGET"')
+              print("Targets are sorted YAML files. Use the caller's base config or --no-config when none applies.")
 
           def clean_log(val: object) -> str:
               return re.sub(r"[\r\n\x00-\x1f\x7f]+", " ", str(val))
@@ -1005,11 +1023,11 @@ jobs:
               s = clean_log(val)
               return s.replace("%", "%25").replace(":", "%3A").replace(",", "%2C")
 
-          def int_or_zero(val: object) -> int:
-              try:
-                  return int(val)
-              except (TypeError, ValueError):
-                  return 0
+          severity_order = ("critical", "high", "medium", "low", "unknown")
+
+          def finding_severity(raw: object) -> str:
+              key = str(raw).lower()
+              return key if key in severity_order else "unknown"
 
           def emit(receipt: dict, rc: int) -> None:
               encoded = json.dumps(receipt, sort_keys=True, separators=(",", ":"))
@@ -1050,14 +1068,15 @@ jobs:
                   raw_paths.append(".github/actions")
 
           files: list[str] = []
-          for raw in raw_paths:
+          for number, raw in enumerate(raw_paths, start=1):
+              label = f"target {number}" if redact else raw
               resolved = valid_rel(raw)
               if resolved is None:
-                  print(f"::error::Invalid zizmor target path '{raw}'; failing closed")
+                  print(f"::error::Invalid zizmor target path '{label}'; failing closed")
                   emit({"tool": "zizmor", "version": version, "status": "invalid_target", "files": 0, "findings": 0}, 1)
               if not resolved.exists():
-                  print(f"::error::zizmor target '{raw}' is missing; failing closed")
-                  emit({"tool": "zizmor", "version": version, "target": raw, "status": "missing_target", "files": 0, "findings": 0}, 1)
+                  print(f"::error::zizmor target '{label}' is missing; failing closed")
+                  emit({"tool": "zizmor", "version": version, "target": number if redact else raw, "status": "missing_target", "files": 0, "findings": 0}, 1)
               found: list[str] = []
               if resolved.is_file() and not resolved.is_symlink():
                   if resolved.suffix in (".yml", ".yaml"):
@@ -1069,8 +1088,8 @@ jobs:
                       if p.is_file() and not p.is_symlink() and p.suffix in (".yml", ".yaml")
                   )
               if explicit and not found:
-                  print(f"::error::zizmor target '{raw}' holds no YAML files; failing closed")
-                  emit({"tool": "zizmor", "version": version, "target": raw, "status": "missing_target", "files": 0, "findings": 0}, 1)
+                  print(f"::error::zizmor target '{label}' holds no YAML files; failing closed")
+                  emit({"tool": "zizmor", "version": version, "target": number if redact else raw, "status": "missing_target", "files": 0, "findings": 0}, 1)
               files.extend(found)
 
           files = sorted(set(files))
@@ -1118,7 +1137,8 @@ jobs:
               print(f"::error::zizmor exited {proc.returncode} without findings (tool error); failing closed")
               emit({"tool": "zizmor", "version": version, "status": "error", "files": len(files), "findings": 0}, 1)
 
-          # Redacted diagnostics: rule ident, severity, confidence and file path only; never code snippets.
+          file_numbers = {path: number for number, path in enumerate(files, start=1)}
+          file_counts: dict[int, Counter[str]] = {}
           for item in findings:
               if not isinstance(item, dict):
                   continue
@@ -1134,14 +1154,31 @@ jobs:
                       local = sym.get("Local")
                       if isinstance(local, dict) and isinstance(local.get("verbatim_path"), str):
                           fp = clean_log(local["verbatim_path"])
-              print(f"::error file={esc_prop(fp)}::zizmor {ident} severity={sev} confidence={conf} at {fp}")
+              if redact:
+                  number = file_numbers.get(fp, 0)
+                  level = "low" if sev.lower() == "informational" else finding_severity(sev)
+                  file_counts.setdefault(number, Counter())[level] += 1
+              else:
+                  print(f"::error file={esc_prop(fp)}::zizmor {ident} severity={sev} confidence={conf} at {fp}")
+          target_summary = raw_paths
+          if redact:
+              target_summary = [
+                  {"target": number, "findings_by_severity": counts}
+                  for number, counts in sorted(file_counts.items())
+              ]
+              counts = Counter[str]()
+              for file_count in file_counts.values():
+                  counts.update(file_count)
+              if counts:
+                  severity = next(key for key in severity_order if counts[key])
+                  print(f"::error::fleet-security-finding/v1 zizmor {severity} {counts.total()}")
           status = "clean" if proc.returncode == 0 and not findings else "finding"
           emit(
               {
                   "tool": "zizmor",
                   "version": version,
                   "status": status,
-                  "targets": raw_paths,
+                  "targets": target_summary,
                   "files": len(files),
                   "findings": len(findings),
               },
@@ -1228,6 +1265,15 @@ jobs:
           INPUT_REQUIRED_EXTS: ${{ inputs.secret-scan-required-extensions }}
         run: |
           set -euo pipefail
+          redact=false
+          if [ "${GITHUB_ACTIONS:-}" = true ] && [ "${FLEET_SECURITY_PRIVATE:-}" != true ]; then
+            redact=true
+            # Shell variables belong to the maintainer's local invocation.
+            # shellcheck disable=SC2016
+            echo 'Reproduce locally: trufflehog git "file://$PWD" --branch "$HEAD_SHA" --fail --no-update --json --results=verified,unknown,unverified --exclude-detectors=Lob --fail-on-scan-errors'
+            # shellcheck disable=SC2016
+            echo 'Use a full Git checkout. Add --since-commit "$BASE_SHA" for a bounded range and --exclude-paths for the caller base policy.'
+          fi
           ZERO_SHA="0000000000000000000000000000000000000000"
           case "$EVENT_NAME" in
             pull_request) base="$PR_BASE"; head="$PR_HEAD" ;;
@@ -1431,7 +1477,7 @@ jobs:
             echo "::error::TruffleHog output is not valid JSON (exit ${rc}); failing closed"
             exit 1
           fi
-          if [ "$count" -gt 0 ]; then
+          if [ "$count" -gt 0 ] && [ "$redact" = false ]; then
             echo "::error::TruffleHog reported ${count} finding(s). Secret values are redacted from this log."
             jq -r 'def s: if type == "string" or type == "number" or type == "boolean" then (tostring | gsub("[\r\n\u0000-\u001f\u007f]+"; " ")) else "?" end;
               .SourceMetadata.Data.Git as $git
@@ -1462,6 +1508,18 @@ jobs:
           receipt="$(jq -nc --arg version "$TRUFFLEHOG_VERSION" --arg event "$EVENT_NAME" \
             --arg status "$status" --argjson commits "$commits" --argjson findings "$count" \
             '{tool: "trufflehog", version: $version, event: $event, status: $status, commits: $commits, findings: $findings}')"
+          if [ "$redact" = true ]; then
+            counts="$(jq -sc 'reduce .[] as $row ({};
+              (if ($row | type) != "object" then "unknown"
+               elif $row.Verified == true then "critical"
+               elif $row.Verified == false then "high"
+               else "unknown" end) as $severity | .[$severity] += 1)' "$findings")"
+            if [ "$status" = finding ] && [ "$count" -gt 0 ]; then
+              severity="$(jq -r 'if .critical then "critical" elif .high then "high" else "unknown" end' <<< "$counts")"
+              echo "::error::fleet-security-finding/v1 trufflehog ${severity} ${count}"
+            fi
+            receipt="$(jq -c --argjson counts "$counts" '. + {findings_by_severity: $counts}' <<< "$receipt")"
+          fi
           echo "secret-scan receipt: ${receipt}"
           printf '### Secret scan (TruffleHog %s)\n\140\140\140json\n%s\n\140\140\140\n' "$TRUFFLEHOG_VERSION" "$receipt" >> "$GITHUB_STEP_SUMMARY"
           printf 'receipt=%s\n' "$receipt" >> "$GITHUB_OUTPUT"
@@ -1475,7 +1533,12 @@ jobs:
 
   trivy-fs:
     name: Trivy dependencies and licences
-    if: ${{ inputs.run-trivy-fs }}
+    # Refuse inline policy before the runner receives a job. The runner logs step environments.
+    if: >-
+      ${{ inputs.run-trivy-fs && (
+          (inputs.private && github.event.repository.visibility == 'private') ||
+          (inputs.trivy-fs-license-dispositions == '' && inputs.trivy-ignored-licenses == '')
+      ) }}
     runs-on: ${{ fromJSON(inputs.runs-on) }}
     timeout-minutes: 20
     permissions:
@@ -1550,6 +1613,7 @@ jobs:
           INPUT_IGNOREFILE: ${{ inputs.trivy-ignorefile }}
           INPUT_IGNORED_LICENSES: ${{ inputs.trivy-ignored-licenses }}
           INPUT_LICENSE_DISPOSITIONS: ${{ inputs.trivy-fs-license-dispositions }}
+          INPUT_LICENSE_POLICY_FILE: ${{ inputs.trivy-license-policy-file }}
         run: |
           set -euo pipefail
           work="$RUNNER_TEMP/trivy-fs-work"
@@ -1562,6 +1626,7 @@ jobs:
           import subprocess
           import sys
           import unicodedata
+          from collections import Counter
           from pathlib import Path
 
           work = Path(sys.argv[1])
@@ -1573,20 +1638,24 @@ jobs:
           checks_digest = os.environ["TRIVY_CHECKS_BUNDLE_DIGEST"]
           clean_env = {"PATH": "/usr/bin:/bin", "HOME": str(work / "home"), "TMPDIR": str(work / "tmp")}
 
+          redact = os.environ.get("GITHUB_ACTIONS") == "true" and os.environ.get("FLEET_SECURITY_PRIVATE") != "true"
+          if redact:
+              print('Reproduce locally: trivy fs --config "" --scanners "$SCANNERS" --severity "$SEVERITY" --format json "$TARGET"')
+              print("Use the caller's flags and base ignore file. For pip lock targets add --file-patterns 'pip:.*'. Compare licence rows with the caller's dispositions.")
+
           def clean_log(val: object) -> str:
               return re.sub(r"[\r\n\x00-\x1f\x7f]+", " ", str(val))
 
-          def esc_prop(val: object) -> str:
-              s = clean_log(val)
-              return s.replace("%", "%25").replace(":", "%3A").replace(",", "%2C")
+          severity_order = ("critical", "high", "medium", "low", "unknown")
 
-          def int_or_zero(val: object) -> int:
-              try:
-                  return int(val)
-              except (TypeError, ValueError):
-                  return 0
+          def finding_severity(raw: object) -> str:
+              key = str(raw).lower()
+              return key if key in severity_order else "unknown"
 
           def emit(receipt: dict, rc: int) -> None:
+              if redact:
+                  for number, target in enumerate(receipt["targets"], start=1):
+                      target["target"] = number
               encoded = json.dumps(receipt, sort_keys=True, separators=(",", ":"))
               print(f"trivy-fs receipt: {encoded}")
               summary = os.environ.get("GITHUB_STEP_SUMMARY")
@@ -1631,12 +1700,37 @@ jobs:
               emit({"tool": "trivy-fs", "version": version, "status": "error", "targets": []}, 1)
 
           ignored_licenses = os.environ.get("INPUT_IGNORED_LICENSES", "").strip()
+          raw_dispositions = os.environ.get("INPUT_LICENSE_DISPOSITIONS", "")
+          raw_policy = os.environ.get("INPUT_LICENSE_POLICY_FILE", "").strip()
+          if raw_policy:
+              try:
+                  policy_path = valid_rel(raw_policy)
+                  if policy_path is None or not policy_path.is_file() or ignored_licenses or raw_dispositions:
+                      raise ValueError
+                  policy = json.loads(policy_path.read_text(encoding="utf-8"))
+                  if not isinstance(policy, dict) or set(policy) - {"ignored_licenses", "dispositions"}:
+                      raise ValueError
+                  ignored = policy.get("ignored_licenses", [])
+                  exact = policy.get("dispositions", [])
+                  if not isinstance(ignored, list) or any(
+                      not isinstance(item, str) or not re.fullmatch(r"[A-Za-z0-9.+-]+", item) for item in ignored
+                  ):
+                      raise ValueError
+                  if not isinstance(exact, list) or any(
+                      not isinstance(item, str) or not item or "\n" in item or "\r" in item for item in exact
+                  ):
+                      raise ValueError
+                  ignored_licenses = ",".join(ignored)
+                  raw_dispositions = "\n".join(exact)
+              except (OSError, ValueError, RecursionError):
+                  print("::error title=invalid_license_policy::trivy-license-policy-file must be a valid JSON policy file used without inline licence inputs.")
+                  emit({"tool": "trivy-fs", "version": version, "status": "error", "targets": []}, 1)
           if ignored_licenses and not re.fullmatch(r"[A-Za-z0-9.+-]+(,[A-Za-z0-9.+-]+)*", ignored_licenses):
               print("::error::Invalid trivy-ignored-licenses syntax; failing closed")
               emit({"tool": "trivy-fs", "version": version, "status": "error", "targets": []}, 1)
 
           dispositions: set[tuple[str, str, str]] = set()
-          disposition_lines = os.environ.get("INPUT_LICENSE_DISPOSITIONS", "").replace("\r\n", "\n").split("\n")
+          disposition_lines = raw_dispositions.replace("\r\n", "\n").split("\n")
           for line_number, line in enumerate(disposition_lines, start=1):
               if not line:
                   continue
@@ -1718,15 +1812,16 @@ jobs:
           checks_downloaded = False
 
           for idx, raw_target in enumerate(targets):
+              target_label = f'target {idx + 1}' if redact else raw_target
               pip_lock = raw_target in pip_lock_files
               resolved = valid_rel(raw_target)
               if resolved is None:
-                  print(f"::error::Invalid trivy-fs target path '{raw_target}'; failing closed")
+                  print(f"::error::Invalid trivy-fs target path '{target_label}'; failing closed")
                   target_receipts.append({"target": raw_target, "status": "invalid_target"})
                   failed = True
                   continue
               if not resolved.exists() or resolved.is_symlink() or (pip_lock and not resolved.is_file()):
-                  print(f"::error::trivy-fs target '{raw_target}' is missing; failing closed")
+                  print(f"::error::trivy-fs target '{target_label}' is missing; failing closed")
                   target_receipts.append({"target": raw_target, "status": "missing_target"})
                   failed = True
                   continue
@@ -1765,7 +1860,7 @@ jobs:
               with open(err_log, "wb") as err_fh:
                   proc = subprocess.run(cmd, env=clean_env, stdout=subprocess.DEVNULL, stderr=err_fh, check=False)
               err_lines = sum(1 for _ in open(err_log, "rb"))
-              print(f"trivy fs target={raw_target}: exit={proc.returncode}, {err_lines} stderr line(s) withheld.")
+              print(f"trivy fs target={target_label}: exit={proc.returncode}, {err_lines} stderr line(s) withheld.")
               if "misconfig" in scanners and not checks_downloaded:
                   meta_file = work / "cache" / "policy" / "metadata.json"
                   try:
@@ -1780,14 +1875,14 @@ jobs:
                   checks_downloaded = True
 
               if proc.returncode != 0:
-                  print(f"::error::trivy fs exited {proc.returncode} on '{raw_target}'; failing closed")
+                  print(f"::error::trivy fs exited {proc.returncode} on '{target_label}'; failing closed")
                   target_receipts.append({"target": raw_target, "status": "error"})
                   failed = True
                   continue
               try:
                   report = json.loads(out_json.read_text(encoding="utf-8"))
               except (OSError, ValueError):
-                  print(f"::error::trivy fs output for '{raw_target}' is missing or malformed JSON; failing closed")
+                  print(f"::error::trivy fs output for '{target_label}' is missing or malformed JSON; failing closed")
                   target_receipts.append({"target": raw_target, "status": "error"})
                   failed = True
                   continue
@@ -1801,6 +1896,8 @@ jobs:
               misconfigs = 0
               configs_seen = 0
               accepted_licenses = []
+              accepted_counts = Counter[str]()
+              counts = Counter[str]()
               for res in results:
                   if not isinstance(res, dict):
                       continue
@@ -1811,12 +1908,15 @@ jobs:
                       configs_seen += 1
                   for v in res.get("Vulnerabilities") or []:
                       vulns += 1
-                      vid = clean_log(v.get("VulnerabilityID", "?"))
-                      pkg = clean_log(v.get("PkgName", "?"))
-                      inst = clean_log(v.get("InstalledVersion", "?"))
-                      fix = clean_log(v.get("FixedVersion", "") or "unfixed")
-                      sev = clean_log(v.get("Severity", "?"))
-                      print(f"::error::Trivy vuln {vid} ({sev}) {pkg} {inst} (fixed: {fix}) in {r_target}")
+                      if redact:
+                          counts[finding_severity(v.get("Severity"))] += 1
+                      else:
+                          vid = clean_log(v.get("VulnerabilityID", "?"))
+                          pkg = clean_log(v.get("PkgName", "?"))
+                          inst = clean_log(v.get("InstalledVersion", "?"))
+                          fix = clean_log(v.get("FixedVersion", "") or "unfixed")
+                          sev = clean_log(v.get("Severity", "?"))
+                          print(f"::error::Trivy vuln {vid} ({sev}) {pkg} {inst} (fixed: {fix}) in {r_target}")
                   for lic in res.get("Licenses") or []:
                       lics += 1
                       name = lic.get("Name")
@@ -1825,30 +1925,38 @@ jobs:
                           finding = (raw_target, package, name)
                           if finding in dispositions:
                               accepted_licenses.append(finding)
+                              if redact:
+                                  accepted_counts[finding_severity(lic.get("Severity"))] += 1
                               unused_dispositions.discard(finding)
                               continue
-                      lname = clean_log(name if name is not None else "?")
-                      pkg = clean_log(package if package is not None else "?")
-                      cat = clean_log(lic.get("Category", "?"))
-                      sev = clean_log(lic.get("Severity", "?"))
-                      print(f"::error::Trivy licence {lname} ({cat}/{sev}) {pkg} in {r_target}")
+                      if redact:
+                          counts[finding_severity(lic.get("Severity"))] += 1
+                      else:
+                          lname = clean_log(name if name is not None else "?")
+                          pkg = clean_log(package if package is not None else "?")
+                          cat = clean_log(lic.get("Category", "?"))
+                          sev = clean_log(lic.get("Severity", "?"))
+                          print(f"::error::Trivy licence {lname} ({cat}/{sev}) {pkg} in {r_target}")
                   for m in res.get("Misconfigurations") or []:
                       if m.get("Status") == "FAIL":
                           misconfigs += 1
-                          mid = clean_log(m.get("ID", "?"))
-                          sev = clean_log(m.get("Severity", "?"))
-                          print(f"::error::Trivy misconfig {mid} ({sev}) in {r_target}")
+                          if redact:
+                              counts[finding_severity(m.get("Severity"))] += 1
+                          else:
+                              mid = clean_log(m.get("ID", "?"))
+                              sev = clean_log(m.get("Severity", "?"))
+                              print(f"::error::Trivy misconfig {mid} ({sev}) in {r_target}")
 
               blocking_findings = vulns + lics - len(accepted_licenses) + misconfigs
               t_status = "finding" if blocking_findings else "clean"
               if (pip_lock or "vuln" in scanners) and pkgs == 0:
-                  print(f"::error::trivy fs inventoried zero packages for '{clean_log(raw_target)}'; failing closed")
+                  print(f"::error::trivy fs inventoried zero packages for '{target_label if redact else clean_log(raw_target)}'; failing closed")
                   t_status = "missing_target"
               elif not pip_lock and "misconfig" in scanners and "vuln" not in scanners and configs_seen == 0:
-                  print(f"::error::trivy fs detected zero config files for '{clean_log(raw_target)}'; failing closed")
+                  print(f"::error::trivy fs detected zero config files for '{target_label}'; failing closed")
                   t_status = "missing_target"
               elif scanners == ["license"] and not results:
-                  print(f"::error::trivy fs detected zero licence targets for '{clean_log(raw_target)}'; failing closed")
+                  print(f"::error::trivy fs detected zero licence targets for '{target_label}'; failing closed")
                   t_status = "missing_target"
 
               if t_status != "clean":
@@ -1863,7 +1971,10 @@ jobs:
                   "licenses": lics,
                   "misconfigs": misconfigs,
               }
-              if accepted_licenses:
+              if redact:
+                  target_receipt["findings_by_severity"] = counts
+                  target_receipt["accepted_licenses_by_severity"] = accepted_counts
+              elif accepted_licenses:
                   target_receipt["accepted_license_findings"] = accepted_licenses
               target_receipts.append(target_receipt)
 
@@ -1877,7 +1988,17 @@ jobs:
           }
           if unused_dispositions:
               print(f"::warning::{len(unused_dispositions)} trivy-fs licence disposition(s) matched no finding")
-              receipt["stale_license_dispositions"] = sorted(unused_dispositions)
+              if redact:
+                  receipt["stale_license_disposition_count"] = len(unused_dispositions)
+              else:
+                  receipt["stale_license_dispositions"] = sorted(unused_dispositions)
+          if redact:
+              counts = Counter[str]()
+              for summary in target_receipts:
+                  counts.update(summary.get("findings_by_severity", {}))
+              if counts:
+                  severity = next(key for key in severity_order if counts[key])
+                  print(f"::error::fleet-security-finding/v1 trivy-fs {severity} {counts.total()}")
           emit(receipt, 1 if failed else 0)
           PY
 
@@ -1971,6 +2092,7 @@ jobs:
           import subprocess
           import sys
           import unicodedata
+          from collections import Counter
           from pathlib import Path
 
           work = Path(sys.argv[1])
@@ -1980,6 +2102,11 @@ jobs:
           checks_repo = os.environ["TRIVY_CHECKS_BUNDLE_REPOSITORY"]
           checks_digest = os.environ["TRIVY_CHECKS_BUNDLE_DIGEST"]
           clean_env = {"PATH": "/usr/bin:/bin", "HOME": str(work / "home"), "TMPDIR": str(work / "tmp")}
+
+          redact = os.environ.get("GITHUB_ACTIONS") == "true" and os.environ.get("FLEET_SECURITY_PRIVATE") != "true"
+          if redact:
+              print('Reproduce locally: trivy config --config "" --misconfig-scanners "$SCANNERS" --severity "$SEVERITY" --format json "$TARGET"')
+              print("Use the caller's base ignore file, checks bundle and skip flags.")
 
           def clean_log(val: object) -> str:
               return re.sub(r"[\r\n\x00-\x1f\x7f]+", " ", str(val))
@@ -1994,7 +2121,16 @@ jobs:
               except (TypeError, ValueError):
                   return 0
 
+          severity_order = ("critical", "high", "medium", "low", "unknown")
+
+          def finding_severity(raw: object) -> str:
+              key = str(raw).lower()
+              return key if key in severity_order else "unknown"
+
           def emit(receipt: dict, rc: int) -> None:
+              if redact:
+                  for number, target in enumerate(receipt["targets"], start=1):
+                      target["target"] = number
               encoded = json.dumps(receipt, sort_keys=True, separators=(",", ":"))
               print(f"trivy-iac receipt: {encoded}")
               summary = os.environ.get("GITHUB_STEP_SUMMARY")
@@ -2072,14 +2208,15 @@ jobs:
           checks_verified = False
 
           for idx, raw_target in enumerate(targets):
+              target_label = f'target {idx + 1}' if redact else raw_target
               resolved = valid_rel(raw_target)
               if resolved is None:
-                  print(f"::error::Invalid trivy-iac target path '{raw_target}'; failing closed")
+                  print(f"::error::Invalid trivy-iac target path '{target_label}'; failing closed")
                   target_receipts.append({"target": raw_target, "status": "invalid_target"})
                   failed = True
                   continue
               if not resolved.exists() or resolved.is_symlink():
-                  print(f"::error::trivy-iac target '{raw_target}' is missing; failing closed")
+                  print(f"::error::trivy-iac target '{target_label}' is missing; failing closed")
                   target_receipts.append({"target": raw_target, "status": "missing_target"})
                   failed = True
                   continue
@@ -2110,7 +2247,7 @@ jobs:
               with open(err_log, "wb") as err_fh:
                   proc = subprocess.run(cmd, env=clean_env, stdout=subprocess.DEVNULL, stderr=err_fh, check=False)
               err_lines = sum(1 for _ in open(err_log, "rb"))
-              print(f"trivy config target={raw_target}: exit={proc.returncode}, {err_lines} stderr line(s) withheld.")
+              print(f"trivy config target={target_label}: exit={proc.returncode}, {err_lines} stderr line(s) withheld.")
               if not checks_verified:
                   meta_file = work / "cache" / "policy" / "metadata.json"
                   try:
@@ -2125,14 +2262,14 @@ jobs:
                   checks_verified = True
 
               if proc.returncode != 0:
-                  print(f"::error::trivy config exited {proc.returncode} on '{raw_target}'; failing closed")
+                  print(f"::error::trivy config exited {proc.returncode} on '{target_label}'; failing closed")
                   target_receipts.append({"target": raw_target, "status": "error"})
                   failed = True
                   continue
               try:
                   report = json.loads(out_json.read_text(encoding="utf-8"))
               except (OSError, ValueError):
-                  print(f"::error::trivy config output for '{raw_target}' is missing or malformed JSON; failing closed")
+                  print(f"::error::trivy config output for '{target_label}' is missing or malformed JSON; failing closed")
                   target_receipts.append({"target": raw_target, "status": "error"})
                   failed = True
                   continue
@@ -2143,6 +2280,7 @@ jobs:
               configs = 0
               passed_checks = 0
               failures = 0
+              counts = Counter[str]()
               for res in results:
                   if not isinstance(res, dict) or res.get("Class") != "config":
                       continue
@@ -2154,15 +2292,18 @@ jobs:
                       if m.get("Status") != "FAIL":
                           continue
                       failures += 1
-                      mid = clean_log(m.get("ID", "?"))
-                      sev = clean_log(m.get("Severity", "?"))
-                      cause = m.get("CauseMetadata") if isinstance(m.get("CauseMetadata"), dict) else {}
-                      line = int_or_zero(cause.get("StartLine", 0))
-                      # Redacted diagnostics: rule ID, severity, target path and line only (never Code.Lines).
-                      print(f"::error file={esc_prop(r_target)},line={line}::Trivy IaC {mid} ({sev}) at {r_target}:{line}")
+                      if redact:
+                          counts[finding_severity(m.get("Severity"))] += 1
+                      else:
+                          mid = clean_log(m.get("ID", "?"))
+                          sev = clean_log(m.get("Severity", "?"))
+                          cause = m.get("CauseMetadata") if isinstance(m.get("CauseMetadata"), dict) else {}
+                          line = int_or_zero(cause.get("StartLine", 0))
+                          # Redacted diagnostics: rule ID, severity, target path and line only (never Code.Lines).
+                          print(f"::error file={esc_prop(r_target)},line={line}::Trivy IaC {mid} ({sev}) at {r_target}:{line}")
 
               if configs == 0:
-                  print(f"::error::trivy config detected zero config files for '{raw_target}'; failing closed")
+                  print(f"::error::trivy config detected zero config files for '{target_label}'; failing closed")
                   target_receipts.append({"target": raw_target, "status": "missing_target", "configs": 0, "passed": 0, "failures": 0})
                   failed = True
                   continue
@@ -2176,9 +2317,17 @@ jobs:
                       "configs": configs,
                       "passed": passed_checks,
                       "failures": failures,
+                      **({"findings_by_severity": counts} if redact else {}),
                   }
               )
 
+          if redact:
+              counts = Counter[str]()
+              for summary in target_receipts:
+                  counts.update(summary.get("findings_by_severity", {}))
+              if counts:
+                  severity = next(key for key in severity_order if counts[key])
+                  print(f"::error::fleet-security-finding/v1 trivy-iac {severity} {counts.total()}")
           emit(
               {
                   "tool": "trivy-iac",
@@ -2198,7 +2347,10 @@ jobs:
 
   trivy-image:
     name: Trivy container image
-    if: ${{ inputs.run-trivy-image }}
+    if: >-
+      ${{ inputs.run-trivy-image && (
+          (inputs.private && github.event.repository.visibility == 'private') || inputs.trivy-ignored-licenses == ''
+      ) }}
     runs-on: ${{ fromJSON(inputs.runs-on) }}
     timeout-minutes: 30
     permissions:
@@ -2270,6 +2422,7 @@ jobs:
           INPUT_IGNORE_UNFIXED: ${{ inputs.trivy-image-ignore-unfixed }}
           INPUT_IGNOREFILE: ${{ inputs.trivy-ignorefile }}
           INPUT_IGNORED_LICENSES: ${{ inputs.trivy-ignored-licenses }}
+          INPUT_LICENSE_POLICY_FILE: ${{ inputs.trivy-license-policy-file }}
         run: |
           set -euo pipefail
           work="$RUNNER_TEMP/trivy-image-work"
@@ -2282,6 +2435,7 @@ jobs:
           import subprocess
           import sys
           import unicodedata
+          from collections import Counter
           from pathlib import Path
 
           work = Path(sys.argv[1])
@@ -2291,20 +2445,25 @@ jobs:
           db_repo = os.environ["TRIVY_DB_REPOSITORY"]
           clean_env = {"PATH": "/usr/bin:/bin", "HOME": str(work / "home"), "TMPDIR": str(work / "tmp")}
 
+          redact = os.environ.get("GITHUB_ACTIONS") == "true" and os.environ.get("FLEET_SECURITY_PRIVATE") != "true"
+          if redact:
+              print('Reproduce locally: trivy image --config "" --scanners "$SCANNERS" --severity "$SEVERITY" --format json "$IMAGE_REF"')
+              print("Use the caller's flags and base ignore file. For a build target, build it locally and use --input with the saved image.")
+
           def clean_log(val: object) -> str:
               return re.sub(r"[\r\n\x00-\x1f\x7f]+", " ", str(val))
 
-          def esc_prop(val: object) -> str:
-              s = clean_log(val)
-              return s.replace("%", "%25").replace(":", "%3A").replace(",", "%2C")
+          severity_order = ("critical", "high", "medium", "low", "unknown")
 
-          def int_or_zero(val: object) -> int:
-              try:
-                  return int(val)
-              except (TypeError, ValueError):
-                  return 0
+          def finding_severity(raw: object) -> str:
+              key = str(raw).lower()
+              return key if key in severity_order else "unknown"
 
           def emit(receipt: dict, rc: int) -> None:
+              if redact:
+                  for number, target in enumerate(receipt["targets"], start=1):
+                      target["target"] = number
+                      target.pop("image_id", None)
               encoded = json.dumps(receipt, sort_keys=True, separators=(",", ":"))
               print(f"trivy-image receipt: {encoded}")
               summary = os.environ.get("GITHUB_STEP_SUMMARY")
@@ -2349,6 +2508,24 @@ jobs:
               emit({"tool": "trivy-image", "version": version, "status": "error", "targets": []}, 1)
 
           ignored_licenses = os.environ.get("INPUT_IGNORED_LICENSES", "").strip()
+          raw_policy = os.environ.get("INPUT_LICENSE_POLICY_FILE", "").strip()
+          if raw_policy:
+              try:
+                  policy_path = valid_rel(raw_policy)
+                  if policy_path is None or not policy_path.is_file() or ignored_licenses:
+                      raise ValueError
+                  policy = json.loads(policy_path.read_text(encoding="utf-8"))
+                  if not isinstance(policy, dict) or set(policy) - {"ignored_licenses", "dispositions"}:
+                      raise ValueError
+                  ignored = policy.get("ignored_licenses", [])
+                  if not isinstance(ignored, list) or any(
+                      not isinstance(item, str) or not re.fullmatch(r"[A-Za-z0-9.+-]+", item) for item in ignored
+                  ):
+                      raise ValueError
+                  ignored_licenses = ",".join(ignored)
+              except (OSError, ValueError, RecursionError):
+                  print("::error title=invalid_license_policy::trivy-license-policy-file must be a valid JSON policy file used without inline licence inputs.")
+                  emit({"tool": "trivy-image", "version": version, "status": "error", "targets": []}, 1)
           if ignored_licenses and not re.fullmatch(r"[A-Za-z0-9.+-]+(,[A-Za-z0-9.+-]+)*", ignored_licenses):
               print("::error::Invalid trivy-ignored-licenses syntax; failing closed")
               emit({"tool": "trivy-image", "version": version, "status": "error", "targets": []}, 1)
@@ -2399,6 +2576,7 @@ jobs:
           target_receipts = []
 
           for idx, spec in enumerate(targets):
+              spec_display = f'target {idx + 1}' if redact else spec
               parts = [p.strip() for p in spec.split("|")]
               kind = parts[0] if parts else ""
               built_tag = None
@@ -2412,17 +2590,17 @@ jobs:
                       df_path = valid_rel(dockerfile_raw)
                       ctx_path = valid_rel(context_raw)
                       if df_path is None or ctx_path is None:
-                          print(f"::error::Invalid build target paths in '{spec}'; failing closed")
+                          print(f"::error::Invalid build target paths in '{spec_display}'; failing closed")
                           target_receipts.append({"target": spec, "status": "invalid_target"})
                           failed = True
                           continue
                       if not df_path.is_file() or df_path.is_symlink() or not ctx_path.is_dir() or ctx_path.is_symlink():
-                          print(f"::error::Dockerfile or context missing for '{spec}'; failing closed")
+                          print(f"::error::Dockerfile or context missing for '{spec_display}'; failing closed")
                           target_receipts.append({"target": spec, "status": "missing_target"})
                           failed = True
                           continue
                       if stage and not STAGE_NAME.fullmatch(stage):
-                          print(f"::error::Invalid build stage name in '{spec}'; failing closed")
+                          print(f"::error::Invalid build stage name in '{spec_display}'; failing closed")
                           target_receipts.append({"target": spec, "status": "invalid_target"})
                           failed = True
                           continue
@@ -2435,7 +2613,7 @@ jobs:
                       with open(build_log, "wb") as log_fh:
                           bproc = subprocess.run(build_cmd, stdout=log_fh, stderr=subprocess.STDOUT, check=False)
                       if bproc.returncode != 0:
-                          print(f"::error::docker build failed (exit {bproc.returncode}) for '{spec}'; build output withheld")
+                          print(f"::error::docker build failed (exit {bproc.returncode}) for '{spec_display}'; build output withheld")
                           target_receipts.append({"target": spec, "status": "error"})
                           failed = True
                           continue
@@ -2450,7 +2628,7 @@ jobs:
                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False,
                       )
                       if sproc.returncode != 0 or not tarball.is_file():
-                          print(f"::error::docker save failed for '{spec}'; failing closed")
+                          print(f"::error::docker save failed for '{spec_display}'; failing closed")
                           target_receipts.append({"target": spec, "status": "error"})
                           failed = True
                           continue
@@ -2459,7 +2637,7 @@ jobs:
                   elif kind == "image" and len(parts) == 2:
                       ref = parts[1]
                       if not DIGEST_REF.fullmatch(ref):
-                          print(f"::error::Image target '{ref}' must be digest-pinned (@sha256:...); failing closed")
+                          print(f"::error::Image target '{spec_display if redact else ref}' must be digest-pinned (@sha256:...); failing closed")
                           target_receipts.append({"target": ref, "status": "invalid_target"})
                           failed = True
                           continue
@@ -2467,7 +2645,7 @@ jobs:
                       image_id = ref.split("@", 1)[1]
                       label = ref
                   else:
-                      print(f"::error::Malformed trivy-image-targets entry '{spec}'; failing closed")
+                      print(f"::error::Malformed trivy-image-targets entry '{spec_display}'; failing closed")
                       target_receipts.append({"target": spec, "status": "invalid_target"})
                       failed = True
                       continue
@@ -2496,17 +2674,18 @@ jobs:
 
                   with open(err_log, "wb") as err_fh:
                       proc = subprocess.run(cmd, env=clean_env, stdout=subprocess.DEVNULL, stderr=err_fh, check=False)
+                  target_label = spec_display if redact else label
                   err_lines = sum(1 for _ in open(err_log, "rb"))
-                  print(f"trivy image target={label}: exit={proc.returncode}, {err_lines} stderr line(s) withheld.")
+                  print(f"trivy image target={target_label}: exit={proc.returncode}, {err_lines} stderr line(s) withheld.")
                   if proc.returncode != 0:
-                      print(f"::error::trivy image exited {proc.returncode} on '{label}'; failing closed")
+                      print(f"::error::trivy image exited {proc.returncode} on '{target_label}'; failing closed")
                       target_receipts.append({"target": label, "image_id": image_id, "status": "error"})
                       failed = True
                       continue
                   try:
                       report = json.loads(out_json.read_text(encoding="utf-8"))
                   except (OSError, ValueError):
-                      print(f"::error::trivy image output for '{label}' is malformed JSON; failing closed")
+                      print(f"::error::trivy image output for '{target_label}' is malformed JSON; failing closed")
                       target_receipts.append({"target": label, "image_id": image_id, "status": "error"})
                       failed = True
                       continue
@@ -2516,6 +2695,7 @@ jobs:
                   pkgs = 0
                   vulns = 0
                   lics = 0
+                  counts = Counter[str]()
                   for res in results:
                       if not isinstance(res, dict):
                           continue
@@ -2523,21 +2703,27 @@ jobs:
                       pkgs += len(res.get("Packages") or [])
                       for v in res.get("Vulnerabilities") or []:
                           vulns += 1
-                          vid = clean_log(v.get("VulnerabilityID", "?"))
-                          pkg = clean_log(v.get("PkgName", "?"))
-                          inst = clean_log(v.get("InstalledVersion", "?"))
-                          fix = clean_log(v.get("FixedVersion", "") or "unfixed")
-                          sev = clean_log(v.get("Severity", "?"))
-                          print(f"::error::Trivy image vuln {vid} ({sev}) {pkg} {inst} (fixed: {fix}) in {r_target}")
+                          if redact:
+                              counts[finding_severity(v.get("Severity"))] += 1
+                          else:
+                              vid = clean_log(v.get("VulnerabilityID", "?"))
+                              pkg = clean_log(v.get("PkgName", "?"))
+                              inst = clean_log(v.get("InstalledVersion", "?"))
+                              fix = clean_log(v.get("FixedVersion", "") or "unfixed")
+                              sev = clean_log(v.get("Severity", "?"))
+                              print(f"::error::Trivy image vuln {vid} ({sev}) {pkg} {inst} (fixed: {fix}) in {r_target}")
                       for lic in res.get("Licenses") or []:
                           lics += 1
-                          lname = clean_log(lic.get("Name", "?"))
-                          pkg = clean_log(lic.get("PkgName", "?"))
-                          cat = clean_log(lic.get("Category", "?"))
-                          sev = clean_log(lic.get("Severity", "?"))
-                          print(f"::error::Trivy image licence {lname} ({cat}/{sev}) {pkg} in {r_target}")
+                          if redact:
+                              counts[finding_severity(lic.get("Severity"))] += 1
+                          else:
+                              lname = clean_log(lic.get("Name", "?"))
+                              pkg = clean_log(lic.get("PkgName", "?"))
+                              cat = clean_log(lic.get("Category", "?"))
+                              sev = clean_log(lic.get("Severity", "?"))
+                              print(f"::error::Trivy image licence {lname} ({cat}/{sev}) {pkg} in {r_target}")
                   if pkgs == 0:
-                      print(f"::error::trivy image inventoried zero packages for '{label}'; failing closed")
+                      print(f"::error::trivy image inventoried zero packages for '{target_label}'; failing closed")
                       target_receipts.append({"target": label, "image_id": image_id, "status": "missing_target", "packages": 0, "vulns": 0, "licenses": 0})
                       failed = True
                       continue
@@ -2552,6 +2738,7 @@ jobs:
                           "packages": pkgs,
                           "vulns": vulns,
                           "licenses": lics,
+                          **({"findings_by_severity": counts} if redact else {}),
                       }
                   )
               finally:
@@ -2560,6 +2747,13 @@ jobs:
                   if built_tag:
                       subprocess.run(["docker", "image", "rm", "-f", built_tag], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
 
+          if redact:
+              counts = Counter[str]()
+              for summary in target_receipts:
+                  counts.update(summary.get("findings_by_severity", {}))
+              if counts:
+                  severity = next(key for key in severity_order if counts[key])
+                  print(f"::error::fleet-security-finding/v1 trivy-image {severity} {counts.total()}")
           emit(
               {
                   "tool": "trivy-image",
@@ -2644,6 +2838,8 @@ jobs:
               expected = "success" if on else "skipped"
               print(f"{name}: {result} (required {expected})")
               if result != expected:
+                  if on and result == "skipped" and name in ("trivy-fs", "trivy-image"):
+                      print("::error title=public_inline_license_policy::Use trivy-license-policy-file for licence policy in redacted Actions runs.")
                   print(f"::error::Job {name} finished with result {result}, expected {expected}")
                   failed = True
               job_summary = {"enabled": on, "result": result, "receipt": None}
