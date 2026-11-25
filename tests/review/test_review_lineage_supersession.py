@@ -95,6 +95,116 @@ def report(*pairs, exclude_head=None):
 ORPHAN_REJECTION = "VERDICT: REQUEST_CHANGES\nF1 [P1] scripts/unit.py:1 the guard drops a case."
 
 
+class UnhashableString(str):
+    __hash__ = None
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        pytest.param("started_at", "9999-12-31T23:59:59-01:00", id="started_at-utc-overflow"),
+        pytest.param("status", [], id="status-list"),
+        pytest.param("status", {}, id="status-dict"),
+        pytest.param("agent", [], id="agent-list"),
+        pytest.param("agent", {}, id="agent-dict"),
+        *(
+            pytest.param(field, [], id=f"{field}-list")
+            for field in (
+                "task_id", "model", "resolved_model", "resolved_model_source", "run_nonce", "mode", "repository",
+                "review_branch", "worktree_branch", "review_mode", "review_profile", "review_author_model",
+                "review_risk", "research_role", "research_task_family", "task_family", "advisory_role", "type",
+                "trial_label", "trial_role", "trial_qualified_task", "provider_terminal_status",
+                "provider_terminal_error", "never_started_reason", "output_schema_path", "worktree_base_sha",
+                "pinned_head", "result_sha256", "output_schema_sha256", "require_review_verdict",
+                "provider_terminal_failure", "resolved_model_known", "review_language_lane", "language_lane",
+                "review_attempt",
+            )
+        ),
+        *(
+            pytest.param(field, value, id=f"{field}-{case}")
+            for field in ("started_at", "finished_at")
+            for value, case in (
+                (10**100, "huge"), (-1, "negative"), ("", "empty"), ("2026-10-28T20:01:00", "naive"),
+                ("0001-01-01T00:00:00+01:00", "utc-underflow"),
+                (UnhashableString(started(1)), "str-subclass"),
+            )
+        ),
+        *(
+            pytest.param(field, value, id=f"{field}-{case}")
+            for field in ("schema_version", "pr", "provider_pgid", "returncode", "sources_mcp_call_count")
+            for value, case in ((True, "boolean"), (1.0, "float"), (10**100, "huge"), (-(10**100), "too-negative"))
+        ),
+        *(
+            pytest.param(field, -1, id=f"{field}-negative")
+            for field in ("schema_version", "pr", "provider_pgid", "sources_mcp_call_count")
+        ),
+        *(
+            pytest.param(field, value, id=f"{field}-{case}")
+            for field in ("orphaned_child_tasks", "unknown_child_tasks")
+            for value, case in (({}, "not-a-list"), ([[]], "nested-list"), ([""], "empty-item"))
+        ),
+        pytest.param("task_id", "different-task", id="task_id-mismatch"),
+        pytest.param("schema_version", None, id="schema_version-null"),
+        pytest.param("review_attempt", {}, id="review_attempt-empty"),
+        pytest.param("status", "", id="status-empty"),
+        pytest.param("status", None, id="status-null"),
+        pytest.param("status", UnhashableString("done"), id="status-str-subclass"),
+        pytest.param("agent", UnhashableString("codex"), id="agent-str-subclass"),
+        pytest.param("model", "", id="model-empty"),
+        pytest.param("finished_at", "9999-12-31T23:59:59-01:00", id="finished_at-utc-overflow"),
+        pytest.param("worktree_base_sha", "", id="worktree_base_sha-empty"),
+        pytest.param("pinned_head", "invalid-sha", id="pinned_head-bad-sha"),
+        pytest.param("result_sha256", "A" * 64, id="result_sha256-uppercase"),
+        pytest.param("output_schema_sha256", "a" * 63, id="output_schema_sha256-short"),
+        pytest.param("output_schema_path", "", id="output_schema_path-empty"),
+        pytest.param("run.task_id", [], id="run-task_id-list"),
+        pytest.param("run.task_id", UnhashableString("malformed-r1"), id="run-task_id-str-subclass"),
+        pytest.param("run.reply", b"VERDICT: APPROVE", id="run-reply-bytes"),
+        pytest.param("run.reply", UnhashableString("VERDICT: APPROVE"), id="run-reply-str-subclass"),
+        pytest.param("disk.repository", ["org/repo"], id="disk-repository-list"),
+        pytest.param("disk.repository", " ", id="disk-repository-blank"),
+        pytest.param("disk.repository", None, id="disk-repository-null"),
+        pytest.param("disk.repository", "invalid-slug", id="disk-repository-invalid-slug"),
+        pytest.param("disk.research_role", ["review"], id="disk-role-list"),
+        pytest.param("disk.advisory_role", {}, id="disk-advisory-role-dict"),
+        pytest.param("disk.pr", "1398", id="disk-pr-string"),
+        pytest.param("disk.review_branch", [], id="disk-branch-list"),
+        pytest.param("supplied.pr", "1398", id="supplied-pr-string"),
+        pytest.param("supplied.review_branch", [], id="supplied-branch-list"),
+    ],
+)
+def test_check_lineage_refuses_malformed_record_fields(field, value, tmp_path):
+    """Defect class: malformed task-record values crash or bypass the review lineage gate."""
+    run, comment = review("malformed-r1", APPROVED, "VERDICT: APPROVE", minute=1)
+    record = {**run.record, "returncode": -15, "orphaned_child_tasks": [], "unknown_child_tasks": []}
+    source, _, name = field.rpartition(".")
+    task = "<unknown>" if field == "run.task_id" else run.task_id
+    with pytest.raises(LineageRefused, match=rf"review task {task} .*\b{name}\b"):
+        if source in {"disk", "supplied"}:
+            record.update(schema_version=2, repository="org/repo", review_branch="codex/other")
+            if name == "research_role":
+                record.pop("review_profile")
+                record["review_branch"] = "codex/target"
+            elif name not in {"pr", "review_branch"}:
+                record["pr"] = 1398
+            record[name] = value
+            path = tmp_path / f"{run.task_id}.json"
+            if source == "disk":
+                path.write_text(json.dumps(record))
+                path.with_suffix(".result").write_text(run.reply)
+            records = [(path, record)] if source == "supplied" else None
+            selected = lineage_runs(tmp_path, repository="org/repo", number=1398, branch="codex/target", records=records)
+        elif field == "run.task_id":
+            # A legacy record can leave its task identity to the enclosing run.
+            del record["task_id"]
+            selected = [ReviewRun(value, record, run.reply)]
+        elif field == "run.reply":
+            selected = [ReviewRun(run.task_id, record, value)]
+        else:
+            selected = [ReviewRun(run.task_id, {**record, name: value}, run.reply)]
+        check_lineage(runs=selected, comments=[comment], login="fleet", approved=APPROVED)
+
+
 def test_lineage_keeps_the_reply_when_a_listed_review_moves_to_archive(tmp_path, monkeypatch):
     """Defect class: moving a listed review to the archive refuses lineage admission."""
     branch = "codex/reviewed"
@@ -314,8 +424,10 @@ UNSUPERSEDED = "review task sol-r1 finished but its verdict is unpublished"
         ),
         # A witness pinned to another head, or to no valid head, is evidence the recorder refuses.
         (lambda: _pinned(review("sol-r2", APPROVED, "VERDICT: APPROVE", minute=2), CANDIDATE), UNSUPERSEDED),
-        (lambda: _pinned(review("sol-r2", APPROVED, "VERDICT: APPROVE", minute=2), "invalid-sha"), UNSUPERSEDED),
-        (lambda: _pinned(review("sol-r2", APPROVED, "VERDICT: APPROVE", minute=2), []), UNSUPERSEDED),
+        (lambda: _pinned(review("sol-r2", APPROVED, "VERDICT: APPROVE", minute=2), "invalid-sha"),
+         "review task sol-r2 has invalid pinned_head"),
+        (lambda: _pinned(review("sol-r2", APPROVED, "VERDICT: APPROVE", minute=2), []),
+         "review task sol-r2 has invalid pinned_head"),
     ],
     ids=[
         "conflicting-marker",
@@ -564,5 +676,7 @@ def test_a_rate_limited_codex_run_is_skipped_only_beside_its_bound_published_ret
     if admitted:
         assert lineage((limited, None), retry, approve) == (["openai"], [])
     else:
-        with pytest.raises(LineageRefused, match=r"review task rl-r0 \(rate_limited\) has no reply on record"):
+        refusal = ("review task rl-r0 has invalid output_schema_path" if case == "schema-path-missing"
+                   else r"review task rl-r0 \(rate_limited\) has no reply on record")
+        with pytest.raises(LineageRefused, match=refusal):
             lineage((limited, None), retry, approve)
