@@ -796,11 +796,7 @@ def require_operator_inputs(tree: Tree) -> None:
                 finally:
                     os.close(child)
 
-    check(os.fstat(tree.fd), ".")
-    entry = tree.read(DESCRIPTOR)
-    descriptor = decode(entry[0]) if entry is not None else {}
-    declared = [DESCRIPTOR, *(spec["path"] for spec in descriptor.get("sources", {}).values())]
-    for path in declared:
+    def check_chain(path: str) -> None:
         parts = relative(path).split("/")
         for depth, name in enumerate(parts, 1):
             parent = "/".join(parts[:depth - 1])
@@ -808,25 +804,40 @@ def require_operator_inputs(tree: Tree) -> None:
                 try:
                     info = os.stat(name, dir_fd=fd, follow_symlinks=False)
                 except FileNotFoundError:
-                    break  # an absent optional source; build() has decided whether that is allowed
+                    break  # an absent optional source; build() decides whether that is allowed
             check(info, "/".join(parts[:depth]))
             if depth == len(parts) and stat.S_ISDIR(info.st_mode):
                 with tree.directory(path) as source:
                     walk(source, path + "/")
 
+    # Every input is verified before the plan reads it, the descriptor before its own bytes:
+    # once the chain is protected, only its owner can change what build() then reads.
+    check(os.fstat(tree.fd), ".")
+    check_chain(DESCRIPTOR)
+    entry = tree.read(DESCRIPTOR)
+    descriptor = decode(entry[0]) if entry is not None else {}
+    sources = descriptor.get("sources", {}) if isinstance(descriptor, dict) else {}
+    for spec in sources.values() if isinstance(sources, dict) else ():
+        if isinstance(spec, dict) and isinstance(spec.get("path"), str):
+            check_chain(spec["path"])
+
 
 def deploy(tree: Tree, *, check: bool, print_manifest: bool = False, inputs_commit: str | None = None,
            workspace: bool = False) -> int:
+    if workspace:
+        require_operator_inputs(tree)
     plan = build(tree, CommitInputs(tree, inputs_commit) if inputs_commit is not None else None)
     if workspace:
+        # Protected before and after the plan read them: only their owner could have changed
+        # the inputs in between, so the plan holds the operator's bytes.
+        require_operator_inputs(tree)
         if TARGETS["claude"] not in plan.roots:
             # The workspace runs Claude Code; enabling it makes the release's mandatory Claude
             # hook settings a deployment requirement, so a guard-less workspace never verifies.
             raise Invalid("a workspace target must enable the claude provider")
-        require_operator_inputs(tree)
-        if tree.read(".claude/settings.local.json") is not None:
+        if ".claude/settings.local.json" in plan.files or tree.read(".claude/settings.local.json") is not None:
             # Claude loads local settings beside the deployed ones; in a workspace nothing else
-            # validates them, so none may exist.
+            # validates them, so none may be planned or present.
             raise Invalid("a workspace target must not hold .claude/settings.local.json")
     old = old_state(tree)
     problems = preflight(tree, plan, old, check)

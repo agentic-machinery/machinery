@@ -175,6 +175,15 @@ def test_workspace_target_deploys_outside_every_checkout_and_only_there(consumer
     assert run("--workspace", "--project-root", str(workspace), "--check") == 2
     assert "settings.local.json" in capsys.readouterr().err
     (workspace / ".claude/settings.local.json").unlink()
+    # A local settings layer planned from the workspace's own sources is refused before any write.
+    planned = write(workspace, "agents_extensions/shared/settings.local.json", "{}")
+    descriptor(workspace, preserve=[".agent/tmp"])
+    before = snapshot(workspace)
+    assert run("--workspace", "--project-root", str(workspace)) == 2
+    assert "settings.local.json" in capsys.readouterr().err
+    assert snapshot(workspace) == before and not (workspace / ".claude/settings.local.json").exists()
+    planned.unlink()
+    descriptor(workspace)
     capsys.readouterr()
 
     nested = consumer / "tools" / "cto-workspace"
