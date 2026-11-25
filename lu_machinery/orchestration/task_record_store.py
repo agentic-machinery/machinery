@@ -226,44 +226,38 @@ def _report_foreign(path: Path, raw: bytes) -> None:
 atexit.register(_flush_foreign_reports, force=True)
 
 
-def _has_v2_record_name(path: Path) -> bool:
-    """Whether dispatch could have written ``path`` as a v2 record, archive collision stamps included."""
-    if not path.name.endswith(".json"):
-        return False
-    stem = path.name[:-5]
-    while match := _REDISPATCH_ARCHIVED_STEM_RE.fullmatch(stem):
-        stem = match["base"]
-    return _V2_TASK_ID_RE.fullmatch(stem) is not None and ".." not in stem
+def _reject_json_constant(token: str) -> Any:
+    """Refuse ``NaN`` and ``Infinity``: Python's decoder admits them, JSON does not."""
+    raise ValueError(f"non-JSON constant {token}")
 
 
 def parse_task_record(path: Path, raw: bytes, *, display_unknown_schema: bool = False) -> dict[str, Any] | None:
     """Distinguish records from sidecars without hiding damaged record claims.
 
+    Only a strict JSON object or exactly ``[]`` can be foreign (``None``): the
+    object classification below decides whether an object claims a run. Every
+    other input raises ``ValueError``, so no reader can skip a file that may
+    hold a record: text that is not strict JSON (bare record members, a
+    truncated object, ``NaN`` or ``Infinity``), an empty, whitespace, BOM or
+    NUL-only file (a crash can leave a record zero-filled), and any other array
+    or scalar (an array can hold a record).
+
     Dispatch writes an integer schema version and a task-id basename; legacy
     records may identify a run by filename and lifecycle fields alone. The v2
-    basename and archive collision stamps follow the by-id naming contract. A
-    broken JSON object may have lost its markers to truncation, so it remains
-    a record claim and fails closed. So does a file carrying a v2 record name
-    whose bytes are empty, whitespace, BOM or NUL only: a crash can leave a
-    record zero-filled, and a blank file has no content that marks it foreign.
+    basename and archive collision stamps follow the by-id naming contract.
     """
     try:
         decoded = raw.decode("utf-8")
-        record = json_depth.loads(decoded, max_depth=_JSON_MAX_DEPTH)
+        record = json_depth.loads(decoded, max_depth=_JSON_MAX_DEPTH, parse_constant=_reject_json_constant)
     except RecursionError as exc:
         raise ValueError(f"task record {path} exceeds JSON parser nesting") from exc
     except ValueError as exc:
-        if isinstance(exc, UnicodeDecodeError):
-            raise
-        prefix = 0
-        while prefix < len(decoded) and (decoded[prefix].isspace() or decoded[prefix] in "\ufeff\x00"):
-            prefix += 1
-        if decoded.startswith("{", prefix):
-            raise
-        if prefix == len(decoded) and _has_v2_record_name(path):
+        if not isinstance(exc, UnicodeDecodeError) and all(ch.isspace() or ch in "\ufeff\x00" for ch in decoded):
             raise ValueError(f"task record {path} is empty") from None
-        record = None
+        raise
     if not isinstance(record, dict):
+        if record != []:
+            raise ValueError(f"task record {path} is not a JSON object")
         _report_foreign(path, raw)
         return None
     task_id = record.get("task_id")
