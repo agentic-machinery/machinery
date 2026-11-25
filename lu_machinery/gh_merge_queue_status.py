@@ -21,11 +21,14 @@ from pathlib import Path
 from typing import Any
 
 from lu_machinery.ci.ci_timings import (
+    PR_NUM_RE,
+    QUEUE_BRANCH_RE,
     _gh_env,
     extract_pr_number,
     resolve_repository,
 )
 from lu_machinery.common import github_client, json_depth
+from lu_machinery.orchestration.fleet_repos import parse_ascii_positive_int
 from lu_machinery.publish.github import read
 
 
@@ -34,6 +37,8 @@ def parse_pr_identifier(value: str | int) -> int:
     if isinstance(value, bool):
         raise ValueError(f"Invalid pull request identifier: {value!r}")
     if isinstance(value, int):
+        if value <= 0:
+            raise ValueError(f"Invalid pull request identifier: {value!r}")
         return value
     raw = str(value)
     if not raw.isascii():
@@ -44,19 +49,33 @@ def parse_pr_identifier(value: str | int) -> int:
     # Match URL like https://github.com/.../pull/1234
     url_m = re.search(r"/pull/([0-9]+)(?!\d)", text)
     if url_m:
-        return int(url_m.group(1))
+        raw_num = url_m.group(1)
+        parsed = parse_ascii_positive_int(raw_num) if len(raw_num) <= 19 else None
+        if parsed is None:
+            raise ValueError(f"Could not parse pull request number from: {value!r}")
+        return parsed
     # Match queue branch or feature branch with PR number
-    pr_num = extract_pr_number(text)
-    if pr_num is not None:
+    if QUEUE_BRANCH_RE.search(text) or PR_NUM_RE.search(text):
+        pr_num = extract_pr_number(text)
+        if pr_num is None:
+            raise ValueError(f"Could not parse pull request number from: {value!r}")
         return pr_num
     # Match branch or text with prefix '#123' or 'pr123'
     m = re.search(r"(?:^|[#/_-]|(?ai:pr))([0-9]+)(?:[#/_.-]|$)", text)
     if m:
-        return int(m.group(1))
+        raw_num = m.group(1)
+        parsed = parse_ascii_positive_int(raw_num) if len(raw_num) <= 19 else None
+        if parsed is None:
+            raise ValueError(f"Could not parse pull request number from: {value!r}")
+        return parsed
     # Fallback to pure digits if present
     digits = re.findall(r"(?<!\d)[0-9]+(?!\d)", text)
     if digits:
-        return int(digits[0])
+        raw_num = digits[0]
+        parsed = parse_ascii_positive_int(raw_num) if len(raw_num) <= 19 else None
+        if parsed is None:
+            raise ValueError(f"Could not parse pull request number from: {value!r}")
+        return parsed
     raise ValueError(f"Could not parse pull request number from: {value!r}")
 
 

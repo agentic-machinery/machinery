@@ -148,6 +148,15 @@ def _ledger_from_state(state: dict) -> FindingsLedger:
     return FindingsLedger.from_events(FindingEvent(**raw) for raw in state.get("findings", []))
 
 
+def _parse_positive_pr_arg(raw: str) -> int:
+    from lu_machinery.orchestration.fleet_repos import parse_ascii_positive_int
+
+    parsed = parse_ascii_positive_int(raw) if len(raw) <= 19 else None
+    if parsed is None:
+        raise argparse.ArgumentTypeError(f"invalid positive ASCII PR number: {raw!r}")
+    return parsed
+
+
 def _cmd_target(args: argparse.Namespace) -> int:
     state = _load_state(args.state_file)
     if state.get("baseline"):
@@ -192,6 +201,18 @@ def _cmd_target(args: argparse.Namespace) -> int:
         )
     except (TargetResolutionError, OSError, subprocess.TimeoutExpired) as exc:
         print(json.dumps({"error": str(repository_target_error(args.repo, exc))}), file=sys.stderr)
+        return 1
+    except UnicodeDecodeError:
+        print(
+            json.dumps(
+                {
+                    "error": str(
+                        repository_target_error(args.repo, TargetResolutionError("checkout origin is not valid ASCII"))
+                    )
+                }
+            ),
+            file=sys.stderr,
+        )
         return 1
 
     state["target"] = asdict(target)
@@ -384,6 +405,9 @@ def _cmd_check_expansion(args: argparse.Namespace) -> int:
     except TargetResolutionError as exc:
         print(json.dumps({"error": str(exc)}), file=sys.stderr)
         return 1
+    except UnicodeDecodeError:
+        print(json.dumps({"error": "repository metadata is not valid UTF-8"}), file=sys.stderr)
+        return 1
 
     result = check_expansion_breaker(baseline, current_files, current_non_test_loc)
     print(json.dumps({"triggered": result.triggered, "reason": result.reason}, indent=2))
@@ -438,6 +462,10 @@ def _checkout_repository(repo_root: Path) -> str:
     """
     try:
         origin = _origin_github_repo(repo_root)
+    except TargetResolutionError as exc:
+        raise CloseoutStateError(f"repository unknown: {exc}") from exc
+    except UnicodeDecodeError as exc:
+        raise CloseoutStateError("repository unknown: checkout origin is not valid ASCII") from exc
     except (OSError, subprocess.TimeoutExpired):
         origin = None
     if origin is None:
@@ -504,6 +532,8 @@ def _cmd_resolve_reviewer(args: argparse.Namespace) -> int:
             literal_paths = git_changed_paths(repo_root, base_sha, target.head_sha)
         except TargetResolutionError as exc:
             raise CloseoutStateError(str(exc)) from exc
+        except UnicodeDecodeError as exc:
+            raise CloseoutStateError("repository metadata is not valid UTF-8") from exc
         changed_paths = tuple(dict.fromkeys((*changed_paths, *literal_paths)))
         if target.mode != "local":
             # A committed target has complete Git authorship: select from the
@@ -1418,7 +1448,7 @@ def _checklist_diff(repo_root: Path, merge_base: str, head: str) -> list[dict[st
             if current is None:
                 raise CloseoutStateError(f"diff names a file the status list lacks: {name!r}")
         elif line.startswith("@@ "):
-            match = re.match(r"@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@", line)
+            match = re.match(r"@@ -([0-9]{1,10})(?:,([0-9]{1,10}))? \+([0-9]{1,10})(?:,([0-9]{1,10}))? @@", line)
             if match is None:
                 raise CloseoutStateError("unparseable diff hunk header")
             old_line, new_line = int(match.group(1)), int(match.group(3))
@@ -1732,7 +1762,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p_target.add_argument("--commit", help="Commit SHA for --mode commit. Example: HEAD")
     p_target.add_argument("--branch", help="Branch name for --mode branch. Example: grok/impl-8946")
     p_target.add_argument("--base", help="Base ref for --mode branch. Example: origin/main")
-    p_target.add_argument("--pr", type=int, help="Pull request number for --mode pr. Example: 8946")
+    p_target.add_argument("--pr", type=_parse_positive_pr_arg, help="Pull request number for --mode pr. Example: 8946")
     p_target.set_defaults(func=_cmd_target)
 
     p_freeze = sub.add_parser("freeze", help="Freeze the scope baseline from the resolved target")

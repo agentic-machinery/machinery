@@ -17,7 +17,7 @@ if __package__ in (None, ""):
 from lu_machinery.common import github_client, json_depth
 from lu_machinery.fleet_comms.authority import AuthorityService
 from lu_machinery.orchestration import task_lifecycle
-from lu_machinery.orchestration.fleet_repos import ascii_repo_slug
+from lu_machinery.orchestration.fleet_repos import ascii_repo_slug, parse_ascii_positive_int
 from lu_machinery.publish.github import publish, read
 
 # This package's import name, from the unresolved file location: never from __package__, which a
@@ -100,9 +100,10 @@ def closing_issues(pr: dict, repository: str) -> list[tuple[str, int]]:
             if isinstance(url, str)
             else None
         )
-        if not match:
+        number = parse_ascii_positive_int(match[2]) if match and len(match[2]) <= 19 else None
+        if not match or number is None:
             raise ValueError("invalid closing issue URL")
-        issues.add((match[1], int(match[2])))
+        issues.add((match[1], number))
     reference = r"(?:[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)?#[1-9][0-9]*(?!\w)"
     separator = r"[ \t]*(?:,|(?ai:and)\b|&)[ \t]*(?:(?ai:and)[ \t]+)?"
     for closing in re.finditer(
@@ -110,7 +111,9 @@ def closing_issues(pr: dict, repository: str) -> list[tuple[str, int]]:
         visible_markdown(pr.get("body") or ""),
     ):
         for match in re.finditer(r"(?:([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+))?#([1-9][0-9]*)(?!\w)", closing[1]):
-            issues.add((match[1] or repository, int(match[2])))
+            number = parse_ascii_positive_int(match[2]) if len(match[2]) <= 19 else None
+            if number is not None:
+                issues.add((match[1] or repository, number))
     return sorted(issues)
 
 
@@ -188,6 +191,13 @@ def _item_set_key(repository: str, number: int, items: list[dict]) -> str:
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
 
 
+def _parse_positive_pr_arg(raw: str) -> int:
+    parsed = parse_ascii_positive_int(raw) if len(raw) <= 19 else None
+    if parsed is None:
+        raise argparse.ArgumentTypeError(f"invalid positive ASCII PR number: {raw!r}")
+    return parsed
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Report outstanding acceptance criteria for a merged PR's issues.\n"
@@ -201,7 +211,7 @@ def main(argv: list[str] | None = None) -> int:
         "Exit codes: 0 = no outstanding items; 1 = outstanding items; 2 = read/write or state error.\n"
         "Related: docs/best-practices/task-quality.md; #11213.",
     )
-    parser.add_argument("--pr", type=int, required=True, help="Merged PR number, e.g. 123, in the current repository.")
+    parser.add_argument("--pr", type=_parse_positive_pr_arg, required=True, help="Merged PR number, e.g. 123, in the current repository.")
     parser.add_argument("--apply", action="store_true", help="Apply reopen, comment and escalation actions (default: dry-run).")
     args = parser.parse_args(argv)
     try:

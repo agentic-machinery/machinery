@@ -42,7 +42,7 @@ from lu_machinery.common.git_context import sanitized_git_env
 # The post-release PR's title. A range holding only these PRs is unchanged.
 BUMP_TITLE = "chore(release): record {released} and start {next}"
 _BUMP = re.compile(r"chore\(release\): record \d+\.\d+\.\d+ and start \d+\.\d+\.\d+( \(#\d+\))?")
-_VERSION = re.compile(r"(\d+)\.(\d+)\.(\d+)")
+_VERSION = re.compile(r"([0-9]{1,9})\.([0-9]{1,9})\.([0-9]{1,9})")
 # Same value grammar as lu_machinery.ci.check_agent_attribution (``X-Agent: <agent>/<task-id>``).
 _X_AGENT = re.compile(r"[a-z][a-z0-9]*(?:-[a-z0-9]+)*/[A-Za-z0-9._-]+")
 _X_AGENT_EXAMPLE = "claude/claude-opus-5-5"
@@ -1577,7 +1577,7 @@ def utc_date() -> str:
 
 
 def pr_number(output: str) -> int:
-    match = re.search(r"/pull/(\d+)\b", output)
+    match = re.search(r"/pull/([1-9][0-9]{0,18})(?!\w)", output)
     if match is None:
         raise CutError(f"no pull request URL in publisher output: {output.strip()[:200]}")
     return int(match.group(1))

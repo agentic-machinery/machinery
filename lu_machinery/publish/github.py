@@ -1030,7 +1030,7 @@ def _issue_node(read_runner, gh_repo, number, cwd, environment, *, allowed_slugs
         if parsed_html.scheme != "https" or parsed_html.netloc.lower() != "github.com":
             return None
         parts = [p for p in parsed_html.path.split("/") if p]
-        if len(parts) != 4 or parts[2] != "issues" or parse_ascii_positive_int(parts[3]) != number:
+        if len(parts) != 4 or parts[2] != "issues" or len(parts[3]) > 19 or parse_ascii_positive_int(parts[3]) != number:
             return None
         html_slug = _github_slug_or_none(f"{parts[0]}/{parts[1]}")
         if html_slug is None:
@@ -1263,7 +1263,8 @@ def _created_resource_number(created, *, kind):
         return None
     from lu_machinery.orchestration.fleet_repos import parse_ascii_positive_int
 
-    return parse_ascii_positive_int(match.group(1))
+    raw_num = match.group(1)
+    return parse_ascii_positive_int(raw_num) if len(raw_num) <= 19 else None
 
 
 def _link_created_issue(created, parent_ref, parent_node, gh_repo, read_runner, runner, cwd, environment):
@@ -1332,12 +1333,14 @@ def _pr_closing_issues(body: str, gh_repo: str) -> list[int]:
             ref_repo = match.group("url_repo")
             if not same_repository(ref_repo, gh_repo):
                 continue
-            number = parse_ascii_positive_int(match.group("url_num"))
+            raw_num = match.group("url_num")
+            number = parse_ascii_positive_int(raw_num) if len(raw_num) <= 19 else None
         else:
             ref_repo = match.group("slug")
             if ref_repo is not None and not same_repository(ref_repo, gh_repo):
                 continue
-            number = parse_ascii_positive_int(match.group("num"))
+            raw_num = match.group("num")
+            number = parse_ascii_positive_int(raw_num) if len(raw_num) <= 19 else None
         if number is not None and number not in found:
             found.append(number)
     return found
@@ -5295,7 +5298,18 @@ def _parse_args(argv):
                             raise argparse.ArgumentTypeError("invalid artifact") from None
 
                     kwargs["type"] = asset_arg
-            elif kind in {"number", "count"}:
+            elif kind == "number":
+
+                def _parse_verb_number(raw: str) -> int:
+                    from lu_machinery.orchestration.fleet_repos import parse_ascii_positive_int
+
+                    parsed = parse_ascii_positive_int(raw) if len(raw) <= 19 else None
+                    if parsed is None:
+                        raise argparse.ArgumentTypeError(f"invalid positive ASCII number: {raw!r}")
+                    return parsed
+
+                kwargs["type"] = _parse_verb_number
+            elif kind == "count":
                 kwargs["type"] = int
             if kind == "workflow_inputs":
                 kwargs["type"] = loads
@@ -5331,10 +5345,18 @@ def _parse_args(argv):
             "repository labels only confirm that identity, and inherited Git overrides cannot select it."
         ),
     )
+    def _parse_positive_number_arg(raw: str) -> int:
+        from lu_machinery.orchestration.fleet_repos import parse_ascii_positive_int
+
+        parsed = parse_ascii_positive_int(raw) if len(raw) <= 19 else None
+        if parsed is None:
+            raise argparse.ArgumentTypeError(f"invalid positive ASCII number: {raw!r}")
+        return parsed
+
     for key in ("number",):
         read_parser.add_argument(
             "--" + key,
-            type=int,
+            type=_parse_positive_number_arg,
             default=argparse.SUPPRESS,
             help="Positive issue, PR, run or check-run ID; omitted by default",
         )

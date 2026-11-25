@@ -61,7 +61,7 @@ DEFAULT_RETRY_DELAY_SECONDS = 15.0
 
 _SHA = re.compile(r"[0-9a-f]{40}\Z")
 _REPOSITORY = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\Z")
-_PR_SUFFIX = re.compile(r"\(#([1-9][0-9]*)\)\Z")
+_PR_SUFFIX = re.compile(r"\(#([1-9][0-9]{0,18})\)\Z")
 
 QUEUE_QUERY = """
 query($owner: String!, $name: String!, $branch: String!, $qualified: String!, $after: String) {
@@ -141,13 +141,14 @@ def parse_event(payload: object) -> Event:
             raise ValueError("invalid base ref")
         branch = base_ref.removeprefix("refs/heads/")
         match = re.fullmatch(
-            rf"refs/heads/gh-readonly-queue/{re.escape(branch)}/pr-([1-9][0-9]*)-([0-9a-f]{{40}})", head_ref
+            rf"refs/heads/gh-readonly-queue/{re.escape(branch)}/pr-([1-9][0-9]{{0,18}})-([0-9a-f]{{40}})", head_ref
         )
         if match is None or match[2] != base or base == head:
             raise ValueError("queue ref does not match the event's base")
+        ref_pr = int(match[1])
     except (KeyError, TypeError, ValueError) as error:
         raise GateError(f"merge_group event unreadable: {error}") from None
-    return Event(repository, branch, base, head, int(match[1]))
+    return Event(repository, branch, base, head, ref_pr)
 
 
 def _git(*args: str, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:

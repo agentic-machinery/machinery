@@ -56,7 +56,7 @@ def parse_issue_work_id(work_id: str | None) -> tuple[str, int] | None:
     if len(parts) == 5 and parts[0] == WORK_ID_PREFIX and parts[1] == SOURCE_PUBLIC and parts[3] == "issue":
         from lu_machinery.orchestration.fleet_repos import parse_ascii_positive_int
 
-        number = parse_ascii_positive_int(parts[4])
+        number = parse_ascii_positive_int(parts[4]) if len(parts[4]) <= 19 else None
         if number is None:
             return None
         return parts[2], number
@@ -84,12 +84,16 @@ def extract_body_relations(
     """Extract source-provided relations from public issue body text."""
     if not body:
         return []
+    from lu_machinery.orchestration.fleet_repos import parse_ascii_positive_int
+
     rels: list[dict[str, str]] = []
     seen: set[tuple[str, str]] = set()
 
-    def add(rel_type: str, number: str, evidence: str) -> None:
-        if number == str(self_number):
+    def add(rel_type: str, raw_number: str, evidence: str) -> None:
+        parsed = parse_ascii_positive_int(raw_number) if len(raw_number) <= 19 else None
+        if parsed is None or parsed == self_number:
             return
+        number = str(parsed)
         key = (rel_type, number)
         if key in seen:
             return
@@ -268,7 +272,7 @@ def resolve_live_blockers(
                 lifecycle_by_id[str(k)] = state
                 lifecycle_by_id[k] = state
             elif isinstance(k, str):
-                parsed_k = parse_ascii_positive_int(k)
+                parsed_k = parse_ascii_positive_int(k) if len(k) <= 19 else None
                 if parsed_k is not None:
                     lifecycle_by_id[str(parsed_k)] = state
                     lifecycle_by_id[parsed_k] = state
