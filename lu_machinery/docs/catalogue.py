@@ -430,7 +430,7 @@ def owner_keys(repo: Path) -> set[str]:
     for name, section in OWNER_SOURCES:
         relative = f'config/{name}.yaml'
         indexed = f'{tree}/{relative}'
-        paths = git(repo, 'ls-files', '-z', '--', f':(top,literal){indexed}').split(b'\0')
+        paths = git(repo, 'ls-files', '--full-name', '-z', '--', f':(top,literal){indexed}').split(b'\0')
         if indexed.encode() in paths:
             data = yaml.safe_load(git(repo, 'show', f':{indexed}').decode('utf-8')) or {}
             keys.update((data.get(section) or {}).keys())
