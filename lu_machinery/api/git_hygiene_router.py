@@ -620,8 +620,9 @@ _CI_STATES = {"success", "failure", "error", "pending", "expected"}
 _QUEUE_STATES = {"queued", "awaiting_checks", "locked", "mergeable", "unmergeable"}
 # A reading older than the delegate panel's own bound is not a live count.
 LIVE_WORKERS_MAX_AGE_S = 60.0
-# Since when each repository has been unreadable: the first of its consecutive failed readings in
-# this process. The first good reading clears it, and a Monitor restart starts it again.
+# Since when each project (by fleet key, stable across a slug change) has been unreadable: the first of
+# its consecutive failed readings in this process. The first good reading clears it, and a Monitor
+# restart starts it again.
 _UNKNOWN_SINCE: dict[str, str] = {}
 _PR_FIELDS = (
     "number isDraft createdAt headRefName mergeStateStatus"
@@ -727,7 +728,7 @@ def _pull_request_row(
 
 def _unreadable_row(entry: dict[str, Any], reason: str, observed_at: str, *, private: bool | None = None) -> dict[str, Any]:
     """A project that could not be read: unknown with the time it first failed, never a zero."""
-    since = _UNKNOWN_SINCE.setdefault(entry["repository"], observed_at)
+    since = _UNKNOWN_SINCE.setdefault(entry["key"], observed_at)
     return {**entry, "status": "unknown", "reason": reason, "private": private, "open_total": None,
             "pull_requests": [], "default_branch": None, "pin": None, "unknown_since": since}
 
@@ -986,7 +987,7 @@ def compute_pull_requests(project_root: Path, *, tasks_dir: Path | None = None) 
                 or not _graphql_int(total, len(nodes))):
             rows.append(_unreadable_row(entry, "github_invalid_response", observed_at, private=private))
             continue
-        _UNKNOWN_SINCE.pop(entry["repository"], None)
+        _UNKNOWN_SINCE.pop(entry["key"], None)
         rows.append({
             **entry,
             "status": "ok",
