@@ -2,6 +2,7 @@
 
 import argparse
 import contextlib
+import copy
 import json
 import math
 import os
@@ -37,6 +38,7 @@ from lu_machinery.dispatcher import (
 from lu_machinery.dispatcher.environment import child_env, probe_env
 from lu_machinery.dispatcher.types import ReviewAccess, StartRefusal, TaskSpec
 from lu_machinery.dispatcher.watchdog import DEFAULT_INITIAL_RESPONSE_TIMEOUT_S, DEFAULT_SILENCE_TIMEOUT_S, deadlines
+from lu_machinery.orchestration.task_record_store import NonFiniteRecordValue
 
 # Grok runs through Cursor's TUI: --agent cursor --model grok-4.7-high (grok-build is the separate Grok TUI).
 ALIASES = dict(sol="codex", gemini="agy", deepseek="opencode")
@@ -55,6 +57,28 @@ class _PromptPath(type(Path())):
 # The entry points as a user runs them: the wrapper by its checkout path, this module by its import name.
 _DISPATCH = f"{Path(__file__).absolute().parents[1].name}/dispatch.py"
 _CLI = f"-m {Path(__file__).absolute().parents[1].name}.dispatcher.cli"
+
+
+def finite_number(text: str) -> float:
+    """A float; a spelling of NaN or an infinity is refused at parse time, since the value reaches a task record (#1440)."""
+    value = float(text)
+    if not math.isfinite(value):
+        raise argparse.ArgumentTypeError(f"must be a finite number, got {text!r}")
+    return value
+
+
+def _no_non_finite(text: str) -> str:
+    """A numeric option's text, unchanged; a spelling of NaN or an infinity is refused at parse time (#1440).
+
+    Any other text goes on to the option's own check (``savant_token_cap``, ``resolve_claude_budget_usd``).
+    """
+    try:
+        value = float(text)
+    except ValueError:
+        return text
+    if not math.isfinite(value):
+        raise argparse.ArgumentTypeError(f"must be a finite number, got {text!r}")
+    return text
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -134,7 +158,10 @@ def build_parser() -> argparse.ArgumentParser:
         ("trial-role", None, "Shadow trial role, e.g. review; read-only, with --trial-qualified-task and --pinned-head (default: none)"),
         ("trial-qualified-task", None, "Successful qualified non-trial task on the same input, head and role, e.g. qualified-42 (default: none)"),
     ):
-        dispatch.add_argument(f"--{flag}", default=default, required=flag in {"agent", "model"}, help=help_text)
+        if flag in {"max-budget-usd", "max-tokens"}:
+            dispatch.add_argument(f"--{flag}", default=default, help=help_text, type=_no_non_finite)
+        else:
+            dispatch.add_argument(f"--{flag}", default=default, required=flag in {"agent", "model"}, help=help_text)
     dispatch.add_argument(
         "--contributor-mode",
         choices=("on", "off"),
@@ -227,7 +254,7 @@ def build_parser() -> argparse.ArgumentParser:
         "Excluded: " + ", ".join(sorted(git.SPARSE_EXCLUDE_DEFAULT)),
     )
     dispatch.add_argument(
-        "--hard-timeout", type=float, default=7200, help="Deadline seconds; 0 disables (default: 7200)"
+        "--hard-timeout", type=finite_number, default=7200, help="Deadline seconds; 0 disables (default: 7200)"
     )
     dispatch.add_argument(
         "--silence-timeout", type=int, default=DEFAULT_SILENCE_TIMEOUT_S, metavar="SECS",
@@ -1135,7 +1162,7 @@ def main(argv=None) -> int:
         if args.command == "worktrees":
             result = _worktrees(args.repo, args.all)
         elif args.command == "list":
-            result = [worker._observe(record) for record in store.list_tasks(include_archive=args.all)]
+            result = [_observe_listed(record) for record in store.list_tasks(include_archive=args.all)]
             if args.status is not None:
                 result = [record for record in result if record.get("status") == args.status]
         elif args.command == "wait":
@@ -1165,6 +1192,28 @@ def main(argv=None) -> int:
             message = type(exc).__name__
         print(f"dispatcher: {message}", file=sys.stderr)
         return 2
+
+
+def _observe_listed(record: dict) -> dict:
+    """One row of ``dispatch list``: the record as ``worker._observe`` leaves it, as strict JSON (#1440).
+
+    A heal the writer refuses leaves that record as stored, and the other records are still listed.
+    ``_observe`` updates the dict it heals before writing it, so it gets a copy: a refused record is listed as
+    read, never in the unwritten ``crashed`` state. A row holding NaN or an infinity (a record stored before
+    #1440) lists each such top-level field as ``null``, as the settlement fallback records it, so the listing
+    stays valid JSON for strict readers; stderr names the first such field, and the record on disk is
+    unchanged.
+    """
+    task_id = record.get("task_id")
+    try:
+        row = worker._observe(copy.deepcopy(record))
+    except NonFiniteRecordValue as exc:
+        print(f"dispatcher: task record {task_id} not healed: {exc.code}", file=sys.stderr)
+        row = copy.deepcopy(record)
+    cleared = store.clear_non_finite_fields(row)
+    if cleared is not None:
+        print(f"dispatcher: task record {task_id} listed with non-finite fields as null: {cleared}", file=sys.stderr)
+    return row
 
 
 if __name__ == "__main__":

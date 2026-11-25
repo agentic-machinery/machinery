@@ -1228,9 +1228,11 @@ def test_registry_loaders_resolve_profile_config_at_call_time(unconfigured, tmp_
     from lu_machinery import agent_identity
     from lu_machinery.common import git_credentials
     from lu_machinery.dispatcher import git as dispatch_git
-    from lu_machinery.fleet import hramatka_scope_gate, sibling_git
+    from lu_machinery.fleet import hramatka_scope_gate, ignored_task_output, sibling_git
+    from lu_machinery.ops import driver_lanes
     from lu_machinery.orchestration import (
         driver_agent_type,
+        fleet_taxonomy,
         issue_stream_audit,
         slot_routing,
         validate_fleet_taxonomy,
@@ -1258,12 +1260,20 @@ def test_registry_loaders_resolve_profile_config_at_call_time(unconfigured, tmp_
             encoding="utf-8",
         )
         (root / "area_assignments.yaml").write_text(
-            f"version: 1\n"
+            f"schema_version: 1\n"
             f"assignments:\n"
             f"  {name}-area:\n"
             f"    slots: [{slot}]\n"
             f"    driver_agent_type: {agent_type}\n",
             encoding="utf-8",
+        )
+        (root / "fleet_taxonomy.yaml").write_text(
+            f"schema_version: 1\nareas:\n  {name}-area:\n    id: {name}-area\n    aliases: [{name}-lane]\n    epics:\n      - number: {epic}\n        name: {name}\n",
+            encoding="utf-8",
+        )
+        shutil.copyfile(driver_lanes.DATA_FILE, root / "driver_lanes.json")
+        (root / "terminal_abandon_succession.yaml").write_bytes(
+            ignored_task_output.SUCCESSION_MAP.read_bytes() + f"# {name}\n".encode()
         )
         profile_file = root / "profile.v1.json"
         profile_file.write_text(
@@ -1277,6 +1287,9 @@ def test_registry_loaders_resolve_profile_config_at_call_time(unconfigured, tmp_
                         "fleet_repos": "fleet_repos.yaml",
                         "issue_streams": "issue_streams.yaml",
                         "area_assignments": "area_assignments.yaml",
+                        "fleet_taxonomy": "fleet_taxonomy.yaml",
+                        "driver_lanes": "driver_lanes.json",
+                        "terminal_abandon_succession": "terminal_abandon_succession.yaml",
                     },
                 }
             ),
@@ -1291,6 +1304,14 @@ def test_registry_loaders_resolve_profile_config_at_call_time(unconfigured, tmp_
     assert validate_fleet_taxonomy.default_assignments_path() == validate_fleet_taxonomy.ASSIGNMENTS_PATH
     assert slot_routing._default_assignments_path() == slot_routing.DEFAULT_ASSIGNMENTS_PATH
     assert stream_inventory.resolve_streams_yaml(tmp_path) == stream_inventory.DEFAULT_STREAMS_YAML
+    assert driver_lanes.default_data_path() == driver_lanes.DATA_FILE
+    assert fleet_taxonomy.default_taxonomy_path() == fleet_taxonomy.DEFAULT_TAXONOMY_PATH
+    assert ignored_task_output.default_succession_map_path() == ignored_task_output.SUCCESSION_MAP
+
+    def _succession_digest(profile_file: Path) -> str:
+        import hashlib
+
+        return hashlib.sha256((profile_file.parent / "terminal_abandon_succession.yaml").read_bytes()).hexdigest()
 
     profile_a = _write_consumer_profile("alpha", "alpha-org/alpha-repo", "alpha", 111, "claude-alpha", "alpha-driver", "https")
     profile_b = _write_consumer_profile("beta", "beta-org/beta-repo", "beta", 222, "claude-beta", "beta-driver", "ssh")
@@ -1313,6 +1334,11 @@ def test_registry_loaders_resolve_profile_config_at_call_time(unconfigured, tmp_
         assert driver_agent_type.resolve_driver_agent_type("alpha-area") == "alpha-driver"
         assert slot_routing._default_assignments_path() == profile_a.parent / "area_assignments.yaml"
         assert validate_fleet_taxonomy.default_assignments_path() == profile_a.parent / "area_assignments.yaml"
+        assert driver_lanes.default_data_path() == profile_a.parent / "driver_lanes.json"
+        assert driver_lanes.load_registry().lanes
+        assert fleet_taxonomy.resolve_area("alpha-lane").id == "alpha-area"
+        assert driver_agent_type.resolve_driver_agent_type("alpha-lane") == "alpha-driver"
+        assert ignored_task_output.succession_streams()[1] == _succession_digest(profile_a)
 
         # Switch to Profile B in the same process -> call-time resolution switches immediately.
         monkeypatch.setenv(rr.PROFILE_PATH_ENV, str(profile_b))
@@ -1327,6 +1353,30 @@ def test_registry_loaders_resolve_profile_config_at_call_time(unconfigured, tmp_
         assert "claude-beta" in agent_identity.get_valid_agents()
         assert "claude-alpha" not in agent_identity.get_valid_agents()
         assert driver_agent_type.resolve_driver_agent_type("beta-area") == "beta-driver"
+        assert driver_lanes.default_data_path() == profile_b.parent / "driver_lanes.json"
+        assert fleet_taxonomy.resolve_area("beta-lane").id == "beta-area"
+        with pytest.raises(fleet_taxonomy.UnknownAreaError):
+            fleet_taxonomy.resolve_area("alpha-lane")
+        assert driver_agent_type.resolve_driver_agent_type("beta-lane") == "beta-driver"
+        assert ignored_task_output.succession_streams()[1] == _succession_digest(profile_b)
+
+        # A declared lane or taxonomy file that is missing fails closed with each reader's own typed
+        # error; the Fleet Comms roster reports its lane part unavailable instead of raising.
+        from lu_machinery.fleet_comms import authority
+
+        kept = {name: (profile_b.parent / name).read_bytes() for name in ("driver_lanes.json", "fleet_taxonomy.yaml")}
+        for name in kept:
+            (profile_b.parent / name).unlink()
+        with pytest.raises(driver_lanes.LaneConfigError, match="driver_lanes"):
+            driver_lanes.load_registry()
+        with pytest.raises(fleet_taxonomy.FleetTaxonomyError, match="fleet_taxonomy"):
+            fleet_taxonomy.resolve_area("beta-lane")
+        authority._ROSTER_CACHE.clear()
+        roster, complete = authority._load_roster()
+        assert complete is False
+        assert authority.DURABLE_CTO_RECIPIENT in roster
+        for name, content in kept.items():
+            (profile_b.parent / name).write_bytes(content)
 
         # Broken declared target in active profile fails closed rather than falling back to packaged defaults.
         (profile_b.parent / "issue_streams.yaml").unlink()
@@ -1363,7 +1413,7 @@ def test_registry_loaders_resolve_profile_config_at_call_time(unconfigured, tmp_
         from lu_machinery.fleet_comms import authority
 
         (profile_b.parent / "area_assignments.yaml").write_text(
-            "version: 1\nexternal_recipients: eggbot\nassignments:\n  beta-area:\n    slots: [claude-beta]\n    driver_agent_type: 7\n",
+            "schema_version: 1\nexternal_recipients: eggbot\nassignments:\n  beta-area:\n    slots: [claude-beta]\n    driver_agent_type: 7\n",
             encoding="utf-8",
         )
         authority._ROSTER_CACHE.clear()
@@ -1377,7 +1427,7 @@ def test_registry_loaders_resolve_profile_config_at_call_time(unconfigured, tmp_
 
         # F7: mixed-type slots list raises SlotAssignmentsConfigError instead of falling back to suffix inference.
         (profile_b.parent / "area_assignments.yaml").write_text(
-            "version: 1\nassignments:\n  beta-area:\n    slots: [claude-beta, 7]\n",
+            "schema_version: 1\nassignments:\n  beta-area:\n    slots: [claude-beta, 7]\n",
             encoding="utf-8",
         )
         with pytest.raises(slot_routing.SlotAssignmentsConfigError, match="slots"):
@@ -1392,7 +1442,7 @@ def test_registry_loaders_resolve_profile_config_at_call_time(unconfigured, tmp_
         # F4: malformed assignments mapping raises ValueError in stalled_work.owner_lanes().
         from lu_machinery.orchestration import stalled_work
 
-        (profile_b.parent / "area_assignments.yaml").write_text("version: 1\nassignments: []\n", encoding="utf-8")
+        (profile_b.parent / "area_assignments.yaml").write_text("schema_version: 1\nassignments: []\n", encoding="utf-8")
         with pytest.raises(ValueError, match="assignments"):
             stalled_work.owner_lanes()
 
@@ -1401,5 +1451,293 @@ def test_registry_loaders_resolve_profile_config_at_call_time(unconfigured, tmp_
         assert driver_agent_type.main(["--lane", "beta-area"]) == 2
         _, _, external_roster = fleet_router._fleet_seat_roster()
         assert external_roster == "unavailable"
+
+        # F2 (PR 1476 r1): YAML constructor failures (e.g. !!int "") in profile succession map raise ValueError.
+        (profile_b.parent / "terminal_abandon_succession.yaml").write_text(
+            'schema: terminal-abandon-succession-map.v1\nstreams:\n  "epic:1":\n    initiators: [!!int ""]\n',
+            encoding="utf-8",
+        )
+        with pytest.raises(ValueError, match="succession map unreadable"):
+            ignored_task_output.succession_streams()
     finally:
         git_credentials.repository_registry.cache_clear()
+
+
+def test_validate_fleet_taxonomy_refuses_deeply_nested_acyclic_aliases_without_recursion_error(tmp_path, capsys):
+    """Defect class (F8): deeply nested acyclic YAML values in uniqueItems arrays crash schema validation with RecursionError."""
+    from lu_machinery.orchestration import fleet_taxonomy, validate_fleet_taxonomy
+
+    valid_assignments = tmp_path / "area_assignments.yaml"
+    valid_assignments.write_text(
+        "schema_version: 1\nassignments:\n  atlas:\n    driver_agent_type: atlas-driver\n    slots: [claude-atlas]\n",
+        encoding="utf-8",
+    )
+    deep_a = "[" * 365 + "1" + "]" * 365
+    deep_b = "[" * 365 + "2" + "]" * 365
+    deep_taxonomy = tmp_path / "fleet_taxonomy.yaml"
+    deep_taxonomy.write_text(
+        f"schema_version: 1\nareas:\n  atlas:\n    id: atlas\n    aliases: [{deep_a}, {deep_b}]\n    epics: []\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(validate_fleet_taxonomy.FleetTaxonomyValidationError, match="recursion depth"):
+        validate_fleet_taxonomy.validate_fleet_taxonomy(
+            taxonomy_path=deep_taxonomy,
+            assignments_path=valid_assignments,
+        )
+    assert (
+        validate_fleet_taxonomy.main(
+            ["--taxonomy", str(deep_taxonomy), "--assignments", str(valid_assignments), "--json"]
+        )
+        == 1
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ok"] is False
+    assert "recursion depth" in payload["error"]
+
+    # Runtime taxonomy loader shares the same typed refusal.
+    with pytest.raises(fleet_taxonomy.FleetTaxonomyError, match="recursion depth"):
+        fleet_taxonomy.load_fleet_taxonomy(deep_taxonomy)
+
+    # Sibling: deeply nested external_recipients in area_assignments.yaml also returns a typed refusal.
+    valid_taxonomy = tmp_path / "valid_taxonomy.yaml"
+    valid_taxonomy.write_text(
+        "schema_version: 1\nareas:\n  atlas:\n    id: atlas\n    aliases: []\n    epics: []\n",
+        encoding="utf-8",
+    )
+    deep_assignments = tmp_path / "deep_assignments.yaml"
+    deep_assignments.write_text(
+        "schema_version: 1\n"
+        f"external_recipients: [{deep_a}, {deep_b}]\n"
+        "assignments:\n  atlas:\n    driver_agent_type: atlas-driver\n    slots: [claude-atlas]\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(validate_fleet_taxonomy.FleetTaxonomyValidationError, match="recursion depth"):
+        validate_fleet_taxonomy.validate_fleet_taxonomy(
+            taxonomy_path=valid_taxonomy,
+            assignments_path=deep_assignments,
+        )
+
+    # Shared acyclic anchors stay valid.
+    shared_taxonomy = tmp_path / "shared_taxonomy.yaml"
+    shared_taxonomy.write_text(
+        "schema_version: 1\nareas:\n  atlas:\n    id: atlas\n    aliases: []\n    epics: &ep []\n"
+        "  other:\n    id: other\n    aliases: []\n    epics: *ep\n",
+        encoding="utf-8",
+    )
+    shared_assignments = tmp_path / "shared_assignments.yaml"
+    shared_assignments.write_text(
+        "schema_version: 1\nassignments:\n"
+        "  atlas:\n    driver_agent_type: atlas-driver\n    slots: [claude-atlas]\n"
+        "  other:\n    driver_agent_type: other-driver\n    slots: [claude-other]\n",
+        encoding="utf-8",
+    )
+    assert (
+        validate_fleet_taxonomy.validate_fleet_taxonomy(
+            taxonomy_path=shared_taxonomy,
+            assignments_path=shared_assignments,
+        )["ok"]
+        is True
+    )
+
+    # Valid YAML merge overrides (<<: *defaults with explicit id override) remain valid.
+    merge_taxonomy = tmp_path / "merge_taxonomy.yaml"
+    merge_taxonomy.write_text(
+        "schema_version: 1\nareas:\n"
+        "  atlas: &defaults\n    id: atlas\n    aliases: [atlas-alias]\n    epics: []\n"
+        "  other:\n    <<: *defaults\n    id: other\n    aliases: [other-alias]\n",
+        encoding="utf-8",
+    )
+    assert (
+        validate_fleet_taxonomy.validate_fleet_taxonomy(
+            taxonomy_path=merge_taxonomy,
+            assignments_path=shared_assignments,
+        )["ok"]
+        is True
+    )
+    assert fleet_taxonomy.load_fleet_taxonomy(merge_taxonomy).areas["other"].id == "other"
+
+    # Nonregular paths (e.g. a named pipe with no writer) fail closed immediately without blocking.
+    fifo = tmp_path / "taxonomy.fifo"
+    os.mkfifo(fifo)
+    assert (
+        validate_fleet_taxonomy.main(
+            ["--taxonomy", str(fifo), "--assignments", str(valid_assignments), "--json"]
+        )
+        == 1
+    )
+    fifo_payload = json.loads(capsys.readouterr().out)
+    assert fifo_payload["ok"] is False
+    assert "Not a regular file" in fifo_payload["error"]
+    with pytest.raises(fleet_taxonomy.FleetTaxonomyError, match="Not a regular file"):
+        fleet_taxonomy.load_fleet_taxonomy(fifo)
+
+
+def test_a_key_written_twice_in_one_config_mapping_merge_key_included_is_refused_by_every_fleet_config_loader(tmp_path):
+    """Defect class: a config key written twice in one source mapping is silently last-wins (R2-YAML-MERGE).
+
+    One rule for the taxonomy, assignments, succession map and lane data loaders: a key written twice
+    is refused, the YAML merge key ``<<`` counts like any other key, and merging (``<<: *a``,
+    ``<<: [*a, *b]``) with explicit overrides stays valid.
+    """
+    from lu_machinery.fleet import ignored_task_output
+    from lu_machinery.ops import driver_lanes
+    from lu_machinery.orchestration import fleet_taxonomy, validate_fleet_taxonomy
+
+    assignments = tmp_path / "area_assignments.yaml"
+    assignments.write_text(
+        "schema_version: 1\nassignments:\n"
+        "  atlas:\n    driver_agent_type: atlas-driver\n    slots: [claude-atlas]\n"
+        "  other:\n    driver_agent_type: other-driver\n    slots: [claude-other]\n",
+        encoding="utf-8",
+    )
+    # Valid in every other respect, so the second ``<<`` is the only reason to refuse.
+    twice = tmp_path / "twice.yaml"
+    twice.write_text(
+        "schema_version: 1\nareas:\n"
+        "  atlas: &a\n    id: atlas\n    aliases: [atlas-alias]\n    epics: []\n"
+        "  other:\n    <<: *a\n    <<: *a\n    id: other\n    aliases: [other-alias]\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(validate_fleet_taxonomy.FleetTaxonomyValidationError, match="duplicate YAML key: '<<'"):
+        validate_fleet_taxonomy.validate_fleet_taxonomy(taxonomy_path=twice, assignments_path=assignments)
+    with pytest.raises(fleet_taxonomy.FleetTaxonomyError, match="duplicate YAML key: '<<'"):
+        fleet_taxonomy.load_fleet_taxonomy(twice)
+    twice_assignments = tmp_path / "twice_assignments.yaml"
+    twice_assignments.write_text(
+        "schema_version: 1\nassignments:\n"
+        "  atlas: &x\n    driver_agent_type: atlas-driver\n    slots: [claude-atlas]\n"
+        "  other:\n    <<: *x\n    <<: *x\n    driver_agent_type: other-driver\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(validate_fleet_taxonomy.FleetTaxonomyValidationError, match="duplicate YAML key: '<<'"):
+        validate_fleet_taxonomy.load_validated_assignments(twice_assignments)
+
+    # One merge key naming several mappings, with explicit overrides, is still valid.
+    merged = tmp_path / "merged.yaml"
+    merged.write_text(
+        "schema_version: 1\nareas:\n"
+        "  atlas: &a\n    id: atlas\n    aliases: [atlas-alias]\n    epics: []\n"
+        "  other:\n    <<: [*a]\n    id: other\n    aliases: [other-alias]\n",
+        encoding="utf-8",
+    )
+    assert validate_fleet_taxonomy.validate_fleet_taxonomy(taxonomy_path=merged, assignments_path=assignments)["ok"]
+    assert fleet_taxonomy.load_fleet_taxonomy(merged).alias_to_area["other-alias"].id == "other"
+
+    # The succession map follows the same rule: an override through one merge key is valid ...
+    header = 'schema: terminal-abandon-succession-map.v1\nstreams:\n  "epic:1": &one\n    initiators: [a-x]\n'
+    succession = tmp_path / "succession.yaml"
+    succession.write_text(header + '  "epic:2":\n    <<: *one\n    initiators: [b-x]\n', encoding="utf-8")
+    assert ignored_task_output.succession_streams(succession)[0] == {"a-x": "epic:1", "b-x": "epic:2"}
+    # ... and a second merge key in one mapping is refused, never last-wins.
+    succession.write_text(
+        header + '  "epic:2": &two\n    initiators: [b-x]\n  "epic:3":\n    <<: *one\n    <<: *two\n',
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="succession map unreadable"):
+        ignored_task_output.succession_streams(succession)
+
+    # Lane data is JSON: a member name written twice is refused too.
+    lanes = tmp_path / "driver_lanes.json"
+    packaged = driver_lanes._PACKAGED_DATA_FILE.read_text(encoding="utf-8")
+    assert packaged.lstrip().startswith("{")
+    lanes.write_text(packaged.replace("{", '{"lanes": [], ', 1), encoding="utf-8")
+    with pytest.raises(driver_lanes.LaneConfigError, match="duplicate JSON key: 'lanes'"):
+        driver_lanes.load_registry(lanes)
+    lanes.write_text(packaged, encoding="utf-8")
+    assert driver_lanes.load_registry(lanes).lanes
+
+
+def test_a_non_regular_config_file_is_refused_without_a_blocking_open_by_every_touched_reader(tmp_path, monkeypatch):
+    """Defect class: a config read that opens a FIFO or other non-regular file blocks (R2-NONREGULAR-PATH).
+
+    Every config read this change adds or touches goes through ``read_regular_file_bytes``, which
+    opens without blocking and checks the opened descriptor, so a file that is regular when
+    inspected and a FIFO when opened is refused too. Each caller keeps its own typed refusal.
+    """
+    import signal
+
+    from lu_machinery.fleet import ignored_task_output
+    from lu_machinery.ops import driver_lanes
+    from lu_machinery.orchestration import fleet_taxonomy, validate_fleet_taxonomy
+
+    fifo = tmp_path / "config.fifo"
+    os.mkfifo(fifo)
+    regular = tmp_path / "regular.yaml"
+    regular.write_text("schema_version: 1\n", encoding="utf-8")
+
+    def _hung(signum, frame):
+        raise AssertionError("a config read blocked on a FIFO")
+
+    class _InspectsRegular:
+        """``os`` whose ``stat`` reports the regular file: the FIFO appears only at open."""
+
+        def __getattr__(self, name):
+            return getattr(os, name)
+
+        @staticmethod
+        def stat(path, *args, **kwargs):
+            return os.stat(regular)
+
+    previous = signal.signal(signal.SIGALRM, _hung)
+    signal.alarm(20)
+    try:
+        for swapped in (False, True):
+            if swapped:  # regular at inspection, a FIFO at open: only the descriptor check can refuse
+                monkeypatch.setattr(validate_fleet_taxonomy, "os", _InspectsRegular())
+            with pytest.raises(ValueError, match="succession map unreadable"):
+                ignored_task_output.succession_streams(fifo)
+            with pytest.raises(driver_lanes.LaneConfigError, match="Not a regular file"):
+                driver_lanes.load_registry(fifo)
+            with pytest.raises(fleet_taxonomy.FleetTaxonomyError, match="Not a regular file"):
+                fleet_taxonomy.load_fleet_taxonomy(fifo)
+            with pytest.raises(validate_fleet_taxonomy.FleetTaxonomyValidationError, match="Not a regular file"):
+                validate_fleet_taxonomy.load_validated_assignments(fifo)
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, previous)
+
+
+def test_a_profile_refusal_on_a_default_config_path_is_each_callers_own_typed_refusal(tmp_path, monkeypatch):
+    """Defect class: a default config path resolved outside the caller's error translation (PR1479-F1).
+
+    A refused profile entry (a FIFO, a symlink, a bad profile) or an unusable root setting (a relative
+    state root) must surface as the same typed refusal the caller gives for an explicit path, never as
+    a bare ``MachineryConfigError`` or an exception from a fail-open reader.
+    """
+    from lu_machinery.fleet import ignored_task_output
+    from lu_machinery.fleet_comms import authority
+    from lu_machinery.ops import driver_lanes
+    from lu_machinery.orchestration import driver_agent_type, fleet_taxonomy, validate_fleet_taxonomy
+
+    assignments = tmp_path / "area_assignments.yaml"
+    assignments.write_text(
+        "schema_version: 1\nassignments:\n  atlas:\n    driver_agent_type: atlas-driver\n    slots: [claude-atlas]\n",
+        encoding="utf-8",
+    )
+    for error in (profile.ProfileError, rr.MachineryConfigError):
+
+        def _refused(name, *, _error=error, **_kwargs):
+            raise _error(f"consumer config {name!r} is not a regular file")
+
+        monkeypatch.setattr(profile, "config_path", _refused)
+        for kwargs in ({}, {"assignments_path": assignments}):  # the second reaches the taxonomy default
+            with pytest.raises(driver_agent_type.DriverAgentConfigError, match="not a regular file"):
+                driver_agent_type.resolve_driver_agent_type("atlas-alias", **kwargs)
+        assert driver_agent_type.main(["--lane", "atlas-alias", "--assignments", str(assignments)]) == 2
+        with pytest.raises(validate_fleet_taxonomy.FleetTaxonomyValidationError, match="not a regular file"):
+            validate_fleet_taxonomy.load_validated_assignments()
+        with pytest.raises(validate_fleet_taxonomy.FleetTaxonomyValidationError, match="not a regular file"):
+            validate_fleet_taxonomy.validate_fleet_taxonomy()
+        assert validate_fleet_taxonomy.main(["--json"]) == 1
+        with pytest.raises(fleet_taxonomy.FleetTaxonomyError, match="not a regular file"):
+            fleet_taxonomy.load_fleet_taxonomy()
+        with pytest.raises(ValueError, match="succession map unreadable"):
+            ignored_task_output.succession_streams()
+        with pytest.raises(driver_lanes.LaneConfigError, match="not a regular file"):
+            driver_lanes.load_registry()
+        # The recipient roster is fail-open by design: a refused source leaves it incomplete, never raises.
+        monkeypatch.setattr(authority, "_ROSTER_CACHE", {})
+        names, complete = authority._load_roster()
+        assert complete is False
+        assert authority.DURABLE_CTO_RECIPIENT in names

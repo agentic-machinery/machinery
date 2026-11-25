@@ -26,13 +26,14 @@ neither replaces that immutable parent. No fetched-target, event-base ancestry,
 changes still fail the checkout-integrity check.
 The diff uses NUL-delimited Git paths, rename destinations and tracked regular
 files. Deleted files are reported.
-Unsafe paths, missing guards and symlinks fail closed. Tests for changed code come
-from the direct edges of the static scan in `lu_machinery/ci/components.py`
-(`scan_imports`): imports, literal loads, file reads and Python subprocess targets.
-Only direct importers are selected; the transitive closure spans most of the suite,
-which the merge group runs. A `conftest.py` counts as an importer for every test file under its directory, because
-pytest loads it for each of them: code a conftest imports or copies into a fixture selects those tests too. A deleted file has no edges in the candidate, so the
-surviving tests that depended on it come from the same scan of the base tree.
+Unsafe paths, missing guards and symlinks fail closed. The selector follows up to
+two file edges in reverse from changed code. The static scan in
+`lu_machinery/ci/components.py` records imports, literal loads, file reads and
+Python subprocess targets. Pytest loads each `conftest.py` for the tests under
+its directory. The selector expands that scope for a conftest that depends
+directly on changed code. An indirect conftest adds no implicit test scope.
+For a deleted target, the selector reads the first file edge from the base tree.
+Merge-group pytest covers longer chains and indirect conftest scopes.
 The component inventory chooses no tests.
 
 CI does not run on PR title and body edits; an edit would restart the whole
@@ -75,6 +76,8 @@ a text reader of that file (#12789). The whole literal must match; comments, doc
 other bare string statements, f-string pieces and literals in `conftest.py` never count.
 After the main selection, remaining direct importers and text readers share 60 extra seconds,
 ordered by duration, then by path. `text_reading_test_files` lists the reader candidates.
+Tests two file edges away fill the remaining estimate budget, in the same order.
+`indirect_importing_test_files` lists those candidates.
 Tests still over budget appear in `deferred_files` for merge-group pytest. The extra pass
 can extend the timeout to the total estimate times 1.18, rounded up to at most 550 seconds. Infrastructure
 includes conftest, pytest configuration, dependency locks, the CI workflow, CI Python setup,

@@ -28,7 +28,7 @@ from lu_machinery.orchestration.dead_worker_state import (
     mark_orphaned_worktree_prep_crashed,
     worker_liveness,
 )
-from lu_machinery.orchestration.task_record_store import task_state_lock
+from lu_machinery.orchestration.task_record_store import NonFiniteRecordValue, task_state_lock
 
 
 class Refused(ValueError):
@@ -48,25 +48,40 @@ def _write(path, record):
         write_record_unlocked(path, record)
 
 
+def _heal_dead_in_scan(path, state):
+    """``heal_dead`` for the admission scan: a record the writer refuses (#1440) stays unhealed; admission goes on.
+
+    Returns whether the record was written, so the admission receipt lists only confirmed heals.
+    """
+    try:
+        return heal_dead(path, state)
+    except NonFiniteRecordValue as exc:
+        print(f"dispatcher: dead task record {Path(path).name} not healed: {exc.code}", file=sys.stderr)
+        return False
+
+
 def heal_dead(path, state):
-    """Adapter for legacy _heal_dead_task: only proven death permits a write."""
+    """Adapter for legacy _heal_dead_task: only proven death permits a write. Returns whether it wrote."""
     if state.get("status") not in legacy.ACTIVE_STATUSES:
-        return
+        return False
     if state.get("pid"):
-        mark_dead_worker_terminal(
+        _record, wrote = mark_dead_worker_terminal(
             path, state, source="admission", terminal_status="crashed",
             allowed_statuses=("running", "spawning"), pid_alive=legacy.process_alive,
             resolve_head=_head, write=_write,
         )
     elif worktree_prep.is_orphaned_prep_record(state):
-        mark_orphaned_worktree_prep_crashed(
+        _record, wrote = mark_orphaned_worktree_prep_crashed(
             path, state, source="admission", is_orphaned=worktree_prep.is_orphaned_prep_record, write=_write,
         )
     elif legacy.is_orphaned_admission_hold(state):
-        mark_orphaned_admission_hold_crashed(
+        _record, wrote = mark_orphaned_admission_hold_crashed(
             path, state, source="admission", is_orphaned=legacy.is_orphaned_admission_hold,
             reason=legacy.ORPHANED_HOLD_REASON, write=_write,
         )
+    else:
+        return False
+    return wrote
 
 
 def _head(root):
@@ -124,7 +139,7 @@ def evaluate(mode, *, sweep, thresholds=None, disk_guard=True, meter=None, budge
     return legacy.evaluate(
         mode, tasks_dir(), pid_alive=legacy.process_alive,
         record_liveness=lambda record: worker_liveness(record, pid_alive=legacy.process_alive),
-        on_dead=heal_dead if sweep else None, thresholds=thresholds, disk_guard=disk_guard,
+        on_dead=_heal_dead_in_scan if sweep else None, thresholds=thresholds, disk_guard=disk_guard,
         meter=meter, meter_budget=budget, meter_budget_error=budget_error, orchestrator=orchestrator,
     )
 

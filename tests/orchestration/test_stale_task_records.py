@@ -301,6 +301,20 @@ def test_apply_settles_class_c_and_leaves_other_classes(tasks_dir, mixed):
     )
 
 
+
+def test_apply_reports_a_record_the_writer_refuses_and_settles_the_rest(tasks_dir, mixed):
+    """Defect class (#1440): one record holding NaN aborts the whole settle-stale sweep."""
+    poisoned = _record(tasks_dir, "crashed", returncode=1, usage={"input_tokens": float("nan")})
+    before = poisoned.read_bytes()
+    report = _run(tasks_dir, mixed, apply=True)
+    assert report["actions"] == {"settled": 5, "error": 1, "report": 3}
+    row = _by_file(report)["crashed.json"]
+    assert (row["action"], row["skip_reason"]) == (
+        "error", 'write refused: TASK_RECORD_NON_FINITE: ["usage", "input_tokens"]')
+    assert poisoned.read_bytes() == before
+    assert json.loads((tasks_dir / "merged.json").read_text())["status"] == "done"
+
+
 def test_pull_list_failure_settles_nothing(tasks_dir, mixed):
     """Defect class: a missing pull list settles an orphaned record without its evidence."""
 

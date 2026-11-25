@@ -1545,6 +1545,10 @@ def apply_settlement(
     except worktree_claims.WorktreeLockError as exc:
         candidate.action, candidate.skip_reason = "skipped", worktree_claims.lock_refusal(exc)
         return
+    except task_record_store.NonFiniteRecordValue as exc:
+        # Both writer families refuse a record holding NaN or an infinity (#1440); that record stays as it is.
+        candidate.action, candidate.skip_reason = "error", f"write refused: {exc.code}"
+        return
     except OSError as exc:
         candidate.action, candidate.skip_reason = "error", f"write failed: {type(exc).__name__}: {exc}"
         return

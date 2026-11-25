@@ -40,6 +40,58 @@ def _isolated_task_scratch_root(tmp_path_factory, monkeypatch) -> Path:
     return root
 
 
+def test_default_repositories_come_from_configured_roots(tmp_path: Path, monkeypatch, capsys, configured_roots) -> None:
+    """Defect class: a default repository taken from the state root or guessed as a sibling of another checkout.
+
+    The Git-backed state root (here the configured primary) owns the task store, so the default
+    sweep still visits it as a repository: it alone runs retained-worktree settlement.
+    """
+    repos = tmp_path / "checkouts"
+    repos.mkdir()
+    monkeypatch.setenv("LU_REPOS_ROOT", str(repos))
+    local_name = cleanup.load_fleet_repos()["infra-private"].local_name
+    # The state root here is the configured primary; neither default may come from it.
+    assert cleanup.default_public_repo() == configured_roots.product != configured_roots.primary
+    assert cleanup.default_private_repo() == repos / local_name
+    assert configured_roots.product.parent != repos
+    assert cleanup.git_backed_state_root(configured_roots.product) == configured_roots.primary
+    assert cleanup.git_backed_state_root(configured_roots.primary) is None
+    # Without --repo-root, Git hygiene runs on those checkouts and the Git-backed state root, and the
+    # batch_state and rollover sweeps stay on the state root.
+    seen: dict[str, list[Path]] = {}
+    monkeypatch.setattr(
+        cleanup,
+        "build_receipt",
+        lambda roots, **_kwargs: seen.setdefault("git", list(roots))
+        and {"observed_at": "2026-11-25T00:00:00Z", "summary": {"errors": 0}, "repositories": []},
+    )
+    monkeypatch.setattr(cleanup, "batch_state_retention_reports", lambda roots, **_kwargs: seen.setdefault("state", list(roots)) and [])
+    monkeypatch.setattr(
+        cleanup,
+        "sweep_sessions",
+        lambda **kwargs: seen.setdefault("rollover", kwargs["rollover_roots"]) and {"summary": {"errors": 0}},
+    )
+    monkeypatch.setattr(cleanup.home_session_retention_check, "build_report", lambda: {})
+    monkeypatch.setattr(cleanup.home_session_retention_check, "warning_lines", lambda _report: [])
+    monkeypatch.setattr(cleanup, "build_public_summary", lambda *_args: {})
+    assert cleanup.main(["--receipt-dir", str(tmp_path / "receipts")]) == 0
+    assert seen["git"] == [configured_roots.product, configured_roots.primary, repos / local_name]
+    assert seen["state"] == [cleanup.state_root(), repos / local_name]
+    assert seen["rollover"] == [Path(root) / ".agent/thread-rollovers/claude" for root in seen["state"]]
+    assert cleanup.state_root() != configured_roots.product
+    # The macOS agent's job carries no root settings, so its first checkout is the state root, which
+    # its batch_state and rollover sweeps read from the arguments; the private one is the configured one.
+    import plistlib
+
+    from lu_machinery.orchestration import install_worktree_cleanup_launchd as launchd
+
+    capsys.readouterr()
+    assert launchd.main(["--home", str(tmp_path / "home"), "render"]) == 0
+    arguments = plistlib.loads(capsys.readouterr().out.encode())["ProgramArguments"]
+    repo_roots = [Path(arguments[i + 1]) for i, word in enumerate(arguments) if word == "--repo-root"]
+    assert repo_roots == [cleanup.state_root().resolve(), (repos / local_name).resolve()]
+
+
 @pytest.mark.parametrize("apply", [False, True])
 def test_main_sweeps_sessions_once_and_reports_counts_only(tmp_path: Path, monkeypatch, capsys, apply: bool) -> None:
     root = tmp_path / f"claude-{os.getuid()}"

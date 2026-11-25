@@ -20,7 +20,7 @@ from types import SimpleNamespace
 import pytest
 
 from lu_machinery.dispatcher import git, host_admission, ownership, store, worker
-from lu_machinery.orchestration import dispatch_admission
+from lu_machinery.orchestration import dead_worker_state, dispatch_admission
 from lu_machinery.orchestration.issue_stream_audit import load_registry as _load_stream_registry
 from lu_machinery.session_supervisor import remote
 from tests.dispatcher.conftest import await_file, run_git
@@ -189,8 +189,6 @@ def test_entry_refuses_a_caller_inside_a_dispatched_task(task_store, cto_seat, m
     [
         (["--task-id", "worker-1"], "a turn's --task-id starts with 'turn-'"),  # T6: its tree would not read as a turn's
         (["--task-id", "turn-1", "--worktree", "/trees/elsewhere"], "takes no --worktree path"),  # T6
-        (["--task-id", "turn-1", "--hard-timeout", "nan"], "orchestrator_timeout_refused"),  # T5
-        (["--task-id", "turn-1", "--hard-timeout", "inf"], "orchestrator_timeout_refused"),  # T5
         (["--task-id", "turn-1", "--hard-timeout", "0"], "orchestrator_timeout_refused"),  # T5: 0 disables a deadline
         (["--task-id", "turn-1", "--hard-timeout", "86400"], "orchestrator_timeout_refused"),  # T5
     ],
@@ -209,6 +207,66 @@ def test_entry_refuses_a_turn_without_a_turn_id_its_own_tree_or_a_bounded_deadli
 
 
 # --- admission -----------------------------------------------------------------------------------------------------
+
+
+def test_admission_scan_leaves_a_dead_record_the_writer_refuses_and_reports_only_what_it_wrote(
+    task_store, monkeypatch, capsys,
+):
+    """Defect classes: a dead task record already holding NaN makes every admission scan raise (#1440); the admission
+    receipt reports a dead record as marked crashed when its heal was refused or declined and nothing was written;
+    one such record ends ``dispatch list`` and hides every other record."""
+    from lu_machinery.dispatcher import cli
+
+    monkeypatch.setattr(dispatch_admission, "host_failures", lambda *_a: [])
+    # A test-owned PID view: the initial namespace, where every worker pid in this store is dead, for the scan
+    # and for the locked recheck alike, whatever namespace the test runner is in.
+    initial = dead_worker_state.INITIAL_PID_NAMESPACE
+    monkeypatch.setattr(dead_worker_state, "_pid_namespace", lambda process="self": initial)
+    monkeypatch.setattr(dead_worker_state, "_proc_pid_namespace", lambda: initial)
+    monkeypatch.setattr(dispatch_admission, "process_alive", lambda _pid: False)
+
+    def dead_worker(task_id, **fields):
+        record = _orchestrator_record(task_id, pid=4_194_305, **fields)  # above the kernel's pid_max
+        del record["orchestrator"]
+        return record
+
+    path = store.record_path("worker-nan")
+    launch = dict(model="m", effort="high", provider="claude", claude_account=None, process_start="boot:1",
+                  worktree_path=str(task_store), worktree_base_sha=None, prompt_file=str(task_store / "prompt"),
+                  result_file=str(task_store / "result"))  # what dispatch list's own heal reads
+    nan_record = dead_worker("worker-nan", usage={"input_tokens": float("nan")}, **launch)
+    path.write_text(json.dumps(nan_record))  # as stored pre-#1440
+    before = path.read_bytes()
+    _write(dead_worker("worker-raced"))
+    _write(dead_worker("worker-dead"))
+    real_mark = host_admission.mark_dead_worker_terminal
+
+    def settled_first(record_path, state, **kwargs):  # its supervisor settles it between the scan and the heal
+        if state["task_id"] == "worker-raced":
+            _write({**state, "status": "done", "finished_at": store.now()})
+        return real_mark(record_path, state, **kwargs)
+
+    monkeypatch.setattr(host_admission, "mark_dead_worker_terminal", settled_first)
+    decision = host_admission.evaluate("workspace-write", sweep=True)
+    assert decision.admitted, decision.failures
+    assert path.read_bytes() == before
+    assert ('dead task record worker-nan.json not healed: TASK_RECORD_NON_FINITE: ["usage", "input_tokens"]'
+            in capsys.readouterr().err)
+    assert store.read("worker-raced")["status"] == "done"
+    assert store.read("worker-dead")["status"] == "crashed"
+    assert sorted(decision.dead_task_ids) == ["worker-dead", "worker-nan", "worker-raced"]
+    assert decision.swept_task_ids == ("worker-dead",)
+    assert decision.to_record()["swept_crashed"] == ["worker-dead"]
+    assert "; 1 record(s) marked crashed: worker-dead;" in decision.summary()
+    assert "; 2 record(s) dead pid, not counted: " in decision.summary()
+    assert cli.main(["list"]) == 0  # list heals every record before it filters
+    listed = capsys.readouterr()
+    rows = {row["task_id"]: row for row in json.loads(listed.out, parse_constant=pytest.fail)}  # strict JSON
+    assert {task_id: row["status"] for task_id, row in rows.items()} == {
+        "worker-nan": "running", "worker-raced": "done", "worker-dead": "crashed"}
+    assert rows["worker-nan"]["usage"] is None
+    assert 'task record worker-nan not healed: TASK_RECORD_NON_FINITE: ["usage", "input_tokens"]' in listed.err
+    assert path.read_bytes() == before
 
 
 def test_a_turn_takes_no_write_slot_but_keeps_the_host_checks(task_store, monkeypatch):

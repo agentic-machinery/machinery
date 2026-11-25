@@ -44,7 +44,8 @@ from typing import Any
 REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
-from lu_machinery.common import json_depth
+from lu_machinery.common import json_depth, profile
+from lu_machinery.common.repo_root import MachineryConfigError
 
 # The machinery package's directory name, which is also its import name and the first component
 # of its files' checkout paths. Taken from this file's unresolved location, so neither a short
@@ -52,7 +53,8 @@ from lu_machinery.common import json_depth
 # than through ``common/``: hooks load this module from a minimal copy (its package marker, this
 # file and the lane data).
 _MACHINERY = Path(os.path.abspath(__file__)).parents[1].name
-DATA_FILE = REPO_ROOT / _MACHINERY / "config" / "driver_lanes.json"
+_PACKAGED_DATA_FILE = REPO_ROOT / _MACHINERY / "config" / "driver_lanes.json"
+DATA_FILE = _PACKAGED_DATA_FILE
 LOCAL_ENV = "LU_DRIVER_LANES_LOCAL"
 KINDS = frozenset({"claude", "codex"})
 SESSION_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*\Z")
@@ -231,11 +233,35 @@ def parse_registry(data: Any) -> Registry:
     return Registry(lanes=tuple(lanes), settings=settings, guard_sender=guard_sender)
 
 
+def default_data_path() -> Path:
+    """Resolve ``driver_lanes.json`` at call time via the active profile, else the packaged copy."""
+    if DATA_FILE != _PACKAGED_DATA_FILE:
+        return DATA_FILE
+    return profile.config_path("driver_lanes", default=_PACKAGED_DATA_FILE)
+
+
+def _unique_members(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    """A JSON object whose every member name is written once; a repeated name is refused, never last-wins."""
+    members: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in members:
+            raise ValueError(f"duplicate JSON key: {key!r}")
+        members[key] = value
+    return members
+
+
 def load_registry(path: Path | None = None) -> Registry:
-    source = path or DATA_FILE
+    # The fleet-config file read: a non-regular file is refused without a blocking open.
+    from lu_machinery.orchestration.validate_fleet_taxonomy import read_regular_file_bytes
+
     try:
-        data = json_depth.loads(source.read_text(encoding="utf-8"), max_depth=512)
-    except (OSError, json.JSONDecodeError) as exc:
+        source = path or default_data_path()
+    except MachineryConfigError as exc:  # a ProfileError or an unusable root setting
+        raise LaneConfigError(f"lane data unavailable: {exc}") from exc
+    try:
+        _, raw = read_regular_file_bytes(source)  # its refusal is a ValueError
+        data = json_depth.loads(raw.decode("utf-8"), object_pairs_hook=_unique_members, max_depth=512)
+    except (OSError, ValueError, RecursionError) as exc:  # unreadable, not regular, not UTF-8, not JSON, too deep
         raise LaneConfigError(f"cannot read lane data {source.name}: {exc}") from exc
     return parse_registry(data)
 
@@ -378,8 +404,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--data",
         type=Path,
-        default=DATA_FILE,
-        help=f"Lane data file (default: {_MACHINERY}/config/driver_lanes.json).",
+        default=None,
+        help=f"Lane data file (default: the active profile's, else {_MACHINERY}/config/driver_lanes.json).",
     )
     args = parser.parse_args(argv)
     try:
