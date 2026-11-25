@@ -296,5 +296,7 @@ def test_rest_pr_identity_matches_both_transferred_repository_slugs(monkeypatch)
     pr["base"]["repo"]["full_name"] = moved.alternate_github
 
     assert git._same_repo_pr(pr, REPO)
+    pr["head"]["repo"]["full_name"] = REPO
+    assert not git._same_repo_pr(pr, moved.alternate_github)
     pr["head"]["repo"]["full_name"] = "fork-owner/fork-repo"
     assert not git._same_repo_pr(pr, REPO)

@@ -1188,7 +1188,10 @@ def _same_repo_pr(pr: dict, repo: str) -> bool:
     base_repo = base.get("repo") if isinstance(base, dict) else None
     head_name = head_repo.get("full_name") if isinstance(head_repo, dict) else None
     base_name = base_repo.get("full_name") if isinstance(base_repo, dict) else None
-    return all(same_repository(ascii_repo_slug(name, strip=False), target) for name in (head_name, base_name))
+    head_slug = ascii_repo_slug(head_name, strip=False)
+    base_slug = ascii_repo_slug(base_name, strip=False)
+    # Both names describe live repositories in one response. The old name could now belong to a fork.
+    return base_slug is not None and head_slug == base_slug and same_repository(base_slug, target)
 
 
 def _branch_pulls(repo: str, branch: str) -> list[dict]:
