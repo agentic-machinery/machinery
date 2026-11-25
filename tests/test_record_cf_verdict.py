@@ -355,7 +355,7 @@ def test_ci_fix_uses_the_repository_required_workflow(monkeypatch, tmp_path):
     ]
     reads = fake_github_reads(queue=queue, trees={"c" * 40: tree, "d" * 40: "e" * 40})
     gate = ".github/workflows/ci-gate.yml"
-    row = {"github": REPOSITORY.upper(), "required_workflow": gate}
+    row = {"github": REPOSITORY.upper(), "default": True, "required_workflow": gate}
     monkeypatch.setattr(repair_round.prepublish, "catalog", lambda: {"unit": row})
     kwargs = dict(number=42, repo_root=repo, github=reads)
     assert repair_round.failed_runs_for(approved, **kwargs, workflows=repair_round.required_workflows(REPOSITORY)) == []
@@ -367,7 +367,7 @@ def test_ci_fix_uses_the_repository_required_workflow(monkeypatch, tmp_path):
     # A list normalizes to the same collection; each listed workflow's failure is evidence on its own.
     other = ".github/workflows/other.yml"
     monkeypatch.setattr(
-        repair_round.prepublish, "catalog", lambda: {"unit": {"github": REPOSITORY, "required_workflow": [gate, other]}}
+        repair_round.prepublish, "catalog", lambda: {"unit": {"github": REPOSITORY, "default": True, "required_workflow": [gate, other]}}
     )
     listed = repair_round.required_workflows(REPOSITORY)
     assert listed == (gate, other)
@@ -391,16 +391,16 @@ def test_ci_fix_uses_the_repository_required_workflow(monkeypatch, tmp_path):
         {"path": gate},
     )
     for bad_value in bad_rows:
-        bad = {"github": REPOSITORY, "required_workflow": bad_value}
+        bad = {"github": REPOSITORY, "default": True, "required_workflow": bad_value}
         monkeypatch.setattr(repair_round.prepublish, "catalog", lambda bad=bad: {"unit": bad})
         with pytest.raises(repair_round.RepairRefused, match=r"\[evidence\].*required_workflow"):
             repair_round.required_workflows(REPOSITORY)
-    monkeypatch.setattr(repair_round.prepublish, "catalog", lambda: {"a": row, "b": row})
+    monkeypatch.setattr(repair_round.prepublish, "catalog", lambda: {"a": row, "b": {**row, "default": False}})
     with pytest.raises(repair_round.RepairRefused, match=r"\[evidence\].*registered more than once"):
         repair_round.required_workflows(REPOSITORY)
 
 
-def test_every_registered_row_requires_exactly_its_repository_merge_gates():
+def test_every_registered_row_requires_exactly_its_repository_merge_gates(monkeypatch):
     """Defect classes: a fleet_repos.yaml row whose required workflows (the ci.yml default included) differ from
     the workflows that gate that repository's merges, so a repair round refuses a real CI failure or accepts a
     non-gating one; and a merge-queue row naming several workflows, which merge closeout refuses.
@@ -410,10 +410,15 @@ def test_every_registered_row_requires_exactly_its_repository_merge_gates():
     """
     import yaml
 
+    from lu_machinery.common import git_credentials
+
     document = yaml.safe_load((Path(__file__).parent / "review/fixtures/fleet_repo_workflows.yaml").read_text())
     assert isinstance(document, dict) and isinstance(document.get("repos"), dict)
     recorded = document["repos"]
     registered = recorder.load_fleet_repos()
+    # A transferred row resolves only through a host selector; the test owns one, never the host's.
+    selected = {key: repo.github.lower() for key, repo in registered.items() if repo.alternate_github}
+    monkeypatch.setattr(git_credentials, "load_selector", lambda **_kwargs: git_credentials.SelectorState(selected, "d" * 64))
     # A newly registered repository has no recorded gates until someone reads them from GitHub.
     assert set(recorded) == set(registered)
     wrong = {}
@@ -2738,7 +2743,7 @@ def test_mixed_family_head_needs_both_family_approvals(tmp_path, monkeypatch):
     monkeypatch.setattr(recorder, "pr_review_facts", lambda *_a, **_k: facts)
     statuses = []
     monkeypatch.setattr(recorder, "post_commit_status", lambda **fields: statuses.append(fields["state"]))
-    monkeypatch.setattr(github.gate, "catalog", lambda: {"unit": {"github": REPOSITORY, "verdict_recorder": True}})
+    monkeypatch.setattr(github.gate, "catalog", lambda: {"unit": {"github": REPOSITORY, "default": True, "verdict_recorder": True}})
 
     def reads(operation, **_kwargs):
         value = {"comments": [comments], "pr-files": [[{"filename": "docs/a.md"}]], "identity": {"login": "fleet"}}
@@ -2892,7 +2897,7 @@ def test_three_family_head_needs_an_outside_approval_for_every_family(tmp_path, 
     monkeypatch.setattr(recorder, "pr_review_facts", lambda *_a, **_k: facts)
     statuses = []
     monkeypatch.setattr(recorder, "post_commit_status", lambda **fields: statuses.append(fields["state"]))
-    monkeypatch.setattr(github.gate, "catalog", lambda: {"unit": {"github": REPOSITORY, "verdict_recorder": True}})
+    monkeypatch.setattr(github.gate, "catalog", lambda: {"unit": {"github": REPOSITORY, "default": True, "verdict_recorder": True}})
 
     def reads(operation, **_kwargs):
         value = {"comments": [comments], "pr-files": [[{"filename": "docs/a.md"}]], "identity": {"login": "fleet"}}

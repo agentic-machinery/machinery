@@ -82,4 +82,4 @@ def closeout_reads(case, root):
 
 def fleet_row(monkeypatch, **row):
     """Register the case repository (org/repo) as the only fleet_repos.yaml row, with the given keys."""
-    monkeypatch.setattr(prepublish, "catalog", lambda: {"case": {"github": "org/repo", **row}})
+    monkeypatch.setattr(prepublish, "catalog", lambda: {"case": {"github": "org/repo", "default": True, **row}})

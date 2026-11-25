@@ -667,14 +667,11 @@ def _refuse_incomplete_seats(dest, number, head, runner, cwd, environment):
     from lu_machinery.review.tiers import UNREVIEWED_STATES, classify_pr_files
 
     # The setting is explicit per repository; an absent, ambiguous or non-boolean one is unverifiable.
-    rows = [
-        row for row in gate.catalog().values()
-        if gate.normalize_repository(str(row.get("github", ""))) == gate.normalize_repository(dest)
-    ]
-    recorder = rows[0].get("verdict_recorder") if len(rows) == 1 else None
+    entry = _fleet_catalog_entry(dest, environment)
+    recorder = entry[1].get("verdict_recorder") if entry else None
     if type(recorder) is not bool:
         raise gate.PublishBlocked("OPSEC: merge refused: the repository's verdict_recorder setting is unverifiable.")
-    configured_recorder_login = rows[0].get("verdict_recorder_login") if len(rows) == 1 else None
+    configured_recorder_login = entry[1].get("verdict_recorder_login") if entry else None
     if configured_recorder_login is not None and (
         not isinstance(configured_recorder_login, str) or not re.fullmatch(r"\S+", configured_recorder_login)
     ):
@@ -785,12 +782,9 @@ def _keeper_custody_blocks_worker_recovery(dest: str, number: int, environment: 
         )
 
 
-def _configured_verdict_login(dest: str, fallback: str) -> str:
-    rows = [
-        row for row in gate.catalog().values()
-        if gate.normalize_repository(str(row.get("github", ""))) == gate.normalize_repository(dest)
-    ]
-    configured = rows[0].get("verdict_recorder_login") if len(rows) == 1 else None
+def _configured_verdict_login(dest: str, fallback: str, environment: dict[str, str]) -> str:
+    entry = _fleet_catalog_entry(dest, environment)
+    configured = entry[1].get("verdict_recorder_login") if entry else None
     if configured is not None:
         if not isinstance(configured, str) or not re.fullmatch(r"\S+", configured):
             raise gate.PublishBlocked("RECOVERY_LOOKUP_UNKNOWN: invalid verdict_recorder_login configuration")
@@ -802,6 +796,9 @@ def _prepare_recovery(verb, fields, dest, cwd, environment, runner):
     """Resolve live PR/run identities and posted evidence before any recovery write."""
     from lu_machinery.gh_merge_queue_status import extract_pr_number
     from lu_machinery.orchestration.integration_sweep import changes_learner_content, lookup_verdict, pr_file_paths
+
+    # An inactive, ambiguous or selector-less spelling is refused before any evidence read.
+    _fleet_catalog_entry(dest, environment)
 
     def fetch(name, **selectors):
         unknown = "RECOVERY_LOOKUP_UNKNOWN: live evidence unavailable"
@@ -925,7 +922,7 @@ def _prepare_recovery(verb, fields, dest, cwd, environment, runner):
     login = fetch("identity").get("login")
     if not isinstance(login, str) or not login:
         raise gate.PublishBlocked("RECOVERY_APPROVAL_MISSING: exact-head recorded approval required")
-    verdict_login = _configured_verdict_login(dest, login)
+    verdict_login = _configured_verdict_login(dest, login, environment)
     if lookup_verdict(
         comments, head, verdict_login, learner_content=content,
     ).state != "APPROVED":
@@ -1056,15 +1053,29 @@ def _github_slug_or_none(value):
     return slug
 
 
-def _catalog_fleet_repos():
-    """Convert ``gate.catalog()`` rows into validated ``FleetRepo`` objects for the A01 resolver.
+def _registry_slug(value):
+    """The registry's own owner/name spelling, case kept, when *value* names a github.com repository, else None.
+
+    The host selector names a dual-slug row's active slug as the registry spells it, so the
+    resolver compares against that spelling, never a lowercased copy.
+    """
+    slug = _github_slug_or_none(value)
+    if slug is None:
+        return None
+    spelled = value.strip()
+    return spelled if spelled.casefold() == slug else slug
+
+
+def _catalog_fleet_repos(raw_catalog=None):
+    """Convert ``gate.catalog()`` rows (or *raw_catalog*, one such read) into validated ``FleetRepo`` objects.
 
     Fails closed on any malformed key, row, ``github``, or ``alternate_github`` entry so
     broken dual-slug configuration can never downgrade into selector-free acceptance.
     """
     from lu_machinery.orchestration import fleet_repos
 
-    raw_catalog = gate.catalog()
+    if raw_catalog is None:
+        raw_catalog = gate.catalog()
     if not isinstance(raw_catalog, dict) or not raw_catalog:
         raise gate.PublishBlocked("OPSEC: repository allowlist unavailable; write refused.")
     repos = {}
@@ -1075,7 +1086,7 @@ def _catalog_fleet_repos():
         github = row.get("github")
         if not isinstance(github, str):
             raise gate.PublishBlocked("OPSEC: repository allowlist malformed; write refused.")
-        slug = _github_slug_or_none(github)
+        slug = _registry_slug(github)
         if slug is None:
             raise gate.PublishBlocked("OPSEC: repository allowlist malformed; write refused.")
         default_raw = row.get("default", False)
@@ -1094,7 +1105,7 @@ def _catalog_fleet_repos():
         if alt_raw is not None:
             if not isinstance(alt_raw, str):
                 raise gate.PublishBlocked("OPSEC: repository allowlist malformed; write refused.")
-            alt_slug = _github_slug_or_none(alt_raw)
+            alt_slug = _registry_slug(alt_raw)
             if alt_slug is None:
                 raise gate.PublishBlocked("OPSEC: repository allowlist malformed; write refused.")
             if alt_slug.casefold() == slug.casefold() or repo_id is None or visibility is None:
@@ -1114,8 +1125,13 @@ def _catalog_fleet_repos():
     return repos
 
 
-def _fleet_catalog_row(gh_repo, *, env=None, repos=None):
-    """Resolve *gh_repo* through the A01 active-slug resolver, or None when unregistered."""
+def _fleet_catalog_row(gh_repo, *, env=None, repos=None, bind_inactive=False):
+    """Resolve *gh_repo* through the A01 active-slug resolver, or None when unregistered.
+
+    A dual-slug row's inactive spelling is refused, as every write gate requires; with
+    *bind_inactive* (a configuration read of a stored spelling) either baked slug binds to the row.
+    A dual-slug row with a missing or untrusted selector is refused either way.
+    """
     from lu_machinery.orchestration import fleet_repos
 
     slug = _github_slug_or_none(gh_repo)
@@ -1126,17 +1142,35 @@ def _fleet_catalog_row(gh_repo, *, env=None, repos=None):
     try:
         fleet_repos.resolve_fleet_repo_by_slug(slug, repos=repos)
     except fleet_repos.FleetRepoError:
+        # A spelling that several rows claim is ambiguous, never unregistered.
+        if sum(slug.casefold() in {item.casefold() for item in repo.slugs} for repo in repos.values()) > 1:
+            raise gate.PublishBlocked(
+                f"REPO_REFUSED: {slug} is registered more than once; nothing was created."
+            ) from None
         return None
     try:
         active = fleet_repos.resolve_active_fleet_repo(slug, repos=repos, env=env)
     except fleet_repos.FleetRepoError as exc:
         raise gate.PublishBlocked(f"REPO_REFUSED: {exc}; nothing was created.") from None
-    if active.active_github.casefold() != slug.casefold():
+    if not bind_inactive and active.active_github.casefold() != slug.casefold():
         raise gate.PublishBlocked(
             f"REPO_REFUSED: {slug} is not the active slug for {active.repo.key} "
             f"(active: {active.active_github}); nothing was created."
         )
     return active
+
+
+def _fleet_catalog_entry(gh_repo, environment, *, bind_inactive=False):
+    """The one lookup from a repository spelling to its fleet_repos.yaml row, through ``_fleet_catalog_row``.
+
+    Returns ``(active, row)``: the resolved row bound to its active slug, and its raw catalog
+    mapping from the same catalog read; None for an unregistered spelling.
+    """
+    raw_catalog = gate.catalog()
+    active = _fleet_catalog_row(
+        gh_repo, env=environment, repos=_catalog_fleet_repos(raw_catalog), bind_inactive=bind_inactive,
+    )
+    return None if active is None else (active, raw_catalog[active.repo.key])
 
 
 def _owns_stream_registry(active, *, default_key=None):
@@ -1178,7 +1212,7 @@ def _parent_epic_node(read_runner, active, repos, parent, cwd, environment):
             path=issue_stream_audit.default_registry_path(),
         ):
             target = fleet_repos.resolve_active_fleet_repo(default_key, repos=repos, env=environment)
-            if active.active_github.split("/", 1)[0] != target.active_github.split("/", 1)[0] or not all(
+            if not _same_slug(active.active_github.split("/", 1)[0], target.active_github.split("/", 1)[0]) or not all(
                 item.repo.role.startswith("public-") and item.repo.visibility in (None, "public")
                 for item in (active, target)
             ):
@@ -1579,24 +1613,27 @@ def _transfer_refused(reason):
 
 
 def _transfer_endpoint(value, environment):
-    """Resolve a registry alias or owner/name to exactly one registered github.com repository."""
+    """Resolve a registry alias or owner/name to exactly one registered github.com repository at its active slug.
+
+    An owner/name must be the row's active slug; an alias binds to it.
+    """
     rows = gate.catalog()
     if not isinstance(rows, dict):
         raise _transfer_refused("the repository registry is unreadable")
     if "/" in value:
         wanted = gate.normalize_repository(value, environment.get("GH_HOST", "github.com"))
-        matches = [
-            (alias, row) for alias, row in rows.items()
-            if isinstance(row, dict) and isinstance(row.get("github"), str)
-            and gate.normalize_repository(row["github"]) == wanted != "unknown"
-        ]
+        entry = _fleet_catalog_entry(wanted, environment)
     else:
-        matches = [(value, rows[value])] if value in rows else []
-    if len(matches) != 1:
+        row = rows.get(value)
+        github = row.get("github") if isinstance(row, dict) else None
+        entry = _fleet_catalog_entry(github, environment, bind_inactive=True) if isinstance(github, str) else None
+        if entry is not None and entry[0].repo.key != value:
+            entry = None
+    if entry is None:
         raise _transfer_refused(f"{value} is not exactly one repository registered in {_FLEET_REPOS}")
-    alias, row = matches[0]
-    github, role = (row.get("github"), row.get("role")) if isinstance(row, dict) else (None, None)
-    canonical = gate.normalize_repository(github) if isinstance(github, str) else "unknown"
+    active, row = entry
+    alias, role = active.repo.key, row.get("role")
+    canonical = gate.normalize_repository(active.active_github)
     privacy = None
     if isinstance(role, str):
         privacy = "private" if role.startswith("private-") else "public" if role.startswith("public-") else None
@@ -4229,6 +4266,9 @@ def publish(
         if verb == "pr-merge":
             from lu_machinery.publish.merge_guard import ensure_merge_ready
 
+            # Bind the merge target to its registry row before any GitHub read: an inactive,
+            # ambiguous or selector-less spelling is refused here (the seat guard reads the row again).
+            _fleet_catalog_entry(dest, environment)
             # Refuse a blocked supplied subject or body before any GitHub read. With an
             # override set, the one combined scan below decides, so the override is
             # offered once for the whole publish.
@@ -5329,7 +5369,11 @@ def _dependabot_repository(cwd, environment, explicit):
         matches = [row for row in gate.catalog().values() if public.parent / row["local_name"] == primary]
         if len(matches) != 1:
             raise ValueError
-        destination = gate.normalize_repository(matches[0]["github"])
+        # The checkout's row names its repository at the row's active slug.
+        entry = _fleet_catalog_entry(matches[0]["github"], environment, bind_inactive=True)
+        if entry is None:
+            raise ValueError
+        destination = gate.normalize_repository(entry[0].active_github)
         if destination.split("/", 1)[0] != "github.com":
             raise ValueError
         if environment.get("GH_HOST", "github.com") != "github.com":
@@ -5429,11 +5473,12 @@ def read(
         timeout = timeout or 30
     if operation == "issue-count":
         # One fixed aggregate read. No selectors, arbitrary queries or text leave this path.
-        known = gate.catalog()
-        allowed = {"github.com/" + row["github"].casefold() for row in known.values()}
-        if fields or dest not in allowed:
+        # A registered row by either baked slug (callers pass the stored one), read at its active slug.
+        entry = None if fields else _fleet_catalog_entry(dest, environment, bind_inactive=True)
+        if entry is None:
             raise gate.PublishBlocked("OPSEC: invalid issue count repository or fields.")
-        owner, name = gh_repo.split("/", 1)
+        dest = gate.normalize_repository(entry[0].active_github)
+        owner, name = dest.split("/")[1:]
         query = "query($owner:String!,$name:String!){repository(owner:$owner,name:$name){issues(states:OPEN){totalCount}}}"
         with tempfile.TemporaryDirectory(prefix="lu-issue-count-", dir=ensure_scratch_root()) as directory:
             frozen = Path(directory) / "query.json"

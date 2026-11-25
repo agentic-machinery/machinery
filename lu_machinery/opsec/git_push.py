@@ -365,17 +365,24 @@ class CanonicalPublicRepository:
 
     def from_catalog(self) -> CanonicalPublicRepository | None:
         """Select the public destination or its verified public parent."""
+        # Imported here, as _read imports the publisher.
+        from lu_machinery.publish.github import _fleet_catalog_entry
+
         destination = self.repo
         if destination == "unknown":
             return None
-        rows = [
-            (gate.normalize_repository(str(row.get("github", ""))), str(row.get("role", "")).startswith("public-"))
-            for row in gate.catalog().values()
-        ]
-        matches = [public for repo, public in rows if repo == destination]
-        if matches:
-            # Keep the registered-destination rule: exactly one public row.
-            return self if matches.count(True) == 1 else None
+        gate.catalog()  # An unreadable allowlist refuses the push, as before.
+        try:
+            entry = _fleet_catalog_entry(destination, self.environment)
+        except gate.PublishBlocked:
+            # An inactive or ambiguous spelling, a malformed row or an untrusted selector proves no public history.
+            return None
+        if entry is not None and gate.normalize_repository(entry[0].repo.github) == destination:
+            # Keep the registered-destination rule at the row's baked github slug: exactly one public row.
+            return self if str(entry[1].get("role", "")).startswith("public-") else None
+        # Any other spelling, a moved row's active alternate slug included, proves neither live public
+        # visibility nor the push receiver, so like an unregistered destination it may only exclude
+        # the history of a verified public fork parent.
         if gate.normalize_repository(destination) != destination:
             return None
         host, owner, name = destination.split("/")
@@ -405,9 +412,10 @@ class CanonicalPublicRepository:
             parent_slug = parent["nameWithOwner"]
             if not parent_slug.isascii() or parent["visibility"] != "PUBLIC":
                 return None
-            parent_repo = f"github.com/{parent_slug.lower()}"
-            if [public for repo, public in rows if repo == parent_repo] != [True]:
+            registered = _fleet_catalog_entry(f"github.com/{parent_slug.lower()}", self.environment)
+            if registered is None or not str(registered[1].get("role", "")).startswith("public-"):
                 return None
+            parent_repo = gate.normalize_repository(registered[0].active_github)
             oid = parent["defaultBranchRef"]["target"]["oid"]
             if not isinstance(oid, str) or PUBLIC_HEAD.fullmatch(oid) is None:
                 return None

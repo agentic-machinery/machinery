@@ -4198,7 +4198,7 @@ def low_review(monkeypatch, tmp_path):
 
     monkeypatch.setattr(recorder, "_post_verdict", post)
     monkeypatch.setattr(publisher.gate, "catalog", lambda: {
-        "public": {"github": REPOSITORY, "verdict_recorder": True},
+        "public": {"github": REPOSITORY, "default": True, "verdict_recorder": True},
     })
     # These fixtures contain no learner paths. Product content policy is independent.
     monkeypatch.setattr(sweep, "changes_learner_content", lambda _: False)
@@ -4212,9 +4212,7 @@ def low_review(monkeypatch, tmp_path):
         )
         return subprocess.CompletedProcess(args, 0, json.dumps(value), "")
 
-    def admit():
-        publisher._refuse_incomplete_seats(
-            "github.com/" + REPOSITORY, 1, HEAD, send, tmp_path, {},
-        )
+    def admit(dest="github.com/" + REPOSITORY, environment=None):
+        publisher._refuse_incomplete_seats(dest, 1, HEAD, send, tmp_path, environment or {})
 
     return tasks, comments, statuses, files, admit

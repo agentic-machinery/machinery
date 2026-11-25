@@ -65,7 +65,7 @@ def enqueue_transport(writes, *, state="CLEAN", draft=False, priority=False, hea
 
 @pytest.fixture
 def queue_publisher(monkeypatch, synthetic_opsec):
-    monkeypatch.setattr(publisher.gate, "catalog", lambda: {"public": {"github": "unit/public"}})
+    monkeypatch.setattr(publisher.gate, "catalog", lambda: {"public": {"github": "unit/public", "default": True}})
     monkeypatch.delenv("AGENT_NO_MERGE", raising=False)
     # Review qualification is tested separately. Keep the actual readiness and transport here.
     monkeypatch.setattr(publisher, "_refuse_incomplete_seats", lambda *args: None)
@@ -223,7 +223,7 @@ def test_head_without_a_recorded_verdict_is_refused_only_where_the_recorder_is_u
     _tasks, _comments, _statuses, files, admit = low_review
     files[:] = [{"filename": "lu_machinery/common/example.py", "status": "modified"}]
     monkeypatch.setattr(publisher.gate, "catalog", lambda: {
-        "public": {"github": "unit/public", "verdict_recorder": recorder},
+        "public": {"github": "unit/public", "default": True, "verdict_recorder": recorder},
     })
     if recorder:
         with pytest.raises(publisher.gate.PublishBlocked, match="no cross-family APPROVE"):
@@ -267,7 +267,7 @@ def test_absent_string_or_null_verdict_recorder_is_refused_before_publication(
     monkeypatch, tmp_path, setting,
 ):
     """An absent, string (including \"true\") or null recorder is unverifiable, never coerced."""
-    row = {"github": "unit/public"}
+    row = {"github": "unit/public", "default": True}
     if setting is not _ABSENT:
         row["verdict_recorder"] = setting
     monkeypatch.setattr(publisher.gate, "catalog", lambda: {"public": row})
@@ -283,6 +283,76 @@ def test_absent_string_or_null_verdict_recorder_is_refused_before_publication(
         )
     assert str(caught.value) == _UNVERIFIABLE_RECORDER
     assert calls == []
+
+
+def _moved_registry(monkeypatch, *, recorder):
+    """A registry whose infra row moved from unit/infra to its active alternate slug neworg/infra."""
+    from lu_machinery.common import git_credentials
+
+    monkeypatch.setattr(publisher.gate, "catalog", lambda: {
+        "public": {"github": "unit/public", "default": True, "verdict_recorder": False},
+        "infra": {"github": "unit/infra", "alternate_github": "neworg/infra", "repository_id": 4242,
+                  "visibility": "private", "role": "private-infra", "verdict_recorder": recorder},
+    })
+    monkeypatch.setattr(
+        git_credentials, "load_selector",
+        lambda **_kwargs: git_credentials.SelectorState({"infra": "neworg/infra"}, "d" * 64),
+    )
+
+
+@pytest.mark.parametrize("recorder", [True, False])
+def test_pr_merge_on_a_moved_rows_active_slug_reads_the_rows_verdict_recorder(monkeypatch, low_review, recorder):
+    """Defect class: the merge guard matches only a row's baked github slug, so on a moved row's active alternate
+    slug it finds no row and refuses every merge as verdict_recorder unverifiable (#1415)."""
+    from tests.opsec_fixtures import recorded_approval
+
+    _tasks, comments, _statuses, files, admit = low_review
+    files[:] = [{"filename": "lu_machinery/common/example.py", "status": "modified"}]
+    _moved_registry(monkeypatch, recorder=recorder)
+    if recorder:
+        with pytest.raises(publisher.gate.PublishBlocked, match="no cross-family APPROVE"):
+            admit("github.com/neworg/infra")
+        comments.append(recorded_approval(HEAD, login="fleet"))
+    assert admit("github.com/neworg/infra") is None
+
+
+@pytest.mark.parametrize(
+    ("dest", "refusal"),
+    [
+        pytest.param("github.com/evil/infra", _UNVERIFIABLE_RECORDER, id="unregistered"),
+        pytest.param(
+            "github.com/unit/infra",
+            "REPO_REFUSED: unit/infra is not the active slug for infra (active: neworg/infra); nothing was created.",
+            id="inactive-spelling",
+        ),
+    ],
+)
+def test_pr_merge_refuses_an_unregistered_repository_or_a_moved_rows_inactive_spelling(
+    monkeypatch, tmp_path, dest, refusal,
+):
+    """Defect class: an active-slug lookup that admits a repository outside the registry, or the inactive
+    spelling of a moved row, to the merge guard before any GitHub read; for the inactive spelling, the
+    publisher's merge-readiness reads running before the refusal."""
+    _moved_registry(monkeypatch, recorder=True)
+    monkeypatch.delenv("AGENT_NO_MERGE", raising=False)
+    calls = []
+
+    def send(args, **_kwargs):
+        calls.append(args)
+        return subprocess.CompletedProcess(args, 0, "{}", "")
+
+    with pytest.raises(publisher.gate.PublishBlocked) as caught:
+        publisher._refuse_incomplete_seats(dest, 1, HEAD, send, tmp_path, {})
+    assert str(caught.value) == refusal
+    assert calls == []
+    if refusal.startswith("REPO_REFUSED"):
+        with pytest.raises(publisher.gate.PublishBlocked) as caught:
+            publisher.publish(
+                "pr-merge", repo=dest.removeprefix("github.com/"), number=1, match_head=HEAD, expect_queue="true",
+                runner=send, cwd=tmp_path, env={},
+            )
+        assert str(caught.value) == refusal
+        assert calls == []
 
 
 transport = enqueue_transport
