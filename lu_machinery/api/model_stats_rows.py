@@ -947,7 +947,15 @@ REPOSITORY_SLUG = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9._-]{1,10
 
 
 def _selector_ok(receipt: object) -> bool:
-    """None, or a receipt the durable review stores' one receipt check (``selector_columns``) accepts."""
+    """None, or a plain dict the durable review stores' one receipt check (``selector_columns``) accepts.
+
+    A ledger line is JSON: any other mapping type is refused before a batch writes anything, never discovered by the
+    serializer after earlier lines were appended (``publication`` copies a caller's mapping into a dict first).
+    """
+    if receipt is None:
+        return True
+    if not isinstance(receipt, dict):
+        return False
     try:
         selector_columns(receipt)
     except ValueError:
