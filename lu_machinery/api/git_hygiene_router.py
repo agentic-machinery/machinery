@@ -684,6 +684,10 @@ def _recorded_task_reference(tasks_dir: Path, candidate: object, slugs: frozense
         return None
     if not isinstance(record, dict) or record.get("task_id") != token:
         return None
+    for field in ("repository_id", "repository"):
+        raw_repo = record.get(field)
+        if raw_repo is not None and (not isinstance(raw_repo, str) or not raw_repo.isascii()):
+            return None
     repo = _authoritative_task_repository(record)
     if not repo or not repo.isascii() or repo.casefold() not in slugs:
         return None

@@ -2711,16 +2711,18 @@ def test_check_issue_task_quality_rejects_kelvin_sign_slug_folding(monkeypatch):
     assert check_issue_task_quality.registry_for(kelvin_slug) is None
     assert check_issue_task_quality.registry_for(real_slug) is None
 
-    # _claim matches ASCII digits only (re.ASCII), ignoring Arabic-Indic digits.
+    # _claim matches complete ASCII digit tokens only, rejecting Arabic-Indic and mixed-digit tokens.
     assert check_issue_task_quality._claim({"title": "[٤٢]", "body": "Parent: #٤٢"}, real_slug, [42], {}, {}) is None
+    assert check_issue_task_quality._claim({"title": "[4٢]", "body": "Parent: #4٢"}, real_slug, [4, 42], {}, {}) is None
     assert check_issue_task_quality._claim({"title": "", "body": "Parent: #42"}, real_slug, [42], {}, {}) == 42
 
-    # CLI rejects a Kelvin-sign --repo before loading the catalog or calling fetch_issue.
+    # CLI rejects a Kelvin-sign or non-ASCII whitespace (U+00A0) --repo before trimming or calling fetch_issue.
     monkeypatch.setattr(
         check_issue_task_quality,
         "fetch_issue",
         lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("fetch_issue must not run for non-ASCII repo")),
     )
     assert check_issue_task_quality.main(["--issue", "42", "--repo", kelvin_slug, "--strict", "--json"]) == 1
+    assert check_issue_task_quality.main(["--issue", "42", "--repo", f"{real_slug}\u00a0", "--strict", "--json"]) == 1
     # Even with an ASCII --repo, a non-ASCII active_github from the resolver is refused before fetch_issue.
     assert check_issue_task_quality.main(["--issue", "42", "--repo", real_slug, "--strict", "--json"]) == 1

@@ -2862,8 +2862,15 @@ def _review_pr_ownership_refusal(record: dict, repo_id: str, caller: str, *, not
     from lu_machinery.orchestration import pr_ownership
 
     try:
-        owner = pr_ownership.accepted_handoffs().get((repo_id.casefold(), pr_number))
-    except (pr_ownership.OwnershipError, OSError, ValueError, RecursionError):
+        data = pr_ownership.load(pr_ownership.state_path())
+        handoff = data["handoffs"].get(f"{repo_id.casefold()}#{pr_number}")
+        owner = (
+            handoff["successor"]
+            if isinstance(handoff, dict)
+            and not (pr_ownership.decision_custody(handoff) or pr_ownership.keeper_custody(handoff))
+            else None
+        )
+    except (pr_ownership.OwnershipError, OSError, ValueError, KeyError, TypeError, RecursionError):
         return "ownership_state_unavailable"
     return None if owner == caller else not_owner
 
@@ -2900,14 +2907,14 @@ def _own_review_reply(record: dict, nonce: str | None) -> dict:
             branch for branch in (holder.get("publish_branch"), holder.get("worktree_branch"))
             if isinstance(branch, str) and branch
         }
-        if holder.get("repository_id") != record.get("repository_id"):
+        holder_repo = _record_repo_id(holder)
+        repo_id = _record_repo_id(record)
+        if not holder_repo or not repo_id or holder_repo != repo_id:
             return {"result_unavailable": "review_not_of_parent_branch"}
         if review_branch not in branches:
             # Read-only --pr admission binds the repository, PR number, branch and pinned commit before
             # the dispatcher writes the v2 record. The holder's local HEAD must still match that commit.
-            repo_id = _record_repo_id(record)
-            if (record.get("schema_version") != 2 or record.get("mode") != "read-only"
-                    or not repo_id or _record_repo_id(holder) != repo_id):
+            if record.get("schema_version") != 2 or record.get("mode") != "read-only":
                 return {"result_unavailable": "review_not_of_parent_branch"}
             refusal = _review_pr_ownership_refusal(record, repo_id, caller, not_owner="review_not_of_parent_branch")
             if refusal is not None:

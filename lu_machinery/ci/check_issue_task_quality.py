@@ -293,8 +293,8 @@ def read_parent(repository: str, number: int) -> dict | None:
 
 def _claim(issue: dict, repository: str, roots: list[int], index: dict, parents: dict) -> int | None:
     """Resolve the documented title/body claim independently of the observed root."""
-    candidates = re.findall(r"\[(\d+)\]", issue.get("title") or "", re.ASCII)
-    candidates += re.findall(r"^Parent:\s*#(\d+)\b", issue.get("body") or "", re.IGNORECASE | re.MULTILINE | re.ASCII)
+    candidates = re.findall(r"\[([0-9]+)\]", issue.get("title") or "")
+    candidates += re.findall(r"^(?ai:Parent):[ \t]*#([0-9]+)(?!\w)", issue.get("body") or "", re.MULTILINE)
     for candidate in candidates:
         number = int(candidate)
         visited = set()
@@ -842,8 +842,10 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         if args.issue is not None:
-            raw_repo = args.repo.strip() if isinstance(args.repo, str) else ""
-            if not raw_repo or not raw_repo.isascii():
+            if not isinstance(args.repo, str) or not args.repo.isascii():
+                raise ValueError("repository must be non-empty ASCII")
+            raw_repo = args.repo.strip()
+            if not raw_repo:
                 raise ValueError("repository must be non-empty ASCII")
             catalog = fleet_repos.load_fleet_repos()
             active = fleet_repos.resolve_active_fleet_repo(raw_repo, repos=catalog)

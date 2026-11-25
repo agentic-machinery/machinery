@@ -858,6 +858,11 @@ def test_pull_requests_and_live_workers_reject_kelvin_sign_slug_folding(tmp_path
     tasks = tmp_path / "tasks"
     _write_task_record(tasks, _KEPT, repository=kelvin_slug)
     assert git_hygiene_router._recorded_task_reference(tasks, _KEPT, frozenset({real_slug})) is None
+    # Non-ASCII whitespace (U+00A0) on repository must be rejected before trimming even when repository_id is ASCII.
+    (tasks / f"{_KEPT}.json").write_text(json.dumps({
+        "task_id": _KEPT, "repository_id": real_slug, "repository": f"{real_slug}\u00a0",
+    }))
+    assert git_hygiene_router._recorded_task_reference(tasks, _KEPT, frozenset({real_slug})) is None
     _write_task_record(tasks, _KEPT, repository="Learn-Ukrainian/Machinery")
     assert git_hygiene_router._recorded_task_reference(tasks, _KEPT, frozenset({real_slug})) == _KEPT
 

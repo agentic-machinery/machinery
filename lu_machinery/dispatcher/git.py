@@ -1165,11 +1165,16 @@ def _accepted_prs(task_id: str, repo: str) -> list[int]:
         and not pr_ownership.decision_custody(entry)
     ]
     target = repo.casefold()
-    return sorted({
-        int(key.rpartition("#")[2])
-        for key in keys
-        if isinstance(key, str) and key.rpartition("#")[0].isascii() and key.rpartition("#")[0] == target
-    })
+    accepted: set[int] = set()
+    for key in keys:
+        if not isinstance(key, str) or not key.isascii():
+            continue
+        key_repo, sep, key_num = key.rpartition("#")
+        if sep == "#" and key_repo == target and key_num.isdigit():
+            number = int(key_num)
+            if number > 0:
+                accepted.add(number)
+    return sorted(accepted)
 
 
 def _same_repo_pr(pr: dict, repo: str) -> bool:
