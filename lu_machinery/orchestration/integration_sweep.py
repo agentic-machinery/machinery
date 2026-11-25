@@ -154,9 +154,14 @@ REPLY_OPENER = "<details><summary>Reviewer's reply</summary>\n\n"
 # Since #11127 the publisher posts only the recorder's typed record, which never carries a
 # raw APPROVE trailer, so only a comment GitHub created before then can be such a legacy record.
 LEGACY_TRAILER_CUTOFF = datetime(2026, 10, 20, 6, 0, 20, tzinfo=UTC)
+# The recorder's statement of the author families it resolved at record time (GUARD-FAMILY-1125);
+# older records lack it. Its value is sorted, unique family tokens joined by ", ".
+AUTHOR_FAMILIES_LABEL = "Author families: "
+AUTHOR_FAMILY_TOKEN = r"[a-z][a-z0-9_-]{0,63}"
 # Readable record lines whose value the trailer does not carry.
 FREE_RECORD_LINES = re.compile(
     r"Review score: (?:\d+/10|absent)|Authored by: [^\s,]+(?:, [^\s,]+)*|Withheld findings: (?:\d+|unknown)"
+    rf"|{AUTHOR_FAMILIES_LABEL}{AUTHOR_FAMILY_TOKEN}(?:, {AUTHOR_FAMILY_TOKEN})*"
 )
 REQUIRED_CHECKS = ("CI Gate",)
 DEFAULT_GH_TIMEOUT_SECONDS = 60.0
@@ -478,6 +483,15 @@ def parse_marker(body: str) -> dict[str, Any] | None:
     if len(authored) > 1:
         return None
     item["author_models"] = tuple(authored[0].removeprefix("Authored by: ").split(", ")) if authored else ()
+    attested = [
+        line.removeprefix(AUTHOR_FAMILIES_LABEL).split(", ")
+        for line in readable
+        if line.startswith(AUTHOR_FAMILIES_LABEL)
+    ]
+    if len(attested) > 1 or (attested and attested[0] != sorted(set(attested[0]))):
+        return None
+    if attested:
+        item["author_families"] = tuple(attested[0])
     if pair is not None:
         if attested_author_families([item]) != pair_families:
             return None

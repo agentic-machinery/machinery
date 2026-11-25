@@ -770,6 +770,49 @@ def test_republish_withheld_posts_the_sealed_security_reply(monkeypatch, low_rev
 
 
 
+def test_marker_attests_author_families(monkeypatch, low_review, tmp_path):
+    """Defect class: marker readers re-derive author families from their own model lists, which drift.
+
+    GUARD-FAMILY-1125: a reader without ``grok-4.7-high`` refused a valid approval. The recorder now states the
+    families it resolved; a record written before that still parses and republishes.
+    """
+    from dataclasses import replace
+
+    tasks, comments, statuses, _files, _admit = low_review
+    facts = recorder.pr_review_facts()
+    grok = recorder.CommitAttribution(
+        "c" * 40, "xai", "task-record", task_id="cursor/author-two", author_models=("grok-4.7-high",),
+    )
+    monkeypatch.setattr(recorder, "pr_review_facts", lambda *_, **__: replace(
+        facts, commits=(*facts.commits, grok), existing_families=frozenset({"openai", "xai"}),
+    ))
+    task = _seal(tasks, comments, statuses, reply=f"VERDICT: CHANGES_REQUESTED\n\n{_FINDING}\n", profile="security")
+    monkeypatch.setattr(recorder, "_pr", lambda *_a: _pr_view(task))
+    recorder.record("review-one", pr_number=1, task_root=tasks, lock_root=tmp_path / "locks")
+    withheld = comments[-1]["body"]
+    line = "Author families: openai, xai\n"
+    authors = ", ".join(sorted((CURRENT_SOL, "grok-4.7-high")))
+    assert f"Authored by: {authors}\n{line}Task id: review-one\n" in withheld and _FINDING not in withheld
+    assert sweep.parse_marker(withheld)["author_families"] == ("openai", "xai")
+    # An old record has no families line; it still parses with the same author models.
+    legacy = withheld.replace(line, "")
+    assert "author_families" not in sweep.parse_marker(legacy)
+    assert sweep.parse_marker(legacy)["author_models"] == sweep.parse_marker(withheld)["author_models"]
+    for bad in ("Author families: xai, openai\n", "Author families: openai, openai\n", "Author families: Open AI\n"):
+        assert sweep.parse_marker(withheld.replace(line, bad)) is None
+    assert sweep.parse_marker(withheld.replace(line, line + line)) is None
+    comments[-1]["body"] = legacy
+    assert sweep.lookup_verdict(comments, task["worktree_base_sha"], "fleet").state == "CHANGES_REQUESTED"
+    republished = recorder.republish_withheld("review-one", pr_number=1, task_root=tasks, lock_root=tmp_path / "locks")
+    assert republished["comment"] == "posted"
+    assert line in comments[-1]["body"] and _FINDING in comments[-1]["body"]
+    with pytest.raises(recorder.RecordError, match="author family is not a marker token"):
+        recorder.build_comment(
+            sha=SHA, task_id="review-one", started="2026-09-23T12:00:00.000001+00:00", verdict="APPROVED",
+            model=CURRENT_SOL, family="openai", reply="VERDICT: APPROVE", author_families=("open ai",),
+        )
+
+
 def test_republish_withheld_refuses_malformed_later_trusted_marker(low_review, tmp_path):
     """A malformed later verdict must prevent republication out of order."""
     tasks, comments, statuses, _files, _admit = low_review
@@ -962,7 +1005,7 @@ def test_real_refusal_publishes_only_skeleton(scanned_recorder, tmp_path, detail
     assert body == (
         f"### Cross-family review\nhead: {SHA}\nReviewer family: openai\nVERDICT: {verdict}\n"
         f"Reviewer model: {CURRENT_SOL}\nReview score: absent\nAuthored by: gemini-3.8-flash-high\n"
-        "Task id: review-one\n\nWithheld findings: unknown\n"
+        "Author families: google\nTask id: review-one\n\nWithheld findings: unknown\n"
         "Findings are held privately.\n\n"
         f"<!-- cf-verdict v1 sha={SHA} task=review-one started=2026-09-23T12:00:00.000001+00:00 "
         f"verdict={verdict} model={CURRENT_SOL} family=openai -->"
@@ -993,7 +1036,7 @@ def test_clean_publication_bytes_unchanged(scanned_recorder, tmp_path):
     expected = (
         f"### Cross-family review\nhead: {SHA}\nReviewer family: openai\nVERDICT: APPROVED\n"
         f"Reviewer model: {CURRENT_SOL}\nReview score: 8/10\nAuthored by: gemini-3.8-flash-high\n"
-        "Task id: review-one\n\n"
+        "Author families: google\nTask id: review-one\n\n"
         "<details><summary>Reviewer's reply</summary>\n\n"
         + reply + "\n\n</details>\n\n"
         f"<!-- cf-verdict v1 sha={SHA} task=review-one started=2026-09-23T12:00:00.000001+00:00 "
