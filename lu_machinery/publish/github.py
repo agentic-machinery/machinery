@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import contextvars
 import hashlib
 import json
 import os
@@ -2191,9 +2192,13 @@ def _repo_admin_authority(verb, environment):
     if environment.get("GH_HOST", "github.com") != "github.com":
         raise _repo_refused(verb, "only github.com is supported")
     environment["GH_HOST"] = "github.com"
-    # With GH_CONFIG_DIR and XDG_CONFIG_HOME refused, gh finds its stored login under $HOME: pin it to the
-    # account's own home (as the journal's directory is), so a caller HOME cannot select another login.
-    environment["HOME"] = _account_home()
+    # With GH_CONFIG_DIR and XDG_CONFIG_HOME refused, gh finds its stored login under the transport's HOME,
+    # and the shared client keys its rate-limit budget on that login through this process's home. Both must
+    # be the account's own home (the journal's too), so a caller HOME selects no other login or budget.
+    home = _account_home()
+    for value in (environment.get("HOME"), str(Path.home())):
+        if not value or os.path.realpath(value) != os.path.realpath(home):
+            raise _repo_refused(verb, f"HOME must be the account's home directory {home}, where gh keeps its login")
 
 
 def _repo_admin_row(verb, key):
@@ -2309,13 +2314,27 @@ def _silence_stream(name):
     _devnull_stream(name)
 
 
-# The current repo-admin run: whether it sent a mutation, and which output streams failed.
-# A failed output in a run that sent a mutation makes it unsettled.
-_REPO_ADMIN_RUN: dict[str, Any] = {"sent": False, "failed": []}
+# The current repo-admin run: whether it sent a mutation and which output streams failed. A failed output
+# in a run that sent a mutation makes it unsettled. main() opens the run before it builds its parser,
+# publish() opens one for a direct caller, and a nested open joins the run already open.
+_REPO_ADMIN_RUN: contextvars.ContextVar[dict[str, Any] | None] = contextvars.ContextVar("repo_admin_run", default=None)
 
 
-def _repo_admin_reset():
-    _REPO_ADMIN_RUN.update(sent=False, failed=[])
+@contextlib.contextmanager
+def _repo_admin_run():
+    if _REPO_ADMIN_RUN.get() is not None:
+        yield
+        return
+    token = _REPO_ADMIN_RUN.set({"sent": False, "failed": []})
+    try:
+        yield
+    finally:
+        _REPO_ADMIN_RUN.reset(token)
+
+
+def _repo_admin_state():
+    """The open run's state; outside a run, a fresh one nothing reads."""
+    return _REPO_ADMIN_RUN.get() or {"sent": False, "failed": []}
 
 
 def _stream_write(name, text):
@@ -2326,7 +2345,7 @@ def _stream_write(name, text):
         stream.flush()
         return True
     except Exception:
-        _REPO_ADMIN_RUN["failed"].append(name)
+        _repo_admin_state()["failed"].append(name)
         _silence_stream(name)
         return False
 
@@ -2345,19 +2364,39 @@ def _repo_admin_flush():
 def _repo_admin_settled(code):
     """*code* after a final guarded flush of both streams: any output failure once a mutation was sent is 3."""
     _repo_admin_flush()
-    return REPO_ADMIN_UNSETTLED if _REPO_ADMIN_RUN["sent"] and _REPO_ADMIN_RUN["failed"] else code
+    state = _repo_admin_state()
+    return REPO_ADMIN_UNSETTLED if state["sent"] and state["failed"] else code
 
 
-def _repo_admin_exit(code):
-    """The process exit code of a repo-admin verb, settled after its last output.
+def _repo_admin_argv(argv):
+    """Whether argparse dispatches *argv* to repo-create or repo-transfer.
 
-    Both streams are then detached (replaced by /dev/null), so the interpreter's shutdown flush
-    of a stream that fails only later cannot turn the code into 120.
+    argparse's own tokenizer reads the verb (the first positional, after any ``--``), never a copy of it.
+    The probe writes nothing, and runs with both streams on /dev/null (restored after), since building a
+    parser probes ``sys.stdout``, which may be unusable here.
     """
-    code = _repo_admin_settled(code)
-    for name in ("stdout", "stderr"):
-        _devnull_stream(name)
-    return code
+    try:
+        with open(os.devnull, "w", encoding="utf-8") as devnull, contextlib.redirect_stdout(devnull), \
+                contextlib.redirect_stderr(devnull):
+            probe = argparse.ArgumentParser(add_help=False, allow_abbrev=False, exit_on_error=False)
+            probe.add_argument("-h", "--help", action="store_true")
+            probe.add_argument("rest", nargs=argparse.PARSER)  # how a subparsers action takes its verb
+            known, _ = probe.parse_known_args(list(argv))
+    except Exception:
+        return False
+    return not known.help and known.rest[:1] != [] and known.rest[0] in REPO_ADMIN_VERBS
+
+
+def repo_admin_detach(argv):
+    """After ``main(argv)`` returned or exited for a repo-admin verb: replace both streams with /dev/null.
+
+    Only the ``python -m lu_machinery.publish`` entry point calls this, after ``main()`` settled the
+    code with its last guarded flush, so the interpreter's shutdown flush cannot turn that code into
+    120. In-process callers of ``main()`` keep their streams; for any other verb it does nothing.
+    """
+    if _repo_admin_argv(argv):
+        for name in ("stdout", "stderr"):
+            _devnull_stream(name)
 
 
 def _repo_admin_limited(verb, exc, capture_output, text):
@@ -2387,10 +2426,11 @@ def _repo_admin_result(verb, receipt, code, capture_output, text):
     Both streams are flushed here, so nothing is left for interpreter shutdown to fail on.
     """
     encoded = json.dumps(receipt, indent=2, sort_keys=True) + "\n"
-    _REPO_ADMIN_RUN["sent"] = bool(receipt["mutations_sent"])
+    state = _repo_admin_state()
+    state["sent"] = bool(receipt["mutations_sent"])
     if not capture_output and not _stream_write("stdout", encoded):
         _stderr_note(f"{verb.upper().replace('-', '_')}_STDOUT_UNWRITTEN: the receipt is only in its file.")
-    if code == REPO_ADMIN_UNSETTLED or (_REPO_ADMIN_RUN["sent"] and _REPO_ADMIN_RUN["failed"]):
+    if code == REPO_ADMIN_UNSETTLED or (state["sent"] and state["failed"]):
         _stderr_note(
             f"{verb.upper().replace('-', '_')}_UNSETTLED: {receipt['detail'] or 'the result is unknown'}; "
             "do not retry. Reconcile the state on GitHub first (see --help)."
@@ -2446,7 +2486,6 @@ def _repo_admin(verb, fields, *, runner, cwd, environment, capture_output, text)
     One lock per fixture name or repository id is held from the first read to settlement, so a
     second run never acts on reads taken before the first run's mutation.
     """
-    _repo_admin_reset()
     _repo_admin_authority(verb, environment)
     repos, row = _repo_admin_row(verb, fields["repo"])
     plan = (_repo_create_plan if verb == "repo-create" else _repo_transfer_plan)(verb, fields, repos, row, environment)
@@ -2481,7 +2520,9 @@ def _repo_admin(verb, fields, *, runner, cwd, environment, capture_output, text)
             fields, plan, receipt, sink, held["directory"], directory, runner=runner, cwd=cwd,
             environment=environment, capture_output=capture_output, text=text,
         )
-    except Exception as exc:
+    except BaseException as exc:
+        if not isinstance(exc, Exception) and not receipt["mutations_sent"]:
+            raise  # An interrupt before the POST stops with nothing sent.
         if not receipt["mutations_sent"] and verb == "repo-transfer" and not isinstance(
             exc, github_client.GitHubRateLimited
         ) and _repo_admin_journal_possible(plan["repository_id"]):
@@ -2507,7 +2548,10 @@ def _repo_admin(verb, fields, *, runner, cwd, environment, capture_output, text)
                 return _repo_admin_limited(verb, exc, capture_output, text)
             raise
         if receipt["outcome"] in {None, "created", "transferred"}:
-            receipt["outcome"], receipt["detail"] = "unverified", "a local step failed after the mutation was sent"
+            receipt["outcome"], receipt["detail"] = "unverified", (
+                "a local step failed after the mutation was sent" if isinstance(exc, Exception)
+                else "the run was interrupted after the mutation was sent"
+            )
         _write_transfer_receipt(sink, receipt)
         return _repo_admin_result(verb, receipt, REPO_ADMIN_UNSETTLED, capture_output, text)
     finally:
@@ -3975,10 +4019,12 @@ def publish(
         return _issue_transfer(
             fields, runner=runner, cwd=cwd, environment=environment, capture_output=capture_output, text=text
         )
-    if verb in {"repo-create", "repo-transfer"}:
-        return _repo_admin(
-            verb, fields, runner=runner, cwd=cwd, environment=environment, capture_output=capture_output, text=text
-        )
+    if verb in REPO_ADMIN_VERBS:
+        with _repo_admin_run():
+            return _repo_admin(
+                verb, fields, runner=runner, cwd=cwd, environment=environment, capture_output=capture_output,
+                text=text,
+            )
     dest = "unknown" if verb == "gist-create" else repository(cwd, environment, fields.get("repo"))
     if dest == "unknown" and verb != "gist-create":
         raise gate.PublishBlocked("OPSEC: publisher repository unresolved; provide --repo.")
@@ -4496,6 +4542,31 @@ def loads(value: str) -> object:
 
 
 def main(argv=None, *, runner=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if not _repo_admin_argv(argv):
+        return _main(argv, runner=runner)
+    # repo-create and repo-transfer: one run from before the parser is built to the settled exit code.
+    with _repo_admin_run():
+        try:
+            try:
+                code = _main(argv, runner=runner)
+            except Exception:
+                # Only building or parsing raises here (_main settles every publish error itself), when a
+                # stream argparse probes or writes is unusable. Nothing was sent: replace both streams,
+                # record them as failed output, and run again.
+                for name in ("stdout", "stderr"):
+                    _repo_admin_state()["failed"].append(name)
+                    _devnull_stream(name)
+                code = _main(argv, runner=runner)
+        except SystemExit:
+            # --help (0) or invalid input (2): a broken stream is replaced, so it cannot make the code 120.
+            _repo_admin_flush()
+            raise
+        # Settled after the last output; a failure there after a mutation is unsettled, never 0.
+        return _repo_admin_settled(code)
+
+
+def _main(argv, *, runner=None):
     parser = PublisherParser(
         description="Publish GitHub changes through closed, scanned fields.\nUse for public writes; raw gh reads use native CLI arguments.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -4740,9 +4811,9 @@ def main(argv=None, *, runner=None):
                 "Checks before the mutation: LU_PRODUCT_ROOT names the product checkout, which the private\n"
                 "  directory below must stay outside (unset: exit 2); no worker marker; none of GH_TOKEN,\n"
                 "  GITHUB_TOKEN, GH_ENTERPRISE_TOKEN, GITHUB_ENTERPRISE_TOKEN, GH_CONFIG_DIR, XDG_CONFIG_HOME set;\n"
-                "  GH_HOST unset or github.com; gh runs with HOME set to the account's password-database home, so its\n"
-                "  stored login is the account's own; GET /user is --principal; the principal is an active admin of\n"
-                "  the source organization; both names are free.\n"
+                "  GH_HOST unset or github.com; HOME is the account's password-database home (gh reads its stored\n"
+                "  login, and the client its rate-limit budget, through it); GET /user is --principal; the principal\n"
+                "  is an active admin of the source organization; both names are free.\n"
                 "  One run per fixture name: a lock in the private directory is held from the first read to settlement.\n"
                 "Outputs: one POST orgs/<owner>/repos (private, auto_init), a readback of the same id, private, and\n"
                 "  GET /user again. Receipt JSON on stdout and in a new 0600 file under\n"
@@ -4751,8 +4822,9 @@ def main(argv=None, *, runner=None):
                 "  rehearsal_destination, principal before and after. repo-transfer --create-receipt takes that file.\n"
                 "Exit codes: 0 created and verified, or dry run passed (no mutation); 2 invalid input or refusal, no\n"
                 "  mutation; 3 UNSETTLED: the POST was sent and its result is unknown or unverified (an output\n"
-                "  failure after the POST included), or another run holds the lock (in-progress); never retry with\n"
-                "  the same name: check the organization on GitHub and use a new name; a rate limit at the POST is 3;\n"
+                "  failure or Ctrl-C after the POST included), or another run holds the lock (in-progress); never\n"
+                "  retry with the same name: check the organization on GitHub and use a new name; a rate limit at\n"
+                "  the POST is 3; Ctrl-C before the POST stops with nothing sent;\n"
                 "  75 a rate limit refused a read before the POST.\n"
                 "Related: decision GH-ADMIN-VERBS-1124; repo-transfer; docs/runbooks/write-worker-boundary.md."
             )
@@ -4790,13 +4862,14 @@ def main(argv=None, *, runner=None):
                 "  not be removed is named in the receipt); 2 invalid input, a caller or registry refusal, or a\n"
                 "  --create-receipt that cannot be loaded (the id is then unknown), or a refusal with no mutation sent\n"
                 "  and no journal for this repository id; 3 UNSETTLED: the POST was sent and the result is unknown or\n"
-                "  unverified (an output failure after the POST included); a journal for this repository id exists or\n"
+                "  unverified (an output failure or Ctrl-C after the POST included); a journal for this repository id exists or\n"
                 "  cannot be read and the destination does not settle it, whichever later step fails (unreconciled);\n"
                 "  a refused run could not remove its own journal (journal-retained); or another run holds the lock\n"
                 "  (in-progress). Journals are per repository id: the rehearsal's never blocks the move.\n"
                 "  Never retry: rerun only to reconcile (it exits 0 once the id is at the\n"
                 "  destination); if GitHub still shows it at the source, confirm no transfer is pending and remove\n"
                 "  the journal by hand. Do not flip the selector until reconciled. A rate limit at the POST is 3;\n"
+                "  Ctrl-C before the POST stops with nothing sent (a journal it leaves is reconciled as above);\n"
                 "  75 a rate limit refused a read before the POST.\n"
                 "Related: decision GH-ADMIN-VERBS-1124; repo-create; lu_machinery/config/fleet_repos.yaml."
             )
@@ -5004,18 +5077,8 @@ def main(argv=None, *, runner=None):
         action="store_true",
         help="Wrap paginated pages in an array (default off; unsupported for shaped diagnostic reads)",
     )
-    argv = list(sys.argv[1:] if argv is None else argv)
-    try:
-        args = vars(parser.parse_args(argv))
-    except SystemExit:
-        if argv[:1] and argv[0] in REPO_ADMIN_VERBS:
-            # --help (0) or invalid input (2) of a repo-admin verb: a broken stream must not make it 120 at exit.
-            _repo_admin_reset()
-            _repo_admin_exit(0)
-        raise
+    args = vars(parser.parse_args(argv))
     verb = args.pop("verb")
-    if verb in REPO_ADMIN_VERBS:
-        _repo_admin_reset()
     try:
         if verb == "read":
             code = read(args.pop("name"), runner=runner, **args).returncode
@@ -5033,9 +5096,6 @@ def main(argv=None, *, runner=None):
             return 2
         _stderr_note("OPSEC: publisher transport unavailable.")
         code = 2
-    if verb in REPO_ADMIN_VERBS:
-        # Settled after the last output; a failure there after a mutation is unsettled, never 0 or 120.
-        code = _repo_admin_exit(code)
     return code
 
 

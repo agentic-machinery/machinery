@@ -33,8 +33,8 @@ CATALOG = {
     "guard": {"github": f"{OLD}/held-moved", "local_name": "held-moved", "role": "private-labs"},
 }
 WORKER_MARKERS = ("LEARN_UKRAINIAN_DISPATCH_TASK_ID", "LU_WRITE_BOUNDARY_BROKER")
-# The real state-directory resolver, before the autouse fixture replaces it with a tmp_path seam.
-REAL_STATE_DIRECTORY = pub._repo_admin_directory
+# The real state-directory and account-home resolvers, before the autouse fixture replaces them.
+REAL_STATE_DIRECTORY, REAL_ACCOUNT_HOME = pub._repo_admin_directory, pub._account_home
 PRINCIPAL = "octo-admin"
 
 
@@ -64,7 +64,7 @@ class FakeGitHub:
         self.repos = {SOURCE: repository(REPO_ID, SOURCE)}
         self.memberships = {OLD: {"state": "active", "role": "admin"}, NEW: {"state": "active", "role": "admin"}}
         self.login, self.after_login = login, after_login
-        self.calls, self.posts, self.overrides, self.homes = [], [], {}, set()
+        self.calls, self.posts, self.overrides = [], [], {}
         self.next_id = 900
 
     def find(self, slug):
@@ -74,7 +74,6 @@ class FakeGitHub:
         assert args[:3] == ["gh", "api", "--method"], args
         assert not set(pub.REPO_ADMIN_CREDENTIAL_OVERRIDES) & set(kwargs["env"])
         self.calls.append(args)
-        self.homes.add(kwargs["env"].get("HOME"))
         method, endpoint = args[3], args[4]
         override = self.overrides.get((method, endpoint, bool(self.posts)))
         if method == "POST":
@@ -120,6 +119,10 @@ def selector(tmp_path, monkeypatch):
     (tmp_path / "product").mkdir()
     monkeypatch.setenv("LU_PRODUCT_ROOT", str(tmp_path / "product"))
     monkeypatch.setattr(pub, "_repo_admin_directory", lambda: str(state_dir(tmp_path)))
+    # A test-owned account home, which HOME names (a HOME other than the account's is refused).
+    (tmp_path / "home").mkdir()
+    monkeypatch.setattr(pub, "_account_home", lambda: str(tmp_path / "home"))
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
     monkeypatch.setenv("LU_SCRATCH_ROOT", str(tmp_path / "scratch"))
     chosen = {"slug": SOURCE, "error": None}
 
@@ -159,6 +162,8 @@ def state_dir_of(_receipt):
 
 CALLER = [
     ("HOME", "/caller/home"),
+    # Only this process's HOME differs: the environment given to publish() carries the account's home.
+    ("process HOME", "/caller/home"),
     *[(marker, "task-1") for marker in WORKER_MARKERS],
     *[(name, "/caller/value") for name in pub.REPO_ADMIN_CREDENTIAL_OVERRIDES],
     ("GH_HOST", "ghe.example.com"),
@@ -170,14 +175,20 @@ CALLER = [
 def test_caller_authority_and_credential_overrides_refused_before_any_read(monkeypatch, verb, fields, name, value):
     """Defect class: a caller-controlled identity or credential (worker marker, token, gh config, host) reaching GitHub.
 
-    A caller HOME, through which gh finds its stored login, is replaced by the account's own home.
+    A HOME other than the account's, through which gh finds its stored login, is refused the same way, also
+    when only this process's HOME differs (the shared client keys its rate-limit budget through it).
     """
-    monkeypatch.setenv(name, value)
     gh = FakeGitHub()
-    if name == "HOME":
-        result, _ = run(verb, gh, repo="infra-private", dry_run=True, **fields)
-        assert result.returncode == 0 and gh.homes == {pub._account_home()} and value not in gh.homes
+    if name == "process HOME":
+        monkeypatch.setenv("HOME", value)
+        with pytest.raises(gate.PublishBlocked, match="_REFUSED: HOME must be"):
+            pub.publish(
+                verb, runner=gh, capture_output=True, text=True, principal=PRINCIPAL, repo="infra-private",
+                env={**os.environ, "HOME": pub._account_home()}, **fields,
+            )
+        assert gh.calls == []
         return
+    monkeypatch.setenv(name, value)
     with pytest.raises(gate.PublishBlocked, match="_REFUSED: "):
         run(verb, gh, repo="infra-private", **fields)
     assert gh.calls == []
@@ -439,19 +450,20 @@ def test_unsettled_transfer_blocks_retry_until_reconciled(tmp_path, monkeypatch,
     gh = FakeGitHub()
     transfer = ("POST", f"repos/{SOURCE}/transfer", False)
     if outcome == "pending-state-home-changed":
-        # The real resolver: the account's password-database home, whatever HOME and XDG_STATE_HOME say.
+        # The real resolvers: the account's password-database home, whatever XDG_STATE_HOME says
+        # (a HOME other than that home is refused before any read, T1).
         import pwd
         from types import SimpleNamespace
 
         monkeypatch.setattr(pwd, "getpwuid", lambda uid: SimpleNamespace(pw_dir=str(tmp_path / "home")))
         monkeypatch.setattr(pub, "_repo_admin_directory", REAL_STATE_DIRECTORY)
+        monkeypatch.setattr(pub, "_account_home", REAL_ACCOUNT_HOME)
         monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state-a"))
         gh.overrides[transfer] = subprocess.TimeoutExpired(["gh"], 60)
         result, _ = run("repo-transfer", gh, repo="infra-private")
         assert result.returncode == pub.REPO_ADMIN_UNSETTLED
         gh.overrides.clear()
         monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state-b"))
-        monkeypatch.setenv("HOME", str(tmp_path / "elsewhere"))
         result, receipt = run("repo-transfer", gh, repo="infra-private")
         assert result.returncode == pub.REPO_ADMIN_UNSETTLED and receipt["outcome"] == "unreconciled"
         assert len(gh.posts) == 1
@@ -627,7 +639,10 @@ def test_rehearsal_transfer_bound_to_create_receipt(tmp_path, tamper, reason):
 
 @pytest.mark.parametrize("verb", ["repo-create", "repo-transfer"])
 def test_help_documents_examples_outputs_and_exit_codes(capsys, verb):
-    """Defect class: --help drifting from the CLI help standard (no examples, outputs, exit codes or option help)."""
+    """Defect class: --help drifting from the CLI help standard (no examples, outputs, exit codes or option help).
+
+    Also: one call's stream handling silencing a later in-process call (each call writes its own output).
+    """
     with pytest.raises(SystemExit) as exit_:
         pub.main([verb, "--help"])
     out = capsys.readouterr().out
@@ -637,6 +652,15 @@ def test_help_documents_examples_outputs_and_exit_codes(capsys, verb):
     ):
         assert section in out
     assert "omitted by default" not in out
+    with pytest.raises(SystemExit) as exit_:
+        pub.main(["ruleset-merge-queue", "--invalid"])
+    assert exit_.value.code == 2 and "invalid publisher arguments" in capsys.readouterr().err
+    gh = FakeGitHub()
+    argv = [verb, "--repo", "infra-private", "--principal", PRINCIPAL, *(["--name", "rehearsal-1"] if verb == "repo-create" else [])]
+    for extra, outcome in ((["--dry-run"], "dry-run"), ([], "created" if verb == "repo-create" else "transferred")):
+        assert pub.main([*argv, *extra], runner=gh) == 0
+        captured = capsys.readouterr()
+        assert json.loads(captured.out)["outcome"] == outcome and f"{verb}: receipt " in captured.err
 
 
 @pytest.mark.parametrize("verb,fields,lock", [
@@ -661,7 +685,9 @@ def test_concurrent_run_lock_refuses_without_sending(tmp_path, verb, fields, loc
 # write fails; "descriptorless" replaces stdout with a failing wrapper that has no descriptor to redirect,
 # "over-descriptor" with a failing wrapper over the valid descriptor 1, "fails-later" with a stream that
 # fails only from main()'s final flush on, and "bufferless" with a working stream that has no binary
-# buffer; "closed" closes descriptor 1 before main().
+# buffer; "closed" closes descriptor 1 before main(), and "closed-stdout-object" / "closed-stderr-object"
+# close that stream object; "fileno-valueerror" gives stdout a fileno() that raises ValueError (argparse
+# probes it while building the parser); "sigint-after-post" sends SIGINT during the readback.
 _BROKEN_STREAMS_CHILD = """
 import importlib.util, io, os, sys
 streams = os.environ["REPO_ADMIN_TEST_STREAMS"]
@@ -717,6 +743,19 @@ if streams == "fails-later":
 if streams == "closed":
     sys.stdout.flush()
     os.close(1)
+if streams == "closed-stdout-object":
+    sys.stdout.close()
+
+
+class FilenoValueError(io.TextIOWrapper):
+    def fileno(self):
+        raise ValueError("no descriptor")
+
+
+if streams == "fileno-valueerror":
+    sys.stdout = FilenoValueError(io.BytesIO(), encoding="utf-8")
+if streams == "closed-stderr-object":
+    sys.stderr.close()
 spec = importlib.util.spec_from_file_location("repo_admin_fixture", sys.argv[1])
 fixture = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(fixture)
@@ -726,6 +765,7 @@ from lu_machinery.publish import github as pub
 gate.catalog = lambda: fixture.CATALOG
 pub._transfer_sleep = lambda _delay: None
 pub._repo_admin_directory = lambda: os.environ["REPO_ADMIN_TEST_DIRECTORY"]
+pub._account_home = lambda: os.environ["HOME"]
 fleet_repos.resolve_active_fleet_repo = lambda identifier, *, repos, env=None, **_: fleet_repos.ActiveFleetRepo(
     repo=repos[identifier], active_github=fixture.SOURCE,
 )
@@ -739,6 +779,14 @@ if streams == "fails-later":
 
     pub._repo_admin_result = settled_then_failing
 gh = fixture.FakeGitHub()
+if streams == "sigint-after-post":
+    import signal
+
+    def interrupted(args):
+        os.kill(os.getpid(), signal.SIGINT)
+        return fixture.not_found(args)
+
+    gh.overrides[("GET", f"repos/{fixture.OLD}/rehearsal-1", True)] = interrupted
 if os.environ.get("REPO_ADMIN_TEST_RATE_LIMIT"):
     from lu_machinery.common import github_client
     gh.overrides[("GET", "user", False)] = github_client.GitHubRateLimited(None, "pool_exhausted")
@@ -764,7 +812,14 @@ if sys.argv[2] == "ruleset-merge-queue":
             open(os.path.join(os.environ["REPO_ADMIN_TEST_MARKERS"], "ruleset-put"), "w").close()
             raise subprocess.TimeoutExpired(args, 30)
         return subprocess.CompletedProcess(args, 0, json.dumps(ruleset), "")
-sys.exit(pub.main(sys.argv[2:], runner=gh))
+# As the python -m lu_machinery.publish entry point does.
+try:
+    code = pub.main(sys.argv[2:], runner=gh)
+except SystemExit:
+    pub.repo_admin_detach(sys.argv[2:])
+    raise
+pub.repo_admin_detach(sys.argv[2:])
+sys.exit(code)
 """
 
 
@@ -787,6 +842,13 @@ _CREATED, _TRANSFERRED = "repo-create-rehearsal-1-*.json", f"repo-transfer-{REPO
     (_CREATE, _CREATED, False, "over-descriptor", 3),
     (_CREATE, _CREATED, False, "fails-later", 3),
     (["repo-create", "--help"], None, False, "closed", 0),
+    (["repo-create", "--help"], None, False, "closed-stdout-object", 0),
+    (["repo-transfer", "--invalid"], None, False, "closed-stderr-object", 2),
+    (["--", "repo-create", "--help"], None, False, "stdout", 0),
+    (["--", *_CREATE], _CREATED, False, "fails-later", 3),
+    (["repo-create", "--help"], None, False, "fileno-valueerror", 0),
+    (["repo-transfer", "--invalid"], None, False, "fileno-valueerror", 2),
+    (_CREATE, _CREATED, False, "sigint-after-post", 3),
     (_RULESET, None, False, "stderr", 120),
 ])
 def test_broken_output_streams_keep_the_exit_code(tmp_path, argv, pattern, limited, streams, code):
@@ -794,8 +856,9 @@ def test_broken_output_streams_keep_the_exit_code(tmp_path, argv, pattern, limit
 
     After a POST it stays 3, whichever stream failed, whether or not it has a descriptor, and also when
     the failure first appears at main()'s final flush (never 0 or 120); a rate limit before any POST
-    stays 75, also on a stream without a binary buffer (never 2); --help stays 0, also with stdout's
-    descriptor closed. The repo-admin output guard never reaches another verb: a ruleset-merge-queue PUT that
+    stays 75, also on a stream without a binary buffer (never 2); --help stays 0 and invalid arguments
+    stay 2, also with stdout's descriptor or a stream object closed, a fileno() that raises, or a leading
+    "--" before the verb; Ctrl-C after the POST is 3 with a complete receipt. The repo-admin output guard never reaches another verb: a ruleset-merge-queue PUT that
     timed out with a broken stderr keeps the code the shared main() gives it.
     """
     environment = {
@@ -823,3 +886,5 @@ def test_broken_output_streams_keep_the_exit_code(tmp_path, argv, pattern, limit
         return
     receipts = sorted(state_dir(tmp_path).glob(pattern))
     assert receipts and json.loads(receipts[-1].read_text())["mutations_sent"] == (0 if limited else 1)
+    if streams == "sigint-after-post":
+        assert json.loads(receipts[-1].read_text())["outcome"] == "unverified" and b"_UNSETTLED" in completed.stderr
