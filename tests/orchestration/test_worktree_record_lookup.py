@@ -52,6 +52,8 @@ def legacy_resolve_worktree_record(
             raise ValueError("task identity inventory unreadable") from None
         try:
             record = json.loads(raw)
+            if not isinstance(record, dict) and record != []:
+                raise ValueError("not a JSON object")  # may hold a record (#1440)
         except ValueError:
             # Reuse the claim owner's existing released-record proof only for
             # corrupt records with no possible retention key. Valid records,

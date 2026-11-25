@@ -492,13 +492,12 @@ def test_task_loader_rejects_malformed_or_mismatched_records(tmp_path):
     (tmp_path / "impl-1.sandbox.json").write_text(json.dumps({"schema": "sandbox", "task_id": "impl-1"}))
     (tmp_path / "impl-1.review.json").write_text(json.dumps({"findings": [], "target": "/tmp/held"}))
     (tmp_path / "result.json").write_text(json.dumps({"schema_version": "findings.v1", "overall": {}}))
-    (tmp_path / "notes.json").write_text("not json")
     (tmp_path / "list.json").write_text("[]")
     inventory = sweep.load_tasks(tmp_path)
     # A receipt's paths protect while its owner's record is missing or unsettled, never after it settles.
     assert inventory.complete is True and Path("/tmp/boundary-held") in inventory.references
     assert Path("/tmp/held") not in inventory.references
-    names = {"impl-1.write-boundary", "impl-1.sandbox", "impl-1.review", "result", "notes", "list"}
+    names = {"impl-1.write-boundary", "impl-1.sandbox", "impl-1.review", "result", "list"}
     assert set(inventory.records) == names
     assert all(record["status"] is None for record in inventory.records.values())
     (tmp_path / "impl-1.json").write_text(json.dumps({"task_id": "impl-1", "status": "done"}))
@@ -513,6 +512,8 @@ def test_task_loader_rejects_malformed_or_mismatched_records(tmp_path):
     (tmp_path / "own.sandbox.json").unlink()
     for name, raw in (
         ("wrong.json", json.dumps({"task_id": "someone-else"})),
+        # Text that is not JSON may hold bare record members (#1440).
+        ("notes.json", "not json"),
         ("cut.json", '{"task_id": "cut", "status": "runn'),
         ("blank.json", "\0\0"),
         ("future.json", json.dumps({"task_id": "future", "schema_version": 9})),
