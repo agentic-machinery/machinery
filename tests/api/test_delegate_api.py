@@ -1135,3 +1135,15 @@ def test_delegate_router_rejects_non_ascii_delivery_pr_repo_and_dor_digits(tmp_p
         }
     })
     assert links == [{"issue": 7, "repository": delegate_router.public_repository_id()}]
+
+
+def test_repository_authority_and_issues_router_refuse_non_ascii():
+    """Defect class: NBSP remotes or Unicode issue digits bypass repository_authority and issues_router parsers."""
+    from lu_machinery.api import issues_router, repository_authority
+
+    with pytest.raises(repository_authority.RepositoryAuthorityError, match="non-ASCII"):
+        repository_authority._repository_slug("\u00a0https://github.com/learn-ukrainian/machinery.git")
+    with pytest.raises(repository_authority.RepositoryAuthorityError, match="non-ASCII"):
+        repository_authority._repository_slug("https://github.com/learn-u\u212arainian/machinery.git")
+    assert issues_router._SUPERSEDED_RE.findall("superseded by #42 superseded by #\u0664\u0662 superseded by #4\u0662") == ["42"]
+    assert issues_router._MERGED_IN_RE.findall("merged in PR #42 merged in PR #\u0664\u0662 merged in PR #4\u0662") == ["42"]

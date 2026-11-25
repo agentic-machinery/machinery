@@ -174,8 +174,12 @@ def _merged_cohort(
         response = result.value
         if response.get("errors"):
             raise SourceUnavailable("merged_pr_lookup_partial")
+        from lu_machinery.orchestration.fleet_repos import ascii_repo_slug
+
         target = response["data"]["repository"]
-        if target["nameWithOwner"].casefold() != repo.casefold():
+        observed_slug = ascii_repo_slug(target.get("nameWithOwner"), strip=False)
+        expected_slug = ascii_repo_slug(repo, strip=False)
+        if observed_slug is None or expected_slug is None or observed_slug != expected_slug:
             raise SourceUnavailable("merged_pr_repository_mismatch")
         connection = target["pullRequests"]
         total = connection["totalCount"]
@@ -231,6 +235,8 @@ def _first_review_wait(
         if (
             not isinstance(author, dict)
             or not isinstance(author.get("login"), str)
+            or not author["login"].isascii()
+            or not publisher.isascii()
             or author["login"].casefold() != publisher
             or not isinstance(association, str)
             or association not in TRUSTED_ASSOCIATIONS

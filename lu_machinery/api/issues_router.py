@@ -69,14 +69,12 @@ _SUPERSEDED_RE = re.compile(
     # ``obsoletes``. Catches both the "this issue is-superseded-by X"
     # and "this issue supersedes X" phrasings (the latter flagged by
     # Codex on #1312 pre-merge as a regex gap).
-    r"(?:superseded[- ]?by|supersedes|closes|replaces|obsoletes)"
-    r"\s*(?::\s*)?(?:standalone\s+)?#(\d+)",
-    re.IGNORECASE,
+    r"(?ai:superseded[- ]?by|supersedes|closes|replaces|obsoletes)"
+    r"[ \t\r\n]*(?::[ \t\r\n]*)?(?:(?ai:standalone)[ \t\r\n]+)?#([0-9]+)(?!\w)",
 )
 _MERGED_IN_RE = re.compile(
-    r"(?:merged[- ]?in|landed[- ]?in|shipped[- ]?in|fixed[- ]?in)"
-    r"\s*(?::\s*)?(?:PR\s*)?#(\d+)",
-    re.IGNORECASE,
+    r"(?ai:merged[- ]?in|landed[- ]?in|shipped[- ]?in|fixed[- ]?in)"
+    r"[ \t\r\n]*(?::[ \t\r\n]*)?(?:(?ai:PR)[ \t\r\n]*)?#([0-9]+)(?!\w)",
 )
 
 

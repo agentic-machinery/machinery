@@ -197,7 +197,7 @@ def _worktree_prune(repo_root: Path, *, apply: bool) -> dict[str, Any]:
 _PROTECTED_BRANCHES = frozenset({"main", "master"})
 # salvage/* holds work settlement pushed instead of discarding it; only the operator deletes it.
 _PROTECTED_LOCAL_PREFIXES = ("salvage/",)
-_REVIEW_CHECKOUT_RE = re.compile(r"^(?:pr|review)-(\d+)(?:-review|-tmp)?$")
+_REVIEW_CHECKOUT_RE = re.compile(r"^(?:pr|review)-([0-9]+)(?:-review|-tmp)?$")
 
 
 def _checked_out_branches(repo_root: Path) -> set[str]:

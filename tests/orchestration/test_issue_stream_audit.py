@@ -2422,3 +2422,41 @@ def test_schedule_refresh_skips_fresh_cache_but_force_and_stale_spawn(tmp_path, 
     cache.write_text(json.dumps({**report, 'generated_at': 6399}))
     assert issue_stream_audit.schedule_refresh()['phase'] == 'scheduled'
     assert len(spawned) == 2
+
+
+def test_pr2_orchestration_readers_refuse_non_ascii_slugs_and_digits():
+    """Defect class: non-ASCII slugs, whitespace, or Unicode digits bypass audit, control, cleanup, or taxonomy readers."""
+    from lu_machinery.orchestration import (
+        fleet_taxonomy,
+        orchestrator_control,
+        scheduled_worktree_cleanup,
+    )
+
+    assert issue_stream_audit.ISSUE_REF_RE.findall("#42 #\u0664\u0662 #4\u0662") == ["42"]
+    assert issue_stream_audit.ISSUE_RANGE_RE.findall("#40-#42 #\u0664\u0660-#\u0664\u0662") == [("40", "42")]
+    with pytest.raises(ValueError, match="ASCII"):
+        issue_stream_audit.resolve_audit_repo("\u00a0learn-ukrainian/machinery")
+    assert not issue_stream_audit._valid_membership_index({"\u0664\u0662": {"epics": [1], "via": ["native"], "unique_stream": True}})
+    resolver = issue_stream_audit.make_issue_resolver({
+        "membership_complete": True,
+        "incomplete_nodes": [],
+        "open_issue_numbers": [42],
+        "effective_membership": {"42": {"epics": [1], "via": ["native"], "unique_stream": True}},
+    })
+    assert resolver("42") is True
+    assert resolver("\u0664\u0662") is False
+
+    assert orchestrator_control.PR_URL_RE.findall(
+        "https://github.com/learn-ukrainian/machinery/pull/42 "
+        "https://github.com/learn-ukrainian/machinery/pull/\u0664\u0662 "
+        "https://github.com/learn-ukrainian/machinery/pull/4\u0662"
+    ) == ["https://github.com/learn-ukrainian/machinery/pull/42"]
+    assert scheduled_worktree_cleanup._review_checkout_pr_number("pr-42") == 42
+    assert scheduled_worktree_cleanup._review_checkout_pr_number("pr-\u0664\u0662") is None
+
+    with pytest.raises(fleet_taxonomy.UnknownAreaError):
+        fleet_taxonomy.resolve_area("epic:\u0664\u0667\u0660\u0667")
+    with pytest.raises(fleet_taxonomy.UnknownAreaError):
+        fleet_taxonomy.resolve_area_by_epic("\u00a04707")
+    with pytest.raises(fleet_taxonomy.UnknownAreaError):
+        fleet_taxonomy.resolve_area_by_epic("\u0664\u0667\u0660\u0667")

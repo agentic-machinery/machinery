@@ -306,6 +306,10 @@ def _resolve_installation_id(
 ) -> str:
     """Resolve and cache the installation id covering ``owner/repo_name`` via App JWT."""
     base_url = api_base_url.rstrip("/")
+    if not isinstance(owner, str) or not owner or not owner.isascii():
+        raise GitHubIdentityError("GitHub App installation lookup requires an ASCII repository owner")
+    if not isinstance(repo_name, str) or not repo_name or not repo_name.isascii():
+        raise GitHubIdentityError("GitHub App installation lookup requires an ASCII repository name")
     owner_key = owner.lower()
     cache_key = (app_id, base_url, owner_key)
     now_mono = time.monotonic()
@@ -341,7 +345,7 @@ def _resolve_installation_id(
             raise ValueError("installation suspended")
         account = payload.get("account")
         login = account.get("login") if isinstance(account, dict) else None
-        if not isinstance(login, str) or not login or login.lower() != owner_key:
+        if not isinstance(login, str) or not login or not login.isascii() or login.lower() != owner_key:
             raise ValueError("installation owner mismatch")
         raw_app_id = payload.get("app_id")
         if type(raw_app_id) is not int or raw_app_id <= 0:

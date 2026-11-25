@@ -45,8 +45,8 @@ DEFAULT_MAX_WORKERS = 8
 MAX_PAGINATION_PAGES = 10
 EMPTY_PAGE_ATTEMPTS = 3
 
-QUEUE_BRANCH_RE = re.compile(r"gh-readonly-queue/[^/]+/pr-(\d+)-([0-9a-fA-F]+)")
-PR_NUM_RE = re.compile(r"(?:pr[-/]|issue/|pull/|#|^)(\d+)")
+QUEUE_BRANCH_RE = re.compile(r"gh-readonly-queue/[^/]+/pr-([0-9]+)-([0-9a-fA-F]+)")
+PR_NUM_RE = re.compile(r"(?:pr[-/]|issue/|pull/|#|^)([0-9]+)(?!\d)")
 CLASSIFIER_RE = re.compile(r"\bfiles=(\d+)\b.*\bpytest_mode=([a-z_]+)\b")
 
 
@@ -318,11 +318,14 @@ def fetch_classifier_log(job_id: int, *, token: str | None = None) -> str:
 
 def resolve_repository(repo_arg: str | None = None) -> str:
     """Resolve owner/repo string from CLI arg, environment, or git remote."""
-    if repo_arg and repo_arg.strip():
-        return repo_arg.strip()
+    if repo_arg is not None:
+        if not isinstance(repo_arg, str) or not repo_arg.isascii():
+            raise ValueError(f"Repository must be ASCII owner/name: {repo_arg!r}")
+        if repo_arg.strip():
+            return repo_arg.strip()
 
     env_repo = os.environ.get("GITHUB_REPOSITORY")
-    if env_repo and "/" in env_repo:
+    if env_repo and env_repo.isascii() and "/" in env_repo:
         return env_repo.strip()
 
     try:
@@ -333,10 +336,10 @@ def resolve_repository(repo_arg: str | None = None) -> str:
             timeout=10,
             check=False,
         )
-        if completed.returncode == 0 and completed.stdout.strip():
+        if completed.returncode == 0 and completed.stdout.isascii() and completed.stdout.strip():
             url = completed.stdout.strip()
             # Parse git remote url: git@github.com:owner/repo.git or https://github.com/owner/repo.git
-            m = re.search(r"github\.com[:/]([^/]+/[^/]+?)(?:\.git)?$", url)
+            m = re.search(r"(?ai:github\.com)[:/]([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+?)(?:\.git)?$", url)
             if m:
                 return m.group(1)
     except Exception:

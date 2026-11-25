@@ -145,18 +145,24 @@ def resolve_area(
         )
 
     # 2. String lookup: canonical ID or alias
-    s_name = str(name).strip()
+    raw_name = str(name)
+    if not raw_name.isascii():
+        valid_names = sorted(registry.alias_to_area.keys())
+        raise UnknownAreaError(
+            f"Unknown area name, alias, or epic '{name}'. Valid canonical names and aliases: {valid_names}"
+        )
+    s_name = raw_name.strip()
     if s_name in registry.alias_to_area:
         return registry.alias_to_area[s_name]
 
     # 3. String numeric or epic:N lookup
+    from lu_machinery.orchestration.fleet_repos import parse_ascii_positive_int
+
     target_num: int | None = None
     if s_name.startswith("epic:"):
-        raw_num = s_name[5:]
-        if raw_num.isdigit():
-            target_num = int(raw_num)
-    elif s_name.isdigit():
-        target_num = int(s_name)
+        target_num = parse_ascii_positive_int(s_name[5:])
+    else:
+        target_num = parse_ascii_positive_int(s_name)
 
     if target_num is not None and target_num in registry.epic_to_area:
         return registry.epic_to_area[target_num]
@@ -173,13 +179,19 @@ def resolve_area_by_epic(
     taxonomy_path: Path | None = None,
 ) -> ResolvedArea:
     """Resolve an area specifically by epic number (e.g. 4707 or 'epic:4707' or '4707')."""
+    from lu_machinery.orchestration.fleet_repos import parse_ascii_positive_int
+
     if isinstance(epic_number, str):
+        if not epic_number.isascii():
+            raise UnknownAreaError(f"Invalid epic number format: '{epic_number}'")
         cleaned = epic_number.strip()
         if cleaned.startswith("epic:"):
             cleaned = cleaned[5:]
-        if not cleaned.isdigit():
+        num = parse_ascii_positive_int(cleaned)
+        if num is None:
             raise UnknownAreaError(f"Invalid epic number format: '{epic_number}'")
-        num = int(cleaned)
+    elif isinstance(epic_number, bool):
+        raise UnknownAreaError(f"Invalid epic number format: '{epic_number}'")
     else:
         num = int(epic_number)
 

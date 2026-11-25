@@ -31,13 +31,18 @@ from lu_machinery.publish.github import read
 
 def parse_pr_identifier(value: str | int) -> int:
     """Extract integer PR number from a number, '#123', URL, or branch name."""
+    if isinstance(value, bool):
+        raise ValueError(f"Invalid pull request identifier: {value!r}")
     if isinstance(value, int):
         return value
-    text = str(value).strip()
+    raw = str(value)
+    if not raw.isascii():
+        raise ValueError(f"Pull request identifier must be ASCII: {value!r}")
+    text = raw.strip()
     if not text:
         raise ValueError("Empty pull request identifier provided.")
     # Match URL like https://github.com/.../pull/1234
-    url_m = re.search(r"/pull/(\d+)", text)
+    url_m = re.search(r"/pull/([0-9]+)(?!\d)", text)
     if url_m:
         return int(url_m.group(1))
     # Match queue branch or feature branch with PR number
@@ -45,11 +50,11 @@ def parse_pr_identifier(value: str | int) -> int:
     if pr_num is not None:
         return pr_num
     # Match branch or text with prefix '#123' or 'pr123'
-    m = re.search(r"(?:^|[#/_-]|pr)(\d+)(?:[#/_.-]|$)", text, re.IGNORECASE)
+    m = re.search(r"(?:^|[#/_-]|(?ai:pr))([0-9]+)(?:[#/_.-]|$)", text)
     if m:
         return int(m.group(1))
     # Fallback to pure digits if present
-    digits = re.findall(r"\d+", text)
+    digits = re.findall(r"(?<!\d)[0-9]+(?!\d)", text)
     if digits:
         return int(digits[0])
     raise ValueError(f"Could not parse pull request number from: {value!r}")

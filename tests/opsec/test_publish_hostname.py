@@ -1968,3 +1968,25 @@ def test_publish_recovery_and_github_client_reject_non_ascii_slugs_and_digits():
         fresh=True,
     )
     assert seen_paths and seen_paths[0].startswith("repos/learn-ukrainian/machinery/pulls?state=all&head=")
+
+
+def test_agent_github_identity_refuses_non_ascii_owner_and_repo():
+    """Defect class: non-ASCII owner or repo names fold before ASCII checks in installation lookup."""
+    from lu_machinery.agent_runtime import agent_github_identity
+
+    with pytest.raises(agent_github_identity.GitHubIdentityError, match="ASCII"):
+        agent_github_identity._resolve_installation_id(
+            app_id="123",
+            assertion="jwt",
+            owner="learn-u\u212arainian",
+            repo_name="machinery",
+            api_base_url="https://api.github.com",
+        )
+    with pytest.raises(agent_github_identity.GitHubIdentityError, match="ASCII"):
+        agent_github_identity._resolve_installation_id(
+            app_id="123",
+            assertion="jwt",
+            owner="learn-ukrainian",
+            repo_name="ma\u212achinery",
+            api_base_url="https://api.github.com",
+        )

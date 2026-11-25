@@ -393,4 +393,26 @@ def test_secret_scan_scope_refuses_non_ascii_repository_and_unicode_digits(monke
     assert called is False
 
 
+def test_ci_timings_and_merge_queue_status_refuse_non_ascii_digits_and_repos(monkeypatch):
+    """Defect class: Unicode PR digits or non-ASCII repo strings pass ci_timings or gh_merge_queue_status parsers."""
+    from lu_machinery import gh_merge_queue_status
+    from lu_machinery.ci import ci_timings
+
+    assert ci_timings.extract_pr_number("pr-42-fix") == 42
+    assert ci_timings.extract_pr_number("pr-\u0664\u0662-fix") is None
+    assert ci_timings.extract_pr_number("pr-4\u0662") is None
+    assert ci_timings.extract_pr_number("gh-readonly-queue/main/pr-\u0664\u0662-abcdef") is None
+    with pytest.raises(ValueError, match="ASCII"):
+        ci_timings.resolve_repository("\u00a0learn-ukrainian/machinery")
+    monkeypatch.setenv("GITHUB_REPOSITORY", "learn-u\u212arainian/machinery")
+    monkeypatch.setattr(ci_timings.subprocess, "run", lambda *_a, **_kw: (_ for _ in ()).throw(OSError("no git")))
+    assert ci_timings.resolve_repository(None) == ci_timings.DEFAULT_REPO
+
+    assert gh_merge_queue_status.parse_pr_identifier("#42") == 42
+    with pytest.raises(ValueError, match="ASCII"):
+        gh_merge_queue_status.parse_pr_identifier("#\u0664\u0662")
+    with pytest.raises(ValueError, match="ASCII"):
+        gh_merge_queue_status.parse_pr_identifier("\u00a042")
+
+
 pytestmark = [pytest.mark.usefixtures('github_command_boundary')]
