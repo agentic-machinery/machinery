@@ -308,9 +308,10 @@ def repository_registry(path: Path) -> dict[str, dict[str, Any]]:
     Cached in-process with ``@cache``: long-running processes must restart after
     a registry update or dual-slug selector flip.
     """
+    text = path.read_text(encoding="utf-8")
     try:
-        registry = yaml.load(path.read_text(encoding="utf-8"), Loader=_UniqueSafeLoader)
-    except yaml.YAMLError:
+        registry = yaml.load(text, Loader=_UniqueSafeLoader)
+    except Exception:  # PyYAML also raises RecursionError, KeyError, ValueError, IndexError, AttributeError
         raise ValueError("invalid fleet repository registry") from None
     repos = registry.get("repos") if isinstance(registry, dict) else None
     if not isinstance(repos, dict) or not repos:
@@ -407,7 +408,7 @@ def load_selector(
     try:
         text = raw_bytes.decode("utf-8")
         document = yaml.load(text, Loader=_UniqueSafeLoader)
-    except (UnicodeDecodeError, yaml.YAMLError):
+    except Exception:  # PyYAML also raises RecursionError, KeyError, ValueError, IndexError, AttributeError
         raise SelectorError("fleet repository selector is malformed") from None
 
     if not isinstance(document, dict) or set(document.keys()) != {"version", "active_slugs"}:

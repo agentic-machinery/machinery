@@ -27,7 +27,7 @@ from pydantic import AfterValidator, BaseModel
 from lu_machinery.common import github_client, json_depth
 from lu_machinery.common.git_context import sanitized_git_env
 from lu_machinery.common.task_store_paths import read_cached_task_record
-from lu_machinery.orchestration.fleet_repos import FleetRepoError, load_fleet_repos
+from lu_machinery.orchestration.fleet_repos import FleetRepoError, load_fleet_repos, resolve_active_fleet_repo
 from lu_machinery.orchestration.task_record_store import (
     candidate_task_record_names,
     locate_task_record,
@@ -620,8 +620,9 @@ _CI_STATES = {"success", "failure", "error", "pending", "expected"}
 _QUEUE_STATES = {"queued", "awaiting_checks", "locked", "mergeable", "unmergeable"}
 # A reading older than the delegate panel's own bound is not a live count.
 LIVE_WORKERS_MAX_AGE_S = 60.0
-# Since when each repository has been unreadable: the first of its consecutive failed readings in
-# this process. The first good reading clears it, and a Monitor restart starts it again.
+# Since when each project (by fleet key, stable across a slug change) has been unreadable: the first of
+# its consecutive failed readings in this process. The first good reading clears it, and a Monitor
+# restart starts it again.
 _UNKNOWN_SINCE: dict[str, str] = {}
 _PR_FIELDS = (
     "number isDraft createdAt headRefName mergeStateStatus"
@@ -727,18 +728,14 @@ def _pull_request_row(
 
 def _unreadable_row(entry: dict[str, Any], reason: str, observed_at: str, *, private: bool | None = None) -> dict[str, Any]:
     """A project that could not be read: unknown with the time it first failed, never a zero."""
-    since = _UNKNOWN_SINCE.setdefault(entry["repository"], observed_at)
+    since = _UNKNOWN_SINCE.setdefault(entry["key"], observed_at)
     return {**entry, "status": "unknown", "reason": reason, "private": private, "open_total": None,
             "pull_requests": [], "default_branch": None, "pin": None, "unknown_since": since}
 
 
-def _unknown_pull_requests(
-    reason: str, observed_at: str, targets: list[tuple[str, str, str, str]] | None = None,
-) -> dict[str, Any]:
-    """A whole failed read still lists every registered project, each unknown since its first failure."""
-    rows = [_unreadable_row({"repository": f"{owner}/{name}", "name": display, "key": key}, reason, observed_at)
-            for key, owner, name, display in targets or []]
-    return {"status": "unknown", "reason": reason, "observed_at": observed_at, "repositories": rows}
+def _unknown_pull_requests(reason: str, observed_at: str) -> dict[str, Any]:
+    """No reading and no registry to list projects from (``compute_pull_requests`` lists them when it can)."""
+    return {"status": "unknown", "reason": reason, "observed_at": observed_at, "repositories": []}
 
 
 def _locked_version(text: str) -> str | None:
@@ -894,20 +891,43 @@ def compute_pull_requests(project_root: Path, *, tasks_dir: Path | None = None) 
     records = tasks_dir if tasks_dir is not None else project_root / "batch_state" / "tasks"
     observed_at = datetime.now(UTC).isoformat().replace("+00:00", "Z")
     try:
-        catalog = list(load_fleet_repos().values())
+        registry = load_fleet_repos()
     except FleetRepoError:
         return _unknown_pull_requests("registry_unavailable", observed_at)
-    targets = [(repo.key, repo.owner, repo.name, repo.local_name) for repo in catalog]
+    catalog = list(registry.values())
+    # Each project is read at its active slug (a transferred row's host-selected one). A row that does not
+    # resolve (a dual-slug row without a trusted selector) is that project's unknown row, labelled with its
+    # registry slug, never a read of the slug it may have left and never a failed read for the others.
+    active: list[str | None] = []
+    for row in catalog:
+        try:
+            active.append(resolve_active_fleet_repo(row.key, repos=registry).active_github)
+        except FleetRepoError:
+            active.append(None)
+    slugs = [slug or row.github for slug, row in zip(active, catalog, strict=True)]
+    targets = [(row.key, slug.split("/", 1)[0], slug.split("/", 1)[1], row.local_name)
+               for slug, row in zip(slugs, catalog, strict=True)]
     # One invalid slug is that project's unknown row, never a failed read for the others.
-    valid = [bool(_REPOSITORY_SLUG.fullmatch(repo.github)) and repo.name not in {".", ".."} for repo in catalog]
+    refused: list[str | None] = [
+        "repository_resolution_failed" if slug is None
+        else None if _REPOSITORY_SLUG.fullmatch(slug) and slug.split("/", 1)[1] not in {".", ".."}
+        else "invalid_repository"
+        for slug in active
+    ]
+    valid = [reason is None for reason in refused]
     repositories: list[tuple[str, str, bool] | None] = [
         (owner, name, key == SELF_KEY) if ok else None for ok, (key, owner, name, _display) in zip(valid, targets, strict=True)
     ]
-    if not any(valid):
-        return _unknown_pull_requests("invalid_repository", observed_at, targets)
 
     def unknown(reason: str) -> dict[str, Any]:
-        return _unknown_pull_requests(reason, observed_at, targets)
+        # A whole failed read: every project is unknown, and one refused before the read keeps its own reason.
+        rows = [_unreadable_row({"repository": f"{owner}/{name}", "name": display, "key": key}, own or reason,
+                                observed_at)
+                for (key, owner, name, display), own in zip(targets, refused, strict=True)]
+        return {"status": "unknown", "reason": reason, "observed_at": observed_at, "repositories": rows}
+
+    if not any(valid):
+        return unknown("invalid_repository" if "invalid_repository" in refused else "repository_resolution_failed")
 
     try:
         proc = github_client.run(
@@ -944,7 +964,7 @@ def compute_pull_requests(project_root: Path, *, tasks_dir: Path | None = None) 
         repo = data.get(f"r{index}")
         entry: dict[str, Any] = {"repository": f"{owner}/{name}", "name": display, "key": key}
         if not valid[index]:
-            rows.append(_unreadable_row(entry, "invalid_repository", observed_at))
+            rows.append(_unreadable_row(entry, str(refused[index]), observed_at))
             continue
         failed = errored.get(f"r{index}", set())
         # An error on the repository or anywhere in its PRs leaves them unread (GitHub nulls the
@@ -967,7 +987,7 @@ def compute_pull_requests(project_root: Path, *, tasks_dir: Path | None = None) 
                 or not _graphql_int(total, len(nodes))):
             rows.append(_unreadable_row(entry, "github_invalid_response", observed_at, private=private))
             continue
-        _UNKNOWN_SINCE.pop(entry["repository"], None)
+        _UNKNOWN_SINCE.pop(entry["key"], None)
         rows.append({
             **entry,
             "status": "ok",
