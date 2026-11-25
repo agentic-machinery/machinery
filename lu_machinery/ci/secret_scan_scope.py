@@ -246,7 +246,10 @@ def _last_scanned_head(repository: str, repository_id: str, default_branch_ref: 
     Only successful scans publish this artifact. Untrusted PR/fork artifacts
     are ignored. A bounded metadata search that finds no record fails closed.
     """
-    if not re.fullmatch(r"[\w.-]+/[\w.-]+", repository) or not repository_id.isdecimal():
+    if (
+        not re.fullmatch(r"[\w.-]+/[\w.-]+", repository, re.ASCII)
+        or not re.fullmatch(r"[1-9][0-9]*", repository_id)
+    ):
         raise SecretScanScopeError(_COVERAGE_RECOVERY)
     if not default_branch_ref.startswith("refs/heads/"):
         raise SecretScanScopeError(_COVERAGE_RECOVERY)

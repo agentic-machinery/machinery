@@ -1345,3 +1345,78 @@ def test_run_prs_refuses_complete_output_when_an_archive_record_is_unreadable(ru
     result = capsys.readouterr()
     assert result.out == ""
     assert "unreadable task record broken.json" in result.err
+
+
+def test_pr_ownership_rejects_non_ascii_handoff_keys_and_verdict_repos(tmp_path):
+    """Defect class: Unicode-digit handoff keys via int() or unguarded casefold alias real PR ownership records."""
+    from lu_machinery.orchestration.fleet_repos import FleetRepoError
+
+    bad_digits_path = tmp_path / "unicode_digits.json"
+    bad_digits_path.write_text(json.dumps({
+        "schema": 1,
+        "last_tick": None,
+        "episodes": {},
+        "handoffs": {
+            f"{REPO}#1277": {
+                "successor": "codex/valid-worker",
+                "accepted_at": at(0).isoformat(),
+                "head": HEAD,
+            },
+            f"{REPO}#\u0664\u0662": {
+                "successor": "codex/worker",
+                "accepted_at": at(0).isoformat(),
+                "head": HEAD,
+            },
+        },
+        "history": [],
+        "outbox": [],
+        "heal_attempts": {},
+    }))
+    loaded_digits = own.load(bad_digits_path)
+    assert list(loaded_digits["handoffs"]) == [f"{REPO}#1277"]
+    with pytest.raises(own.OwnershipError), own.locked(bad_digits_path):
+        pass
+
+    lookalike_repo = REPO.replace("k", "\u212a")
+    mixed_path = tmp_path / "lookalike_sibling.json"
+    mixed_path.write_text(json.dumps({
+        "schema": 1,
+        "last_tick": None,
+        "episodes": {},
+        "handoffs": {
+            f"{REPO}#1277": {
+                "successor": "codex/valid-worker",
+                "accepted_at": at(0).isoformat(),
+                "head": HEAD,
+            },
+            f"{lookalike_repo}#42": {
+                "successor": "codex/spoofed",
+                "accepted_at": at(0).isoformat(),
+                "head": HEAD,
+            },
+        },
+        "history": [],
+        "outbox": [],
+        "heal_attempts": {},
+    }))
+    loaded = own.load(mixed_path)
+    assert own._handoff_map(loaded) == {(REPO.casefold(), 1277): "codex/valid-worker"}
+
+    with pytest.raises((own.OwnershipError, FleetRepoError)):
+        own.pr_key(lookalike_repo, 42)
+    with pytest.raises((own.OwnershipError, FleetRepoError)):
+        own.keeper_custodies_for_repo(tmp_path / "missing.json", lookalike_repo)
+    with pytest.raises(own.OwnershipError, match="repository"):
+        own._validate_verdict_receipt(
+            {
+                "repository": lookalike_repo,
+                "pr": 42,
+                "head": HEAD,
+                "task": "review-1",
+                "verdict": "APPROVED",
+                "status": "posted",
+            },
+            pr=42,
+            head=HEAD,
+            repo=REPO,
+        )

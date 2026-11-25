@@ -471,3 +471,22 @@ def test_dismissal_keeps_raw_patch_worker_broker_and_reviewer_relays_closed(monk
     broker._handle(connection)
     assert connection.reply["returncode"] == 2
     assert "the verb is not one of" in connection.reply["stderr"]
+
+
+def test_gh_snapshot_and_prepublish_reject_non_ascii_urls_hosts_and_whitespace(tmp_path):
+    """Defect class: non-ASCII write URLs, NBSP-padded GH_HOST/repo selectors, or NBSP-padded normalize_repository inputs bypass OPSEC checks."""
+    from lu_machinery.opsec import prepublish
+
+    assert prepublish.normalize_repository("\u00a0learn-ukrainian/machinery") == "unknown"
+    assert prepublish.normalize_repository("learn-u\u212arainian/machinery") == "unknown"
+
+    with pytest.raises(PublishBlocked, match="non-ASCII"):
+        admit(["pr", "view", "1", "--repo", "learn-u\u212arainian/machinery"], cwd=tmp_path, environment={})
+    with pytest.raises(PublishBlocked, match="GH_HOST"):
+        admit(["pr", "view", "1"], cwd=tmp_path, environment={"GH_HOST": "\u00a0github.com"})
+    with pytest.raises(PublishBlocked):
+        admit(
+            ["pr", "comment", "https://github.com/learn-u\u212arainian/infra-private/pull/1", "--body", "hi"],
+            cwd=tmp_path,
+            environment={},
+        )

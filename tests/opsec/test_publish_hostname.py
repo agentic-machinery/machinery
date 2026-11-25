@@ -1915,3 +1915,56 @@ def publisher_workflows(configured_roots, tmp_path, monkeypatch):
         (product / ".github/workflows" / name).write_text(text)
 
 pytestmark = [pytest.mark.usefixtures('configured_roots')]
+
+
+def test_publish_recovery_and_github_client_reject_non_ascii_slugs_and_digits():
+    """Defect class: non-ASCII URLs, Unicode issue digits, or look-alike repo slugs bypass recovery/client guards."""
+    from types import SimpleNamespace
+
+    from lu_machinery.common import github_client
+    from lu_machinery.opsec.prepublish import PublishBlocked
+    from lu_machinery.publish import recovery
+
+    with pytest.raises(PublishBlocked, match="repository identity invalid"):
+        recovery._repo_key("\u00a0learn-ukrainian/machinery")
+    with pytest.raises(PublishBlocked, match="repository identity invalid"):
+        recovery._repo_key("learn-u\u212arainian/machinery")
+
+    # github_client._read_command refuses non-ASCII URLs or Unicode-digit PR/issue operands before any request.
+    seen_paths: list[str] = []
+
+    class DummyClient:
+        def request(self, method, path, **_kw):
+            seen_paths.append(path)
+            return SimpleNamespace(value=[], stale=False, error=None)
+
+    for cmd, sub, operand in (
+        ("pr", "view", "https://github.com/learn-ukrainian/machinery/pull/\u0664\u0662"),
+        ("pr", "view", "https://github.com/learn-ukrainian/machinery/pull/4\u0662"),
+        ("pr", "view", "https://github.com/learn-u\u212arainian/machinery/pull/42"),
+        ("pr", "view", "\u0664\u0662"),
+        ("issue", "view", "\u0664\u0662"),
+    ):
+        res = github_client._read_command(
+            DummyClient(),
+            cmd,
+            sub,
+            {"--repo": ["learn-ukrainian/machinery"], "--json": ["number"]},
+            [operand],
+            timeout=5,
+            fresh=True,
+        )
+        assert res.status == 400 and res.error == "github_invalid_command"
+    assert seen_paths == []
+
+    # Valid ASCII branch operands still query the branch-lookup endpoint.
+    github_client._read_command(
+        DummyClient(),
+        "pr",
+        "view",
+        {"--repo": ["learn-ukrainian/machinery"], "--json": ["number"]},
+        ["topic/branch"],
+        timeout=5,
+        fresh=True,
+    )
+    assert seen_paths and seen_paths[0].startswith("repos/learn-ukrainian/machinery/pulls?state=all&head=")

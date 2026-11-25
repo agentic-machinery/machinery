@@ -17,6 +17,7 @@ if __package__ in (None, ""):
 from lu_machinery.common import github_client, json_depth
 from lu_machinery.fleet_comms.authority import AuthorityService
 from lu_machinery.orchestration import task_lifecycle
+from lu_machinery.orchestration.fleet_repos import ascii_repo_slug
 from lu_machinery.publish.github import publish, read
 
 # This package's import name, from the unresolved file location: never from __package__, which a
@@ -89,19 +90,26 @@ def item_assignment(text: str) -> tuple[str | None, str | None]:
 
 def closing_issues(pr: dict, repository: str) -> list[tuple[str, int]]:
     """Combine GitHub closing links with explicit closing keywords in the body."""
+    if ascii_repo_slug(repository, strip=False) is None:
+        raise ValueError("invalid repository slug")
     issues = set()
     for reference in pr["closingIssuesReferences"]:
-        match = re.fullmatch(r"https://github.com/([^/]+/[^/]+)/issues/(\d+)", reference["url"])
+        url = reference["url"]
+        match = (
+            re.fullmatch(r"https://github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/issues/([1-9][0-9]*)", url)
+            if isinstance(url, str)
+            else None
+        )
         if not match:
             raise ValueError("invalid closing issue URL")
         issues.add((match[1], int(match[2])))
-    reference = r"(?:[\w.-]+/[\w.-]+)?#[1-9]\d*\b"
-    separator = r"[ \t]*(?:,|and\b|&)[ \t]*(?:and[ \t]+)?"
+    reference = r"(?:[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)?#[1-9][0-9]*(?!\w)"
+    separator = r"[ \t]*(?:,|(?ai:and)\b|&)[ \t]*(?:(?ai:and)[ \t]+)?"
     for closing in re.finditer(
-        rf"\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s+({reference}(?:{separator}{reference})*)",
-        visible_markdown(pr.get("body") or ""), re.I,
+        rf"\b(?ai:close[sd]?|fix(?:e[sd])?|resolve[sd]?)[ \t\r\n]+({reference}(?:{separator}{reference})*)",
+        visible_markdown(pr.get("body") or ""),
     ):
-        for match in re.finditer(r"(?:([\w.-]+/[\w.-]+))?#([1-9]\d*)\b", closing[1]):
+        for match in re.finditer(r"(?<![\w.-/])(?:([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+))?#([1-9][0-9]*)(?!\w)", closing[1]):
             issues.add((match[1] or repository, int(match[2])))
     return sorted(issues)
 
@@ -114,7 +122,12 @@ def run_postmerge_criteria(pr_number: int, *, apply: bool = False) -> dict:
     ), max_depth=512)
     if pr["state"] != "MERGED":
         raise ValueError("PR must be MERGED before checking post-merge criteria")
-    match = re.fullmatch(r"https://github.com/([^/]+/[^/]+)/pull/\d+", pr["url"])
+    pr_url = pr["url"]
+    match = (
+        re.fullmatch(r"https://github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/pull/[1-9][0-9]*", pr_url)
+        if isinstance(pr_url, str)
+        else None
+    )
     if not match:
         raise ValueError("invalid PR URL")
     reports = []
@@ -168,7 +181,10 @@ def run_postmerge_criteria(pr_number: int, *, apply: bool = False) -> dict:
 
 
 def _item_set_key(repository: str, number: int, items: list[dict]) -> str:
-    payload = [repository.casefold(), number, sorted((item["id"], item["text"]) for item in items)]
+    folded = ascii_repo_slug(repository, strip=False)
+    if folded is None:
+        raise ValueError("invalid repository slug")
+    payload = [folded, number, sorted((item["id"], item["text"]) for item in items)]
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
 
 
