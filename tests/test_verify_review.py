@@ -1336,6 +1336,59 @@ def test_cli_receipt_path_and_forbidden_paths(tmp_path, monkeypatch):
     assert code2 == EXIT_INVALID
 
 
+def test_cli_receipt_path_refuses_direct_task_store_and_allows_task_artifacts(tmp_path, monkeypatch, capsys):
+    """Defect class: verify_review writes a receipt JSON directly into the flat task store."""
+    repo = _init_repo(tmp_path)
+    (repo / "app.py").write_text("print('v2')\n", encoding="utf-8")
+    review = tmp_path / "review.json"
+    review.write_text(json.dumps(_clean_payload()), encoding="utf-8")
+
+    store = tmp_path / "task-store"
+    (store / "archive").mkdir(parents=True)
+    monkeypatch.setenv("LU_TASKS_DIR", str(store))
+
+    link_dir = tmp_path / "tasks-link"
+    link_dir.symlink_to(store)
+    outside_link = tmp_path / "alias.behavior-receipt.json"
+    outside_link.symlink_to(store / "via-symlink.behavior-receipt.json")
+
+    for blocked in (
+        store / "t1.behavior-receipt.json",
+        store / "archive" / "t1.behavior-receipt.json",
+        link_dir / "t1.behavior-receipt.json",
+        outside_link,
+        tmp_path / "other" / "batch_state" / "tasks" / "t1.behavior-receipt.json",
+    ):
+        capsys.readouterr()
+        code = verify_review_cli.main(
+            [
+                "--review-file",
+                str(review),
+                *_cli_envelope_args(repo),
+                "--receipt-path",
+                str(blocked),
+            ]
+        )
+        assert code == EXIT_INVALID, f"expected EXIT_INVALID for {blocked}"
+        assert "receipt_path_forbidden" in capsys.readouterr().err
+        assert not (store / "t1.behavior-receipt.json").exists()
+        assert not (store / "archive" / "t1.behavior-receipt.json").exists()
+        assert not (store / "via-symlink.behavior-receipt.json").exists()
+
+    allowed = store / "t1.artifacts" / "behavior-receipt.json"
+    code_ok = verify_review_cli.main(
+        [
+            "--review-file",
+            str(review),
+            *_cli_envelope_args(repo),
+            "--receipt-path",
+            str(allowed),
+        ]
+    )
+    assert code_ok == EXIT_CLEAN
+    assert allowed.is_file()
+
+
 def test_cli_issue_mode_posts_opt_in_comment(tmp_path, monkeypatch, capsys):
     repo = _init_repo(tmp_path)
     (repo / "app.py").write_text("print('v1')\nvalue = 2\n", encoding="utf-8")
