@@ -618,7 +618,17 @@ def capability_exemption(
 
 
 def _charges_round(run: ReviewRun) -> bool:
-    """Reserve unfinished or unverifiable attempts and charge any visible verdict."""
+    """Whether this run charges or reserves its head (``False`` releases it).
+
+    A ``workspace-write`` run releases the head. Otherwise a recognized verdict
+    or a completed non-empty reply charges the head, an unfinished or unknown
+    attempt reserves it, and a terminal attempt whose record proves no reply
+    releases it when the run is not ``done``. A ``done`` run with no reply
+    keeps the head, and a missing reply whose record does not prove that
+    reserves it. A completed empty reply releases it. A terminal run that is
+    not ``done`` releases a reply with no recognized verdict, and reserves a
+    reply that cannot be parsed.
+    """
     if run.record.get("mode") == "workspace-write":
         return False
     status = run.record.get("status")
@@ -660,8 +670,11 @@ def dispatched_rounds(
 ) -> dict[str, list[str]]:
     """Each head charged or reserved by a review run, with the task ids that make it count.
 
-    A verdict counts before publication. An attempt reserves its head until its record proves
-    there was no verdict. The lineage's one uncharged capability failure opens no round.
+    A recognized verdict or a completed non-empty reply charges the head before
+    publication. An unfinished or unknown attempt reserves it. A terminal
+    attempt whose record proves no reply releases it when the run is not
+    ``done`` (:func:`_charges_round` states every release and reservation).
+    The lineage's one uncharged capability failure opens no round.
     ``exclude_head`` drops the round being decided.
     """
     exempt = capability_exemption(runs=runs, comments=comments, login=login)
