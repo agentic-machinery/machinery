@@ -3696,18 +3696,30 @@ def test_write_lifecycle_and_lock_refuse_direct_task_store_and_load_reads_existi
     rc_carrier = task_closeout.main(["carrier", "--state-file", str(legacy)])
     assert rc_carrier == 0
 
-    # R2 F4 regression: allowed artifact paths that traverse a directory symlink followed by `..`
-    # stage temporary files in the resolved artifact parent and succeed for ledger, lock, and archive.
+    # F4 regression: parent traversal can send writes to a different path from later reads.
     nested_artifact = store / "t2.artifacts" / "nested"
     nested_artifact.mkdir(parents=True)
-    missing_container = tmp_path / "not-created" / "via"
-    missing_container.parent.mkdir()
-    missing_container.symlink_to(nested_artifact)
-    via_symlink_ledger = missing_container / ".." / "sub" / "closeout.json"
-    with task_lifecycle.lifecycle_lock(via_symlink_ledger):
-        task_lifecycle.write_lifecycle(via_symlink_ledger, ledger)
-    assert (store / "t2.artifacts" / "sub" / "closeout.json").is_file()
-    via_archive_bytes = b'{"prev": 2}\n'
-    via_pred_path, via_pred_sha = task_lifecycle.predecessor_archive_path(via_symlink_ledger, via_archive_bytes)
-    task_lifecycle.archive_predecessor(via_archive_bytes, via_pred_path, via_pred_sha)
-    assert (store / "t2.artifacts" / "sub" / "predecessors" / via_pred_path.name).read_bytes() == via_archive_bytes
+    alias = tmp_path / "artifact-link"
+    alias.symlink_to(nested_artifact)
+    broken_alias = tmp_path / "broken-artifact-link"
+    broken_alias.symlink_to(alias / "missing" / "..")
+    raw = b'{"prev": 2}\n'
+
+    for blocked in (
+        alias / ".." / "sub" / "closeout.json",
+        alias / "missing" / ".." / "sub" / "closeout.json",
+        broken_alias / "sub" / "closeout.json",
+    ):
+        with pytest.raises(task_lifecycle.LifecycleError, match="task_store_direct_write_refused"):
+            task_lifecycle.write_lifecycle(blocked, ledger)
+        with (
+            pytest.raises(task_lifecycle.LifecycleError, match="task_store_direct_write_refused"),
+            task_lifecycle.lifecycle_lock(blocked),
+        ):
+            pass
+        pred_path, pred_sha = task_lifecycle.predecessor_archive_path(blocked, raw)
+        with pytest.raises(task_lifecycle.LifecycleError, match="task_store_direct_write_refused"):
+            task_lifecycle.archive_predecessor(raw, pred_path, pred_sha)
+
+    assert list(nested_artifact.parent.iterdir()) == [nested_artifact]
+    assert not list(nested_artifact.iterdir())
