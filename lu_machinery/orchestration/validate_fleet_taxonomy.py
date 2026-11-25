@@ -19,7 +19,7 @@ from jsonschema import Draft202012Validator, FormatChecker
 if __package__ in {None, ""}:  # run as a file (launchers do): the repository root holds the package
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from lu_machinery.common import json_depth, profile
-from lu_machinery.common.repo_root import machinery_path
+from lu_machinery.common.repo_root import MachineryConfigError, machinery_path
 
 # The packaged copies; readers resolve the active profile at call time unless overridden.
 _PACKAGED_TAXONOMY_PATH = machinery_path("config/fleet_taxonomy.yaml")
@@ -58,7 +58,7 @@ def _registry_path(explicit: Path | None, default: Callable[[], Path]) -> Path:
         return explicit
     try:
         return default()
-    except profile.ProfileError as exc:
+    except MachineryConfigError as exc:  # a ProfileError or an unusable root setting
         raise FleetTaxonomyValidationError(str(exc)) from exc
 
 
@@ -422,7 +422,7 @@ def main(argv: list[str] | None = None) -> int:
             taxonomy_path=(default_taxonomy_path() if args.taxonomy is None else args.taxonomy).resolve(),
             assignments_path=resolved_assignments,
         )
-    except (FleetTaxonomyValidationError, profile.ProfileError, OSError, RuntimeError) as exc:
+    except (FleetTaxonomyValidationError, MachineryConfigError, OSError, RuntimeError) as exc:
         if args.json:
             print(json.dumps({"ok": False, "error": str(exc)}, sort_keys=True))
         else:

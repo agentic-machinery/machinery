@@ -234,17 +234,17 @@ def _load_roster() -> tuple[frozenset[str], bool]:
     reparse both files.
     """
     from lu_machinery import agent_identity
-    from lu_machinery.common import profile
+    from lu_machinery.common.repo_root import MachineryConfigError
     from lu_machinery.ops import driver_lanes
 
-    # An unusable profile entry leaves that roster source unavailable, so the roster is incomplete.
+    # An unusable profile entry or root setting leaves that roster source unavailable, so the roster is incomplete.
     try:
         assignments: Path | None = Path(agent_identity.default_assignments_path())
-    except profile.ProfileError:
+    except MachineryConfigError:
         assignments = None
     try:
         lane_data: Path | None = Path(driver_lanes.default_data_path())
-    except profile.ProfileError:
+    except MachineryConfigError:
         lane_data = None
     key: list[object] = []
     for path in (assignments, lane_data):

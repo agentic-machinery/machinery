@@ -45,6 +45,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 from lu_machinery.common import json_depth, profile
+from lu_machinery.common.repo_root import MachineryConfigError
 
 # The machinery package's directory name, which is also its import name and the first component
 # of its files' checkout paths. Taken from this file's unresolved location, so neither a short
@@ -255,7 +256,7 @@ def load_registry(path: Path | None = None) -> Registry:
 
     try:
         source = path or default_data_path()
-    except profile.ProfileError as exc:
+    except MachineryConfigError as exc:  # a ProfileError or an unusable root setting
         raise LaneConfigError(f"lane data unavailable: {exc}") from exc
     try:
         _, raw = read_regular_file_bytes(source)  # its refusal is a ValueError

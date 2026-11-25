@@ -27,7 +27,7 @@ from pathlib import Path
 from typing import Any
 
 from lu_machinery.common import json_depth, profile
-from lu_machinery.common.repo_root import machinery_path
+from lu_machinery.common.repo_root import MachineryConfigError, machinery_path
 from lu_machinery.fleet.regenerable_output import committed_release_pins, is_regenerable_ignored_path
 from lu_machinery.orchestration import worktree_artifacts as artifacts
 from lu_machinery.orchestration.task_record_store import (
@@ -637,7 +637,7 @@ def succession_streams(path: Path | None = None) -> tuple[dict[str, str], str]:
         # written twice in one mapping (``<<`` included), no cyclic anchor.
         _, raw = read_regular_file_bytes(target)
         data = load_yaml_mapping_bytes(raw, target)
-    except (profile.ProfileError, FleetTaxonomyValidationError) as exc:
+    except (MachineryConfigError, FleetTaxonomyValidationError) as exc:
         raise ValueError("succession map unreadable") from exc
     if not isinstance(data, dict) or set(data) != {"schema", "streams"}:
         raise ValueError("succession map invalid")

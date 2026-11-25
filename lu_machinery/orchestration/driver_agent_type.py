@@ -25,7 +25,7 @@ if __package__ in {None, ""}:  # run as a file (launchers do): the repository ro
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from lu_machinery.common import profile
-from lu_machinery.common.repo_root import machinery_path
+from lu_machinery.common.repo_root import MachineryConfigError, machinery_path
 from lu_machinery.orchestration.fleet_taxonomy import DEFAULT_TAXONOMY_PATH as DEFAULT_TAXONOMY_PATH  # packaged copy
 from lu_machinery.orchestration.fleet_taxonomy import FleetTaxonomyError, default_taxonomy_path, load_fleet_taxonomy
 from lu_machinery.orchestration.validate_fleet_taxonomy import (
@@ -54,7 +54,7 @@ def _registry_path(explicit: Path | None, default: Callable[[], Path]) -> Path:
         return explicit
     try:
         return default()
-    except profile.ProfileError as exc:
+    except MachineryConfigError as exc:  # a ProfileError or an unusable root setting
         raise DriverAgentConfigError(str(exc)) from exc
 
 

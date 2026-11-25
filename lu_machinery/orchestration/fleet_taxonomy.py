@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from lu_machinery.common import profile
-from lu_machinery.common.repo_root import machinery_path
+from lu_machinery.common.repo_root import MachineryConfigError, machinery_path
 from lu_machinery.orchestration.validate_fleet_taxonomy import (
     FleetTaxonomyValidationError,
     parse_validated_taxonomy_bytes,
@@ -72,7 +72,7 @@ def load_fleet_taxonomy(taxonomy_path: Path | None = None) -> TaxonomyRegistry:
     if taxonomy_path is None:
         try:
             taxonomy_path = default_taxonomy_path()
-        except profile.ProfileError as exc:
+        except MachineryConfigError as exc:  # a ProfileError or an unusable root setting
             raise FleetTaxonomyError(f"Fleet taxonomy unavailable: {exc}") from exc
     try:
         path, content = read_regular_file_bytes(taxonomy_path)
