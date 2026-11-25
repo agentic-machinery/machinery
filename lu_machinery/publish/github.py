@@ -941,13 +941,16 @@ def _prepare_recovery(verb, fields, dest, cwd, environment, runner):
         event = run.get("event")
         if associations == [] and isinstance(event, str) and event and event not in {"pull_request", "pull_request_target", "merge_group"}:
             return None
-        if run.get("status") != "completed" or run.get("conclusion") not in (
-            failed_run_conclusions | recovery.PASSING_RUN_CONCLUSIONS
+        run_conclusion = run.get("conclusion")
+        if (
+            run.get("status") != "completed"
+            or not isinstance(run_conclusion, str)
+            or run_conclusion not in (failed_run_conclusions | recovery.PASSING_RUN_CONCLUSIONS)
         ):
             raise gate.PublishBlocked(
                 "RECOVERY_RUN_INVALID: completed failed or incoherent all-green run required"
             )
-        incoherent_candidate = run.get("conclusion") in recovery.PASSING_RUN_CONCLUSIONS
+        incoherent_candidate = run_conclusion in recovery.PASSING_RUN_CONCLUSIONS
         if run.get("event") == "merge_group":
             branch_pr = extract_pr_number(run.get("head_branch", ""))
             number = (
@@ -978,7 +981,12 @@ def _prepare_recovery(verb, fields, dest, cwd, environment, runner):
             raise gate.PublishBlocked("RECOVERY_RUN_INVALID: run identity required")
         if run.get("event") != "merge_group":
             raise gate.PublishBlocked("RECOVERY_RUN_INVALID: merge_group failed run required for re-enqueue")
-        if run.get("status") != "completed" or run.get("conclusion") not in failed_run_conclusions:
+        run_conclusion = run.get("conclusion")
+        if (
+            run.get("status") != "completed"
+            or not isinstance(run_conclusion, str)
+            or run_conclusion not in failed_run_conclusions
+        ):
             raise gate.PublishBlocked("RECOVERY_RUN_INVALID: completed failed run required")
         if extract_pr_number(run.get("head_branch", "")) != number:
             raise gate.PublishBlocked("RECOVERY_PR_UNKNOWN: merge_group run does not identify this PR")
@@ -1066,7 +1074,9 @@ def _prepare_recovery(verb, fields, dest, cwd, environment, runner):
                 failed_run, jobs_check, required_workflow=required_workflow, pr_number=number
             )
             or any(
-                isinstance(job, dict) and job.get("conclusion") in failure_conclusions
+                isinstance(job, dict)
+                and isinstance(job.get("conclusion"), str)
+                and job["conclusion"] in failure_conclusions
                 for job in jobs_check
             )
         ):
@@ -1084,28 +1094,35 @@ def _prepare_recovery(verb, fields, dest, cwd, environment, runner):
             allow_empty_jobs=True,
         )
         cancelled_no_artifact = True
+    evidence = {key: value for key, value in evidence.items() if key != "recovery_mode"}
     allowed_conclusions = (
         recovery.PASSING_RUN_CONCLUSIONS if incoherent_candidate else failed_run_conclusions
     )
+    failed_run_conclusion = failed_run.get("conclusion")
     if (type(failed_run.get("run_attempt")) is not int or failed_run["run_attempt"] < 1
             or failed_run.get("status") != "completed"
-            or failed_run.get("conclusion") not in allowed_conclusions):
+            or not isinstance(failed_run_conclusion, str)
+            or failed_run_conclusion not in allowed_conclusions):
         raise gate.PublishBlocked("RECOVERY_RUN_INVALID: completed failed run and attempt metadata required")
     if failed_run["run_attempt"] > 1:
         raise gate.PublishBlocked("RECOVERY_ALLOWANCE_SPENT: first=prior workflow run attempt")
     if failed_run.get("head_sha") != evidence["tested_sha"]:
         raise gate.PublishBlocked("RECOVERY_EVIDENCE_MISMATCH: tested SHA does not match run")
     jobs = load_jobs()
+    rerun_mode: str | None = None
     if incoherent_candidate:
         assert incoherent_ids is not None
         if incoherent_ids != set(evidence["job_ids"]):
             raise gate.PublishBlocked("RECOVERY_EVIDENCE_MISMATCH: every incoherent job must be diagnosed")
-        evidence = {**evidence, "recovery_mode": recovery.INCOHERENT_CHECK_RECOVERY_MODE}
+        rerun_mode = recovery.INCOHERENT_CHECK_RECOVERY_MODE
+        evidence = {**evidence, "recovery_mode": rerun_mode}
     else:
         failed_ids = {
             job.get("id")
             for job in jobs
-            if isinstance(job, dict) and job.get("conclusion") in failure_conclusions
+            if isinstance(job, dict)
+            and isinstance(job.get("conclusion"), str)
+            and job["conclusion"] in failure_conclusions
         }
         if failed_ids != set(evidence["job_ids"]) or (not failed_ids and not cancelled_no_artifact):
             raise gate.PublishBlocked("RECOVERY_EVIDENCE_MISMATCH: every failing job must be diagnosed")
@@ -1122,13 +1139,14 @@ def _prepare_recovery(verb, fields, dest, cwd, environment, runner):
     if cancelled_no_artifact:
         recovery.require_infra_diagnosis_evidence(evidence)
         action = "re-enqueue"
-        evidence = {**evidence, "recovery_mode": recovery.CANCELLED_MERGE_GROUP_RECOVERY_MODE}
+        rerun_mode = recovery.CANCELLED_MERGE_GROUP_RECOVERY_MODE
+        evidence = {**evidence, "recovery_mode": rerun_mode}
     elif failed_run.get("event") == "merge_group":
         recovery.require_queue_diff(evidence, failed_run, fetch)
     current = fetch("pull", number=number)
     if current.get("state") != "open" or current.get("head", {}).get("sha") != head:
         raise gate.PublishBlocked("RECOVERY_HEAD_MOVED: PR changed during preflight")
-    return path, number, head, action, evidence
+    return path, number, head, action, evidence, rerun_mode
 
 
 def _refuse_unreadable_criteria(body):
@@ -4986,7 +5004,7 @@ def publish(
         if verb == "run-rerun" or (verb == "pr-merge" and "recovery_run_id" in fields and not already_queued):
             reservation = _prepare_recovery(verb, fields, dest, cwd, environment, readiness_runner)
             if reservation:
-                path, number, head, action, evidence = reservation
+                path, number, head, action, evidence, rerun_mode = reservation
                 if verb == "run-rerun" and action == "re-enqueue":
                     from lu_machinery.publish.merge_guard import ensure_merge_ready
 
@@ -5083,7 +5101,7 @@ def publish(
                             result.queue_jump = True
                             print(f"queue-jump: enqueued at the front of the merge queue at {head}", file=sys.stderr)
                     return result
-                if verb == "run-rerun" and evidence.get("recovery_mode") != recovery.INCOHERENT_CHECK_RECOVERY_MODE:
+                if verb == "run-rerun" and rerun_mode != recovery.INCOHERENT_CHECK_RECOVERY_MODE:
                     argv.append("--failed")
                 recovery.consume(path, dest, number, head, action, evidence)
             elif verb == "run-rerun":

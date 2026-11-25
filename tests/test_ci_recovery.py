@@ -1078,7 +1078,7 @@ def test_incoherent_check_row_all_green_run_recovers_with_full_rerun(setup, mode
                 "status": "completed",
                 "conclusion": "success",
                 "completed_at": completed_at,
-                "steps": [{"name": "Run checks", "status": "completed", "conclusion": "success"}],
+                "steps": [{"name": "Run checks", "status": "completed", "conclusion": "success", "completed_at": completed_at}],
             },
             {
                 "id": 456,
@@ -1089,8 +1089,8 @@ def test_incoherent_check_row_all_green_run_recovers_with_full_rerun(setup, mode
                 "conclusion": "success",
                 "completed_at": completed_at,
                 "steps": [
-                    {"name": "Lint", "status": "completed", "conclusion": "success"},
-                    {"name": "Skip cache", "status": "completed", "conclusion": "skipped"},
+                    {"name": "Lint", "status": "completed", "conclusion": "success", "completed_at": completed_at},
+                    {"name": "Skip cache", "status": "completed", "conclusion": "skipped", "completed_at": completed_at},
                 ],
             },
         ]
@@ -1105,7 +1105,7 @@ def test_incoherent_check_row_all_green_run_recovers_with_full_rerun(setup, mode
                 "status": "in_progress",
                 "conclusion": "success",
                 "completed_at": completed_at,
-                "steps": [{"name": "Lint", "status": "completed", "conclusion": "success"}],
+                "steps": [{"name": "Lint", "status": "completed", "conclusion": "success", "completed_at": completed_at}],
             },
             {
                 "id": 457,
@@ -1139,7 +1139,7 @@ def test_incoherent_check_row_all_green_run_recovers_with_full_rerun(setup, mode
                 "status": "waiting",
                 "conclusion": "neutral",
                 "completed_at": completed_at,
-                "steps": [{"name": "Check", "status": "completed", "conclusion": "neutral"}],
+                "steps": [{"name": "Check", "status": "completed", "conclusion": "neutral", "completed_at": completed_at}],
             },
         ]
         incoherent_ids = [456]
@@ -1165,7 +1165,8 @@ def test_incoherent_check_row_all_green_run_recovers_with_full_rerun(setup, mode
         pub.publish("run-rerun", number=123, repo="unit/public", cwd=root, env={}, runner=transport)
     assert len(transport.writes) == 1
 
-    # A failed run with any failing job still uses failed-only (--failed) on a new head.
+    # A failed run with any failing job still uses failed-only (--failed) on a new head,
+    # even when the evidence comment carries a spoofed recovery_mode field (F1).
     transport.head = NEW_HEAD
     transport.conclusion = "failure"
     transport.jobs = [
@@ -1177,7 +1178,7 @@ def test_incoherent_check_row_all_green_run_recovers_with_full_rerun(setup, mode
             "status": "completed",
             "conclusion": "failure",
             "completed_at": completed_at,
-            "steps": [{"name": "Checkout", "status": "completed", "conclusion": "failure"}],
+            "steps": [{"name": "Checkout", "status": "completed", "conclusion": "failure", "completed_at": completed_at}],
         },
         {
             "id": 457,
@@ -1187,7 +1188,7 @@ def test_incoherent_check_row_all_green_run_recovers_with_full_rerun(setup, mode
             "status": "in_progress",
             "conclusion": "success",
             "completed_at": completed_at,
-            "steps": [{"name": "Lint", "status": "completed", "conclusion": "success"}],
+            "steps": [{"name": "Lint", "status": "completed", "conclusion": "success", "completed_at": completed_at}],
         },
     ]
     transport.proof = {
@@ -1196,12 +1197,16 @@ def test_incoherent_check_row_all_green_run_recovers_with_full_rerun(setup, mode
         "run_id": 123,
         "job_ids": [456],
         "tested_sha": TESTED,
+        "recovery_mode": pub.recovery.INCOHERENT_CHECK_RECOVERY_MODE,
         "failure_evidence": "runner checkout failure on job 456",
         "unrelated_to_diff": "failed before changed code ran",
     }
     failed_result = pub.publish("run-rerun", number=123, repo="unit/public", cwd=root, env={}, runner=transport)
     assert failed_result.returncode == 0
     assert transport.writes[-1] == ["gh", "run", "rerun", "123", "--repo", "unit/public", "--failed"]
+    failed_prior = pub.recovery.first_attempt(pub.recovery.ledger_path(root), "github.com/unit/public", 42, NEW_HEAD)
+    assert failed_prior is not None
+    assert "recovery_mode" not in failed_prior
 
 
 @pytest.mark.parametrize(
@@ -1212,7 +1217,14 @@ def test_incoherent_check_row_all_green_run_recovers_with_full_rerun(setup, mode
         ("running-job-no-conclusion", "RECOVERY_RUN_INVALID"),
         ("incoherent-missing-completed-at", "RECOVERY_RUN_INVALID"),
         ("incoherent-invalid-completed-at", "RECOVERY_RUN_INVALID"),
+        ("incoherent-invalid-offset-minutes", "RECOVERY_RUN_INVALID"),
+        ("incoherent-invalid-offset-hours", "RECOVERY_RUN_INVALID"),
         ("coherent-missing-completed-at", "RECOVERY_RUN_INVALID"),
+        ("step-missing-completed-at", "RECOVERY_RUN_INVALID"),
+        ("step-invalid-completed-at", "RECOVERY_RUN_INVALID"),
+        ("unhashable-job-conclusion", "RECOVERY_RUN_INVALID"),
+        ("unhashable-step-conclusion", "RECOVERY_RUN_INVALID"),
+        ("unhashable-run-conclusion", "RECOVERY_RUN_INVALID"),
         ("failing-job-on-green-run", "RECOVERY_RUN_INVALID"),
         ("failing-step-on-incoherent-job", "RECOVERY_RUN_INVALID"),
         ("incomplete-step-on-incoherent-job", "RECOVERY_RUN_INVALID"),
@@ -1237,7 +1249,7 @@ def test_incoherent_check_row_all_green_run_recovers_with_full_rerun(setup, mode
     ],
 )
 def test_coherent_or_invalid_all_green_run_refuses_recovery(setup, case, expected_error):
-    """Defect class: coherent all-green runs (nothing to recover), incomplete/failing/malformed job or step rows, incomplete pagination, missing gates, or pr-merge misuse refuse without writing or consuming allowance."""
+    """Defect class: coherent all-green runs (nothing to recover), incomplete/failing/malformed job or step rows, invalid timestamps, unhashable conclusions, incomplete pagination, missing gates, or pr-merge misuse refuse without writing or consuming allowance."""
     root, transport = setup
     completed_at = "2026-11-25T21:54:06Z"
     transport.event = "pull_request"
@@ -1252,7 +1264,7 @@ def test_coherent_or_invalid_all_green_run_refuses_recovery(setup, case, expecte
             "status": "completed",
             "conclusion": "success",
             "completed_at": completed_at,
-            "steps": [{"name": "Run checks", "status": "completed", "conclusion": "success"}],
+            "steps": [{"name": "Run checks", "status": "completed", "conclusion": "success", "completed_at": completed_at}],
         },
         {
             "id": 456,
@@ -1262,7 +1274,7 @@ def test_coherent_or_invalid_all_green_run_refuses_recovery(setup, case, expecte
             "status": "in_progress",
             "conclusion": "success",
             "completed_at": completed_at,
-            "steps": [{"name": "Lint", "status": "completed", "conclusion": "success"}],
+            "steps": [{"name": "Lint", "status": "completed", "conclusion": "success", "completed_at": completed_at}],
         },
     ]
     transport.proof = {
@@ -1287,14 +1299,36 @@ def test_coherent_or_invalid_all_green_run_refuses_recovery(setup, case, expecte
         transport.jobs[1]["completed_at"] = None
     elif case == "incoherent-invalid-completed-at":
         transport.jobs[1]["completed_at"] = "not-a-timestamp"
+    elif case == "incoherent-invalid-offset-minutes":
+        transport.jobs[1]["completed_at"] = "2026-11-25T21:54:06+00:99"
+    elif case == "incoherent-invalid-offset-hours":
+        transport.jobs[1]["completed_at"] = "2026-11-25T21:54:06+24:00"
     elif case == "coherent-missing-completed-at":
         transport.jobs[0]["completed_at"] = None
+    elif case == "step-missing-completed-at":
+        transport.jobs[1]["steps"] = [{"name": "Lint", "status": "completed", "conclusion": "success"}]
+    elif case == "step-invalid-completed-at":
+        transport.jobs[1]["steps"] = [
+            {"name": "Lint", "status": "completed", "conclusion": "success", "completed_at": "2026-11-25T21:54:06+00:99"}
+        ]
+    elif case == "unhashable-job-conclusion":
+        transport.jobs[1]["conclusion"] = ["success"]
+    elif case == "unhashable-step-conclusion":
+        transport.jobs[1]["steps"] = [
+            {"name": "Lint", "status": "completed", "conclusion": ["success"], "completed_at": completed_at}
+        ]
+    elif case == "unhashable-run-conclusion":
+        transport.conclusion = ["success"]
     elif case == "failing-job-on-green-run":
         transport.jobs[0]["conclusion"] = "failure"
     elif case == "failing-step-on-incoherent-job":
-        transport.jobs[1]["steps"] = [{"name": "Lint", "status": "completed", "conclusion": "failure"}]
+        transport.jobs[1]["steps"] = [
+            {"name": "Lint", "status": "completed", "conclusion": "failure", "completed_at": completed_at}
+        ]
     elif case == "incomplete-step-on-incoherent-job":
-        transport.jobs[1]["steps"] = [{"name": "Lint", "status": "in_progress", "conclusion": "success"}]
+        transport.jobs[1]["steps"] = [
+            {"name": "Lint", "status": "in_progress", "conclusion": "success", "completed_at": completed_at}
+        ]
     elif case == "missing-steps-field":
         del transport.jobs[1]["steps"]
     elif case == "unknown-job-status":
