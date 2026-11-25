@@ -136,9 +136,10 @@ def _repository_key(value: object) -> int | str | None:
     if value.isprintable() and Path(value).is_absolute():
         return value
     hosted = normalize_repository(value)
-    if hosted.startswith("github.com/"):
+    host, _, slug = hosted.partition("/")
+    if host == "github.com":
         try:
-            identity = repository_identity(hosted.removeprefix("github.com/"))
+            identity = repository_identity(slug)
         except FleetRepoError:
             raise LineageRefused("fleet repository identity is unavailable") from None
         if isinstance(identity, int):
