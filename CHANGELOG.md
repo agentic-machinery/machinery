@@ -9,6 +9,35 @@ this file.
 
 ## [Unreleased]
 
+<a id="v0.1.71"></a>
+## [0.1.71] - 2026-11-25
+
+### Added
+
+- Support dedicated non-Git state root, repos root, and host profile ([#1373](https://github.com/learn-ukrainian/machinery/pull/1373))
+- Resolve consumer registry configs through profile.config_path ([#1380](https://github.com/learn-ukrainian/machinery/pull/1380))
+- Resolve fleet_repos.yaml through profile.config_path in fleet_repos and prepublish ([#1393](https://github.com/learn-ukrainian/machinery/pull/1393))
+- Add operator-only repository create and transfer ([#1401](https://github.com/learn-ukrainian/machinery/pull/1401))
+- Retain selector receipts in durable review stores ([#1395](https://github.com/learn-ukrainian/machinery/pull/1395))
+- Launch the CTO from a non-Git workspace ([#1397](https://github.com/learn-ukrainian/machinery/pull/1397))
+
+### Changed
+
+- Dispatcher-owned orchestrator-turn claims in core; drive-epic orchestrator-turn reference ([#1376](https://github.com/learn-ukrainian/machinery/pull/1376))
+- Bound findings by impact, actors and delta scope ([#1377](https://github.com/learn-ukrainian/machinery/pull/1377))
+- Align reviewer prompt and rules 8.4 with the review policy ([#1382](https://github.com/learn-ukrainian/machinery/pull/1382))
+- Align leftover finding-class copies with the review policy ([#1396](https://github.com/learn-ukrainian/machinery/pull/1396))
+- Align review-loop stop rule with carried findings ([#1400](https://github.com/learn-ukrainian/machinery/pull/1400))
+
+### Fixed
+
+- List only machinery pages in the Monitor nav ([#1381](https://github.com/learn-ukrainian/machinery/pull/1381))
+- Skip a rate-limited Codex attempt once its bound retry published (LINEAGE-RATELIMIT-1124) ([#1388](https://github.com/learn-ukrainian/machinery/pull/1388))
+- Bind dual-slug call sites to the active slug (A01b, supersedes #1375) ([#1378](https://github.com/learn-ukrainian/machinery/pull/1378))
+- Handle seat-resolution errors inside rules_core main ([#1389](https://github.com/learn-ukrainian/machinery/pull/1389))
+- Pin is_private and private_tooling to packaged fleet_repos catalog ([#1399](https://github.com/learn-ukrainian/machinery/pull/1399))
+- Refuse malformed lineage task records ([#1398](https://github.com/learn-ukrainian/machinery/pull/1398))
+
 <a id="v0.1.70"></a>
 ## [0.1.70] - 2026-11-24
 
@@ -1634,7 +1663,8 @@ First release: the machinery extracted from learn-ukrainian as the installable `
 - Rollover confirms replacement bindings without a self-answered quiz. ([#65](https://github.com/learn-ukrainian/machinery/pull/65))
 - Deploy derives release identity from packaged bytes. ([#145](https://github.com/learn-ukrainian/machinery/pull/145))
 
-[Unreleased]: https://github.com/learn-ukrainian/machinery/compare/v0.1.70...HEAD
+[Unreleased]: https://github.com/learn-ukrainian/machinery/compare/v0.1.71...HEAD
+[0.1.71]: https://github.com/learn-ukrainian/machinery/compare/v0.1.70...v0.1.71
 [0.1.70]: https://github.com/learn-ukrainian/machinery/compare/v0.1.69...v0.1.70
 [0.1.69]: https://github.com/learn-ukrainian/machinery/compare/v0.1.68...v0.1.69
 [0.1.68]: https://github.com/learn-ukrainian/machinery/compare/v0.1.66...v0.1.68
