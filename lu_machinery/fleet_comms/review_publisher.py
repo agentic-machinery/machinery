@@ -408,7 +408,7 @@ def execute_publication(
         )
     # Refuse a malformed receipt, or one the store cannot hold, before anything reaches GitHub, never after the post.
     try:
-        selector_value, _ = selector_columns(fleet_repo_selector)
+        selector_value, selector_sha256 = selector_columns(fleet_repo_selector)
     except ValueError as exc:
         raise ReviewPublisherError(f"invalid_fleet_repo_selector: {exc}") from exc
     if conn is not None and selector_value is not None and not _has_selector_columns(conn):
@@ -437,7 +437,7 @@ def execute_publication(
             review_id=plan.review_id,
             head_sha=plan.head_sha,
             status_context=plan.status_context,
-            fleet_repo_selector=fleet_repo_selector,
+            fleet_repo_selector=selector_receipt_from_columns(selector_value, selector_sha256),
         )
     return PublicationResult(
         plan=plan,
