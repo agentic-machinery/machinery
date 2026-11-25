@@ -168,6 +168,8 @@ def load_fleet_repos(path: Path | None = None) -> dict[str, FleetRepo]:
     out: dict[str, FleetRepo] = {}
     defaults = 0
     for key, body in repos_raw.items():
+        if not isinstance(key, str) or not key.isascii() or not key.strip():
+            raise FleetRepoError("fleet_repos key must be a non-empty ASCII string")
         github = body.get("github")
         local_name = body.get("local_name")
         role = body.get("role") or ""
@@ -262,7 +264,10 @@ def parse_ascii_positive_int(value: object, *, strip: bool = False) -> int | Non
     text = value.strip() if strip else value
     if not re.fullmatch(r"[1-9][0-9]*", text):
         return None
-    return int(text)
+    try:
+        return int(text)
+    except ValueError:
+        return None
 
 
 def canonical_repo_key(key: str, repos: Mapping[str, FleetRepo] | None = None) -> str:
@@ -273,6 +278,8 @@ def canonical_repo_key(key: str, repos: Mapping[str, FleetRepo] | None = None) -
     the default. The error is raised before any checkout path exists.
     """
     catalog = repos if repos is not None else load_fleet_repos()
+    if any(not isinstance(candidate, str) or not candidate.isascii() or not candidate.strip() for candidate in catalog):
+        raise FleetRepoError("fleet_repos catalog contains non-ASCII key")
     known = ", ".join(sorted(catalog))
     if not isinstance(key, str) or not key.isascii() or not key.strip():
         raise FleetRepoError(f"unknown --repo ''; allowlisted: {known}")
@@ -303,6 +310,13 @@ def resolve_fleet_repo_by_slug(
         # Keys and slugs are ASCII; casefold would map look-alikes such as U+212A onto them.
         raise FleetRepoError("unknown fleet repository identifier")
     catalog = repos if repos is not None else load_fleet_repos()
+    if any(
+        not isinstance(repo.key, str)
+        or not repo.key.isascii()
+        or any(not isinstance(slug, str) or not slug.isascii() for slug in repo.slugs)
+        for repo in catalog.values()
+    ):
+        raise FleetRepoError("fleet_repos catalog contains non-ASCII key or slug")
     spelling = identifier.strip().casefold()
     matches = [
         repo

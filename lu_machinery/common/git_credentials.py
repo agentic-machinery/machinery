@@ -320,6 +320,7 @@ def repository_registry(path: Path) -> dict[str, dict[str, Any]]:
     for key, entry in repos.items():
         if (
             not isinstance(key, str)
+            or not key.isascii()
             or not key.strip()
             or not isinstance(entry, dict)
             or not isinstance(entry.get("github", ""), str)

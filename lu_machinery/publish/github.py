@@ -1253,10 +1253,21 @@ def _parent_epic_node(read_runner, active, repos, parent, cwd, environment):
     return target.active_github, node
 
 
+def _created_resource_number(created, *, kind):
+    """Extract a created issue/PR number only from pure-ASCII stdout before any strip()."""
+    if not isinstance(created, str) or not created.isascii():
+        return None
+    match = re.search(rf"/{kind}/([1-9][0-9]*)[ \t\r\n]*$", created)
+    if not match:
+        return None
+    from lu_machinery.orchestration.fleet_repos import parse_ascii_positive_int
+
+    return parse_ascii_positive_int(match.group(1))
+
+
 def _link_created_issue(created, parent_ref, parent_node, gh_repo, read_runner, runner, cwd, environment):
     """Link the issue ``created`` printed to the stream epic through the ``issue-link`` verb."""
-    match = re.search(r"/issues/([1-9][0-9]*)[ \t\r\n]*$", created)
-    number = int(match.group(1)) if match else None
+    number = _created_resource_number(created, kind="issues")
     limited = link = None
     try:
         child_node = _issue_node(read_runner, gh_repo, number, cwd, environment) if number else None
@@ -1293,7 +1304,7 @@ _INLINE_CODE_RE = re.compile(r"(`+)([^`]*?)\1")
 _HTML_COMMENT_RE = re.compile(r"(?s)<!--.*?-->")
 _CLOSING_ISSUE_RE = re.compile(
     r"(?<![A-Za-z0-9_])(?ai:close[sd]?|fix(?:e[sd])?|resolve[sd]?)[ \t\r\n]*:?[ \t\r\n]+"
-    r"(?:(?P<url>https://github\.com/(?P<url_repo>[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/issues/(?P<url_num>[1-9][0-9]*))"
+    r"(?:(?P<url>(?ai:https://github\.com)/(?P<url_repo>[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/(?ai:issues)/(?P<url_num>[1-9][0-9]*))"
     r"|(?:(?P<slug>[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)?#(?P<num>[1-9][0-9]*)))(?!\w)"
 )
 _MAX_PR_CLOSING_ISSUES = 20
@@ -1517,8 +1528,7 @@ def _resolve_linked_issue_milestone(
 
 def _apply_pr_milestone(created, milestone_number, milestone_title, dest, gh_repo, runner, cwd, environment, temp):
     """Apply the pre-validated milestone to the newly created PR via Issues PATCH."""
-    match = re.search(r"/pull/([1-9][0-9]*)[ \t\r\n]*$", created)
-    number = int(match.group(1)) if match else None
+    number = _created_resource_number(created, kind="pull")
     limited = applied = None
     try:
         if number:
@@ -1537,7 +1547,7 @@ def _apply_pr_milestone(created, milestone_number, milestone_title, dest, gh_rep
         limited = exc
     except Exception:
         applied = None
-    created_pr = github_client.created_pr_detail({"number": number, "html_url": created}) or None
+    created_pr = github_client.created_pr_detail({"number": number, "html_url": created.strip() if isinstance(created, str) and created.isascii() else ""}) or None
     pr_url = created_pr.get("pr_url") if created_pr else None
     which = (
         f"PR #{number} ({pr_url})"
@@ -4608,7 +4618,7 @@ def publish(
         if parent_epic is not None and result.returncode == 0:
             parent_repo, parent_node = parent_epic
             _link_created_issue(
-                str(result.stdout or "").strip(), f"{parent_repo}#{fields['parent']}", parent_node, gh_repo,
+                str(result.stdout or ""), f"{parent_repo}#{fields['parent']}", parent_node, gh_repo,
                 readiness_runner, runner,
                 cwd, environment,
             )
@@ -4616,7 +4626,7 @@ def publish(
                 print(str(result.stdout or "").strip())
         if pr_milestone is not None and result.returncode == 0:
             _apply_pr_milestone(
-                str(result.stdout or "").strip(), pr_milestone[0], pr_milestone[1], dest, gh_repo, runner,
+                str(result.stdout or ""), pr_milestone[0], pr_milestone[1], dest, gh_repo, runner,
                 cwd, environment, temp,
             )
             if not capture_output:

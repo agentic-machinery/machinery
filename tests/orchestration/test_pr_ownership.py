@@ -1310,18 +1310,25 @@ def test_pr_ownership_rejects_non_ascii_handoff_keys_and_verdict_repos(tmp_path)
         "last_tick": None,
         "episodes": {},
         "handoffs": {
+            f"{REPO}#1277": {
+                "successor": "codex/valid-worker",
+                "accepted_at": at(0).isoformat(),
+                "head": HEAD,
+            },
             f"{REPO}#\u0664\u0662": {
                 "successor": "codex/worker",
                 "accepted_at": at(0).isoformat(),
                 "head": HEAD,
-            }
+            },
         },
         "history": [],
         "outbox": [],
         "heal_attempts": {},
     }))
-    with pytest.raises(own.OwnershipError):
-        own.load(bad_digits_path)
+    loaded = own.load(bad_digits_path)
+    assert list(loaded["handoffs"]) == [f"{REPO}#1277"]
+    with pytest.raises(own.OwnershipError), own.locked(bad_digits_path):
+        pass
 
     lookalike_repo = REPO.replace("k", "\u212a")
     with pytest.raises(own.OwnershipError):

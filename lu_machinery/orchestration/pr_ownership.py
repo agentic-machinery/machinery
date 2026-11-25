@@ -340,7 +340,7 @@ def keeper_custody(handoff: Mapping[str, Any] | None) -> bool:
     )
 
 
-def load(path: Path) -> dict[str, Any]:
+def load(path: Path, *, strict_keys: bool = False) -> dict[str, Any]:
     try:
         try:
             path.lstat()
@@ -363,8 +363,14 @@ def load(path: Path) -> dict[str, Any]:
                     _at(episode[name])
             if type(episode.get("reminders", 0)) is not int:
                 raise TypeError(key)
+        valid_handoffs: dict[str, Any] = {}
         for key, handoff in data["handoffs"].items():
-            _parse_pr_ref(key, "ownership handoff")
+            try:
+                _parse_pr_ref(key, "ownership handoff")
+            except OwnershipError:
+                if strict_keys:
+                    raise
+                continue
             _at(handoff["accepted_at"])
             if not all(isinstance(handoff[name], str) and handoff[name] for name in ("successor", "head")):
                 raise TypeError(key)
@@ -376,6 +382,8 @@ def load(path: Path) -> dict[str, Any]:
                 _at(handoff["acknowledged_at"])
                 if handoff.get("repair_at") is not None:
                     _at(handoff["repair_at"])
+            valid_handoffs[key] = handoff
+        data["handoffs"] = valid_handoffs
         last = data.get("last_tick")
         if last is not None:
             _at(last["at"])
@@ -426,7 +434,7 @@ def locked(path: Path) -> Iterator[dict[str, Any]]:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.with_suffix(".lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
-        data = load(path)
+        data = load(path, strict_keys=True)
         yield data
         _save(path, data)
 

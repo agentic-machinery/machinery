@@ -1947,7 +1947,41 @@ def test_publish_recovery_and_github_client_reject_non_ascii_slugs_and_digits(tm
         )
 
     assert pub_github._issue_node(fake_reader, "learn-ukrainian/machinery", 42, tmp_path, {}) is None
-    assert pub_github._link_created_issue.__code__ is not None
+    assert pub_github._pr_closing_issues(
+        "Fixes https://GitHub.com/learn-ukrainian/machinery/issues/42", "learn-ukrainian/machinery"
+    ) == [42]
+    assert pub_github._pr_closing_issues(
+        "Fixes https://github.com/learn-u\u212arainian/machinery/issues/42", "learn-ukrainian/machinery"
+    ) == []
+    assert pub_github._pr_closing_issues("Fixes #4\u0662", "learn-ukrainian/machinery") == []
+    assert (
+        pub_github._created_resource_number(
+            "\u00a0https://github.com/learn-ukrainian/machinery/pull/42\n",
+            kind="pull",
+        )
+        is None
+    )
+    assert (
+        pub_github._created_resource_number(
+            "https://github.com/learn-u\u212arainian/machinery/pull/42\n",
+            kind="pull",
+        )
+        is None
+    )
+    assert (
+        pub_github._created_resource_number(
+            "https://github.com/learn-ukrainian/machinery/issues/4\u0662\n",
+            kind="issues",
+        )
+        is None
+    )
+    assert (
+        pub_github._created_resource_number(
+            "https://GitHub.com/learn-ukrainian/machinery/pull/42\n",
+            kind="pull",
+        )
+        == 42
+    )
 
     # Branch delete refuses a look-alike repository full_name from the remote payload.
     def lookalike_repo_reader(argv, **_kw):
@@ -1969,7 +2003,7 @@ def test_publish_recovery_and_github_client_reject_non_ascii_slugs_and_digits(tm
             text=True,
         )
 
-    # github_client._read_command does not rewrite a Unicode-digit pull URL as a numeric PR id.
+    # github_client._read_command refuses non-ASCII URLs or Unicode-digit PR/issue operands before any request.
     from types import SimpleNamespace
 
     seen_paths: list[str] = []
@@ -1979,13 +2013,33 @@ def test_publish_recovery_and_github_client_reject_non_ascii_slugs_and_digits(tm
             seen_paths.append(path)
             return SimpleNamespace(value=[], stale=False, error=None)
 
+    for cmd, sub, operand in (
+        ("pr", "view", "https://github.com/learn-ukrainian/machinery/pull/\u0664\u0662"),
+        ("pr", "view", "https://github.com/learn-ukrainian/machinery/pull/4\u0662"),
+        ("pr", "view", "https://github.com/learn-u\u212arainian/machinery/pull/42"),
+        ("pr", "view", "\u0664\u0662"),
+        ("issue", "view", "\u0664\u0662"),
+    ):
+        res = github_client._read_command(
+            DummyClient(),
+            cmd,
+            sub,
+            {"--repo": ["learn-ukrainian/machinery"], "--json": ["number"]},
+            [operand],
+            timeout=5,
+            fresh=True,
+        )
+        assert res.status == 400 and res.error == "github_invalid_command"
+    assert seen_paths == []
+
+    # Valid ASCII branch operands still query the branch-lookup endpoint.
     github_client._read_command(
         DummyClient(),
         "pr",
         "view",
         {"--repo": ["learn-ukrainian/machinery"], "--json": ["number"]},
-        ["https://github.com/learn-ukrainian/machinery/pull/\u0664\u0662"],
+        ["topic/branch"],
         timeout=5,
         fresh=True,
     )
-    assert seen_paths and all("/pulls/\u0664\u0662" not in p and "%D9%A4" not in p.split("?", 1)[0] for p in seen_paths)
+    assert seen_paths and seen_paths[0].startswith("repos/learn-ukrainian/machinery/pulls?state=all&head=")

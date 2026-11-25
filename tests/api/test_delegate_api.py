@@ -1127,7 +1127,7 @@ def test_delegate_router_rejects_non_ascii_delivery_pr_repo_and_dor_digits(tmp_p
 
     links = delegate_router._linked_issues_from_dor({
         "dor_preflight": {
-            "issues": ["\u0664\u0662", True, 7],
+            "issues": ["\u0664\u0662", "9" * 4301, True, 7, 9],
             "issue_repositories": [
                 {"issue": "\u0664\u0662", "repo": "learn-ukrainian/machinery"},
                 {"issue": 9, "repo": "learn-u\u212arainian/machinery"},

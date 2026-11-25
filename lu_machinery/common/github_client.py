@@ -2090,8 +2090,38 @@ def _read_command(client, kind, action, options, positional, *, timeout, fresh):
     root = f"repos/{repo}"
     fields = str(_opt(options, "--json", default="")).split(",")
     number = positional[0] if positional else None
-    if number and "/" in number and re.search(r"/(pull|issues)/[1-9][0-9]*(?:/|$)", number):
-        number = number.rstrip("/").split("/")[-1]
+    if number is not None and kind in {"pr", "issue"} and action in {"view", "checks", "diff"}:
+        if not isinstance(number, str):
+            return Result(status=400, error="github_invalid_command", reason="invalid_github_reference")
+        expected_seg = "pull" if kind == "pr" else "issues"
+        is_url_like = (
+            "://" in number
+            or "github.com/" in number.casefold()
+            or "/pull/" in number
+            or "/issues/" in number
+            or number.startswith("/")
+        )
+        if is_url_like:
+            url_match = (
+                re.fullmatch(
+                    rf"(?ai:https://github\.com)/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/{expected_seg}/([1-9][0-9]*)/?",
+                    number,
+                )
+                if number.isascii()
+                else None
+            )
+            if url_match is None:
+                return Result(status=400, error="github_invalid_command", reason="invalid_github_reference")
+            url_slug = url_match.group(1)
+            owner, _, name = url_slug.partition("/")
+            if url_slug.endswith(".git") or owner in {".", ".."} or name in {".", ".."}:
+                return Result(status=400, error="github_invalid_command", reason="invalid_github_reference")
+            number = url_match.group(2)
+        elif (kind == "issue" and action == "view") or number.startswith("#") or number.isdigit():
+            candidate = number.removeprefix("#")
+            if not number.isascii() or not re.fullmatch(r"[1-9][0-9]*", candidate):
+                return Result(status=400, error="github_invalid_command", reason="invalid_github_reference")
+            number = candidate
     query = {"per_page": 100}
     for flag, parameter in {
         "--state": "state",
@@ -2115,7 +2145,7 @@ def _read_command(client, kind, action, options, positional, *, timeout, fresh):
     if action == "list":
         query["per_page"] = min(limit, 100)
     if kind == "pr" and action in {"view", "checks", "diff"}:
-        if not number or not str(number).isdigit():
+        if not number or not (isinstance(number, str) and number.isascii() and re.fullmatch(r"[1-9][0-9]*", number)):
             head = (
                 number
                 or subprocess.run(

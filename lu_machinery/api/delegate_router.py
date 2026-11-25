@@ -513,11 +513,14 @@ def _linked_issues_from_dor(task: dict[str, Any]) -> list[dict[str, Any]] | None
             if not isinstance(entry, dict):
                 continue
             number = parse_ascii_positive_int(entry.get("issue"), strip=True)
+            if number is None:
+                continue
             repo = entry.get("repo") if isinstance(entry.get("repo"), str) else entry.get("repository")
-            if not isinstance(repo, str) or not repo or not repo.isascii() or number is None:
+            if not isinstance(repo, str) or not repo:
                 continue
             foreign_by_number.setdefault(number, []).append(repo)
-            foreign_links.append({"issue": number, "repository": repo})
+            if repo.isascii():
+                foreign_links.append({"issue": number, "repository": repo})
     counts: dict[int, int] = {}
     raw_issues = preflight.get("issues") or []
     if isinstance(raw_issues, list):
