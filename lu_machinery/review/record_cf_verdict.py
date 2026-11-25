@@ -3191,13 +3191,18 @@ def import_publications(
         prs.add(only)
     else:
         since = (now or datetime.now(UTC)) - timedelta(days=days)
-        slugs = {key.casefold(): repo.github for key, repo in load_fleet_repos().items()}
+        slugs = {
+            key.casefold(): repo.github
+            for key, repo in load_fleet_repos().items()
+            if isinstance(key, str) and key.isascii()
+        }
         for row in model_stats_rows.read_rows(batch_state_dir)[0]:
             moment = (model_stats_rows.timestamp(row.get("finished_at"))
                       or model_stats_rows.timestamp(row.get("started_at")))
             if row.get("role") != "review" or not isinstance(row.get("pr"), int) or moment is None or moment < since:
                 continue
-            slug = slugs.get(str(row.get("repo") or "public").casefold())
+            raw_repo = row.get("repo") or "public"
+            slug = slugs.get(raw_repo.casefold()) if isinstance(raw_repo, str) and raw_repo.isascii() else None
             if slug is None:
                 counts["rows_unregistered_repo"] += 1
             else:

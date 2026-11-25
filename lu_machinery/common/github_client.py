@@ -2115,6 +2115,8 @@ def _read_command(client, kind, action, options, positional, *, timeout, fresh):
             owner, _, name = url_slug.partition("/")
             if url_slug.endswith(".git") or owner in {".", ".."} or name in {".", ".."}:
                 return Result(status=400, error="github_invalid_command", reason="invalid_github_reference")
+            if url_slug.casefold() != repo.casefold():
+                return Result(status=400, error="github_invalid_command", reason="repository_mismatch")
             number = url_match.group(2)
         elif (kind == "issue" and action == "view") or number.startswith("#") or number.isdigit():
             candidate = number.removeprefix("#")
