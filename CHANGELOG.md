@@ -9,6 +9,25 @@ this file.
 
 ## [Unreleased]
 
+<a id="v0.1.75"></a>
+## [0.1.75] - 2026-11-25
+
+### Added
+
+- Allow transfers of registered public repositories ([#1445](https://github.com/learn-ukrainian/machinery/pull/1445))
+
+### Fixed
+
+- State the round-charging rule the code applies ([#1426](https://github.com/learn-ukrainian/machinery/pull/1426))
+- Reject non-ASCII slugs before case folding across five readers ([#1430](https://github.com/learn-ukrainian/machinery/pull/1430))
+- Strict task inventory reads the live store (supersedes #1420) ([#1435](https://github.com/learn-ukrainian/machinery/pull/1435))
+- Resolve active repository slugs across transfers ([#1439](https://github.com/learn-ukrainian/machinery/pull/1439))
+- Redact scanner findings in public CI ([#1444](https://github.com/learn-ukrainian/machinery/pull/1444))
+
+### Removed
+
+- Remove the retired dependency advisory writer ([#1437](https://github.com/learn-ukrainian/machinery/pull/1437))
+
 <a id="v0.1.74"></a>
 ## [0.1.74] - 2026-11-25
 
@@ -1718,7 +1737,8 @@ First release: the machinery extracted from learn-ukrainian as the installable `
 - Rollover confirms replacement bindings without a self-answered quiz. ([#65](https://github.com/learn-ukrainian/machinery/pull/65))
 - Deploy derives release identity from packaged bytes. ([#145](https://github.com/learn-ukrainian/machinery/pull/145))
 
-[Unreleased]: https://github.com/learn-ukrainian/machinery/compare/v0.1.74...HEAD
+[Unreleased]: https://github.com/learn-ukrainian/machinery/compare/v0.1.75...HEAD
+[0.1.75]: https://github.com/learn-ukrainian/machinery/compare/v0.1.74...v0.1.75
 [0.1.74]: https://github.com/learn-ukrainian/machinery/compare/v0.1.73...v0.1.74
 [0.1.73]: https://github.com/learn-ukrainian/machinery/compare/v0.1.71...v0.1.73
 [0.1.72]: https://github.com/learn-ukrainian/machinery/compare/v0.1.71...v0.1.72
