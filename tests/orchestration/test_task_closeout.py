@@ -1488,7 +1488,13 @@ def test_cmd_init_accepts_native_membership_without_a_live_audit(
         "public": fleet_repos.FleetRepo("public", epic_repo, "product", "public-monorepo", True),
         "machinery": fleet_repos.FleetRepo("machinery", "org/repo", "repo", "public-machinery"),
     })
-    monkeypatch.setattr(issue_stream_audit, "load_registry", lambda *args, **kwargs: {"epics": [10, 42]})
+    registry_path = tmp_path / "issue_streams.yaml"
+    registry_path.write_text("streams:\n  epics:\n    epics: [10, 42]\n", encoding="utf-8")
+    config_path = task_closeout.profile.config_path
+    monkeypatch.setattr(
+        task_closeout.profile, "config_path",
+        lambda name, **kwargs: registry_path if name == "issue_streams" else config_path(name, **kwargs),
+    )
     monkeypatch.setattr(task_closeout.GhGitHubAdapter, "_json", lambda self, command: {"nameWithOwner": "org/repo"})
     read_issue = _stub_read_issue(parent_epic=10)
     monkeypatch.setattr(task_closeout.GhGitHubAdapter, "read_issue", lambda self, repo, number: {

@@ -43,7 +43,11 @@ from lu_machinery.orchestration.fleet_repos import (
     canonical_repository,
     load_fleet_repos,
     pull_request_repository,
+    repository_slugs,
+    resolve_active_fleet_repo,
     resolve_fleet_repo,
+    resolve_fleet_repo_by_slug,
+    resolve_payload_fleet_repo,
 )
 from lu_machinery.publish.github import Request, request_run
 from lu_machinery.review.target_resolution import repository_target_error
@@ -112,6 +116,13 @@ def _run_gh(
 
 def fetch_pr_info(repo_root: Path, pr_number: int, *, repo: str | None = None) -> PullRequestInfo:
     """Read PR state from GitHub, preferring REST's core quota."""
+    if repo is None and (origin := rw._github_owner_repo(repo_root)) is not None:
+        repo = "/".join(origin)
+    try:
+        if repo is not None and len(repository_slugs(repo)) > 1:
+            repo = resolve_payload_fleet_repo(repo).active_github
+    except FleetRepoError as exc:
+        raise MergeCloseoutError(str(exc)) from exc
     info, rest_error = _fetch_pr_info_rest(repo_root, pr_number, repo=repo)
     if info is not None:
         return info
@@ -199,8 +210,8 @@ def _fetch_pr_info_graphql(
         "--json",
         "number,state,headRefName,headRefOid,url",
     ]
-    if repository:
-        args += ["--repo", repository]
+    if target := repo or repository:
+        args += ["--repo", target]
     try:
         proc = _run_gh(args, cwd=repo_root)
     except (FileNotFoundError, subprocess.SubprocessError) as exc:
@@ -525,6 +536,8 @@ def collect_merged_run_evidence(
     repository = ledger["identity"]["repository"]
     pr_number = ledger["pr"]["number"]
     workflow = lifecycle_observation.required_merge_workflow(repository)
+    if len(repository_slugs(repository)) > 1:
+        repository = resolve_payload_fleet_repo(repository).active_github
     pull = _closeout_api(repo_root, Request("read-pull", repo=repository, number=pr_number))
     if not isinstance(pull.get("head"), dict) or pull["head"].get("sha") != observation["github"]["pr"].get("head_sha"):
         raise MergeCloseoutError("CLOSEOUT_PR_HEAD_MOVED")
@@ -768,25 +781,17 @@ def main(argv: list[str] | None = None) -> int:
             try:
                 catalog = load_fleet_repos()
                 supplied = args.repo.strip() if isinstance(args.repo, str) else ""
-                spelling = supplied.casefold()
-                selected = next(
-                    (
-                        item
-                        for item in catalog.values()
-                        if spelling and spelling in {item.key.casefold(), item.github.casefold()}
-                    ),
-                    None,
-                )
-                if selected is None:
-                    known = ", ".join(sorted(item.github for item in catalog.values()))
+                try:
+                    selected = resolve_fleet_repo_by_slug(supplied, repos=catalog)
+                except FleetRepoError:
+                    known = ", ".join(sorted(slug for item in catalog.values() for slug in item.slugs))
                     raise FleetRepoError(
                         f"unknown --repo {supplied!r}; allowlisted: {known}. "
                         "Pass --repo owner/name or --repo-root; "
                         "a checkout is not taken from the working directory."
-                    )
-                _, repo_root = resolve_fleet_repo(selected.key, primary_root=state_root())
-                # REST lookup requires owner/name, so the catalog slug is the GitHub argument.
-                repo_arg = selected.github
+                    ) from None
+                _, repo_root = resolve_fleet_repo(selected.key, primary_root=state_root(), repos=catalog)
+                repo_arg = resolve_active_fleet_repo(selected.key, repos=catalog).active_github
             except (FleetRepoError, MachineryConfigError) as exc:
                 # A missing private checkout is refused without naming its path.
                 key = selected.key if selected is not None else None

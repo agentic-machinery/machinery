@@ -10,11 +10,10 @@ import subprocess
 import pytest
 from fastapi.testclient import TestClient
 
-from lu_machinery.api import main as monitor_main
 from lu_machinery.api import work_router
 from lu_machinery.api.main import app
 from lu_machinery.common.repo_root import machinery_path
-from lu_machinery.orchestration.fleet_repos import FleetRepo
+from lu_machinery.orchestration import fleet_repos
 
 
 def _node(script: str) -> None:
@@ -322,8 +321,8 @@ def test_refresh_header_names_a_failure_and_claims_updated_only_after_success(mo
     assert health.status_code == 200
     version = health.json()["machinery_version"]
     assert version == importlib.metadata.version("lu-machinery")
-    machinery = FleetRepo("machinery", "new-owner/machinery", "machinery", "public-machinery")
-    monkeypatch.setattr(monitor_main, "load_fleet_repos", lambda: {"machinery": machinery})
+    machinery = fleet_repos.FleetRepo("machinery", "new-owner/machinery", "machinery", "public-machinery")
+    monkeypatch.setattr(fleet_repos, "load_fleet_repos", lambda path=None: {"machinery": machinery})
     served = TestClient(app).get("/machinery")
     assert served.status_code == 200
     data = re.search(r'id="machinery-version" data-version="([^"]*)" data-repository="([^"]*)"', served.text)

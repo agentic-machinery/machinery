@@ -1232,10 +1232,17 @@ def test_main_explicit_repo_root_does_not_discover_a_checkout_from_cwd(
     assert json.loads(capsys.readouterr().out)["ok"] is True
 
 
+@pytest.mark.parametrize("active", ["learn-ukrainian/machinery", "agentic-machinery/machinery"])
 def test_main_without_repo_root_selects_catalog_checkout_from_unrelated_cwd(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, active: str,
 ) -> None:
-    """Defect class: without --repo-root, --repo learn-ukrainian/machinery must select the catalog sibling, not cwd."""
+    """Defect class: either slug must select the same sibling and dispatch reads to the active slug."""
+    from lu_machinery.common import git_credentials
+
+    monkeypatch.setattr(
+        git_credentials, "load_selector",
+        lambda **_kwargs: git_credentials.SelectorState({"machinery": active}, "d" * 64),
+    )
     layout = tmp_path / "layout"
     primary = layout / "learn-ukrainian"
     checkout = layout / "machinery"
@@ -1249,18 +1256,10 @@ def test_main_without_repo_root_selects_catalog_checkout_from_unrelated_cwd(
     monkeypatch.setattr(mc, "state_root", lambda start=None, env=None: primary)
     seen = _capture_closeout(monkeypatch)
 
-    exit_code = mc.main(["113", "--repo", "learn-ukrainian/machinery", "--json"])
-
-    assert exit_code == 0
-    assert seen["repo_root"] == checkout.resolve()
-    assert seen["repo"] == "learn-ukrainian/machinery"
-    assert seen["repo_root"] != unrelated.resolve()
-
-    exit_code = mc.main(["113", "--repo", "machinery", "--json"])
-
-    assert exit_code == 0
-    assert seen["repo_root"] == checkout.resolve()
-    assert seen["repo"] == "learn-ukrainian/machinery"
+    for spelling in ("learn-ukrainian/machinery", "agentic-machinery/machinery", "machinery"):
+        assert mc.main(["113", "--repo", spelling, "--json"]) == 0
+        assert seen["repo_root"] == checkout.resolve()
+        assert seen["repo"] == active
 
 
 def test_main_unknown_or_missing_repo_refuses_exit_2(
@@ -1376,14 +1375,20 @@ def test_main_help_resolves_no_checkout(
 
 
 @pytest.mark.parametrize(("payload_slug", "accepted"), [("org/repo", True), ("neworg/repo", True), ("evil/repo", False)])
+@pytest.mark.parametrize("active", ["org/repo", "neworg/repo"])
 def test_fetch_pr_info_binds_either_baked_slug_of_the_requested_repository(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, payload_slug: str, accepted: bool
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, payload_slug: str, accepted: bool, active: str,
 ) -> None:
     """Defect class: a payload naming the other baked slug of the same repository is refused, or a slug
     with the same repository name under another owner is accepted (--repo spells the old slug)."""
+    from lu_machinery.common import git_credentials
     from tests.test_fleet_repos import transferred_catalog
 
-    transferred_catalog(monkeypatch)
+    row = transferred_catalog(monkeypatch)
+    monkeypatch.setattr(
+        git_credentials, "load_selector",
+        lambda **_kwargs: git_credentials.SelectorState({row.key: active}, "d" * 64),
+    )
     rest = {
         "number": 42, "state": "closed", "merged_at": "2026-01-02T03:04:05Z", "head": {"ref": "b", "sha": "a" * 40},
         "base": {"repo": {"full_name": payload_slug}}, "html_url": f"https://github.com/{payload_slug}/pull/42",
@@ -1393,6 +1398,10 @@ def test_fetch_pr_info_binds_either_baked_slug_of_the_requested_repository(
 
     def fake_run(args: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
         assert args[0] == "gh", args
+        if args[1] == "api":
+            assert args[-1] == f"repos/{active}/pulls/42"
+        else:
+            assert args[args.index("--repo") + 1] == active
         return subprocess.CompletedProcess(args, 0, json.dumps(rest if args[1] == "api" else graphql), "")
 
     monkeypatch.setattr(mc.github_client, "run", fake_run)

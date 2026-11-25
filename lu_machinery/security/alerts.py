@@ -32,10 +32,12 @@ from prometheus_client import CollectorRegistry, Gauge, generate_latest, write_t
 
 from lu_machinery.common import github_client
 from lu_machinery.orchestration.fleet_repos import (
+    ActiveFleetRepo,
     FleetRepo,
     FleetRepoError,
     canonical_repo_key,
     load_fleet_repos,
+    resolve_active_fleet_repo,
 )
 from lu_machinery.review.model_catalog import ModelCatalogError, load_model_catalog, validate_catalog
 from lu_machinery.review.role_resolution import RoleCandidate, resolve_role
@@ -301,11 +303,11 @@ def _safe_owned_path(raw: Any) -> str | None:
     return "/".join(parts)
 
 
-def _repo_endpoint(repo: FleetRepo, tool: str) -> str:
-    parts = repo.github.split("/")
-    if len(parts) != 2 or not all(_SLUG_SEGMENT_RE.fullmatch(p) and p not in {".", ".."} for p in parts):
-        raise SecurityAlertsError(f"invalid GitHub repository slug for {repo.key!r}")
-    owner, name = (quote(p, safe="") for p in parts)
+def _repo_endpoint(active: ActiveFleetRepo, tool: str) -> str:
+    parts = _split_slug(active.active_github)
+    if parts is None:
+        raise SecurityAlertsError(f"invalid GitHub repository slug for {active.repo.key!r}")
+    owner, name = (quote(part, safe="") for part in parts)
     return f"repos/{owner}/{name}/{_ENDPOINT_SUFFIXES[tool]}"
 
 
@@ -370,7 +372,7 @@ def _normalize_severity(tool: str, alert: Mapping[str, Any]) -> str:
 
 def _fetch_tool_alerts(
     client: Any,
-    repo: FleetRepo,
+    active: ActiveFleetRepo,
     tool: str,
     *,
     timeout: float,
@@ -381,10 +383,10 @@ def _fetch_tool_alerts(
     ``"ok"``, ``"not_enabled"``, or ``"error"``.
     """
     try:
-        initial_endpoint = _repo_endpoint(repo, tool)
+        initial_endpoint = _repo_endpoint(active, tool)
     except SecurityAlertsError:
         return "error", None, "invalid_repository_slug"
-    slugs = _repo_slugs(repo)
+    slugs = _repo_slugs(active.repo)
     if slugs is None:
         return "error", None, "invalid_repository_slug"
     expected_path = initial_endpoint.split("?", 1)[0]
@@ -429,7 +431,7 @@ def _fetch_tool_alerts(
             if not numeric_match or numeric_match.group(2) != expected_tool_suffix:
                 return "error", None, "github_invalid_next_link"
             if not repo_id_loaded:
-                known_repo_id = _load_repo_numeric_id(client, repo, timeout)
+                known_repo_id = _load_repo_numeric_id(client, active.active_github, timeout)
                 repo_id_loaded = True
             if known_repo_id is None or numeric_match.group(1) != known_repo_id:
                 return "error", None, "github_invalid_next_link"
@@ -492,10 +494,6 @@ def _split_slug(slug: Any) -> tuple[str, str] | None:
     return parts[0], parts[1]
 
 
-def _split_github_slug(repo: FleetRepo) -> tuple[str, str] | None:
-    return _split_slug(repo.github)
-
-
 def _repo_slugs(repo: FleetRepo) -> tuple[str, ...] | None:
     """Validated baked slugs of the selected ``FleetRepo``, or None if any slug is invalid."""
     slugs = repo.slugs
@@ -544,15 +542,16 @@ def _run_html_url_matches(html_url: Any, allowed_slugs: Sequence[str], run_id: i
     return _slug_matches(slug, allowed_slugs)
 
 
-def _fleet_security_workflow(repos: Mapping[str, FleetRepo] | None) -> str | None:
+def _fleet_security_workflow(
+    repos: Mapping[str, FleetRepo] | None, *, registry_path: Path | None = None,
+) -> str | None:
     try:
-        catalog = load_fleet_repos() if repos is None else repos
+        active = resolve_active_fleet_repo("machinery", repos=repos, registry_path=registry_path)
     except FleetRepoError:
         return None
-    machinery = catalog.get("machinery")
-    if machinery is None or _split_github_slug(machinery) is None:
+    if _split_slug(active.active_github) is None:
         return None
-    return f"{machinery.github}/{_FLEET_SECURITY_WORKFLOW_PATH}"
+    return f"{active.active_github}/{_FLEET_SECURITY_WORKFLOW_PATH}"
 
 
 def _repo_numeric_id(document: Mapping[str, Any]) -> str | None:
@@ -562,8 +561,8 @@ def _repo_numeric_id(document: Mapping[str, Any]) -> str | None:
     return str(repo_id)
 
 
-def _load_repo_numeric_id(client: Any, repo: FleetRepo, timeout: float) -> str | None:
-    slug = _split_github_slug(repo)
+def _load_repo_numeric_id(client: Any, github: str, timeout: float) -> str | None:
+    slug = _split_slug(github)
     if slug is None:
         return None
     owner, name = slug
@@ -1302,6 +1301,7 @@ def read_fleet_security(
     *,
     timeout: float,
     repos: Mapping[str, FleetRepo] | None = None,
+    registry_path: Path | None = None,
 ) -> dict[str, Any]:
     """Read one repository's fleet-security enrollment and CI evidence.
 
@@ -1310,11 +1310,15 @@ def read_fleet_security(
     caller could not be shown to be absent. Findings come only from redacted
     annotations the workflow already emits.
     """
-    slug = _split_github_slug(repo)
+    try:
+        active = resolve_active_fleet_repo(repo.key, repos={repo.key: repo}, registry_path=registry_path)
+    except FleetRepoError:
+        return _fleet_record("inaccessible_evidence", reason="active_repository_unavailable")
+    slug = _split_slug(active.active_github)
     allowed_slugs = _repo_slugs(repo)
     if slug is None or allowed_slugs is None:
         return _fleet_record("inaccessible_evidence", reason="invalid_repository")
-    fleet_workflow = _fleet_security_workflow(repos)
+    fleet_workflow = _fleet_security_workflow(repos, registry_path=registry_path)
     if fleet_workflow is None:
         return _fleet_record("inaccessible_evidence", reason="machinery_repository_unavailable")
     owner, name = slug
@@ -1387,10 +1391,25 @@ def scan_fleet_alerts(
     for key, repo in catalog.items():
         if not repo.security_alerts:
             continue
+        try:
+            active = resolve_active_fleet_repo(key, repos=catalog, registry_path=registry_path)
+        except FleetRepoError:
+            reason = "active_repository_unavailable"
+            all_ok = False
+            repositories[key] = {
+                "github": None,
+                "source_ok": False,
+                "tools": {
+                    tool: {"status": "error", "total": None, "by_severity": None, "error": reason}
+                    for tool in TOOLS
+                },
+                "fleet_security": _fleet_record("inaccessible_evidence", reason=reason),
+            }
+            continue
         tools_payload: dict[str, dict[str, Any]] = {}
         repo_ok = True
         for tool in TOOLS:
-            status, alerts, err = _fetch_tool_alerts(gh, repo, tool, timeout=checked_timeout)
+            status, alerts, err = _fetch_tool_alerts(gh, active, tool, timeout=checked_timeout)
             if status == "ok" and alerts is not None:
                 tools_payload[tool] = _summarize_alerts(tool, alerts)
             elif status == "not_enabled":
@@ -1409,10 +1428,12 @@ def scan_fleet_alerts(
                     "error": err or "github_error",
                 }
         repositories[key] = {
-            "github": repo.github,
+            "github": active.active_github,
             "source_ok": repo_ok,
             "tools": tools_payload,
-            "fleet_security": read_fleet_security(gh, repo, timeout=checked_timeout, repos=catalog),
+            "fleet_security": read_fleet_security(
+                gh, repo, timeout=checked_timeout, repos=catalog, registry_path=registry_path,
+            ),
         }
 
     return {
@@ -1774,7 +1795,7 @@ def _render_fleet_section(fleet: Mapping[str, Any], *, fleet_workflow: str | Non
 
 def _render_brief_markdown(
     *,
-    repo: FleetRepo,
+    active: ActiveFleetRepo,
     generated_at: str,
     worker: WorkerSelection,
     alerts_payload: Mapping[str, Any],
@@ -1793,7 +1814,7 @@ def _render_brief_markdown(
         f"route `{worker.route}`, effort `{worker.effort}`)"
     )
     lines: list[str] = [
-        f"# Security Alert Fix Brief — `{repo.key}` (`{repo.github}`)",
+        f"# Security Alert Fix Brief — `{active.repo.key}` (`{active.active_github}`)",
         "",
         f"Generated: `{generated_at}`",
         routing_line,
@@ -1994,6 +2015,7 @@ def build_fix_brief(
             "(pass --include-opted-out to override)",
             exit_code=2,
         )
+    active = resolve_active_fleet_repo(resolved_key, repos=repo_catalog, registry_path=registry_path)
 
     safe_prompt_file = _validate_prompt_file_arg(prompt_file)
     worker = select_security_worker(catalog=catalog, health=health, role=role)
@@ -2010,7 +2032,7 @@ def build_fix_brief(
     errors: list[str] = []
 
     for tool in TOOLS:
-        status, raw_alerts, err = _fetch_tool_alerts(gh, repo, tool, timeout=checked_timeout)
+        status, raw_alerts, err = _fetch_tool_alerts(gh, active, tool, timeout=checked_timeout)
         if status == "error":
             errors.append(f"{tool}={err or 'github_error'}")
             continue
@@ -2044,7 +2066,7 @@ def build_fix_brief(
             f"refusing to generate fix brief for {resolved_key!r}: alert API error ({', '.join(errors)})"
         )
 
-    fleet_security = read_fleet_security(gh, repo, timeout=checked_timeout, repos=repo_catalog)
+    fleet_security = read_fleet_security(gh, repo, timeout=checked_timeout, repos=repo_catalog, registry_path=registry_path)
     if fleet_security.get("state") == "findings":
         for item in fleet_security.get("findings", ()):
             path = item.get("path") if isinstance(item, Mapping) else None
@@ -2061,18 +2083,18 @@ def build_fix_brief(
     )
     dispatch_command = shlex.join(dispatch_argv)
     brief_markdown = _render_brief_markdown(
-        repo=repo,
+        active=active,
         generated_at=generated_at,
         worker=worker,
         alerts_payload=alerts_payload,
         fleet_security=fleet_security,
-        fleet_workflow=_fleet_security_workflow(repo_catalog),
+        fleet_workflow=_fleet_security_workflow(repo_catalog, registry_path=registry_path),
         owned_paths=owned_paths,
         dispatch_command=dispatch_command,
     )
     return BriefResult(
         repo_key=resolved_key,
-        github=repo.github,
+        github=active.active_github,
         generated_at=generated_at,
         worker=worker,
         alerts=alerts_payload,

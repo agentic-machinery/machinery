@@ -57,7 +57,7 @@ except ImportError:
     from ..path_safety import _clean_parts  # scripts.api package import (production)
 
 from lu_machinery.orchestration import issue_stream_audit as isa
-from lu_machinery.orchestration.fleet_repos import FleetRepoError, load_fleet_repos
+from lu_machinery.orchestration.fleet_repos import FleetRepoError, resolve_active_fleet_repo
 
 from . import config, subscriptions
 from . import delegate_router as delegate_api
@@ -1851,8 +1851,8 @@ def _machinery_page_response(page: Path, current_file: str) -> HTMLResponse:
     if _VERSION_PLACEHOLDER in text or _MACHINERY_REPOSITORY_PLACEHOLDER in text:
         version = html.escape(_machinery_version() or "", quote=True)
         try:
-            repository = load_fleet_repos()["machinery"].github
-        except (FleetRepoError, KeyError):
+            repository = resolve_active_fleet_repo("machinery").active_github
+        except FleetRepoError:
             repository = ""
         text = text.replace(_VERSION_PLACEHOLDER, version)
         text = text.replace(_MACHINERY_REPOSITORY_PLACEHOLDER, html.escape(repository, quote=True))

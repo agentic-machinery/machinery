@@ -77,17 +77,17 @@ class RecordRepositoryRefusal(ValueError):
 
 
 def record_repository(record: Mapping[str, object], repos: Mapping[str, FleetRepo]) -> str:
-    """Resolve the recorded slug or dispatch key. Populated fields must agree."""
+    """Bind either baked slug or the dispatch key to one stable repository identity."""
     selected: set[str] = set()
     for field in ("repository", "repository_id", "repo"):
         value = record.get(field)
         if value is None:
             continue
-        if isinstance(value, str):
+        if isinstance(value, str) and value.isascii():
             spelling = value.casefold()
             matches = {
                 repo.github for key, repo in repos.items()
-                if spelling == (key if field == "repo" else repo.github).casefold()
+                if any(spelling == name.casefold() for name in ((key,) if field == "repo" else repo.slugs))
             }
             if len(matches) == 1:
                 selected.update(matches)

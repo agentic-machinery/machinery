@@ -12,8 +12,14 @@ from typing import Any
 import pytest
 import yaml
 
+from lu_machinery.common import git_credentials
 from lu_machinery.common.github_client import Result
-from lu_machinery.orchestration.fleet_repos import FleetRepo, FleetRepoError, load_fleet_repos
+from lu_machinery.orchestration.fleet_repos import (
+    FleetRepo,
+    FleetRepoError,
+    load_fleet_repos,
+    resolve_active_fleet_repo,
+)
 from lu_machinery.review.model_catalog import CATALOG_PATH
 from lu_machinery.security import alerts as alerts_module
 from lu_machinery.security.alerts import (
@@ -963,7 +969,7 @@ def test_fleet_security_states_stay_distinct(tmp_path: Path) -> None:
     ) == ("repos/org/fixture/actions/runs/5/jobs", "page=2")
 
 
-def test_fixture_registry_addition_needs_no_code_change(tmp_path: Path) -> None:
+def test_fixture_registry_addition_needs_no_code_change(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Defect class: a registry row is scanned only after a code change, and an unreadable private row looks unenrolled."""
     source = Path(alerts_module.__file__).read_text(encoding="utf-8")
     assert "fixture-added-repo" not in source
@@ -990,6 +996,10 @@ def test_fixture_registry_addition_needs_no_code_change(tmp_path: Path) -> None:
     assert added["repositories"]["fixture-added-repo"]["fleet_security"]["state"] == "missing_enrollment"
 
     catalog = load_fleet_repos()
+    selector = {key: repo.github for key, repo in catalog.items() if repo.has_alternate_slug}
+    monkeypatch.setattr(
+        git_credentials, "load_selector", lambda **_kwargs: git_credentials.SelectorState(selector, "d" * 64),
+    )
     watched = {key: repo for key, repo in catalog.items() if repo.security_alerts}
     assert watched
     private = [repo for repo in watched.values() if repo.role.startswith("private")]
@@ -1185,7 +1195,10 @@ def test_single_caller_run_keeps_its_state(finding: bool) -> None:
         ("evil/machinery", False),
     ],
 )
-def test_run_links_bind_either_baked_slug_of_the_scanned_repository(tmp_path: Path, payload_slug: str, accepted: bool):
+@pytest.mark.parametrize("active", ["learn-ukrainian/machinery", "next-owner/machinery"])
+def test_run_links_bind_either_baked_slug_of_the_scanned_repository(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, payload_slug: str, accepted: bool, active: str,
+):
     """Defect class: alert pagination, runs, and annotations use the bundled registry instead of the
     selected FleetRepo row, rejecting the selected row's alternate slug or accepting an unrelated
     bundled alternate slug."""
@@ -1200,13 +1213,17 @@ def test_run_links_bind_either_baked_slug_of_the_scanned_repository(tmp_path: Pa
             }
         },
     )
+    monkeypatch.setattr(
+        git_credentials, "load_selector",
+        lambda **_kwargs: git_credentials.SelectorState({"machinery": active}, "d" * 64),
+    )
     run_url = f"https://github.com/{payload_slug}/actions/runs/9"
     workflow_text = (
         "name: security\n"
         "on: [push]\n"
         "jobs:\n"
         "  fleet-security:\n"
-        f'    "uses": learn-ukrainian/machinery/.github/workflows/fleet-security.yml@{_PIN}\n'
+        f'    "uses": {active}/.github/workflows/fleet-security.yml@{_PIN}\n'
     )
 
     def _job_row(job_id: int, job_name: str, check_id: int) -> dict[str, Any]:
@@ -1219,7 +1236,7 @@ def test_run_links_bind_either_baked_slug_of_the_scanned_repository(tmp_path: Pa
 
     def respond(endpoint: str) -> Result:
         path, _, query = endpoint.partition("?")
-        if path == "repos/learn-ukrainian/machinery/code-scanning/alerts" and "page=2" not in query:
+        if path == f"repos/{active}/code-scanning/alerts" and "page=2" not in query:
             return Result(
                 status=200,
                 headers={"Link": f'<https://api.github.com/repos/{payload_slug}/code-scanning/alerts?state=open&per_page=100&page=2>; rel="next"'},
@@ -1227,9 +1244,9 @@ def test_run_links_bind_either_baked_slug_of_the_scanned_repository(tmp_path: Pa
             )
         if path == f"repos/{payload_slug}/code-scanning/alerts" and "page=2" in query:
             return Result(status=200, value=[{"number": 2, "rule": {"security_severity_level": "medium"}}])
-        if path == "repos/learn-ukrainian/machinery/dependabot/alerts":
+        if path == f"repos/{active}/dependabot/alerts":
             return Result(status=200, value=[])
-        if path == "repos/learn-ukrainian/machinery/secret-scanning/alerts" and "page=2" not in query:
+        if path == f"repos/{active}/secret-scanning/alerts" and "page=2" not in query:
             return Result(
                 status=200,
                 headers={"Link": f'<https://api.github.com/repos/{payload_slug}/secret-scanning/alerts?state=open&per_page=100&hide_secret=true&page=2>; rel="next"'},
@@ -1237,13 +1254,13 @@ def test_run_links_bind_either_baked_slug_of_the_scanned_repository(tmp_path: Pa
             )
         if path == f"repos/{payload_slug}/secret-scanning/alerts" and "page=2" in query:
             return Result(status=200, value=[])
-        if path == "repos/learn-ukrainian/machinery":
+        if path == f"repos/{active}":
             return Result(status=200, value={"id": 1445647449, "default_branch": "main"})
-        if path == "repos/learn-ukrainian/machinery/contents/.github/workflows":
+        if path == f"repos/{active}/contents/.github/workflows":
             return Result(status=200, value=[{"name": "security.yml", "path": ".github/workflows/security.yml", "type": "file"}])
-        if path == "repos/learn-ukrainian/machinery/contents/.github/workflows/security.yml":
+        if path == f"repos/{active}/contents/.github/workflows/security.yml":
             return Result(status=200, value=_workflow_file(workflow_text))
-        if path == "repos/learn-ukrainian/machinery/actions/workflows/security.yml/runs":
+        if path == f"repos/{active}/actions/workflows/security.yml/runs":
             return Result(
                 status=200,
                 value={
@@ -1258,7 +1275,7 @@ def test_run_links_bind_either_baked_slug_of_the_scanned_repository(tmp_path: Pa
                     ],
                 },
             )
-        if path == "repos/learn-ukrainian/machinery/actions/runs/9/jobs" and "page=2" not in query:
+        if path == f"repos/{active}/actions/runs/9/jobs" and "page=2" not in query:
             return Result(
                 status=200,
                 headers={"Link": f'<https://api.github.com/repos/{payload_slug}/actions/runs/9/jobs?per_page=100&page=2>; rel="next"'},
@@ -1269,7 +1286,7 @@ def test_run_links_bind_either_baked_slug_of_the_scanned_repository(tmp_path: Pa
                 status=200,
                 value={"total_count": 2, "jobs": [_job_row(9, "fleet-security / Fleet security gate", 6)]},
             )
-        if path == "repos/learn-ukrainian/machinery/check-runs/5/annotations" and "page=2" not in query:
+        if path == f"repos/{active}/check-runs/5/annotations" and "page=2" not in query:
             return Result(
                 status=200,
                 headers={"Link": f'<https://api.github.com/repos/{payload_slug}/check-runs/5/annotations?per_page=100&page=2>; rel="next"'},
@@ -1277,12 +1294,13 @@ def test_run_links_bind_either_baked_slug_of_the_scanned_repository(tmp_path: Pa
             )
         if path == f"repos/{payload_slug}/check-runs/5/annotations" and "page=2" in query:
             return Result(status=200, value=[])
-        if path == "repos/learn-ukrainian/machinery/check-runs/6/annotations":
+        if path == f"repos/{active}/check-runs/6/annotations":
             return Result(status=200, value=[])
         raise AssertionError(endpoint)
 
     report = scan_fleet_alerts(registry_path=registry, client=_FakeGitHubClient(respond), clock=lambda: 1700000000.0)
     entry = report["repositories"]["machinery"]
+    assert entry["github"] == active
     selected_slugs = ("learn-ukrainian/machinery", "next-owner/machinery")
     if accepted:
         assert entry["source_ok"] is True
@@ -1298,7 +1316,7 @@ def test_run_links_bind_either_baked_slug_of_the_scanned_repository(tmp_path: Pa
                 value=[],
             )
         )
-        selected_repo = load_fleet_repos(registry)["machinery"]
+        selected_repo = resolve_active_fleet_repo("machinery", registry_path=registry)
         assert alerts_module._fetch_tool_alerts(unredacted, selected_repo, "secret_scanning", timeout=1.0) == (
             "error", None, "github_invalid_next_link"
         )
@@ -1324,6 +1342,7 @@ def test_run_links_bind_either_baked_slug_of_the_scanned_repository(tmp_path: Pa
         )
         assert brief.alerts["code_scanning"]["total"] == 2
         assert brief.fleet_security["state"] == "zero_findings"
+        assert brief.github == active
     else:
         assert entry["source_ok"] is False
         assert entry["tools"]["code_scanning"]["error"] == "github_invalid_next_link"
