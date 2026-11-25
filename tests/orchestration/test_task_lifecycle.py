@@ -3663,3 +3663,35 @@ def test_write_lifecycle_and_lock_refuse_direct_task_store_and_load_reads_existi
     legacy = store / "legacy.closeout.json"
     legacy.write_text(allowed.read_text(encoding="utf-8"), encoding="utf-8")
     assert task_lifecycle.load_lifecycle(legacy)["lifecycle_id"] == ledger["lifecycle_id"]
+
+    # F1 regression: derived lock path symlinked into the flat task store and derived
+    # predecessor archive directory symlinked to the flat store/archive are both refused.
+    safe_dir = tmp_path / "safe-ledger"
+    safe_dir.mkdir()
+    safe_ledger = safe_dir / "issue-42.json"
+    (safe_dir / "issue-42.json.lock").symlink_to(store / "planted.lock")
+    with (
+        pytest.raises(task_lifecycle.LifecycleError, match="task_store_direct_write_refused"),
+        task_lifecycle.lifecycle_lock(safe_ledger),
+    ):
+        pass
+    assert not (store / "planted.lock").exists()
+
+    (safe_dir / "predecessors").symlink_to(store / "archive")
+    pred_path, pred_sha = task_lifecycle.predecessor_archive_path(safe_ledger, b'{"old": 1}\n')
+    with pytest.raises(task_lifecycle.LifecycleError, match="task_store_direct_write_refused"):
+        task_lifecycle.archive_predecessor(b'{"old": 1}\n', pred_path, pred_sha)
+    assert not any((store / "archive").glob("*.json"))
+
+    # F3 regression: task_closeout validates the un-resolved --state-file before resolving
+    # symlinks on mutating commands, while read-only `carrier` still reads a pre-existing file.
+    external_target = tmp_path / "external-ledger.json"
+    dangling_in_store = store / "dangling-link.json"
+    dangling_in_store.symlink_to(external_target)
+    rc_mut = task_closeout.main(["bind-pr", "--state-file", str(dangling_in_store), "--pr", "77", "--now", NOW])
+    assert rc_mut == 2
+    assert not external_target.exists()
+    assert not (tmp_path / "external-ledger.json.lock").exists()
+
+    rc_carrier = task_closeout.main(["carrier", "--state-file", str(legacy)])
+    assert rc_carrier == 0
