@@ -704,4 +704,76 @@ def test_pr_successor_refused_when_parent_or_successor_record_missing(tmp_path, 
     assert ("result" in missing_parent, missing_parent["result_unavailable"]) == (False, "parent_record_unavailable")
 
 
+def test_review_reply_slug_readers_reject_kelvin_sign_lookalikes(tmp_path, monkeypatch):
+    """Defect class: non-ASCII Kelvin-sign (U+212A) look-alike slugs fold into real repository IDs."""
+    real_slug = "learn-ukrainian/machinery"
+    kelvin_slug = "learn-u\u212arainian/machinery"
+
+    # _record_repo_id rejects non-ASCII repository_id or repository before casefold.
+    assert worker._record_repo_id({"repository_id": kelvin_slug, "repository": real_slug}) is None
+    assert worker._record_repo_id({"repository_id": real_slug, "repository": kelvin_slug}) is None
+    assert worker._record_repo_id({"repository_id": kelvin_slug}) is None
+    assert worker._record_repo_id({"repository_id": real_slug, "repository": "Learn-Ukrainian/Machinery"}) == real_slug
+
+    # _review_pr_ownership_refusal rejects non-ASCII repo_id and non-ASCII PR digits in handoff keys.
+    _review_with_pr_successor(
+        tmp_path,
+        monkeypatch,
+        review_repo=real_slug,
+        handoff_repo=real_slug,
+        successor_repo=kelvin_slug,
+    )
+    assert worker._review_pr_ownership_refusal(
+        {"pr": 1277}, kelvin_slug, "successor", not_owner="caller_not_parent",
+    ) == "caller_not_parent"
+    assert worker._review_pr_ownership_refusal(
+        {"pr": 1277}, "Learn-Ukrainian/Machinery", "successor", not_owner="caller_not_parent",
+    ) is None
+    _write_ownership_state(tmp_path, {
+        f"{real_slug}#1277": {
+            "successor": "successor",
+            "predecessor": None,
+            "accepted_at": "2026-11-23T15:00:00+00:00",
+            "head": "a" * 40,
+            "custody": [],
+            "rerun_allowance": "unspent",
+        },
+        f"{real_slug}#٤٢": {
+            "successor": "successor",
+            "predecessor": None,
+            "accepted_at": "2026-11-23T15:00:00+00:00",
+            "head": "a" * 40,
+            "custody": [],
+            "rerun_allowance": "unspent",
+        },
+    })
+    assert worker._review_pr_ownership_refusal(
+        {"pr": 42}, real_slug, "successor", not_owner="caller_not_parent",
+    ) == "caller_not_parent"
+
+    # End-to-end wait(..., reply=True) refuses a successor whose repository_id uses a Kelvin sign.
+    monkeypatch.setenv(ownership.TASK_ID_ENV, "successor")
+    record, _code = worker.wait("pr-review", "r1", reply=True)
+    assert ("result" in record, record["result_unavailable"]) == (False, "review_not_of_successor_branch")
+
+    # Direct running-parent path also refuses matching non-ASCII repository_id or conflicting repository claims.
+    tasks = tmp_path / "tasks"
+    parent_rec = json.loads((tasks / "parent.json").read_text())
+    review_rec = json.loads((tasks / "pr-review.json").read_text())
+    parent_rec.update(status="running", worktree_path=str(tmp_path / "successor-tree"),
+                      worktree_branch=review_rec["review_branch"], repository_id=kelvin_slug)
+    review_rec.update(repository_id=kelvin_slug)
+    (tasks / "parent.json").write_text(json.dumps(parent_rec))
+    (tasks / "pr-review.json").write_text(json.dumps(review_rec))
+    monkeypatch.setenv(ownership.TASK_ID_ENV, "parent")
+    direct_kelvin, _code = worker.wait("pr-review", "r1", reply=True)
+    assert ("result" in direct_kelvin, direct_kelvin["result_unavailable"]) == (False, "review_not_of_parent_branch")
+    parent_rec.update(repository_id=real_slug, repository="learn-ukrainian/other")
+    review_rec.update(repository_id=real_slug)
+    (tasks / "parent.json").write_text(json.dumps(parent_rec))
+    (tasks / "pr-review.json").write_text(json.dumps(review_rec))
+    direct_conflict, _code = worker.wait("pr-review", "r1", reply=True)
+    assert ("result" in direct_conflict, direct_conflict["result_unavailable"]) == (False, "review_not_of_parent_branch")
+
+
 pytestmark = pytest.mark.usefixtures("configured_roots")

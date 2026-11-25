@@ -829,6 +829,22 @@ def test_github_read_runs_only_named_reads_of_the_own_repository(broker):
     assert len(broker.steps) == 6
 
 
+def test_claimed_repository_rejects_kelvin_sign_lookalike(broker, monkeypatch):
+    """Defect class: non-ASCII Kelvin-sign (U+212A) look-alike repo folds to the launch's repository slug."""
+    broker.launch_repository = ("learn-ukrainian/machinery", False)
+    monkeypatch.setattr(broker, "_repository_slug", lambda: "learn-ukrainian/machinery")
+    kelvin_slug = "learn-u\u212arainian/machinery"
+    assert "this task's repository" in _refused(
+        lambda: broker._github_read({"name": "pull", "number": 7, "repo": kelvin_slug}),
+    )
+    assert "this task's repository" in _refused(
+        lambda: broker._claimed({"repo": "learn-ukrainian/machinery"}, kelvin_slug),
+    )
+    assert broker.steps == []
+    assert broker._github_read({"name": "pull", "number": 7, "repo": "Learn-Ukrainian/Machinery"})["returncode"] == 0
+    assert len(broker.steps) == 1
+
+
 def test_private_repository_refuses_cross_repository_publication(broker, primary, monkeypatch):
     """Defect class: a named read reaches another repository or an unregistered origin."""
     from lu_machinery.dispatcher import agy_sandbox

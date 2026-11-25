@@ -878,7 +878,8 @@ def _holds(paths: list[str], path: str) -> bool:
 
 def _public_origin(repository: Path) -> str:
     """The primary origin's GitHub slug, refused unless it names a registered repository with a public role."""
-    match = _GITHUB_REMOTE.fullmatch(_git(repository, "remote", "get-url", "origin").strip())
+    origin = _git(repository, "remote", "get-url", "origin")
+    match = _GITHUB_REMOTE.fullmatch(origin.strip()) if origin.isascii() else None
     if not (match and agy_sandbox.public_repository(match.group(1))):
         raise Refused("savant_snapshot_refused: origin is not a registered public repository")
     return match.group(1)
@@ -1213,7 +1214,7 @@ class _Broker:
             url = _git(self.boundary.repository, "config", "--get", "remote.origin.url", git_dir=self.boundary.common)
         except Refused:
             return _BrokerRefusal("the primary's origin is not a github.com repository")
-        if not (match := _GITHUB_REMOTE.fullmatch(url.strip())):
+        if not url.isascii() or not (match := _GITHUB_REMOTE.fullmatch(url.strip())):
             return _BrokerRefusal("the primary's origin is not a github.com repository")
         slug = match.group(1)
         if agy_sandbox.public_repository(slug):
@@ -1296,8 +1297,10 @@ class _Broker:
 
     def _claimed(self, payload: dict, slug: str) -> None:
         """Refuse a named repository other than the launch's own."""
+        if not isinstance(slug, str) or not slug or not slug.isascii():
+            raise _BrokerRefusal("repo is not this task's repository")
         repo = payload.get("repo")
-        if repo is not None and not (isinstance(repo, str) and repo.lower() == slug.lower()):
+        if repo is not None and not (isinstance(repo, str) and repo.isascii() and repo.lower() == slug.lower()):
             raise _BrokerRefusal("repo is not this task's repository")
     # -- host steps ----------------------------------------------------------------------------------------------
 

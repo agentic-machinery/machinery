@@ -1101,7 +1101,7 @@ def snapshot_delivery(spec: TaskSpec, record: dict) -> dict:
     return delivery
 
 
-_REMOTE_SLUG = re.compile(r"(?:https://[^/]+/|git@[^:]+:|ssh://[^/]+/)([\w.-]+/[\w.-]+?)(?:\.git)?/?")
+_REMOTE_SLUG = re.compile(r"(?:https://[^/]+/|git@[^:]+:|ssh://[^/]+/)([\w.-]+/[\w.-]+?)(?:\.git)?/?", re.ASCII)
 
 
 class GitHubRefused(ValueError):
@@ -1149,6 +1149,8 @@ def _repo_and_base(record: dict) -> tuple[str | None, str]:
 
 def _accepted_prs(task_id: str, repo: str) -> list[int]:
     """Numbers of ``repo`` pull requests this task accepted through ``pr_ownership``, current or since cleared."""
+    if not isinstance(repo, str) or not repo or not repo.isascii():
+        return []
     from lu_machinery.orchestration import pr_ownership
 
     data = pr_ownership.load(pr_ownership.state_path())
@@ -1162,11 +1164,23 @@ def _accepted_prs(task_id: str, repo: str) -> list[int]:
         if entry.get("event") == "accepted" and entry.get("successor") == task_id
         and not pr_ownership.decision_custody(entry)
     ]
-    return sorted({int(key.rpartition("#")[2]) for key in keys if key.rpartition("#")[0] == repo.casefold()})
+    target = repo.casefold()
+    accepted: set[int] = set()
+    for key in keys:
+        if not isinstance(key, str) or not key.isascii():
+            continue
+        key_repo, sep, key_num = key.rpartition("#")
+        if sep == "#" and key_repo == target and key_num.isdigit():
+            number = int(key_num)
+            if number > 0:
+                accepted.add(number)
+    return sorted(accepted)
 
 
 def _same_repo_pr(pr: dict, repo: str) -> bool:
     """Whether a REST pull-request object has both head and base strictly in ``repo``."""
+    if not isinstance(repo, str) or not repo or not repo.isascii():
+        return False
     head = pr.get("head")
     base = pr.get("base")
     head_repo = head.get("repo") if isinstance(head, dict) else None
@@ -1174,11 +1188,14 @@ def _same_repo_pr(pr: dict, repo: str) -> bool:
     head_name = head_repo.get("full_name") if isinstance(head_repo, dict) else None
     base_name = base_repo.get("full_name") if isinstance(base_repo, dict) else None
     return (isinstance(head_name, str) and isinstance(base_name, str)
+            and head_name.isascii() and base_name.isascii()
             and head_name.casefold() == base_name.casefold() == repo.casefold())
 
 
 def _branch_pulls(repo: str, branch: str) -> list[dict]:
     """Pull requests for ``repo``'s exact ``branch`` via one conditional REST query."""
+    if not isinstance(repo, str) or not repo.isascii():
+        raise ValueError("branch pull-request lookup requires owner/repo and branch")
     owner, sep, name = repo.partition("/")
     if not sep or not owner or not name or "/" in name or not isinstance(branch, str) or not branch:
         raise ValueError("branch pull-request lookup requires owner/repo and branch")

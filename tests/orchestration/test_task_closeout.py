@@ -2692,3 +2692,37 @@ def test_a02_dor_and_closeout_resolve_moved_repo_both_selector_states_and_same_i
     finally:
         sel_dir.chmod(0o700)
         sel_file.chmod(0o600)
+
+
+def test_check_issue_task_quality_rejects_kelvin_sign_slug_folding(monkeypatch):
+    """Defect class: non-ASCII Kelvin-sign (U+212A) look-alike slugs fold into active fleet slugs."""
+    real_slug = "learn-ukrainian/machinery"
+    kelvin_slug = "learn-u\u212arainian/machinery"
+    repo = fleet_repos.FleetRepo(
+        key="machinery", local_name="machinery", github=real_slug, role="public-tooling", default=False,
+    )
+    kelvin_active = fleet_repos.ActiveFleetRepo(repo=repo, active_github=kelvin_slug)
+
+    # _resolve_active_repository and registry_for reject non-ASCII input and non-ASCII active_github before folding.
+    monkeypatch.setattr(fleet_repos, "load_fleet_repos", lambda: {"machinery": repo})
+    monkeypatch.setattr(fleet_repos, "resolve_active_fleet_repo", lambda *_a, **_k: kelvin_active)
+    assert check_issue_task_quality._resolve_active_repository(kelvin_slug) is None
+    assert check_issue_task_quality._resolve_active_repository(real_slug) is None
+    assert check_issue_task_quality.registry_for(kelvin_slug) is None
+    assert check_issue_task_quality.registry_for(real_slug) is None
+
+    # _claim matches complete ASCII digit tokens only, rejecting Arabic-Indic and mixed-digit tokens.
+    assert check_issue_task_quality._claim({"title": "[٤٢]", "body": "Parent: #٤٢"}, real_slug, [42], {}, {}) is None
+    assert check_issue_task_quality._claim({"title": "[4٢]", "body": "Parent: #4٢"}, real_slug, [4, 42], {}, {}) is None
+    assert check_issue_task_quality._claim({"title": "", "body": "Parent: #42"}, real_slug, [42], {}, {}) == 42
+
+    # CLI rejects a Kelvin-sign or non-ASCII whitespace (U+00A0) --repo before trimming or calling fetch_issue.
+    monkeypatch.setattr(
+        check_issue_task_quality,
+        "fetch_issue",
+        lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("fetch_issue must not run for non-ASCII repo")),
+    )
+    assert check_issue_task_quality.main(["--issue", "42", "--repo", kelvin_slug, "--strict", "--json"]) == 1
+    assert check_issue_task_quality.main(["--issue", "42", "--repo", f"{real_slug}\u00a0", "--strict", "--json"]) == 1
+    # Even with an ASCII --repo, a non-ASCII active_github from the resolver is refused before fetch_issue.
+    assert check_issue_task_quality.main(["--issue", "42", "--repo", real_slug, "--strict", "--json"]) == 1
