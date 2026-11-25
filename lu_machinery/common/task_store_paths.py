@@ -9,7 +9,7 @@ from collections import OrderedDict
 from pathlib import Path
 from typing import Any
 
-from lu_machinery.common.repo_root import state_root
+from lu_machinery.common.repo_root import MachineryConfigError, state_root
 
 # Keep one version per path, including foreign-file classifications. Entry and
 # content caps bound retention; an evicted version is an ordinary cache miss.
@@ -123,3 +123,55 @@ def tasks_dir() -> Path:
     if override:
         return Path(override)
     return state_root() / "batch_state" / "tasks"
+
+
+def _is_flat_task_store_dir(directory: Path, forbidden_dirs: set[Path]) -> bool:
+    if directory in forbidden_dirs:
+        return True
+    parts = directory.parts
+    return parts[-2:] == ("batch_state", "tasks") or parts[-3:] == ("batch_state", "tasks", "archive")
+
+
+def is_direct_task_store_path(path: Path, *, store_dir: Path | None = None) -> bool:
+    """Whether ``path`` targets the flat task-record store or its archive directly.
+
+    Every task-store reader scans ``tasks_dir/*.json`` and ``tasks_dir/archive/*.json``
+    as dispatch task records. Non-record tool files belong in a subdirectory such as
+    ``<task-id>.artifacts/`` rather than directly inside those two directories.
+
+    Resolves both the path's parent directory and the target path itself via
+    ``os.path.realpath`` so symlinked directories into the task store, symlink
+    files pointing into or out of the task store, and ``..`` traversals are all caught.
+    """
+    configured: Path | None
+    if store_dir is not None:
+        configured = store_dir
+    else:
+        try:
+            configured = tasks_dir()
+        except (MachineryConfigError, OSError):
+            configured = None
+    forbidden_dirs: set[Path] = set()
+    if configured is not None:
+        root = Path(os.path.realpath(configured))
+        forbidden_dirs.add(root)
+        forbidden_dirs.add(root / "archive")
+        forbidden_dirs.add(Path(os.path.realpath(configured / "archive")))
+    resolved_parent = Path(os.path.realpath(path.parent))
+    resolved_target = Path(os.path.realpath(path))
+    return (
+        _is_flat_task_store_dir(resolved_parent, forbidden_dirs)
+        or _is_flat_task_store_dir(resolved_target.parent, forbidden_dirs)
+        or _is_flat_task_store_dir(resolved_target, forbidden_dirs)
+    )
+
+
+def require_not_direct_task_store_path(
+    path: Path, *, label: str = "non-record file", store_dir: Path | None = None,
+) -> None:
+    """Refuse writing a non-record file directly inside the task store or its archive."""
+    if is_direct_task_store_path(path, store_dir=store_dir):
+        raise ValueError(
+            f"task_store_direct_write_refused: refusing to write {label} directly in the task store "
+            f"({path}); write it under <task>.artifacts/ instead"
+        )

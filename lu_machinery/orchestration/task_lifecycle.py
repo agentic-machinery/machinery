@@ -34,6 +34,7 @@ from lu_machinery.common.repo_root import (
     machinery_path,
     state_root_for_checkout,
 )
+from lu_machinery.common.task_store_paths import require_not_direct_task_store_path
 from lu_machinery.github_check_rollup import group_collapsed_by_name
 from lu_machinery.orchestration import fleet_repos, issue_stream_audit, task_identity
 from lu_machinery.review.review_contract import finding_supports_approval, unverified_follow_up_notes
@@ -1315,7 +1316,15 @@ def load_lifecycle(path: Path) -> dict[str, Any]:
     return validate_lifecycle(payload)
 
 
+def _require_not_direct_task_store(path: Path) -> None:
+    try:
+        require_not_direct_task_store_path(path, label="lifecycle ledger")
+    except ValueError as exc:
+        raise LifecycleError(str(exc)) from None
+
+
 def write_lifecycle(path: Path, payload: Mapping[str, Any]) -> None:
+    _require_not_direct_task_store(path)
     ledger = validate_lifecycle(payload)
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + f".tmp.{os.getpid()}")
@@ -1326,6 +1335,7 @@ def write_lifecycle(path: Path, payload: Mapping[str, Any]) -> None:
 @contextmanager
 def lifecycle_lock(path: Path, *, blocking: bool = True) -> Iterator[None]:
     """Hold the ledger's exclusive lock; non-blocking callers refuse a held lock."""
+    _require_not_direct_task_store(path)
     lock_path = path.with_suffix(path.suffix + ".lock")
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     with lock_path.open("a+", encoding="utf-8") as handle:
