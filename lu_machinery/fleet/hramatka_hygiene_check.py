@@ -36,6 +36,7 @@ import json
 import re
 import shutil
 import subprocess
+import unicodedata
 from collections.abc import Callable
 from enum import StrEnum
 from pathlib import Path
@@ -141,25 +142,52 @@ def _gh_issue(
     return data
 
 
-# The pointer is a whole token, bounded by allowlists: it starts at the text's start, whitespace or ASCII
-# punctuation other than ``#-./@_`` (so never inside another owner, path or word), and ends at the text's
-# end, whitespace or ASCII punctuation other than ``_`` (so never inside another number or word, of any script).
-_POINTER_START = r"(?<![^\s!\"$%&'()*+,:;<=>?\[\\\]^`{|}~])"
-_POINTER_END = r"(?![^\s!-/:-@\[-^`{-~])"
+def _bounds_word(ch: str, quotes: str, categories: tuple[str, str]) -> bool:
+    """Whether ``ch`` ends a run of text: whitespace, or a bracket or quote of any script."""
+    return ch.isspace() or ch in quotes or unicodedata.category(ch) in categories
 
 
-def _pointer_pattern(private_repos: tuple[str, ...], private_board: int) -> re.Pattern[str]:
-    """The board pointer at any of ``private_repos`` (the live spellings of the board's repository).
+def _continues_word(ch: str) -> bool:
+    """Whether ``ch`` joins the text next to it into one word: a letter, digit or mark of any script."""
+    return unicodedata.category(ch)[0] in "LNM"
 
-    Two forms, each a whole token: ``owner/board#349`` and the issue URL ``https://github.com/owner/board/issues/349``.
-    ``owner/board`` never matches inside ``new-owner/board`` or another URL's path, nor ``#349`` inside ``#3490``
-    or ``#349é``.
+
+def _has_pointer(body: str, private_repos: tuple[str, ...], private_board: int) -> bool:
+    """Whether ``body`` points at the board at any of ``private_repos`` (the live spellings of its repository).
+
+    Two forms, each a whole reference. Both start a word: the character before is no letter, digit or mark of
+    any script, nor ``-`` or ``.``, and the text back to the last space, bracket or quote holds no ``/`` (so never
+    inside ``new-owner/board`` or another URL).
+
+    - ``owner/board#349`` ends at the number: the character after is no letter, digit, mark or ``_``, so never
+      ``#3490`` or ``#349é``, while ``#349…`` and ``#349—next`` still count.
+    - ``https://github.com/owner/board/issues/349`` (also ``http``, ``www.`` and any host case) is a URL, which
+      runs to the next space, bracket or quote. After the number it may hold one ``/``, then a query or fragment,
+      or only punctuation and symbols other than ``/`` and ``-``. So never ``.../issues/349/roadmap`` or ``.json``.
     """
-    forms = [form for repo in private_repos for form in (
-        re.escape(f"{repo}#{private_board}"),
-        r"https?://(?:www\.)?github\.com/" + re.escape(f"{repo}/issues/{private_board}"),
-    )]
-    return re.compile(_POINTER_START + "(?:" + "|".join(forms) + ")" + _POINTER_END)
+    for repo in private_repos:
+        short = re.escape(f"{repo}#{private_board}")
+        url = r"(?i:https?://(?:www\.)?github\.com/)" + re.escape(f"{repo}/issues/{private_board}")
+        for form, is_url in ((short, False), (url, True)):
+            for match in re.finditer(form, body):
+                start, end = match.span()
+                head_start = start
+                while head_start and not _bounds_word(body[head_start - 1], "\"'<", ("Ps", "Pi")):
+                    head_start -= 1
+                joined = start > 0 and (_continues_word(body[start - 1]) or body[start - 1] in "-.")
+                if joined or "/" in body[head_start:start]:
+                    continue
+                if not is_url:
+                    if end == len(body) or not (_continues_word(body[end]) or body[end] == "_"):
+                        return True
+                    continue
+                tail_end = end
+                while tail_end < len(body) and not _bounds_word(body[tail_end], "\"'>", ("Pe", "Pf")):
+                    tail_end += 1
+                tail = body[end:tail_end].removeprefix("/")
+                if tail[:1] in ("?", "#") or all(unicodedata.category(ch)[0] in "PS" and ch not in "/-" for ch in tail):
+                    return True
+    return False
 
 
 def _count_task_list_items(body: str) -> tuple[int, int]:
@@ -462,7 +490,7 @@ def hygiene_check(
     if not epic_charter_ok:
         reasons.append(f"public epic #{public_epic} still has {unchecked} live (unchecked) checkbox item(s)")
 
-    queue_pointer_ok = bool(_pointer_pattern(pointer_repos, private_board).search(body))
+    queue_pointer_ok = _has_pointer(body, pointer_repos, private_board)
     if not queue_pointer_ok:
         reasons.append(f"public epic #{public_epic} is missing the {private_repo}#{private_board} pointer")
 

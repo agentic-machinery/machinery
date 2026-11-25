@@ -252,7 +252,8 @@ def test_stale_when_349_pointer_missing(hermetic_repo) -> None:
     for near_miss in (f"other-{PRIVATE}#{BOARD}", f"é{PRIVATE}#{BOARD}", f"https://github.com/x{PRIVATE}/issues/{BOARD}",
                       f"https://github.com/o/r/blob/main/{PRIVATE}/issues/{BOARD}", f"{PRIVATE}/issues/{BOARD}",
                       f"{PRIVATE}#{BOARD}0", f"https://github.com/{PRIVATE}/issues/{BOARD}1", f"{PRIVATE}#{BOARD}a",
-                      f"{PRIVATE}#{BOARD}é"):
+                      f"{PRIVATE}#{BOARD}é", f"https://github.com/{PRIVATE}/issues/{BOARD}/roadmap",
+                      f"https://github.com/{PRIVATE}/issues/{BOARD}.json", f"https://e.example/?u={PRIVATE}#{BOARD}"):
         reader = _reader({(PUBLIC, EPIC): {"number": EPIC, "body": f"Queue: {near_miss} here."},
                           (PRIVATE, BOARD): {"number": BOARD, "body": ""}})
         assert hygiene.hygiene_check(reader=reader, **_base_kwargs(repo_root, tasks_dir))["queue_pointer_ok"] is False
@@ -266,6 +267,11 @@ def test_pointer_short_form_is_also_accepted(hermetic_repo) -> None:
     receipt = hygiene.hygiene_check(reader=reader, **_base_kwargs(repo_root, tasks_dir))
 
     assert receipt["queue_pointer_ok"] is True
+    # Defect class: prose punctuation of any script next to a genuine pointer read as part of a longer token.
+    for body in (f"Queue {PRIVATE}#{BOARD}…", f"Queue:{PRIVATE}#{BOARD}—the board", f"«{PRIVATE}#{BOARD}»",
+                 f"**https://github.com/{PRIVATE}/issues/{BOARD}**…"):
+        reader = _reader({(PUBLIC, EPIC): {"number": EPIC, "body": body}, (PRIVATE, BOARD): {"number": BOARD, "body": ""}})
+        assert hygiene.hygiene_check(reader=reader, **_base_kwargs(repo_root, tasks_dir))["queue_pointer_ok"] is True
 
 
 # --- unknown: GitHub unreachable --------------------------------------------
