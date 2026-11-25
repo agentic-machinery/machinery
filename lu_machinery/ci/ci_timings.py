@@ -172,12 +172,10 @@ def extract_pr_number(head_branch: str | None) -> int | None:
         return None
     queue_m = QUEUE_BRANCH_RE.search(head_branch)
     if queue_m:
-        raw = queue_m.group(1)
-        return parse_ascii_positive_int(raw) if len(raw) <= 19 else None
+        return parse_ascii_positive_int(queue_m.group(1))
     pr_m = PR_NUM_RE.search(head_branch)
     if pr_m:
-        raw = pr_m.group(1)
-        return parse_ascii_positive_int(raw) if len(raw) <= 19 else None
+        return parse_ascii_positive_int(pr_m.group(1))
     return None
 
 

@@ -251,23 +251,25 @@ def ascii_repo_slug(value: object, *, strip: bool = True) -> str | None:
     return candidate.casefold()
 
 
-def parse_ascii_positive_int(value: object, *, strip: bool = False) -> int | None:
-    """Parse an ASCII-only positive decimal PR/issue number, or return ``None``.
+_MAX_ASCII_POSITIVE_INT_DIGITS = 19
+_MAX_ASCII_POSITIVE_INT = 10**_MAX_ASCII_POSITIVE_INT_DIGITS - 1
+_ASCII_POSITIVE_INT_RE = re.compile(rf"[1-9][0-9]{{0,{_MAX_ASCII_POSITIVE_INT_DIGITS - 1}}}", re.ASCII)
 
-    Rejects booleans, non-positive integers, signs, leading zeros, and non-ASCII
-    digits or whitespace before calling ``int()``.
+
+def parse_ascii_positive_int(value: object, *, strip: bool = False) -> int | None:
+    """Parse an ASCII-only positive decimal PR/issue number (at most 19 digits), or return ``None``.
+
+    Rejects booleans, non-positive integers, values longer than 19 digits, signs,
+    leading zeros, and non-ASCII digits or whitespace before calling ``int()``.
     """
     if type(value) is int:
-        return value if value > 0 else None
+        return value if 0 < value <= _MAX_ASCII_POSITIVE_INT else None
     if not isinstance(value, str) or not value.isascii():
         return None
     text = value.strip() if strip else value
-    if not re.fullmatch(r"[1-9][0-9]*", text):
+    if len(text) > _MAX_ASCII_POSITIVE_INT_DIGITS or not _ASCII_POSITIVE_INT_RE.fullmatch(text):
         return None
-    try:
-        return int(text)
-    except ValueError:
-        return None
+    return int(text)
 
 
 def canonical_repo_key(key: str, repos: Mapping[str, FleetRepo] | None = None) -> str:

@@ -115,6 +115,8 @@ _PLAIN_AC_RE = re.compile(
 )
 _AC_LIKE_CHECKBOX_RE = re.compile(r"^[-*+]\s*\[[^\]]*\]\s*[*_`]*AC(?=[^A-Za-z]|$)", re.IGNORECASE)
 _SAFE_FAMILY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,99}$")
+_GITHUB_URL_RE = re.compile(r"https://github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/(.+)", re.ASCII)
+_REPOSITORY_IDENTITY_FIELDS = frozenset({"repository", "github_issue_url", "stream_epic_url"})
 
 
 def _match_ac_checkbox_line(line: str) -> re.Match[str] | None:
@@ -176,6 +178,7 @@ def _pr_url(repository: str, number: int) -> str:
 
 
 def lifecycle_id(identity: Mapping[str, Any]) -> str:
+    # This digest addresses stored ledgers. Repository comparisons use the fleet catalog separately.
     canonical = task_identity.validate_identity(identity)
     issue = canonical.get("github_issue_number")
     if issue is None:
@@ -228,6 +231,53 @@ def stream_epic_url_matches(identity: Mapping[str, Any], epic_repository: str) -
     # Slugs are ASCII; casefold would map look-alikes such as U+212A onto them.
     return isinstance(url, str) and url.isascii() and any(
         url.casefold() == stream_epic_url(slug, identity["stream_epic"]).casefold() for slug in slugs
+    )
+
+
+def _same_repository(left: object, right: object) -> bool:
+    left_slug = fleet_repos.ascii_repo_slug(left, strip=False)
+    right_slug = fleet_repos.ascii_repo_slug(right, strip=False)
+    return left_slug is not None and right_slug is not None and fleet_repos.same_repository(left_slug, right_slug)
+
+
+def _github_url_parts(url: object) -> tuple[str, str] | None:
+    match = _GITHUB_URL_RE.fullmatch(url) if isinstance(url, str) and url.isascii() else None
+    return (match[1], match[2]) if match else None
+
+
+def _github_path(url: object, repository: str) -> str | None:
+    parts = _github_url_parts(url)
+    return parts[1] if parts and _same_repository(parts[0], repository) else None
+
+
+def _issue_url_matches(identity: Mapping[str, Any], url: object) -> bool:
+    return _github_path(url, identity["repository"]) == f"issues/{identity['github_issue_number']}"
+
+
+def _epic_repository(identity: Mapping[str, Any]) -> str | None:
+    url = identity["stream_epic_url"]
+    if url is None:
+        return fleet_repos.ascii_repo_slug(identity["repository"], strip=False)
+    # Keep the stream-epic URL's existing ASCII case-insensitive comparison.
+    parts = _github_url_parts(url.lower()) if isinstance(url, str) and url.isascii() else None
+    return parts[0] if parts and parts[1] == f"issues/{identity['stream_epic']}" else None
+
+
+def same_lifecycle_scope(left: Mapping[str, Any], right: Mapping[str, Any]) -> bool:
+    """Compare the issue and governing epic of two validated lifecycle identities."""
+    return (
+        left["github_issue_number"] == right["github_issue_number"]
+        and left["stream_epic"] == right["stream_epic"]
+        and _same_repository(left["repository"], right["repository"])
+        and _same_repository(_epic_repository(left), _epic_repository(right))
+    )
+
+
+def same_task_identity(left: Mapping[str, Any], right: Mapping[str, Any]) -> bool:
+    """Keep the exact thread and task fields while allowing either repository spelling."""
+    return same_lifecycle_scope(left, right) and (
+        {key: value for key, value in left.items() if key not in _REPOSITORY_IDENTITY_FIELDS}
+        == {key: value for key, value in right.items() if key not in _REPOSITORY_IDENTITY_FIELDS}
     )
 
 
@@ -938,9 +988,14 @@ def validate_lifecycle(payload: Mapping[str, Any]) -> dict[str, Any]:
         raise LifecycleError("lifecycle terminal goal does not match task identity")
     if identity.get("github_issue_number") is None or identity.get("stream_epic") is None:
         raise LifecycleError("task lifecycle identity requires issue and stream epic")
+    if not _issue_url_matches(identity, identity["github_issue_url"]):
+        raise LifecycleError("issue URL does not match repository and issue number")
     pr_number = ledger["pr"]["number"]
-    expected_pr_url = _pr_url(identity["repository"], pr_number) if pr_number else None
-    if ledger["pr"]["url"] != expected_pr_url:
+    pr_url = ledger["pr"]["url"]
+    if pr_number is None:
+        if pr_url is not None:
+            raise LifecycleError("PR URL does not match repository and PR number")
+    elif _github_path(pr_url, identity["repository"]) != f"pull/{pr_number}":
         raise LifecycleError("PR URL does not match repository and PR number")
     snapshot = ledger["ac_snapshot"]
     criteria = snapshot["criteria"]
@@ -966,7 +1021,7 @@ def validate_lifecycle(payload: Mapping[str, Any]) -> dict[str, Any]:
         if record["ac_id"] not in criteria_by_id:
             raise LifecycleError(f"evidence targets unknown AC: {record['ac_id']}")
         subject = record["subject"]
-        if subject["repository"] != identity["repository"]:
+        if not _same_repository(subject["repository"], identity["repository"]):
             raise LifecycleError("evidence repository does not match task identity")
         if subject["issue"] != identity["github_issue_number"]:
             raise LifecycleError("evidence issue does not match task identity")
@@ -999,7 +1054,8 @@ def validate_lifecycle(payload: Mapping[str, Any]) -> dict[str, Any]:
             if (
                 target["ac_id"] != record["ac_id"]
                 or target["type"] != record["type"]
-                or any(target["subject"][key] != subject[key] for key in ("repository", "issue", "pr"))
+                or not _same_repository(target["subject"]["repository"], subject["repository"])
+                or any(target["subject"][key] != subject[key] for key in ("issue", "pr"))
             ):
                 raise LifecycleError("superseding evidence must have the same criterion, type, repository, issue, and PR")
             if _utc_timestamp(record["recorded_at"]) <= _utc_timestamp(target["recorded_at"]):
@@ -1347,8 +1403,12 @@ def bind_successor(
     prior = validate_lifecycle(predecessor)
     successor = task_identity.validate_identity(identity)
     previous = prior["identity"]
+    if not _same_repository(successor["repository"], previous["repository"]):
+        raise EvidencePolicyError(
+            "SUCCESSOR_REPOSITORY_MISMATCH",
+            f"successor repository {successor['repository']!r} differs from the predecessor's {previous['repository']!r}",
+        )
     for field, code in (
-        ("repository", "SUCCESSOR_REPOSITORY_MISMATCH"),
         ("github_issue_number", "SUCCESSOR_ISSUE_MISMATCH"),
         ("stream_epic", "SUCCESSOR_STREAM_MISMATCH"),
     ):
@@ -1356,9 +1416,11 @@ def bind_successor(
             raise EvidencePolicyError(
                 code, f"successor {field} {successor.get(field)!r} differs from the predecessor's {previous.get(field)!r}"
             )
-    if lifecycle_id(successor) != prior["lifecycle_id"]:
+    if not _issue_url_matches(successor, successor["github_issue_url"]):
+        raise EvidencePolicyError("SUCCESSOR_ISSUE_MISMATCH", "successor issue URL does not match its issue")
+    if not _same_repository(_epic_repository(successor), _epic_repository(previous)):
         raise EvidencePolicyError("SUCCESSOR_STREAM_MISMATCH", "successor stream epic repository differs")
-    if successor == previous:
+    if same_task_identity(successor, previous):
         raise EvidencePolicyError(
             "SUCCESSOR_IDENTITY_UNCHANGED", "the successor identity equals the predecessor's; use init --reuse"
         )
@@ -1389,13 +1451,16 @@ def bind_successor(
             "a cross-family takeover needs a CTO decision",
         )
     ledger = build_lifecycle(
-        successor,
+        # A successor changes the thread; the issue's durable ledger keeps its original spelling.
+        {**successor, **{key: previous[key] for key in _REPOSITORY_IDENTITY_FIELDS}},
         author_family=prior["author_family"],
         ac_snapshot=prior["ac_snapshot"],
         required_checks=list(prior["required_checks"]),
         now=now,
         pr_number=bound_pr if bound_pr is not None else pr_number,
     )
+    if bound_pr is not None:
+        ledger["pr"] = deepcopy(prior["pr"])
     ledger["remaining_scope"] = deepcopy(prior["remaining_scope"])
     if prior.get("evidence_type_corrections"):
         ledger["evidence_type_corrections"] = deepcopy(prior["evidence_type_corrections"])
@@ -1713,34 +1778,45 @@ def _ledger_projection_material(ledger: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
-def _seat_identity(seats: Any) -> tuple:
+def _review_comment_path(url: object, subject: Mapping[str, Any]) -> str | None:
+    """Bind a review link to the exact PR, keeping its comment fragment verbatim."""
+    path = _github_path(url, subject["repository"])
+    number = subject["pr"]
+    if path is None or number is None:
+        return None
+    pr_path, _, fragment = path.partition("#")
+    return path if fragment and pr_path == f"pull/{number}" else None
+
+
+def _seat_identity(seats: Any, subject: Mapping[str, Any]) -> tuple | None:
     if not isinstance(seats, (list, tuple)):
-        return ()
+        return None
     rows = []
     for seat in seats:
         if not isinstance(seat, Mapping):
-            return ()
-        chunks = tuple(
-            sorted(
-                (
-                    chunk.get("comment_url"),
-                    chunk.get("task"),
-                    chunk.get("model"),
-                    chunk.get("sha"),
-                    tuple(chunk.get("coverage") or ()),
-                    chunk.get("verdict"),
-                )
-                for chunk in seat.get("chunks") or []
-                if isinstance(chunk, Mapping)
-            )
-        )
+            return None
+        chunks = []
+        for chunk in seat.get("chunks") or []:
+            if not isinstance(chunk, Mapping):
+                return None
+            comment_path = _review_comment_path(chunk.get("comment_url"), subject)
+            if comment_path is None:
+                return None
+            chunks.append((
+                comment_path,
+                chunk.get("task"),
+                chunk.get("model"),
+                chunk.get("sha"),
+                tuple(chunk.get("coverage") or ()),
+                chunk.get("verdict"),
+            ))
         rows.append(
             (
                 seat.get("family"),
                 seat.get("harness"),
                 tuple(seat.get("denominator") or ()),
                 tuple(seat.get("coverage") or ()),
-                chunks,
+                tuple(sorted(chunks)),
             )
         )
     return tuple(sorted(rows, key=lambda row: str(row[0])))
@@ -1749,10 +1825,11 @@ def _seat_identity(seats: Any) -> tuple:
 def _ukrainian_behavior_proof_error(
     receipt: Mapping[str, Any],
     *,
+    subject: Mapping[str, Any],
     head_sha: str | None,
     comments: Sequence[Mapping[str, Any]] | None,
     authenticated_login: str | None,
-    review_urls: set[str],
+    review_comment_paths: set[str],
 ) -> str | None:
     if "reviewer" in receipt or "reviewer_payload" in receipt:
         return "ukrainian behavior-proof receipt carries a singular reviewer"
@@ -1765,7 +1842,8 @@ def _ukrainian_behavior_proof_error(
     )
     if provenance["refused"]:
         return f"ukrainian behavior-proof seat quorum is not approved: {provenance['refused']}"
-    if _seat_identity(receipt.get("ukrainian_seat_verdicts")) != _seat_identity(provenance["seats"]):
+    receipt_seats = _seat_identity(receipt.get("ukrainian_seat_verdicts"), subject)
+    if receipt_seats is None or receipt_seats != _seat_identity(provenance["seats"], subject):
         return "ukrainian behavior-proof receipt does not match the recorded seat chunks"
     author = receipt.get("author") if isinstance(receipt.get("author"), Mapping) else {}
     if list(author.get("models") or []) != list(provenance["author_models"]):
@@ -1777,7 +1855,7 @@ def _ukrainian_behavior_proof_error(
         for seat in provenance["seats"]
         for chunk in seat["chunks"]
     ]
-    if any(url not in review_urls for url in chunk_urls):
+    if any(_review_comment_path(url, subject) not in review_comment_paths for url in chunk_urls):
         return "ukrainian behavior-proof chunks lack separate review evidence"
     return None
 
@@ -1788,7 +1866,7 @@ def _behavior_proof_reference_error(
     head_sha: str | None,
     comments: Sequence[Mapping[str, Any]] | None = None,
     authenticated_login: str | None = None,
-    review_urls: set[str] | None = None,
+    review_comment_paths: set[str] | None = None,
     changed_paths: Sequence[str] | None = None,
     accepted_notes: list[dict[str, Any]] | None = None,
 ) -> str | None:
@@ -1855,10 +1933,11 @@ def _behavior_proof_reference_error(
     if receipt.get("review_profile") == "ukrainian":
         seat_error = _ukrainian_behavior_proof_error(
             receipt,
+            subject=record["subject"],
             head_sha=head_sha,
             comments=comments,
             authenticated_login=authenticated_login,
-            review_urls=review_urls or set(),
+            review_comment_paths=review_comment_paths or set(),
         )
         if seat_error:
             return seat_error
@@ -1905,6 +1984,13 @@ def _evidence_status(
     valid: dict[str, set[str]] = {}
     errors: dict[str, str] = {}
     notes_by_evidence: dict[str, list[dict[str, Any]]] = {}
+    subject = {"repository": ledger["identity"]["repository"], "pr": ledger["pr"]["number"]}
+    comment_paths = {path for url in comment_urls if (path := _review_comment_path(url, subject)) is not None}
+    review_paths = {
+        path
+        for item in ledger["evidence"] if item["type"] == "review"
+        if (path := _review_comment_path(item.get("url"), subject)) is not None
+    }
     for record in ledger["evidence"]:
         kind = record["type"]
         commit = record["subject"]["commit"]
@@ -1913,17 +1999,12 @@ def _evidence_status(
             continue
         if kind == "behavior_proof":
             notes: list[dict[str, Any]] = []
-            review_urls = {
-                str(item["url"])
-                for item in ledger["evidence"]
-                if item["type"] == "review" and item.get("url")
-            }
             reference_error = _behavior_proof_reference_error(
                 record,
                 head_sha=head_sha,
                 comments=comments,
                 authenticated_login=authenticated_login,
-                review_urls=review_urls,
+                review_comment_paths=review_paths,
                 changed_paths=changed_paths,
                 accepted_notes=notes,
             )
@@ -1934,7 +2015,7 @@ def _evidence_status(
                 {"evidence_id": record["id"], "ac_id": record["ac_id"], **note}
                 for note in notes
             ]
-        if kind == "review" and (not record["url"] or record["url"] not in comment_urls):
+        if kind == "review" and _review_comment_path(record["url"], subject) not in comment_paths:
             errors[record["id"]] = f"{record['ac_id']}: review receipt URL is absent from authoritative PR comments"
             continue
 
@@ -2086,7 +2167,7 @@ def evaluate(payload: Mapping[str, Any], observation: Mapping[str, Any]) -> dict
     if github.get("error"):
         hard.append(f"GitHub observation failed: {github['error']}")
 
-    if github.get("repository") != identity["repository"]:
+    if not _same_repository(github.get("repository"), identity["repository"]):
         hard.append("authoritative GitHub repository does not match task identity")
     registered_epics = github.get("registered_stream_epics")
     epic_repository = github.get("stream_epic_repository")
@@ -2094,7 +2175,7 @@ def evaluate(payload: Mapping[str, Any], observation: Mapping[str, Any]) -> dict
         epic_repository = identity["repository"]
     if issue.get("number") != identity["github_issue_number"]:
         hard.append("authoritative GitHub issue does not match task identity")
-    if issue.get("url") != identity["github_issue_url"]:
+    if not _issue_url_matches(identity, issue.get("url")):
         hard.append("authoritative GitHub issue URL does not match task identity")
     if not repository_identity_valid(epic_repository) or not stream_epic_url_matches(identity, epic_repository):
         membership = _membership_refusal("identity stream epic URL does not match the registered repository and number")
@@ -2171,7 +2252,7 @@ def evaluate(payload: Mapping[str, Any], observation: Mapping[str, Any]) -> dict
     if expected_pr is None:
         waiting.append("PR is not yet bound to the lifecycle ledger")
         actions.append("bind the exact PR number")
-    elif pr.get("number") != expected_pr or pr.get("url") != ledger["pr"]["url"]:
+    elif pr.get("number") != expected_pr or _github_path(pr.get("url"), identity["repository"]) != f"pull/{expected_pr}":
         hard.append("authoritative PR does not match the lifecycle binding")
     else:
         pr_state = str(pr.get("state") or "").upper()
