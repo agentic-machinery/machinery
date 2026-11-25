@@ -241,18 +241,21 @@ def classify_delta(repo_root: Path, *, approved: str, candidate: str, base_tip: 
     return delta
 
 
-def required_workflows(repository: str) -> tuple[str, ...]:
-    """The repository's required CI workflows: its row's ``required_workflow`` (a path or a list), else ci.yml."""
+def _registry_entry(repository: str) -> tuple[Any, Mapping[str, Any]] | None:
+    """The fleet_repos.yaml row either baked slug of *repository* names, bound to its active slug; None if unregistered."""
     # Imported here to keep the publisher out of this module's import closure.
     from lu_machinery.publish.github import _fleet_catalog_entry
 
     try:
-        # Either baked slug names the row's configuration; the row is resolved through the active-slug resolver.
-        entry = _fleet_catalog_entry(repository, os.environ, bind_inactive=True)
+        entry: tuple[Any, Mapping[str, Any]] | None = _fleet_catalog_entry(repository, os.environ, bind_inactive=True)
     except prepublish.PublishBlocked as exc:
-        raise RepairRefused(
-            EVIDENCE, f"the repository allowlist cannot resolve {repository} ({exc}), so its required CI workflow is unknown"
-        ) from None
+        raise RepairRefused(EVIDENCE, f"the repository allowlist cannot resolve {repository} ({exc})") from None
+    return entry
+
+
+def required_workflows(repository: str) -> tuple[str, ...]:
+    """The repository's required CI workflows: its row's ``required_workflow`` (a path or a list), else ci.yml."""
+    entry = _registry_entry(repository)
     value = entry[1].get("required_workflow", DEFAULT_REQUIRED_WORKFLOW) if entry else DEFAULT_REQUIRED_WORKFLOW
     items = value if isinstance(value, list) and value else [value] if isinstance(value, str) else None
     if (
@@ -370,7 +373,10 @@ def admit_repair_round(
     fetch: bool = True,
 ) -> dict[str, Any]:
     """The receipt of the lineage's one repair round at ``head``, or a refusal. Reads only."""
-    github = github or github_reads(repository, number)
+    if github is None:
+        # Lineage keys and receipts keep the stored spelling; GitHub is read at the row's active slug.
+        entry = _registry_entry(repository)
+        github = github_reads(entry[0].active_github if entry else repository, number)
     markers = recorder._trusted_markers(comments, login)
     others = [marker for _, marker in markers if marker["sha"] != head]
     if not others:

@@ -797,6 +797,9 @@ def _prepare_recovery(verb, fields, dest, cwd, environment, runner):
     from lu_machinery.gh_merge_queue_status import extract_pr_number
     from lu_machinery.orchestration.integration_sweep import changes_learner_content, lookup_verdict, pr_file_paths
 
+    # An inactive, ambiguous or selector-less spelling is refused before any evidence read.
+    _fleet_catalog_entry(dest, environment)
+
     def fetch(name, **selectors):
         unknown = "RECOVERY_LOOKUP_UNKNOWN: live evidence unavailable"
         if verb == "run-rerun" and name == "run":
@@ -1050,6 +1053,19 @@ def _github_slug_or_none(value):
     return slug
 
 
+def _registry_slug(value):
+    """The registry's own owner/name spelling, case kept, when *value* names a github.com repository, else None.
+
+    The host selector names a dual-slug row's active slug as the registry spells it, so the
+    resolver compares against that spelling, never a lowercased copy.
+    """
+    slug = _github_slug_or_none(value)
+    if slug is None:
+        return None
+    spelled = value.strip()
+    return spelled if spelled.casefold() == slug else slug
+
+
 def _catalog_fleet_repos(raw_catalog=None):
     """Convert ``gate.catalog()`` rows (or *raw_catalog*, one such read) into validated ``FleetRepo`` objects.
 
@@ -1070,7 +1086,7 @@ def _catalog_fleet_repos(raw_catalog=None):
         github = row.get("github")
         if not isinstance(github, str):
             raise gate.PublishBlocked("OPSEC: repository allowlist malformed; write refused.")
-        slug = _github_slug_or_none(github)
+        slug = _registry_slug(github)
         if slug is None:
             raise gate.PublishBlocked("OPSEC: repository allowlist malformed; write refused.")
         default_raw = row.get("default", False)
@@ -1089,7 +1105,7 @@ def _catalog_fleet_repos(raw_catalog=None):
         if alt_raw is not None:
             if not isinstance(alt_raw, str):
                 raise gate.PublishBlocked("OPSEC: repository allowlist malformed; write refused.")
-            alt_slug = _github_slug_or_none(alt_raw)
+            alt_slug = _registry_slug(alt_raw)
             if alt_slug is None:
                 raise gate.PublishBlocked("OPSEC: repository allowlist malformed; write refused.")
             if alt_slug.casefold() == slug.casefold() or repo_id is None or visibility is None:
@@ -1196,7 +1212,7 @@ def _parent_epic_node(read_runner, active, repos, parent, cwd, environment):
             path=issue_stream_audit.default_registry_path(),
         ):
             target = fleet_repos.resolve_active_fleet_repo(default_key, repos=repos, env=environment)
-            if active.active_github.split("/", 1)[0] != target.active_github.split("/", 1)[0] or not all(
+            if not _same_slug(active.active_github.split("/", 1)[0], target.active_github.split("/", 1)[0]) or not all(
                 item.repo.role.startswith("public-") and item.repo.visibility in (None, "public")
                 for item in (active, target)
             ):
@@ -4250,6 +4266,9 @@ def publish(
         if verb == "pr-merge":
             from lu_machinery.publish.merge_guard import ensure_merge_ready
 
+            # Bind the merge target to its registry row before any GitHub read: an inactive,
+            # ambiguous or selector-less spelling is refused here (the seat guard reads the row again).
+            _fleet_catalog_entry(dest, environment)
             # Refuse a blocked supplied subject or body before any GitHub read. With an
             # override set, the one combined scan below decides, so the override is
             # offered once for the whole publish.
@@ -5458,8 +5477,8 @@ def read(
         entry = None if fields else _fleet_catalog_entry(dest, environment, bind_inactive=True)
         if entry is None:
             raise gate.PublishBlocked("OPSEC: invalid issue count repository or fields.")
-        dest = "github.com/" + entry[0].active_github
-        owner, name = entry[0].active_github.split("/", 1)
+        dest = gate.normalize_repository(entry[0].active_github)
+        owner, name = dest.split("/")[1:]
         query = "query($owner:String!,$name:String!){repository(owner:$owner,name:$name){issues(states:OPEN){totalCount}}}"
         with tempfile.TemporaryDirectory(prefix="lu-issue-count-", dir=ensure_scratch_root()) as directory:
             frozen = Path(directory) / "query.json"

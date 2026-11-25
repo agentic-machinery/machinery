@@ -372,17 +372,18 @@ class CanonicalPublicRepository:
         if destination == "unknown":
             return None
         gate.catalog()  # An unreadable allowlist refuses the push, as before.
-        # Either baked spelling names the row; its public history is read at the row's active slug.
+        # The destination must be its row's active slug: the default head read below is then the
+        # destination's own, so the excluded history is already in the repository pushed to.
         try:
-            entry = _fleet_catalog_entry(destination, self.environment, bind_inactive=True)
+            entry = _fleet_catalog_entry(destination, self.environment)
         except gate.PublishBlocked:
-            # An ambiguous spelling, a malformed row or an untrusted selector proves no public history.
+            # An inactive or ambiguous spelling, a malformed row or an untrusted selector proves no public history.
             return None
         if entry is not None:
             # Keep the registered-destination rule: exactly one public row.
             if not str(entry[1].get("role", "")).startswith("public-"):
                 return None
-            self.repo = f"github.com/{entry[0].active_github}"
+            self.repo = gate.normalize_repository(entry[0].active_github)
             return self
         if gate.normalize_repository(destination) != destination:
             return None
@@ -413,10 +414,10 @@ class CanonicalPublicRepository:
             parent_slug = parent["nameWithOwner"]
             if not parent_slug.isascii() or parent["visibility"] != "PUBLIC":
                 return None
-            registered = _fleet_catalog_entry(f"github.com/{parent_slug.lower()}", self.environment, bind_inactive=True)
+            registered = _fleet_catalog_entry(f"github.com/{parent_slug.lower()}", self.environment)
             if registered is None or not str(registered[1].get("role", "")).startswith("public-"):
                 return None
-            parent_repo = f"github.com/{registered[0].active_github}"
+            parent_repo = gate.normalize_repository(registered[0].active_github)
             oid = parent["defaultBranchRef"]["target"]["oid"]
             if not isinstance(oid, str) or PUBLIC_HEAD.fullmatch(oid) is None:
                 return None

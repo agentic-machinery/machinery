@@ -331,8 +331,10 @@ def test_pr_merge_refuses_an_unregistered_repository_or_a_moved_rows_inactive_sp
     monkeypatch, tmp_path, dest, refusal,
 ):
     """Defect class: an active-slug lookup that admits a repository outside the registry, or the inactive
-    spelling of a moved row, to the merge guard before any GitHub read."""
+    spelling of a moved row, to the merge guard before any GitHub read; for the inactive spelling, the
+    publisher's merge-readiness reads running before the refusal."""
     _moved_registry(monkeypatch, recorder=True)
+    monkeypatch.delenv("AGENT_NO_MERGE", raising=False)
     calls = []
 
     def send(args, **_kwargs):
@@ -343,6 +345,14 @@ def test_pr_merge_refuses_an_unregistered_repository_or_a_moved_rows_inactive_sp
         publisher._refuse_incomplete_seats(dest, 1, HEAD, send, tmp_path, {})
     assert str(caught.value) == refusal
     assert calls == []
+    if refusal.startswith("REPO_REFUSED"):
+        with pytest.raises(publisher.gate.PublishBlocked) as caught:
+            publisher.publish(
+                "pr-merge", repo=dest.removeprefix("github.com/"), number=1, match_head=HEAD, expect_queue="true",
+                runner=send, cwd=tmp_path, env={},
+            )
+        assert str(caught.value) == refusal
+        assert calls == []
 
 
 transport = enqueue_transport
