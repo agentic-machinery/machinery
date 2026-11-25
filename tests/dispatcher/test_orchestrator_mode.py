@@ -213,7 +213,10 @@ def test_admission_scan_leaves_a_dead_record_the_writer_refuses_and_reports_only
     task_store, monkeypatch, capsys,
 ):
     """Defect classes: a dead task record already holding NaN makes every admission scan raise (#1440); the admission
-    receipt reports a dead record as marked crashed when its heal was refused or declined and nothing was written."""
+    receipt reports a dead record as marked crashed when its heal was refused or declined and nothing was written;
+    one such record ends ``dispatch list`` and hides every other record."""
+    from lu_machinery.dispatcher import cli
+
     monkeypatch.setattr(dispatch_admission, "host_failures", lambda *_a: [])
     # A test-owned PID view: the initial namespace, where every worker pid in this store is dead, for the scan
     # and for the locked recheck alike, whatever namespace the test runner is in.
@@ -228,7 +231,11 @@ def test_admission_scan_leaves_a_dead_record_the_writer_refuses_and_reports_only
         return record
 
     path = store.record_path("worker-nan")
-    path.write_text(json.dumps(dead_worker("worker-nan", usage={"input_tokens": float("nan")})))  # as stored pre-#1440
+    launch = dict(model="m", effort="high", provider="claude", claude_account=None, process_start="boot:1",
+                  worktree_path=str(task_store), worktree_base_sha=None, prompt_file=str(task_store / "prompt"),
+                  result_file=str(task_store / "result"))  # what dispatch list's own heal reads
+    nan_record = dead_worker("worker-nan", usage={"input_tokens": float("nan")}, **launch)
+    path.write_text(json.dumps(nan_record))  # as stored pre-#1440
     before = path.read_bytes()
     _write(dead_worker("worker-raced"))
     _write(dead_worker("worker-dead"))
@@ -252,6 +259,12 @@ def test_admission_scan_leaves_a_dead_record_the_writer_refuses_and_reports_only
     assert decision.to_record()["swept_crashed"] == ["worker-dead"]
     assert "; 1 record(s) marked crashed: worker-dead;" in decision.summary()
     assert "; 2 record(s) dead pid, not counted: " in decision.summary()
+    assert cli.main(["list"]) == 0  # list heals every record before it filters
+    listed = capsys.readouterr()
+    assert {row["task_id"]: row["status"] for row in json.loads(listed.out)} == {
+        "worker-nan": "running", "worker-raced": "done", "worker-dead": "crashed"}
+    assert 'task record worker-nan not healed: TASK_RECORD_NON_FINITE: ["usage", "input_tokens"]' in listed.err
+    assert path.read_bytes() == before
 
 
 def test_a_turn_takes_no_write_slot_but_keeps_the_host_checks(task_store, monkeypatch):
