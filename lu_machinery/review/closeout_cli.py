@@ -918,6 +918,8 @@ def _cmd_behavior_proof_receipt(args: argparse.Namespace) -> int:
     """Write the Ukrainian receipt from the frozen proof and the live PR comments."""
     from lu_machinery.review.review_contract import ContractError, build_ukrainian_behavior_receipt
 
+    if not args.state_file.name or args.state_file.name in {".", ".."}:
+        raise CloseoutStateError(f"state_unreadable: invalid state file path {args.state_file}")
     raw_receipt_path = args.state_file.with_name(f"{args.state_file.stem}.ukrainian-behavior-proof-receipt.json")
     _require_writable_path(raw_receipt_path, label="behavior-proof receipt")
     state = _load_state(args.state_file)

@@ -1328,24 +1328,28 @@ def write_lifecycle(path: Path, payload: Mapping[str, Any]) -> None:
     ledger = validate_lifecycle(payload)
     path.parent.mkdir(parents=True, exist_ok=True)
     encoded = json.dumps(ledger, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
-    tmp_path: Path | None = None
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    tmp_path = Path(tmp_name)
+    closed_fd = False
     try:
-        with tempfile.NamedTemporaryFile(
-            mode="w", encoding="utf-8", dir=path.parent, prefix=f".{path.name}.", suffix=".tmp", delete=False,
-        ) as handle:
-            tmp_path = Path(handle.name)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            closed_fd = True
             handle.write(encoded)
+            handle.flush()
         os.replace(tmp_path, path)
-        tmp_path = None
     finally:
-        if tmp_path is not None:
-            tmp_path.unlink(missing_ok=True)
+        if not closed_fd:
+            with suppress(OSError):
+                os.close(fd)
+        tmp_path.unlink(missing_ok=True)
 
 
 @contextmanager
 def lifecycle_lock(path: Path, *, blocking: bool = True) -> Iterator[None]:
     """Hold the ledger's exclusive lock; non-blocking callers refuse a held lock."""
     _require_not_direct_task_store(path, label="lifecycle ledger")
+    if not path.name or path.name in {".", ".."}:
+        raise LifecycleError(f"invalid lifecycle ledger path: {path}")
     lock_path = path.with_suffix(path.suffix + ".lock")
     _require_not_direct_task_store(lock_path, label="lifecycle lock")
     lock_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1376,20 +1380,22 @@ def archive_predecessor(raw: bytes, archive_path: Path, archive_sha256: str) -> 
     """Store predecessor bytes once, never overwriting a different archive."""
     _require_not_direct_task_store(archive_path, label="predecessor archive")
     archive_path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path: Path | None = None
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{archive_path.name}.", suffix=".tmp", dir=archive_path.parent)
+    tmp_path = Path(tmp_name)
+    closed_fd = False
     try:
-        with tempfile.NamedTemporaryFile(
-            mode="wb", dir=archive_path.parent, prefix=f".{archive_path.name}.", suffix=".tmp", delete=False,
-        ) as handle:
-            tmp_path = Path(handle.name)
+        with os.fdopen(fd, "wb") as handle:
+            closed_fd = True
             handle.write(raw)
             handle.flush()
             os.fsync(handle.fileno())
         with suppress(FileExistsError):
             os.link(tmp_path, archive_path)
     finally:
-        if tmp_path is not None:
-            tmp_path.unlink(missing_ok=True)
+        if not closed_fd:
+            with suppress(OSError):
+                os.close(fd)
+        tmp_path.unlink(missing_ok=True)
     stored = archive_path.read_bytes()
     if stored != raw or "sha256:" + hashlib.sha256(stored).hexdigest() != archive_sha256:
         raise EvidencePolicyError(
