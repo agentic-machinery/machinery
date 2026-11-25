@@ -146,9 +146,12 @@ def _minimal_checkout_has_profile() -> bool:
     return False
 
 
+_PACKAGED_CATALOG_PATH = _PACKAGE / "config" / "fleet_repos.yaml"
+
+
 def _catalog_path() -> Path:
     """Resolve ``fleet_repos.yaml`` at call time via the active profile, else the packaged copy."""
-    default = _PACKAGE / "config" / "fleet_repos.yaml"
+    default = _PACKAGED_CATALOG_PATH
     try:
         # Imported here: minimal workflow checkouts omit common/profile.py.
         from lu_machinery.common.profile import config_path
@@ -159,7 +162,7 @@ def _catalog_path() -> Path:
     return config_path("fleet_repos", default=default)
 
 
-def catalog() -> dict:
+def _load_catalog_from_path(path: Path) -> dict:
     import yaml
 
     class UniqueLoader(getattr(yaml, "CSafeLoader", yaml.SafeLoader)):
@@ -172,7 +175,7 @@ def catalog() -> dict:
             return super().construct_mapping(node, deep=deep)
 
     try:
-        data = yaml.load(_catalog_path().read_text(encoding="utf-8"), Loader=UniqueLoader)
+        data = yaml.load(path.read_text(encoding="utf-8"), Loader=UniqueLoader)
         repos = data["repos"] if isinstance(data, dict) else None
         if (
             not isinstance(repos, dict)
@@ -183,6 +186,22 @@ def catalog() -> dict:
         return repos
     except Exception:
         raise PublishBlocked("OPSEC: repository allowlist unavailable; write refused.") from None
+
+
+def _packaged_catalog() -> dict:
+    """Load the host-installed packaged ``fleet_repos.yaml``, ignoring caller profile overrides."""
+    return _load_catalog_from_path(_PACKAGED_CATALOG_PATH)
+
+
+def catalog() -> dict:
+    try:
+        path = _catalog_path()
+    except Exception:
+        raise PublishBlocked("OPSEC: repository allowlist unavailable; write refused.") from None
+    return _load_catalog_from_path(path)
+
+
+_DEFAULT_CATALOG_FN = catalog
 
 
 def normalize_hostname(value: str) -> str | None:
@@ -219,24 +238,30 @@ def normalize_repository(value: str, host: str = "github.com") -> str:
 def is_private(destination: str) -> bool:
     """Grant the exemption only to a normalized, configured private repository at its active slug.
 
-    A row is private by its declared ``visibility``, else by its ``private-`` role. A dual-slug row
-    (``alternate_github``) is matched only at the slug the host selector makes active; its inactive
-    slug, and a dual-slug row whose selector is missing or untrusted, are not private.
+    Reads the host-installed packaged ``fleet_repos.yaml`` (never a caller-controlled profile
+    override) unless ``catalog`` was explicitly monkeypatched in tests. A row is private by its
+    declared ``visibility``, else by its ``private-`` role. A dual-slug row (``alternate_github``)
+    is matched only at the slug the host selector makes active; its inactive slug, and a dual-slug
+    row whose selector is missing or untrusted, are not private.
     """
     destination = normalize_repository(destination)
     if destination == "unknown":
         return False
-    for key, row in catalog().items():
+    use_packaged = catalog is _DEFAULT_CATALOG_FN
+    rows = _packaged_catalog() if use_packaged else catalog()
+    for key, row in rows.items():
         visibility = row.get("visibility") or ("private" if str(row.get("role", "")).startswith("private-") else None)
         if visibility != "private" or row.get("default"):
             continue
-        slug = row["github"]
+        slug = row.get("github")
+        if not isinstance(slug, str):
+            continue
         if row.get("alternate_github") is not None:
             try:
                 # Imported here: git_credentials imports this module. SelectorError is a ValueError.
                 from lu_machinery.common.git_credentials import active_slug
 
-                slug, _ = active_slug(row, key=key)
+                slug, _ = active_slug(row, key=key, registry_path=_PACKAGED_CATALOG_PATH if use_packaged else None)
             except (ImportError, ValueError, OSError):
                 continue
         if normalize_repository(slug) == destination:
@@ -245,7 +270,7 @@ def is_private(destination: str) -> bool:
 
 
 def private_tooling() -> Path:
-    return primary_root().parent / catalog()["infra-private"]["local_name"] / "tools/public_opsec_scan"
+    return primary_root().parent / _packaged_catalog()["infra-private"]["local_name"] / "tools/public_opsec_scan"
 
 
 CREDENTIAL_TOKEN_PATTERN = re.compile(
