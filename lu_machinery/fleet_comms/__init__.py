@@ -17,13 +17,6 @@ from lu_machinery.fleet_comms.authority import (
     open_authority_service,
 )
 from lu_machinery.fleet_comms.contracts import AssistantSegment, CompletionState, ResponseEnvelope, new_id
-from lu_machinery.fleet_comms.formal_review_jobs import (
-    FormalReviewAttempt,
-    FormalReviewJob,
-    FormalReviewJobsError,
-    FormalReviewJobService,
-    open_formal_review_jobs,
-)
 from lu_machinery.fleet_comms.message_plane import (
     MessagePlane,
     open_message_plane,
@@ -48,10 +41,6 @@ __all__ = [
     "CaptureInput",
     "CompletionState",
     "ContextRevision",
-    "FormalReviewAttempt",
-    "FormalReviewJob",
-    "FormalReviewJobService",
-    "FormalReviewJobsError",
     "HistoricalImportResult",
     "MessagePlane",
     "RequestExecutor",
@@ -60,7 +49,6 @@ __all__ = [
     "conform",
     "new_id",
     "open_authority_service",
-    "open_formal_review_jobs",
     "open_message_plane",
     "read_plane_status",
     "resolve_plane_mode",

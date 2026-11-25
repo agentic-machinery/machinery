@@ -1,11 +1,9 @@
-"""Fleet-comms CLI: plane status, formal-job get, formal-job accept (+ optional publish).
+"""Fleet-comms CLI: plane status, formal-job get (RO), efficiency and authority tools.
 
 Usage::
 
     .venv/bin/python -m scripts.fleet_comms plane-status
     .venv/bin/python -m scripts.fleet_comms formal-job get <review_id>
-    .venv/bin/python -m scripts.fleet_comms formal-job accept \\
-        --pr 5571 --verdict APPROVED --model M --family F --harness H
     .venv/bin/python -m scripts.fleet_comms metrics
     .venv/bin/python -m scripts.fleet_comms backlog
     .venv/bin/python -m scripts.fleet_comms dead-letters
@@ -14,8 +12,7 @@ Usage::
     .venv/bin/python -m scripts.fleet_comms authority-import --legacy-db /path/to/messages.db --source legacy-broker
     .venv/bin/python -m scripts.fleet_comms retention [--older-than-days 30] [--apply]
 
-``formal-job accept`` is post-review glue (create/reuse job + sealed
-verdict accept; sealed review-pr was removed in #8520). Optional ``--publish`` posts GitHub comment/status via PR-G.
+``formal-job get`` is read-only historical inspection of retired sealed-review rows.
 
 ``metrics`` / ``backlog`` / ``dead-letters`` are Sol PR-M efficiency surfaces
 (metadata only; never message content). They read the Fleet Comms authority
@@ -61,7 +58,6 @@ from lu_machinery.fleet_comms.opsec_store import (
     comms_plane_store,
 )
 from lu_machinery.fleet_comms.paths import PlaneRootAnchorError
-from lu_machinery.fleet_comms.review_publication import DEFAULT_GATE_KIND
 from lu_machinery.lib.readonly_sqlite import SQLiteConnection
 
 # This package's import name, as ``python -m`` runs it: from this module's unresolved location
@@ -575,49 +571,6 @@ def cmd_formal_job_get(args: argparse.Namespace) -> int:
             return EXIT_NOT_FOUND
         return EXIT_ERROR
     sys.stdout.write(_json_dump(payload))
-    return EXIT_OK
-
-
-def cmd_formal_job_accept(args: argparse.Namespace) -> int:
-    """Create/reuse formal job, accept sealed verdict, optionally publish."""
-    from lu_machinery.fleet_comms.formal_review_finalize import (
-        FormalReviewFinalizeError,
-        finalize_formal_review_verdict,
-    )
-
-    root = Path(args.root).expanduser() if args.root else None
-    verdict_file = Path(args.verdict_file) if args.verdict_file else None
-    findings = Path(args.findings_json) if args.findings_json else None
-    verdict_text = None
-    if verdict_file is not None:
-        try:
-            verdict_text = verdict_file.read_text(encoding="utf-8")
-        except OSError as exc:
-            sys.stderr.write(f"verdict_file_unreadable: {exc}\n")
-            return EXIT_ERROR
-
-    try:
-        result = finalize_formal_review_verdict(
-            pr_number=int(args.pr),
-            model=args.model,
-            family=args.family,
-            harness=args.harness,
-            repository=args.repository,
-            gate_kind=args.gate_kind,
-            verdict=args.verdict,
-            verdict_text=verdict_text,
-            findings_path=findings,
-            review_id=args.review_id,
-            head_sha=args.head_sha,
-            publish=bool(args.publish),
-            dry_run_publish=bool(args.dry_run_publish),
-            plane_root=root,
-        )
-    except FormalReviewFinalizeError as exc:
-        sys.stderr.write(str(exc) + "\n")
-        return EXIT_ERROR
-
-    sys.stdout.write(_json_dump(result.to_dict()))
     return EXIT_OK
 
 
@@ -1446,7 +1399,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     formal = sub.add_parser(
         "formal-job",
-        help="Formal review job get (RO) and accept (writer)",
+        help="Formal review job get (RO, historical history)",
     )
     formal_sub = formal.add_subparsers(dest="formal_command", required=True)
 
@@ -1471,61 +1424,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="Omit formal_review_attempts rows",
     )
     formal_get.set_defaults(func=cmd_formal_job_get)
-
-    formal_accept = formal_sub.add_parser(
-        "accept",
-        help=(
-            "Create/reuse formal job for PR head, accept sealed verdict, "
-            "optionally publish (post-review glue; review-pr removed in #8520)"
-        ),
-    )
-    formal_accept.add_argument("--pr", type=int, required=True, help="Pull request number")
-    formal_accept.add_argument("--model", required=True, help="Exact reviewer model ID")
-    formal_accept.add_argument("--family", required=True, help="Reviewer model family")
-    formal_accept.add_argument("--harness", required=True, help="Reviewer harness")
-    formal_accept.add_argument(
-        "--repository",
-        default="learn-ukrainian/learn-ukrainian.github.io",
-        help="owner/repo (default: learn-ukrainian/learn-ukrainian.github.io)",
-    )
-    formal_accept.add_argument(
-        "--gate-kind",
-        default=DEFAULT_GATE_KIND,
-        help=f"Gate kind (default: {DEFAULT_GATE_KIND})",
-    )
-    formal_accept.add_argument("--verdict", help="APPROVED|CHANGES_REQUESTED|BLOCKED")
-    formal_accept.add_argument(
-        "--verdict-file",
-        help="Text file containing VERDICT: … line",
-    )
-    formal_accept.add_argument(
-        "--findings-json",
-        help="Findings JSON with top-level verdict field",
-    )
-    formal_accept.add_argument(
-        "--review-id",
-        help="Optional review_id when creating the job (default: auto)",
-    )
-    formal_accept.add_argument(
-        "--head-sha",
-        help="Override PR head SHA (default: gh pr view)",
-    )
-    formal_accept.add_argument(
-        "--root",
-        default=None,
-        help="Plane ArtifactStore root (default under batch_state/fleet-comms/v1)",
-    )
-    formal_accept.add_argument(
-        "--publish",
-        action="store_true",
-        help="After accept, live-publish comment + fleet/cross-family-review status",
-    )
-    formal_accept.add_argument(
-        "--dry-run-publish",
-        action="store_true",
-        help="Plan publication without mutating GitHub (still accepts sealed verdict)",
-    )
-    formal_accept.set_defaults(func=cmd_formal_job_accept)
 
     authority_import = sub.add_parser(
         "authority-import",

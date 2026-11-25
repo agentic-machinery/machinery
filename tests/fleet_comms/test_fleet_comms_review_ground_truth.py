@@ -4,13 +4,9 @@ from __future__ import annotations
 
 import json
 import subprocess
-from pathlib import Path
 
 import pytest
 
-from lu_machinery.fleet_comms.formal_review_finalize import (
-    finalize_formal_review_verdict,
-)
 from lu_machinery.fleet_comms.review_ground_truth import (
     ReviewGroundTruthError,
     fetch_pr_change_inventory,
@@ -28,7 +24,6 @@ from lu_machinery.fleet_comms.review_publication import (
 _SHA = "a" * 40
 _BASE = "b" * 40
 _REPO = "learn-ukrainian/learn-ukrainian.github.io"
-_MODEL = "glm-5.3"
 
 
 def _finding(*, path: str, finding_id: str = "F001") -> ReviewFinding:
@@ -176,84 +171,3 @@ def test_fetch_pr_change_inventory_fails_closed_on_gh_error() -> None:
 
     with pytest.raises(ReviewGroundTruthError, match="gh_pr_files_lookup_failed"):
         fetch_pr_change_inventory(repository=_REPO, pr_number=5802, runner=runner)
-
-
-class _FakeGh:
-    def __init__(
-        self,
-        *,
-        head: str = _SHA,
-        files: list[dict[str, str]] | None = None,
-    ) -> None:
-        self.head = head
-        self.files = files or [{"path": "scripts/ok.py", "changeType": "MODIFIED"}]
-        self.calls: list[list[str]] = []
-
-    def __call__(
-        self, command: list[str], **_kwargs: object
-    ) -> subprocess.CompletedProcess[str]:
-        self.calls.append(list(command))
-        if len(command) >= 3 and command[1] == "pr" and command[2] == "view":
-            joined = " ".join(command)
-            if "files" in joined:
-                payload = {
-                    "headRefOid": self.head,
-                    "baseRefOid": _BASE,
-                    "files": self.files,
-                }
-                return subprocess.CompletedProcess(
-                    command, 0, stdout=json.dumps(payload), stderr=""
-                )
-            return subprocess.CompletedProcess(
-                command, 0, stdout=f"{self.head}\n", stderr=""
-            )
-        return subprocess.CompletedProcess(command, 1, stdout="", stderr="unexpected")
-
-
-def test_finalize_accepts_in_surface_findings(tmp_path: Path) -> None:
-    findings_path = tmp_path / "real-block.json"
-    findings_path.write_text(
-        json.dumps(
-            {
-                "schema_version": "code-review-findings.v1",
-                "overall": {
-                    "correctness": "incorrect",
-                    "explanation": "Bug in the only changed file.",
-                    "confidence": 0.9,
-                },
-                "findings": [
-                    {
-                        "id": "F001",
-                        "title": "Null deref",
-                        "body": "Missing guard.",
-                        "priority": "P1",
-                        "confidence": 0.9,
-                        "category": "bug",
-                        "location": {
-                            "path": "scripts/ok.py",
-                            "start_line": 10,
-                            "end_line": 10,
-                            "claim_type": "present",
-                        },
-                        "verbatim": "value.method()",
-                        "why_wrong": "value may be None.",
-                        "smallest_fix": "Guard before call.",
-                        "sources": ["none"],
-                    }
-                ],
-            }
-        ),
-        encoding="utf-8",
-    )
-    gh = _FakeGh()
-    result = finalize_formal_review_verdict(
-        pr_number=5802,
-        model=_MODEL,
-        family="zhipu",
-        harness="opencode",
-        findings_path=findings_path,
-        plane_root=tmp_path / "plane",
-        runner=gh,
-    )
-    assert result.verdict == "CHANGES_REQUESTED"
-    assert any("files" in " ".join(call) for call in gh.calls)

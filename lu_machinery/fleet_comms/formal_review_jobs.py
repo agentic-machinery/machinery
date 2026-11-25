@@ -1,59 +1,23 @@
-"""Formal review jobs (Fleet Comms Sol PR-F / #5512).
+"""Read-only historical reader for formal review jobs (Fleet Comms C-7371).
 
-Durable SQLite usage of ``formal_review_jobs`` / ``formal_review_attempts``
-(schema from fleet_comms migrations). Unique key (one job per head; attempts accumulate):
-
-    (repository, pr_number, head_sha, gate_kind)
-
-Concurrent duplicate creates are rejected.
-
-PR-F slice 2 (sealed verdict acceptance): store a content-addressed sealed
-verdict payload on the job so PR-G can publish with
-durable provenance (sealed review-pr was removed in #8520).
-
-This module does **not** invoke reviewers, create reviewer-neutral
-snapshots, or resolve reviewers (sealed review-pr was removed in #8520).
+The sealed formal-review writer path (``create_job``, ``record_attempt``,
+``record_rejected_response``, ``accept_sealed_verdict``, ``load_sealed_verdict``)
+was retired under decision C-7371.  The ``formal_review_jobs`` and
+``formal_review_attempts`` tables and their migrations stay in place as
+read-only historical records.
 """
 
 from __future__ import annotations
 
-import json
 import sqlite3
-from collections.abc import Mapping
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 from lu_machinery.fleet_comms.artifacts import ArtifactStore
-from lu_machinery.fleet_comms.contracts import CompletionState, new_id
 from lu_machinery.fleet_comms.migrations import apply_migrations
-from lu_machinery.fleet_comms.review_publication import (
-    ReviewPublicationError,
-    SealedVerdict,
-    parse_sealed_verdict_payload,
-    validate_review_gate_input,
-)
 
 JOB_STATES = frozenset({"open", "running", "complete", "failed", "blocked"})
-ACTIVE_JOB_STATES = frozenset({"open", "running"})
-
-
-def _utc_now() -> str:
-    return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-
-def _normalize_completion_state(completion_state: CompletionState | str) -> str:
-    if isinstance(completion_state, CompletionState):
-        return completion_state.value
-    value = str(completion_state).strip().lower()
-    try:
-        return CompletionState(value).value
-    except ValueError as exc:
-        raise FormalReviewJobsError(
-            f"invalid completion_state: {completion_state!r}; "
-            f"expected one of {[s.value for s in CompletionState]}"
-        ) from exc
 
 
 @dataclass(frozen=True, slots=True)
@@ -117,7 +81,7 @@ class FormalReviewJobsError(RuntimeError):
 
 
 class FormalReviewJobService:
-    """SQLite writers/readers for formal review jobs and attempts (no GitHub)."""
+    """Read-only SQLite reader for historical formal review jobs and attempts."""
 
     def __init__(
         self,
@@ -141,345 +105,6 @@ class FormalReviewJobService:
     def __exit__(self, *exc: object) -> None:
         self.close()
 
-    def create_job(
-        self,
-        repository: str,
-        pr: int,
-        head_sha: str,
-        gate_kind: str,
-        *,
-        snapshot_artifact_id: str | None = None,
-        state: str = "open",
-        review_id: str | None = None,
-    ) -> FormalReviewJob:
-        """Create a formal review job under the unique key (one job per head).
-
-        Parameters
-        ----------
-        repository:
-            ``owner/repo`` style identifier.
-        pr:
-            Pull request number (positive integer).
-        head_sha:
-            Immutable commit SHA under review.
-        gate_kind:
-            Gate discriminator (e.g. ``cross-family``).
-        """
-        repo = self._require_nonempty(repository, "repository")
-        pr_number = self._require_pr(pr)
-        sha = self._require_nonempty(head_sha, "head_sha").lower()
-        gate = self._require_nonempty(gate_kind, "gate_kind")
-        if state not in JOB_STATES:
-            raise FormalReviewJobsError(
-                f"invalid job state: {state!r}; expected one of {sorted(JOB_STATES)}"
-            )
-        if snapshot_artifact_id is not None:
-            self._require_artifact(snapshot_artifact_id)
-
-        existing = self._find_by_key(repo, pr_number, sha, gate)
-        if existing is not None:
-            raise FormalReviewJobsError(
-                "concurrent duplicate formal review job rejected: "
-                f"unique job key {(repo, pr_number, sha, gate)} already held by "
-                f"{existing.review_id} (state={existing.state})"
-            )
-
-        rid = review_id or new_id("review")
-        created = _utc_now()
-        try:
-            self._conn.execute(
-                """INSERT INTO formal_review_jobs(
-                    review_id, repository, pr_number, head_sha, gate_kind,
-                    state, snapshot_artifact_id, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                (rid, repo, pr_number, sha, gate, state, snapshot_artifact_id, created),
-            )
-            self._conn.commit()
-        except sqlite3.IntegrityError as exc:
-            self._conn.rollback()
-            # Race: another writer inserted the same unique key between SELECT and INSERT.
-            raced = self._find_by_key(repo, pr_number, sha, gate)
-            if raced is not None:
-                raise FormalReviewJobsError(
-                    "concurrent duplicate formal review job rejected: "
-                    f"unique job key {(repo, pr_number, sha, gate)} already held by "
-                    f"{raced.review_id} (state={raced.state})"
-                ) from exc
-            raise FormalReviewJobsError(f"failed to create formal review job: {exc}") from exc
-        return self.get_job(rid)
-
-    def record_attempt(
-        self,
-        review_id: str,
-        *,
-        completion_state: CompletionState | str,
-        raw_capture_artifact_id: str | None = None,
-        review_attempt_id: str | None = None,
-    ) -> FormalReviewAttempt:
-        """Append one attempt row for an existing job.
-
-        ``raw_capture_artifact_id`` is optional; when provided it must exist in
-        the artifact store (FK is not enforced by schema, but the skeleton
-        fails closed so callers cannot invent IDs).
-        """
-        job = self.get_job(review_id, include_attempts=False)
-        state_value = _normalize_completion_state(completion_state)
-        if raw_capture_artifact_id is not None:
-            self._require_artifact(raw_capture_artifact_id)
-
-        row = self._conn.execute(
-            "SELECT COALESCE(MAX(attempt_number), 0) FROM formal_review_attempts WHERE review_id = ?",
-            (job.review_id,),
-        ).fetchone()
-        next_number = int(row[0]) + 1 if row is not None else 1
-        attempt_id = review_attempt_id or new_id("review-attempt")
-        created = _utc_now()
-        try:
-            self._conn.execute(
-                """INSERT INTO formal_review_attempts(
-                    review_attempt_id, review_id, attempt_number,
-                    completion_state, raw_capture_artifact_id, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?)""",
-                (
-                    attempt_id,
-                    job.review_id,
-                    next_number,
-                    state_value,
-                    raw_capture_artifact_id,
-                    created,
-                ),
-            )
-            # Keep job state in step with the latest attempt (skeleton mapping only).
-            new_job_state = self._map_completion_to_job_state(state_value, job.state)
-            if new_job_state != job.state:
-                self._conn.execute(
-                    "UPDATE formal_review_jobs SET state = ? WHERE review_id = ?",
-                    (new_job_state, job.review_id),
-                )
-            self._conn.commit()
-        except sqlite3.IntegrityError as exc:
-            self._conn.rollback()
-            raise FormalReviewJobsError(
-                f"failed to record attempt for {job.review_id}: {exc}"
-            ) from exc
-
-        return FormalReviewAttempt(
-            review_attempt_id=attempt_id,
-            review_id=job.review_id,
-            attempt_number=next_number,
-            completion_state=state_value,
-            raw_capture_artifact_id=raw_capture_artifact_id,
-            created_at=created,
-        )
-
-    def record_rejected_response(
-        self,
-        review_id: str,
-        raw_response: str | bytes,
-    ) -> FormalReviewAttempt:
-        """Atomically retain a non-canonical response as a failed attempt.
-
-        A response which failed formal-review validation is evidence of an
-        attempted review, not a verdict.  Persist the original bytes and its
-        failed attempt together so a subsequent authority-lease race cannot
-        erase the only durable record of the provider result.
-        """
-        job = self.get_job(review_id, include_attempts=False)
-        payload = (
-            raw_response.encode("utf-8")
-            if isinstance(raw_response, str)
-            else bytes(raw_response)
-        )
-
-        attempt_id = new_id("review-attempt")
-        created = _utc_now()
-        try:
-            self._conn.execute("BEGIN IMMEDIATE")
-            current = self._conn.execute(
-                "SELECT sealed_verdict_artifact_id FROM formal_review_jobs WHERE review_id = ?",
-                (job.review_id,),
-            ).fetchone()
-            if current is None:
-                raise FormalReviewJobsError(f"formal review job not found: {job.review_id}")
-            if current["sealed_verdict_artifact_id"] is not None:
-                raise FormalReviewJobsError(
-                    f"sealed_verdict_already_set: job {job.review_id} cannot record a rejected response"
-                )
-            capture = self.store.store_bytes(
-                payload,
-                producer="formal-review-jobs",
-                retention_class="rejected-review-response",
-                logical_filename=f"{job.review_id}.rejected-response.raw",
-                mime_type="text/plain; charset=utf-8",
-                commit=False,
-            )
-            row = self._conn.execute(
-                "SELECT COALESCE(MAX(attempt_number), 0) FROM formal_review_attempts WHERE review_id = ?",
-                (job.review_id,),
-            ).fetchone()
-            attempt_number = int(row[0]) + 1 if row is not None else 1
-            self._conn.execute(
-                """INSERT INTO formal_review_attempts(
-                    review_attempt_id, review_id, attempt_number,
-                    completion_state, raw_capture_artifact_id, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?)""",
-                (
-                    attempt_id,
-                    job.review_id,
-                    attempt_number,
-                    CompletionState.FAILED.value,
-                    capture.artifact_id,
-                    created,
-                ),
-            )
-            self._conn.execute(
-                "UPDATE formal_review_jobs SET state = 'failed' WHERE review_id = ?",
-                (job.review_id,),
-            )
-            self._conn.commit()
-        except FormalReviewJobsError:
-            self._conn.rollback()
-            raise
-        except Exception as exc:
-            self._conn.rollback()
-            raise FormalReviewJobsError(
-                f"failed to record rejected response for {job.review_id}: {exc}"
-            ) from exc
-
-        return FormalReviewAttempt(
-            review_attempt_id=attempt_id,
-            review_id=job.review_id,
-            attempt_number=attempt_number,
-            completion_state=CompletionState.FAILED.value,
-            raw_capture_artifact_id=capture.artifact_id,
-            created_at=created,
-        )
-
-    def accept_sealed_verdict(
-        self,
-        review_id: str,
-        sealed: SealedVerdict | Mapping[str, Any] | str | bytes,
-        *,
-        record_complete_attempt: bool = True,
-        raw_capture_artifact_id: str | None = None,
-    ) -> SealedVerdict:
-        """Accept a schema-valid sealed verdict and bind it to the job (fail closed).
-
-        Provenance (model/family/harness/verdict) is taken **only** from the
-        sealed payload. The payload's repository/pr/head/gate/review_id must
-        match the durable job row exactly.
-        """
-        job = self.get_job(review_id, include_attempts=False)
-        try:
-            if not isinstance(sealed, SealedVerdict):
-                sealed = parse_sealed_verdict_payload(sealed)
-            validate_review_gate_input(
-                verdict=sealed.verdict,
-                model=sealed.model,
-                review_evidence=sealed.review_evidence,
-            )
-        except ReviewPublicationError as exc:
-            raise FormalReviewJobsError(f"sealed_verdict_invalid: {exc}") from exc
-
-        if sealed.review_id != job.review_id:
-            raise FormalReviewJobsError(
-                f"sealed_job_mismatch: review_id sealed={sealed.review_id!r} "
-                f"job={job.review_id!r}"
-            )
-        if sealed.repository != job.repository:
-            raise FormalReviewJobsError(
-                f"sealed_job_mismatch: repository sealed={sealed.repository!r} "
-                f"job={job.repository!r}"
-            )
-        if sealed.pr_number != job.pr_number:
-            raise FormalReviewJobsError(
-                f"sealed_job_mismatch: pr sealed={sealed.pr_number} job={job.pr_number}"
-            )
-        if sealed.head_sha.lower() != job.head_sha.lower():
-            raise FormalReviewJobsError(
-                f"sealed_job_mismatch: head_sha sealed={sealed.head_sha!r} "
-                f"job={job.head_sha!r}"
-            )
-        if sealed.gate_kind != job.gate_kind:
-            raise FormalReviewJobsError(
-                f"sealed_job_mismatch: gate_kind sealed={sealed.gate_kind!r} "
-                f"job={job.gate_kind!r}"
-            )
-
-        if job.sealed_verdict_artifact_id is not None:
-            # Idempotent re-accept of identical payload only.
-            existing = self.load_sealed_verdict(job.review_id)
-            if existing.to_dict() != sealed.to_dict():
-                raise FormalReviewJobsError(
-                    f"sealed_verdict_already_set: job {job.review_id} already holds a "
-                    "different sealed verdict; refuse overwrite"
-                )
-            return existing
-
-        payload = json.dumps(sealed.to_dict(), sort_keys=True, separators=(",", ":"))
-        artifact = self.store.store_text(
-            payload,
-            producer="formal-review-jobs",
-            retention_class="sealed-verdict",
-            logical_filename=f"{job.review_id}.sealed-verdict.json",
-            mime_type="application/json; charset=utf-8",
-        )
-        try:
-            self._conn.execute(
-                """UPDATE formal_review_jobs
-                   SET sealed_verdict_artifact_id = ?, state = ?
-                   WHERE review_id = ?""",
-                (artifact.artifact_id, "complete", job.review_id),
-            )
-            self._conn.commit()
-        except sqlite3.Error as exc:
-            self._conn.rollback()
-            raise FormalReviewJobsError(
-                f"failed to bind sealed verdict for {job.review_id}: {exc}"
-            ) from exc
-
-        if record_complete_attempt:
-            self.record_attempt(
-                job.review_id,
-                completion_state=CompletionState.COMPLETE,
-                raw_capture_artifact_id=raw_capture_artifact_id or artifact.artifact_id,
-            )
-        return sealed
-
-    def load_sealed_verdict(self, review_id: str) -> SealedVerdict:
-        """Reload the durable sealed verdict for PR-G ``--review-id`` publish."""
-        job = self.get_job(review_id, include_attempts=False)
-        if job.sealed_verdict_artifact_id is None:
-            raise FormalReviewJobsError(
-                f"sealed_verdict_missing: job {job.review_id} has no accepted sealed "
-                "verdict (call accept_sealed_verdict first)"
-            )
-        try:
-            raw = self.store.read_bytes(job.sealed_verdict_artifact_id)
-        except Exception as exc:
-            raise FormalReviewJobsError(
-                f"sealed_verdict_artifact_unreadable: {job.sealed_verdict_artifact_id}: {exc}"
-            ) from exc
-        try:
-            sealed = parse_sealed_verdict_payload(raw)
-        except ReviewPublicationError as exc:
-            raise FormalReviewJobsError(
-                f"sealed_verdict_corrupt: {job.sealed_verdict_artifact_id}: {exc}"
-            ) from exc
-        # Re-validate binding on every load (fail closed if DB/job drifted).
-        if (
-            sealed.review_id != job.review_id
-            or sealed.repository != job.repository
-            or sealed.pr_number != job.pr_number
-            or sealed.head_sha.lower() != job.head_sha.lower()
-            or sealed.gate_kind != job.gate_kind
-        ):
-            raise FormalReviewJobsError(
-                f"sealed_verdict_job_drift: artifact for {job.review_id} does not "
-                "match durable job identity"
-            )
-        return sealed
-
     def get_job(self, review_id: str, *, include_attempts: bool = True) -> FormalReviewJob:
         rid = self._require_nonempty(review_id, "review_id")
         row = self._conn.execute(
@@ -502,7 +127,7 @@ class FormalReviewJobService:
         state: str | None = None,
         include_attempts: bool = False,
     ) -> list[FormalReviewJob]:
-        """List jobs matching optional filters (``list_job`` API surface)."""
+        """List historical jobs matching optional filters (``list_job`` API surface)."""
         clauses: list[str] = []
         params: list[Any] = []
         if repository is not None:
@@ -629,14 +254,6 @@ class FormalReviewJobService:
             attempts=attempts,
         )
 
-    def _require_artifact(self, artifact_id: str) -> None:
-        aid = self._require_nonempty(artifact_id, "artifact_id")
-        row = self._conn.execute(
-            "SELECT 1 FROM artifacts WHERE artifact_id = ?", (aid,)
-        ).fetchone()
-        if row is None:
-            raise FormalReviewJobsError(f"artifact not found: {aid}")
-
     @staticmethod
     def _require_nonempty(value: str, field_name: str) -> str:
         if value is None or not str(value).strip():
@@ -653,24 +270,7 @@ class FormalReviewJobService:
             raise FormalReviewJobsError(f"pr must be a positive integer, got {number}")
         return number
 
-    @staticmethod
-    def _map_completion_to_job_state(completion_state: str, current: str) -> str:
-        if completion_state == CompletionState.COMPLETE.value:
-            return "complete"
-        if completion_state == CompletionState.FAILED.value:
-            return "failed"
-        if completion_state in {
-            CompletionState.LENGTH_LIMITED.value,
-            CompletionState.TRANSPORT_INCOMPLETE.value,
-            CompletionState.UNKNOWN.value,
-        }:
-            # Keep open jobs runnable for retries; otherwise leave terminal alone.
-            if current in ACTIVE_JOB_STATES:
-                return "running"
-            return current
-        return current
-
 
 def open_formal_review_jobs(root: Path | None = None) -> FormalReviewJobService:
-    """Factory used by CLI/tests."""
+    """Factory for read-only historical formal review job inspection."""
     return FormalReviewJobService(root=root)
