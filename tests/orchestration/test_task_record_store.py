@@ -257,12 +257,24 @@ def test_parser_refuses_input_that_is_not_an_object_or_empty_array(tmp_path, raw
     for name in ("worker.json", "worker.ac-policy.json", "not a task id.json"):
         with pytest.raises(ValueError, match=match):
             store.parse_task_record(tmp_path / name, raw)
-    # A record object holding a non-JSON constant parses as before: the dispatcher's writer can emit one.
+    # A record object holding a non-JSON constant parses as before: records written before #1440's writer fix hold one.
     record = store.parse_task_record(tmp_path / "worker.json", b'{"task_id": "worker", "status": "running", "cost": NaN}')
     assert record is not None and record["task_id"] == "worker"
     # A foreign object and exactly [] stay foreign.
     assert store.parse_task_record(tmp_path / "worker.ac-policy.json", b'{"criteria": []}') is None
     assert store.parse_task_record(tmp_path / "worker.ac-policy.json", b" [ ]\n") is None
+
+
+def test_legacy_record_write_refuses_non_finite_numbers_and_names_the_field(tmp_path):
+    """Defect class (#1440): the legacy task-record writer stores NaN or Infinity, which strict JSON readers refuse."""
+    path = tmp_path / "worker.json"
+    store.write_state_unlocked(path, {"task_id": "worker", "status": "running"})
+    before = path.read_bytes()
+    with pytest.raises(store.NonFiniteRecordValue) as refused:
+        store.write_state_unlocked(path, {"task_id": "worker", "status": "failed", "usage": {"cost": float("nan")}})
+    assert refused.value.code == 'TASK_RECORD_NON_FINITE: ["usage", "cost"]'
+    assert path.read_bytes() == before
+    assert sorted(entry.name for entry in tmp_path.iterdir()) == ["worker.json"]
 
 
 def test_foreign_filename_cannot_inject_log_lines(tmp_path, caplog):
