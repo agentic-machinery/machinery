@@ -92,7 +92,7 @@ def test_foreign_sidecar_blocks_review_admission_only_when_it_may_hold_a_record(
     if refused:
         readers = admission_readers(tmp_path)
         for reader in readers[:3]:
-            with pytest.raises((ValueError, recorder.RecordError), match="worker.manifest-canary.json"):
+            with pytest.raises((ValueError, recorder.RecordError), match=re.escape("worker.manifest-canary.json")):
                 reader()
         # The in-flight guard reads the active (hot) ledger only; an archived record is terminal.
         if archived:
@@ -100,7 +100,7 @@ def test_foreign_sidecar_blocks_review_admission_only_when_it_may_hold_a_record(
         else:
             with pytest.raises(recorder.RecordError, match="RED_TEAM_REFUSED: task ledger unavailable"):
                 readers[3]()
-        with pytest.raises(ValueError, match="worker.manifest-canary.json"):
+        with pytest.raises(ValueError, match=re.escape("worker.manifest-canary.json")):
             store.check_review_attempt(dict(review_id="unused", attempt_id="unused", manifest_sha256="b" * 64))
         return
     assert [record["task_id"] for _, record in admission_readers(tmp_path)[0]()] == ["unrelated"]

@@ -241,21 +241,25 @@ def test_blank_record_file_is_damaged_not_foreign(tmp_path):
         pytest.param(b"42", "is not a JSON object", id="number"),
         pytest.param(b'"worker"', "is not a JSON object", id="string"),
         pytest.param(b"null", "is not a JSON object", id="null"),
-        pytest.param(b'{"task_id": "worker", "status": "running", "cost": NaN}', "non-JSON constant NaN", id="nan"),
+        pytest.param(b'{"status": "ok", "elapsed_s": NaN}', "non-JSON constant NaN", id="nan"),
         pytest.param(b'{"status": "ok", "elapsed_s": Infinity}', "non-JSON constant Infinity", id="infinity"),
         pytest.param(b'{"status": "ok", "elapsed_s": -Infinity}', "non-JSON constant -Infinity", id="negative-infinity"),
-        pytest.param(b"NaN", "non-JSON constant NaN", id="bare-nan"),
+        pytest.param(b"NaN", "is not a JSON object", id="bare-nan"),
     ],
 )
 def test_parser_refuses_input_that_is_not_an_object_or_empty_array(tmp_path, raw, match):
     """Defect class: a reader skips a parser ``None`` that may hold a record (#1440).
 
-    Bare record members, an array holding a record, a scalar and non-JSON constants are not a
-    foreign object, so the parser refuses them under every name instead of calling them foreign.
+    Bare record members, an array holding a record, a scalar and an object that is not strict JSON
+    are not a foreign object, so the parser refuses them under every name instead of calling them
+    foreign.
     """
     for name in ("worker.json", "worker.ac-policy.json", "not a task id.json"):
         with pytest.raises(ValueError, match=match):
             store.parse_task_record(tmp_path / name, raw)
+    # A record object holding a non-JSON constant parses as before: the dispatcher's writer can emit one.
+    record = store.parse_task_record(tmp_path / "worker.json", b'{"task_id": "worker", "status": "running", "cost": NaN}')
+    assert record is not None and record["task_id"] == "worker"
     # A foreign object and exactly [] stay foreign.
     assert store.parse_task_record(tmp_path / "worker.ac-policy.json", b'{"criteria": []}') is None
     assert store.parse_task_record(tmp_path / "worker.ac-policy.json", b" [ ]\n") is None
