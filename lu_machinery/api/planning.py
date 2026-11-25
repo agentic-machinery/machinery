@@ -22,7 +22,7 @@ from lu_machinery import github_rest_cache as github
 from lu_machinery.common import json_depth
 from lu_machinery.dispatcher.checks import _ISSUE_REF, card_dependencies
 from lu_machinery.guardrails.delegate_ownership import ClaimKind, PathClaim, claims_conflict, expand_claim
-from lu_machinery.orchestration.fleet_repos import FleetRepo, FleetRepoError, load_fleet_repos
+from lu_machinery.orchestration.fleet_repos import FleetRepoError, load_fleet_repos, resolve_active_fleet_repo
 
 from . import subscriptions
 from .delegate_router import active_snapshot
@@ -88,9 +88,9 @@ class IssueSnapshot:
     repositories_read: int
 
 
-def _inventory(repo: FleetRepo) -> tuple[dict[Ref, Issue], bool]:
+def _inventory(slug: str) -> tuple[dict[Ref, Issue], bool]:
     try:
-        page = github.list_open_issues(repo.github, limit=ISSUE_LIMIT, timeout=FORGE_TIMEOUT_S)
+        page = github.list_open_issues(slug, limit=ISSUE_LIMIT, timeout=FORGE_TIMEOUT_S)
     except (github.GitHubRestError, github.GitHubRestTimeout):
         return {}, False
     if page.stale:
@@ -100,10 +100,10 @@ def _inventory(repo: FleetRepo) -> tuple[dict[Ref, Issue], bool]:
     for row in page:
         value, title, body = row.get("number"), row.get("title"), row.get("body")
         if (type(value) is not int or not 0 < value < 10**16 or not isinstance(title, str)
-                or row.get("state") != "OPEN" or (repo.github.lower(), value) in found):
+                or row.get("state") != "OPEN" or (slug, value) in found):
             complete = False
             continue
-        found[repo.github.lower(), value] = Issue(title, body if isinstance(body, str) else "")
+        found[slug, value] = Issue(title, body if isinstance(body, str) else "")
     return found, complete
 
 
@@ -114,7 +114,7 @@ def _literal_ref(entry: str, repo: str) -> Ref | None:
     return (match[1] or repo).lower(), int(match[2])
 
 
-def _title_ref(title: str, repos: Sequence[str], timeout: float) -> Ref | None:
+def _title_ref(title: str, repos: Sequence[str], aliases: Mapping[str, str], timeout: float) -> Ref | None:
     # GitHub search supplies candidates. Only an exact title in a registered repository can resolve.
     if not title.isprintable() or not 0 < len(title) <= 256 or not repos:
         return None
@@ -140,7 +140,11 @@ def _title_ref(title: str, repos: Sequence[str], timeout: float) -> Ref | None:
         if (not isinstance(url, str) or not url.startswith("https://api.github.com/repos/")
                 or type(issue) is not int or not 0 < issue < 10**16):
             return None
-        repo = url.removeprefix("https://api.github.com/repos/").lower()
+        repo = url.removeprefix("https://api.github.com/repos/")
+        if not _SLUG.fullmatch(repo):
+            return None
+        repo = repo.lower()
+        repo = aliases.get(repo, repo)
         if repo not in repos:
             return None
         found.add((repo, issue))
@@ -149,6 +153,7 @@ def _title_ref(title: str, repos: Sequence[str], timeout: float) -> Ref | None:
 
 def _lookup_refs(
     entries: Mapping[Ref, list[str]], issues: Mapping[Ref, Issue], slugs: Sequence[str],
+    aliases: Mapping[str, str],
 ) -> tuple[dict[Ref, set[Ref]], set[Ref]]:
     by_title: dict[str, set[Ref]] = defaultdict(set)
     for issue_ref, card in issues.items():
@@ -163,7 +168,7 @@ def _lookup_refs(
     deadline = time.monotonic() + FORGE_TIMEOUT_S
 
     def search(title: str) -> Ref | None:
-        return _title_ref(title, slugs, min(5.0, deadline - time.monotonic()))
+        return _title_ref(title, slugs, aliases, min(5.0, deadline - time.monotonic()))
 
     # A refresh cannot turn arbitrary issue prose into unlimited forge reads.
     with ThreadPoolExecutor(max_workers=4) as pool:
@@ -173,7 +178,7 @@ def _lookup_refs(
 
     def resolve(entry: str, repo: str) -> Ref | None:
         if ref := _literal_ref(entry, repo):
-            return ref
+            return aliases.get(ref[0], ref[0]), ref[1]
         matches = by_title.get(entry, set())
         return next(iter(matches)) if len(matches) == 1 else None
 
@@ -209,18 +214,29 @@ def _lookup_refs(
 
 def collect_issues() -> IssueSnapshot | None:
     try:
-        repos = list(load_fleet_repos().values())
+        repos = load_fleet_repos()
     except FleetRepoError:
         return None
-    valid = [repo for repo in repos if _SLUG.fullmatch(repo.github)]
+    aliases: dict[str, str] = {}
+    valid: dict[str, bool] = {}
+    for key, repo in repos.items():
+        try:
+            slug = resolve_active_fleet_repo(key, repos=repos).active_github
+        except FleetRepoError:
+            # Keep the repository in the coverage denominator without querying an inactive slug.
+            aliases[key] = repo.github.lower()
+            continue
+        aliases.update(dict.fromkeys((key, *(name.lower() for name in repo.slugs)), slug.lower()))
+        if _SLUG.fullmatch(slug):
+            valid[slug.lower()] = repo.role.startswith("public-")
     with ThreadPoolExecutor(max_workers=8) as pool:
         inventories = list(pool.map(_inventory, valid))
     issues = {ref: issue for rows, _ in inventories for ref, issue in rows.items()}
     entries = {ref: lines for ref, issue in issues.items() if (lines := card_dependencies(issue.body)) is not None}
-    deps, unresolved = _lookup_refs(entries, issues, sorted({repo.github.lower() for repo in valid}))
+    deps, unresolved = _lookup_refs(entries, issues, sorted(valid), aliases)
     return IssueSnapshot(
-        frozenset(repo.github.lower() for repo in valid if repo.role.startswith("public-")),
-        {repo.key: repo.github.lower() for repo in repos},
+        frozenset(slug for slug, public in valid.items() if public),
+        aliases,
         issues, {ref: frozenset(dests) for ref, dests in deps.items()}, frozenset(unresolved),
         sum(complete for _, complete in inventories),
     )
@@ -316,7 +332,7 @@ def _workers(ctx: MonitorContext, aliases: Mapping[str, str]) -> dict[str, list[
     known = set(aliases.values())
     claims: dict[str, list[PathClaim] | None] = {}
     for repo, paths in rows:
-        if not isinstance(repo, str) or (slug := aliases.get(repo, repo.lower())) not in known:
+        if not isinstance(repo, str) or (slug := aliases.get(repo.lower(), repo.lower())) not in known:
             return None
         expanded = [claim for path in paths for claim in expand_claim(path)] if all(
             isinstance(path, str) for path in paths) else []
@@ -352,7 +368,7 @@ def project_issues(
 
     blocked, ready, ready_now = [], [], []
     states: Counter[str] = Counter()
-    repositories = frozenset(snap.aliases.values())
+    repositories = {alias for alias in snap.aliases if _SLUG.fullmatch(alias)} | set(snap.aliases.values())
     for ref, issue in sorted(snap.issues.items()):
         if deps := snap.dependencies.get(ref):
             if ref[0] in snap.public:
@@ -372,7 +388,7 @@ def project_issues(
                 # withhold ready; a proven overlap still reports the conflict.
                 conflict = unknown = False
                 for repo, path in scope:
-                    live = workers.get(repo or ref[0], [])
+                    live = workers.get(snap.aliases.get(repo, repo) if repo is not None else ref[0], [])
                     if live is None:
                         unknown = True
                     elif any(claims_conflict(path, worker) for worker in live):
@@ -388,7 +404,7 @@ def project_issues(
                 ready.append({"ref": _ref_text(ref), "path_status": path_status})
                 if path_status == "ready_now":
                     ready_now.append({"ref": _ref_text(ref)})
-    total = len(snap.aliases)
+    total = len(set(snap.aliases.values()))
     status = "stale" if stale else "unknown" if not snap.issues and not snap.repositories_read else (
         "ok" if snap.repositories_read == total else "partial")
     return {

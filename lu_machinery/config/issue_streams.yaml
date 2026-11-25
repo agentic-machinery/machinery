@@ -25,7 +25,7 @@ repos:
     streams:
       epics:
         title: "Machinery epic coordination"
-        epics: []
+        epics: [1415]
 streams:
   epics:
     title: "Epic coordination"

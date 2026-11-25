@@ -530,7 +530,8 @@ def check_branch_author_families(
             if resolution.selected is None or resolution.selected.concrete_model != canonical_model_id(reviewer_model):
                 raise ValueError("RED_TEAM_REFUSED: temporary reviewer is ineligible or an eligible outside-family reviewer takes precedence")
             try:
-                require_no_outside_rejection(GitHubAdapter(repo).comments(repository["github"], args.pr), head_sha)
+                active, _ = git_credentials.active_slug(repository)
+                require_no_outside_rejection(GitHubAdapter(repo).comments(active, args.pr), head_sha)
                 require_no_outside_review_in_flight(store.tasks_dir(), repository["github"], head_sha)
             except RecordError as exc:
                 raise ValueError(str(exc)) from None
@@ -577,6 +578,12 @@ def _dependency_key(entry: str, repo: str | None) -> str:
     return entry.strip()
 
 
+def _active_issue_slug(slug: str) -> str:
+    from lu_machinery.orchestration.fleet_repos import repository_slugs, resolve_payload_fleet_repo
+
+    return resolve_payload_fleet_repo(slug).active_github if len(repository_slugs(slug)) > 1 else slug
+
+
 def check_task_card(card: str, allowed: list[str], repo: str | None) -> dict:
     """Refuse a dispatch whose task card names a dependency that is not closed, unless allowed (#583).
 
@@ -591,7 +598,8 @@ def check_task_card(card: str, allowed: list[str], repo: str | None) -> dict:
             repo = match.group(1) or repo
             if not (repo and _SLUG.fullmatch(repo)):
                 raise ValueError("no GitHub repository")
-            text = json_depth.loads(git._gh("api", f"repos/{repo}/issues/{match.group(2)}"), max_depth=512)["body"] or ""
+            endpoint = f"repos/{_active_issue_slug(repo)}/issues/{match.group(2)}"
+            text = json_depth.loads(git._gh("api", endpoint), max_depth=512)["body"] or ""
         else:
             text = Path(card).read_text(encoding="utf-8")
     except (OSError, ValueError, KeyError, TypeError) as exc:
@@ -608,7 +616,8 @@ def check_task_card(card: str, allowed: list[str], repo: str | None) -> dict:
             state = "unreadable (no GitHub repository)"
         else:
             try:
-                issue = json_depth.loads(git._gh("api", f"repos/{reference.group(1)}/issues/{reference.group(2)}"), max_depth=512)
+                endpoint = f"repos/{_active_issue_slug(reference.group(1))}/issues/{reference.group(2)}"
+                issue = json_depth.loads(git._gh("api", endpoint), max_depth=512)
                 state = str(issue["state"])
             except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as exc:
                 state = f"unreadable ({type(exc).__name__})"

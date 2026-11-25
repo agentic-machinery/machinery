@@ -8,6 +8,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
 import pytest
+from lu_machinery.common import git_credentials
 from lu_machinery.dispatcher import checks, cli, git, store, worker
 from lu_machinery.review import record_cf_verdict as cf
 from lu_machinery.review.subject_seat import classify_owned_path
@@ -63,13 +64,30 @@ def dispatch(tmp_path, monkeypatch):
     return invoke
 
 
-def test_review_metadata_loss_round_trip_enforces_risk_and_subjects(dispatch, monkeypatch):
-    monkeypatch.setattr(cf, "_pr", lambda *_a: dict(headRefName="review/target", headRefOid="a" * 40))
+@pytest.mark.parametrize("active", ["learn-ukrainian/machinery", "agentic-machinery/machinery"])
+def test_review_metadata_loss_round_trip_enforces_risk_and_subjects(dispatch, monkeypatch, tmp_path, active):
+    """Defect class: dispatch review admission reads a PR and classifies its files on the baked slug."""
+    baked = "learn-ukrainian/machinery"
+    repository = {"key": "machinery", "github": baked, "alternate_github": "agentic-machinery/machinery"}
+    monkeypatch.setattr(git, "resolve_repo", lambda _: (tmp_path, repository))
+    monkeypatch.setattr(
+        git_credentials, "load_selector",
+        lambda **_kwargs: git_credentials.SelectorState({"machinery": active}, "d" * 64),
+    )
+    load_pr = Mock(return_value=dict(headRefName="review/target", headRefOid="a" * 40))
+    read_files = Mock(return_value=[])
+    monkeypatch.setattr(cf, "_pr", load_pr)
+    monkeypatch.setattr(cf.GitHubAdapter, "pr_file_rows", read_files)
     record = dispatch("--risk", "high", "--review-profile", "code", "--review-mode", "cross_family",
                       "--review-author-model", "claude-opus-5-5", "--language-lane", "", "--pr", "42",
                       "--subject-seat", "GROK_build", "--subject-seat", "claude-infra",
                       "--subject-seat", "grok", "--subject-family", " XAI ", "--require-review-verdict")
     assert record["schema_version"] == 2
+    load_pr.assert_any_call(active, "", 42)
+    assert all(call.args[0] == active for call in load_pr.call_args_list)
+    read_files.assert_called_once_with(active, 42)
+    assert record["repository"] == baked
+    assert record["fleet_repo_selector"]["selector_value"] == active
     assert (record["review_branch"], record["pinned_head"]) == ("review/target", "a" * 40)
     assert {key: record[key] for key in ("review_risk", "review_profile", "review_mode", "review_author_model",
                                        "language_lane", "pr", "require_review_verdict")} == dict(

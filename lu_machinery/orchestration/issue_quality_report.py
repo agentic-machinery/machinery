@@ -137,7 +137,7 @@ def summarize_repository(
         codes.append("membership_registry_absent")
     elif (
         not isinstance(report, dict)
-        or report.get("repository", "").casefold() != repo.github.casefold()
+        or not fleet_repos.same_repository(report.get("repository"), repo.github)
         or not audit.membership_report_is_complete(report)
         or report.get("streams") != {key: sorted(numbers) for key, numbers in registry.items()}
     ):

@@ -465,7 +465,7 @@ def _fleet_repo_visibility() -> tuple[frozenset[str], dict[str, str], str | None
     except Exception:  # fail closed: an unreadable repo catalog admits no reply samples
         return frozenset(), {}, None
     public_keys = frozenset(key for key, repo in repos.items() if repo.role.startswith("public-"))
-    by_github = {repo.github.lower(): key for key, repo in repos.items()}
+    by_github = repository_keys(repos)
     default_key = next((key for key, repo in repos.items() if repo.default), None)
     return public_keys, by_github, default_key
 
@@ -1112,7 +1112,7 @@ def fleet_catalog() -> dict[str, FleetRepo] | None:
 def repository_keys(repos: Mapping[str, FleetRepo] | None) -> dict[str, str]:
     """Each registered GitHub ``owner/name``, lowercased, to its fleet repository key (the rows' ``repo``); empty
     without a catalog."""
-    return {} if repos is None else {repo.github.lower(): key for key, repo in repos.items()}
+    return {} if repos is None else {slug.lower(): key for key, repo in repos.items() for slug in repo.slugs}
 
 
 _LABEL_FIELDS = ("harness", "model", "effort", "role", "class", "status", "repo")

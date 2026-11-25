@@ -18,6 +18,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from urllib.parse import parse_qs, urlsplit
 
+import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from prometheus_client import CollectorRegistry, generate_latest
@@ -29,6 +30,7 @@ from lu_machinery.api import planning
 from lu_machinery.api.delegate_router import active_snapshot
 from lu_machinery.api.monitor_context import fixture_context, get_ctx
 from lu_machinery.api.state_helpers import cache_get_or_compute, cache_invalidate, ctx_scoped_ttl_key
+from lu_machinery.common import git_credentials
 from lu_machinery.common.repo_root import machinery_path
 from lu_machinery.dispatcher import store, worker
 from lu_machinery.github_rest_cache import RestPage, RestResult
@@ -36,6 +38,23 @@ from lu_machinery.orchestration.fleet_repos import FleetRepo
 
 NOW = datetime(2026, 11, 15, 12, tzinfo=UTC)
 SINCE = NOW - timedelta(days=7)
+
+
+@pytest.mark.parametrize("recorded", ["fixture/machinery", "moved/machinery"])
+def test_model_stats_binds_both_recorded_slugs_to_the_public_row(monkeypatch, recorded):
+    """Defect class: model statistics drop public review records anchored after a repository transfer."""
+    row = FleetRepo(
+        "machinery", "fixture/machinery", "machinery", "public-machinery",
+        alternate_github="moved/machinery", repository_id=42, visibility="public",
+    )
+    repos = {row.key: row}
+    monkeypatch.setattr(rows, "load_fleet_repos", lambda: repos)
+    rows._fleet_repo_visibility.cache_clear()
+    try:
+        assert rows.repository_keys(repos)[recorded] == "machinery"
+        assert rows._record_allows_sample({"repository": recorded, "repository_id": "fixture/machinery"})
+    finally:
+        rows._fleet_repo_visibility.cache_clear()
 
 
 def test_model_value_sections_explain_how_to_read_the_figures():
@@ -78,11 +97,22 @@ def _record(tasks: Path, task_id: str, **fields) -> dict:
     return record
 
 
-def test_planning_ranks_product_blocker_and_withholds_colliding_cards(tmp_path, monkeypatch):
+@pytest.mark.parametrize("machinery", ["sample/machinery", "new-owner/machinery"])
+def test_planning_ranks_product_blocker_and_withholds_colliding_cards(tmp_path, monkeypatch, machinery):
     """Diamond dependencies count once, and a ready issue cannot overlap a live grant."""
-    product, machinery, private = "sample/product", "sample/machinery", "sample/private.dev"
-    repos = {slug: FleetRepo(slug, slug, slug.rsplit("/", 1)[1], role) for slug, role in (
-        (product, "public-product"), (machinery, "public-machinery"), (private, "private-infra"))}
+    product, historical_machinery, private = "sample/product", "sample/machinery", "sample/private.dev"
+    repos = {
+        product: FleetRepo(product, product, "product", "public-product"),
+        "machinery": FleetRepo(
+            "machinery", historical_machinery, "machinery", "public-machinery",
+            alternate_github="new-owner/machinery", repository_id=42, visibility="public",
+        ),
+        private: FleetRepo(private, private, "private.dev", "private-infra"),
+    }
+    monkeypatch.setattr(
+        git_credentials, "load_selector",
+        lambda **_kwargs: git_credentials.SelectorState({"machinery": machinery}, "d" * 64),
+    )
     title = "Product: remove the classified in-tree machinery copy"
     product_ref = f"{product}#13032"
 
@@ -96,9 +126,10 @@ def test_planning_ranks_product_blocker_and_withholds_colliding_cards(tmp_path, 
         machinery: [
             issue(503, "Redirect runtime callers", title),
             issue(505, "Remove duplicate API", product_ref),
-            issue(519, "Remove mirrored readers", "#503; #505"),
+            issue(519, "Remove mirrored readers", f"{historical_machinery}#503; #505"),
             issue(525, "Run issue checks", "#519"),
-            issue(584, "Ready card with collision", "#581", "- src/elsewhere.py, **`src/owned/worker.py:12`**"),
+            issue(584, "Ready card with collision", "#581",
+                  f"- src/elsewhere.py, **`{historical_machinery}/src/owned/worker.py:12`**"),
             issue(585, "Ready card on a sibling prefix", "#581", "src/owned-extra/file.py"),
             issue(586, "Unknown dependency", "#404", "docs/guide.md"),
             issue(587, "Scope is in prose", "None", "Refine the reader, use `owned_paths`, e.g. Ruff 0.15.21."),
@@ -128,7 +159,7 @@ def test_planning_ranks_product_blocker_and_withholds_colliding_cards(tmp_path, 
     context = fixture_context(tmp_path)
     tasks = context.roots.batch_state_dir / "tasks"
     tasks.mkdir(parents=True)
-    _record(tasks, "live-writer", status="spawning", repository=machinery,
+    _record(tasks, "live-writer", status="spawning", repository=historical_machinery,
             owned_paths=["src/shared.py"], run_nonce="run",
             owned_path_grants=[{"grant_id": "grant", "task_id": "live-writer", "run_nonce": "run",
                                 "owned_paths": ["src/owned"]}])
@@ -147,6 +178,7 @@ def test_planning_ranks_product_blocker_and_withholds_colliding_cards(tmp_path, 
         response = client.get("/api/fleet/model-stats/planning")
         assert response.status_code == 200
         result = response.json()["issues"]
+        assert result["coverage"]["repositories_read"] == result["coverage"]["repositories_total"] == 3
         assert result["coverage"]["open_issues"] == 19
         assert result["coverage"]["dependency_unknown"] == 1
         assert result["blockers"][0] == {"ref": product_ref, "direct": 3, "total": 6}
