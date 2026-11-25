@@ -469,3 +469,81 @@ def test_a_run_recorded_for_another_pr_on_the_same_branch_is_not_this_prs_lineag
 
     assert counted(13076) == ["pr-b", "unattributed"]
     assert counted(13075) == ["pr-a", "unattributed"]
+
+
+RATE_LIMIT_PR = 1378
+RATE_LIMIT_BRANCH = "claude/rate-limited-review"
+
+
+def _bound(run, *, nonce, result_sha256, pr=RATE_LIMIT_PR, **updates):
+    """``run`` as a v2 read-only Codex review bound to its nonce, PR, review branch and pinned SHA."""
+    record = {
+        **run.record,
+        "schema_version": 2,
+        "mode": "read-only",
+        "run_nonce": nonce,
+        "pr": pr,
+        "repository": "org/repo",
+        "review_branch": RATE_LIMIT_BRANCH,
+        "result_sha256": result_sha256,
+        **updates,
+    }
+    return ReviewRun(run.task_id, record, run.reply)
+
+
+def _rate_limited_run():
+    """The v2rev1 shape on PR 1378: a usage-limit exit 12 s after start, with a provider pgid and no result."""
+    run, _ = review("rl-r0", EARLY, "", minute=0, status="rate_limited", publish=False)
+    return _bound(
+        ReviewRun(run.task_id, run.record, None),
+        nonce="a" * 32,
+        result_sha256=None,
+        provider_pgid=29558,
+        returncode=1,
+        finished_at="2026-10-28T20:00:12.000001+00:00",
+        output_schema_path="/schemas/code-review-findings.v1.schema.json",
+        output_schema_sha256="9" * 64,
+    )
+
+
+@pytest.mark.parametrize(
+    "case,admitted",
+    [
+        ("rate-limited-retry", True),
+        ("schema-digest-missing", False),
+        ("schema-path-missing", False),
+        ("result-digest", False),
+        ("overlapping-retry", False),
+        ("retry-at-another-head", False),
+        ("retry-for-another-pr", False),
+        ("retry-by-another-family", False),
+        ("unpublished-retry", False),
+    ],
+)
+def test_a_rate_limited_codex_run_is_skipped_only_beside_its_bound_published_retry(case, admitted):
+    """Defect class: a schema-bound Codex review settled ``rate_limited`` with no result blocks its lineage forever,
+    or a missing reply is skipped without schema proof, with a result digest, or without a later bound publication
+    of its own seat at the same head (designated approval LINEAGE-RATELIMIT-1124).
+    """
+    limited = _rate_limited_run()
+    if case == "schema-digest-missing":
+        limited = _bound(limited, nonce="a" * 32, result_sha256=None, output_schema_sha256=None)
+    elif case == "schema-path-missing":
+        limited = _bound(limited, nonce="a" * 32, result_sha256=None, output_schema_path="")
+    elif case == "result-digest":
+        limited = _bound(limited, nonce="a" * 32, result_sha256="ab" * 32)
+    elif case == "overlapping-retry":
+        limited = _bound(limited, nonce="a" * 32, result_sha256=None, finished_at=started(5))
+    head = APPROVED if case == "retry-at-another-head" else EARLY
+    family = "anthropic" if case == "retry-by-another-family" else "openai"
+    run, comment = review("rl-r1", head, ORPHAN_REJECTION, minute=1, family=family, publish=case != "unpublished-retry")
+    retry = (
+        _bound(run, nonce="b" * 32, result_sha256="cd" * 32, pr=1379 if case == "retry-for-another-pr" else RATE_LIMIT_PR),
+        comment,
+    )
+    approve = review("rl-r2", APPROVED, "VERDICT: APPROVE", minute=2)
+    if admitted:
+        assert lineage((limited, None), retry, approve) == (["openai"], [])
+    else:
+        with pytest.raises(LineageRefused, match=r"review task rl-r0 \(rate_limited\) has no reply on record"):
+            lineage((limited, None), retry, approve)

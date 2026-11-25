@@ -13,7 +13,10 @@ only outcome is a published capability failure
 A terminal run that is not ``done``, has no reply, and whose record proves
 no provider ran (``provider_pgid`` absent or null, and no result digest)
 carries no verdict. One supervisor-attested provider failure with no
-result can be recovered by a later, published review (#1071). Other
+result can be recovered by a later, published review (#1071). A
+schema-bound native Codex run the supervisor settled as ``rate_limited``
+with no result carries no verdict once a later run of its seat at the same
+head publishes its own bound verdict (LINEAGE-RATELIMIT-1124). Other
 missing replies refuse. Neither kind of no-result run can own a verdict.
 The approval carry-over and the repair-verification round
 (``scripts/review/repair_round.py``) both apply it before anything else. Ported from the carry-over's reviewed reader (#11907) so the two
@@ -659,6 +662,93 @@ def provider_crash_recovery(
     return ProviderCrashRecovery(failed, replacement)
 
 
+_LOWER_SHA256 = frozenset("0123456789abcdef")
+
+
+def _attested_rate_limit(run: ReviewRun) -> bool:
+    """Recognize a schema-bound native Codex review the supervisor settled as ``rate_limited``, with no result.
+
+    The supervisor sets that status from the provider's parsed terminal event and returns before it
+    writes ``provider_terminal_failure``. With an output schema bound there is no format-correction
+    launch, so no earlier decision can hide behind the missing reply (designated approval
+    LINEAGE-RATELIMIT-1124).
+    """
+    record = run.record
+    pgid, returncode, schema = record.get("provider_pgid"), record.get("returncode"), record.get("output_schema_sha256")
+    return (
+        run.reply is None
+        and record.get("status") == "rate_limited"
+        and record.get("agent") == "codex"
+        and _supervised_review_binding(run)
+        and type(pgid) is int and pgid > 0
+        and type(returncode) is int and returncode > 0
+        and "result_sha256" in record and record["result_sha256"] is None
+        and isinstance(schema, str) and len(schema) == 64 and set(schema) <= _LOWER_SHA256
+        and isinstance(record.get("output_schema_path"), str) and bool(record["output_schema_path"])
+        and any(record.get("provider_terminal_failure") is value for value in (None, False))
+        and "provider_terminal_status" not in record
+        and not record.get("never_started_reason")
+        and not record.get("orphaned_child_tasks")
+        and not record.get("unknown_child_tasks")
+    )
+
+
+def _rate_limit_retried(
+    run: ReviewRun, runs: Sequence[ReviewRun], comments: Sequence[Mapping[str, Any]], login: str
+) -> bool:
+    """Whether a rate-limited run's retry, started after it settled, published its own bound verdict.
+
+    The retry must match the run's repository, PR, review branch, full SHA, reviewer family and
+    normalized profile, and its published verdict must bind to its own nonce, reply digest and
+    trusted publication (:func:`bound_published_run`). Any verdict counts: a genuine
+    ``CHANGES_REQUESTED`` also proves the retry happened. The skipped run fills no seat.
+    """
+    if not _attested_rate_limit(run):
+        return False
+    record = run.record
+    settled = _timestamp(record.get("finished_at"))
+    started = _timestamp(record.get("started_at"))
+    repository, number = record.get("repository"), record.get("pr")
+    if (
+        settled is None or started is None or settled < started
+        or not isinstance(repository, str) or type(number) is not int
+    ):
+        return False
+    try:
+        branch = recorder._review_branch(dict(record))
+        family = recorder.reviewer_identity(record)[1]
+    except recorder.RecordError:
+        return False
+    for retry in runs:
+        if retry.task_id == run.task_id or retry.record.get("run_nonce") == record.get("run_nonce"):
+            continue
+        retry_start = _timestamp(retry.record.get("started_at"))
+        if (
+            retry_start is None
+            or retry_start <= settled
+            or retry.record.get("worktree_base_sha") != record.get("worktree_base_sha")
+            or _profile(retry.record) != _profile(record)
+            or not _supervised_review_binding(retry)
+        ):
+            continue
+        evidence = {
+            "task_id": retry.task_id,
+            "run_nonce": retry.record.get("run_nonce"),
+            "reviewed_sha": record.get("worktree_base_sha"),
+            "reply_sha256": retry.record.get("result_sha256"),
+        }
+        try:
+            _, marker = bound_published_run(
+                evidence, runs=runs, comments=comments, login=login,
+                repository=repository, number=number, branch=branch,
+            )
+        except (LineageRefused, recorder.RecordError):
+            continue
+        if marker["family"] == family:
+            return True
+    return False
+
+
 def check_lineage(
     *,
     runs: Sequence[ReviewRun],
@@ -677,7 +767,8 @@ def check_lineage(
     supersedes it (:func:`superseded_runs`), and any other run's reply must
     carry no verdict at all. A terminal run that is not ``done`` and whose reply
     is missing counts as carrying no verdict when :func:`_provider_never_ran`
-    holds, or when a later replacement has a published verdict. Every other
+    holds, or when a later replacement has a published verdict (an attested
+    provider crash, or an attested Codex rate limit, :func:`_rate_limit_retried`). Every other
     missing reply is refused, and a ``done`` run is unchanged. A published
     verdict that names a run without a result is refused. A finished run may instead have exactly
     one capability-failure event that its record and reply re-derive
@@ -710,7 +801,11 @@ def check_lineage(
         if status not in TERMINAL_TASK_STATUSES:
             raise LineageRefused(f"review task {run.task_id} is not terminal (status {status!r})")
         if run.reply is None:
-            if run is recovered or (status != "done" and _provider_never_ran(run.record)):
+            if (
+                run is recovered
+                or (status != "done" and _provider_never_ran(run.record))
+                or _rate_limit_retried(run, runs, comments, login)
+            ):
                 continue
             raise LineageRefused(f"review task {run.task_id} ({status}) has no reply on record")
         if status != "done":
