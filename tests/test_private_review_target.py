@@ -603,5 +603,14 @@ def test_non_ascii_origin_refuses_with_module_typed_errors(tmp_path):
     with pytest.raises(_gemini_review.GeminiChangedPathListError, match="refusing to list files"):
         _gemini_review.resolve_same_repo_pr_head("9" * 5000, repo_root=str(repo))  # type: ignore[arg-type]
 
+    # Undecodable raw bytes in .git/config must also produce the module's typed error (no UnicodeDecodeError).
+    cfg = repo / ".git" / "config"
+    raw_cfg = cfg.read_bytes()
+    cfg.write_bytes(raw_cfg.replace(b"learn-u\xe2\x84\xaarainian", b"learn-\xffukrainian"))
+    with pytest.raises(closeout_cli.CloseoutStateError, match="not valid ASCII"):
+        closeout_cli._checkout_repository(repo)
+    with pytest.raises(_gemini_review.GeminiChangedPathListError, match="not valid ASCII"):
+        _gemini_review.resolve_same_repo_pr_head(9, repo_root=str(repo))
+
 
 pytestmark = pytest.mark.usefixtures("configured_roots")

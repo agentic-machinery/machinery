@@ -3617,11 +3617,13 @@ def _dismiss_preflight(fields, gh_repo, dest, runner, cwd, environment, *, temp=
     from lu_machinery.orchestration.fleet_repos import parse_ascii_positive_int
 
     pattern = rf"https://github\.com/(?:{slugs})/pull/([1-9][0-9]*)(?:#[A-Za-z0-9_-]+)?"
-    prs = {
-        num
-        for link in links
-        if (match := re.fullmatch(pattern, link)) and (num := parse_ascii_positive_int(match[1])) is not None
-    }
+    prs: set[int] = set()
+    for link in links:
+        if match := re.fullmatch(pattern, link):
+            num = parse_ascii_positive_int(match[1]) if len(match[1]) <= 19 else None
+            if num is None:
+                raise ValueError("comment needs an explanation and one same-repository merged PR")
+            prs.add(num)
     explanation = re.sub(identifier, "", re.sub(r"https://[^\s<>()]+", "", comment)).strip(" .,:;\n")
     if dest.partition("/")[0] != "github.com" or len(prs) != 1 or not any(char.isalpha() for char in explanation):
         raise ValueError("comment needs an explanation and one same-repository merged PR")
@@ -3838,7 +3840,7 @@ def _dismiss_preflight(fields, gh_repo, dest, runner, cwd, environment, *, temp=
     pull_instance_set: set[int] = set()
     for instance in instances:
         if match := re.fullmatch(r"refs/pull/([1-9][0-9]*)/merge", instance["ref"]):
-            pr_num = parse_ascii_positive_int(match[1])
+            pr_num = parse_ascii_positive_int(match[1]) if len(match[1]) <= 19 else None
             if pr_num is None:
                 raise ValueError("unknown instance PR identity or state")
             pull_instance_set.add(pr_num)
@@ -3847,7 +3849,7 @@ def _dismiss_preflight(fields, gh_repo, dest, runner, cwd, environment, *, temp=
     skipped_prs = {}
     for instance in instances:
         if match := re.fullmatch(r"refs/pull/([1-9][0-9]*)/merge", instance["ref"]):
-            pr_num = parse_ascii_positive_int(match[1])
+            pr_num = parse_ascii_positive_int(match[1]) if len(match[1]) <= 19 else None
             if pr_num is None:
                 raise ValueError("unknown instance PR identity or state")
             state, merged = pr_states[pr_num]

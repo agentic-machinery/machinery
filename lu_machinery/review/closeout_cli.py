@@ -440,6 +440,8 @@ def _checkout_repository(repo_root: Path) -> str:
         origin = _origin_github_repo(repo_root)
     except TargetResolutionError as exc:
         raise CloseoutStateError(f"repository unknown: {exc}") from exc
+    except UnicodeDecodeError as exc:
+        raise CloseoutStateError("repository unknown: checkout origin is not valid ASCII") from exc
     except (OSError, subprocess.TimeoutExpired):
         origin = None
     if origin is None:

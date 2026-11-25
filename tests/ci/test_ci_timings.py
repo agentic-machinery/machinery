@@ -427,7 +427,9 @@ def test_ci_timings_and_merge_queue_status_refuse_non_ascii_digits_and_repos(mon
 
 
 def test_machinery_readers_refuse_overlong_digit_captures_without_unbounded_int():
-    """Defect class: unbounded regex digit captures passed to int() raise raw int-digit-limit ValueError (>4300 digits)."""
+    """Defect class: unbounded regex digit captures passed to int() raise raw ValueError or convert huge ints."""
+    import sys
+
     from lu_machinery import gh_merge_queue_status, release_cut
     from lu_machinery.api import issues_router
     from lu_machinery.ci import check_agent_attribution, ci_timings, queue_review_gate
@@ -437,91 +439,104 @@ def test_machinery_readers_refuse_overlong_digit_captures_without_unbounded_int(
     from lu_machinery.work import relations
 
     huge = "9" * 5000
-    assert issues_router._extract_supersede_hint(f"superseded-by: #{huge}\nmerged-in: PR #{huge}") == {}
-    assert issues_router._extract_supersede_hint("superseded-by: #42\nmerged-in: PR #43") == {
-        "superseded_by": 42,
-        "merged_in_pr": 43,
-    }
-
-    assert ci_timings.extract_pr_number(f"gh-readonly-queue/main/pr-{huge}-abcdef") is None
-    assert ci_timings.extract_pr_number(f"pr-{huge}") is None
-    with pytest.raises(ValueError, match="Invalid --since format"):
-        ci_timings.parse_since(f"{huge}d")
-    with pytest.raises(ValueError, match="Invalid --since format"):
-        ci_timings.parse_since("\u0661\u0660d")
-
-    for bad_pr in (f"https://github.com/o/r/pull/{huge}", f"pr-{huge}", huge, f"feature-123-pr-{huge}"):
-        with pytest.raises(ValueError, match="Could not parse pull request number"):
-            gh_merge_queue_status.parse_pr_identifier(bad_pr)
-
-    rels = relations.extract_body_relations(
-        f"blocks #{huge} and depends on #0 and supersedes #42",
-        repository_id="learn-ukrainian/machinery",
-        self_number=1,
-    )
-    assert rels == [
-        {
-            "type": "supersedes",
-            "target_id": relations.issue_work_id("learn-ukrainian/machinery", 42),
-            "evidence": "issue_body",
+    prev_limit = sys.get_int_max_str_digits()
+    sys.set_int_max_str_digits(0)
+    try:
+        assert issues_router._extract_supersede_hint(f"superseded-by: #{huge}\nmerged-in: PR #{huge}") == {}
+        assert issues_router._extract_supersede_hint("superseded-by: #42\nmerged-in: PR #43") == {
+            "superseded_by": 42,
+            "merged_in_pr": 43,
         }
-    ]
 
-    assert check_agent_attribution.pr_number_from_subject(f"fix: subject (#{huge})") is None
-    assert check_agent_attribution.pr_number_from_subject("fix: subject (#42)") == 42
+        assert ci_timings.extract_pr_number(f"gh-readonly-queue/main/pr-{huge}-abcdef") is None
+        assert ci_timings.extract_pr_number(f"pr-{huge}") is None
+        with pytest.raises(ValueError, match="Invalid --since format"):
+            ci_timings.parse_since(f"{huge}d")
+        with pytest.raises(ValueError, match="Invalid --since format"):
+            ci_timings.parse_since("\u0661\u0660d")
 
-    base_sha = "a" * 40
-    head_sha = "b" * 40
-    with pytest.raises(queue_review_gate.GateError, match="merge_group event unreadable"):
-        queue_review_gate.parse_event(
+        for bad_pr in (f"https://github.com/o/r/pull/{huge}", f"pr-{huge}", huge, f"feature-123-pr-{huge}"):
+            with pytest.raises(ValueError, match="Could not parse pull request number"):
+                gh_merge_queue_status.parse_pr_identifier(bad_pr)
+
+        rels = relations.extract_body_relations(
+            f"blocks #{huge} and depends on #0 and supersedes #42",
+            repository_id="learn-ukrainian/machinery",
+            self_number=1,
+        )
+        assert rels == [
             {
-                "action": "checks_requested",
-                "repository": {"full_name": "learn-ukrainian/machinery"},
-                "merge_group": {
-                    "base_sha": base_sha,
-                    "head_sha": head_sha,
-                    "base_ref": "refs/heads/main",
-                    "head_ref": f"refs/heads/gh-readonly-queue/main/pr-{huge}-{base_sha}",
-                },
+                "type": "supersedes",
+                "target_id": relations.issue_work_id("learn-ukrainian/machinery", 42),
+                "evidence": "issue_body",
             }
-        )
+        ]
 
-    assert branch_sweep._numbers(branch_sweep._ISSUE_NUMBER_RE, f"issue-{huge}") == []
-    assert branch_sweep._numbers(branch_sweep._ISSUE_NUMBER_RE, "issue-420") == [420]
+        assert check_agent_attribution.pr_number_from_subject(f"fix: subject (#{huge})") is None
+        assert check_agent_attribution.pr_number_from_subject("fix: subject (#42)") == 42
 
-    assert merge_queue_keeper._failed_check_run_ids(
-        [{"head_sha": head_sha, "conclusion": "failure", "details_url": f"https://github.com/o/r/actions/runs/{huge}"}],
-        head_sha,
-    ) == []
+        base_sha = "a" * 40
+        head_sha = "b" * 40
+        with pytest.raises(queue_review_gate.GateError, match="merge_group event unreadable"):
+            queue_review_gate.parse_event(
+                {
+                    "action": "checks_requested",
+                    "repository": {"full_name": "learn-ukrainian/machinery"},
+                    "merge_group": {
+                        "base_sha": base_sha,
+                        "head_sha": head_sha,
+                        "base_ref": "refs/heads/main",
+                        "head_ref": f"refs/heads/gh-readonly-queue/main/pr-{huge}-{base_sha}",
+                    },
+                }
+            )
 
-    with pytest.raises(ValueError, match="invalid closing issue URL"):
-        postmerge_criteria.closing_issues(
-            {"closingIssuesReferences": [{"url": f"https://github.com/o/r/issues/{huge}"}], "body": ""},
+        assert branch_sweep._numbers(branch_sweep._ISSUE_NUMBER_RE, f"issue-{huge}") == []
+        assert branch_sweep._numbers(branch_sweep._ISSUE_NUMBER_RE, "issue-420") == [420]
+
+        assert merge_queue_keeper._failed_check_run_ids(
+            [
+                {"head_sha": head_sha, "conclusion": "failure", "details_url": f"https://github.com/o/r/actions/runs/{huge}"},
+                {"head_sha": head_sha, "conclusion": "failure", "details_url": "https://github.com/o/r/actions/runs/123\u0664"},
+            ],
+            head_sha,
+        ) == []
+        assert merge_queue_keeper._failed_check_run_ids(
+            [{"head_sha": head_sha, "conclusion": "failure", "details_url": "https://github.com/o/r/actions/runs/123/job/9"}],
+            head_sha,
+        ) == [123]
+
+        with pytest.raises(ValueError, match="invalid closing issue URL"):
+            postmerge_criteria.closing_issues(
+                {"closingIssuesReferences": [{"url": f"https://github.com/o/r/issues/{huge}"}], "body": ""},
+                "o/r",
+            )
+        assert postmerge_criteria.closing_issues(
+            {"closingIssuesReferences": [], "body": f"Fixes #{huge} and Fixes #42"},
             "o/r",
-        )
-    assert postmerge_criteria.closing_issues(
-        {"closingIssuesReferences": [], "body": f"Fixes #{huge} and Fixes #42"},
-        "o/r",
-    ) == [("o/r", 42)]
+        ) == [("o/r", 42)]
 
-    with pytest.raises(release_cut.CutError, match="not a release version"):
-        release_cut.next_version(f"0.1.{huge}")
-    with pytest.raises(release_cut.CutError, match="no pull request URL"):
-        release_cut.pr_number(f"https://github.com/o/r/pull/{huge}")
-    assert release_cut.pr_number("https://github.com/o/r/pull/42") == 42
+        with pytest.raises(release_cut.CutError, match="not a release version"):
+            release_cut.next_version(f"0.1.{huge}")
+        with pytest.raises(release_cut.CutError, match="no pull request URL"):
+            release_cut.pr_number(f"https://github.com/o/r/pull/{huge}")
+        assert release_cut.pr_number("https://github.com/o/r/pull/42") == 42
 
-    with pytest.raises(ValueError, match="comment needs an explanation and one same-repository merged PR"):
-        publish_github._dismiss_preflight(
-            {
-                "number": 7,
-                "comment": f"Dismiss alert #7 fixed in https://github.com/learn-ukrainian/machinery/pull/{huge}",
-            },
-            "learn-ukrainian/machinery",
-            "github.com/learn-ukrainian/machinery",
-            None,
-            Path("."),
-            {},
-        )
+        for comment in (
+            f"Dismiss alert #7 fixed in https://github.com/learn-ukrainian/machinery/pull/{huge}",
+            f"Dismiss alert #7 fixed in https://github.com/learn-ukrainian/machinery/pull/42 and https://github.com/learn-ukrainian/machinery/pull/{huge}",
+        ):
+            with pytest.raises(ValueError, match="comment needs an explanation and one same-repository merged PR"):
+                publish_github._dismiss_preflight(
+                    {"number": 7, "comment": comment},
+                    "learn-ukrainian/machinery",
+                    "github.com/learn-ukrainian/machinery",
+                    None,
+                    Path("."),
+                    {},
+                )
+    finally:
+        sys.set_int_max_str_digits(prev_limit)
 
 
 pytestmark = [pytest.mark.usefixtures('github_command_boundary')]
