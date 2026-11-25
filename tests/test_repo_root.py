@@ -1360,6 +1360,24 @@ def test_registry_loaders_resolve_profile_config_at_call_time(unconfigured, tmp_
         assert driver_agent_type.resolve_driver_agent_type("beta-lane") == "beta-driver"
         assert ignored_task_output.succession_streams()[1] == _succession_digest(profile_b)
 
+        # A declared lane or taxonomy file that is missing fails closed with each reader's own typed
+        # error; the Fleet Comms roster reports its lane part unavailable instead of raising.
+        from lu_machinery.fleet_comms import authority
+
+        kept = {name: (profile_b.parent / name).read_bytes() for name in ("driver_lanes.json", "fleet_taxonomy.yaml")}
+        for name in kept:
+            (profile_b.parent / name).unlink()
+        with pytest.raises(driver_lanes.LaneConfigError, match="driver_lanes"):
+            driver_lanes.load_registry()
+        with pytest.raises(fleet_taxonomy.FleetTaxonomyError, match="fleet_taxonomy"):
+            fleet_taxonomy.resolve_area("beta-lane")
+        authority._ROSTER_CACHE.clear()
+        roster, complete = authority._load_roster()
+        assert complete is False
+        assert authority.DURABLE_CTO_RECIPIENT in roster
+        for name, content in kept.items():
+            (profile_b.parent / name).write_bytes(content)
+
         # Broken declared target in active profile fails closed rather than falling back to packaged defaults.
         (profile_b.parent / "issue_streams.yaml").unlink()
         with pytest.raises(profile.ProfileError, match="issue_streams"):

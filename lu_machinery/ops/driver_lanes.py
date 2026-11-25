@@ -240,7 +240,10 @@ def default_data_path() -> Path:
 
 
 def load_registry(path: Path | None = None) -> Registry:
-    source = path or default_data_path()
+    try:
+        source = path or default_data_path()
+    except profile.ProfileError as exc:
+        raise LaneConfigError(f"lane data unavailable: {exc}") from exc
     try:
         data = json_depth.loads(source.read_text(encoding="utf-8"), max_depth=512)
     except (OSError, json.JSONDecodeError) as exc:

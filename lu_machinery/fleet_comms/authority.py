@@ -234,24 +234,31 @@ def _load_roster() -> tuple[frozenset[str], bool]:
     reparse both files.
     """
     from lu_machinery import agent_identity
+    from lu_machinery.common import profile
     from lu_machinery.ops import driver_lanes
 
-    paths = (Path(agent_identity.default_assignments_path()), Path(driver_lanes.default_data_path()))
+    assignments = Path(agent_identity.default_assignments_path())
+    try:
+        lane_data: Path | None = Path(driver_lanes.default_data_path())
+    except profile.ProfileError:  # an unusable profile entry leaves the lane roster unavailable
+        lane_data = None
     key: list[object] = []
-    for path in paths:
-        try:
-            stat = path.stat()
-            key.append((str(path), stat.st_mtime_ns, stat.st_size))
-        except OSError:
-            key.append((str(path), None, None))
+    for path in (assignments, lane_data):
+        identity: tuple[int | None, int | None] = (None, None)
+        if path is not None:
+            with contextlib.suppress(OSError):
+                stat = path.stat()
+                identity = (stat.st_mtime_ns, stat.st_size)
+        key.append((str(path), *identity))
     cached = _ROSTER_CACHE.get(tuple(key))
     if cached is not None:
         return cached
-    slots = agent_identity._load_registry_slots(paths[0])
-    external, external_availability = load_external_recipients(paths[0])
+    slots = agent_identity._load_registry_slots(assignments)
+    external, external_availability = load_external_recipients(assignments)
     lanes: tuple[str, ...] = ()
-    with contextlib.suppress(Exception):
-        lanes = tuple(lane.sender for lane in driver_lanes.load_registry(paths[1]).lanes)
+    if lane_data is not None:
+        with contextlib.suppress(Exception):
+            lanes = tuple(lane.sender for lane in driver_lanes.load_registry(lane_data).lanes)
     complete = bool(slots) and bool(lanes) and external_availability == "available"
     if not complete:
         _LOG.warning(

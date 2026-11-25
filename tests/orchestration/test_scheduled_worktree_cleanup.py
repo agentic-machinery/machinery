@@ -41,7 +41,11 @@ def _isolated_task_scratch_root(tmp_path_factory, monkeypatch) -> Path:
 
 
 def test_default_repositories_come_from_configured_roots(tmp_path: Path, monkeypatch, configured_roots) -> None:
-    """Defect class: a default repository taken from the state root or guessed as a sibling of another checkout."""
+    """Defect class: a default repository taken from the state root or guessed as a sibling of another checkout.
+
+    The Git-backed state root (here the configured primary) owns the task store, so the default
+    sweep still visits it as a repository: it alone runs retained-worktree settlement.
+    """
     repos = tmp_path / "checkouts"
     repos.mkdir()
     monkeypatch.setenv("LU_REPOS_ROOT", str(repos))
@@ -50,8 +54,10 @@ def test_default_repositories_come_from_configured_roots(tmp_path: Path, monkeyp
     assert cleanup.default_public_repo() == configured_roots.product != configured_roots.primary
     assert cleanup.default_private_repo() == repos / local_name
     assert configured_roots.product.parent != repos
-    # Without --repo-root, Git hygiene runs on those checkouts, and the batch_state and rollover
-    # sweeps stay on the state root.
+    assert cleanup.git_backed_state_root(configured_roots.product) == configured_roots.primary
+    assert cleanup.git_backed_state_root(configured_roots.primary) is None
+    # Without --repo-root, Git hygiene runs on those checkouts and the Git-backed state root, and the
+    # batch_state and rollover sweeps stay on the state root.
     seen: dict[str, list[Path]] = {}
     monkeypatch.setattr(
         cleanup,
@@ -69,7 +75,7 @@ def test_default_repositories_come_from_configured_roots(tmp_path: Path, monkeyp
     monkeypatch.setattr(cleanup.home_session_retention_check, "warning_lines", lambda _report: [])
     monkeypatch.setattr(cleanup, "build_public_summary", lambda *_args: {})
     assert cleanup.main(["--receipt-dir", str(tmp_path / "receipts")]) == 0
-    assert seen["git"] == [configured_roots.product, repos / local_name]
+    assert seen["git"] == [configured_roots.product, configured_roots.primary, repos / local_name]
     assert seen["state"] == [cleanup.state_root(), repos / local_name]
     assert seen["rollover"] == [Path(root) / ".agent/thread-rollovers/claude" for root in seen["state"]]
     assert cleanup.state_root() != configured_roots.product

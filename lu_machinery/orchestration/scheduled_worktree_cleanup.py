@@ -91,6 +91,18 @@ def default_private_repo() -> Path:
     return repos_root() / repo.local_name
 
 
+def git_backed_state_root(*repo_roots: Path) -> Path | None:
+    """The state root when it is a Git checkout apart from ``repo_roots``, else ``None``.
+
+    Such a checkout owns the task store, so it alone runs retained-worktree settlement and must be
+    swept as a repository too.
+    """
+    state = state_root()
+    if not (state / ".git").exists() or state.resolve() in {root.resolve() for root in repo_roots}:
+        return None
+    return state
+
+
 def default_state_dir() -> Path:
     return Path.home() / ".codex" / "worktree-cleanup"
 
@@ -1820,10 +1832,12 @@ def main(argv: list[str] | None = None) -> int:
         if args.repo_root:
             repo_roots = state_roots = args.repo_root
         else:
+            public = default_public_repo()
             private = default_private_repo()
-            repo_roots = [default_public_repo(), private]
-            # batch_state/ and .agent/ live under the state root, which a detached plane keeps
-            # apart from the product checkout.
+            state = git_backed_state_root(public, private)
+            repo_roots = [public, *([state] if state is not None else []), private]
+            # batch_state/ and .agent/ live under the state root, which a detached plane keeps apart
+            # from the product checkout.
             state_roots = [state_root(), private]
     except (MachineryConfigError, FleetRepoError) as exc:
         parser.error(str(exc))

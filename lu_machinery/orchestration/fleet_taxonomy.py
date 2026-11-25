@@ -61,8 +61,16 @@ class TaxonomyRegistry:
 
 
 def load_fleet_taxonomy(taxonomy_path: Path | None = None) -> TaxonomyRegistry:
-    """Load and index fleet_taxonomy.yaml (default: :func:`default_taxonomy_path`, resolved per call)."""
-    return _load_fleet_taxonomy((taxonomy_path or default_taxonomy_path()).resolve())
+    """Load and index fleet_taxonomy.yaml (default: :func:`default_taxonomy_path`, resolved per call).
+
+    A profile entry that cannot be used raises :class:`FleetTaxonomyError`, like an unreadable file.
+    """
+    if taxonomy_path is None:
+        try:
+            taxonomy_path = default_taxonomy_path()
+        except profile.ProfileError as exc:
+            raise FleetTaxonomyError(f"Fleet taxonomy unavailable: {exc}") from exc
+    return _load_fleet_taxonomy(taxonomy_path.resolve())
 
 
 @functools.lru_cache(maxsize=16)

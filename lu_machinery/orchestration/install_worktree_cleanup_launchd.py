@@ -74,8 +74,10 @@ def build_plist(
     private_repo: Path,
     home: Path,
     interval_minutes: int,
+    state_repo: Path | None = None,
 ) -> dict[str, Any]:
     runtime = state_dir(home)
+    state_args = ["--repo-root", str(state_repo)] if state_repo is not None else []
     return {
         "Label": LABEL,
         "EnvironmentVariables": {"PATH": LAUNCHD_PATH},
@@ -89,6 +91,7 @@ def build_plist(
             "--apply",
             "--repo-root",
             str(public_repo),
+            *state_args,
             "--repo-root",
             str(private_repo),
             "--receipt-dir",
@@ -108,6 +111,7 @@ def render_plist(
     private_repo: Path,
     home: Path,
     interval_minutes: int,
+    state_repo: Path | None = None,
 ) -> bytes:
     return plistlib.dumps(
         build_plist(
@@ -115,6 +119,7 @@ def render_plist(
             private_repo=private_repo,
             home=home,
             interval_minutes=interval_minutes,
+            state_repo=state_repo,
         ),
         fmt=plistlib.FMT_XML,
         sort_keys=True,
@@ -190,17 +195,22 @@ def install(
     private_repo: Path,
     home: Path,
     interval_minutes: int,
+    state_repo: Path | None = None,
 ) -> dict[str, Any]:
     public_repo = public_repo.resolve()
     private_repo = private_repo.resolve()
     _validate_primary(public_repo, require_interpreter=True)
     _validate_primary(private_repo)
+    if state_repo is not None:
+        state_repo = state_repo.resolve()
+        _validate_primary(state_repo)
     destination = plist_path(home)
     content = render_plist(
         public_repo=public_repo,
         private_repo=private_repo,
         home=home,
         interval_minutes=interval_minutes,
+        state_repo=state_repo,
     )
     # Refuse a symlinked home or plist directory before creating state under it.
     installed = load_unit(destination, home=home)
@@ -239,6 +249,7 @@ def install(
         "plist_path": str(destination),
         "private_repo": str(private_repo),
         "public_repo": str(public_repo),
+        **({"state_repo": str(state_repo)} if state_repo is not None else {}),
         "wrote_plist": wrote_plist,
     }
 
@@ -250,12 +261,14 @@ def _valid_persisted_plist(
     private_repo: Path,
     home: Path,
     interval_minutes: int,
+    state_repo: Path | None = None,
 ) -> bool:
     return payload == build_plist(
         public_repo=public_repo,
         private_repo=private_repo,
         home=home,
         interval_minutes=interval_minutes,
+        state_repo=state_repo,
     )
 
 
@@ -265,6 +278,7 @@ def status(
     private_repo: Path | None,
     home: Path,
     interval_minutes: int,
+    state_repo: Path | None = None,
 ) -> tuple[dict[str, Any], int]:
     destination = plist_path(home)
     installed = load_unit(destination, home=home)
@@ -282,6 +296,7 @@ def status(
         private_repo=private_repo.resolve(),
         home=home,
         interval_minutes=interval_minutes,
+        state_repo=state_repo.resolve() if state_repo is not None else None,
     )
     result = {
         "action": "status",
@@ -357,6 +372,9 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         public_repo = (args.public_repo or scheduled_worktree_cleanup.default_public_repo()).expanduser().resolve()
+        # The default public repository is the product checkout. A Git-backed state root apart from
+        # it owns the task store, so the agent sweeps it too, as the scheduled job's own default does.
+        state_repo = None if args.public_repo is not None else scheduled_worktree_cleanup.git_backed_state_root(public_repo)
     except MachineryConfigError as exc:
         parser.error(str(exc))
     registry_error = None
@@ -377,6 +395,7 @@ def main(argv: list[str] | None = None) -> int:
             private_repo=private_repo,
             home=home,
             interval_minutes=args.interval_minutes,
+            state_repo=state_repo,
         )
         if registry_error is not None:
             result["registry_error"] = registry_error
@@ -389,6 +408,7 @@ def main(argv: list[str] | None = None) -> int:
                 private_repo=private_repo,
                 home=home,
                 interval_minutes=args.interval_minutes,
+                state_repo=state_repo,
             ).decode("utf-8"),
             end="",
         )
@@ -399,6 +419,7 @@ def main(argv: list[str] | None = None) -> int:
             private_repo=private_repo,
             home=home,
             interval_minutes=args.interval_minutes,
+            state_repo=state_repo,
         )
         return_code = 0
     print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
