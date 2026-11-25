@@ -84,12 +84,16 @@ def extract_body_relations(
     """Extract source-provided relations from public issue body text."""
     if not body:
         return []
+    from lu_machinery.orchestration.fleet_repos import parse_ascii_positive_int
+
     rels: list[dict[str, str]] = []
     seen: set[tuple[str, str]] = set()
 
-    def add(rel_type: str, number: str, evidence: str) -> None:
-        if number == str(self_number):
+    def add(rel_type: str, raw_number: str, evidence: str) -> None:
+        parsed = parse_ascii_positive_int(raw_number)
+        if parsed is None or parsed == self_number:
             return
+        number = str(parsed)
         key = (rel_type, number)
         if key in seen:
             return

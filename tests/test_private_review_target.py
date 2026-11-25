@@ -585,4 +585,23 @@ def test_repository_target_error_hides_unavailable_root_oserror():
     assert "absent-root" not in error
 
 
+def test_non_ascii_origin_refuses_with_module_typed_errors(tmp_path):
+    """Defect class: non-ASCII remote.origin.url raises uncaught TargetResolutionError instead of module typed errors."""
+    from lu_machinery.ai_agent_bridge import _gemini_review
+    from lu_machinery.review import closeout_cli
+
+    repo = tmp_path / "non-ascii-origin"
+    catalog = load_fleet_repos()["public"].github
+    _init_committed_repo(repo, f"https://github.com/{catalog}.git", "app.py")
+    assert closeout_cli._checkout_repository(repo) == catalog
+
+    _git(repo, "remote", "set-url", "origin", "https://github.com/learn-u\u212arainian/machinery.git")
+    with pytest.raises(closeout_cli.CloseoutStateError, match="checkout origin is not an exact owner/name"):
+        closeout_cli._checkout_repository(repo)
+    with pytest.raises(_gemini_review.GeminiChangedPathListError, match="checkout origin is not an exact owner/name"):
+        _gemini_review.resolve_same_repo_pr_head(9, repo_root=str(repo))
+    with pytest.raises(_gemini_review.GeminiChangedPathListError, match="refusing to list files"):
+        _gemini_review.resolve_same_repo_pr_head("9" * 5000, repo_root=str(repo))  # type: ignore[arg-type]
+
+
 pytestmark = pytest.mark.usefixtures("configured_roots")

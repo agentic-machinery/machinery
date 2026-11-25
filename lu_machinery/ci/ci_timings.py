@@ -36,6 +36,7 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from lu_machinery.ci._location import module_name
 from lu_machinery.common import github_client, json_depth
+from lu_machinery.orchestration.fleet_repos import parse_ascii_positive_int
 
 DEFAULT_WORKFLOW = "CI"
 DEFAULT_WORKFLOW_FILE = "ci.yml"
@@ -94,28 +95,38 @@ def parse_since(since_str: str, now: datetime | None = None) -> datetime:
     - ISO timestamps: '2026-08-22', '2026-08-22T00:00:00Z', '2026-08-22T00:00:00+00:00'
     - Relative durations: '10d', '24h', '30m', '2w', or plain integer (treated as days).
     """
+    if not isinstance(since_str, str) or not since_str.isascii():
+        raise ValueError(
+            f"Invalid --since format {since_str!r}. Expected ISO timestamp (e.g. 2026-08-22) "
+            f"or relative duration (e.g. 10d, 24h)."
+        )
     text = since_str.strip()
     if not text:
         raise ValueError("Empty since string")
 
-    # Check relative duration pattern
-    rel_match = re.fullmatch(r"(\d+)\s*([dhwmsDHWMS])?", text)
+    # Check relative duration pattern (bounded ASCII digits to avoid unbounded int()/timedelta overflow)
+    rel_match = re.fullmatch(r"([0-9]{1,9})[ \t]*([dhwmsDHWMS])?", text)
     if rel_match:
         val = int(rel_match.group(1))
         unit = (rel_match.group(2) or "d").lower()
         clock = now if now is not None else datetime.now(UTC)
         clock = clock.replace(tzinfo=UTC) if clock.tzinfo is None else clock.astimezone(UTC)
 
-        if unit == "d":
-            return clock - timedelta(days=val)
-        if unit == "h":
-            return clock - timedelta(hours=val)
-        if unit == "w":
-            return clock - timedelta(weeks=val)
-        if unit == "m":
-            return clock - timedelta(minutes=val)
-        if unit == "s":
-            return clock - timedelta(seconds=val)
+        try:
+            if unit == "d":
+                return clock - timedelta(days=val)
+            if unit == "h":
+                return clock - timedelta(hours=val)
+            if unit == "w":
+                return clock - timedelta(weeks=val)
+            if unit == "m":
+                return clock - timedelta(minutes=val)
+            if unit == "s":
+                return clock - timedelta(seconds=val)
+        except OverflowError as exc:
+            raise ValueError(
+                f"Invalid --since format {since_str!r}. Relative duration is out of range."
+            ) from exc
 
     # ISO format parsing
     iso_text = text
@@ -161,10 +172,10 @@ def extract_pr_number(head_branch: str | None) -> int | None:
         return None
     queue_m = QUEUE_BRANCH_RE.search(head_branch)
     if queue_m:
-        return int(queue_m.group(1))
+        return parse_ascii_positive_int(queue_m.group(1))
     pr_m = PR_NUM_RE.search(head_branch)
     if pr_m:
-        return int(pr_m.group(1))
+        return parse_ascii_positive_int(pr_m.group(1))
     return None
 
 

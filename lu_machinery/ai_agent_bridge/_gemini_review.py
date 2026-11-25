@@ -152,8 +152,10 @@ def resolve_same_repo_pr_head(pr_number: int, *, repo_root: str) -> tuple[str, s
     A second lookup is a different moment: callers keep this pair and pass the
     SHA through instead of asking GitHub again.
     """
-    number = int(pr_number)
-    if number < 1:
+    from lu_machinery.orchestration.fleet_repos import parse_ascii_positive_int
+
+    number = parse_ascii_positive_int(pr_number)
+    if number is None:
         raise GeminiChangedPathListError(f"refusing to list files for PR {pr_number!r}")
     from lu_machinery.review.target_resolution import (
         TargetResolutionError,
@@ -161,7 +163,10 @@ def resolve_same_repo_pr_head(pr_number: int, *, repo_root: str) -> tuple[str, s
         live_canonical_branch_head,
     )
 
-    slug = _origin_github_repo(Path(repo_root))
+    try:
+        slug = _origin_github_repo(Path(repo_root))
+    except (TargetResolutionError, OSError, subprocess.TimeoutExpired) as exc:
+        raise GeminiChangedPathListError(str(exc)) from exc
     if slug is None:
         raise GeminiChangedPathListError("checkout origin is not a GitHub owner/name; refusing an unpinned gh pr view")
     raw = _run_changed_path_command(
@@ -308,14 +313,19 @@ def gemini_pr_or_branch_content_error(
     if head_sha is None and pr_number is None and not (branch and str(branch).strip()):
         return None
     try:
-        if pr_number is not None and int(pr_number) < 1:
-            raise GeminiChangedPathListError(f"refusing to list files for PR {pr_number!r}")
-        if head_sha is not None or pr_number is not None:
+        parsed_pr: int | None = None
+        if pr_number is not None:
+            from lu_machinery.orchestration.fleet_repos import parse_ascii_positive_int
+
+            parsed_pr = parse_ascii_positive_int(pr_number)
+            if parsed_pr is None:
+                raise GeminiChangedPathListError(f"refusing to list files for PR {pr_number!r}")
+        if head_sha is not None or parsed_pr is not None:
             pinned = _full_git_sha(head_sha or "")
             if pinned is None:
-                if pr_number is None:
+                if parsed_pr is None:
                     raise GeminiChangedPathListError(f"refusing to diff non-SHA {head_sha!r}")
-                _branch, pinned = resolve_same_repo_pr_head(int(pr_number), repo_root=repo_root)
+                _branch, pinned = resolve_same_repo_pr_head(parsed_pr, repo_root=repo_root)
             if head_out is not None:
                 head_out.append(pinned)
             paths = list_commit_changed_paths(pinned, repo_root=repo_root)
