@@ -2299,6 +2299,29 @@ def _repo_matches(document, slug, repository_id):
     )
 
 
+def _repo_transfer_acknowledged(document, source, destination, repository_id):
+    """Whether a POST /repos/{source}/transfer 202 answer names the pinned private repository.
+
+    GitHub's transfer endpoint returns 202 Accepted with ``minimal-repository``, where ``id``,
+    ``full_name`` and ``private`` are required and ``visibility`` is optional; the owner transfer
+    and ``new_name`` rename continue asynchronously, so ``full_name`` may hold either endpoint's
+    owner paired with either endpoint's name. Exact destination slug and ``visibility == "private"``
+    are verified afterwards by the bounded ``GET /repos/{destination}`` readback loop.
+    """
+    if not isinstance(document, dict):
+        return False
+    source_owner, source_name = source.split("/", 1)
+    dest_owner, dest_name = destination.split("/", 1)
+    slugs = (source, destination, f"{source_owner}/{dest_name}", f"{dest_owner}/{source_name}")
+    if "visibility" in document and document["visibility"] != "private":
+        return False
+    return (
+        any(_same_slug(document.get("full_name"), slug) for slug in slugs)
+        and type(document.get("id")) is int and document["id"] == repository_id
+        and document.get("private") is True
+    )
+
+
 _REPO_ADMIN_RUN: contextvars.ContextVar[dict[str, bool]] = contextvars.ContextVar("repo_admin_run")
 
 
@@ -2534,9 +2557,11 @@ def _repo_admin_post(endpoint, frozen, runner, cwd, environment):
 
 
 def _repo_admin_readback(slug, repository_id, principal_before, reader, cwd, environment):
-    """Re-read *slug* until it is exactly that id and private, then re-read the principal. Nothing here writes.
+    """Re-read *slug* within ``TRANSFER_VERIFY_DELAYS`` (8 reads over 180 s) until it matches, then re-read the principal.
 
-    Every failure raises ValueError with its reason; the caller reports it as unsettled.
+    GitHub runs repository transfers asynchronously (202 Accepted), so the destination slug may not appear
+    immediately after the POST. Nothing here writes; every failure raises ValueError with its reason and
+    the caller reports it as unsettled while keeping any transfer journal.
     """
     detail = "the readback did not show the expected repository"
     for delay in TRANSFER_VERIFY_DELAYS:
@@ -2556,7 +2581,7 @@ def _repo_admin_readback(slug, repository_id, principal_before, reader, cwd, env
             else "the readback found another repository, slug or visibility"
         )
     else:
-        raise ValueError(detail)
+        raise ValueError(f"{detail} after {len(TRANSFER_VERIFY_DELAYS)} reads over {sum(TRANSFER_VERIFY_DELAYS)} s")
     try:
         identity = _repo_admin_whoami(reader, cwd, environment)
     except Exception:
@@ -3053,7 +3078,7 @@ def _repo_transfer_send(plan, receipt, sink, directory_fd, journal_name, frozen,
             verb, receipt, sink, REPO_ADMIN_UNSETTLED, "ambiguous", "the transfer's result is unknown",
             capture_output, text,
         )
-    if not any(_repo_matches(acknowledged, slug, repository_id) for slug in (source, destination)):
+    if not _repo_transfer_acknowledged(acknowledged, source, destination, repository_id):
         return _repo_admin_settle(
             verb, receipt, sink, REPO_ADMIN_UNSETTLED, "unverified",
             f"GitHub's answer does not name the pinned private repository {repository_id}", capture_output, text,
@@ -4891,9 +4916,15 @@ def _parse_args(argv):
                 + _DESTINATION_OWNER_PRECONDITION
                 + "GitHub addresses a transfer by slug only, so nobody else may rename, transfer\n"
                 "  or create repositories in the source organization during the run.\n"
-                "Outputs: one POST repos/<source>/transfer {new_owner, new_name}; its answer must name the pinned id,\n"
-                "  private; then readbacks of the exact destination slug (same id, private) over about 180 s, and\n"
-                "  GET /user to verify the same login and account id. Receipt JSON on stdout and in a new 0600 file;\n"
+                "Outputs: one POST repos/<source>/transfer {new_owner, new_name}. GitHub executes transfers\n"
+                "  asynchronously (202 Accepted with minimal-repository, where visibility may be omitted and\n"
+                "  full_name may still name the source or an intermediate owner/name pair): the POST answer must\n"
+                "  name the pinned id and private=true (and visibility=private if present). repo-transfer then\n"
+                "  polls GET repos/<destination> for the exact pinned private repository (id, full_name, private,\n"
+                "  visibility=private) across 8 fresh reads over a bounded 180 s wait (backoff 0, 2, 4, 8, 16, 30,\n"
+                "  60, 60 s), then re-reads GET /user after the last GitHub read to verify the same login and\n"
+                "  account id. Only after that bound (or on a mismatched POST answer or final GET /user) does it\n"
+                "  exit 3 (unverified) and keep the journal. Receipt JSON on stdout and in a new 0600 file;\n"
                 "  journal repo-transfer-<id>.pending there from just before the POST until verified.\n"
                 "Exit codes: 0 transferred and verified, already transferred, or dry run passed (a journal that could\n"
                 "  not be removed is named in the receipt); 2 invalid input, a caller or registry refusal, or a\n"
