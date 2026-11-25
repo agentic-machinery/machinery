@@ -975,11 +975,12 @@ if [ "$HERE" = 1 ]; then
   LC_WORKSPACE_ROOT="$REPO" exec "${LAUNCH[@]}"
 fi
 tmux has-session -t =cto 2>/dev/null && { echo "refused: tmux session cto exists (use --here inside it)" >&2; exit 3; }
-# tmux takes the client's working directory. An empty session value overrides
-# a reused server's selector. Escape trailing semicolons in tmux arguments.
+# Enter REPO in the pane so a tmux config-client cwd cannot override it.
+# An empty session value overrides a reused server's selector.
+# Escape trailing semicolons in tmux arguments.
 TMUX_ARGS=(
   new-session -d -s cto -e "CLAUDE_CONFIG_DIR=$DIR" -e "LC_WORKSPACE_ROOT="
-  bash -c 'unset LC_WORKSPACE_ROOT; LC_WORKSPACE_ROOT="$1" "${@:2}"; exec bash' bash "$REPO" "${LAUNCH[@]}"
+  bash -c 'unset LC_WORKSPACE_ROOT; cd -- "$1" || exit; LC_WORKSPACE_ROOT="$1" "${@:2}"; exec bash' bash "$REPO" "${LAUNCH[@]}"
 )
 for index in "${!TMUX_ARGS[@]}"; do
   if [[ "${TMUX_ARGS[index]}" == *';' ]]; then
@@ -987,7 +988,7 @@ for index in "${!TMUX_ARGS[@]}"; do
   fi
 done
 env -u LC_WORKSPACE_ROOT tmux "${TMUX_ARGS[@]}"
-echo "started; attach with: tmux attach -t cto"
+echo "created tmux session cto; attach with: tmux attach -t cto"
 """
 
 
