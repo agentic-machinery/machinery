@@ -1974,6 +1974,9 @@ def test_strict_inventory_skips_review_tool_receipts_without_identity(tmp_path, 
         ),
         pytest.param("lost-identity.json", b'{"schema_version": 2, "status": "running"}', id="int-schema-object"),
         pytest.param("note-list.json", b'["note"]', id="non-empty-foreign-array"),
+        pytest.param("nan-report.json", b'{"status": "ok", "elapsed_s": NaN}', id="non-json-nan"),
+        pytest.param("inf-report.json", b'{"status": "ok", "elapsed_s": Infinity}', id="non-json-infinity"),
+        pytest.param("neg-inf-report.json", b'{"status": "ok", "elapsed_s": -Infinity}', id="non-json-negative-infinity"),
     ],
 )
 def test_strict_inventory_still_refuses_record_claims_that_fail_to_parse(tmp_path, name, raw):

@@ -1741,9 +1741,10 @@ def strict_task_inventory_in(tasks_dir: Path, *, include_archive: bool = True) -
     """Return every verified task record under ``tasks_dir`` (and archive) while holding ``task_archive_lock``.
 
     A file ``parse_task_record`` calls foreign (it returns ``None``) is skipped only when its bytes
-    decode to a JSON object (the parser alone classifies objects: a policy, build or receipt file
-    makes no record claim) or to exactly ``[]``. Any other ``None`` (text that is not JSON, such as
-    bare record members, or another array or scalar, such as an array holding a record) is refused.
+    decode as strict JSON (no ``NaN`` or ``Infinity``) to an object (the parser alone classifies
+    objects: a policy, build or receipt file makes no record claim) or to exactly ``[]``. Any other
+    ``None`` (text that is not JSON, such as bare record members, or another array or scalar, such
+    as an array holding a record) is refused.
     Fails closed on any directory traversal error, unreachable existing archive entry, dangling
     symlink, non-regular ``.json`` candidate (FIFO, socket, device, directory), damaged record claim
     the parser refuses (a broken JSON object, a blank or zero-filled file under a v2 record name, an
@@ -1777,7 +1778,11 @@ def strict_task_inventory_in(tasks_dir: Path, *, include_archive: bool = True) -
                 # The parser also returns None for text that is not JSON and for every array or scalar,
                 # so bare record members or an array holding a record would hide a live child.
                 try:
-                    decoded = json_depth.loads(raw.decode("utf-8"), max_depth=task_record_store._JSON_MAX_DEPTH)
+                    decoded = json_depth.loads(
+                        raw.decode("utf-8"),
+                        max_depth=task_record_store._JSON_MAX_DEPTH,
+                        parse_constant=_reject_json_constant,
+                    )
                 except ValueError:
                     decoded = None
                 if not (isinstance(decoded, dict) or decoded == []):
@@ -1787,6 +1792,11 @@ def strict_task_inventory_in(tasks_dir: Path, *, include_archive: bool = True) -
                 raise ValueError(f"unreadable task record {listed.name}")
             records.append(parsed)
     return records
+
+
+def _reject_json_constant(token: str) -> Any:
+    """Refuse ``NaN`` and ``Infinity``: Python's decoder admits them, JSON does not."""
+    raise ValueError(f"non-JSON constant {token}")
 
 
 def _is_valid_run_identity(value: object) -> bool:
