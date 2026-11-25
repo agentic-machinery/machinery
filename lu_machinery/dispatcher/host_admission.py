@@ -28,7 +28,7 @@ from lu_machinery.orchestration.dead_worker_state import (
     mark_orphaned_worktree_prep_crashed,
     worker_liveness,
 )
-from lu_machinery.orchestration.task_record_store import task_state_lock
+from lu_machinery.orchestration.task_record_store import NonFiniteRecordValue, task_state_lock
 
 
 class Refused(ValueError):
@@ -46,6 +46,14 @@ def _write(path, record):
         from lu_machinery.orchestration.task_record_store import write_record_unlocked
 
         write_record_unlocked(path, record)
+
+
+def _heal_dead_in_scan(path, state):
+    """``heal_dead`` for the admission scan: a record the writer refuses (#1440) stays unhealed; admission goes on."""
+    try:
+        heal_dead(path, state)
+    except NonFiniteRecordValue as exc:
+        print(f"dispatcher: dead task record {Path(path).name} not healed: {exc.code}", file=sys.stderr)
 
 
 def heal_dead(path, state):
@@ -124,7 +132,7 @@ def evaluate(mode, *, sweep, thresholds=None, disk_guard=True, meter=None, budge
     return legacy.evaluate(
         mode, tasks_dir(), pid_alive=legacy.process_alive,
         record_liveness=lambda record: worker_liveness(record, pid_alive=legacy.process_alive),
-        on_dead=heal_dead if sweep else None, thresholds=thresholds, disk_guard=disk_guard,
+        on_dead=_heal_dead_in_scan if sweep else None, thresholds=thresholds, disk_guard=disk_guard,
         meter=meter, meter_budget=budget, meter_budget_error=budget_error, orchestrator=orchestrator,
     )
 

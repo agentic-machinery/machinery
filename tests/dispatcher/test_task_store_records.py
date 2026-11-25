@@ -882,6 +882,13 @@ def test_dispatch_refuses_a_non_finite_numeric_option_at_parse_time(flag, value,
         cli.build_parser().parse_args([*argv, f"--{flag}={value}"])
     assert exited.value.code == 2
     assert f"--{flag}: must be a finite number" in capsys.readouterr().err
+    if flag == "max-budget-usd":  # the orchestrator wrapper parses the same flag before it dispatches
+        from lu_machinery.orchestration import orchestrator_control
+
+        with pytest.raises(SystemExit) as exited:
+            orchestrator_control.build_parser().parse_args(["dispatch", "--task-id", "t", f"--{flag}={value}"])
+        assert exited.value.code == 2
+        assert f"--{flag}: must be a finite number" in capsys.readouterr().err
 
 
 pytestmark = pytest.mark.usefixtures("configured_roots")

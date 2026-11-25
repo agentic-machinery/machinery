@@ -49,6 +49,17 @@ class TaskRecordError(ValueError):
         self.code = code
 
 
+class TaskRecordNonFinite(TaskRecordError, NonFiniteRecordValue):
+    """The writer's refusal of a non-finite number (#1440).
+
+    A ``TaskRecordError`` for the supervisor, and the same ``NonFiniteRecordValue`` the legacy writer
+    raises, so a per-record boundary catches both writer families with one clause.
+    """
+
+    def __init__(self, refusal: NonFiniteRecordValue):
+        NonFiniteRecordValue.__init__(self, refusal.field)
+
+
 def now() -> str:
     return datetime.now(UTC).isoformat()
 
@@ -307,7 +318,7 @@ def _write_atomic(path: Path, record: dict, exclusive: bool) -> None:
     try:
         text = record_json(record) + "\n"
     except NonFiniteRecordValue as exc:
-        raise TaskRecordError(exc.code) from exc
+        raise TaskRecordNonFinite(exc) from exc
     # Stage beside the record so the atomic replacement stays on one filesystem.
     name = path.with_name(f".{path.stem}.{uuid.uuid4().hex}.tmp")
     try:
@@ -469,7 +480,7 @@ def _clear_non_finite_fields(record: dict) -> str | None:
 
     A provider can report such a number (for example in ``usage``), which the writer refuses, so the failure
     record clears that field and names it in its error instead. A value this cannot clear (a non-finite key at
-    the top level) refuses as ``TaskRecordError``.
+    the top level) refuses as ``TaskRecordNonFinite``.
     """
     first: str | None = None
     cleared: set[Any] = set()
@@ -480,7 +491,7 @@ def _clear_non_finite_fields(record: dict) -> str | None:
         except NonFiniteRecordValue as exc:
             key = exc.field[0] if exc.field else None
             if key not in record or key in cleared:
-                raise TaskRecordError(exc.code) from exc
+                raise TaskRecordNonFinite(exc) from exc
             first = first or exc.code
             cleared.add(key)
             record[key] = None
