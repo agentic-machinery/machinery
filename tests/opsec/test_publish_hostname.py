@@ -98,6 +98,44 @@ def test_hostname_normalizer_preserves_valid_hosts(dest, expected):
     assert gate.normalize_hostname(host) == host.lower()
 
 
+def test_profile_override_cannot_lower_private_classification(tmp_path, monkeypatch):
+    """Defect class: a caller-controlled profile override lowers OPSEC classification."""
+    repo = "unit/private"
+    packaged = tmp_path / "packaged.yaml"
+    packaged.write_text(f"repos:\n  fixture:\n    github: {repo}\n    visibility: private\n", encoding="utf-8")
+    monkeypatch.setattr(gate, "_PACKAGED_CATALOG_PATH", packaged)
+
+    profile = tmp_path / ".lu-machinery" / "profile.v1.json"
+    profile.parent.mkdir()
+    (profile.parent / "fleet.yaml").write_text(
+        f"repos:\n  fixture:\n    github: {repo}\n    visibility: public\n", encoding="utf-8"
+    )
+    monkeypatch.delenv("LU_GITHUB_SLUG", raising=False)
+    monkeypatch.delenv("LEARN_UKRAINIAN_GITHUB_SLUG", raising=False)
+    monkeypatch.delenv("LEARN_UKRAINIAN_STATE_ROOT", raising=False)
+    monkeypatch.setenv("LU_STATE_ROOT", str(tmp_path))
+    monkeypatch.delenv("LU_PROFILE_PATH", raising=False)
+
+    profile_data = {
+        "schema": "lu-machinery.profile",
+        "version": 1,
+        "profile_id": "unit",
+        "github_slug": "unit/public",
+        "config": {"fleet_repos": ".lu-machinery/fleet.yaml"},
+    }
+    profile.write_text(json.dumps(profile_data), encoding="utf-8")
+    assert gate.catalog()["fixture"]["visibility"] == "public"
+    assert gate.is_private(repo)
+
+    profile_data["config"] = {"fleet_repos": "fleet.yaml"}
+    explicit_profile = profile.with_name("explicit.json")
+    explicit_profile.write_text(json.dumps(profile_data), encoding="utf-8")
+    monkeypatch.setenv("LU_PROFILE_PATH", str(explicit_profile))
+    profile.unlink()
+    assert gate.catalog()["fixture"]["visibility"] == "public"
+    assert gate.is_private(repo)
+
+
 @pytest.fixture
 def destination_transport(monkeypatch, synthetic_opsec):
     monkeypatch.setattr(gate, "catalog", lambda: CATALOG)
@@ -615,6 +653,7 @@ class _recovery_Transport:
 @pytest.fixture()
 def catalog(monkeypatch):
     monkeypatch.setattr(gate, "catalog", lambda: CATALOG)
+    monkeypatch.setattr(gate, "_packaged_catalog", lambda: CATALOG)
     monkeypatch.delenv("AGENT_NO_MERGE", raising=False)
 
 
