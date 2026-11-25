@@ -64,7 +64,7 @@ class FakeGitHub:
         self.repos = {SOURCE: repository(REPO_ID, SOURCE)}
         self.memberships = {OLD: {"state": "active", "role": "admin"}, NEW: {"state": "active", "role": "admin"}}
         self.login, self.after_login = login, after_login
-        self.calls, self.posts, self.overrides = [], [], {}
+        self.calls, self.posts, self.overrides, self.homes = [], [], {}, set()
         self.next_id = 900
 
     def find(self, slug):
@@ -74,6 +74,7 @@ class FakeGitHub:
         assert args[:3] == ["gh", "api", "--method"], args
         assert not set(pub.REPO_ADMIN_CREDENTIAL_OVERRIDES) & set(kwargs["env"])
         self.calls.append(args)
+        self.homes.add(kwargs["env"].get("HOME"))
         method, endpoint = args[3], args[4]
         override = self.overrides.get((method, endpoint, bool(self.posts)))
         if method == "POST":
@@ -157,6 +158,7 @@ def state_dir_of(_receipt):
 
 
 CALLER = [
+    ("HOME", "/caller/home"),
     *[(marker, "task-1") for marker in WORKER_MARKERS],
     *[(name, "/caller/value") for name in pub.REPO_ADMIN_CREDENTIAL_OVERRIDES],
     ("GH_HOST", "ghe.example.com"),
@@ -166,9 +168,16 @@ CALLER = [
 @pytest.mark.parametrize("verb,fields", [("repo-create", {"name": "rehearsal-1"}), ("repo-transfer", {})])
 @pytest.mark.parametrize("name,value", CALLER)
 def test_caller_authority_and_credential_overrides_refused_before_any_read(monkeypatch, verb, fields, name, value):
-    """Defect class: a caller-controlled identity or credential (worker marker, token, gh config, host) reaching GitHub."""
+    """Defect class: a caller-controlled identity or credential (worker marker, token, gh config, host) reaching GitHub.
+
+    A caller HOME, through which gh finds its stored login, is replaced by the account's own home.
+    """
     monkeypatch.setenv(name, value)
     gh = FakeGitHub()
+    if name == "HOME":
+        result, _ = run(verb, gh, repo="infra-private", dry_run=True, **fields)
+        assert result.returncode == 0 and gh.homes == {pub._account_home()} and value not in gh.homes
+        return
     with pytest.raises(gate.PublishBlocked, match="_REFUSED: "):
         run(verb, gh, repo="infra-private", **fields)
     assert gh.calls == []
@@ -623,7 +632,9 @@ def test_help_documents_examples_outputs_and_exit_codes(capsys, verb):
         pub.main([verb, "--help"])
     out = capsys.readouterr().out
     assert exit_.value.code == 0
-    for section in ("Examples:", "Outputs:", "Exit codes:", "Related:", "--principal", "--dry-run", "UNSETTLED"):
+    for section in (
+        "Examples:", "Outputs:", "Exit codes:", "Related:", "--principal", "--dry-run", "UNSETTLED", "LU_PRODUCT_ROOT",
+    ):
         assert section in out
     assert "omitted by default" not in out
 
@@ -648,7 +659,9 @@ def test_concurrent_run_lock_refuses_without_sending(tmp_path, verb, fields, loc
 
 # A child interpreter whose stdout and stderr (or only one of them) are pipes with no reader, so every
 # write fails; "descriptorless" replaces stdout with a failing wrapper that has no descriptor to redirect,
-# and "bufferless" with a working stream that has no binary buffer.
+# "over-descriptor" with a failing wrapper over the valid descriptor 1, "fails-later" with a stream that
+# fails only from main()'s final flush on, and "bufferless" with a working stream that has no binary
+# buffer; "closed" closes descriptor 1 before main().
 _BROKEN_STREAMS_CHILD = """
 import importlib.util, io, os, sys
 streams = os.environ["REPO_ADMIN_TEST_STREAMS"]
@@ -674,6 +687,36 @@ if streams == "descriptorless":
     sys.stdout = Descriptorless()
 if streams == "bufferless":
     sys.stdout = io.StringIO()
+
+
+class OverDescriptor(Descriptorless):
+    def fileno(self):
+        return 1
+
+
+class FailsLater(io.TextIOBase):
+    def __init__(self, inner):
+        self.inner, self.failing = inner, False
+
+    def write(self, text):
+        return self.inner.write(text)
+
+    def flush(self):
+        if self.failing:
+            raise BrokenPipeError(32, "Broken pipe")
+        return self.inner.flush()
+
+    def fileno(self):
+        return self.inner.fileno()
+
+
+if streams == "over-descriptor":
+    sys.stdout = OverDescriptor()
+if streams == "fails-later":
+    sys.stdout = FailsLater(sys.stdout)
+if streams == "closed":
+    sys.stdout.flush()
+    os.close(1)
 spec = importlib.util.spec_from_file_location("repo_admin_fixture", sys.argv[1])
 fixture = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(fixture)
@@ -686,6 +729,15 @@ pub._repo_admin_directory = lambda: os.environ["REPO_ADMIN_TEST_DIRECTORY"]
 fleet_repos.resolve_active_fleet_repo = lambda identifier, *, repos, env=None, **_: fleet_repos.ActiveFleetRepo(
     repo=repos[identifier], active_github=fixture.SOURCE,
 )
+if streams == "fails-later":
+    settle = pub._repo_admin_result
+
+    def settled_then_failing(*args, **kwargs):
+        result = settle(*args, **kwargs)
+        sys.stdout.failing = True
+        return result
+
+    pub._repo_admin_result = settled_then_failing
 gh = fixture.FakeGitHub()
 if os.environ.get("REPO_ADMIN_TEST_RATE_LIMIT"):
     from lu_machinery.common import github_client
@@ -732,14 +784,18 @@ _CREATED, _TRANSFERRED = "repo-create-rehearsal-1-*.json", f"repo-transfer-{REPO
     (_CREATE, _CREATED, False, "descriptorless", 3),
     (_TRANSFER, _TRANSFERRED, True, "bufferless", 75),
     (["repo-transfer", "--help"], None, False, "stdout", 0),
+    (_CREATE, _CREATED, False, "over-descriptor", 3),
+    (_CREATE, _CREATED, False, "fails-later", 3),
+    (["repo-create", "--help"], None, False, "closed", 0),
     (_RULESET, None, False, "stderr", 120),
 ])
 def test_broken_output_streams_keep_the_exit_code(tmp_path, argv, pattern, limited, streams, code):
     """Defect class: interpreter shutdown overriding the documented exit code after a failed stream write.
 
-    After a POST it stays 3, whichever stream failed and whether or not it has a descriptor (never 120);
-    a rate limit before any POST stays 75, also on a stream without a binary buffer (never 2); --help
-    stays 0. The repo-admin output guard never reaches another verb: a ruleset-merge-queue PUT that
+    After a POST it stays 3, whichever stream failed, whether or not it has a descriptor, and also when
+    the failure first appears at main()'s final flush (never 0 or 120); a rate limit before any POST
+    stays 75, also on a stream without a binary buffer (never 2); --help stays 0, also with stdout's
+    descriptor closed. The repo-admin output guard never reaches another verb: a ruleset-merge-queue PUT that
     timed out with a broken stderr keeps the code the shared main() gives it.
     """
     environment = {

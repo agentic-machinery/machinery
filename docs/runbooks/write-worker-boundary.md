@@ -312,10 +312,12 @@ worker runs as the dispatching user with that user's `gh` login (above), and the
 (decision GH-ADMIN-VERBS-1124) therefore run only from an operator-run script. They refuse a process
 carrying `LEARN_UKRAINIAN_DISPATCH_TASK_ID` or `LU_WRITE_BOUNDARY_BROKER`, refuse every caller
 credential override (`GH_TOKEN`, `GITHUB_TOKEN`, `GH_ENTERPRISE_TOKEN`, `GITHUB_ENTERPRISE_TOKEN`,
-`GH_CONFIG_DIR`, `XDG_CONFIG_HOME`), and verify the `--principal` the operator names with `GET /user`
-through the same `gh` credential before and after the mutation. The marker refusal stops accidents; it
-is not authentication, because a worker can drop its own markers. Run `--help` on either verb for the
-checks, receipts and exit codes.
+`GH_CONFIG_DIR`, `XDG_CONFIG_HOME`), run `gh` with `HOME` set to the account's password-database home
+(so a caller `HOME` cannot select another stored login), and verify the `--principal` the operator names
+with `GET /user` through the same `gh` credential before and after the mutation. The marker refusal
+stops accidents; it is not authentication, because a worker can drop its own markers. Both verbs need
+`LU_PRODUCT_ROOT` set to the product checkout, which their private state directory must stay outside.
+Run `--help` on either verb for the checks, receipts and exit codes.
 
 ## Review contract canary
 

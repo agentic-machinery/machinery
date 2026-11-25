@@ -20,7 +20,7 @@ import time
 import zipfile
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import NoReturn
+from typing import Any, NoReturn
 from urllib.parse import quote
 
 import yaml
@@ -1621,7 +1621,10 @@ def _product_checkouts(environment, refused=_transfer_refused):
     try:
         product = Path(product_root(env=environment)).resolve()
     except ProductRootError:
-        raise refused("the product checkout is unresolved, so the receipt boundary is unknown") from None
+        raise refused(
+            "the product checkout is unresolved (set LU_PRODUCT_ROOT to its absolute path), so the receipt "
+            "boundary is unknown"
+        ) from None
     checkouts = [product]
     with contextlib.suppress(NotAGitRepositoryError):
         checkouts.append(resolve_main_root_without_git(product).resolve())
@@ -2137,12 +2140,8 @@ REPO_ADMIN_CREDENTIAL_OVERRIDES = (
 REPO_ADMIN_DIRECTORY = "repo-admin"
 
 
-def _repo_admin_directory():
-    """``~/.local/state/learn-ukrainian/repo-admin`` of the running account, from the password database.
-
-    Not ``$HOME`` or ``$XDG_STATE_HOME``: every run of the same account must find the same journal,
-    whatever its environment says, or a changed variable would hide an unsettled transfer.
-    """
+def _account_home():
+    """The running account's home directory from the password database, never ``$HOME``."""
     import pwd
 
     try:
@@ -2151,7 +2150,16 @@ def _repo_admin_directory():
         raise gate.PublishBlocked("REPO_ADMIN_REFUSED: the account has no home directory; nothing was sent.") from None
     if not os.path.isabs(home):
         raise gate.PublishBlocked("REPO_ADMIN_REFUSED: the account's home directory is not absolute; nothing was sent.")
-    return os.path.join(home, ".local", "state", "learn-ukrainian", REPO_ADMIN_DIRECTORY)
+    return home
+
+
+def _repo_admin_directory():
+    """``~/.local/state/learn-ukrainian/repo-admin`` of the running account, from the password database.
+
+    Not ``$HOME`` or ``$XDG_STATE_HOME``: every run of the same account must find the same journal,
+    whatever its environment says, or a changed variable would hide an unsettled transfer.
+    """
+    return os.path.join(_account_home(), ".local", "state", "learn-ukrainian", REPO_ADMIN_DIRECTORY)
 REPO_CREATE_SCHEMA = "repo-create-receipt/v1"
 REPO_TRANSFER_SCHEMA = "repo-transfer-receipt/v1"
 _REPO_ADMIN_RECEIPT_BYTES = 64 * 1024
@@ -2183,6 +2191,9 @@ def _repo_admin_authority(verb, environment):
     if environment.get("GH_HOST", "github.com") != "github.com":
         raise _repo_refused(verb, "only github.com is supported")
     environment["GH_HOST"] = "github.com"
+    # With GH_CONFIG_DIR and XDG_CONFIG_HOME refused, gh finds its stored login under $HOME: pin it to the
+    # account's own home (as the journal's directory is), so a caller HOME cannot select another login.
+    environment["HOME"] = _account_home()
 
 
 def _repo_admin_row(verb, key):
@@ -2272,28 +2283,39 @@ def _repo_matches(identity, slug, repository_id):
     )
 
 
+def _devnull_stream(name):
+    """Replace ``sys.<name>`` with a /dev/null text stream, which interpreter shutdown cannot fail to flush."""
+    with contextlib.suppress(Exception):
+        setattr(sys, name, open(os.devnull, "w", encoding="utf-8"))  # noqa: SIM115 - lives until exit
+
+
 def _silence_stream(name):
-    """Make the failed ``sys.<name>`` stream harmless, so interpreter shutdown cannot fail on its buffer.
+    """Make the failed ``sys.<name>`` stream harmless, so interpreter shutdown cannot fail on it.
 
     A failed write leaves data that CPython flushes again at exit, turning the exit code into 120.
-    The descriptor is pointed at /dev/null, the remedy the Python ``signal`` documentation gives
-    for a broken pipe (Note on SIGPIPE); a stream without a usable descriptor is replaced by one.
+    Its descriptor, if any, is pointed at /dev/null, the remedy the Python ``signal`` documentation
+    gives for a broken pipe (Note on SIGPIPE). The failed object itself is replaced too, since it
+    can fail again whatever its descriptor holds. A descriptor that was closed is reused by the
+    /dev/null open, so it is kept open, never closed a second time.
     """
-    stream = getattr(sys, name)
-    try:
-        descriptor = stream.fileno()
+    with contextlib.suppress(Exception):
+        descriptor = getattr(sys, name).fileno()
         devnull = os.open(os.devnull, os.O_WRONLY)
-        try:
-            os.dup2(devnull, descriptor)
-        finally:
-            os.close(devnull)
-    except Exception:
-        with contextlib.suppress(Exception):
-            setattr(sys, name, open(os.devnull, "w", encoding="utf-8"))  # noqa: SIM115 - lives until exit
+        if devnull != descriptor:
+            try:
+                os.dup2(devnull, descriptor)
+            finally:
+                os.close(devnull)
+    _devnull_stream(name)
 
 
-# Output failures of the current repo-admin run; a failure after a mutation makes it unsettled.
-_REPO_ADMIN_OUTPUT_FAILED: list[str] = []
+# The current repo-admin run: whether it sent a mutation, and which output streams failed.
+# A failed output in a run that sent a mutation makes it unsettled.
+_REPO_ADMIN_RUN: dict[str, Any] = {"sent": False, "failed": []}
+
+
+def _repo_admin_reset():
+    _REPO_ADMIN_RUN.update(sent=False, failed=[])
 
 
 def _stream_write(name, text):
@@ -2304,7 +2326,7 @@ def _stream_write(name, text):
         stream.flush()
         return True
     except Exception:
-        _REPO_ADMIN_OUTPUT_FAILED.append(name)
+        _REPO_ADMIN_RUN["failed"].append(name)
         _silence_stream(name)
         return False
 
@@ -2318,6 +2340,24 @@ def _repo_admin_flush():
     """Flush both streams through the guarded writer, so interpreter shutdown has nothing left to fail on."""
     for name in ("stdout", "stderr"):
         _stream_write(name, "")
+
+
+def _repo_admin_settled(code):
+    """*code* after a final guarded flush of both streams: any output failure once a mutation was sent is 3."""
+    _repo_admin_flush()
+    return REPO_ADMIN_UNSETTLED if _REPO_ADMIN_RUN["sent"] and _REPO_ADMIN_RUN["failed"] else code
+
+
+def _repo_admin_exit(code):
+    """The process exit code of a repo-admin verb, settled after its last output.
+
+    Both streams are then detached (replaced by /dev/null), so the interpreter's shutdown flush
+    of a stream that fails only later cannot turn the code into 120.
+    """
+    code = _repo_admin_settled(code)
+    for name in ("stdout", "stderr"):
+        _devnull_stream(name)
+    return code
 
 
 def _repo_admin_limited(verb, exc, capture_output, text):
@@ -2347,16 +2387,15 @@ def _repo_admin_result(verb, receipt, code, capture_output, text):
     Both streams are flushed here, so nothing is left for interpreter shutdown to fail on.
     """
     encoded = json.dumps(receipt, indent=2, sort_keys=True) + "\n"
+    _REPO_ADMIN_RUN["sent"] = bool(receipt["mutations_sent"])
     if not capture_output and not _stream_write("stdout", encoded):
         _stderr_note(f"{verb.upper().replace('-', '_')}_STDOUT_UNWRITTEN: the receipt is only in its file.")
-    if code == REPO_ADMIN_UNSETTLED or (receipt["mutations_sent"] and _REPO_ADMIN_OUTPUT_FAILED):
+    if code == REPO_ADMIN_UNSETTLED or (_REPO_ADMIN_RUN["sent"] and _REPO_ADMIN_RUN["failed"]):
         _stderr_note(
             f"{verb.upper().replace('-', '_')}_UNSETTLED: {receipt['detail'] or 'the result is unknown'}; "
             "do not retry. Reconcile the state on GitHub first (see --help)."
         )
-    _repo_admin_flush()
-    if receipt["mutations_sent"] and _REPO_ADMIN_OUTPUT_FAILED:
-        code = REPO_ADMIN_UNSETTLED
+    code = _repo_admin_settled(code)
     return subprocess.CompletedProcess(
         ["github", verb], code,
         (encoded if text else encoded.encode("utf-8")) if capture_output else None,
@@ -2407,7 +2446,7 @@ def _repo_admin(verb, fields, *, runner, cwd, environment, capture_output, text)
     One lock per fixture name or repository id is held from the first read to settlement, so a
     second run never acts on reads taken before the first run's mutation.
     """
-    _REPO_ADMIN_OUTPUT_FAILED.clear()
+    _repo_admin_reset()
     _repo_admin_authority(verb, environment)
     repos, row = _repo_admin_row(verb, fields["repo"])
     plan = (_repo_create_plan if verb == "repo-create" else _repo_transfer_plan)(verb, fields, repos, row, environment)
@@ -4690,6 +4729,7 @@ def main(argv=None, *, runner=None):
             sub.formatter_class = argparse.RawDescriptionHelpFormatter
             sub.epilog = (
                 "Examples:\n"
+                "  export LU_PRODUCT_ROOT=/abs/path/to/product-checkout\n"
                 f"  .venv/bin/python -m {_PUBLISHER} repo-create --repo infra-private --name move-rehearsal-1 "
                 "--principal octo-admin --dry-run\n"
                 f"  .venv/bin/python -m {_PUBLISHER} repo-create --repo infra-private --name move-rehearsal-1 "
@@ -4697,9 +4737,12 @@ def main(argv=None, *, runner=None):
                 f"The --repo row of {_FLEET_REPOS} (alternate_github, repository_id, private) names both\n"
                 "  organizations: the fixture is <github owner>/<name>, and its exact rehearsal destination is\n"
                 "  <alternate_github owner>/<name>-moved (owner and name change, like the move itself).\n"
-                "Checks before the mutation: no worker marker; none of GH_TOKEN, GITHUB_TOKEN, GH_ENTERPRISE_TOKEN,\n"
-                "  GITHUB_ENTERPRISE_TOKEN, GH_CONFIG_DIR, XDG_CONFIG_HOME set; GH_HOST unset or github.com; GET /user\n"
-                "  is --principal; the principal is an active admin of the source organization; both names are free.\n"
+                "Checks before the mutation: LU_PRODUCT_ROOT names the product checkout, which the private\n"
+                "  directory below must stay outside (unset: exit 2); no worker marker; none of GH_TOKEN,\n"
+                "  GITHUB_TOKEN, GH_ENTERPRISE_TOKEN, GITHUB_ENTERPRISE_TOKEN, GH_CONFIG_DIR, XDG_CONFIG_HOME set;\n"
+                "  GH_HOST unset or github.com; gh runs with HOME set to the account's password-database home, so its\n"
+                "  stored login is the account's own; GET /user is --principal; the principal is an active admin of\n"
+                "  the source organization; both names are free.\n"
                 "  One run per fixture name: a lock in the private directory is held from the first read to settlement.\n"
                 "Outputs: one POST orgs/<owner>/repos (private, auto_init), a readback of the same id, private, and\n"
                 "  GET /user again. Receipt JSON on stdout and in a new 0600 file under\n"
@@ -4721,6 +4764,7 @@ def main(argv=None, *, runner=None):
             sub.formatter_class = argparse.RawDescriptionHelpFormatter
             sub.epilog = (
                 "Examples:\n"
+                "  export LU_PRODUCT_ROOT=/abs/path/to/product-checkout\n"
                 f"  .venv/bin/python -m {_PUBLISHER} repo-transfer --repo infra-private --principal octo-admin "
                 "--create-receipt /abs/state/learn-ukrainian/repo-admin/repo-create-move-rehearsal-1-<time>.json\n"
                 f"  .venv/bin/python -m {_PUBLISHER} repo-transfer --repo infra-private --principal octo-admin --dry-run\n"
@@ -4966,9 +5010,12 @@ def main(argv=None, *, runner=None):
     except SystemExit:
         if argv[:1] and argv[0] in REPO_ADMIN_VERBS:
             # --help (0) or invalid input (2) of a repo-admin verb: a broken stream must not make it 120 at exit.
-            _repo_admin_flush()
+            _repo_admin_reset()
+            _repo_admin_exit(0)
         raise
     verb = args.pop("verb")
+    if verb in REPO_ADMIN_VERBS:
+        _repo_admin_reset()
     try:
         if verb == "read":
             code = read(args.pop("name"), runner=runner, **args).returncode
@@ -4987,8 +5034,8 @@ def main(argv=None, *, runner=None):
         _stderr_note("OPSEC: publisher transport unavailable.")
         code = 2
     if verb in REPO_ADMIN_VERBS:
-        # A refusal note that failed must not become 120 at interpreter exit.
-        _repo_admin_flush()
+        # Settled after the last output; a failure there after a mutation is unsettled, never 0 or 120.
+        code = _repo_admin_exit(code)
     return code
 
 
