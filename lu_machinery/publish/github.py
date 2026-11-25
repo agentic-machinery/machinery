@@ -176,7 +176,8 @@ SCHEMAS = {
         {"repo", "number", "destination"},
         {"repo": "endpoint", "number": "number", "destination": "alias", "receipt_dir": "path", "dry_run": "bool"},
     ),
-    # Operator-run only (GH-ADMIN-VERBS-1124): both organizations come from one dual-slug private registry row.
+    # Operator-run only (GH-ADMIN-VERBS-1124): both organizations come from one dual-slug registry row
+    # (repo-create stays private-only; repo-transfer admits registered public or private dual-slug rows).
     "repo-create": (
         {"repo", "name", "principal"}, {"repo": "alias", "name": "alias", "principal": "login", "dry_run": "bool"},
     ),
@@ -2128,7 +2129,7 @@ def _transfer_checked(fields, source, destination, receipt, sink, temp, *, runne
 
 
 # --- repo-create and repo-transfer (GH-ADMIN-VERBS-1124) -------------------------------------
-# The move of a dual-slug private registry row to its alternate organization, and its rehearsal
+# The move of a dual-slug registry row to its alternate organization, and its rehearsal
 # on one private fixture. No protected executor holds a GitHub principal that workers cannot
 # read (docs/runbooks/write-worker-boundary.md), so these verbs run only from an operator-run
 # script: worker markers and every caller credential override are refused, and the principal
@@ -2212,15 +2213,25 @@ def _repo_admin_authority(verb, environment):
 
 
 def _repo_admin_row(verb, key):
-    """The dual-slug private registry row *key*: its two organizations and its pinned identity."""
+    """The dual-slug registry row *key*: its two organizations and its pinned identity.
+
+    ``repo-create`` remains restricted to private rows (it creates private rehearsal fixtures);
+    ``repo-transfer`` admits registered public or private dual-slug rows whose declared
+    ``visibility`` matches their ``role`` prefix.
+    """
     repos = _catalog_fleet_repos()
     row = repos.get(key)
     if row is None:
         raise _repo_refused(verb, f"{key} is not a repository key in {_FLEET_REPOS}")
     if not row.has_alternate_slug or row.repository_id is None:
         raise _repo_refused(verb, f"the registry row {key} names no alternate_github and repository_id")
-    if row.visibility != "private" or not row.role.startswith("private-"):
-        raise _repo_refused(verb, f"the registry row {key} is not a private repository")
+    if verb == "repo-create":
+        if row.visibility != "private" or not row.role.startswith("private-"):
+            raise _repo_refused(verb, f"the registry row {key} is not a private repository")
+    elif row.visibility not in {"public", "private"} or not row.role.startswith(f"{row.visibility}-"):
+        raise _repo_refused(
+            verb, f"the registry row {key} must declare public or private visibility matching its role",
+        )
     if _same_slug(row.owner, row.alternate_github.split("/", 1)[0]):
         raise _repo_refused(verb, f"the registry row {key} names one organization twice")
     return repos, row
@@ -2290,35 +2301,38 @@ def _repo_identity(document):
     return identity
 
 
-def _repo_matches(document, slug, repository_id):
-    """Whether a repository response proves the expected slug, id and private visibility."""
+def _repo_matches(document, slug, repository_id, visibility="private"):
+    """Whether a repository response proves the expected slug, id and visibility."""
+    if visibility not in {"public", "private"}:
+        return False
     return (
         _same_slug(document.get("full_name"), slug)
         and type(document.get("id")) is int and document["id"] == repository_id
-        and document.get("private") is True and document.get("visibility") == "private"
+        and document.get("private") is (visibility == "private")
+        and document.get("visibility") == visibility
     )
 
 
-def _repo_transfer_acknowledged(document, source, destination, repository_id):
-    """Whether a POST /repos/{source}/transfer 202 answer names the pinned private repository.
+def _repo_transfer_acknowledged(document, source, destination, repository_id, visibility="private"):
+    """Whether a POST /repos/{source}/transfer 202 answer names the pinned repository with *visibility*.
 
     GitHub's transfer endpoint returns 202 Accepted with ``minimal-repository``, where ``id``,
     ``full_name`` and ``private`` are required and ``visibility`` is optional; the owner transfer
     and ``new_name`` rename continue asynchronously, so ``full_name`` may hold either endpoint's
-    owner paired with either endpoint's name. Exact destination slug and ``visibility == "private"``
+    owner paired with either endpoint's name. Exact destination slug and ``visibility``
     are verified afterwards by the bounded ``GET /repos/{destination}`` readback loop.
     """
-    if not isinstance(document, dict):
+    if not isinstance(document, dict) or visibility not in {"public", "private"}:
         return False
     source_owner, source_name = source.split("/", 1)
     dest_owner, dest_name = destination.split("/", 1)
     slugs = (source, destination, f"{source_owner}/{dest_name}", f"{dest_owner}/{source_name}")
-    if "visibility" in document and document["visibility"] != "private":
+    if "visibility" in document and document["visibility"] != visibility:
         return False
     return (
         any(_same_slug(document.get("full_name"), slug) for slug in slugs)
         and type(document.get("id")) is int and document["id"] == repository_id
-        and document.get("private") is True
+        and document.get("private") is (visibility == "private")
     )
 
 
@@ -2556,7 +2570,7 @@ def _repo_admin_post(endpoint, frozen, runner, cwd, environment):
     return document
 
 
-def _repo_admin_readback(slug, repository_id, principal_before, reader, cwd, environment):
+def _repo_admin_readback(slug, repository_id, principal_before, reader, cwd, environment, *, visibility="private"):
     """Re-read *slug* within ``TRANSFER_VERIFY_DELAYS`` (8 reads over 180 s) until it matches, then re-read the principal.
 
     GitHub runs repository transfers asynchronously (202 Accepted), so the destination slug may not appear
@@ -2572,7 +2586,7 @@ def _repo_admin_readback(slug, repository_id, principal_before, reader, cwd, env
             detail = "the readback was unreadable or rate limited"
             continue
         try:
-            if document is not None and _repo_matches(_repo_identity(document), slug, repository_id):
+            if document is not None and _repo_matches(_repo_identity(document), slug, repository_id, visibility):
                 break
         except ValueError:
             pass
@@ -2739,6 +2753,8 @@ def _repo_transfer_plan(verb, fields, repos, row, environment):
 
     selector = None
     if "create_receipt" in fields:
+        if row.visibility != "private" or not row.role.startswith("private-"):
+            raise _repo_refused(verb, f"rehearsal --create-receipt requires a private registry row, not {row.key}")
         created = _load_create_receipt(verb, fields["create_receipt"], environment)
         repository = created.get("repository") if isinstance(created.get("repository"), dict) else {}
         slug, repository_id = repository.get("slug"), repository.get("id")
@@ -2786,11 +2802,13 @@ def _repo_transfer_plan(verb, fields, repos, row, environment):
         "source": source,
         "destination": destination,
         "repository_id": repository_id,
+        "visibility": row.visibility,
         "receipt": {
             "mode": mode,
             "repository_id": repository_id,
             "source": source,
             "destination": destination,
+            "visibility": row.visibility,
             "create_receipt": str(fields["create_receipt"]) if mode == "rehearsal" else None,
             "journal": None,
             "preflight": {},
@@ -2877,7 +2895,9 @@ def _repo_transfer_checked(fields, plan, receipt, sink, directory_fd, directory,
     re-read before an exit 0 or a journal removal (the journal is kept), or a journal that could not be removed.
     """
     verb, reader = "repo-transfer", merge_readiness_runner(runner)
-    source, destination, repository_id = plan["source"], plan["destination"], plan["repository_id"]
+    source, destination, repository_id, visibility = (
+        plan["source"], plan["destination"], plan["repository_id"], plan["visibility"]
+    )
     destination_owner = destination.split("/", 1)[0]
     journal_name = f"repo-transfer-{repository_id}.pending"
     receipt["journal"] = str(directory / journal_name)
@@ -2890,7 +2910,7 @@ def _repo_transfer_checked(fields, plan, receipt, sink, directory_fd, directory,
         receipt["journal_principal"] = started_by
     unreconciled = (
         f"an earlier run left the transfer journal {receipt['journal']}, so a transfer of repository "
-        f"{repository_id} may have been sent, and {destination} does not show it private. Check on GitHub that no "
+        f"{repository_id} may have been sent, and {destination} does not show it {visibility}. Check on GitHub that no "
         "transfer is pending, then remove the journal before a new attempt; no mutation was sent by this run"
     )
     state = {}
@@ -2903,7 +2923,7 @@ def _repo_transfer_checked(fields, plan, receipt, sink, directory_fd, directory,
         receipt["preflight"]["destination_observed"] = observed and {
             key: observed[key] for key in ("id", "full_name", "private", "visibility")
         }
-        if observed is not None and _repo_matches(observed, destination, repository_id):
+        if observed is not None and _repo_matches(observed, destination, repository_id, visibility):
             state["moved"] = True
             return
         if pending:
@@ -2919,8 +2939,8 @@ def _repo_transfer_checked(fields, plan, receipt, sink, directory_fd, directory,
             raise _repo_refused(verb, f"repository {repository_id} is neither at {source} nor at {destination}")
         if identity["id"] != repository_id:
             raise _repo_refused(verb, f"{source} is repository {identity['id']}, not the pinned {repository_id}")
-        if identity["private"] is not True or identity["visibility"] != "private":
-            raise _repo_refused(verb, f"{source} is not private")
+        if identity["private"] is not (visibility == "private") or identity["visibility"] != visibility:
+            raise _repo_refused(verb, f"{source} is not {visibility}")
         if identity["archived"]:
             raise _repo_refused(verb, f"{source} is archived")
         if (found.get("permissions") or {}).get("admin") is not True:
@@ -2955,7 +2975,7 @@ def _repo_transfer_checked(fields, plan, receipt, sink, directory_fd, directory,
             )
             return _repo_admin_settle(
                 verb, receipt, sink, REPO_ADMIN_UNSETTLED, "unreconciled",
-                f"repository {repository_id} is at {destination}, private, but the transfer journal "
+                f"repository {repository_id} is at {destination}, {visibility}, but the transfer journal "
                 f"{receipt['journal']} {started}, and {reason}. Only the principal that started the transfer "
                 "settles it: check the account on GitHub, then rerun as that principal or remove the journal by "
                 "hand; the journal is kept and no mutation was sent by this run",
@@ -2969,7 +2989,7 @@ def _repo_transfer_checked(fields, plan, receipt, sink, directory_fd, directory,
                 capture_output, text,
             )
     if state.get("moved"):
-        detail = f"repository {repository_id} is at {destination}, private; no mutation was sent"
+        detail = f"repository {repository_id} is at {destination}, {visibility}; no mutation was sent"
         if pending and receipt["dry_run"]:
             detail += f"; the dry run leaves the journal {receipt['journal']} for a plain run to clear"
         elif pending and not _repo_admin_unjournal(directory_fd, journal_name, receipt):
@@ -3015,7 +3035,9 @@ def _repo_transfer_send(plan, receipt, sink, directory_fd, journal_name, frozen,
     journal that cannot be removed, keeps it and exits 3. Every failure after the POST is unsettled (exit 3).
     """
     verb = "repo-transfer"
-    source, destination, repository_id = plan["source"], plan["destination"], plan["repository_id"]
+    source, destination, repository_id, visibility = (
+        plan["source"], plan["destination"], plan["repository_id"], plan["visibility"]
+    )
 
     def abandon(reason, limited=None):
         # Like every journal removal, this one rests on a principal read after the last GitHub read.
@@ -3063,13 +3085,13 @@ def _repo_transfer_send(plan, receipt, sink, directory_fd, journal_name, frozen,
     # GitHub addresses the transfer by slug only: re-read it just before the POST to keep the window to one request.
     try:
         current = _repo_admin_get(reader, f"repos/{source}", cwd, environment)
-        bound = current is not None and _repo_matches(_repo_identity(current), source, repository_id)
+        bound = current is not None and _repo_matches(_repo_identity(current), source, repository_id, visibility)
     except github_client.GitHubRateLimited as limited:
         return abandon("the source re-read before the transfer was refused by the GitHub rate limit", limited)
     except Exception:
         return abandon("the source re-read before the transfer was unreadable or malformed")
     if not bound:
-        return abandon(f"{source} no longer holds the pinned private repository {repository_id}")
+        return abandon(f"{source} no longer holds the pinned {visibility} repository {repository_id}")
     receipt["mutations_sent"] = 1
     try:
         acknowledged = _repo_admin_post(f"repos/{source}/transfer", frozen, runner, cwd, environment)
@@ -3078,14 +3100,15 @@ def _repo_transfer_send(plan, receipt, sink, directory_fd, journal_name, frozen,
             verb, receipt, sink, REPO_ADMIN_UNSETTLED, "ambiguous", "the transfer's result is unknown",
             capture_output, text,
         )
-    if not _repo_transfer_acknowledged(acknowledged, source, destination, repository_id):
+    if not _repo_transfer_acknowledged(acknowledged, source, destination, repository_id, visibility):
         return _repo_admin_settle(
             verb, receipt, sink, REPO_ADMIN_UNSETTLED, "unverified",
-            f"GitHub's answer does not name the pinned private repository {repository_id}", capture_output, text,
+            f"GitHub's answer does not name the pinned {visibility} repository {repository_id}", capture_output, text,
         )
     try:
         receipt["principal"]["after"] = _repo_admin_readback(
             destination, repository_id, receipt["principal"]["before"], reader, cwd, environment,
+            visibility=visibility,
         )
     except Exception as exc:
         return _repo_admin_settle(
@@ -4886,7 +4909,7 @@ def _parse_args(argv):
             )
         if verb == "repo-transfer":
             sub.description = (
-                "Transfer one private repository to its registered alternate organization, exactly once.\n"
+                "Transfer one registered dual-slug repository to its alternate organization, exactly once.\n"
                 "Use only from an operator-run script for the approved move or its rehearsal; workers are refused."
             )
             sub.formatter_class = argparse.RawDescriptionHelpFormatter
@@ -4896,36 +4919,38 @@ def _parse_args(argv):
                 f"  .venv/bin/python -m {_PUBLISHER} repo-transfer --repo infra-private --principal octo-admin "
                 "--create-receipt /abs/state/learn-ukrainian/repo-admin/repo-create-move-rehearsal-1-<time>.json\n"
                 f"  .venv/bin/python -m {_PUBLISHER} repo-transfer --repo infra-private --principal octo-admin --dry-run\n"
-                f"  .venv/bin/python -m {_PUBLISHER} repo-transfer --repo infra-private --principal octo-admin\n"
+                f"  .venv/bin/python -m {_PUBLISHER} repo-transfer --repo machinery --principal octo-admin\n"
                 "Move: source and destination are the --repo row's github and alternate_github slugs, the id is its\n"
-                "  repository_id, and LU_FLEET_REPO_SELECTOR_FILE must still name the github slug (else refused).\n"
-                "Rehearsal (--create-receipt): the repo-create receipt from the private state directory binds the\n"
-                "  fixture's id and its exact <name>-moved destination; registered ids and names are refused.\n"
+                "  repository_id, its visibility matches the row (public or private) and must stay unchanged, and\n"
+                "  LU_FLEET_REPO_SELECTOR_FILE must still name the github slug (else refused).\n"
+                "Rehearsal (--create-receipt, private rows only): the repo-create receipt from the private state\n"
+                "  directory binds the fixture's id and its exact <name>-moved destination; registered ids and names\n"
+                "  are refused.\n"
                 "Checks before the mutation, under one lock per repository id held to settlement: the repo-create\n"
-                "  caller checks; first the exact destination: the id there, private, exits 0 as already-transferred\n"
-                "  with no mutation and clears the journal (a dry run leaves it), but a journal exits 0 or clears only\n"
-                "  when it binds the login and account id of this run (the preflight GET /user of the run that wrote\n"
-                "  it); else a journal for that id exits 3 (this run sent no request; an earlier one may have,\n"
-                "  and the journal is kept for reconciliation), as does any failed check while it exists.\n"
+                "  caller checks; first the exact destination: the id there, with the row's visibility, exits 0 as\n"
+                "  already-transferred with no mutation and clears the journal (a dry run leaves it), but a journal\n"
+                "  exits 0 or clears only when it binds the login and account id of this run (the preflight GET /user\n"
+                "  of the run that wrote it); else a journal for that id exits 3 (this run sent no request; an earlier\n"
+                "  one may have, and the journal is kept for reconciliation), as does any failed check while it exists.\n"
                 "  Every exit 0 with no POST (already transferred, journal or not, and a dry run) and every journal\n"
                 "  removal (a refusal before the POST included) re-reads GET /user after its last GitHub read and\n"
                 "  requires the bound login and account id; a failed or mismatched re-read exits 3 and keeps the journal.\n"
-                "  A new send requires no visible destination collision, a private and unarchived source with the\n"
-                "  pinned id, source admin permission, and active destination admin membership. The source slug is\n"
-                "  re-read just before the POST.\n"
+                "  A new send requires no visible destination collision, an unarchived source with the pinned id and\n"
+                "  row visibility, source admin permission, and active destination admin membership. The source slug\n"
+                "  and visibility are re-read just before the POST.\n"
                 + _DESTINATION_OWNER_PRECONDITION
                 + "GitHub addresses a transfer by slug only, so nobody else may rename, transfer\n"
                 "  or create repositories in the source organization during the run.\n"
                 "Outputs: one POST repos/<source>/transfer {new_owner, new_name}. GitHub executes transfers\n"
                 "  asynchronously (202 Accepted with minimal-repository, where visibility may be omitted and\n"
                 "  full_name may still name the source or an intermediate owner/name pair): the POST answer must\n"
-                "  name the pinned id and private=true (and visibility=private if present). repo-transfer then\n"
-                "  polls GET repos/<destination> for the exact pinned private repository (id, full_name, private,\n"
-                "  visibility=private) across 8 fresh reads over a bounded 180 s wait (backoff 0, 2, 4, 8, 16, 30,\n"
-                "  60, 60 s), then re-reads GET /user after the last GitHub read to verify the same login and\n"
-                "  account id. Only after that bound (or on a mismatched POST answer or final GET /user) does it\n"
-                "  exit 3 (unverified) and keep the journal. Receipt JSON on stdout and in a new 0600 file;\n"
-                "  journal repo-transfer-<id>.pending there from just before the POST until verified.\n"
+                "  name the pinned id and the row's visibility (private matching the row, and visibility matching if\n"
+                "  present). repo-transfer then polls GET repos/<destination> for the exact pinned repository (id,\n"
+                "  full_name, private, visibility matching the row) across 8 fresh reads over a bounded 180 s wait\n"
+                "  (backoff 0, 2, 4, 8, 16, 30, 60, 60 s), then re-reads GET /user after the last GitHub read to\n"
+                "  verify the same login and account id. Only after that bound (or on a mismatched POST answer or\n"
+                "  final GET /user) does it exit 3 (unverified) and keep the journal. Receipt JSON on stdout and in\n"
+                "  a new 0600 file; journal repo-transfer-<id>.pending there from just before the POST until verified.\n"
                 "Exit codes: 0 transferred and verified, already transferred, or dry run passed (a journal that could\n"
                 "  not be removed is named in the receipt); 2 invalid input, a caller or registry refusal, or a\n"
                 "  --create-receipt that cannot be loaded (the id is then unknown), or a refusal with no mutation sent\n"
@@ -5005,14 +5030,19 @@ def _parse_args(argv):
                 if kind != "bool":
                     kwargs["action"] = StoreOnce
                 kwargs["help"] = {
-                    "repo": "Required registry key of a dual-slug private row (e.g. infra-private); no default",
+                    "repo": (
+                        "Required registry key of a dual-slug private row (e.g. infra-private); no default"
+                        if verb == "repo-create"
+                        else "Required registry key of a dual-slug row (e.g. infra-private or machinery); no default"
+                    ),
                     "name": (
                         "Required fixture name, lowercase letters, digits and hyphens (e.g. move-rehearsal-1). "
                         f"At most {_GITHUB_REPOSITORY_NAME_LIMIT - len(_REHEARSAL_SUFFIX)} characters."
                     ),
                     "principal": "Required GitHub login the gh credential must authenticate as (e.g. octo-admin)",
                     "create_receipt": (
-                        "Absolute path of a repo-create receipt for the rehearsal; omitted transfers the row itself"
+                        "Absolute path of a repo-create receipt for the rehearsal (private rows only); "
+                        "omitted transfers the row itself"
                     ),
                     "dry_run": "Run every check and write the receipt; no mutation; default off",
                 }[key]
