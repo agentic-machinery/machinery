@@ -380,16 +380,6 @@
    "sha256": "09dd06b5a5e1a474e979e7963c848a1bd03cb19565b94e62fd3da9f54a86c875"
   },
   {
-   "path": "lu_machinery/ci/dependency_advisory_issue.py",
-   "rule": "python.lang.correctness.common-mistakes.string-concat-in-list",
-   "sha256": "0c46f6c4f1ac627ff357b9a093e8deee9183d234ffa95d40220c16460ece1ddf"
-  },
-  {
-   "path": "lu_machinery/ci/dependency_advisory_issue.py",
-   "rule": "python.lang.correctness.common-mistakes.string-concat-in-list",
-   "sha256": "da322d0a2f4a89f079419be8174afa7e72c087357670ef0b892ffdbfe2928fe3"
-  },
-  {
    "path": "lu_machinery/dispatcher/ownership.py",
    "rule": "python.lang.correctness.common-mistakes.string-concat-in-list",
    "sha256": "7e1adea38216ab01088a56831c0485adacd2102d37999b8d0f438a327e2505dd"
@@ -1273,11 +1263,6 @@
    "path": "lu_machinery/ci/data_tier.py",
    "rule": "python.lang.security.audit.dangerous-subprocess-use-audit",
    "sha256": "cb161da1a3e9d05cf692a5d13a42caaec628c3332f1c72494d0bdbffe3fff9b5"
-  },
-  {
-   "path": "lu_machinery/ci/dependency_advisory_issue.py",
-   "rule": "python.lang.security.audit.dangerous-subprocess-use-audit",
-   "sha256": "38f4bc4d2c5364c523aa93e7e40a9836a1e6bf81c9e659e57d653093e1fb60c6"
   },
   {
    "path": "lu_machinery/ci/pr_affected_tests.py",

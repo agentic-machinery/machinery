@@ -248,7 +248,6 @@
   "tests/ci/test_coverage_diff.py": 1.106,
   "tests/ci/test_coverage_ref.py": 14.222,
   "tests/ci/test_data_tier_in_place.py": 6.946,
-  "tests/ci/test_dependency_advisory_issue.py": 0.626,
   "tests/ci/test_dispatch_xdist_cap.py": 17.915,
   "tests/ci/test_flake_ledger.py": 5.5,
   "tests/ci/test_gh_merge_queue_status.py": 0.842,
