@@ -24,6 +24,7 @@ import atexit
 import fcntl
 import json
 import logging
+import math
 import os
 import re
 import threading
@@ -564,10 +565,58 @@ def task_state_lock(path: Path) -> Iterator[None]:
         os.close(descriptor)
 
 
+class NonFiniteRecordValue(ValueError):
+    """A task record holds NaN or an infinity, which strict JSON cannot carry (#1440).
+
+    ``field`` is the JSON path of the first such value in encoder order; ``code`` names it.
+    """
+
+    def __init__(self, field: list[Any]):
+        self.field = field
+        self.code = f"TASK_RECORD_NON_FINITE: {json.dumps(field)}"
+        super().__init__(self.code)
+
+
+def _non_finite_field(value: Any, path: list[Any], open_ids: frozenset[int] = frozenset()) -> list[Any] | None:
+    """The JSON path of the first NaN or infinity in ``value`` (a dict key included), in the encoder's order.
+
+    ``None`` when there is none, or on a cycle (``open_ids`` holds the containers being walked), which
+    the encoder refuses on its own.
+    """
+    if isinstance(value, float) and not math.isfinite(value):
+        return path
+    if not isinstance(value, (dict, list, tuple)) or id(value) in open_ids:
+        return None
+    open_ids |= {id(value)}
+    items = value.items() if isinstance(value, dict) else enumerate(value)
+    for key, item in items:
+        if isinstance(value, dict) and isinstance(key, float) and not math.isfinite(key):
+            return [*path, str(key)]
+        if (found := _non_finite_field(item, [*path, key], open_ids)) is not None:
+            return found
+    return None
+
+
+def record_json(record: dict[str, Any], **kwargs: Any) -> str:
+    """``record`` as every task-record writer stores it: strict, indented JSON.
+
+    NaN and infinities are not JSON, so a record holding one raises :class:`NonFiniteRecordValue`
+    naming the field, before the caller stages anything.
+    """
+    try:
+        return json.dumps(record, indent=2, allow_nan=False, **kwargs)
+    except ValueError as exc:
+        field = _non_finite_field(record, [])
+        if field is None:
+            raise
+        raise NonFiniteRecordValue(field) from exc
+
+
 def write_state_unlocked(path: Path, state: dict[str, Any]) -> None:
     """Replace state while the caller holds its per-task lock."""
+    text = record_json(state, default=str)
     tmp = path.with_suffix(f".json.tmp.{os.getpid()}")
-    tmp.write_text(json.dumps(state, indent=2, default=str), encoding="utf-8")
+    tmp.write_text(text, encoding="utf-8")
     os.replace(tmp, path)
 
 
