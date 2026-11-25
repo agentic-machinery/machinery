@@ -17,6 +17,45 @@ from lu_machinery.opsec.prepublish import PublishBlocked, normalize_repository
 MARKER = re.compile(r"<!-- ci-recovery-evidence\s+(\{.*?\})\s*-->", re.S)
 SHA = re.compile(r"[0-9a-f]{40}\Z")
 RECOVERY_ACTIONS = frozenset({"run-rerun", "re-enqueue"})
+CANCELLED_MERGE_GROUP_RECOVERY_MODE = "cancelled_merge_group_no_artifact"
+_MERGE_GROUP_BRANCH = re.compile(r"gh-readonly-queue/(main)/pr-[1-9][0-9]*-[0-9a-f]{40}")
+_CLEAN_CANCELLED_JOB_CONCLUSIONS = frozenset({"success", "skipped", "neutral", "cancelled"})
+_CLEAN_CANCELLED_STEP_CONCLUSIONS = frozenset({None, "success", "skipped", "neutral", "cancelled"})
+
+
+def cancelled_merge_group_without_failure(run: object, jobs: object) -> bool:
+    """True only for a completed cancelled merge-group run with zero failing jobs or steps."""
+    if not isinstance(run, dict) or not isinstance(jobs, list):
+        return False
+    if (
+        run.get("event") != "merge_group"
+        or run.get("status") != "completed"
+        or run.get("conclusion") != "cancelled"
+    ):
+        return False
+    branch = run.get("head_branch")
+    head = run.get("head_sha")
+    if not isinstance(branch, str) or not _MERGE_GROUP_BRANCH.fullmatch(branch):
+        return False
+    if not isinstance(head, str) or not SHA.fullmatch(head):
+        return False
+    for job in jobs:
+        if not isinstance(job, dict):
+            return False
+        if type(job.get("id")) is not int or job["id"] <= 0:
+            return False
+        if "status" in job and job["status"] != "completed":
+            return False
+        if job.get("conclusion") not in _CLEAN_CANCELLED_JOB_CONCLUSIONS:
+            return False
+        if "steps" in job:
+            steps = job["steps"]
+            if not isinstance(steps, list):
+                return False
+            for step in steps:
+                if not isinstance(step, dict) or step.get("conclusion") not in _CLEAN_CANCELLED_STEP_CONCLUSIONS:
+                    return False
+    return True
 
 
 def _repo_key(repo: object) -> str:
@@ -54,7 +93,7 @@ def require_queue_diff(evidence: dict, run: dict, fetch: Callable[..., dict]) ->
     Matching failed-job names never establish that changes are unrelated.
     """
     try:
-        match = re.fullmatch(r"gh-readonly-queue/(main)/pr-[1-9][0-9]*-[0-9a-f]{40}", run["head_branch"])
+        match = _MERGE_GROUP_BRANCH.fullmatch(run["head_branch"])
         head = run["head_sha"]
         if not match or not SHA.fullmatch(head) or evidence["tested_sha"] != head:
             raise ValueError
@@ -147,6 +186,7 @@ def evidence_from_comments(
     authenticated_login: str,
     run_id: int | None = None,
     require_infra_diagnosis: bool = False,
+    allow_empty_jobs: bool = False,
 ) -> dict:
     """Require the written evidence to already exist on this PR and exact head.
 
@@ -183,7 +223,7 @@ def evidence_from_comments(
                 and evidence["run_id"] > 0
                 and (run_id is None or evidence["run_id"] == run_id)
                 and isinstance(jobs, list)
-                and jobs
+                and (bool(jobs) or allow_empty_jobs)
                 and all(type(job) is int and job > 0 for job in jobs)
                 and len(set(jobs)) == len(jobs)
                 and isinstance(evidence.get("tested_sha"), str)

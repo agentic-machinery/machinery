@@ -605,7 +605,7 @@ merge-group associations remain refused.
 
 Recovery still uses the one allowance for that PR head:
 
-- Merge queue: if the failed run already removed the PR, enqueue it once. That re-enqueue is the existing CI recovery and spends the allowance. If the PR is still queued, dequeue it and then enqueue once, and treat that pair as the head's one recovery. A manual removal is not itself classified as a CI failure; do not take a second recovery for the same head.
+- Merge queue: if a `merge_group` run concluded `cancelled` with no failing job or step and no `ci-queue-candidate` artifact, post the standard `ci-recovery-evidence` comment (using `"job_ids": []` only if zero jobs were cancelled or failed) and run `lu_machinery.publish run-rerun --repo <owner/name> --number <run_id>`. The publisher verifies the merge-readiness gates, consumes the head's one recovery allowance (`re-enqueue`), dequeues the PR if it is still queued on that cancelled candidate, enqueues once at the approved head, and confirms queue membership. For any other missing-job case where the run already removed the PR, enqueue once; if still queued, dequeue and enqueue once as that head's one recovery. A manual removal is not itself classified as a CI failure; do not take a second recovery for the same head.
 - PR CI: the CTO runs one full rerun of the workflow run, not `run-rerun`. Before that rerun, record on the PR the run id, the names of the jobs GitHub never created, and the GitHub status-page incident.
 
 A spent allowance has two ways out: a new PR head with fresh exact-head approval
