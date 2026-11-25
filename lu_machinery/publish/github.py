@@ -1117,13 +1117,20 @@ def _prepare_recovery(verb, fields, dest, cwd, environment, runner):
         rerun_mode = recovery.INCOHERENT_CHECK_RECOVERY_MODE
         evidence = {**evidence, "recovery_mode": rerun_mode}
     else:
-        failed_ids = {
-            job.get("id")
-            for job in jobs
-            if isinstance(job, dict)
-            and isinstance(job.get("conclusion"), str)
-            and job["conclusion"] in failure_conclusions
-        }
+        valid_job_conclusions = failure_conclusions | recovery.PASSING_RUN_CONCLUSIONS | {"stale"}
+        failed_ids: set[int] = set()
+        for job in jobs:
+            job_id = job.get("id") if isinstance(job, dict) else None
+            job_conclusion = job.get("conclusion") if isinstance(job, dict) else None
+            if (
+                type(job_id) is not int
+                or job_id <= 0
+                or not isinstance(job_conclusion, str)
+                or job_conclusion not in valid_job_conclusions
+            ):
+                raise gate.PublishBlocked("RECOVERY_RUN_INVALID: malformed job metadata")
+            if job_conclusion in failure_conclusions:
+                failed_ids.add(job_id)
         if failed_ids != set(evidence["job_ids"]) or (not failed_ids and not cancelled_no_artifact):
             raise gate.PublishBlocked("RECOVERY_EVIDENCE_MISMATCH: every failing job must be diagnosed")
         if failed_run.get("event") == "merge_group" and not cancelled_no_artifact:
