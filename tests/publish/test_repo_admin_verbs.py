@@ -559,6 +559,46 @@ def test_unsettled_transfer_blocks_retry_until_reconciled(tmp_path, monkeypatch,
     assert len(gh.posts) == 1 and not journal(tmp_path).exists()
 
 
+def test_pending_transfer_bound_to_original_principal(tmp_path):
+    """Defect class: a pending transfer settled (exit 0) or its journal cleared by a principal other than its starter.
+
+    The account id changes after the POST, so the first run is unsettled; while GitHub still reports the
+    other id, or the journal's binding is missing, unreadable or names another login, a rerun exits 3 and
+    keeps the journal. Only the original login and id settle it.
+    """
+    gh = FakeGitHub()
+    other_account = lambda args: answer(args, {"login": PRINCIPAL, "id": 22})  # noqa: E731
+    gh.overrides[("GET", "user", True)] = other_account
+    result, receipt = run("repo-transfer", gh, repo="infra-private")
+    assert result.returncode == pub.REPO_ADMIN_UNSETTLED and receipt["outcome"] == "unverified"
+    assert gh.find(DESTINATION)["id"] == REPO_ID and journal(tmp_path).exists()
+    for dry_run in (False, True):
+        result, receipt = run("repo-transfer", gh, repo="infra-private", dry_run=dry_run)
+        assert result.returncode == pub.REPO_ADMIN_UNSETTLED and receipt["outcome"] == "unreconciled"
+        assert "(id 7)" in receipt["detail"] and "(id 22)" in receipt["detail"] and journal(tmp_path).exists()
+    bound = journal(tmp_path).read_text()
+    assert json.loads(bound)["principal"] == {"login": PRINCIPAL, "id": 7}
+    del gh.overrides[("GET", "user", True)]
+    for content, mode in [
+        ("{}", 0o600),
+        ("not json", 0o600),
+        (json.dumps({"principal": {"login": "someone-else", "id": 7}}), 0o600),
+        (json.dumps({"principal": {"login": PRINCIPAL, "id": True}}), 0o600),
+        (bound, 0o644),
+    ]:
+        journal(tmp_path).write_text(content)
+        journal(tmp_path).chmod(mode)
+        result, receipt = run("repo-transfer", gh, repo="infra-private")
+        assert result.returncode == pub.REPO_ADMIN_UNSETTLED and receipt["outcome"] == "unreconciled", content
+        assert journal(tmp_path).exists()
+    journal(tmp_path).write_text(bound)
+    journal(tmp_path).chmod(0o600)
+    result, receipt = run("repo-transfer", gh, repo="infra-private")
+    assert result.returncode == 0 and receipt["outcome"] == "already-transferred"
+    assert receipt["journal_principal"] == {"login": PRINCIPAL, "id": 7} and not journal(tmp_path).exists()
+    assert len(gh.posts) == 1
+
+
 def _edit(**changes):
     def apply(path, tmp_path):
         document = json.loads(path.read_text())

@@ -2771,13 +2771,42 @@ def _journal_exists(directory_fd, name):
     return True
 
 
+def _journal_principal(directory_fd, name):
+    """The login and id a pending journal was started under; None when missing, unreadable or malformed."""
+    try:
+        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=directory_fd)
+    except OSError:
+        return None
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o077:
+            return None
+        with os.fdopen(fd, "rb") as handle:
+            fd = None
+            raw = handle.read(_REPO_ADMIN_RECEIPT_BYTES + 1)
+        if len(raw) > _REPO_ADMIN_RECEIPT_BYTES:
+            return None
+        document = json_depth.loads(raw.decode("utf-8"), max_depth=16)
+    except (OSError, UnicodeError, ValueError, RecursionError):
+        return None
+    finally:
+        if fd is not None:
+            os.close(fd)
+    principal = document.get("principal") if isinstance(document, dict) else None
+    login, user_id = (principal.get("login"), principal.get("id")) if isinstance(principal, dict) else (None, None)
+    if not isinstance(login, str) or not re.fullmatch(PATTERNS["login"], login) or type(user_id) is not int or user_id <= 0:
+        return None
+    return {"login": login, "id": user_id}
+
+
 def _repo_transfer_checked(fields, plan, receipt, sink, directory_fd, directory, *, runner, cwd, environment,
                            capture_output, text):
     """Reconcile from the exact destination first, then the fresh source checks, then one journaled transfer.
 
     Exit contract: 0 verified (or already at the destination, or a passed dry run); 2 refused with nothing
     sent and no journal left; 75 a rate limit before any POST with no journal; 3 everything else: a POST
-    sent and unsettled, a pending journal not settled by the destination, or a journal that could not be removed.
+    sent and unsettled, a pending journal not settled by the destination under the login and id it binds, or a
+    journal that could not be removed.
     """
     verb, reader = "repo-transfer", merge_readiness_runner(runner)
     source, destination, repository_id = plan["source"], plan["destination"], plan["repository_id"]
@@ -2787,6 +2816,10 @@ def _repo_transfer_checked(fields, plan, receipt, sink, directory_fd, directory,
     # Read once under the lock: only the lock holder creates or removes the journal.
     pending = _journal_exists(directory_fd, journal_name)
     receipt["journal_pending"] = pending
+    # The principal that started the pending transfer; only that login and id can settle it (exit 0) or clear it.
+    started_by = _journal_principal(directory_fd, journal_name) if pending else None
+    if pending:
+        receipt["journal_principal"] = started_by
     unreconciled = (
         f"an earlier run left the transfer journal {receipt['journal']}, so a transfer of repository "
         f"{repository_id} may have been sent, and {destination} does not show it private. Check on GitHub that no "
@@ -2834,6 +2867,22 @@ def _repo_transfer_checked(fields, plan, receipt, sink, directory_fd, directory,
     )
     if settled is not None:
         return settled
+    current = receipt["principal"]["before"]
+    if state.get("moved") and pending and (
+        started_by is None or not _same_slug(started_by["login"], current["login"]) or started_by["id"] != current["id"]
+    ):
+        started = (
+            "has no readable principal binding" if started_by is None
+            else f"was started by {started_by['login']} (id {started_by['id']})"
+        )
+        return _repo_admin_settle(
+            verb, receipt, sink, REPO_ADMIN_UNSETTLED, "unreconciled",
+            f"repository {repository_id} is at {destination}, private, but the transfer journal {receipt['journal']} "
+            f"{started}, and this run authenticates as {current['login']} (id {current['id']}). Only the principal "
+            "that started the transfer settles it: check the account on GitHub, then rerun as that principal or "
+            "remove the journal by hand; no mutation was sent by this run",
+            capture_output, text,
+        )
     if state.get("moved"):
         detail = f"repository {repository_id} is at {destination}, private; no mutation was sent"
         if pending and receipt["dry_run"]:
@@ -2910,7 +2959,12 @@ def _repo_transfer_send(plan, receipt, sink, directory_fd, journal_name, frozen,
         raise _repo_refused(verb, "the transfer journal cannot be created") from None
     try:
         with os.fdopen(journal, "w", encoding="utf-8") as handle:
-            entry = json.dumps({"receipt": str(sink["path"]), "source": source, "destination": destination}) + "\n"
+            # The preflight login and id bind the journal: a later run settles or clears it only as that principal.
+            principal = receipt["principal"]["before"]
+            entry = json.dumps({
+                "receipt": str(sink["path"]), "source": source, "destination": destination,
+                "principal": {"login": principal["login"], "id": principal["id"]},
+            }) + "\n"
             if handle.write(entry) != len(entry):
                 raise OSError("short transfer journal write")
     except OSError:
@@ -4756,10 +4810,12 @@ def _parse_args(argv):
                 "  fixture's id and its exact <name>-moved destination; registered ids and names are refused.\n"
                 "Checks before the mutation, under one lock per repository id held to settlement: the repo-create\n"
                 "  caller checks; first the exact destination: the id there, private, exits 0 as already-transferred\n"
-                "  with no mutation and clears the journal (a dry run leaves it); else a journal for that id exits 3\n"
-                "  with no mutation, as does any failed check while it exists. A new send requires no visible\n"
-                "  destination collision, a private and unarchived source with the pinned id, source admin permission,\n"
-                "  and active destination admin membership. The source slug is re-read just before the POST.\n"
+                "  with no mutation and clears the journal (a dry run leaves it), but a journal exits 0 or clears only\n"
+                "  when it binds the login and account id of this run (the preflight GET /user of the run that wrote\n"
+                "  it); else a journal for that id exits 3 with no mutation, as does any failed check while it exists.\n"
+                "  A new send requires no visible destination collision, a private and unarchived source with the\n"
+                "  pinned id, source admin permission, and active destination admin membership. The source slug is\n"
+                "  re-read just before the POST.\n"
                 + _DESTINATION_OWNER_PRECONDITION
                 + "GitHub addresses a transfer by slug only, so nobody else may rename, transfer\n"
                 "  or create repositories in the source organization during the run.\n"
@@ -4772,12 +4828,14 @@ def _parse_args(argv):
                 "  --create-receipt that cannot be loaded (the id is then unknown), or a refusal with no mutation sent\n"
                 "  and no journal for this repository id; 3 UNSETTLED: the POST was sent and the result is unknown or\n"
                 "  unverified (an output failure after the POST included); a journal for this repository id exists or\n"
-                "  cannot be read and the destination does not settle it, whichever later step fails (unreconciled);\n"
+                "  cannot be read and the destination does not settle it, or it binds another login or account id,\n"
+                "  whichever later step fails (unreconciled);\n"
                 "  a refused run could not remove its own journal (journal-retained); or another run holds the lock\n"
                 "  (in-progress). Journals are per repository id: the rehearsal's never blocks the move.\n"
-                "  Never retry: rerun only to reconcile (it exits 0 once the id is at the\n"
-                "  destination); if GitHub still shows it at the source, confirm no transfer is pending and remove\n"
-                "  the journal by hand. Do not flip the selector until reconciled. A rate limit at the POST is 3;\n"
+                "  Never retry: rerun only to reconcile, as the principal that started the transfer (it exits 0 once\n"
+                "  the id is at the destination); if GitHub still shows it at the source, confirm no transfer is\n"
+                "  pending and remove the journal by hand. Do not flip the selector until reconciled. A rate limit at\n"
+                "  the POST is 3;\n"
                 "  75 a rate limit refused a read before the POST.\n"
                 "Related: decision GH-ADMIN-VERBS-1124; repo-create; lu_machinery/config/fleet_repos.yaml."
             )

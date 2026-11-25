@@ -323,7 +323,8 @@ Run both verbs as the destination organization owner with a stored `gh` token th
 repository in that organization. The destination lookup checks for visible collisions only.
 Run `.venv/bin/python -m lu_machinery.publish <verb> --help` for the checks, receipts and exit codes.
 The exit codes apply to that module entry point. After an interruption, check GitHub for the fixture
-name before trying another create, or rerun the transfer command to reconcile its journal.
+name before trying another create, or rerun the transfer command to reconcile its journal. The
+journal binds the login and account id that started the transfer; only that principal settles it.
 
 ## Review contract canary
 
