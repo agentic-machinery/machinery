@@ -57,6 +57,36 @@ def test_model_stats_binds_both_recorded_slugs_to_the_public_row(monkeypatch, re
         rows._fleet_repo_visibility.cache_clear()
 
 
+def test_planning_and_model_stats_reject_non_ascii_repository_spellings(monkeypatch):
+    """Case conversion must not admit a repository look-alike as worker or public review evidence."""
+    registered = "kit/machinery"
+    lookalike = "\N{KELVIN SIGN}it/machinery"
+    alternate = "moved/machinery"
+    repo = FleetRepo(
+        "machinery", registered, "machinery", "public-machinery",
+        alternate_github=alternate, repository_id=42, visibility="public",
+    )
+    repos = {repo.key: repo}
+    monkeypatch.setattr(rows, "load_fleet_repos", lambda: repos)
+    claims = {"planning_claims": [(lookalike, ["src/work.py"])]}
+    monkeypatch.setattr(planning, "active_snapshot", lambda _ctx: SimpleNamespace(read=lambda: (claims, 0)))
+    aliases = {repo.key: alternate, registered: alternate, alternate: alternate}
+    assert planning._workers(None, aliases) is None
+
+    rows._fleet_repo_visibility.cache_clear()
+    try:
+        assert not rows._record_allows_sample({"repository": lookalike})
+    finally:
+        rows._fleet_repo_visibility.cache_clear()
+
+    keys = rows.repository_keys(repos)
+    raw = {"task_id": "review", "role": "review", "pinned_head": "a" * 40, "repo": repo.key}
+    entry = {"head": raw["pinned_head"], "repository": lookalike, "pr": 42}
+    assert stats._publication(raw, {"review": [entry]}, keys) is None
+    invalid_catalog = {"other": FleetRepo("other", lookalike, "other", "public-machinery")}
+    assert rows.repository_keys(invalid_catalog) == {}
+
+
 def test_model_value_sections_explain_how_to_read_the_figures():
     """A dashboard section can keep showing numbers after losing the nearby reading guidance."""
     html = machinery_path("api/dashboards/model-stats.html").read_text()

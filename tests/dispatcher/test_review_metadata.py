@@ -7,13 +7,15 @@ import sys
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
+
 import pytest
+
 from lu_machinery.common import git_credentials
 from lu_machinery.dispatcher import checks, cli, git, store, worker
 from lu_machinery.review import record_cf_verdict as cf
 from lu_machinery.review.subject_seat import classify_owned_path
-from tests.helpers.product_tree import configured_roots  # noqa: F401
 from tests.helpers import current_sol
+from tests.helpers.product_tree import configured_roots  # noqa: F401
 
 CURRENT_SOL = current_sol()
 
@@ -62,6 +64,21 @@ def dispatch(tmp_path, monkeypatch):
         return store.read("review")
 
     return invoke
+
+
+def test_task_card_rejects_non_ascii_repository_before_forge_read(tmp_path, monkeypatch):
+    """A repository look-alike must not become a valid issue reference after case folding."""
+    forge = Mock(side_effect=AssertionError("invalid repository reached the forge"))
+    monkeypatch.setattr(git, "_gh", forge)
+    slug = "\N{KELVIN SIGN}it/machinery"
+    card = tmp_path / "card.md"
+    card.write_text(f"## Dependencies\n- {slug}#42\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match=r"task_card_dependency_refused: .*unparseable"):
+        checks.check_task_card(str(card), ["kit/machinery#42"], None)
+    with pytest.raises(ValueError, match=r"task_card_unreadable: .*no GitHub repository"):
+        checks.check_task_card("#42", [], slug)
+    forge.assert_not_called()
 
 
 @pytest.mark.parametrize("active", ["learn-ukrainian/machinery", "agentic-machinery/machinery"])

@@ -515,7 +515,7 @@ def _record_allows_sample(record: Mapping[str, Any]) -> bool:
         if value is not None
     ]
     for slug in slugs:
-        if not isinstance(slug, str):
+        if not isinstance(slug, str) or not slug.isascii():
             return False
         slug_key = by_github.get(slug.strip().lower())
         if slug_key is None or slug_key not in public_keys:
@@ -1112,7 +1112,12 @@ def fleet_catalog() -> dict[str, FleetRepo] | None:
 def repository_keys(repos: Mapping[str, FleetRepo] | None) -> dict[str, str]:
     """Each registered GitHub ``owner/name``, lowercased, to its fleet repository key (the rows' ``repo``); empty
     without a catalog."""
-    return {} if repos is None else {slug.lower(): key for key, repo in repos.items() for slug in repo.slugs}
+    return {
+        slug.lower(): key
+        for key, repo in (repos or {}).items()
+        for slug in repo.slugs
+        if slug.isascii()
+    }
 
 
 _LABEL_FIELDS = ("harness", "model", "effort", "role", "class", "status", "repo")

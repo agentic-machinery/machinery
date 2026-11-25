@@ -555,8 +555,8 @@ def check_branch_author_families(
 
 
 # ``#N`` or ``owner/repo#N``: the card flag, an override, and the only dependency entry the gate reads.
-_ISSUE_REF = re.compile(r"(?:([A-Za-z0-9][\w.-]*/[\w.-]+))?#([1-9][0-9]*)")
-_SLUG = re.compile(r"[A-Za-z0-9][\w.-]*/[\w.-]+")
+_ISSUE_REF = re.compile(r"(?:([A-Za-z0-9][\w.-]*/[\w.-]+))?#([1-9][0-9]*)", re.ASCII)
+_SLUG = re.compile(r"[A-Za-z0-9][\w.-]*/[\w.-]+", re.ASCII)
 _DEPENDENCIES = re.compile(r"^##[ \t]+Dependencies[ \t]*$(.*?)(?=^#{1,6}[ \t]|\Z)", re.MULTILINE | re.DOTALL)
 
 

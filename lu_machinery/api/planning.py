@@ -224,11 +224,14 @@ def collect_issues() -> IssueSnapshot | None:
             slug = resolve_active_fleet_repo(key, repos=repos).active_github
         except FleetRepoError:
             # Keep the repository in the coverage denominator without querying an inactive slug.
-            aliases[key] = repo.github.lower()
+            if _SLUG.fullmatch(repo.github):
+                aliases[key] = repo.github.lower()
             continue
-        aliases.update(dict.fromkeys((key, *(name.lower() for name in repo.slugs)), slug.lower()))
         if _SLUG.fullmatch(slug):
-            valid[slug.lower()] = repo.role.startswith("public-")
+            active = slug.lower()
+            aliases[key] = active
+            aliases.update({name.lower(): active for name in repo.slugs if _SLUG.fullmatch(name)})
+            valid[active] = repo.role.startswith("public-")
     with ThreadPoolExecutor(max_workers=8) as pool:
         inventories = list(pool.map(_inventory, valid))
     issues = {ref: issue for rows, _ in inventories for ref, issue in rows.items()}
@@ -276,7 +279,9 @@ def _relative_scope_rejected(token: str, repositories: Collection[str], *, prefi
     bare = token.removesuffix("/**").removesuffix("/")
     # A qualified remainder names a repository only when the original text matches the
     # ASCII slug grammar. Folding case first would hide a path a worker still holds.
-    names_repository = bare.lower() in repositories and (not prefixed or _SLUG.fullmatch(bare) is not None)
+    names_repository = (
+        bare.isascii() and (not prefixed or _SLUG.fullmatch(bare) is not None) and bare.lower() in repositories
+    )
     return bool(
         names_repository
         or (not prefixed and separator and "." in root.lstrip("."))
@@ -332,7 +337,10 @@ def _workers(ctx: MonitorContext, aliases: Mapping[str, str]) -> dict[str, list[
     known = set(aliases.values())
     claims: dict[str, list[PathClaim] | None] = {}
     for repo, paths in rows:
-        if not isinstance(repo, str) or (slug := aliases.get(repo.lower(), repo.lower())) not in known:
+        if not isinstance(repo, str) or not repo.isascii():
+            return None
+        spelling = repo.lower()
+        if (slug := aliases.get(spelling, spelling)) not in known:
             return None
         expanded = [claim for path in paths for claim in expand_claim(path)] if all(
             isinstance(path, str) for path in paths) else []
