@@ -1225,6 +1225,9 @@ def test_incoherent_check_row_all_green_run_recovers_with_full_rerun(setup, mode
         ("unhashable-job-conclusion", "RECOVERY_RUN_INVALID"),
         ("unhashable-step-conclusion", "RECOVERY_RUN_INVALID"),
         ("unhashable-run-conclusion", "RECOVERY_RUN_INVALID"),
+        ("failed-run-malformed-sibling-conclusion", "RECOVERY_RUN_INVALID"),
+        ("failed-run-unknown-sibling-conclusion", "RECOVERY_RUN_INVALID"),
+        ("failed-run-malformed-sibling-id", "RECOVERY_RUN_INVALID"),
         ("failing-job-on-green-run", "RECOVERY_RUN_INVALID"),
         ("failing-step-on-incoherent-job", "RECOVERY_RUN_INVALID"),
         ("incomplete-step-on-incoherent-job", "RECOVERY_RUN_INVALID"),
@@ -1319,6 +1322,28 @@ def test_coherent_or_invalid_all_green_run_refuses_recovery(setup, case, expecte
         ]
     elif case == "unhashable-run-conclusion":
         transport.conclusion = ["success"]
+    elif case == "failed-run-malformed-sibling-conclusion":
+        transport.conclusion = "failure"
+        transport.jobs = [
+            {"id": 456, "status": "completed", "conclusion": "failure", "completed_at": completed_at, "steps": []},
+            {"id": 457, "status": "completed", "conclusion": ["failure"], "completed_at": completed_at, "steps": []},
+        ]
+    elif case == "failed-run-unknown-sibling-conclusion":
+        transport.conclusion = "failure"
+        transport.jobs = [
+            {"id": 456, "status": "completed", "conclusion": "failure", "completed_at": completed_at, "steps": []},
+            {"id": 457, "status": "completed", "conclusion": "bogus", "completed_at": completed_at, "steps": []},
+        ]
+    elif case == "failed-run-malformed-sibling-id":
+        transport.conclusion = "failure"
+        transport.jobs_pages = [
+            {
+                "jobs": [
+                    {"id": 456, "status": "completed", "conclusion": "failure"},
+                    {"id": [457], "status": "completed", "conclusion": "failure"},
+                ]
+            }
+        ]
     elif case == "failing-job-on-green-run":
         transport.jobs[0]["conclusion"] = "failure"
     elif case == "failing-step-on-incoherent-job":
