@@ -6,6 +6,7 @@ import os
 import stat
 import subprocess
 import time
+from hashlib import sha256
 from pathlib import Path
 
 from lu_machinery.common.repo_root import machinery_path
@@ -193,14 +194,9 @@ def test_snapshot_sources_restrict_components_to_main_and_preserve_integrity() -
     assert sources["Signed-By"] == "/usr/share/keyrings/ubuntu-archive-keyring.gpg"
     assert sources["Snapshot"] == "no"
     assert "-o Acquire::Retries=3" in setup
-    assert "-o Acquire::Retries=1" not in setup
-    assert "--error-on=any" in setup
-    download = setup.split("if ! timeout ", 1)[1].split("; then", 1)[0]
-    assert download.startswith("--kill-after=1 29 ")
-    assert "--max-time 15" in download
-    assert "--retry 3" in download
-    checksum = 'echo "${digest}  $apt_dir/$deb" | sha256sum -c -'
-    assert setup.index(download) < setup.index(checksum) < setup.index('missing+=("$apt_dir/$deb")')
+    assert 'digest="$(read_pin CI_BUBBLEWRAP_SHA256)"' in setup
+    download = 'download_bubblewrap "$snapshot_url" "$apt_dir/$deb" "$digest"'
+    assert setup.index(download) < setup.index('missing+=("$apt_dir/$deb")')
 
 
 def test_snapshot_update_timeout_derives_from_apt_deadline_and_fails_closed() -> None:
@@ -216,14 +212,17 @@ def test_snapshot_update_timeout_derives_from_apt_deadline_and_fails_closed() ->
 
     # Only the extracted arithmetic/guard block is evaluated with a shell-function
     # `sudo` stub; the host-changing setup script and real apt never run.
-    def _eval_update_block(deadline_offset: int) -> subprocess.CompletedProcess[str]:
+    def _eval_update_block(deadline_offset: int, missing_native: int) -> subprocess.CompletedProcess[str]:
         script = (
             "set -euo pipefail\n"
             "snapshot=20261122T000000Z\n"
+            "apt_dir=/unused/apt\n"
             "apt_opts=(-o Acquire::Retries=3)\n"
+            f"missing_native={missing_native}\n"
             'sudo() { printf "SUDO:%s\\n" "$*"; return 0; }\n'
             f"apt_deadline=$((SECONDS + {deadline_offset}))\n"
             f"{update_block}\n"
+            'printf "APT:%s\\n" "${apt_opts[*]}"\n'
         )
         return subprocess.run(
             ["bash", "-c", script],
@@ -233,17 +232,83 @@ def test_snapshot_update_timeout_derives_from_apt_deadline_and_fails_closed() ->
             check=False,
         )
 
-    fresh = _eval_update_block(195)
+    fresh = _eval_update_block(195, 1)
     assert fresh.returncode == 0, fresh.stdout + fresh.stderr
     assert fresh.stdout.startswith("SUDO:timeout --kill-after=5 "), fresh.stdout
     tokens = fresh.stdout.strip().split()
     cap = int(tokens[2])
     assert 129 <= cap <= 130, f"expected derived cap in 129..130, got {cap}"
+    assert "Dir::Etc::sourcelist=/unused/apt/ubuntu.sources" in fresh.stdout.splitlines()[0]
     # Update cap + 5 s kill grace + first apt_install (55 s + 5 s kill grace) <= 195 s.
     assert cap + 5 + 55 + 5 <= 195
 
     for exhausted_offset in (65, 10):
-        exhausted = _eval_update_block(exhausted_offset)
+        exhausted = _eval_update_block(exhausted_offset, 1)
         assert exhausted.returncode == 1, exhausted.stdout + exhausted.stderr
         assert "SUDO:" not in exhausted.stdout
         assert "::error::Could not update package indexes" in exhausted.stderr
+
+    local_only = _eval_update_block(10, 0)
+    assert local_only.returncode == 0, local_only.stdout + local_only.stderr
+    assert local_only.stdout == "APT:-o Acquire::Retries=3 -o Dir::Etc::sourcelist=/dev/null\n"
+
+
+_SNAPSHOT_ORIGIN = "https://snapshot.ubuntu.com/ubuntu/20250101T000000Z"
+_SECURITY_ORIGIN = "https://security.ubuntu.com/ubuntu"
+_DEB_NAME = "bubblewrap_9.9.9-1_amd64.deb"
+
+
+def _download(
+    tmp_path: Path, *, snapshot_503: bool, digest: str,
+) -> subprocess.CompletedProcess[str]:
+    setup = machinery_path("ci/setup_bubblewrap.sh").read_text()
+    # Evaluate only the download function. The privileged setup body never runs.
+    download = setup.split("download_bubblewrap() {", 1)[1].split("\n}\n", 1)[0]
+    return subprocess.run(
+        [
+            "bash", "-c",
+            "set -euo pipefail\n"
+            'curl() {\n'
+            '  local destination="${@: -2:1}" url="${@: -1}"\n'
+            '  printf "%s\\n" "$url"\n'
+            '  if [[ "$snapshot_503" == yes && "$url" == "$snapshot/"* ]]; then\n'
+            '    printf "partial download" > "$destination"\n'
+            '    echo "curl: (22) The requested URL returned error: 503" >&2\n'
+            '    return 22\n'
+            '  fi\n'
+            '  printf "fixture .deb bytes" > "$destination"\n'
+            '}\n'
+            'timeout() {\n'
+            '  [[ "$1 $2" == "--kill-after=1 14" ]] || return 99\n'
+            '  shift 2\n'
+            '  [[ " $* " == *" --max-time 5 --retry 2 "* ]] || return 99\n'
+            '  "$@"\n'
+            '}\n'
+            'snapshot="$1"\n'
+            'snapshot_503="$2"\n'
+            "download_bubblewrap() {" + download + "\n}\n"
+            'download_bubblewrap "$snapshot" "$3" "$4"\n',
+            "_", _SNAPSHOT_ORIGIN, "yes" if snapshot_503 else "no", str(tmp_path / _DEB_NAME), digest,
+        ],
+        capture_output=True, text=True, timeout=10, check=False,
+    )
+
+
+def test_bubblewrap_snapshot_503_falls_back_to_official_security_pool(tmp_path: Path) -> None:
+    """A failed snapshot transfer must not leave CI dependent on that origin."""
+    result = _download(tmp_path, snapshot_503=True, digest=sha256(b"fixture .deb bytes").hexdigest())
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "503" in result.stderr
+    assert result.stdout.splitlines() == [
+        f"{origin}/pool/main/b/bubblewrap/{_DEB_NAME}" for origin in (_SNAPSHOT_ORIGIN, _SECURITY_ORIGIN)
+    ]
+    assert (tmp_path / _DEB_NAME).read_bytes() == b"fixture .deb bytes"
+
+
+def test_bubblewrap_hash_mismatch_fails_closed_at_either_source(tmp_path: Path) -> None:
+    """An HTTP success must never authorize mismatched bytes or a retry after an integrity failure."""
+    for snapshot_503, origins in ((False, (_SNAPSHOT_ORIGIN,)), (True, (_SNAPSHOT_ORIGIN, _SECURITY_ORIGIN))):
+        result = _download(tmp_path, snapshot_503=snapshot_503, digest="0" * 64)
+        assert result.returncode == 1, result.stdout + result.stderr
+        assert result.stdout.splitlines() == [f"{origin}/pool/main/b/bubblewrap/{_DEB_NAME}" for origin in origins]
+        assert f"::error::SHA-256 verification failed for {_DEB_NAME} from {origins[-1]}" in result.stderr
