@@ -263,19 +263,22 @@ def _protected_repo_roots(wc) -> tuple[Path, ...]:
 
 
 def _is_valid_git_checkout(resolved: Path, wc, protected_roots: tuple[Path, ...]) -> bool:
-    """True only when ``resolved`` belongs to a protected repo or is itself a valid Git checkout root.
+    """True only when ``resolved`` belongs to a protected repo or lies inside a valid Git checkout.
 
-    Never walks mutable ancestor ``.git`` markers (which a session could create with
-    ``touch <parent>/.git``). Any ``NotAGitRepositoryError`` or I/O error keeps the directory
-    protected (fail closed).
+    Validates each candidate ancestor with ``resolve_main_root_without_git`` (requiring a real
+    ``.git`` store or valid linked worktree metadata), never bare ``lstat(.git)``. Any bogus
+    ``.git`` marker (e.g. ``touch <parent>/.git``), ``NotAGitRepositoryError``, or I/O error
+    keeps the directory protected (fail closed).
     """
     if any(wc.classify_repo_path(resolved, cwd=root) != "outside_repo" for root in protected_roots):
         return True
-    try:
-        wc.resolve_main_root_without_git(resolved)
-    except wc.NotAGitRepositoryError:
-        return False
-    return True
+    for candidate in (resolved, *resolved.parents):
+        try:
+            wc.resolve_main_root_without_git(candidate)
+        except wc.NotAGitRepositoryError:
+            continue
+        return True
+    return False
 
 
 def _protected_workspace_roots(wc, protected_roots: tuple[Path, ...]) -> tuple[Path, ...]:
@@ -328,22 +331,30 @@ def _targets_workspace_ancestor_git(path: Path, workspace_root: Path) -> bool:
     return any(_is_within_root(path, ancestor / ".git") for ancestor in (workspace_root, *workspace_root.parents))
 
 
-def _evaluate_workspace_write(target: Path, wc, workspace_root: Path) -> object | None:
-    """Refuse writes inside a non-Git workspace or creating/mutating ``.git`` at any ancestor."""
+def _evaluate_workspace_write(
+    target: Path, wc, workspace_root: Path, *, block_ancestors: bool = False
+) -> object | None:
+    """Refuse writes inside a non-Git workspace, creating/mutating ancestor ``.git``, or moving/deleting an ancestor."""
     message = (
         f"The non-Git CTO workspace ({workspace_root}) holds deployed settings, hooks and "
         "policy inputs and is read-only to the session. Do write work in a dispatch worktree "
         "or scratch outside the workspace."
     )
     canonical = wc.canonicalize(target)
-    if _is_within_root(canonical, workspace_root) or _targets_workspace_ancestor_git(canonical, workspace_root):
+    if (
+        _is_within_root(canonical, workspace_root)
+        or _targets_workspace_ancestor_git(canonical, workspace_root)
+        or (block_ancestors and _is_within_root(workspace_root, canonical))
+    ):
         return _UndecidableWrite("protected_cto_workspace", message)
     lexical = Path(os.path.normpath(os.fspath(target)))
     if lexical != Path("/") and lexical.name not in {"", ".", ".."}:
         parent_canonical = wc.canonicalize(lexical.parent)
         entry_canonical = parent_canonical / lexical.name
-        if _is_within_root(parent_canonical, workspace_root) or _targets_workspace_ancestor_git(
-            entry_canonical, workspace_root
+        if (
+            _is_within_root(parent_canonical, workspace_root)
+            or _targets_workspace_ancestor_git(entry_canonical, workspace_root)
+            or (block_ancestors and _is_within_root(workspace_root, entry_canonical))
         ):
             return _UndecidableWrite("protected_cto_workspace", message)
     return None
@@ -2948,6 +2959,342 @@ def bash_write_targets(
     return targets
 
 
+# Workspace-only Git and inode-alias / ancestor-rename target extraction (FU-WS-SETTINGS-GUARD).
+_GIT_WORKSPACE_IMPLICIT_CWD_WRITERS = frozenset({
+    "init",
+    "clone",
+    "format-patch",
+    "submodule",
+    "worktree",
+    "bundle",
+    "archive",
+    "checkout",
+    "restore",
+    "reset",
+    "apply",
+    "am",
+    "merge",
+    "pull",
+    "rebase",
+    "cherry-pick",
+    "revert",
+    "stash",
+    "clean",
+    "rm",
+    "mv",
+    "config",
+})
+_GIT_WORKSPACE_READONLY_SUBCMDS = frozenset({
+    "log",
+    "show",
+    "status",
+    "diff",
+    "branch",
+    "tag",
+    "rev-parse",
+    "rev-list",
+    "describe",
+    "shortlog",
+    "ls-files",
+    "ls-tree",
+    "cat-file",
+    "merge-base",
+    "for-each-ref",
+    "name-rev",
+    "blame",
+    "grep",
+    "reflog",
+    "symbolic-ref",
+    "show-ref",
+    "verify-commit",
+    "verify-tag",
+})
+_GIT_WORKSPACE_PATH_FLAGS = frozenset({
+    "-o",
+    "--output",
+    "--output-directory",
+    "-f",
+    "--file",
+    "--separate-git-dir",
+    "--export-marks",
+    "--work-tree",
+    "--git-dir",
+})
+_GIT_WORKSPACE_PATH_CREATORS = frozenset({"clone", "init", "worktree", "bundle", "submodule"})
+
+
+def _make_workspace_word(
+    value: object,
+    *,
+    base: str | None,
+    block_ancestors: bool = False,
+    decision_reason: str | None = None,
+) -> ShellWord:
+    word = ShellWord(str(value), unresolved_at=getattr(value, "unresolved_at", None))
+    word.base = base
+    if block_ancestors:
+        word.block_ancestors = True  # type: ignore[attr-defined]
+    if decision_reason is not None:
+        word.decision_reason = decision_reason
+    return word
+
+
+def _git_workspace_targets(segment: list[str], idx: int, cwd: str | None) -> list[ShellWord]:
+    """Fail-closed workspace targets for any Git command when a non-Git workspace is protected."""
+    out: list[ShellWord] = []
+    for prefix_word in segment[:idx]:
+        match = _ASSIGN_RE.match(prefix_word)
+        if not match or not match.group(1).startswith("GIT_"):
+            continue
+        rhs = prefix_word.tail(match.end()) if isinstance(prefix_word, ShellWord) else str(prefix_word)[match.end() :]
+        if not rhs:
+            continue
+        reason = "undecidable_git_workspace_target" if getattr(rhs, "unresolved_at", None) is not None else None
+        out.append(_make_workspace_word(rhs, base=cwd, decision_reason=reason))
+
+    args = segment[idx + 1 :]
+    git_base = cwd
+    base_unresolved = False
+    i = 0
+    n = len(args)
+    while i < n:
+        tok = args[i]
+        if tok == "-C" and i + 1 < n:
+            c_arg = args[i + 1]
+            out.append(_make_workspace_word(c_arg, base=git_base))
+            if getattr(c_arg, "unresolved_at", None) is not None or re.search(r"[*?\[\]{}]", c_arg):
+                git_base = None
+                base_unresolved = True
+            elif git_base is not None or Path(c_arg).is_absolute():
+                git_base = str(_resolve(str(c_arg), git_base or "/", expand_user=False))
+            else:
+                git_base = None
+            i += 2
+            continue
+        if tok.startswith("-C") and len(tok) > 2:
+            c_arg = tok.tail(2) if isinstance(tok, ShellWord) else tok[2:]
+            out.append(_make_workspace_word(c_arg, base=git_base))
+            if getattr(c_arg, "unresolved_at", None) is not None or re.search(r"[*?\[\]{}]", c_arg):
+                git_base = None
+                base_unresolved = True
+            elif git_base is not None or Path(c_arg).is_absolute():
+                git_base = str(_resolve(str(c_arg), git_base or "/", expand_user=False))
+            else:
+                git_base = None
+            i += 1
+            continue
+        if tok in {"--git-dir", "--work-tree"} and i + 1 < n:
+            val = args[i + 1]
+            reason = "undecidable_git_workspace_target" if getattr(val, "unresolved_at", None) is not None else None
+            out.append(_make_workspace_word(val, base=git_base, decision_reason=reason))
+            i += 2
+            continue
+        if tok.startswith(("--git-dir=", "--work-tree=")):
+            val = tok.tail(tok.index("=") + 1) if isinstance(tok, ShellWord) else tok.split("=", 1)[1]
+            reason = "undecidable_git_workspace_target" if getattr(val, "unresolved_at", None) is not None else None
+            out.append(_make_workspace_word(val, base=git_base, decision_reason=reason))
+            i += 1
+            continue
+        if tok == "-c" and i + 1 < n:
+            if "=" in args[i + 1]:
+                val = args[i + 1].split("=", 1)[1]
+                out.append(_make_workspace_word(val, base=git_base))
+            i += 2
+            continue
+        if tok.startswith("-c") and len(tok) > 2 and "=" in tok:
+            out.append(_make_workspace_word(tok.split("=", 1)[1], base=git_base))
+            i += 1
+            continue
+        if tok in {"--config-env", "--exec-path", "--namespace", "--super-prefix", "--list-cmds"} and i + 1 < n:
+            i += 2
+            continue
+        if tok.startswith("--") and "=" in tok:
+            out.append(_make_workspace_word(tok.split("=", 1)[1], base=git_base))
+            i += 1
+            continue
+        if tok in {
+            "--bare",
+            "--no-replace-objects",
+            "--literal-pathspecs",
+            "--glob-pathspecs",
+            "--noglob-pathspecs",
+            "--icase-pathspecs",
+            "--no-optional-locks",
+            "-p",
+            "--paginate",
+            "-P",
+            "--no-pager",
+        }:
+            i += 1
+            continue
+        break
+
+    rest = args[i:]
+    if not rest:
+        return out
+    subcmd = rest[0]
+    sub_args = rest[1:]
+    if subcmd in _GIT_WORKSPACE_IMPLICIT_CWD_WRITERS and not (subcmd == "format-patch" and "--stdout" in sub_args):
+        reason = "undecidable_git_workspace_target" if (base_unresolved or git_base is None) else None
+        out.append(_make_workspace_word(".", base=git_base, decision_reason=reason))
+
+    expect_path_value = False
+    after_ddash = False
+    clone_positionals: list[str] = []
+    for tok in sub_args:
+        if expect_path_value:
+            reason = "undecidable_git_workspace_target" if getattr(tok, "unresolved_at", None) is not None else None
+            out.append(_make_workspace_word(tok, base=git_base, decision_reason=reason))
+            expect_path_value = False
+            continue
+        if tok == "--" and not after_ddash:
+            after_ddash = True
+            continue
+        if not after_ddash and tok.startswith("--"):
+            if "=" in tok:
+                opt_name, raw_val = tok.split("=", 1)
+                val = tok.tail(len(opt_name) + 1) if isinstance(tok, ShellWord) else raw_val
+                is_path_opt = any(_long_option(opt_name, flag) for flag in _GIT_WORKSPACE_PATH_FLAGS if flag.startswith("--"))
+                reason = (
+                    "undecidable_git_workspace_target"
+                    if is_path_opt and getattr(val, "unresolved_at", None) is not None
+                    else None
+                )
+                out.append(_make_workspace_word(val, base=git_base, decision_reason=reason))
+            elif tok in _GIT_WORKSPACE_PATH_FLAGS or any(
+                _long_option(tok, flag) for flag in _GIT_WORKSPACE_PATH_FLAGS if flag.startswith("--")
+            ):
+                expect_path_value = True
+            continue
+        if not after_ddash and tok.startswith("-"):
+            if tok in {"-o", "-f"}:
+                expect_path_value = True
+            elif len(tok) > 2 and tok[:2] in {"-o", "-f"}:
+                val = tok.tail(2) if isinstance(tok, ShellWord) else tok[2:]
+                reason = "undecidable_git_workspace_target" if getattr(val, "unresolved_at", None) is not None else None
+                out.append(_make_workspace_word(val, base=git_base, decision_reason=reason))
+            continue
+        if subcmd == "clone":
+            clone_positionals.append(tok)
+        if subcmd not in _GIT_WORKSPACE_READONLY_SUBCMDS or "/" in tok or tok.startswith((".", "~")):
+            reason = (
+                "undecidable_git_workspace_target"
+                if subcmd in _GIT_WORKSPACE_PATH_CREATORS and getattr(tok, "unresolved_at", None) is not None
+                else None
+            )
+            out.append(_make_workspace_word(tok, base=git_base, decision_reason=reason))
+
+    if subcmd == "clone" and len(clone_positionals) == 1:
+        src = str(clone_positionals[0]).rstrip("/")
+        if src.endswith("/.git"):
+            src = src[:-5]
+        elif src.endswith(".git") and src != ".git":
+            src = src[:-4]
+        implicit = Path(src).name
+        if implicit and implicit not in {".", ".."}:
+            reason = "undecidable_git_workspace_target" if (base_unresolved or git_base is None) else None
+            out.append(_make_workspace_word(implicit, base=git_base, decision_reason=reason))
+    return out
+
+
+def _workspace_segment_targets(segment: list[str], cwd: str | None, depth: int = 0) -> list[ShellWord]:
+    """Workspace-only extra targets for one shell segment (Git writers, hard links, ancestor mv/rm)."""
+    if depth >= _MAX_SHELL_DEPTH:
+        return []
+    argv = _without_redirects(segment)
+    cmd, idx = _command_word(argv)
+    if not cmd:
+        return []
+    if _is_git_binary(cmd):
+        return _git_workspace_targets(argv, idx, cwd)
+    args = argv[idx + 1 :]
+    if cmd == "ln":
+        flags: list[str] = []
+        positionals: list[str] = []
+        after_ddash = False
+        for tok in args:
+            if tok == "--" and not after_ddash:
+                after_ddash = True
+                continue
+            if not after_ddash and tok.startswith("-"):
+                flags.append(tok)
+            else:
+                positionals.append(tok)
+        is_symbolic = any(
+            tok == "--symbolic" or (tok.startswith("-") and not tok.startswith("--") and "s" in tok[1:])
+            for tok in flags
+        )
+        if not is_symbolic:
+            return [_make_workspace_word(tok, base=cwd) for tok in positionals]
+        return []
+    if cmd == "cp":
+        flags = []
+        positionals = []
+        after_ddash = False
+        for tok in args:
+            if tok == "--" and not after_ddash:
+                after_ddash = True
+                continue
+            if not after_ddash and tok.startswith("-"):
+                flags.append(tok)
+            else:
+                positionals.append(tok)
+        is_hardlink = any(
+            tok == "--link" or (tok.startswith("-") and not tok.startswith("--") and "l" in tok[1:])
+            for tok in flags
+        )
+        if is_hardlink:
+            return [_make_workspace_word(tok, base=cwd) for tok in positionals]
+        return []
+    if cmd in {"mv", "rm", "rmdir"}:
+        raw = _destination_targets(argv, idx, cmd) if cmd == "mv" else _mutation_targets(argv, idx, cmd)
+        return [_make_workspace_word(tok, base=cwd, block_ancestors=True) for tok in raw]
+    if cmd in {"sh", "bash", "zsh", "dash"}:
+        script = _shell_command_script(args)
+        if script is not None and getattr(script, "unresolved_at", None) is None:
+            return _workspace_bash_targets(str(script), cwd=cwd, depth=depth + 1)
+    elif cmd == "eval":
+        if not any(getattr(arg, "unresolved_at", None) is not None for arg in args):
+            return _workspace_bash_targets(" ".join(args), cwd=cwd, depth=depth + 1)
+    elif cmd in {"trap", "coproc"}:
+        script = _trap_coproc_script(argv)
+        if script is not None:
+            return _workspace_bash_targets(script, cwd=None if cmd == "trap" else cwd, depth=depth + 1)
+    elif cmd == "find":
+        starts = _find_start_paths(args)
+        nested: list[ShellWord] = []
+        for i, tok in enumerate(args):
+            if tok not in {"-exec", "-execdir", "-ok", "-okdir"}:
+                continue
+            template: list[str] = []
+            for arg in args[i + 1 :]:
+                if arg in {";", "+"}:
+                    break
+                template.append(arg)
+            exec_cwd = None if tok.endswith("dir") else cwd
+            if "{}" in template:
+                for start in starts:
+                    instantiated = [start if word == "{}" else word for word in template]
+                    nested.extend(_workspace_segment_targets(instantiated, exec_cwd, depth=depth + 1))
+            else:
+                nested.extend(_workspace_segment_targets(template, exec_cwd, depth=depth + 1))
+        return nested
+    return []
+
+
+def _workspace_bash_targets(command: str, *, cwd: str | None, depth: int = 0) -> list[ShellWord]:
+    """Collect workspace-only Bash targets (Git subcommands, hard links, ancestor mv/rm)."""
+    if depth >= _MAX_SHELL_DEPTH:
+        return []
+    targets: list[ShellWord] = []
+    for segment, effective_cwd, _shell_cwd in _segments_with_cwd(command, cwd):
+        targets.extend(_workspace_segment_targets(segment, effective_cwd, depth=depth))
+        template = _xargs_template(segment)
+        if template:
+            targets.extend(_workspace_segment_targets(template, effective_cwd, depth=depth + 1))
+    return targets
+
+
 # ---------------------------------------------------------------------------
 # git-mediated working-tree writes (issue #5396)
 # ---------------------------------------------------------------------------
@@ -3914,7 +4261,18 @@ def _main(payload: dict | None) -> int:
         except Exception:
             return _block_uncertain("undecidable_git_target")
 
-    if not raw_targets:
+    workspace_raw_targets: list[ShellWord] = []
+    if is_shell_tool(tool_name) and command and protected_workspaces:
+        try:
+            workspace_raw_targets = _workspace_bash_targets(command, cwd=cwd)
+        except ShellPreprocessLimit:
+            return _block_uncertain("nested_shell_command")
+        except _AnsiCQuotingRefused:
+            return _block_ansi_c_quoting()
+        except _UndecidableWrapper as exc:
+            return _block_wrapper_option(str(exc))
+
+    if not raw_targets and not workspace_raw_targets:
         return 0
 
     try:
@@ -3928,9 +4286,23 @@ def _main(payload: dict | None) -> int:
                 target = _resolve(raw, cwd)
                 decision = _evaluate_write(target, wc, decision_root)
             decisions.append((raw, decision))
-        for raw, workspace_root in ((raw, root) for raw in raw_targets for root in protected_workspaces):
+        workspace_target_ids = {id(item) for item in workspace_raw_targets}
+        for raw, workspace_root in (
+            (raw, root) for raw in (*raw_targets, *workspace_raw_targets) for root in protected_workspaces
+        ):
             if is_shell_tool(tool_name):
-                if getattr(raw, "unresolved_at", None) is not None or getattr(raw, "decision_reason", None) is not None:
+                reason = getattr(raw, "decision_reason", None)
+                if reason is not None:
+                    if id(raw) in workspace_target_ids:
+                        decisions.append((
+                            raw,
+                            _UndecidableWrite(
+                                reason,
+                                f"Cannot verify that a Git/shell write target stays outside the protected non-Git workspace ({workspace_root}).",
+                            ),
+                        ))
+                    continue
+                if getattr(raw, "unresolved_at", None) is not None:
                     continue
                 if re.search(r"[*?\[\]{}]", raw):
                     if _glob_may_reach_workspace(raw, cwd, wc, workspace_root):
@@ -3945,7 +4317,12 @@ def _main(payload: dict | None) -> int:
                 ws_target = _resolve(raw, getattr(raw, "base", None) or cwd, expand_user=False)
             else:
                 ws_target = _resolve(raw, cwd)
-            ws_decision = _evaluate_workspace_write(ws_target, wc, workspace_root)
+            ws_decision = _evaluate_workspace_write(
+                ws_target,
+                wc,
+                workspace_root,
+                block_ancestors=bool(getattr(raw, "block_ancestors", False)),
+            )
             if ws_decision is not None:
                 decisions.append((raw, ws_decision))
     except Exception:
@@ -3953,7 +4330,7 @@ def _main(payload: dict | None) -> int:
 
     for raw, decision in decisions:
         if not decision.allowed:
-            if decision.reason == "protected_cto_workspace":
+            if decision.reason in {"protected_cto_workspace", "undecidable_git_workspace_target"}:
                 sys.stderr.write(
                     f"BLOCKED by guard-primary-checkout-write: {tool_name} would write "
                     f"'{_label(raw)}' inside a protected non-Git workspace "

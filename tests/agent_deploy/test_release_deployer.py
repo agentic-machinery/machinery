@@ -394,6 +394,22 @@ def test_workspace_settings_tamper_refused(consumer, release, tmp_path, monkeypa
         f"touch {workspace.parent}/.git",
         f"touch {workspace.parent}/.gi*",
         f"rm -f {inside_link}",
+        # F4: Git subcommands that write output paths or create repos/worktrees in the workspace.
+        f"git -C {primary} log -1 --format=%B --output={workspace}/.claude/settings.json",
+        f"git -C {primary} diff --output={workspace}/.claude/settings.json",
+        f"git clone {primary} {workspace}/.claude/skills/evil",
+        f"cd {workspace}/agents_extensions/shared && git clone {primary}",
+        f"git clone --bare {primary} {workspace}/.git",
+        f"git clone --bare {primary} {workspace.parent}/.git",
+        f"git -C {primary} worktree add {workspace}/.claude/skills/wt",
+        f"git submodule add {primary} {workspace}/.claude/sub",
+        f"git bundle create {workspace}/.claude/out.bundle HEAD",
+        f"git -C {primary} format-patch -o {workspace}/.claude/patches -1",
+        f"GIT_TRACE={workspace}/.claude/settings.json git --version",
+        # F5: hard link from workspace and moving a workspace ancestor.
+        f"ln {workspace}/.claude/settings.json {tmp_path}/hardlink.json",
+        f"cp -l {workspace}/.claude/settings.json {tmp_path}/hardlink2.json",
+        f"mv {workspace.parent} {tmp_path}/moved && echo x > {tmp_path}/moved/{workspace.name}/.claude/settings.json",
     ):
         res = run_guard({"tool_name": "Bash", "cwd": str(workspace), "tool_input": {"command": command}})
         assert res.returncode == 2, (command, res.returncode, res.stderr)
@@ -409,12 +425,47 @@ def test_workspace_settings_tamper_refused(consumer, release, tmp_path, monkeypa
     finally:
         bogus_ancestor_git.unlink()
 
-    # Legitimate writes to external scratch or a dispatch worktree remain allowed.
+    # F6: a subdirectory of a real foreign Git worktree in CLAUDE_PROJECT_DIR is not misclassified as a CTO workspace.
+    foreign = tmp_path / "foreign-repo"
+    foreign.mkdir()
+    subprocess.run(
+        ["git", "init", "-q", "-b", "main", str(foreign)],
+        check=True,
+        capture_output=True,
+        timeout=30,
+        env=git_environment(),
+    )
+    (foreign / "README.md").write_text("hi\n")
+    commit_all(foreign, "init")
+    foreign_wt = foreign / ".worktrees/dispatch/a/t"
+    subprocess.run(
+        ["git", "-C", str(foreign), "worktree", "add", "-q", "-b", "a/t", str(foreign_wt)],
+        check=True,
+        capture_output=True,
+        timeout=30,
+        env=git_environment(),
+    )
+    foreign_sub = foreign_wt / "sub"
+    foreign_sub.mkdir()
+    foreign_res = subprocess.run(
+        [sys.executable, str(guard_script)],
+        input=json.dumps({"tool_name": "Write", "cwd": str(foreign_sub), "tool_input": {"file_path": str(foreign_sub / "ok.txt")}}),
+        env={**guard_env, "CLAUDE_PROJECT_DIR": str(foreign_sub), "LU_PRODUCT_ROOT": str(primary)},
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert foreign_res.returncode == 0, (foreign_res.returncode, foreign_res.stderr)
+
+    # Legitimate writes to external scratch or a dispatch worktree and read-only git commands remain allowed.
     for payload in (
         {"tool_name": "Write", "cwd": str(workspace), "tool_input": {"file_path": str(tmp_path / "scratch-outside.txt")}},
         {"tool_name": "Write", "cwd": str(dispatch), "tool_input": {"file_path": str(dispatch / "ok.py")}},
         {"tool_name": "Bash", "cwd": str(workspace), "tool_input": {"command": f"echo ok > {tmp_path}/scratch-outside.txt"}},
         {"tool_name": "Bash", "cwd": str(workspace), "tool_input": {"command": "cat .claude/settings.json"}},
+        {"tool_name": "Bash", "cwd": str(workspace), "tool_input": {"command": f"git -C {dispatch} status -sb"}},
+        {"tool_name": "Bash", "cwd": str(workspace), "tool_input": {"command": f"git -C {dispatch} log -n 5 --oneline"}},
     ):
         res = run_guard(payload)
         assert res.returncode == 0, (payload, res.returncode, res.stderr)
