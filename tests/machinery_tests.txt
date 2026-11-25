@@ -390,15 +390,14 @@ tests/fleet_comms/test_fleet_comms_bottleneck_metrics.py
 tests/fleet_comms/test_fleet_comms_cli.py
 tests/fleet_comms/test_fleet_comms_contracts.py
 tests/fleet_comms/test_fleet_comms_fleet_progress.py
-tests/fleet_comms/test_fleet_comms_formal_finalize.py
 tests/fleet_comms/test_fleet_comms_formal_review_jobs.py
 tests/fleet_comms/test_fleet_comms_message_plane.py
 tests/fleet_comms/test_fleet_comms_message_plane_e2e.py
 tests/fleet_comms/test_fleet_comms_review_ground_truth.py
 tests/fleet_comms/test_fleet_comms_review_publication.py
-tests/fleet_comms/test_fleet_comms_review_publisher.py
 tests/fleet_comms/test_fleet_comms_routing_reservations.py
 tests/fleet_comms/test_fleet_comms_wave1.py
+tests/fleet_comms/test_formal_job_retired.py
 tests/fleet_comms/test_github_pr_metrics.py
 tests/fleet_comms/test_grok_sealed_review_refuse.py
 tests/fleet_comms/test_inbox_pending.py

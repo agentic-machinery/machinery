@@ -80,9 +80,6 @@ WRITERS: dict[str, Writer] = {
     ),
     f"{_AUTH}::AuthorityService.finish_job": Writer(KEYED, "the fenced lease holder terminalizes its own job"),
     f"{_AUTH}::AuthorityService.finish_delivery": Writer(KEYED, "the fenced lease holder terminalizes its delivery"),
-    f"{_AUTH}::AuthorityService.authorize_formal_review_substitution": Writer(
-        KEYED, "one formal-review job; a formal review names no recipient"
-    ),
     f"{_AUTH}::AuthorityService.enqueue_discussion": Writer(ADMITTED, "participants admitted before any insert"),
     f"{_AUTH}::AuthorityService._publish_message_tx": Writer(
         ADMITTED, "admitted targets or subscribers; a historical import records terminal history rows"
@@ -93,7 +90,6 @@ WRITERS: dict[str, Writer] = {
         {
             f"{_AUTH}::AuthorityService.enqueue_request": ADMITTED,
             f"{_AUTH}::AuthorityService.enqueue_discussion": ADMITTED,
-            f"{_AUTH}::AuthorityService.enqueue_formal_review": NO_TARGET,
         },
     ),
     f"{_AUTH}::AuthorityService._append_job_event_tx": Writer(
@@ -103,7 +99,6 @@ WRITERS: dict[str, Writer] = {
             f"{_AUTH}::AuthorityService.claim_next_job": SKIP,
             f"{_AUTH}::AuthorityService.claim_job": SKIP,
             f"{_AUTH}::AuthorityService.finish_job": KEYED,
-            f"{_AUTH}::AuthorityService.authorize_formal_review_substitution": KEYED,
             f"{_AUTH}::AuthorityService._requeue_terminal_job": SKIP,
             f"{_AUTH}::AuthorityService._reclaim_expired_jobs_tx": SKIP,
             f"{_AUTH}::AuthorityService._enqueue_job_tx": HELPER,

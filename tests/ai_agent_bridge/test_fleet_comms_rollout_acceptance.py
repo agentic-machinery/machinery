@@ -6,38 +6,10 @@ import json
 import sqlite3
 from pathlib import Path
 
-import pytest
-
 from lu_machinery.fleet_comms.artifacts import ArtifactStore
-from lu_machinery.fleet_comms.formal_review_finalize import finalize_formal_review_verdict
-from lu_machinery.fleet_comms.formal_review_jobs import FormalReviewJobService
 from lu_machinery.fleet_comms.message_plane import MessagePlane, read_plane_status
 from lu_machinery.fleet_comms.migrations import MIGRATIONS
 from lu_machinery.fleet_comms.request_executor import RequestExecutor
-
-_REPOSITORY = "learn-ukrainian/learn-ukrainian.github.io"
-_HEAD_SHA = "a" * 40
-
-
-@pytest.fixture
-def approved_findings_path(tmp_path: Path) -> Path:
-    """Persist canonical, evidence-backed findings for an approved review."""
-    path = tmp_path / "review-findings.json"
-    path.write_text(
-        json.dumps(
-            {
-                "schema_version": "code-review-findings.v1",
-                "overall": {
-                    "correctness": "correct",
-                    "explanation": "The review found no defects that block approval.",
-                    "confidence": 0.95,
-                },
-                "findings": [],
-            }
-        ),
-        encoding="utf-8",
-    )
-    return path
 
 
 def test_schema_v2_contains_rollout_contract_tables_and_columns(tmp_path: Path) -> None:
@@ -78,55 +50,6 @@ def test_schema_v2_contains_rollout_contract_tables_and_columns(tmp_path: Path) 
     assert {"request_id", "request_message_id", "completion_state", "state"}.issubset(
         request_columns
     )
-
-
-def test_formal_review_verdict_is_sealed_as_an_immutable_json_artifact(
-    tmp_path: Path, approved_findings_path: Path
-) -> None:
-    """Formal verdict provenance is durably sealed before any live publication."""
-    root = tmp_path / "batch_state" / "fleet-comms" / "v1"
-    result = finalize_formal_review_verdict(
-        pr_number=5512,
-        model="claude-sonnet-5",
-        family="anthropic",
-        harness="claude",
-        verdict="APPROVED",
-        repository=_REPOSITORY,
-        head_sha=_HEAD_SHA,
-        findings_path=approved_findings_path,
-        plane_root=root,
-    )
-
-    assert result.published is False
-    assert result.sealed_verdict_artifact_id is not None
-    with FormalReviewJobService(root=root) as service:
-        job = service.get_job(result.review_id)
-        assert job.sealed_verdict_artifact_id == result.sealed_verdict_artifact_id
-        artifact = service.store.get(result.sealed_verdict_artifact_id)
-        sealed = json.loads(service.store.read_bytes(artifact.artifact_id))
-
-    assert artifact.retention_class == "sealed-verdict"
-    assert artifact.logical_filename == f"{result.review_id}.sealed-verdict.json"
-    assert sealed == {
-        "family": "anthropic",
-        "gate_kind": "cross-family-review",
-        "harness": "claude",
-        "head_sha": _HEAD_SHA,
-        "model": "claude-sonnet-5",
-        "pr_number": 5512,
-        "repository": _REPOSITORY,
-        "review_evidence": {
-            "schema_version": "code-review-findings.v1",
-            "overall": {
-                "correctness": "correct",
-                "explanation": "The review found no defects that block approval.",
-                "confidence": 0.95,
-            },
-            "findings": [],
-        },
-        "review_id": result.review_id,
-        "verdict": "APPROVED",
-    }
 
 
 def test_dual_write_completion_records_clean_parity_telemetry(tmp_path: Path) -> None:

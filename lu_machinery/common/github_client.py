@@ -985,9 +985,6 @@ _THIS_MODULE = os.path.realpath(__file__)
 # a caller passes can add to this list; only an edit here can.
 _LANDING_ENTRY_POINTS = {
     ("orchestration/merge_queue_keeper.py", "run"): "merge-queue-keeper",
-    ("fleet_comms/review_publisher.py", "fetch_pr_head_sha"): "verdict-publication",
-    ("fleet_comms/review_publisher.py", "execute_publication"): "verdict-publication",
-    ("fleet_comms/review_publisher.py", "publish_sealed_verdict"): "verdict-publication",
     ("review/record_cf_verdict.py", "record"): "verdict-publication",
 }
 # The publisher's ``publish`` (wrapped by rate_limited_command) and its verbs that land a PR:

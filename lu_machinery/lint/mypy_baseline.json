@@ -4825,11 +4825,6 @@
     {
       "path": "lu_machinery/fleet_comms/authority.py",
       "code": "no-any-return",
-      "message": "Returning Any from function declared to return \"None | Row\""
-    },
-    {
-      "path": "lu_machinery/fleet_comms/authority.py",
-      "code": "no-any-return",
       "message": "Returning Any from function declared to return \"Row\""
     },
     {
@@ -4851,11 +4846,6 @@
       "path": "lu_machinery/fleet_comms/authority.py",
       "code": "no-any-return",
       "message": "Returning Any from function declared to return \"Row\""
-    },
-    {
-      "path": "lu_machinery/fleet_comms/authority.py",
-      "code": "return",
-      "message": "Missing return statement"
     },
     {
       "path": "lu_machinery/fleet_comms/authority.py",
@@ -4973,26 +4963,6 @@
       "message": "Cannot assign to a type"
     },
     {
-      "path": "lu_machinery/fleet_comms/formal_review_jobs.py",
-      "code": "attr-defined",
-      "message": "Module \"lu_machinery.fleet_comms.contracts\" has no attribute \"CompletionState\""
-    },
-    {
-      "path": "lu_machinery/fleet_comms/formal_review_jobs.py",
-      "code": "attr-defined",
-      "message": "Module \"lu_machinery.fleet_comms.contracts\" has no attribute \"new_id\""
-    },
-    {
-      "path": "lu_machinery/fleet_comms/formal_review_jobs.py",
-      "code": "no-any-return",
-      "message": "Returning Any from function declared to return \"str\""
-    },
-    {
-      "path": "lu_machinery/fleet_comms/formal_review_jobs.py",
-      "code": "no-any-return",
-      "message": "Returning Any from function declared to return \"str\""
-    },
-    {
       "path": "lu_machinery/fleet_comms/message_plane.py",
       "code": "arg-type",
       "message": "Argument 1 to \"verify_applied_migrations\" has incompatible type \"Any | Connection\"; expected \"SQLiteConnection\""
@@ -5041,26 +5011,6 @@
       "path": "lu_machinery/fleet_comms/request_executor.py",
       "code": "no-any-return",
       "message": "Returning Any from function declared to return \"str\""
-    },
-    {
-      "path": "lu_machinery/fleet_comms/review_publication.py",
-      "code": "return-value",
-      "message": "Incompatible return value type (got \"str\", expected \"Literal['error', 'failure', 'pending', 'success']\")"
-    },
-    {
-      "path": "lu_machinery/fleet_comms/review_publication.py",
-      "code": "return-value",
-      "message": "Incompatible return value type (got \"str\", expected \"Literal['error', 'failure', 'pending', 'success']\")"
-    },
-    {
-      "path": "lu_machinery/fleet_comms/review_publication.py",
-      "code": "return-value",
-      "message": "Incompatible return value type (got \"str\", expected \"Literal['error', 'failure', 'pending', 'success']\")"
-    },
-    {
-      "path": "lu_machinery/fleet_comms/review_publisher.py",
-      "code": "attr-defined",
-      "message": "Module \"lu_machinery.fleet_comms.contracts\" has no attribute \"new_id\""
     },
     {
       "path": "lu_machinery/fleet_comms/routing_reservations.py",

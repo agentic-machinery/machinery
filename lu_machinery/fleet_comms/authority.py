@@ -6,8 +6,8 @@ broker tables, and never turns a file diary into an authority.  Callers may
 use it only after explicitly selecting ``FLEET_COMMS_MESSAGE_PLANE=authority``.
 
 Every writer uses ``BEGIN IMMEDIATE`` and immutable content-addressed artifacts:
-message fan-out, durable jobs, lease hand-off, historical import, and formal
-review snapshot sealing are therefore recoverable after a process crash.
+message fan-out, durable jobs, lease hand-off, and historical import are
+therefore recoverable after a process crash.
 """
 
 from __future__ import annotations
@@ -47,13 +47,7 @@ from lu_machinery.fleet_comms.artifacts import (
     ArtifactStoreError,
 )
 from lu_machinery.fleet_comms.contracts import new_id
-from lu_machinery.fleet_comms.formal_review_jobs import (
-    FormalReviewJob,
-    FormalReviewJobsError,
-    FormalReviewJobService,
-)
 from lu_machinery.fleet_comms.migrations import MIGRATIONS, apply_migrations
-from lu_machinery.fleet_comms.review_publication import SealedVerdict, parse_sealed_verdict_payload
 from lu_machinery.lib.readonly_sqlite import SQLiteConnection, open_readonly
 
 AuthorityJobKind = Literal["request", "discussion", "formal_review"]
@@ -1186,93 +1180,6 @@ class AuthorityService:
                 idempotency_key=key,
             )
 
-    def enqueue_formal_review(
-        self,
-        *,
-        repository: str,
-        pr_number: int,
-        head_sha: str,
-        gate_kind: str,
-        snapshot: bytes | None = None,
-        snapshot_artifact_id: str | None = None,
-        deadline_at: str | None = None,
-        idempotency_key: str | None = None,
-    ) -> AuthorityJob:
-        """Queue a review only after sealing its exact snapshot and head identity."""
-        key = idempotency_key or new_id("authority-review-key")
-        repo = _nonempty(repository, field="repository")
-        if isinstance(pr_number, bool) or not isinstance(pr_number, int) or pr_number < 1:
-            raise AuthorityServiceError("invalid_pr_number")
-        sha = _nonempty(head_sha, field="head_sha").lower()
-        gate = _nonempty(gate_kind, field="gate_kind")
-        if (snapshot is None) == (snapshot_artifact_id is None):
-            raise AuthorityServiceError("provide_exactly_one_snapshot_or_snapshot_artifact_id")
-        deadline = self._normalize_deadline(deadline_at)
-        payload_base = {
-            "repository": repo,
-            "pr_number": pr_number,
-            "head_sha": sha,
-            "gate_kind": gate,
-        }
-        with self._write_transaction():
-            existing = self._find_job_by_key_tx("formal_review", key)
-            if existing is not None:
-                self._assert_job_payload(existing, payload_base, subset=True)
-                return existing
-            if snapshot is not None:
-                artifact = self.store.store_bytes(
-                    snapshot,
-                    producer="authority-formal-review",
-                    retention_class="formal-review-snapshot",
-                    mime_type="application/json",
-                    logical_filename="formal-review-snapshot.json",
-                    commit=False,
-                )
-            else:
-                artifact = self._require_artifact_tx(
-                    _nonempty(snapshot_artifact_id, field="snapshot_artifact_id")
-                )
-            payload = {**payload_base, "snapshot_sha256": artifact.sha256}
-            review = self._find_formal_review_tx(repo, pr_number, sha, gate)
-            if review is None:
-                review_id = new_id("review")
-                created_at = _iso()
-                self._conn.execute(
-                    """INSERT INTO formal_review_jobs(
-                        review_id, repository, pr_number, head_sha, gate_kind, state,
-                        snapshot_artifact_id, created_at
-                    ) VALUES (?, ?, ?, ?, ?, 'open', ?, ?)""",
-                    (review_id, repo, pr_number, sha, gate, artifact.artifact_id, created_at),
-                )
-                self._conn.execute(
-                    """INSERT INTO formal_review_snapshot_seals(
-                        review_id, repository, pr_number, head_sha, gate_kind,
-                        snapshot_artifact_id, snapshot_sha256, sealed_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (
-                        review_id,
-                        repo,
-                        pr_number,
-                        sha,
-                        gate,
-                        artifact.artifact_id,
-                        artifact.sha256,
-                        created_at,
-                    ),
-                )
-            else:
-                review_id = str(review["review_id"])
-                if str(review["snapshot_artifact_id"] or "") != artifact.artifact_id:
-                    raise AuthorityServiceError("formal_review_snapshot_conflict")
-                self._require_formal_snapshot_seal_tx(review_id, current_head_sha=sha)
-            return self._enqueue_job_tx(
-                job_kind="formal_review",
-                subject_id=review_id,
-                payload=payload,
-                deadline_at=deadline,
-                idempotency_key=key,
-            )
-
     def get_job(self, job_id: str) -> AuthorityJob:
         jid = _nonempty(job_id, field="job_id")
         row = self._conn.execute(
@@ -2072,193 +1979,6 @@ class AuthorityService:
                 state=state,
                 now=now_value,
             )
-
-    # ------------------------------------------------------------------
-    # Formal review authority seam
-
-    def require_publishable_formal_review(
-        self,
-        review_id: str,
-        *,
-        current_head_sha: str,
-    ) -> FormalReviewJob:
-        """Fail closed unless the sealed immutable snapshot matches the exact PR head."""
-        rid = _nonempty(review_id, field="review_id")
-        head = _nonempty(current_head_sha, field="current_head_sha").lower()
-        row = self._conn.execute(
-            "SELECT * FROM formal_review_jobs WHERE review_id = ?", (rid,)
-        ).fetchone()
-        if row is None:
-            raise AuthorityServiceError("formal_review_not_found")
-        self._require_formal_snapshot_seal_tx(rid, current_head_sha=head)
-        service = FormalReviewJobService(store=self.store)
-        return service.get_job(rid, include_attempts=False)
-
-    def accept_formal_review_verdict(
-        self,
-        review_id: str,
-        sealed: SealedVerdict | Mapping[str, Any] | str | bytes,
-    ) -> SealedVerdict:
-        """Accept a verdict only after authority's exact sealed-snapshot/head gate."""
-        try:
-            parsed = sealed if isinstance(sealed, SealedVerdict) else parse_sealed_verdict_payload(sealed)
-        except Exception as exc:
-            raise AuthorityServiceError("sealed_verdict_invalid") from exc
-        job = self.require_publishable_formal_review(
-            review_id, current_head_sha=parsed.head_sha
-        )
-        if parsed.review_id != job.review_id:
-            raise AuthorityServiceError("sealed_review_id_mismatch")
-        try:
-            return FormalReviewJobService(store=self.store).accept_sealed_verdict(
-                job.review_id, parsed
-            )
-        except FormalReviewJobsError as exc:
-            raise AuthorityServiceError("sealed_verdict_rejected") from exc
-
-    def authorize_formal_review_substitution(
-        self,
-        *,
-        authority_job_id: str,
-        review_id: str,
-        current_head_sha: str,
-        expected_snapshot_artifact_id: str,
-        routing_request: Any,
-        selector: Any,
-        substitution_evidence: Mapping[str, Any],
-        ttl_seconds: int,
-        now: str | None = None,
-    ) -> Any:
-        """Atomically requeue one failed formal review and reserve its substitute."""
-        from lu_machinery.fleet_comms.routing_reservations import RoutingReservationLedger
-
-        jid = _nonempty(authority_job_id, field="authority_job_id")
-        rid = _nonempty(review_id, field="review_id")
-        head = _nonempty(current_head_sha, field="current_head_sha").lower()
-        snapshot = _nonempty(expected_snapshot_artifact_id, field="expected_snapshot_artifact_id")
-        now_value = self._now_string(now)
-        with self._write_transaction():
-            job = self._require_job_tx(jid)
-            if str(job["job_kind"]) != "formal_review" or str(job["subject_id"]) != rid:
-                raise AuthorityServiceError("substitution_authority_job_mismatch")
-            if str(job["idempotency_key"]) != str(routing_request.authority_key):
-                raise AuthorityServiceError("substitution_authority_key_mismatch")
-            review = self._conn.execute(
-                "SELECT snapshot_artifact_id, sealed_verdict_artifact_id FROM formal_review_jobs WHERE review_id = ?",
-                (rid,),
-            ).fetchone()
-            if review is None or str(review["snapshot_artifact_id"] or "") != snapshot:
-                raise AuthorityServiceError("substitution_snapshot_drift")
-            if review["sealed_verdict_artifact_id"] is not None:
-                raise AuthorityServiceError("substitution_verdict_already_accepted")
-            published = self._conn.execute(
-                "SELECT 1 FROM github_publications WHERE review_id = ? LIMIT 1", (rid,)
-            ).fetchone()
-            if published is not None:
-                raise AuthorityServiceError("substitution_verdict_already_published")
-            self._require_formal_snapshot_seal_tx(rid, current_head_sha=head)
-            ledger = RoutingReservationLedger(store=self.store)
-            reason = _nonempty(
-                str(substitution_evidence.get("reason") or ""),
-                field="substitution_reason",
-            )
-            egress = substitution_evidence.get("data_egress_policy")
-            if egress is not None and not isinstance(egress, str):
-                raise AuthorityServiceError("substitution_egress_policy_invalid")
-            if egress != routing_request.data_egress_policy:
-                raise AuthorityServiceError("substitution_egress_policy_mismatch")
-            job_state = str(job["state"])
-            if job_state in {"queued", "running"}:
-                existing = ledger.latest_for_authority_key(routing_request.authority_key)
-                decision = (
-                    next(
-                        (
-                            item
-                            for item in ledger.decisions(existing.reservation_id)
-                            if item.event_type == "authorized_substitution"
-                        ),
-                        None,
-                    )
-                    if existing is not None
-                    else None
-                )
-                if (
-                    existing is None
-                    or existing.idempotency_key != routing_request.idempotency_key
-                    or decision is None
-                    or decision.evidence.get("review_id") != rid
-                    or decision.evidence.get("authority_job_id") != jid
-                    or decision.evidence.get("authority_key") != routing_request.authority_key
-                    or decision.evidence.get("reason") != reason
-                    or decision.evidence.get("requested_data_egress_policy") != egress
-                    or decision.evidence.get("new_requested_reviewer")
-                    != routing_request.requested_reviewer
-                ):
-                    raise AuthorityServiceError("substitution_authority_job_not_failed")
-                return ledger.reserve_selection(
-                    routing_request,
-                    selector,
-                    ttl_seconds=ttl_seconds,
-                    now=now_value,
-                    substitution=decision.evidence,
-                )
-            if job_state != "failed":
-                raise AuthorityServiceError("substitution_authority_job_not_failed")
-            prior = ledger.latest_for_authority_key(routing_request.authority_key)
-            if prior is None:
-                raise AuthorityServiceError("substitution_prior_reservation_missing")
-            prior_reserved = next(
-                (
-                    decision
-                    for decision in ledger.decisions(prior.reservation_id)
-                    if decision.event_type == "reserved"
-                ),
-                None,
-            )
-            prior_envelope = (
-                prior_reserved.evidence.get("authorization_envelope")
-                if prior_reserved is not None
-                else None
-            )
-            prior_envelope_source = "persisted"
-            if not isinstance(prior_envelope, Mapping):
-                prior_envelope = {
-                    "required_capabilities": ["code_review", "sealed_evidence"],
-                    "data_egress_policy": None,
-                    "isolation_required": True,
-                }
-                prior_envelope_source = "formal-review-default-contract-before-6342"
-            evidence = {
-                "prior_reservation_id": prior.reservation_id,
-                "prior_failure_classification": prior.failure_classification,
-                "review_id": rid,
-                "authority_job_id": jid,
-                "authority_key": routing_request.authority_key,
-                "reason": reason,
-                "prior_authorization_envelope_source": prior_envelope_source,
-                "prior_data_egress_policy": prior_envelope.get("data_egress_policy"),
-                "requested_data_egress_policy": egress,
-                "prior_resolved_candidate": prior.resolved_candidate,
-                "new_requested_reviewer": routing_request.requested_reviewer,
-            }
-            reservation = ledger.reserve_selection(
-                routing_request,
-                selector,
-                ttl_seconds=ttl_seconds,
-                now=now_value,
-                substitution=evidence,
-            )
-            self._conn.execute(
-                """UPDATE authority_jobs SET state = 'queued', result_artifact_id = NULL,
-                   terminal_sha256 = NULL, lease_owner = NULL, lease_expires_at = NULL,
-                   updated_at = ?, completed_at = NULL WHERE job_id = ?""",
-                (now_value, jid),
-            )
-            self._append_job_event_tx(
-                jid, int(job["fence_token"]), "substitution_authorized", "queued",
-                {"reservation_id": reservation.reservation_id, "review_id": rid},
-            )
-            return reservation
 
     # ------------------------------------------------------------------
     # Historical migration seam (no live-state caller is invoked here)
@@ -3092,42 +2812,7 @@ class AuthorityService:
         )
 
     # ------------------------------------------------------------------
-    # Formal snapshot and import helpers
-
-    def _require_formal_snapshot_seal_tx(self, review_id: str, *, current_head_sha: str) -> None:
-        row = self._conn.execute(
-            """SELECT j.repository, j.pr_number, j.head_sha, j.gate_kind,
-                      j.snapshot_artifact_id, s.snapshot_artifact_id AS sealed_artifact_id,
-                      s.snapshot_sha256, a.sha256 AS artifact_sha256
-               FROM formal_review_jobs j
-               LEFT JOIN formal_review_snapshot_seals s ON s.review_id = j.review_id
-               LEFT JOIN artifacts a ON a.artifact_id = s.snapshot_artifact_id
-               WHERE j.review_id = ?""",
-            (review_id,),
-        ).fetchone()
-        if row is None:
-            raise AuthorityServiceError("formal_review_not_found")
-        if str(row["head_sha"]).lower() != current_head_sha.lower():
-            raise AuthorityServiceError("formal_review_head_mismatch")
-        if row["sealed_artifact_id"] is None or row["snapshot_sha256"] is None:
-            raise AuthorityServiceError("formal_review_snapshot_not_sealed")
-        if row["snapshot_artifact_id"] != row["sealed_artifact_id"]:
-            raise AuthorityServiceError("formal_review_snapshot_binding_mismatch")
-        if row["artifact_sha256"] != row["snapshot_sha256"]:
-            raise AuthorityServiceError("formal_review_snapshot_integrity_mismatch")
-        try:
-            self.store.read_bytes(str(row["sealed_artifact_id"]))
-        except Exception as exc:
-            raise AuthorityServiceError("formal_review_snapshot_unreadable") from exc
-
-    def _find_formal_review_tx(
-        self, repository: str, pr_number: int, head_sha: str, gate_kind: str
-    ) -> sqlite3.Row | None:
-        return self._conn.execute(
-            """SELECT * FROM formal_review_jobs
-               WHERE repository = ? AND pr_number = ? AND head_sha = ? AND gate_kind = ?""",
-            (repository, pr_number, head_sha, gate_kind),
-        ).fetchone()
+    # Historical import helpers
 
     def _normalize_import_record(self, raw: Mapping[str, Any], source: str) -> dict[str, Any]:
         data = dict(raw)

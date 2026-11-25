@@ -579,12 +579,21 @@ def _pull_reply(method, endpoint, body):
 
 
 def test_verdict_publication_entry_point_is_landing_only_while_it_runs(tmp_path, monkeypatch):
-    from lu_machinery.fleet_comms import review_publisher
+    from lu_machinery.review import record_cf_verdict as recorder
 
     wire = Wire(_pull_reply)
     client = store(tmp_path, wire, [("core", 0, OPEN), ("secondary", 0, OPEN)])
-    monkeypatch.setattr(gh, "GitHubClient", lambda **kwargs: client)
-    assert review_publisher.fetch_pr_head_sha(repository="o/r", pr_number=1) == HEAD
+
+    class Done(Exception):
+        pass
+
+    def probe(_task_id, _task_root):
+        raise Done(_pr_view(client))
+
+    monkeypatch.setattr(recorder, "_task", probe)
+    with pytest.raises(Done) as caught:
+        recorder.record("t", task_root=tmp_path, lock_root=tmp_path)
+    assert caught.value.args[0].returncode == 0
     assert wire.sent == [("http", "GET", "repos/o/r/pulls/1")]
     # The declaration ended with the call: the same read outside it is refused.
     refused(_pr_view(client), "secondary_hold")
@@ -645,9 +654,6 @@ def test_caller_tags_flags_headers_and_environment_never_exempt(tmp_path, monkey
 def test_frozen_landing_entry_points_exist_and_nothing_else_declares_them():
     assert gh._LANDING_ENTRY_POINTS == {
         ("orchestration/merge_queue_keeper.py", "run"): "merge-queue-keeper",
-        ("fleet_comms/review_publisher.py", "fetch_pr_head_sha"): "verdict-publication",
-        ("fleet_comms/review_publisher.py", "execute_publication"): "verdict-publication",
-        ("fleet_comms/review_publisher.py", "publish_sealed_verdict"): "verdict-publication",
         ("review/record_cf_verdict.py", "record"): "verdict-publication",
     }
     assert gh._PUBLISHER_ENTRY_POINT == ("publish/github.py", "publish")
