@@ -9,6 +9,27 @@ this file.
 
 ## [Unreleased]
 
+<a id="v0.1.73"></a>
+## [0.1.73] - 2026-11-25
+
+### Added
+
+- Read attested author families from verdict records ([#1402](https://github.com/learn-ukrainian/machinery/pull/1402))
+- Preserve custody history and list run PRs ([#1414](https://github.com/learn-ukrainian/machinery/pull/1414))
+
+### Fixed
+
+- Honor the configured runtime state root ([#1406](https://github.com/learn-ukrainian/machinery/pull/1406))
+- Say when repo-transfer exit 3 sent a request ([#1407](https://github.com/learn-ukrainian/machinery/pull/1407))
+- Classify repositories directly from the packaged catalog ([#1408](https://github.com/learn-ukrainian/machinery/pull/1408))
+- Settle repo-transfer after async 202 acceptance ([#1409](https://github.com/learn-ukrainian/machinery/pull/1409))
+- Verify workspace policy before launch ([#1410](https://github.com/learn-ukrainian/machinery/pull/1410))
+- Resolve owner keys from packaged registries ([#1411](https://github.com/learn-ukrainian/machinery/pull/1411))
+
+### Removed
+
+- Retire sealed formal-review writer path ([#1403](https://github.com/learn-ukrainian/machinery/pull/1403))
+
 <a id="v0.1.72"></a>
 ## [0.1.72] - 2026-11-25 [YANKED]
 
@@ -1685,7 +1706,8 @@ First release: the machinery extracted from learn-ukrainian as the installable `
 - Rollover confirms replacement bindings without a self-answered quiz. ([#65](https://github.com/learn-ukrainian/machinery/pull/65))
 - Deploy derives release identity from packaged bytes. ([#145](https://github.com/learn-ukrainian/machinery/pull/145))
 
-[Unreleased]: https://github.com/learn-ukrainian/machinery/compare/v0.1.72...HEAD
+[Unreleased]: https://github.com/learn-ukrainian/machinery/compare/v0.1.73...HEAD
+[0.1.73]: https://github.com/learn-ukrainian/machinery/compare/v0.1.71...v0.1.73
 [0.1.72]: https://github.com/learn-ukrainian/machinery/compare/v0.1.71...v0.1.72
 [0.1.71]: https://github.com/learn-ukrainian/machinery/compare/v0.1.70...v0.1.71
 [0.1.70]: https://github.com/learn-ukrainian/machinery/compare/v0.1.69...v0.1.70
