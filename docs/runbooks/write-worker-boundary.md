@@ -327,8 +327,9 @@ The exit codes apply to that module entry point. After an interruption, check Gi
 name before trying another create, or rerun the transfer command to reconcile its journal. The
 journal binds the login and account id that started the transfer; only that principal settles it.
 Every exit 0 that sends no POST (an already-transferred repository, with or without a journal, and
-each verb's dry run) re-reads `GET /user` after its last GitHub read and requires that login and id;
-a failed or mismatched re-read exits 3 and keeps the journal.
+each verb's dry run) and every journal removal (a refusal before the POST included) re-reads
+`GET /user` after its last GitHub read and requires that login and id; a failed or mismatched re-read
+exits 3 and keeps the journal.
 
 ## Review contract canary
 

@@ -2845,7 +2845,7 @@ def _repo_transfer_checked(fields, plan, receipt, sink, directory_fd, directory,
     read that follows the last GitHub read; 2 refused with nothing sent and no journal left; 75 a rate limit
     before any POST with no journal; 3 everything else: a POST sent and unsettled, a pending journal not
     settled by the destination under the login and id it binds, a failed or mismatched final principal
-    re-read (the journal is kept), or a journal that could not be removed.
+    re-read before an exit 0 or a journal removal (the journal is kept), or a journal that could not be removed.
     """
     verb, reader = "repo-transfer", merge_readiness_runner(runner)
     source, destination, repository_id = plan["source"], plan["destination"], plan["repository_id"]
@@ -2981,13 +2981,23 @@ def _repo_transfer_send(plan, receipt, sink, directory_fd, journal_name, frozen,
                         environment, capture_output, text):
     """Create the journal, re-read the source, send the one transfer and verify it.
 
-    A refusal before the POST removes the journal (exit 2, or 75 for a rate limit); a journal that
-    cannot be removed stays and exits 3. Every failure after the POST is unsettled (exit 3).
+    A refusal before the POST removes the journal (exit 2, or 75 for a rate limit) only after the principal,
+    re-read after the last GitHub read, is still the journal's starter; a failed or mismatched re-read, or a
+    journal that cannot be removed, keeps it and exits 3. Every failure after the POST is unsettled (exit 3).
     """
     verb = "repo-transfer"
     source, destination, repository_id = plan["source"], plan["destination"], plan["repository_id"]
 
     def abandon(reason, limited=None):
+        # Like every journal removal, this one rests on a principal read after the last GitHub read.
+        reread = _principal_reread(receipt["principal"]["before"], receipt, reader, cwd, environment)
+        if reread:
+            return _repo_admin_settle(
+                verb, receipt, sink, REPO_ADMIN_UNSETTLED, "unreconciled",
+                f"{reason}; no POST was sent, but {reread}, so the journal {receipt['journal']} is kept: check the "
+                "account on GitHub, then remove the journal by hand before a new attempt",
+                capture_output, text,
+            )
         if not _repo_admin_unjournal(directory_fd, journal_name, receipt):
             return _repo_admin_settle(
                 verb, receipt, sink, REPO_ADMIN_UNSETTLED, "journal-retained",
@@ -4867,9 +4877,9 @@ def _parse_args(argv):
                 "  with no mutation and clears the journal (a dry run leaves it), but a journal exits 0 or clears only\n"
                 "  when it binds the login and account id of this run (the preflight GET /user of the run that wrote\n"
                 "  it); else a journal for that id exits 3 with no mutation, as does any failed check while it exists.\n"
-                "  Every exit 0 with no POST (already transferred, journal or not, and a dry run) re-reads GET /user\n"
-                "  after its last GitHub read and requires the bound login and account id; a failed or mismatched\n"
-                "  re-read exits 3 and keeps the journal.\n"
+                "  Every exit 0 with no POST (already transferred, journal or not, and a dry run) and every journal\n"
+                "  removal (a refusal before the POST included) re-reads GET /user after its last GitHub read and\n"
+                "  requires the bound login and account id; a failed or mismatched re-read exits 3 and keeps the journal.\n"
                 "  A new send requires no visible destination collision, a private and unarchived source with the\n"
                 "  pinned id, source admin permission, and active destination admin membership. The source slug is\n"
                 "  re-read just before the POST.\n"
@@ -4886,8 +4896,9 @@ def _parse_args(argv):
                 "  and no journal for this repository id; 3 UNSETTLED: the POST was sent and the result is unknown or\n"
                 "  unverified (an output failure after the POST included); a journal for this repository id exists or\n"
                 "  cannot be read and the destination does not settle it, or it binds another login or account id,\n"
-                "  whichever later step fails (unreconciled); the final GET /user re-read before an exit 0 failed\n"
-                "  or named another login or id (unreconciled with a journal, else unverified; no mutation);\n"
+                "  whichever later step fails (unreconciled); the final GET /user re-read before an exit 0 or a\n"
+                "  journal removal failed or named another login or id (unreconciled with a journal, else\n"
+                "  unverified; no mutation);\n"
                 "  a refused run could not remove its own journal (journal-retained); or another run holds the lock\n"
                 "  (in-progress). Journals are per repository id: the rehearsal's never blocks the move.\n"
                 "  Never retry: rerun only to reconcile, as the principal that started the transfer (it exits 0 once\n"

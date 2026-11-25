@@ -565,8 +565,9 @@ def test_pending_transfer_bound_to_original_principal(tmp_path):
     The account id changes after the POST, so the first run is unsettled; while GitHub still reports the
     other id, or the journal's binding is missing, unreadable or names another login, a rerun exits 3 and
     keeps the journal. Only the original login and id settle it. Every exit 0 without a POST (pending
-    settlement, already transferred with no journal, either verb's dry run) re-reads GET /user after its
-    last GitHub read: a switched login or id, or a failed re-read, exits 3 and keeps the journal.
+    settlement, already transferred with no journal, either verb's dry run) and every pre-POST journal
+    removal re-reads GET /user after its last GitHub read: a switched login or id, or a failed re-read,
+    exits 3 and keeps the journal.
     """
     gh = FakeGitHub()
     other_account = lambda args: answer(args, {"login": PRINCIPAL, "id": 22})  # noqa: E731
@@ -635,6 +636,15 @@ def test_pending_transfer_bound_to_original_principal(tmp_path):
         assert result.returncode == 0 and receipt["outcome"] == outcome
         assert receipt["principal"]["before"] == receipt["principal"]["after"] == {"login": PRINCIPAL, "id": 7}
     assert len(gh.posts) == 1 and fresh.posts == []
+    # A refusal before the POST (would be 2, or 75) removes the journal only under the same re-read principal.
+    for second in (repository(4242, SOURCE), github_client.GitHubRateLimited(None, "pool_exhausted")):
+        for later in (other_account, other_login, server_error):
+            refused = FakeGitHub()
+            _second_source_read(refused, second)
+            receipt = switched(refused, later, False)
+            assert receipt["outcome"] == "unreconciled" and "no POST was sent" in receipt["detail"]
+            assert journal(tmp_path).exists() and refused.posts == []
+            journal(tmp_path).unlink()
 
 
 def _edit(**changes):
