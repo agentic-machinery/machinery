@@ -499,6 +499,56 @@ def _repo_row(slug: str, *, default: bool = False) -> dict[str, Any]:
     return {"github": slug, "local_name": name, "role": "public-app", "default": default}
 
 
+def test_local_workflow_enrolls_only_its_fleet_workflow_host(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    primary = "old-owner/machinery"
+    alternate = "next-owner/machinery"
+    registry = _write_registry(
+        tmp_path,
+        {
+            "machinery": {
+                **_repo_row(primary, default=True),
+                "alternate_github": alternate,
+                "repository_id": 400,
+                "visibility": "public",
+            },
+            "copy": {**_repo_row("other-owner/machinery"), "local_name": "copy"},
+        },
+    )
+    repos = load_fleet_repos(registry)
+    path = ".github/workflows/security.yml"
+    local_uses = "./.github/workflows/fleet-security.yml"
+
+    def respond(endpoint: str) -> Result:
+        api_path = endpoint.partition("?")[0]
+        slug = "/".join(api_path.split("/")[1:3])
+        if api_path == f"repos/{slug}":
+            repo_id = 400 if slug in (primary, alternate) else 401
+            return Result(status=200, value={"id": repo_id, "default_branch": "main"})
+        if api_path == f"repos/{slug}/contents/{path}":
+            return Result(status=200, value=_workflow_file(f"jobs:\n  fleet-security:\n    uses: {local_uses}\n"))
+        result = _clean_fleet(endpoint, slug)
+        assert result is not None, endpoint
+        return result
+
+    for active in (primary, alternate):
+        selector = git_credentials.SelectorState({"machinery": active}, "d" * 64)
+        monkeypatch.setattr(git_credentials, "load_selector", lambda selector=selector, **_kwargs: selector)
+        client = _FakeGitHubClient(respond)
+        host = read_fleet_security(client, repos["machinery"], timeout=1, repos=repos, registry_path=registry)
+        copy = read_fleet_security(client, repos["copy"], timeout=1, repos=repos, registry_path=registry)
+
+        assert host["callers"] == [{"path": path, "pin": "same_commit"}]
+        assert host["state"] == "zero_findings"
+        assert [run["run_id"] for run in host["runs"]] == [5]
+        assert host["rejected_pins"] == []
+        assert copy["state"] == "missing_enrollment"
+        assert copy["callers"] == []
+        assert copy["rejected_pins"] == [{"path": path, "ref": local_uses, "reason": "local_workflow_copy"}]
+        assert not any(call.startswith(f"repos/{repos['copy'].github}/actions/") for call in client.calls)
+
+
 @pytest.mark.parametrize("scalar", ["!!bool maybe", "!!timestamp never", "!!int ''"])
 def test_workflow_loader_exceptions_make_evidence_unreadable(scalar: str) -> None:
     repo = FleetRepo(key="fixture", github="org/fixture", local_name="fixture", role="public-app", default=True)
