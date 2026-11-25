@@ -232,7 +232,7 @@ def test_optional_recorder_still_requires_one_review_on_a_security_path(low_revi
     """Defect class: turning the verdict recorder off admits an unreviewed security PR."""
     _tasks, comments, _statuses, files, admit = low_review
     monkeypatch.setattr(publisher.gate, "catalog", lambda: {
-        "public": {"github": "unit/public", "verdict_recorder": False},
+        "public": {"github": "unit/public", "default": True, "verdict_recorder": False},
     })
     assert comments == []
     assert admit() is None

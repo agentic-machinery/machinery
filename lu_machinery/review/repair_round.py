@@ -243,21 +243,17 @@ def classify_delta(repo_root: Path, *, approved: str, candidate: str, base_tip: 
 
 def required_workflows(repository: str) -> tuple[str, ...]:
     """The repository's required CI workflows: its row's ``required_workflow`` (a path or a list), else ci.yml."""
+    # Imported here to keep the publisher out of this module's import closure.
+    from lu_machinery.publish.github import _fleet_catalog_entry
+
     try:
-        rows = [
-            row
-            for row in prepublish.catalog().values()
-            if isinstance(row, Mapping) and str(row.get("github", "")).casefold() == repository.casefold()
-        ]
-    except (prepublish.PublishBlocked, AttributeError):
+        # Either baked slug names the row's configuration; the row is resolved through the active-slug resolver.
+        entry = _fleet_catalog_entry(repository, os.environ, bind_inactive=True)
+    except prepublish.PublishBlocked as exc:
         raise RepairRefused(
-            EVIDENCE, "the repository allowlist is unreadable, so its required CI workflow is unknown"
+            EVIDENCE, f"the repository allowlist cannot resolve {repository} ({exc}), so its required CI workflow is unknown"
         ) from None
-    if len(rows) > 1:
-        raise RepairRefused(
-            EVIDENCE, f"{repository} is registered more than once, so its required CI workflow is unknown"
-        )
-    value = rows[0].get("required_workflow", DEFAULT_REQUIRED_WORKFLOW) if rows else DEFAULT_REQUIRED_WORKFLOW
+    value = entry[1].get("required_workflow", DEFAULT_REQUIRED_WORKFLOW) if entry else DEFAULT_REQUIRED_WORKFLOW
     items = value if isinstance(value, list) and value else [value] if isinstance(value, str) else None
     if (
         items is None
