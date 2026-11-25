@@ -169,6 +169,14 @@ def test_private_board_is_read_at_the_active_slug(hermetic_repo, monkeypatch) ->
     # An explicit --private-repo is the one spelling its pointer may use.
     explicit = hygiene.hygiene_check(reader=reader, private_repo=moved, **_base_kwargs(repo_root, tasks_dir))
     assert explicit["queue_pointer_ok"] is False
+    # Before the selector makes the alternate live, a pointer to it reaches nothing yet: only the baked one counts.
+    monkeypatch.setattr(git_credentials, "load_selector", lambda **_kwargs: git_credentials.SelectorState(
+        {"infra-private": PRIVATE}, "d" * 64))
+    fixture = _reader({(PUBLIC, EPIC): {"number": EPIC, "body": body}, (PRIVATE, BOARD): {"number": BOARD, "body": ""}})
+    early = hygiene.hygiene_check(reader=reader, **_base_kwargs(repo_root, tasks_dir))
+    assert (early["status"], early["queue_pointer_ok"]) == ("stale", False)
+    fixture = _reader({(PUBLIC, EPIC): {"number": EPIC, "body": CLEAN_BODY}, (PRIVATE, BOARD): {"number": BOARD, "body": ""}})
+    assert hygiene.hygiene_check(reader=reader, **_base_kwargs(repo_root, tasks_dir))["status"] == "verified"
     # Without a trusted selector the transferred row is unknown: no read of the slug it may have left.
     monkeypatch.setattr(git_credentials, "load_selector", lambda **_kwargs: (_ for _ in ()).throw(
         git_credentials.SelectorError("fleet repository selector unavailable")))

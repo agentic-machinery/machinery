@@ -142,7 +142,7 @@ def _gh_issue(
 
 
 def _pointer_pattern(private_repos: tuple[str, ...], private_board: int) -> re.Pattern[str]:
-    """The board pointer at any of ``private_repos`` (a transferred row's registered spellings)."""
+    """The board pointer at any of ``private_repos`` (the live spellings of the board's repository)."""
     forms = [re.escape(f"{repo}{sep}{private_board}") for repo in private_repos for sep in ("#", "/issues/")]
     return re.compile("|".join(forms))
 
@@ -410,9 +410,11 @@ def hygiene_check(
         try:
             # The board is read at the row's active slug; an unknown row or a transferred row without a
             # trusted selector is unknown, never the slug it may have left. The epic's pointer is a stored
-            # document: GitHub redirects a transferred repository's links, so either registered slug names it.
+            # document: it may name the active slug or the row's github slug, the transfer source GitHub
+            # redirects once moved, but never an alternate the selector has not made live.
             active = resolve_active_fleet_repo("infra-private", repos=load_fleet_repos())
-            private_repo, pointer_repos = active.active_github, active.repo.slugs
+            private_repo = active.active_github
+            pointer_repos = tuple(dict.fromkeys((active.active_github, active.repo.github)))
         except FleetRepoError:
             return _receipt(
                 status=Status.UNKNOWN,
