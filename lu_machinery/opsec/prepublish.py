@@ -111,6 +111,54 @@ def primary_root(cwd: Path | None = None) -> Path:
     return Path(result.stdout.strip()).parent
 
 
+# Modules that minimal workflow sparse checkouts omit from ``common/``.
+_MINIMAL_CHECKOUT_OMITTED_MODULES = frozenset({
+    "lu_machinery",
+    "lu_machinery.common",
+    "lu_machinery.common.profile",
+    "lu_machinery.common.repo_root",
+    "lu_machinery.common.safe_open",
+    "lu_machinery.common.json_depth",
+})
+_PROFILE_ROOT_ENVS = (
+    "LU_STATE_ROOT",
+    "LEARN_UKRAINIAN_STATE_ROOT",
+    "LU_PRIMARY_REPO_ROOT",
+    "LEARN_UKRAINIAN_PRIMARY_REPO_ROOT",
+)
+
+
+def _minimal_checkout_has_profile() -> bool:
+    """Whether the environment names a profile that a minimal checkout cannot validate."""
+    if os.environ.get("LU_PROFILE_PATH"):
+        return True
+    for var in _PROFILE_ROOT_ENVS:
+        root = os.environ.get(var)
+        if not root:
+            continue
+        try:
+            os.lstat(os.path.join(root, ".lu-machinery", "profile.v1.json"))
+            return True
+        except FileNotFoundError:
+            continue
+        except OSError:
+            return True
+    return False
+
+
+def _catalog_path() -> Path:
+    """Resolve ``fleet_repos.yaml`` at call time via the active profile, else the packaged copy."""
+    default = _PACKAGE / "config" / "fleet_repos.yaml"
+    try:
+        # Imported here: minimal workflow checkouts omit common/profile.py.
+        from lu_machinery.common.profile import config_path
+    except ModuleNotFoundError as exc:
+        if exc.name not in _MINIMAL_CHECKOUT_OMITTED_MODULES or _minimal_checkout_has_profile():
+            raise
+        return default
+    return config_path("fleet_repos", default=default)
+
+
 def catalog() -> dict:
     import yaml
 
@@ -124,7 +172,15 @@ def catalog() -> dict:
             return super().construct_mapping(node, deep=deep)
 
     try:
-        return yaml.load((_PACKAGE / "config" / "fleet_repos.yaml").read_text(), Loader=UniqueLoader)["repos"]
+        data = yaml.load(_catalog_path().read_text(encoding="utf-8"), Loader=UniqueLoader)
+        repos = data["repos"] if isinstance(data, dict) else None
+        if (
+            not isinstance(repos, dict)
+            or not repos
+            or not all(isinstance(key, str) and isinstance(row, dict) for key, row in repos.items())
+        ):
+            raise ValueError
+        return repos
     except Exception:
         raise PublishBlocked("OPSEC: repository allowlist unavailable; write refused.") from None
 

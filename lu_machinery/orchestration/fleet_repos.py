@@ -33,6 +33,7 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from lu_machinery.agent_runtime.sources_read_only import SERVER_RELATIVE_PATH, printable_text
+from lu_machinery.common import profile
 from lu_machinery.common.git_credentials import (
     SELECTOR_ENV,
     SelectorError,
@@ -44,6 +45,7 @@ from lu_machinery.common.git_credentials import (
 )
 from lu_machinery.common.repo_root import (
     PRODUCT_MARKER,
+    MachineryConfigError,
     StateRootError,
     configured_primary_root,
     configured_product_root,
@@ -54,7 +56,17 @@ from lu_machinery.common.repo_root import (
 )
 from lu_machinery.orchestration.product_policy import POLICY_REL
 
-_CONFIG_PATH = Path(__file__).resolve().parent.parent / "config" / "fleet_repos.yaml"
+_PACKAGED_CONFIG_PATH = Path(__file__).resolve().parent.parent / "config" / "fleet_repos.yaml"
+_CONFIG_PATH = _PACKAGED_CONFIG_PATH
+
+
+def default_config_path(*, env: Mapping[str, str] | None = None) -> Path:
+    """Resolve ``fleet_repos.yaml`` at call time via the active profile, else the packaged copy."""
+    if _CONFIG_PATH != _PACKAGED_CONFIG_PATH:
+        return _CONFIG_PATH
+    return profile.config_path("fleet_repos", env=env, default=_PACKAGED_CONFIG_PATH)
+
+
 _VALID_VISIBILITIES = frozenset({"public", "private"})
 # A row carrying the Learn Ukrainian slug must declare both product files: it never gets consumer defaults.
 _LEARN_UKRAINIAN_SLUG = "learn-ukrainian/learn-ukrainian.github.io"
@@ -148,9 +160,9 @@ class MissingFleetCheckout(FleetRepoError):
 
 
 def load_fleet_repos(path: Path | None = None) -> dict[str, FleetRepo]:
-    cfg_path = path or _CONFIG_PATH
+    cfg_path = _resolved_registry_path(path)
     try:
-        repos_raw = repository_registry(cfg_path.resolve())
+        repos_raw = repository_registry(cfg_path)
     except (ValueError, OSError, RuntimeError) as exc:  # RuntimeError: a symlink loop on Python 3.12
         raise FleetRepoError(f"fleet_repos catalog unreadable: {cfg_path} ({type(exc).__name__}: {exc})") from exc
     out: dict[str, FleetRepo] = {}
@@ -284,9 +296,19 @@ def resolve_fleet_repo_by_slug(
     return repo
 
 
-def _resolved_registry_path(registry_path: Path | None) -> Path:
-    """Resolve *registry_path* (default: the bundled catalog) inside the ``FleetRepoError`` boundary."""
-    path = registry_path or _CONFIG_PATH
+def _resolved_registry_path(
+    registry_path: Path | None,
+    *,
+    env: Mapping[str, str] | None = None,
+) -> Path:
+    """Resolve *registry_path* (default: active profile or bundled catalog) inside the ``FleetRepoError`` boundary."""
+    if registry_path is not None:
+        path = registry_path
+    else:
+        try:
+            path = default_config_path(env=env)
+        except MachineryConfigError as exc:
+            raise FleetRepoError(f"fleet_repos catalog unreadable: {exc}") from exc
     try:
         return path.resolve()
     except (OSError, RuntimeError) as exc:  # RuntimeError: a symlink loop on Python 3.12
@@ -299,7 +321,7 @@ def load_fleet_repo_selector(
     env: Mapping[str, str] | None = None,
 ) -> SelectorState:
     """Load the validated host-owned selector state, normalizing failures to ``FleetRepoError``."""
-    cfg_path = _resolved_registry_path(registry_path)
+    cfg_path = _resolved_registry_path(registry_path, env=env)
     try:
         return load_selector(registry_path=cfg_path, env=env)
     except (SelectorError, ValueError, OSError) as exc:
@@ -334,8 +356,12 @@ def resolve_active_fleet_repo(
     Dual-slug rows fail closed when the host-owned selector (``LU_FLEET_REPO_SELECTOR_FILE``)
     is missing, unreadable, unknown, or worker-writable, and never default to the old slug.
     """
-    cfg_path = _resolved_registry_path(registry_path)
-    catalog = repos if repos is not None else load_fleet_repos(cfg_path)
+    if repos is None:
+        cfg_path: Path | None = _resolved_registry_path(registry_path, env=env)
+        catalog: Mapping[str, FleetRepo] = load_fleet_repos(cfg_path)
+    else:
+        cfg_path = _resolved_registry_path(registry_path, env=env) if registry_path is not None else None
+        catalog = repos
     repo = resolve_fleet_repo_by_slug(
         identifier,
         repos=catalog,
@@ -344,6 +370,8 @@ def resolve_active_fleet_repo(
     )
     if not repo.has_alternate_slug:
         return ActiveFleetRepo(repo=repo, active_github=repo.github)
+    if cfg_path is None:
+        cfg_path = _resolved_registry_path(None, env=env)
     entry: dict[str, Any] = {
         "key": repo.key,
         "github": repo.github,
@@ -543,7 +571,7 @@ def _repository_catalog(path: Path) -> dict[str, FleetRepo]:
 
 
 def _bundled_catalog() -> dict[str, FleetRepo]:
-    """The cached bundled catalog; any failure to locate or read it is a ``FleetRepoError``."""
+    """The cached active-profile or bundled catalog; any failure to locate or read it is a ``FleetRepoError``."""
     return _repository_catalog(_resolved_registry_path(None))
 
 
@@ -925,7 +953,7 @@ def main(argv: list[str] | None = None) -> int:
         "--registry",
         type=Path,
         default=None,
-        help="Optional fleet_repos.yaml path (default: bundled catalog).",
+        help="Optional fleet_repos.yaml path (default: active profile or bundled catalog).",
     )
     args = parser.parse_args(argv)
     if args.command == "selector-check":
@@ -954,6 +982,7 @@ __all__ = [
     "canonical_repo_key",
     "canonical_repository",
     "clear_repository_cache",
+    "default_config_path",
     "default_repo_key",
     "fleet_repo_for_checkout",
     "load_fleet_repo_selector",
