@@ -163,7 +163,6 @@ Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
 Snapshot: no
 EOF
   apt_opts=(
-    -o "Dir::Etc::sourcelist=$apt_dir/ubuntu.sources"
     -o Dir::Etc::sourceparts=/dev/null
     -o "Dir::State::Lists=$apt_dir/lists"
     -o "Dir::Cache::Archives=$apt_dir/archives"
@@ -191,6 +190,7 @@ EOF
   echo "Installing missing native packages: ${missing[*]}"
   apt_deadline=$((SECONDS + 195))
   if [ "$missing_native" -gt 0 ]; then
+    apt_opts+=(-o "Dir::Etc::sourcelist=$apt_dir/ubuntu.sources")
     # Reserve 55 s for the first apt install and 5 s kill grace per command.
     update_cap=$((apt_deadline - SECONDS - 65))
     if [ "$update_cap" -lt 1 ] ||
@@ -199,8 +199,8 @@ EOF
       exit 1
     fi
   else
-    # The runner already has the .deb's base libraries. Use only local packages.
-    apt_opts+=(--no-download)
+    # Keep APT's local file acquisition enabled, with no archive sources.
+    apt_opts+=(-o Dir::Etc::sourcelist=/dev/null)
   fi
   install_log="$apt_dir/install.log"
   install_rc=0

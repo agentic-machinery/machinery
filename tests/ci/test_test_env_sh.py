@@ -216,6 +216,7 @@ def test_snapshot_update_timeout_derives_from_apt_deadline_and_fails_closed() ->
         script = (
             "set -euo pipefail\n"
             "snapshot=20261122T000000Z\n"
+            "apt_dir=/unused/apt\n"
             "apt_opts=(-o Acquire::Retries=3)\n"
             f"missing_native={missing_native}\n"
             'sudo() { printf "SUDO:%s\\n" "$*"; return 0; }\n'
@@ -237,6 +238,7 @@ def test_snapshot_update_timeout_derives_from_apt_deadline_and_fails_closed() ->
     tokens = fresh.stdout.strip().split()
     cap = int(tokens[2])
     assert 129 <= cap <= 130, f"expected derived cap in 129..130, got {cap}"
+    assert "Dir::Etc::sourcelist=/unused/apt/ubuntu.sources" in fresh.stdout.splitlines()[0]
     # Update cap + 5 s kill grace + first apt_install (55 s + 5 s kill grace) <= 195 s.
     assert cap + 5 + 55 + 5 <= 195
 
@@ -248,12 +250,12 @@ def test_snapshot_update_timeout_derives_from_apt_deadline_and_fails_closed() ->
 
     local_only = _eval_update_block(10, 0)
     assert local_only.returncode == 0, local_only.stdout + local_only.stderr
-    assert local_only.stdout == "APT:-o Acquire::Retries=3 --no-download\n"
+    assert local_only.stdout == "APT:-o Acquire::Retries=3 -o Dir::Etc::sourcelist=/dev/null\n"
 
 
-_SNAPSHOT_ORIGIN = "https://snapshot.ubuntu.com/ubuntu/20261122T000000Z"
+_SNAPSHOT_ORIGIN = "https://snapshot.ubuntu.com/ubuntu/20250101T000000Z"
 _SECURITY_ORIGIN = "https://security.ubuntu.com/ubuntu"
-_DEB_NAME = "bubblewrap_0.11.1-1ubuntu0.3_amd64.deb"
+_DEB_NAME = "bubblewrap_9.9.9-1_amd64.deb"
 
 
 def _download(
