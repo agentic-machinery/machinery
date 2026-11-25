@@ -18,6 +18,7 @@ import shlex
 import shutil
 import subprocess
 import tempfile
+import uuid
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager, suppress
 from copy import deepcopy
@@ -34,7 +35,12 @@ from lu_machinery.common.repo_root import (
     machinery_path,
     state_root_for_checkout,
 )
-from lu_machinery.common.task_store_paths import require_not_direct_task_store_path
+from lu_machinery.common.safe_open import UnsafeEntryError, safe_open_below
+from lu_machinery.common.task_store_paths import (
+    open_verified_non_task_store_dir,
+    require_not_direct_task_store_path,
+    write_non_task_store_bytes,
+)
 from lu_machinery.github_check_rollup import group_collapsed_by_name
 from lu_machinery.orchestration import fleet_repos, issue_stream_audit, task_identity
 from lu_machinery.review.review_contract import finding_supports_approval, unverified_follow_up_notes
@@ -1316,34 +1322,49 @@ def load_lifecycle(path: Path) -> dict[str, Any]:
     return validate_lifecycle(payload)
 
 
-def _require_not_direct_task_store(path: Path) -> None:
+def _require_not_direct_task_store(path: Path, *, label: str = "lifecycle ledger") -> None:
     try:
-        require_not_direct_task_store_path(path, label="lifecycle ledger")
+        require_not_direct_task_store_path(path, label=label)
+    except ValueError as exc:
+        raise LifecycleError(str(exc)) from None
+
+
+def _open_verified_lifecycle_dir(path: Path, *, label: str) -> tuple[int, Path, str]:
+    try:
+        return open_verified_non_task_store_dir(path, label=label, create=True)
     except ValueError as exc:
         raise LifecycleError(str(exc)) from None
 
 
 def write_lifecycle(path: Path, payload: Mapping[str, Any]) -> None:
-    _require_not_direct_task_store(path)
+    _require_not_direct_task_store(path, label="lifecycle ledger")
     ledger = validate_lifecycle(payload)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + f".tmp.{os.getpid()}")
-    tmp.write_text(json.dumps(ledger, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    os.replace(tmp, path)
+    encoded = (json.dumps(ledger, ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    try:
+        write_non_task_store_bytes(path, encoded, label="lifecycle ledger")
+    except (ValueError, UnsafeEntryError) as exc:
+        raise LifecycleError(str(exc)) from None
 
 
 @contextmanager
 def lifecycle_lock(path: Path, *, blocking: bool = True) -> Iterator[None]:
     """Hold the ledger's exclusive lock; non-blocking callers refuse a held lock."""
-    _require_not_direct_task_store(path)
+    _require_not_direct_task_store(path, label="lifecycle ledger")
     lock_path = path.with_suffix(path.suffix + ".lock")
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    with lock_path.open("a+", encoding="utf-8") as handle:
+    dir_fd, verified_dir, lock_name = _open_verified_lifecycle_dir(lock_path, label="lifecycle lock")
+    try:
+        try:
+            fd = safe_open_below(dir_fd, lock_name, os.O_RDWR | os.O_CREAT, 0o600)
+        except UnsafeEntryError as exc:
+            raise LifecycleError(f"unsafe lifecycle lock {verified_dir / lock_name}: {exc}") from None
+    finally:
+        os.close(dir_fd)
+    with os.fdopen(fd, "a+", encoding="utf-8") as handle:
         try:
             fcntl.flock(handle, fcntl.LOCK_EX if blocking else fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as exc:
             raise EvidencePolicyError(
-                "LIFECYCLE_LOCK_HELD", f"another process holds the lifecycle lock: {lock_path}"
+                "LIFECYCLE_LOCK_HELD", f"another process holds the lifecycle lock: {verified_dir / lock_name}"
             ) from exc
         try:
             yield
@@ -1363,21 +1384,35 @@ def predecessor_archive_path(path: Path, raw: bytes) -> tuple[Path, str]:
 
 def archive_predecessor(raw: bytes, archive_path: Path, archive_sha256: str) -> None:
     """Store predecessor bytes once, never overwriting a different archive."""
-    archive_path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = archive_path.with_name(archive_path.name + f".tmp.{os.getpid()}")
+    dir_fd, verified_dir, name = _open_verified_lifecycle_dir(archive_path, label="predecessor archive")
+    tmp_name = f".{name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+    created_tmp = False
     try:
-        with tmp.open("wb") as handle:
+        try:
+            fd = safe_open_below(dir_fd, tmp_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except UnsafeEntryError as exc:
+            raise LifecycleError(f"cannot write predecessor archive {archive_path}: {exc}") from None
+        created_tmp = True
+        with os.fdopen(fd, "wb") as handle:
             handle.write(raw)
             handle.flush()
             os.fsync(handle.fileno())
         with suppress(FileExistsError):
-            os.link(tmp, archive_path)
+            os.link(tmp_name, name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+        try:
+            read_fd = safe_open_below(dir_fd, name, os.O_RDONLY)
+        except UnsafeEntryError as exc:
+            raise LifecycleError(f"cannot verify predecessor archive {archive_path}: {exc}") from None
+        with os.fdopen(read_fd, "rb") as handle:
+            stored = handle.read()
     finally:
-        tmp.unlink(missing_ok=True)
-    stored = archive_path.read_bytes()
+        if created_tmp:
+            with suppress(FileNotFoundError):
+                os.unlink(tmp_name, dir_fd=dir_fd)
+        os.close(dir_fd)
     if stored != raw or "sha256:" + hashlib.sha256(stored).hexdigest() != archive_sha256:
         raise EvidencePolicyError(
-            "PREDECESSOR_ARCHIVE_CONFLICT", f"archive {archive_path} does not hold the predecessor bytes"
+            "PREDECESSOR_ARCHIVE_CONFLICT", f"archive {verified_dir / name} does not hold the predecessor bytes"
         )
 
 
