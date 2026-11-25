@@ -769,13 +769,65 @@ def preflight(tree: Tree, plan: Plan, old: dict[str, Any], check: bool) -> list[
     return problems
 
 
+def require_operator_inputs(tree: Tree) -> None:
+    """A workspace's policy inputs must be the operator's, never the session's.
+
+    The workspace runs a session that can write its own directories. Its root, the descriptor
+    and every declared source, each directory and file below it, must be owned by another user
+    and writable by neither group nor others (sshd's StrictModes rule), so the session can
+    neither edit nor rename-and-replace the settings and hooks its next launch deploys. Raises
+    :class:`Invalid` naming the first offending path.
+    """
+    caller = os.getuid()
+
+    def check(info: os.stat_result, path: str) -> None:
+        if info.st_uid == caller or info.st_mode & 0o022:
+            raise Invalid("workspace input is writable by this session (operator-owned, not group or world"
+                          " writable, required): " + path)
+
+    def walk(fd: int, prefix: str) -> None:
+        for name in sorted(os.listdir(fd)):
+            info = os.stat(name, dir_fd=fd, follow_symlinks=False)
+            check(info, prefix + name)
+            if stat.S_ISDIR(info.st_mode):
+                child = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+                try:
+                    walk(child, prefix + name + "/")
+                finally:
+                    os.close(child)
+
+    check(os.fstat(tree.fd), ".")
+    entry = tree.read(DESCRIPTOR)
+    descriptor = decode(entry[0]) if entry is not None else {}
+    declared = [DESCRIPTOR, *(spec["path"] for spec in descriptor.get("sources", {}).values())]
+    for path in declared:
+        parts = relative(path).split("/")
+        for depth, name in enumerate(parts, 1):
+            parent = "/".join(parts[:depth - 1])
+            with tree.directory(parent) if parent else contextlib.nullcontext(tree.fd) as fd:
+                try:
+                    info = os.stat(name, dir_fd=fd, follow_symlinks=False)
+                except FileNotFoundError:
+                    break  # an absent optional source; build() has decided whether that is allowed
+            check(info, "/".join(parts[:depth]))
+            if depth == len(parts) and stat.S_ISDIR(info.st_mode):
+                with tree.directory(path) as source:
+                    walk(source, path + "/")
+
+
 def deploy(tree: Tree, *, check: bool, print_manifest: bool = False, inputs_commit: str | None = None,
            workspace: bool = False) -> int:
     plan = build(tree, CommitInputs(tree, inputs_commit) if inputs_commit is not None else None)
-    if workspace and TARGETS["claude"] not in plan.roots:
-        # The workspace runs Claude Code; enabling it makes the release's mandatory Claude
-        # hook settings a deployment requirement, so a guard-less workspace never verifies.
-        raise Invalid("a workspace target must enable the claude provider")
+    if workspace:
+        if TARGETS["claude"] not in plan.roots:
+            # The workspace runs Claude Code; enabling it makes the release's mandatory Claude
+            # hook settings a deployment requirement, so a guard-less workspace never verifies.
+            raise Invalid("a workspace target must enable the claude provider")
+        require_operator_inputs(tree)
+        if tree.read(".claude/settings.local.json") is not None:
+            # Claude loads local settings beside the deployed ones; in a workspace nothing else
+            # validates them, so none may exist.
+            raise Invalid("a workspace target must not hold .claude/settings.local.json")
     old = old_state(tree)
     problems = preflight(tree, plan, old, check)
     if problems:

@@ -823,8 +823,8 @@ launcher_resolve_roots() {
 }
 
 # The workspace launch's helper root: the operator-configured primary checkout
-# (LU_PRIMARY_REPO_ROOT or its alias; both set must agree), as spelled, once its
-# physical path passes the primary-layout check. Unset or invalid refuses: a
+# (LU_PRIMARY_REPO_ROOT or its alias; both set must agree), named by its physical
+# path, which must pass the primary-layout check. Unset or invalid refuses: a
 # workspace launch has no Git metadata to derive one from.
 launcher_workspace_primary_root() {
   local configured="${LU_PRIMARY_REPO_ROOT:-}" alias="${LEARN_UKRAINIAN_PRIMARY_REPO_ROOT:-}" physical
@@ -840,6 +840,12 @@ launcher_workspace_primary_root() {
   if [[ "$configured" != /* ]] || ! physical="$(_project_physical_dir "$configured")" \
     || ! _project_hook_git_layout "$physical"; then
     launcher_error "LC_WORKSPACE_ROOT: LU_PRIMARY_REPO_ROOT is not a real primary Git checkout: $configured"
+    return 1
+  fi
+  # The hook bootstrap exports the anchor's physical path under the alias; any other
+  # spelling here would then disagree with LU_PRIMARY_REPO_ROOT and refuse every hook.
+  if [ "$physical" != "$configured" ]; then
+    launcher_error "LC_WORKSPACE_ROOT: name the primary checkout by its physical path (no symlink, dot segment or trailing slash): $configured"
     return 1
   fi
   # The hook contract reads the alias as a checkout state root that must be the

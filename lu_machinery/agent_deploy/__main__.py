@@ -19,7 +19,7 @@ def main() -> int:
   .venv/bin/python -I -m lu_machinery.agent_deploy --project-root /work/project --check
   .venv/bin/python -I -m lu_machinery.agent_deploy --project-root /work/project --check --print-manifest
   .venv/bin/python -I -m lu_machinery.agent_deploy --project-root /work/project --inputs-commit "$(git rev-parse HEAD)"
-  .venv/bin/python -I -m lu_machinery.agent_deploy --workspace --project-root /srv/cto-workspace --check
+  "$LEARN_UKRAINIAN_PYTHON" -I -m lu_machinery.agent_deploy --workspace --project-root /srv/cto-workspace --check
 Outputs: enabled provider files and .deploy-state/agent-deploy.v1.json; check writes nothing.
 --print-manifest prints the ownership manifest the check recomposed and verified (JSON) instead of its summary.
 --inputs-commit OID composes the plan (checked or applied) from that commit's descriptor and sources, never the

@@ -130,7 +130,7 @@ def _report(records: list[dict], session_id: str) -> str:
             "files this call created (only those; dry run first, then --apply):"
         )
         lines.append(
-            f"    .venv/bin/python -m {_CLEANUP_MODULE} "
+            f"    {shlex.quote(sys.executable)} -m {_CLEANUP_MODULE} "
             f"--session {shlex.quote(session_id)} --record {shlex.quote(record['record_id'])} [--apply]"
         )
         if any(entry["kind"] == "tracked" for entry in entries):

@@ -125,25 +125,17 @@ def cto_wrapper_signature(wrapper: Path, root: Path, entrypoint: Path, args: lis
         repository = Path(policy["REPO"])
         config = Path(policy["CFG"])
         if workspace:
-            # The launcher admits only its exported physical workspace and a wrapper named
-            # start-claude-cto.sh whose physical directory is the package: compare those
-            # spellings, never resolved ones that the launcher would refuse.
-            # Each literal is checked as the shell will use it: exec runs LAUNCHER as written,
-            # so a trailing slash, an empty, dot or dot-dot segment, a doubled slash, or a path
-            # that does not reach the package wrapper as an executable file now refuses.
-            literal = policy["LAUNCHER"]
-            directory, _, name = literal.rpartition("/")
+            # The successor execs LAUNCHER as written and the package wrapper finds its
+            # library from that spelling, so only the canonical physical wrapper path is
+            # admitted, exactly as an executable file now. REPO must be the exported
+            # physical workspace, still outside every checkout as the launcher requires.
+            repo = policy["REPO"]
             if (
-                policy["REPO"] != workspace
-                or not literal.startswith("/")
-                or literal.startswith("//")
-                or os.path.normpath(literal) != literal
-                or "/../" in literal + "/"
-                or name != _CTO_PACKAGE_WRAPPER.name
-                or Path(os.path.realpath(directory or "/")) != _CTO_PACKAGE_WRAPPER.parent
-                or not os.path.isfile(literal)
-                or not os.access(literal, os.X_OK)
-                or Path(os.path.realpath(literal)) != _CTO_PACKAGE_WRAPPER
+                policy["LAUNCHER"] != str(_CTO_PACKAGE_WRAPPER)
+                or not os.path.isfile(_CTO_PACKAGE_WRAPPER)
+                or not os.access(_CTO_PACKAGE_WRAPPER, os.X_OK)
+                or repo != workspace
+                or any(os.path.lexists(os.path.join(ancestor, ".git")) for ancestor in (repo, *map(str, Path(repo).parents)))
                 or entrypoint.name != _CTO_PACKAGE_WRAPPER.name
             ):
                 raise ValueError("unsupported workspace intent")

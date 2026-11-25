@@ -1026,6 +1026,8 @@ def test_cto_workspace_launch_supervisor_and_driver_state_from_a_non_git_directo
 
     nested = primary / "workspace"
     nested.mkdir()
+    primary_alias = tmp_path / "primary-alias"
+    primary_alias.symlink_to(primary, target_is_directory=True)
     stray, second = tmp_path / "stray-state", tmp_path / "second-checkout"
     (stray / ".git").mkdir(parents=True)
     subprocess.run(["git", "init", "-q", str(second)], check=True, timeout=30,
@@ -1041,6 +1043,7 @@ def test_cto_workspace_launch_supervisor_and_driver_state_from_a_non_git_directo
         ({"LC_WORKSPACE_ROOT": str(nested)}, nested, "outside every Git checkout"),
         ({"LEARN_UKRAINIAN_STATE_ROOT": str(state)}, workspace, "not LEARN_UKRAINIAN_STATE_ROOT"),
         ({"LU_PRODUCT_ROOT": str(workspace)}, workspace, "cannot be the CTO workspace"),
+        ({"LU_PRIMARY_REPO_ROOT": str(primary_alias)}, workspace, "by its physical path"),
         ({"LC_WORKSPACE_ROOT": None}, workspace, "LC_WORKSPACE_ROOT_REQUIRED"),
     ):
         refused = launch(cwd=cwd, **changes)
@@ -1118,6 +1121,8 @@ def test_cto_successor_signature_binds_the_launch_mode(tmp_path: Path, monkeypat
     renamed.symlink_to(package_wrapper)
     stale = tmp_path / "stale-package-link"
     stale.symlink_to(tmp_path / "removed-package")
+    live = tmp_path / "live-package-link"
+    live.symlink_to(package_wrapper.parent, target_is_directory=True)
     for wrapper, root, entry in (
         (template(stray), workspace, stray),  # a wrapper copy outside the package
         (template(package_wrapper), workspace, stray),  # an entrypoint other than the named launcher
@@ -1128,12 +1133,18 @@ def test_cto_successor_signature_binds_the_launch_mode(tmp_path: Path, monkeypat
         (template(f"{package_wrapper.parent}//{package_wrapper.name}"), workspace, package_wrapper),
         (template(f"{package_wrapper.parent}/./{package_wrapper.name}"), workspace, package_wrapper),
         (template(f"{stale}/{package_wrapper.name}"), workspace, package_wrapper),  # a path exec cannot reach
+        (template(f"{live}/{package_wrapper.name}"), workspace, package_wrapper),  # not the canonical path
     ):
         with pytest.raises(SupervisorError, match="cto-wrapper-unsupported"):
             cto_wrapper_signature(wrapper, root, entry, args)
     monkeypatch.chdir(tmp_path)
     with pytest.raises(SupervisorError, match="cto-wrapper-unsupported"):
         cto_wrapper_signature(template(package_wrapper), workspace, package_wrapper, args)
+    monkeypatch.chdir(workspace)
+    (workspace / ".git").mkdir()  # the admitted workspace has since become a checkout
+    with pytest.raises(SupervisorError, match="cto-wrapper-unsupported"):
+        cto_wrapper_signature(template(package_wrapper), workspace, package_wrapper, args)
+    (workspace / ".git").rmdir()
     monkeypatch.chdir(workspace)
     monkeypatch.delenv("LC_WORKSPACE_ROOT")
     with pytest.raises(SupervisorError, match="cto-wrapper-unsupported"):
