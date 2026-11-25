@@ -1266,3 +1266,27 @@ def test_savant_write_draft_checks_only_the_new_paths_in_a_wide_directory(primar
                                           read_path="docs")
     assert receipt["import"]["status"] == "drafted" and receipt["import"]["paths"] == ["docs/new.md"], receipt["import"]
     assert patch.exists() and [args[0] for args in listings] == ["ls-tree"], listings
+
+
+def test_agy_sandbox_rejects_non_ascii_configured_slug_origin_and_gh_host(tmp_path, monkeypatch):
+    """Defect class: non-ASCII configured_github_slug, NBSP-padded origin URL, or non-ASCII GH_HOST folds onto a real repo/host."""
+    from lu_machinery.common import repo_root as repo_root_mod
+    from lu_machinery.dispatcher import agy_sandbox
+    from lu_machinery.orchestration import fleet_repos
+
+    row = fleet_repos.FleetRepo(
+        key="main", github="other/repo", local_name="main", role="public-monorepo", default=True, visibility="public",
+    )
+    monkeypatch.setattr(fleet_repos, "load_fleet_repos", lambda path=None: {"main": row})
+    monkeypatch.setattr(repo_root_mod, "configured_github_slug", lambda: "learn-u\u212arainian/site")
+    assert agy_sandbox.public_repository("learn-ukrainian/site") is False
+
+    monkeypatch.setattr(
+        agy_sandbox.subprocess,
+        "run",
+        lambda *_a, **_kw: subprocess.CompletedProcess([], 0, stdout="\u00a0https://github.com/learn-ukrainian/machinery.git\n", stderr=""),
+    )
+    assert agy_sandbox.origin_repository(tmp_path) is None
+
+    refusal, named = agy_sandbox._gh_parse(["pr", "view", "1"], {"GH_HOST": "github.com\u00a0"})
+    assert refusal is not None and named == []

@@ -612,3 +612,62 @@ def test_review_checkout_origin_must_be_the_active_ascii_slug(tmp_path: Path, mo
     for root in (stale, look_alike):
         with pytest.raises(target_resolution.TargetResolutionError):
             target_resolution.resolve_review_repository(root, "case", mode="pr", commit="a" * 40)
+
+
+def test_non_ascii_slug_key_and_credentials_refused_before_fold_or_strip(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """Defect class: non-ASCII look-alikes (U+212A), whitespace (U+00A0), or Unicode digits alias repo slugs or keys."""
+    assert fleet_repos.ascii_repo_slug("Learn-Ukrainian/Machinery") == "learn-ukrainian/machinery"
+    assert fleet_repos.ascii_repo_slug("learn-u\u212arainian/machinery") is None
+    assert fleet_repos.ascii_repo_slug("\u00a0learn-ukrainian/machinery") is None
+    assert fleet_repos.ascii_repo_slug("owner/repo.git") is None
+    assert fleet_repos.parse_ascii_positive_int("42") == 42
+    assert fleet_repos.parse_ascii_positive_int("\u0664\u0662") is None
+    assert fleet_repos.parse_ascii_positive_int("4\u0662") is None
+    assert fleet_repos.parse_ascii_positive_int(True) is None
+    assert fleet_repos.parse_ascii_positive_int("0") is None
+    assert fleet_repos.parse_ascii_positive_int("9" * 4301) is None
+
+    catalog = {
+        "kit": FleetRepo(key="kit", github="org/kit", local_name="kit", role="public-labs", default=True),
+    }
+    assert fleet_repos.canonical_repo_key(" KIT ", repos=catalog) == "kit"
+    with pytest.raises(fleet_repos.FleetRepoError):
+        fleet_repos.canonical_repo_key("\u212ait", repos=catalog)
+    with pytest.raises(fleet_repos.FleetRepoError):
+        fleet_repos.canonical_repo_key("\u00a0kit", repos=catalog)
+
+    bad_key_catalog = {
+        "\u212ait": FleetRepo(key="\u212ait", github="org/kit", local_name="kit", role="public-labs", default=True),
+    }
+    with pytest.raises(fleet_repos.FleetRepoError, match="ASCII"):
+        fleet_repos.canonical_repo_key("kit", repos=bad_key_catalog)
+
+    bad_slug_catalog = {
+        "kit": FleetRepo(key="kit", github="org/\u212ait", local_name="kit", role="public-labs", default=True),
+    }
+    with pytest.raises(fleet_repos.FleetRepoError, match="ASCII"):
+        fleet_repos.resolve_fleet_repo_by_slug("org/kit", repos=bad_slug_catalog)
+
+    cfg = tmp_path / "fleet_repos.yaml"
+    cfg.write_text(
+        "repos:\n  kit:\n    default: true\n    local_name: kit\n    github: org/\u212ait\n    role: public-labs\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="invalid fleet repository registry"):
+        git_credentials.repository_registry(cfg)
+
+    bad_key_cfg = tmp_path / "bad_key_fleet_repos.yaml"
+    bad_key_cfg.write_text(
+        "repos:\n  \u212ait:\n    default: true\n    local_name: kit\n    github: org/kit\n    role: public-labs\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="invalid fleet repository registry"):
+        git_credentials.repository_registry(bad_key_cfg)
+
+    valid_cfg = tmp_path / "valid_fleet_repos.yaml"
+    valid_cfg.write_text(
+        "repos:\n  kit:\n    default: true\n    local_name: kit\n    github: org/kit\n    role: public-labs\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(git_credentials, "default_config_path", lambda **_kw: valid_cfg)
+    assert git_credentials.verification_credentials("https://github.com/org/\u212ait.git") == []

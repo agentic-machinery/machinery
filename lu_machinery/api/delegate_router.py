@@ -25,6 +25,7 @@ from lu_machinery.common import json_depth
 from lu_machinery.common.task_store_paths import read_cached_task_record
 from lu_machinery.dispatcher.ownership import effective_scope
 from lu_machinery.lib.readonly_sqlite import SQLiteConnection
+from lu_machinery.orchestration.fleet_repos import parse_ascii_positive_int
 from lu_machinery.orchestration.task_record_store import ARCHIVE_DIR_NAME as TASK_ARCHIVE_DIR_NAME
 from lu_machinery.orchestration.task_record_store import iter_task_records
 from lu_machinery.orchestration.worktree_claims import RELEASED_TASK_STATUSES
@@ -98,7 +99,12 @@ def _task_observations(task: dict[str, Any]) -> dict[str, Any]:
     result = {key: task[key] for key in fields if key in task}
     if "delivery_pr" in result:
         # Generic summaries carry no repository identity, including inside a PR reference.
-        match = re.fullmatch(r"(?:[\w.-]+/[\w.-]+)?#([1-9][0-9]*)", str(result["delivery_pr"]))
+        raw_pr = result["delivery_pr"]
+        match = (
+            re.fullmatch(r"(?:[\w.-]+/[\w.-]+)?#([1-9][0-9]*)", raw_pr, re.ASCII)
+            if isinstance(raw_pr, str)
+            else None
+        )
         result["delivery_pr"] = f"#{match[1]}" if match else None
     if "error" in task:
         result["error"] = sanitize_error_excerpt(task["error"])
@@ -236,7 +242,11 @@ def _normalize_repository_predicate(repository: str | None) -> str | None:
     """Return a non-empty exact repository predicate, or None when unscoped."""
     if repository is None:
         return None
-    text = str(repository).strip()
+    raw = str(repository)
+    if not raw.isascii():
+        # Never strip non-ASCII whitespace or collapse a non-ASCII predicate to unscoped None.
+        return raw
+    text = raw.strip()
     return text or None
 
 
@@ -244,16 +254,18 @@ def _authoritative_task_repository(task: dict[str, Any]) -> str | None:
     """Return the single authoritative repository claim from task state.
 
     Only ``repository_id`` and ``repository`` are accepted. When both are
-    present they must agree after strip. Missing, blank, or conflicting claims
-    are unclassified (``None``). Paths, branch, cwd, worktree, and task_id are
-    never consulted.
+    present they must agree after strip. Missing, blank, non-ASCII, or
+    conflicting claims are unclassified (``None``). Paths, branch, cwd,
+    worktree, and task_id are never consulted.
     """
     claimed: list[str] = []
     for attr_name in DELEGATE_REPOSITORY_ATTR_FIELDS:
         raw = task.get(attr_name)
         if raw is None or raw == "":
             continue
-        text = str(raw).strip()
+        if not isinstance(raw, str) or not raw.isascii():
+            return None
+        text = raw.strip()
         if not text:
             continue
         claimed.append(text)
@@ -500,27 +512,21 @@ def _linked_issues_from_dor(task: dict[str, Any]) -> list[dict[str, Any]] | None
         for entry in raw_foreign:
             if not isinstance(entry, dict):
                 continue
-            raw_issue = entry.get("issue")
-            if raw_issue is None:
-                continue
-            try:
-                number = int(raw_issue)
-            except (TypeError, ValueError):
+            number = parse_ascii_positive_int(entry.get("issue"), strip=True)
+            if number is None:
                 continue
             repo = entry.get("repo") if isinstance(entry.get("repo"), str) else entry.get("repository")
-            if not isinstance(repo, str) or not repo or number <= 0:
+            if not isinstance(repo, str) or not repo:
                 continue
             foreign_by_number.setdefault(number, []).append(repo)
-            foreign_links.append({"issue": number, "repository": repo})
+            if repo.isascii():
+                foreign_links.append({"issue": number, "repository": repo})
     counts: dict[int, int] = {}
     raw_issues = preflight.get("issues") or []
     if isinstance(raw_issues, list):
         for raw_issue in raw_issues:
-            try:
-                number = int(raw_issue)
-            except (TypeError, ValueError):
-                continue
-            if number > 0:
+            number = parse_ascii_positive_int(raw_issue, strip=True)
+            if number is not None:
                 counts[number] = counts.get(number, 0) + 1
     links: list[dict[str, Any]] = []
     for number, count in sorted(counts.items()):

@@ -168,6 +168,8 @@ def load_fleet_repos(path: Path | None = None) -> dict[str, FleetRepo]:
     out: dict[str, FleetRepo] = {}
     defaults = 0
     for key, body in repos_raw.items():
+        if not isinstance(key, str) or not key.isascii() or not key.strip():
+            raise FleetRepoError("fleet_repos key must be a non-empty ASCII string")
         github = body.get("github")
         local_name = body.get("local_name")
         role = body.get("role") or ""
@@ -183,7 +185,7 @@ def load_fleet_repos(path: Path | None = None) -> dict[str, FleetRepo]:
             canonical = _PRODUCT_FILE_CANONICAL[field]
             if value != canonical:
                 raise FleetRepoError(f"fleet_repos[{key!r}].{field} must be {canonical!r}")
-        if not isinstance(github, str) or "/" not in github:
+        if not isinstance(github, str) or not github.isascii() or "/" not in github:
             raise FleetRepoError(f"fleet_repos[{key!r}].github must be owner/name")
         if not isinstance(local_name, str) or not local_name.strip():
             raise FleetRepoError(f"fleet_repos[{key!r}].local_name must be a non-empty string")
@@ -194,7 +196,7 @@ def load_fleet_repos(path: Path | None = None) -> dict[str, FleetRepo]:
         if visibility is not None and (not isinstance(visibility, str) or visibility not in _VALID_VISIBILITIES):
             raise FleetRepoError(f"fleet_repos[{key!r}].visibility must be 'public' or 'private'")
         if alternate_github is not None:
-            if not isinstance(alternate_github, str) or "/" not in alternate_github:
+            if not isinstance(alternate_github, str) or not alternate_github.isascii() or "/" not in alternate_github:
                 raise FleetRepoError(f"fleet_repos[{key!r}].alternate_github must be owner/name")
             if repository_id is None or visibility is None:
                 raise FleetRepoError(
@@ -231,15 +233,55 @@ def default_repo_key(repos: Mapping[str, FleetRepo] | None = None) -> str:
     raise FleetRepoError("no default fleet repo")
 
 
+def ascii_repo_slug(value: object, *, strip: bool = True) -> str | None:
+    """Return a validated lower-case ASCII ``owner/name`` slug, or ``None``.
+
+    Checks ``isascii()`` before any trimming or case-folding so non-ASCII
+    look-alikes (such as U+212A) and non-ASCII whitespace (such as U+00A0) can
+    never alias a real repository slug.
+    """
+    if not isinstance(value, str) or not value.isascii():
+        return None
+    candidate = value.strip() if strip else value
+    if not _EXACT_SLUG.fullmatch(candidate) or candidate.endswith(".git"):
+        return None
+    owner, _, name = candidate.partition("/")
+    if owner in {".", ".."} or name in {".", ".."}:
+        return None
+    return candidate.casefold()
+
+
+def parse_ascii_positive_int(value: object, *, strip: bool = False) -> int | None:
+    """Parse an ASCII-only positive decimal PR/issue number, or return ``None``.
+
+    Rejects booleans, non-positive integers, signs, leading zeros, and non-ASCII
+    digits or whitespace before calling ``int()``.
+    """
+    if type(value) is int:
+        return value if value > 0 else None
+    if not isinstance(value, str) or not value.isascii():
+        return None
+    text = value.strip() if strip else value
+    if not re.fullmatch(r"[1-9][0-9]*", text):
+        return None
+    try:
+        return int(text)
+    except ValueError:
+        return None
+
+
 def canonical_repo_key(key: str, repos: Mapping[str, FleetRepo] | None = None) -> str:
     """Return the one catalog key *key* spells.
 
-    Surrounding whitespace and case are not distinct keys. An empty spelling
-    is not the default. The error is raised before any checkout path exists.
+    Surrounding ASCII whitespace and case are not distinct keys. Non-ASCII
+    input is refused before trimming or case-folding. An empty spelling is not
+    the default. The error is raised before any checkout path exists.
     """
     catalog = repos if repos is not None else load_fleet_repos()
+    if any(not isinstance(candidate, str) or not candidate.isascii() or not candidate.strip() for candidate in catalog):
+        raise FleetRepoError("fleet_repos catalog contains non-ASCII key")
     known = ", ".join(sorted(catalog))
-    if not isinstance(key, str) or not key.strip():
+    if not isinstance(key, str) or not key.isascii() or not key.strip():
         raise FleetRepoError(f"unknown --repo ''; allowlisted: {known}")
     if key in catalog:
         return key
@@ -264,10 +306,17 @@ def resolve_fleet_repo_by_slug(
     When *expected_repository_id* or *expected_visibility* is given, mismatches
     fail closed before any network call.
     """
-    if not isinstance(identifier, str) or not identifier.strip() or not identifier.isascii():
+    if not isinstance(identifier, str) or not identifier.isascii() or not identifier.strip():
         # Keys and slugs are ASCII; casefold would map look-alikes such as U+212A onto them.
         raise FleetRepoError("unknown fleet repository identifier")
     catalog = repos if repos is not None else load_fleet_repos()
+    if any(
+        not isinstance(repo.key, str)
+        or not repo.key.isascii()
+        or any(not isinstance(slug, str) or not slug.isascii() for slug in repo.slugs)
+        for repo in catalog.values()
+    ):
+        raise FleetRepoError("fleet_repos catalog contains non-ASCII key or slug")
     spelling = identifier.strip().casefold()
     matches = [
         repo

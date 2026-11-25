@@ -212,9 +212,9 @@ def normalize_hostname(value: str) -> str | None:
 
 def normalize_repository(value: str, host: str = "github.com") -> str:
     """Return a canonical host/owner/name, or unknown (never private by default)."""
-    value = value.strip()
-    if not value.isascii():
+    if not isinstance(value, str) or not value.isascii():
         return "unknown"
+    value = value.strip()
     value = value.lower().removesuffix(".git")
     # Callers may normalize before classification; another pass must not change identity.
     if value.endswith(".git"):
