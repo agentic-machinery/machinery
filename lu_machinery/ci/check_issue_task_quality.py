@@ -146,7 +146,11 @@ def _resolve_active_repository(repository: str) -> fleet_repos.ActiveFleetRepo |
         active = fleet_repos.resolve_active_fleet_repo(repository, repos=catalog)
     except fleet_repos.FleetRepoError:
         return None
-    if active.active_github.casefold() != repository.casefold():
+    if (
+        not active.active_github.isascii()
+        or not repository.isascii()
+        or active.active_github.casefold() != repository.casefold()
+    ):
         return None
     return active
 
@@ -166,7 +170,11 @@ def registry_for(repository: str) -> dict[str, list[int]] | None:
         default_key = fleet_repos.default_repo_key(catalog)
     except fleet_repos.FleetRepoError:
         return None
-    if active.active_github.casefold() != repository.casefold():
+    if (
+        not active.active_github.isascii()
+        or not repository.isascii()
+        or active.active_github.casefold() != repository.casefold()
+    ):
         return None
     path = audit.default_registry_path()
     if active.repo.role == "public-monorepo" or active.repo.default:
@@ -285,8 +293,8 @@ def read_parent(repository: str, number: int) -> dict | None:
 
 def _claim(issue: dict, repository: str, roots: list[int], index: dict, parents: dict) -> int | None:
     """Resolve the documented title/body claim independently of the observed root."""
-    candidates = re.findall(r"\[(\d+)\]", issue.get("title") or "")
-    candidates += re.findall(r"(?im)^Parent:\s*#(\d+)\b", issue.get("body") or "")
+    candidates = re.findall(r"\[(\d+)\]", issue.get("title") or "", re.ASCII)
+    candidates += re.findall(r"^Parent:\s*#(\d+)\b", issue.get("body") or "", re.IGNORECASE | re.MULTILINE | re.ASCII)
     for candidate in candidates:
         number = int(candidate)
         visited = set()
@@ -835,10 +843,12 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.issue is not None:
             raw_repo = args.repo.strip() if isinstance(args.repo, str) else ""
-            if not raw_repo:
-                raise ValueError("repository must be non-empty")
+            if not raw_repo or not raw_repo.isascii():
+                raise ValueError("repository must be non-empty ASCII")
             catalog = fleet_repos.load_fleet_repos()
             active = fleet_repos.resolve_active_fleet_repo(raw_repo, repos=catalog)
+            if not active.active_github.isascii():
+                raise ValueError(f"active repository {active.active_github!r} must be ASCII")
             if "/" in raw_repo and active.active_github.casefold() != raw_repo.casefold():
                 raise ValueError(
                     f"repository {raw_repo!r} is not the active fleet slug ({active.active_github!r})"

@@ -849,3 +849,64 @@ def test_identifier_routes_keep_a_recorded_task_id(tmp_path, monkeypatch):
     assert second.status_code == 200
     assert second.json()["repositories"][0]["pull_requests"][0]["task_reference"] is None
     assert _KEPT not in second.text
+
+
+def test_pull_requests_and_live_workers_reject_kelvin_sign_slug_folding(tmp_path, monkeypatch):
+    """Defect class: non-ASCII Kelvin-sign (U+212A) look-alike slugs fold into real repository slugs."""
+    kelvin_slug = "learn-u\u212arainian/machinery"
+    real_slug = "learn-ukrainian/machinery"
+    tasks = tmp_path / "tasks"
+    _write_task_record(tasks, _KEPT, repository=kelvin_slug)
+    assert git_hygiene_router._recorded_task_reference(tasks, _KEPT, frozenset({real_slug})) is None
+    _write_task_record(tasks, _KEPT, repository="Learn-Ukrainian/Machinery")
+    assert git_hygiene_router._recorded_task_reference(tasks, _KEPT, frozenset({real_slug})) == _KEPT
+
+    # Live-worker attribution must not fold a Kelvin-sign claim into the real project; it stays unattributed.
+    snapshot = SimpleNamespace(read=lambda: ({"live_by_repository": {kelvin_slug: 2, "Learn-Ukrainian/Machinery": 1}}, 0.0))
+    monkeypatch.setattr(git_hygiene_router, "active_snapshot", lambda _ctx: snapshot)
+    counts = git_hygiene_router._live_workers(fixture_context(tmp_path))
+    assert counts is not None
+    assert counts.get(real_slug) == 1
+    assert counts.get(kelvin_slug) == 2
+
+    catalog = {
+        "machinery": FleetRepo(
+            key="machinery", local_name="machinery", github=real_slug, role="public-tooling", default=False,
+        ),
+        "kelvin": FleetRepo(
+            key="kelvin", local_name="kelvin", github=kelvin_slug, role="public-tooling", default=False,
+        ),
+    }
+    monkeypatch.setattr(git_hygiene_router, "load_fleet_repos", lambda: catalog)
+    enriched = git_hygiene_router._with_live_workers(
+        {"repositories": [{"key": "machinery"}, {"key": "kelvin"}]},
+        counts,
+    )
+    assert [row["live_workers"] for row in enriched["repositories"]] == [1, 0]
+    assert enriched["live_workers_unattributed"] == 2
+
+    # compute_pull_requests filters non-ASCII alternate slugs before folding into the matching set.
+    _write_task_record(tasks, _KEPT, repository="learn-ukrainian/other")
+    dual = {
+        "machinery": FleetRepo(
+            key="machinery",
+            local_name="machinery",
+            github=real_slug,
+            alternate_github="learn-u\u212arainian/other",
+            role="public-tooling",
+            default=False,
+        ),
+    }
+    monkeypatch.setattr(git_hygiene_router, "load_fleet_repos", lambda: dual)
+    node = _open_pr(f"agy/{_KEPT}", 7)
+    monkeypatch.setattr(
+        git_hygiene_router.github_client,
+        "run",
+        lambda *_a, **_k: SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps({"data": {"r0": {"isPrivate": False, "pullRequests": {"totalCount": 1, "nodes": [node]}}}}),
+            stderr="",
+        ),
+    )
+    computed = git_hygiene_router.compute_pull_requests(tmp_path, tasks_dir=tasks)
+    assert computed["repositories"][0]["pull_requests"][0]["task_reference"] is None

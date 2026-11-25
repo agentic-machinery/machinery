@@ -2825,12 +2825,12 @@ def _read_status_record(task_id: str) -> dict | None:
 def _record_repo_id(record: dict) -> str | None:
     """The record's non-empty ``repository_id``, or None when missing or conflicting with ``repository``."""
     repo_id = _text(record.get("repository_id"))
-    if not repo_id:
+    if not repo_id or not repo_id.isascii():
         return None
     repo = record.get("repository")
     if repo is not None:
         repo_text = _text(repo)
-        if not repo_text or repo_text.casefold() != repo_id.casefold():
+        if not repo_text or not repo_text.isascii() or repo_text.casefold() != repo_id.casefold():
             return None
     return repo_id
 
@@ -2854,6 +2854,8 @@ def _worktree_head(tree: object) -> str | None:
 
 def _review_pr_ownership_refusal(record: dict, repo_id: str, caller: str, *, not_owner: str) -> str | None:
     """Require recorded task acceptance of the review's exact repository and PR."""
+    if not isinstance(repo_id, str) or not repo_id or not repo_id.isascii():
+        return not_owner
     pr_number = record.get("pr")
     if type(pr_number) is not int or pr_number <= 0:
         return not_owner
@@ -2937,7 +2939,13 @@ def _own_review_reply(record: dict, nonce: str | None) -> dict:
             holder_branch = _text(holder["publish_branch"])
         else:
             holder_branch = _text(holder.get("worktree_branch"))
-        if not holder_repo or holder_repo.casefold() != repo_id.casefold() or review_branch != holder_branch:
+        if (
+            not holder_repo
+            or not holder_repo.isascii()
+            or not repo_id.isascii()
+            or holder_repo.casefold() != repo_id.casefold()
+            or review_branch != holder_branch
+        ):
             return {"result_unavailable": "review_not_of_successor_branch"}
         head_unavailable = "successor_head_unavailable"
     head = _worktree_head(holder.get("worktree_path"))

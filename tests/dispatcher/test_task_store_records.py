@@ -704,4 +704,36 @@ def test_pr_successor_refused_when_parent_or_successor_record_missing(tmp_path, 
     assert ("result" in missing_parent, missing_parent["result_unavailable"]) == (False, "parent_record_unavailable")
 
 
+def test_review_reply_slug_readers_reject_kelvin_sign_lookalikes(tmp_path, monkeypatch):
+    """Defect class: non-ASCII Kelvin-sign (U+212A) look-alike slugs fold into real repository IDs."""
+    real_slug = "learn-ukrainian/machinery"
+    kelvin_slug = "learn-u\u212arainian/machinery"
+
+    # _record_repo_id rejects non-ASCII repository_id or repository before casefold.
+    assert worker._record_repo_id({"repository_id": kelvin_slug, "repository": real_slug}) is None
+    assert worker._record_repo_id({"repository_id": real_slug, "repository": kelvin_slug}) is None
+    assert worker._record_repo_id({"repository_id": kelvin_slug}) is None
+    assert worker._record_repo_id({"repository_id": real_slug, "repository": "Learn-Ukrainian/Machinery"}) == real_slug
+
+    # _review_pr_ownership_refusal rejects non-ASCII repo_id before casefold lookup.
+    _review_with_pr_successor(
+        tmp_path,
+        monkeypatch,
+        review_repo=real_slug,
+        handoff_repo=real_slug,
+        successor_repo=kelvin_slug,
+    )
+    assert worker._review_pr_ownership_refusal(
+        {"pr": 1277}, kelvin_slug, "successor", not_owner="caller_not_parent",
+    ) == "caller_not_parent"
+    assert worker._review_pr_ownership_refusal(
+        {"pr": 1277}, "Learn-Ukrainian/Machinery", "successor", not_owner="caller_not_parent",
+    ) is None
+
+    # End-to-end wait(..., reply=True) refuses a successor whose repository_id uses a Kelvin sign.
+    monkeypatch.setenv(ownership.TASK_ID_ENV, "successor")
+    record, _code = worker.wait("pr-review", "r1", reply=True)
+    assert ("result" in record, record["result_unavailable"]) == (False, "review_not_of_successor_branch")
+
+
 pytestmark = pytest.mark.usefixtures("configured_roots")

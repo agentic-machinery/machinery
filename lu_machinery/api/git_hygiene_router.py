@@ -606,7 +606,7 @@ def compute_git_cleanup(project_root: Path | None = None) -> CleanupReport:
 # Open pull requests, default-branch CI and the lu-machinery pin for every project in the fleet
 # registry (lu_machinery/config/fleet_repos.yaml), in registry order, which also sets the query
 # aliases. The display name is the registry's local_name.
-_REPOSITORY_SLUG = re.compile(r"[A-Za-z0-9-]{1,39}/[A-Za-z0-9._-]{1,100}")
+_REPOSITORY_SLUG = re.compile(r"[A-Za-z0-9-]{1,39}/[A-Za-z0-9._-]{1,100}", re.ASCII)
 PULL_REQUESTS_TTL_S = 120.0
 PULL_REQUESTS_TIMEOUT_S = 20.0
 PULL_REQUESTS_PER_REPOSITORY = 50
@@ -684,7 +684,8 @@ def _recorded_task_reference(tasks_dir: Path, candidate: object, slugs: frozense
         return None
     if not isinstance(record, dict) or record.get("task_id") != token:
         return None
-    if (_authoritative_task_repository(record) or "").casefold() not in slugs:
+    repo = _authoritative_task_repository(record)
+    if not repo or not repo.isascii() or repo.casefold() not in slugs:
         return None
     recorded = record["task_id"]
     return recorded if isinstance(recorded, str) else None
@@ -974,7 +975,8 @@ def compute_pull_requests(project_root: Path, *, tasks_dir: Path | None = None) 
             "unknown_since": None,
             "pull_requests": [
                 _pull_request_row(node, private=private, repository=f"{owner}/{name}",
-                                  slugs=frozenset(slug.casefold() for slug in catalog[index].slugs), tasks_dir=records)
+                                  slugs=frozenset(slug.casefold() for slug in catalog[index].slugs if slug.isascii()),
+                                  tasks_dir=records)
                 for node in nodes[:PULL_REQUESTS_PER_REPOSITORY]
             ],
         })
@@ -995,8 +997,10 @@ def _live_workers(ctx: MonitorContext) -> dict[str, int] | None:
         return None
     merged: dict[str, int] = {}
     for claimed, n in counts.items():
-        if type(n) is int:  # claims that differ only in case are one repository
-            merged[str(claimed).casefold()] = merged.get(str(claimed).casefold(), 0) + n
+        if type(n) is int:  # ASCII claims that differ only in case are one repository
+            raw = claimed if isinstance(claimed, str) else str(claimed)
+            key = raw.casefold() if raw.isascii() else raw
+            merged[key] = merged.get(key, 0) + n
     return merged
 
 
@@ -1021,7 +1025,7 @@ def _with_live_workers(payload: dict[str, Any], counts: dict[str, int] | None) -
         if counts is None or repo is None:
             out.append({**row, "live_workers": None} if isinstance(row, dict) else row)
             continue
-        live = sum(counts.get(slug, 0) for slug in {slug.casefold() for slug in repo.slugs})
+        live = sum(counts.get(slug, 0) for slug in {slug.casefold() for slug in repo.slugs if slug.isascii()})
         seen += live
         out.append({**row, "live_workers": live})
     return {**payload, "repositories": out,

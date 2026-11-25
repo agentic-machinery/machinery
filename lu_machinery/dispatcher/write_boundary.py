@@ -1296,8 +1296,10 @@ class _Broker:
 
     def _claimed(self, payload: dict, slug: str) -> None:
         """Refuse a named repository other than the launch's own."""
+        if not isinstance(slug, str) or not slug or not slug.isascii():
+            raise _BrokerRefusal("repo is not this task's repository")
         repo = payload.get("repo")
-        if repo is not None and not (isinstance(repo, str) and repo.lower() == slug.lower()):
+        if repo is not None and not (isinstance(repo, str) and repo.isascii() and repo.lower() == slug.lower()):
             raise _BrokerRefusal("repo is not this task's repository")
     # -- host steps ----------------------------------------------------------------------------------------------
 

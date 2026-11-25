@@ -224,3 +224,57 @@ def test_a_validator_is_reused_only_for_its_own_url_and_credential(github):
     sent = len(github.sent)
     assert git._delivery_prs(other, REPO) == [9]
     assert github.sent[sent:] == [(other_url, None, 60)]
+
+
+def test_settlement_slug_readers_reject_kelvin_sign_lookalikes(tmp_path, monkeypatch):
+    """Defect class: non-ASCII Kelvin-sign (U+212A) look-alike slugs match \\w or fold into real repos."""
+    real_slug = "learn-ukrainian/machinery"
+    kelvin_slug = "learn-u\u212arainian/machinery"
+
+    # _REMOTE_SLUG requires re.ASCII so Kelvin-sign remote URLs fail closed.
+    assert git._repo_and_base({
+        "worktree_remote_url": f"https://github.com/{kelvin_slug}.git",
+        "worktree_base_ref": "origin/main",
+    }) == (None, "main")
+    assert git._repo_and_base({
+        "worktree_remote_url": f"https://github.com/{real_slug}.git",
+        "worktree_base_ref": "origin/main",
+    }) == (real_slug, "main")
+
+    # _accepted_prs rejects non-ASCII repo before casefold lookup in pr_ownership.
+    state = tmp_path / "ownership.json"
+    state.write_text(json.dumps({
+        "schema": 1,
+        "last_tick": None,
+        "episodes": {},
+        "handoffs": {
+            f"{real_slug}#42": {
+                "successor": "task-1",
+                "predecessor": None,
+                "accepted_at": "2026-11-23T15:00:00+00:00",
+                "head": HEAD,
+                "custody": [],
+                "rerun_allowance": "unspent",
+            },
+        },
+        "history": [],
+        "outbox": [],
+        "heal_attempts": {},
+    }))
+    monkeypatch.setattr(pr_ownership, "state_path", lambda: state)
+    assert git._accepted_prs("task-1", kelvin_slug) == []
+    assert git._accepted_prs("task-1", "Learn-Ukrainian/Machinery") == [42]
+
+    # _same_repo_pr rejects Kelvin-sign slugs in head, base, or repo before casefold.
+    pr_real = {"head": {"repo": {"full_name": "Learn-Ukrainian/Machinery"}}, "base": {"repo": {"full_name": real_slug}}}
+    pr_kelvin_head = {"head": {"repo": {"full_name": kelvin_slug}}, "base": {"repo": {"full_name": real_slug}}}
+    pr_kelvin_base = {"head": {"repo": {"full_name": real_slug}}, "base": {"repo": {"full_name": kelvin_slug}}}
+    assert git._same_repo_pr(pr_real, real_slug) is True
+    assert git._same_repo_pr(pr_real, kelvin_slug) is False
+    assert git._same_repo_pr(pr_kelvin_head, real_slug) is False
+    assert git._same_repo_pr(pr_kelvin_base, real_slug) is False
+
+    # _branch_pulls rejects non-ASCII repo before sending a GitHub REST read.
+    monkeypatch.setattr(git, "_gh", lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("_gh must not run")))
+    with pytest.raises(ValueError, match="owner/repo"):
+        git._branch_pulls(kelvin_slug, BRANCH)
