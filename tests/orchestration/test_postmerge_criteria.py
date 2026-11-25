@@ -243,9 +243,12 @@ def test_postmerge_criteria_rejects_non_ascii_slugs_and_unicode_digits():
     """Defect class: non-ASCII closing URLs, look-alike body slugs, or mixed-digit tokens (#4٢) alias real issues."""
     pr_body = {
         "closingIssuesReferences": [],
-        "body": "Fixes learn-u\u212arainian/machinery#42, Fixes #4\u0662, Fixes \u00a0#77, Fixes #99",
+        "body": "Fixes learn-u\u212arainian/machinery#42, Fixes #4\u0662, Fixes \u00a0#77, Fixes #99 and#100",
     }
-    assert pc.closing_issues(pr_body, "learn-ukrainian/machinery") == [("learn-ukrainian/machinery", 99)]
+    assert pc.closing_issues(pr_body, "learn-ukrainian/machinery") == [
+        ("learn-ukrainian/machinery", 99),
+        ("learn-ukrainian/machinery", 100),
+    ]
 
     with pytest.raises(ValueError, match="invalid closing issue URL"):
         pc.closing_issues(

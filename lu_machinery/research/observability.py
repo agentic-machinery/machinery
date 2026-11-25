@@ -200,9 +200,11 @@ def _consumer_status(
 
 def _membership_report_matches_active_profile(report: dict[str, Any], streams_path: Path) -> bool:
     """Bind a cached membership report to the active repository slug and audit stream map."""
-    observed_repo = report.get("repository")
-    expected_repo = github_slug()
-    if not isinstance(observed_repo, str) or observed_repo.casefold() != expected_repo.casefold():
+    from lu_machinery.orchestration.fleet_repos import ascii_repo_slug
+
+    observed_repo = ascii_repo_slug(report.get("repository"), strip=False)
+    expected_repo = ascii_repo_slug(github_slug(), strip=False)
+    if observed_repo is None or expected_repo is None or observed_repo != expected_repo:
         return False
     try:
         expected_registry = isa.load_registry(streams_path, audit_only=True)

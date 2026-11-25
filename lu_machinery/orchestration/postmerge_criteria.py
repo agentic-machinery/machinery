@@ -109,7 +109,7 @@ def closing_issues(pr: dict, repository: str) -> list[tuple[str, int]]:
         rf"\b(?ai:close[sd]?|fix(?:e[sd])?|resolve[sd]?)[ \t\r\n]+({reference}(?:{separator}{reference})*)",
         visible_markdown(pr.get("body") or ""),
     ):
-        for match in re.finditer(r"(?<![\w.-/])(?:([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+))?#([1-9][0-9]*)(?!\w)", closing[1]):
+        for match in re.finditer(r"(?:([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+))?#([1-9][0-9]*)(?!\w)", closing[1]):
             issues.add((match[1] or repository, int(match[2])))
     return sorted(issues)
 

@@ -65,10 +65,10 @@ class MissingReviewCommit(TargetResolutionError):
 
 # Fail closed on lookalike hosts. Same shapes as delegate's remote parser.
 _GITHUB_ORIGIN_PATTERNS = (
-    re.compile(r"^https?://(?:[^/@\s]+@)?github\.com/([^/\s]+)/([^/\s]+?)(?:\.git)?/?$", re.IGNORECASE),
-    re.compile(r"^ssh://git@github\.com/([^/\s]+)/([^/\s]+?)(?:\.git)?/?$", re.IGNORECASE),
-    re.compile(r"^git@github\.com:([^/\s]+)/([^/\s]+?)(?:\.git)?/?$", re.IGNORECASE),
-    re.compile(r"^git://github\.com/([^/\s]+)/([^/\s]+?)(?:\.git)?/?$", re.IGNORECASE),
+    re.compile(r"^(?ai:https?://)(?:[^/@\s]+@)?(?ai:github\.com)/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(?ai:\.git)?/?$"),
+    re.compile(r"^(?ai:ssh://git@github\.com)/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(?ai:\.git)?/?$"),
+    re.compile(r"^(?ai:git@github\.com):([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(?ai:\.git)?/?$"),
+    re.compile(r"^(?ai:git://github\.com)/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(?ai:\.git)?/?$"),
 )
 _FULL_SHA = re.compile(r"^[0-9a-fA-F]{40}$")
 
@@ -84,8 +84,8 @@ REVIEW_ROOT_UNAVAILABLE = "REVIEW_ROOT_UNAVAILABLE: --repo-root is not a checkou
 
 
 def spells_private_repo(repo_key: str | None) -> bool:
-    """True when *repo_key* is the private catalog key, ignoring pad and case."""
-    return isinstance(repo_key, str) and repo_key.strip().casefold() == "infra-private"
+    """True when *repo_key* is the private catalog key, ignoring ASCII pad and case."""
+    return isinstance(repo_key, str) and repo_key.isascii() and repo_key.strip().casefold() == "infra-private"
 
 
 def repository_target_error(repo_key: str | None, error: Exception) -> TargetResolutionError:
@@ -115,6 +115,8 @@ def _origin_github_repo(checkout: Path) -> str | None:
         raise OSError(REVIEW_ROOT_UNAVAILABLE) from None
     if proc.returncode != 0:
         return None
+    if not proc.stdout.isascii():
+        raise TargetResolutionError("checkout origin is not an exact owner/name")
     text = proc.stdout.strip()
     for pattern in _GITHUB_ORIGIN_PATTERNS:
         match = pattern.match(text)
@@ -439,9 +441,12 @@ def live_canonical_branch_head(repo_root: Path, branch: str, *, repository: str)
     from lu_machinery.common.git_context import UnsafeBranchNameError, validate_plain_branch_name
 
     try:
+        from lu_machinery.orchestration.fleet_repos import ascii_repo_slug
+
         branch = validate_plain_branch_name(branch, repo_root=repo_root)
-        origin = _origin_github_repo(repo_root)
-        if origin is None or origin.casefold() != repository.casefold():
+        origin = ascii_repo_slug(_origin_github_repo(repo_root), strip=False)
+        target_repo = ascii_repo_slug(repository, strip=False)
+        if origin is None or target_repo is None or origin != target_repo:
             raise TargetResolutionError("canonical review repository mismatch")
         ref = f"refs/heads/{branch}"
         proc = _run_git(

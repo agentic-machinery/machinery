@@ -671,3 +671,25 @@ def test_non_ascii_slug_key_and_credentials_refused_before_fold_or_strip(tmp_pat
     )
     monkeypatch.setattr(git_credentials, "default_config_path", lambda **_kw: valid_cfg)
     assert git_credentials.verification_credentials("https://github.com/org/\u212ait.git") == []
+
+
+def test_research_observability_refuses_non_ascii_report_repository(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """Defect class: Kelvin-sign look-alike repository slug in cached membership report matches active profile via casefold."""
+    from lu_machinery.research import observability
+
+    monkeypatch.setattr(observability, "github_slug", lambda: "learn-ukrainian/machinery")
+    monkeypatch.setattr(observability.isa, "load_registry", lambda *_a, **_kw: {})
+    assert (
+        observability._membership_report_matches_active_profile(
+            {"repository": "learn-ukrainian/machinery", "streams": {}},
+            tmp_path / "streams.yaml",
+        )
+        is True
+    )
+    assert (
+        observability._membership_report_matches_active_profile(
+            {"repository": "learn-u\u212arainian/machinery", "streams": {}},
+            tmp_path / "streams.yaml",
+        )
+        is False
+    )

@@ -316,7 +316,11 @@ def _diff_sha256(repo_root: Path, approved: str, candidate: str) -> str:
 
 
 def lineage_keys(repository: str, number: int, branch: str, issues: Sequence[int]) -> list[str]:
-    repo = repository.casefold()
+    from lu_machinery.orchestration.fleet_repos import ascii_repo_slug
+
+    repo = ascii_repo_slug(repository, strip=False)
+    if repo is None:
+        raise RepairRefused(SPENT, f"repair repository must be an ASCII owner/name: {repository!r}")
     return sorted({f"pr:{repo}#{number}", f"branch:{repo}:{branch}", *(f"issue:{repo}#{issue}" for issue in issues)})
 
 
@@ -337,8 +341,14 @@ def _read_receipt(path: Path) -> dict[str, Any] | None:
 
 
 def _same_round(receipt: Mapping[str, Any], *, repository: str, number: int, approved: str, candidate: str) -> bool:
+    from lu_machinery.orchestration.fleet_repos import ascii_repo_slug
+
+    receipt_repo = ascii_repo_slug(receipt.get("repository"), strip=False)
+    target_repo = ascii_repo_slug(repository, strip=False)
     return (
-        str(receipt.get("repository", "")).casefold() == repository.casefold()
+        receipt_repo is not None
+        and target_repo is not None
+        and receipt_repo == target_repo
         and receipt.get("pr") == number
         and receipt.get("approved_head") == approved
         and receipt.get("candidate_head") == candidate
@@ -347,14 +357,18 @@ def _same_round(receipt: Mapping[str, Any], *, repository: str, number: int, app
 
 def repair_heads(receipt_root: Path, *, repository: str, number: int, branch: str) -> frozenset[str]:
     """Candidate heads this PR's repair round admitted: they consume no budgeted round."""
-    repo = repository.casefold()
+    from lu_machinery.orchestration.fleet_repos import ascii_repo_slug
+
+    repo = ascii_repo_slug(repository, strip=False)
+    if repo is None:
+        return frozenset()
     receipts = [
         _read_receipt(_receipt_path(receipt_root, key)) for key in (f"pr:{repo}#{number}", f"branch:{repo}:{branch}")
     ]
     return frozenset(
         str(item["candidate_head"])
         for item in receipts
-        if item and str(item.get("repository", "")).casefold() == repo and item.get("pr") == number
+        if item and ascii_repo_slug(item.get("repository"), strip=False) == repo and item.get("pr") == number
     )
 
 
@@ -516,10 +530,19 @@ def record_admission(receipt_root: Path, receipt: Mapping[str, Any]) -> None:
 
 def receipt_at(receipt_root: Path, *, repository: str, number: int, branch: str, head: str) -> dict[str, Any] | None:
     """This PR's repair-round receipt when ``head`` is its candidate, else None."""
-    repo = repository.casefold()
+    from lu_machinery.orchestration.fleet_repos import ascii_repo_slug
+
+    repo = ascii_repo_slug(repository, strip=False)
+    if repo is None:
+        return None
     for key in (f"pr:{repo}#{number}", f"branch:{repo}:{branch}"):
         receipt = _read_receipt(_receipt_path(receipt_root, key))
-        if receipt and receipt.get("pr") == number and receipt.get("candidate_head") == head:
+        if (
+            receipt
+            and ascii_repo_slug(receipt.get("repository"), strip=False) == repo
+            and receipt.get("pr") == number
+            and receipt.get("candidate_head") == head
+        ):
             return receipt
     return None
 
