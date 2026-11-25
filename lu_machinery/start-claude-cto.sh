@@ -29,6 +29,7 @@ for arg in "$@"; do
       printf 'CTO defaults (these replace the generic driver defaults below): --epic epics --effort high;\n'
       printf '  --model claude-sonnet-5-5 unless --model is given. lu-start-cto passes --model claude-opus-5-5.\n'
       printf '  --force is refused. Runs only from the CTO workspace named by LC_WORKSPACE_ROOT.\n'
+      printf '  Verifies deployed workspace policy before launch. Use agent_deploy --workspace for setup, upgrades or recovery.\n'
       ;;
   esac
 done

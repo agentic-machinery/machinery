@@ -19,15 +19,22 @@ def main() -> int:
   .venv/bin/python -I -m lu_machinery.agent_deploy --project-root /work/project --check
   .venv/bin/python -I -m lu_machinery.agent_deploy --project-root /work/project --check --print-manifest
   .venv/bin/python -I -m lu_machinery.agent_deploy --project-root /work/project --inputs-commit "$(git rev-parse HEAD)"
-  "$LEARN_UKRAINIAN_PYTHON" -I -m lu_machinery.agent_deploy --workspace --project-root /srv/cto-workspace --check
-Outputs: enabled provider files and .deploy-state/agent-deploy.v1.json; check writes nothing.
+  "$LEARN_UKRAINIAN_PYTHON" -I -m lu_machinery.agent_deploy --workspace --project-root /srv/cto-workspace
+Outputs: enabled provider files and .deploy-state/agent-deploy.v1.json. Workspace apply
+also writes a policy digest record under the configured durable state root. Check writes nothing.
 --print-manifest prints the ownership manifest the check recomposed and verified (JSON) instead of its summary.
 --inputs-commit OID composes the plan (checked or applied) from that commit's descriptor and sources, never the
 checkout's.
 --workspace targets a directory that is neither a Git checkout nor inside one: its descriptor and sources are
 read from that directory, as from a checkout, and must enable the claude provider (so its mandatory hook settings
-are required). It needs an explicit --project-root (never LU_PRODUCT_ROOT, which names the product) and refuses
---inputs-commit (a workspace has no commits).
+are required). It needs an explicit --project-root (never LU_PRODUCT_ROOT, which names the product) and
+refuses --inputs-commit (a workspace has no commits). LU_STATE_ROOT, or the primary checkout when that
+setting is omitted, must place the digest record outside the workspace.
+Workspace launch requires a clean --check. After initial setup or a trusted source or release upgrade,
+run workspace apply explicitly. Restore modified files to their verified bytes and modes and remove
+unexpected discovery entries before retrying. Apply recreates missing outputs and locks policy files
+and directories. Workspace mode refuses local Claude settings, workspace hooks, plugins, workflows,
+MCP configuration, and inline hooks or MCP servers in agent frontmatter.
 Exit codes: 0 verified/applied; 1 drift or application failure; 2 invalid/unsafe input.
 Recovery after an interrupted fresh apply followed by source edits:
   Keep a copy of the desired source edits. Restore the product sources and installed
@@ -58,7 +65,7 @@ Related: agents_extensions/deployment.v1.json; machinery #100.""",
         selected = args.project_root if args.project_root is not None else os.environ.get("LU_PRODUCT_ROOT")
         with selected_tree(selected, args.check, workspace=args.workspace) as tree:
             return deploy(tree, check=args.check, print_manifest=args.print_manifest,
-                          inputs_commit=args.inputs_commit, workspace=args.workspace)
+                          inputs_commit=args.inputs_commit, workspace=selected if args.workspace else None)
     except Invalid as exc:
         print(f"invalid deployment: {exc}", file=sys.stderr)
         return 2

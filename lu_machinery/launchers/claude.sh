@@ -2,6 +2,24 @@
 
 launcher_adapter_validate() {
   [ "$LC_HARNESS" = claude-code ] || { launcher_error "Claude supports only --harness claude-code."; exit 2; }
+  [ -n "${LC_WORKSPACE_ROOT:-}" ] || return 0
+  local arg selector option
+  for arg in "${LC_FORWARD_ARGS[@]}"; do
+    selector="${arg%%=*}"
+    case "$selector" in
+      --|-) continue ;;
+      -w*) selector=--worktree ;;
+      --*) ;;
+      *) continue ;;
+    esac
+    for option in --settings --setting-sources --plugin-dir --plugin-url --mcp-config \
+        --strict-mcp-config --agents --add-dir --worktree --cwd --bare --restricted --safe-mode; do
+      if [[ "$option" == "$selector"* ]]; then
+        launcher_error "CTO workspace refuses alternate Claude sources or discovery overrides ($selector)."
+        exit 2
+      fi
+    done
+  done
 }
 launcher_adapter_preflight() {
   # shellcheck source=scripts/lib/profile_resolver.sh

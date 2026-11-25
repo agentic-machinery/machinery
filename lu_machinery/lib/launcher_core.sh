@@ -868,6 +868,7 @@ launcher_validate_workspace_roots() {
   local reason
   project_python_command "$LEARN_UKRAINIAN_PYTHON" || return 1
   if ! reason="$(CLAUDE_PROJECT_DIR="$LC_ROOT" "${PROJECT_PYTHON_COMMAND[@]}" -c '
+import os
 import sys
 from pathlib import Path
 from lu_machinery.agent_deploy.plan import Invalid, relative
@@ -877,10 +878,13 @@ try:
     relative(sys.argv[1].removeprefix("/"))
     native_hook_roots(workspace)
     state = state_root().resolve()
+    claude_config = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude").resolve()
 except (Invalid, MachineryConfigError, OSError) as exc:
     sys.exit(f"{type(exc).__name__}: {exc}")
 if state == workspace or workspace in state.parents:
     sys.exit(f"the state root {state} is the workspace or inside it")
+if claude_config.is_relative_to(workspace):
+    sys.exit("CLAUDE_CONFIG_DIR selects account settings inside the workspace")
 ' "$LC_ROOT" 2>&1 >/dev/null)"; then
     launcher_error "LC_WORKSPACE_ROOT: the workspace path, hook context or state root does not validate: ${reason##*$'\n'}"
     return 1
@@ -1845,13 +1849,11 @@ launcher_main() {
     fi
   fi
 
-  # Agent-extensions staleness gate (restored from the pre-cutover
-  # start-claude.sh, now for EVERY provider): a session launched against stale
-  # deployed hooks/rules runs retired definitions — refuse rather than launch.
-  # Dry-run reports instead of deploying (hermetic probe surface).
+  # Refuse stale hooks and rules. Only enrolled checkouts still deploy at launch.
+  # Dry-run reports the planned operation without needing a deployment.
   if [ "$LC_DRY_RUN" = "1" ]; then
     if [ -n "${LC_WORKSPACE_ROOT:-}" ]; then
-      echo "LAUNCHER_DRY_RUN=1: would deploy agent extensions (workspace $LC_ROOT)"
+      echo "LAUNCHER_DRY_RUN=1: would verify agent extensions (workspace $LC_ROOT)"
     else
       echo "LAUNCHER_DRY_RUN=1: would deploy agent extensions (agents:deploy)"
     fi
@@ -1859,8 +1861,8 @@ launcher_main() {
     # shellcheck source=scripts/lib/deploy_extensions.sh
     source "$LC_MACHINERY_DIR/lib/deploy_extensions.sh"
     if [ -n "${LC_WORKSPACE_ROOT:-}" ]; then
-      if ! deploy_agent_workspace "$LC_ROOT" "$LEARN_UKRAINIAN_PYTHON"; then
-        launcher_error "refusing to launch ${LC_PROVIDER}: the workspace agent-extensions deploy failed."
+      if ! verify_agent_workspace "$LC_ROOT" "$LEARN_UKRAINIAN_PYTHON"; then
+        launcher_error "refusing to launch ${LC_PROVIDER}: workspace agent-extensions verification failed."
         exit 1
       fi
     elif ! deploy_agent_extensions "$LC_ROOT" agents:deploy; then

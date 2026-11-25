@@ -420,7 +420,7 @@ def test_workspace_session_reads_its_account_memory_and_writes_state_to_the_stat
         {"providers": ["claude"], "sources": {"claude": {"path": "agents_extensions/claude", "required": True}},
          "preserve": []}))
     subprocess.run([sys.executable, "-I", "-m", "lu_machinery.agent_deploy", "--workspace", "--project-root",
-                    str(workspace)], check=True, capture_output=True, timeout=120)
+                    str(workspace)], env=env, check=True, capture_output=True, timeout=120)
     drift_env = {**env, "LU_PRODUCT_ROOT": str(primary), "CODEX_CANONICAL_REPO_ROOT": str(primary)}
     drift_payload = json.dumps({"session_id": "workspace-with-product", "source": "startup"})
 
@@ -451,7 +451,10 @@ def test_workspace_session_reads_its_account_memory_and_writes_state_to_the_stat
         text=True, timeout=30, check=True,
     )
     assert f"Thread rollover health (read-only): {state}" in json.loads(compact.stdout)["additionalContext"]
-    (workspace / ".claude" / "rules" / "stray.md").write_text("stray\n")
+    rules = workspace / ".claude" / "rules"
+    rules.chmod(0o755)
+    (rules / "stray.md").write_text("stray\n")
+    rules.chmod(0o555)
     # An inherited Git context naming another checkout cannot redirect the workspace check.
     drift_env["GIT_DIR"] = str(primary / ".git")
     assert deploy_issues() == [
