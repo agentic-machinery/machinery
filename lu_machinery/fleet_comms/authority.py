@@ -236,7 +236,7 @@ def _load_roster() -> tuple[frozenset[str], bool]:
     from lu_machinery import agent_identity
     from lu_machinery.ops import driver_lanes
 
-    paths = (Path(agent_identity.default_assignments_path()), Path(driver_lanes.DATA_FILE))
+    paths = (Path(agent_identity.default_assignments_path()), Path(driver_lanes.default_data_path()))
     key: list[object] = []
     for path in paths:
         try:

@@ -16,8 +16,10 @@ if __package__ in {None, ""}:  # run as a file (launchers do): the repository ro
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from lu_machinery.common import json_depth, profile
 from lu_machinery.common.repo_root import machinery_path
+from lu_machinery.orchestration.fleet_taxonomy import DEFAULT_TAXONOMY_PATH, default_taxonomy_path
 
-TAXONOMY_PATH = machinery_path("config/fleet_taxonomy.yaml")
+# The packaged copy; readers resolve default_taxonomy_path() at call time.
+TAXONOMY_PATH = DEFAULT_TAXONOMY_PATH
 _PACKAGED_ASSIGNMENTS_PATH = machinery_path("config/area_assignments.yaml")
 ASSIGNMENTS_PATH = _PACKAGED_ASSIGNMENTS_PATH
 
@@ -154,13 +156,13 @@ def validate_area_assignments_parity(
 
 def validate_fleet_taxonomy(
     *,
-    taxonomy_path: Path = TAXONOMY_PATH,
+    taxonomy_path: Path | None = None,
     assignments_path: Path | None = None,
     taxonomy_schema_path: Path = TAXONOMY_SCHEMA_PATH,
     assignments_schema_path: Path = ASSIGNMENTS_SCHEMA_PATH,
 ) -> dict[str, Any]:
     """Validate both fleet_taxonomy.yaml and area_assignments.yaml."""
-    taxonomy_data = _load_yaml(taxonomy_path)
+    taxonomy_data = _load_yaml(default_taxonomy_path() if taxonomy_path is None else taxonomy_path)
     resolved_assignments = default_assignments_path() if assignments_path is None else assignments_path
     assignments_data = _load_yaml(resolved_assignments)
 
@@ -194,8 +196,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--taxonomy",
         type=Path,
-        default=TAXONOMY_PATH,
-        help="path to fleet_taxonomy.yaml",
+        default=None,
+        help="path to fleet_taxonomy.yaml (default: the active profile's, else packaged)",
     )
     parser.add_argument(
         "--assignments",
@@ -215,7 +217,7 @@ def main(argv: list[str] | None = None) -> int:
             default_assignments_path() if args.assignments is None else args.assignments
         ).resolve()
         summary = validate_fleet_taxonomy(
-            taxonomy_path=args.taxonomy.resolve(),
+            taxonomy_path=(default_taxonomy_path() if args.taxonomy is None else args.taxonomy).resolve(),
             assignments_path=resolved_assignments,
         )
     except (FleetTaxonomyValidationError, profile.ProfileError) as exc:

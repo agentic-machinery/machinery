@@ -12,9 +12,18 @@ from pathlib import Path
 
 import yaml
 
+from lu_machinery.common import profile
 from lu_machinery.common.repo_root import machinery_path
 
-DEFAULT_TAXONOMY_PATH = machinery_path("config/fleet_taxonomy.yaml")
+_PACKAGED_TAXONOMY_PATH = machinery_path("config/fleet_taxonomy.yaml")
+DEFAULT_TAXONOMY_PATH = _PACKAGED_TAXONOMY_PATH
+
+
+def default_taxonomy_path() -> Path:
+    """Resolve ``fleet_taxonomy.yaml`` at call time via the active profile, else the packaged copy."""
+    if DEFAULT_TAXONOMY_PATH != _PACKAGED_TAXONOMY_PATH:
+        return DEFAULT_TAXONOMY_PATH
+    return profile.config_path("fleet_taxonomy", default=_PACKAGED_TAXONOMY_PATH)
 
 
 class FleetTaxonomyError(ValueError):
@@ -51,10 +60,13 @@ class TaxonomyRegistry:
     epic_to_area: dict[int, ResolvedArea]
 
 
-@functools.lru_cache(maxsize=16)
 def load_fleet_taxonomy(taxonomy_path: Path | None = None) -> TaxonomyRegistry:
-    """Load and index fleet_taxonomy.yaml."""
-    path = (taxonomy_path or DEFAULT_TAXONOMY_PATH).resolve()
+    """Load and index fleet_taxonomy.yaml (default: :func:`default_taxonomy_path`, resolved per call)."""
+    return _load_fleet_taxonomy((taxonomy_path or default_taxonomy_path()).resolve())
+
+
+@functools.lru_cache(maxsize=16)
+def _load_fleet_taxonomy(path: Path) -> TaxonomyRegistry:
     if not path.is_file():
         raise FleetTaxonomyError(f"Fleet taxonomy file not found: {path}")
 

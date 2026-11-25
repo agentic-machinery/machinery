@@ -365,9 +365,9 @@ def main(argv: list[str] | None = None) -> int:
         private_repo = (
             args.private_repo.expanduser().resolve()
             if args.private_repo is not None
-            else scheduled_worktree_cleanup.default_private_repo(public_repo).resolve()
+            else scheduled_worktree_cleanup.default_private_repo().resolve()
         )
-    except FleetRepoError as exc:
+    except (FleetRepoError, MachineryConfigError) as exc:
         private_repo = None
         registry_error = str(exc)
 

@@ -24,10 +24,11 @@ if __package__ in {None, ""}:  # run as a file (launchers do): the repository ro
 
 from lu_machinery.common import profile
 from lu_machinery.common.repo_root import machinery_path
+from lu_machinery.orchestration.fleet_taxonomy import DEFAULT_TAXONOMY_PATH as DEFAULT_TAXONOMY_PATH  # packaged copy
+from lu_machinery.orchestration.fleet_taxonomy import default_taxonomy_path
 
 _PACKAGED_ASSIGNMENTS_PATH = machinery_path("config/area_assignments.yaml")
 DEFAULT_ASSIGNMENTS_PATH = _PACKAGED_ASSIGNMENTS_PATH
-DEFAULT_TAXONOMY_PATH = machinery_path("config/fleet_taxonomy.yaml")
 
 
 def _default_assignments_path() -> Path:
@@ -84,7 +85,7 @@ def resolve_driver_agent_type(
     lane: str,
     *,
     assignments_path: Path | None = None,
-    taxonomy_path: Path = DEFAULT_TAXONOMY_PATH,
+    taxonomy_path: Path | None = None,
     provider: str = "claude",
 ) -> str | None:
     lane = (lane or "").strip()
@@ -113,7 +114,7 @@ def resolve_driver_agent_type(
     if direct:
         return direct
 
-    canonical = _canonical_area_for_alias(lane, taxonomy_path)
+    canonical = _canonical_area_for_alias(lane, default_taxonomy_path() if taxonomy_path is None else taxonomy_path)
     if canonical and canonical != lane:
         aliased = _valid_driver_agent_type(assignments.get(canonical), area_label=canonical)
         if aliased:
@@ -140,7 +141,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--lane", required=True, help="launcher lane after selector normalisation, e.g. infra")
     parser.add_argument("--provider", default="claude", help="slot prefix used for the slots fallback (default claude)")
     parser.add_argument("--assignments", type=Path, default=None, help="area_assignments.yaml path")
-    parser.add_argument("--taxonomy", type=Path, default=DEFAULT_TAXONOMY_PATH, help="fleet_taxonomy.yaml path")
+    parser.add_argument(
+        "--taxonomy", type=Path, default=None, help="fleet_taxonomy.yaml path (default: the active profile's, else packaged)"
+    )
     args = parser.parse_args(argv)
     try:
         assignments_path = _default_assignments_path() if args.assignments is None else args.assignments

@@ -35,9 +35,10 @@ from lu_machinery.orchestration.fleet_repos import (
     resolve_active_fleet_repo,
     resolve_fleet_repo,
 )
+from lu_machinery.orchestration.fleet_taxonomy import default_taxonomy_path
 from lu_machinery.orchestration.integration_sweep import GitHubAdapter, SweepError, lookup_verdict
 from lu_machinery.orchestration.task_record_store import iter_task_records, read_task_record
-from lu_machinery.orchestration.validate_fleet_taxonomy import TAXONOMY_PATH, _load_yaml, default_assignments_path
+from lu_machinery.orchestration.validate_fleet_taxonomy import _load_yaml, default_assignments_path
 from lu_machinery.orchestration.worktree_claims import RELEASED_TASK_STATUSES
 from lu_machinery.session_streams.store import TURN_HOLDER_HARNESS
 from lu_machinery.session_supervisor.remote import RemoteEpicClient, RemoteSupervisorError, RemoteUnreachableError
@@ -124,7 +125,7 @@ def owner_lanes() -> dict[str, str]:
     raw_assignments = _load_yaml(default_assignments_path()).get("assignments")
     if not isinstance(raw_assignments, dict):
         raise ValueError("area_assignments.yaml 'assignments' must be a mapping")
-    raw_areas = _load_yaml(TAXONOMY_PATH).get("areas")
+    raw_areas = _load_yaml(default_taxonomy_path()).get("areas")
     if not isinstance(raw_areas, dict):
         raise ValueError("fleet_taxonomy.yaml 'areas' must be a mapping")
     assignments: dict[str, list[str]] = {}

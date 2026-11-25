@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -54,6 +55,11 @@ def _write_transcript(path: Path, *, tokens: int = 187_000, prev: int = 125_000)
 
 
 
+def _flat(project_root: Path) -> str:
+    """Claude Code's project directory name: every non-alphanumeric character becomes ``-``."""
+    return re.sub(r"[^A-Za-z0-9]", "-", str(project_root.resolve()))
+
+
 def _select_root(monkeypatch, root: Path) -> None:
     """Point the API at ``root`` for both the transcript and the session record.
 
@@ -71,6 +77,8 @@ def telemetry_enabled(monkeypatch):
     monkeypatch.setenv("LEARN_UKRAINIAN_TELEMETRY_FOOTER", "1")
     monkeypatch.delenv("LEARN_UKRAINIAN_TRANSCRIPT_PATH", raising=False)
     monkeypatch.delenv("CLAUDE_TRANSCRIPT_PATH", raising=False)
+    # These cases model the default Claude account directory under HOME.
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
     # These hermetic roots are not Git repositories. Model the canonical primary
     # checkout as the supplied root; a separate regression below covers linked roots.
     monkeypatch.setattr(
@@ -87,7 +95,7 @@ def test_session_hit_returns_caller_match_telemetry(
     project_root = tmp_path / "learn-ukrainian"
     project_root.mkdir()
     session_id = "abc-session-123"
-    flat = str(project_root.resolve()).replace("/", "-")
+    flat = _flat(project_root)
     transcript = home / ".claude" / "projects" / flat / f"{session_id}.jsonl"
     _write_transcript(transcript)
 
@@ -295,7 +303,7 @@ def test_no_session_param_shape_with_newest_sidecar(
     home = tmp_path / "home"
     project_root = tmp_path / "learn-ukrainian"
     project_root.mkdir()
-    flat = str(project_root.resolve()).replace("/", "-")
+    flat = _flat(project_root)
     transcript = home / ".claude" / "projects" / flat / "newest.jsonl"
     _write_transcript(transcript)
 
@@ -319,7 +327,7 @@ def test_query_session_wins_over_header(
     home = tmp_path / "home"
     project_root = tmp_path / "learn-ukrainian"
     project_root.mkdir()
-    flat = str(project_root.resolve()).replace("/", "-")
+    flat = _flat(project_root)
     query_session = "query-session"
     header_session = "header-session"
     _write_transcript(
@@ -368,3 +376,32 @@ def test_session_given_does_not_use_cross_checkout_fallback(
         "/api/state/manifest?session=missing-but-foreign-exists",
     )
     assert response.json()["_telemetry"]["reason"] == "session-transcript-not-found"
+
+
+def test_transcripts_come_only_from_the_configured_claude_account(
+    tmp_path,
+    monkeypatch,
+    telemetry_enabled,
+) -> None:
+    """Defect class: a transcript read from outside the configured account's own project directory.
+
+    Members: the HOME default ignoring ``CLAUDE_CONFIG_DIR``, a cross-checkout name glob, and a
+    project name flattened differently from Claude Code (only ``/`` replaced, not ``.`` or ``_``).
+    """
+    home = tmp_path / "home"
+    account = tmp_path / "account.b"
+    project_root = tmp_path / "work_tree" / ".checkouts" / "learn-ukrainian"
+    project_root.mkdir(parents=True)
+    flat = _flat(project_root)
+    assert "." not in flat and "_" not in flat
+    own = account / "projects" / flat / "own.jsonl"
+    _write_transcript(own, tokens=111_000)
+    _write_transcript(home / ".claude" / "projects" / flat / "default-account.jsonl", tokens=222_000)
+    _write_transcript(account / "projects" / "-srv-learn-ukrainian-other" / "foreign.jsonl", tokens=333_000)
+    _write_transcript(account / "projects" / str(project_root.resolve()).replace("/", "-") / "slash-only.jsonl")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(account))
+
+    assert transcript_tokens.resolve_transcript_paths(project_root) == [own]
+    assert transcript_tokens.resolve_transcript_paths(project_root, session="own") == [own]
+    assert transcript_tokens.resolve_transcript_paths(project_root, session="default-account") == []

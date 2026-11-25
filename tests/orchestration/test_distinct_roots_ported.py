@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import json
 import os
-import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -25,7 +24,6 @@ from lu_machinery.lib import rules_core
 from lu_machinery.orchestration import worktree_claims, worktree_git
 
 REPO = Path(__file__).resolve().parents[2]
-UNIT = REPO / "packaging" / "systemd" / "learn-ukrainian-project-state-reporter.service"
 DEFAULT_SLUG = "learn-ukrainian/learn-ukrainian.github.io"
 # Fleet catalog keys and their GitHub slugs (scripts/config/fleet_repos.yaml).
 REPOS = {"public": DEFAULT_SLUG, "kube-dojo": "kube-dojo/kube-dojo.github.io"}
@@ -154,82 +152,6 @@ def _observe_reexec(monkeypatch: pytest.MonkeyPatch, runtime: Path) -> list[list
     monkeypatch.setattr(dispatcher_primary, "machinery_path", lambda relative: runtime / "lu_machinery" / relative)
     monkeypatch.setattr(dispatcher_primary.os, "execv", fake_execv)
     return calls
-
-
-def _unit_lines() -> dict[str, list[str]]:
-    lines: dict[str, list[str]] = {}
-    for line in UNIT.read_text(encoding="utf-8").splitlines():
-        if "=" in line and not line.startswith("#"):
-            key, value = line.split("=", 1)
-            lines.setdefault(key, []).append(value)
-    return lines
-
-
-def _reporter_code_root() -> str:
-    """Directory that holds the lu_machinery package a fresh interpreter imports.
-
-    A normal import, from the interpreter's own directory, with no ``PYTHONPATH``.
-    The path stays unresolved, including a symlink prefix: ``project_interpreter.sh``
-    builds ``PROJECT_CODE_ROOT`` from the script's unresolved location. The unit
-    finds its script with ``importlib.resources``, so this expectation does not
-    repeat that lookup.
-    """
-    probe = subprocess.run(
-        [
-            sys.executable,
-            "-c",
-            "import lu_machinery, pathlib; "
-            "print(pathlib.Path(lu_machinery.__file__).parents[1])",
-        ],
-        check=True,
-        capture_output=True,
-        text=True,
-        cwd=Path(sys.executable).parent,
-        env={"PATH": "/usr/bin:/bin"},
-    )
-    return probe.stdout.strip()
-
-
-def _systemd_exec_start(home: Path) -> subprocess.CompletedProcess[str]:
-    """Run the unit's ExecStart the way systemd does: Environment=, optional EnvironmentFile=, cwd."""
-    unit = _unit_lines()
-    env: dict[str, str] = {}
-    for assignment in unit["Environment"]:
-        key, value = assignment.split("=", 1)
-        env[key] = value
-    for path in unit["EnvironmentFile"]:
-        optional = path.startswith("-")
-        env_file = Path(path.removeprefix("-").replace("%h", str(home)))
-        if not env_file.is_file():
-            assert optional, f"required EnvironmentFile missing: {env_file}"
-            continue
-        for line in env_file.read_text(encoding="utf-8").splitlines():
-            if line.strip() and not line.startswith("#"):
-                key, value = line.split("=", 1)
-                env[key] = value
-    (command,) = unit["ExecStart"]
-    (cwd,) = unit["WorkingDirectory"]
-    product_python = f"{home}/projects/learn-ukrainian/.venv/bin/python"
-    rendered = command.replace("%h", str(home)).replace(product_python, sys.executable, 1)
-    return subprocess.run(
-        shlex.split(rendered),
-        cwd=cwd.replace("%h", str(home)),
-        env={"HOME": str(home), **env},
-        capture_output=True,
-        text=True,
-        timeout=60,
-        check=False,
-    )
-
-
-def _systemd_home(tmp_path: Path) -> Path:
-    """A product checkout with no machinery tree. The unit must load its script from the package."""
-    home = tmp_path / "home"
-    (home / "projects").mkdir(parents=True)
-    runtime = tmp_path / "runtime-real"
-    runtime.mkdir()
-    (home / "projects/learn-ukrainian").symlink_to(runtime, target_is_directory=True)
-    return home
 
 
 @pytest.fixture
