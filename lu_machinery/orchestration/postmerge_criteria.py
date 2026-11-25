@@ -17,7 +17,7 @@ if __package__ in (None, ""):
 from lu_machinery.common import github_client, json_depth
 from lu_machinery.fleet_comms.authority import AuthorityService
 from lu_machinery.orchestration import task_lifecycle
-from lu_machinery.orchestration.fleet_repos import ascii_repo_slug
+from lu_machinery.orchestration.fleet_repos import ascii_repo_slug, parse_ascii_positive_int
 from lu_machinery.publish.github import publish, read
 
 # This package's import name, from the unresolved file location: never from __package__, which a
@@ -100,9 +100,10 @@ def closing_issues(pr: dict, repository: str) -> list[tuple[str, int]]:
             if isinstance(url, str)
             else None
         )
-        if not match:
+        number = parse_ascii_positive_int(match[2]) if match else None
+        if not match or number is None:
             raise ValueError("invalid closing issue URL")
-        issues.add((match[1], int(match[2])))
+        issues.add((match[1], number))
     reference = r"(?:[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)?#[1-9][0-9]*(?!\w)"
     separator = r"[ \t]*(?:,|(?ai:and)\b|&)[ \t]*(?:(?ai:and)[ \t]+)?"
     for closing in re.finditer(
@@ -110,7 +111,9 @@ def closing_issues(pr: dict, repository: str) -> list[tuple[str, int]]:
         visible_markdown(pr.get("body") or ""),
     ):
         for match in re.finditer(r"(?:([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+))?#([1-9][0-9]*)(?!\w)", closing[1]):
-            issues.add((match[1] or repository, int(match[2])))
+            number = parse_ascii_positive_int(match[2])
+            if number is not None:
+                issues.add((match[1] or repository, number))
     return sorted(issues)
 
 

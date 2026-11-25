@@ -42,7 +42,7 @@ from lu_machinery.common.git_context import sanitized_git_env
 # The post-release PR's title. A range holding only these PRs is unchanged.
 BUMP_TITLE = "chore(release): record {released} and start {next}"
 _BUMP = re.compile(r"chore\(release\): record \d+\.\d+\.\d+ and start \d+\.\d+\.\d+( \(#\d+\))?")
-_VERSION = re.compile(r"(\d+)\.(\d+)\.(\d+)")
+_VERSION = re.compile(r"([0-9]{1,9})\.([0-9]{1,9})\.([0-9]{1,9})")
 # Same value grammar as lu_machinery.ci.check_agent_attribution (``X-Agent: <agent>/<task-id>``).
 _X_AGENT = re.compile(r"[a-z][a-z0-9]*(?:-[a-z0-9]+)*/[A-Za-z0-9._-]+")
 _X_AGENT_EXAMPLE = "claude/claude-opus-5-5"
@@ -1577,10 +1577,13 @@ def utc_date() -> str:
 
 
 def pr_number(output: str) -> int:
-    match = re.search(r"/pull/(\d+)\b", output)
-    if match is None:
+    from lu_machinery.orchestration.fleet_repos import parse_ascii_positive_int
+
+    match = re.search(r"/pull/([0-9]+)(?!\w)", output)
+    parsed = parse_ascii_positive_int(match.group(1)) if match is not None else None
+    if parsed is None:
         raise CutError(f"no pull request URL in publisher output: {output.strip()[:200]}")
-    return int(match.group(1))
+    return parsed
 
 
 def release_body(cut: Cut, section: str, files: Mapping[str, Path], consumer_lock: Path, ci: str,

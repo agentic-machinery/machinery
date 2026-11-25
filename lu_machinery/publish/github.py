@@ -3614,8 +3614,14 @@ def _dismiss_preflight(fields, gh_repo, dest, runner, cwd, environment, *, temp=
     if not known:
         raise ValueError("the repository is not an exact owner/name or the fleet registry is unreadable")
     slugs = "|".join(re.escape(slug) for slug in known)
+    from lu_machinery.orchestration.fleet_repos import parse_ascii_positive_int
+
     pattern = rf"https://github\.com/(?:{slugs})/pull/([1-9][0-9]*)(?:#[A-Za-z0-9_-]+)?"
-    prs = {int(match[1]) for link in links if (match := re.fullmatch(pattern, link))}
+    prs = {
+        num
+        for link in links
+        if (match := re.fullmatch(pattern, link)) and (num := parse_ascii_positive_int(match[1])) is not None
+    }
     explanation = re.sub(identifier, "", re.sub(r"https://[^\s<>()]+", "", comment)).strip(" .,:;\n")
     if dest.partition("/")[0] != "github.com" or len(prs) != 1 or not any(char.isalpha() for char in explanation):
         raise ValueError("comment needs an explanation and one same-repository merged PR")
@@ -3827,16 +3833,23 @@ def _dismiss_preflight(fields, gh_repo, dest, runner, cwd, environment, *, temp=
     baseline_ref = f"refs/heads/{base_ref}"
     if not any(instance["ref"] == baseline_ref for instance in instances):
         raise ValueError("no open triage-branch instance")
-    pull_instance_nums = sorted({
-        int(match[1])
-        for instance in instances
-        if (match := re.fullmatch(r"refs/pull/([1-9][0-9]*)/merge", instance["ref"]))
-    })
+    from lu_machinery.orchestration.fleet_repos import parse_ascii_positive_int
+
+    pull_instance_set: set[int] = set()
+    for instance in instances:
+        if match := re.fullmatch(r"refs/pull/([1-9][0-9]*)/merge", instance["ref"]):
+            pr_num = parse_ascii_positive_int(match[1])
+            if pr_num is None:
+                raise ValueError("unknown instance PR identity or state")
+            pull_instance_set.add(pr_num)
+    pull_instance_nums = sorted(pull_instance_set)
     pr_states = pull_states(pull_instance_nums) if pull_instance_nums else {}
     skipped_prs = {}
     for instance in instances:
         if match := re.fullmatch(r"refs/pull/([1-9][0-9]*)/merge", instance["ref"]):
-            pr_num = int(match[1])
+            pr_num = parse_ascii_positive_int(match[1])
+            if pr_num is None:
+                raise ValueError("unknown instance PR identity or state")
             state, merged = pr_states[pr_num]
             if state in {"CLOSED", "MERGED"} or merged:
                 skipped_prs[pr_num] = (state, merged)

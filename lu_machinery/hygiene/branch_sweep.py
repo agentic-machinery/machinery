@@ -39,6 +39,7 @@ from lu_machinery.common.git_context import UnsafeBranchNameError, sanitized_git
 from lu_machinery.common.jsonl import jsonl_lines, physical_lines
 from lu_machinery.common.scratch import ensure_scratch_root
 from lu_machinery.orchestration import worktree_git as reaper
+from lu_machinery.orchestration.fleet_repos import parse_ascii_positive_int
 from lu_machinery.orchestration.task_family.git_safety import remote_protected_branches
 from lu_machinery.orchestration.task_record_store import parse_task_record, read_task_record_bytes, task_archive_lock
 from lu_machinery.orchestration.worktree_claims import RELEASED_TASK_STATUSES
@@ -450,8 +451,8 @@ def _rescue(name: str) -> bool:
 def _numbers(pattern: re.Pattern[str], text: str) -> list[int]:
     found: list[int] = []
     for raw in pattern.findall(text):
-        number = int(raw)
-        if number > 0 and number not in found:
+        number = parse_ascii_positive_int(raw)
+        if number is not None and number not in found:
             found.append(number)
     return found
 
@@ -582,10 +583,14 @@ def _pr_merge_index(repo: Path, cache: _EvidenceCache) -> dict[int, list[str]]:
         numbers: list[int] = []
         merge = _MERGE_SUBJECT_RE.search(subject)
         if merge:
-            numbers.append(int(merge.group(1)))
+            parsed = parse_ascii_positive_int(merge.group(1))
+            if parsed is not None:
+                numbers.append(parsed)
         squash = _SQUASH_SUBJECT_RE.search(subject)
         if squash:
-            numbers.append(int(squash.group(1)))
+            parsed = parse_ascii_positive_int(squash.group(1))
+            if parsed is not None:
+                numbers.append(parsed)
         for number in dict.fromkeys(numbers):
             bucket = found.setdefault(number, [])
             if sha not in bucket:
