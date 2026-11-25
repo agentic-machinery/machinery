@@ -1869,3 +1869,49 @@ def test_fleet_repos_validates_declared_product_files(tmp_path, monkeypatch):
     with pytest.raises(product_policy.ProductPolicyError) as exc_info:
         adm.load_product_policy()
     assert exc_info.value.code == "policy_origin_mismatch"
+
+
+def test_strict_inventory_skips_foreign_json_beside_records(tmp_path):
+    """Defect class: a strict reader refuses the whole store over a file the record parser calls foreign.
+
+    Policy, build and receipt JSON written beside task records make no record claim; the strict
+    inventory skips them exactly as ``list_tasks(strict=True)`` does, so the turn child count works.
+    """
+    tasks = tmp_path / "tasks"
+    child = _record(tasks, "turn-child", parent_task_id="turn-parent", parent_run_nonce="nonce-turn-parent")
+    archive = tasks / "archive"
+    archive.mkdir()
+    (tasks / "atlas-01a193ab-parent11943-ac-policy.json").write_text(
+        json.dumps({"criteria": [{"id": "AC-1", "applies": True}]}), encoding="utf-8"
+    )
+    (tasks / "turn-child.base-build.json").write_text(json.dumps({"head": "0" * 40, "ok": True}), encoding="utf-8")
+    (archive / "turn-child.behavior-receipt.json").write_text(
+        json.dumps({"schema": "behavior-receipt.v1", "task_id": "turn-child"}), encoding="utf-8"
+    )
+
+    records = adm.strict_task_inventory_in(tasks)
+
+    assert [record["task_id"] for record in records] == ["turn-child"]
+    assert records[0] == json.loads(child.read_text(encoding="utf-8"))
+    assert adm.count_turn_children(tasks, "turn-parent", "nonce-turn-parent") == 1
+
+
+@pytest.mark.parametrize(
+    ("name", "raw"),
+    [
+        pytest.param("truncated.json", b'{"task_id": "truncated", "status": "runn', id="damaged-record-claim"),
+        pytest.param("bad-schema.json", b'{"task_id": "bad-schema", "schema_version": "2"}', id="invalid-schema"),
+        pytest.param("zeroed-child.json", b"\x00" * 64, id="v2-name-zero-filled"),
+        pytest.param("emptied-child.json", b"", id="v2-name-empty"),
+    ],
+)
+def test_strict_inventory_still_refuses_record_claims_that_fail_to_parse(tmp_path, name, raw):
+    """Defect class: skipping foreign files also hides a damaged record, so a live child escapes the cap."""
+    tasks = tmp_path / "tasks"
+    _record(tasks, "turn-child", parent_task_id="turn-parent", parent_run_nonce="nonce-turn-parent")
+    (tasks / name).write_bytes(raw)
+
+    with pytest.raises(ValueError, match=rf"unreadable task record {name}"):
+        adm.strict_task_inventory_in(tasks)
+    with pytest.raises(ValueError, match="cannot verify turn child count"):
+        adm.count_turn_children(tasks, "turn-parent", "nonce-turn-parent")
