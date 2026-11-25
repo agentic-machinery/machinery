@@ -37,8 +37,8 @@ ASSIGNMENTS_SCHEMA_PATH = (
 )
 
 
-class FleetTaxonomyValidationError(Exception):
-    """Raised when fleet taxonomy or area assignments validation fails."""
+class FleetTaxonomyValidationError(ValueError):
+    """Raised when fleet taxonomy or area assignments validation fails (a ``ValueError``, like the loaders' errors)."""
 
 
 def _load_yaml(path: Path) -> dict[str, Any]:

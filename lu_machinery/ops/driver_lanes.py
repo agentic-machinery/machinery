@@ -246,7 +246,7 @@ def load_registry(path: Path | None = None) -> Registry:
         raise LaneConfigError(f"lane data unavailable: {exc}") from exc
     try:
         data = json_depth.loads(source.read_text(encoding="utf-8"), max_depth=512)
-    except (OSError, json.JSONDecodeError) as exc:
+    except (OSError, ValueError, RecursionError) as exc:  # unreadable, not UTF-8, not JSON, too deep
         raise LaneConfigError(f"cannot read lane data {source.name}: {exc}") from exc
     return parse_registry(data)
 

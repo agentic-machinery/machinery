@@ -632,7 +632,7 @@ def succession_streams(path: Path | None = None) -> tuple[dict[str, str], str]:
     raw = (default_succession_map_path() if path is None else path).read_bytes()
     try:
         data = yaml.load(raw.decode("utf-8"), Loader=UniqueKeyLoader)  # SafeLoader subclass
-    except (UnicodeDecodeError, yaml.YAMLError) as exc:
+    except (UnicodeDecodeError, yaml.YAMLError, RecursionError) as exc:
         raise ValueError("succession map unreadable") from exc
     if not isinstance(data, dict) or set(data) != {"schema", "streams"}:
         raise ValueError("succession map invalid")

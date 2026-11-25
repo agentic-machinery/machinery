@@ -83,53 +83,56 @@ def _load_fleet_taxonomy(path: Path) -> TaxonomyRegistry:
     except Exception as exc:
         raise FleetTaxonomyError(f"Failed to parse YAML in {path}: {exc}") from exc
 
-    if not isinstance(raw_data, dict) or "areas" not in raw_data:
-        raise FleetTaxonomyError(f"Invalid taxonomy structure in {path}")
+    if not isinstance(raw_data, dict) or not isinstance(raw_data.get("areas"), dict):
+        raise FleetTaxonomyError(f"Invalid taxonomy structure in {path}: 'areas' must be a mapping")
 
     areas_map: dict[str, ResolvedArea] = {}
     alias_to_area: dict[str, ResolvedArea] = {}
     epic_to_area: dict[int, ResolvedArea] = {}
 
-    raw_areas = raw_data.get("areas", {})
-    if isinstance(raw_areas, dict):
-        for area_id, area_data in raw_areas.items():
-            if not isinstance(area_data, dict):
-                continue
-
-            raw_aliases = area_data.get("aliases", [])
-            aliases = tuple(str(a) for a in raw_aliases)
-
-            epics_list: list[EpicInfo] = []
-            for raw_epic in area_data.get("epics", []):
-                if isinstance(raw_epic, dict) and "number" in raw_epic:
-                    epics_list.append(
-                        EpicInfo(
-                            number=int(raw_epic["number"]),
-                            name=str(raw_epic.get("name", "")),
-                        )
-                    )
-
-            area = ResolvedArea(
-                id=area_id,
-                aliases=aliases,
-                epics=tuple(epics_list),
+    for area_id, area_data in raw_data["areas"].items():
+        # Invalid content refuses the whole file, typed, rather than skipping or crashing on a part.
+        if not isinstance(area_id, str) or not isinstance(area_data, dict):
+            raise FleetTaxonomyError(f"Invalid taxonomy structure in {path}: area {area_id!r} must be a mapping")
+        raw_aliases = area_data.get("aliases", [])
+        raw_epics = area_data.get("epics", [])
+        if not isinstance(raw_aliases, list) or not all(isinstance(a, str) for a in raw_aliases):
+            raise FleetTaxonomyError(f"Invalid taxonomy structure in {path}: {area_id}.aliases must be a list of strings")
+        if not isinstance(raw_epics, list) or not all(
+            isinstance(e, dict)
+            and type(e.get("number")) is int
+            and e["number"] > 0
+            and isinstance(e.get("name", ""), str)
+            for e in raw_epics
+        ):
+            raise FleetTaxonomyError(
+                f"Invalid taxonomy structure in {path}: {area_id}.epics must be a list of "
+                "{number: positive integer, name: string}"
             )
-            areas_map[area_id] = area
-            alias_to_area[area_id] = area
+        aliases = tuple(raw_aliases)
+        epics_list = [EpicInfo(number=e["number"], name=e.get("name", "")) for e in raw_epics]
 
-            for alias in aliases:
-                if alias in alias_to_area and alias_to_area[alias].id != area_id:
-                    raise FleetTaxonomyError(
-                        f"Duplicate alias '{alias}' found across areas '{alias_to_area[alias].id}' and '{area_id}'"
-                    )
-                alias_to_area[alias] = area
+        area = ResolvedArea(
+            id=area_id,
+            aliases=aliases,
+            epics=tuple(epics_list),
+        )
+        areas_map[area_id] = area
+        alias_to_area[area_id] = area
 
-            for epic in area.epics:
-                if epic.number in epic_to_area and epic_to_area[epic.number].id != area_id:
-                    raise FleetTaxonomyError(
-                        f"Duplicate epic number {epic.number} found across areas '{epic_to_area[epic.number].id}' and '{area_id}'"
-                    )
-                epic_to_area[epic.number] = area
+        for alias in aliases:
+            if alias in alias_to_area and alias_to_area[alias].id != area_id:
+                raise FleetTaxonomyError(
+                    f"Duplicate alias '{alias}' found across areas '{alias_to_area[alias].id}' and '{area_id}'"
+                )
+            alias_to_area[alias] = area
+
+        for epic in area.epics:
+            if epic.number in epic_to_area and epic_to_area[epic.number].id != area_id:
+                raise FleetTaxonomyError(
+                    f"Duplicate epic number {epic.number} found across areas '{epic_to_area[epic.number].id}' and '{area_id}'"
+                )
+            epic_to_area[epic.number] = area
 
     return TaxonomyRegistry(
         areas=areas_map,

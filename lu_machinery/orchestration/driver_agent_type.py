@@ -25,7 +25,7 @@ if __package__ in {None, ""}:  # run as a file (launchers do): the repository ro
 from lu_machinery.common import profile
 from lu_machinery.common.repo_root import machinery_path
 from lu_machinery.orchestration.fleet_taxonomy import DEFAULT_TAXONOMY_PATH as DEFAULT_TAXONOMY_PATH  # packaged copy
-from lu_machinery.orchestration.fleet_taxonomy import default_taxonomy_path
+from lu_machinery.orchestration.fleet_taxonomy import FleetTaxonomyError, default_taxonomy_path, load_fleet_taxonomy
 
 _PACKAGED_ASSIGNMENTS_PATH = machinery_path("config/area_assignments.yaml")
 DEFAULT_ASSIGNMENTS_PATH = _PACKAGED_ASSIGNMENTS_PATH
@@ -38,7 +38,7 @@ def _default_assignments_path() -> Path:
 
 
 class DriverAgentConfigError(ValueError):
-    """Raised when ``area_assignments.yaml`` contains malformed driver agent configuration."""
+    """Raised when ``area_assignments.yaml`` or ``fleet_taxonomy.yaml`` holds malformed driver agent configuration."""
 
 
 def _valid_driver_agent_type(entry: object, *, area_label: str) -> str | None:
@@ -62,23 +62,17 @@ def _valid_driver_agent_type(entry: object, *, area_label: str) -> str | None:
 
 
 def _canonical_area_for_alias(lane: str, taxonomy_path: Path) -> str | None:
-    """Map a stream alias to its canonical area id via ``fleet_taxonomy.yaml``."""
+    """Map a stream alias to its canonical area id via ``fleet_taxonomy.yaml``.
+
+    An absent file has no aliases; invalid content raises :class:`DriverAgentConfigError`.
+    """
+    if not taxonomy_path.is_file():
+        return None
     try:
-        data = yaml.safe_load(taxonomy_path.read_text(encoding="utf-8")) or {}
-    except (OSError, yaml.YAMLError):
-        return None
-    areas = data.get("areas") if isinstance(data, dict) else None
-    if not isinstance(areas, dict):
-        return None
-    for area_id, entry in areas.items():
-        if not isinstance(area_id, str) or not isinstance(entry, dict):
-            continue
-        aliases = entry.get("aliases") or []
-        if isinstance(aliases, list) and all(isinstance(item, str) for item in aliases) and lane in aliases:
-            raw_id = entry.get("id")
-            candidate = raw_id if isinstance(raw_id, str) else area_id
-            return candidate.strip() or None
-    return None
+        area = load_fleet_taxonomy(taxonomy_path).alias_to_area.get(lane)
+    except FleetTaxonomyError as exc:
+        raise DriverAgentConfigError(str(exc)) from exc
+    return area.id if area is not None else None
 
 
 def resolve_driver_agent_type(

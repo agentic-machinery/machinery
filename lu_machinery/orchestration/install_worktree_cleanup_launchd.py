@@ -356,15 +356,9 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     try:
-        public_repo = (args.public_repo or scheduled_worktree_cleanup.default_public_repo()).expanduser().resolve()
-        # The agent's job gets no root settings (its environment is PATH only) and treats its first
-        # repository as the primary checkout. The default therefore needs the state root to be the
-        # product checkout; a split layout is refused rather than swept without its state.
-        if args.public_repo is None and state_root().resolve() != public_repo:
-            raise MachineryConfigError(
-                f"the state root ({state_root()}) is not the product checkout ({public_repo}); "
-                "the LaunchAgent carries no root settings, so it cannot serve a split layout"
-            )
+        # The agent's job gets no root settings (its environment is PATH only), so its first
+        # --repo-root carries the state root: batch-state and rollover retention read it from there.
+        public_repo = (args.public_repo or state_root()).expanduser().resolve()
     except MachineryConfigError as exc:
         parser.error(str(exc))
     registry_error = None

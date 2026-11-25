@@ -79,13 +79,17 @@ def test_default_repositories_come_from_configured_roots(tmp_path: Path, monkeyp
     assert seen["state"] == [cleanup.state_root(), repos / local_name]
     assert seen["rollover"] == [Path(root) / ".agent/thread-rollovers/claude" for root in seen["state"]]
     assert cleanup.state_root() != configured_roots.product
-    # The macOS agent's job carries no root settings, so its installer refuses this split layout.
+    # The macOS agent's job carries no root settings, so its first checkout is the state root, which
+    # its batch_state and rollover sweeps read from the arguments; the private one is the configured one.
+    import plistlib
+
     from lu_machinery.orchestration import install_worktree_cleanup_launchd as launchd
 
-    with pytest.raises(SystemExit) as refused:
-        launchd.main(["--home", str(tmp_path / "home"), "render"])
-    assert refused.value.code == 2
-    assert "cannot serve a split layout" in capsys.readouterr().err
+    capsys.readouterr()
+    assert launchd.main(["--home", str(tmp_path / "home"), "render"]) == 0
+    arguments = plistlib.loads(capsys.readouterr().out.encode())["ProgramArguments"]
+    repo_roots = [Path(arguments[i + 1]) for i, word in enumerate(arguments) if word == "--repo-root"]
+    assert repo_roots == [cleanup.state_root().resolve(), (repos / local_name).resolve()]
 
 
 @pytest.mark.parametrize("apply", [False, True])
