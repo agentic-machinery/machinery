@@ -36,6 +36,9 @@ from lu_machinery.common import json_depth
 
 # Deepest JSON this module reads (json_depth): dispatcher task records.
 _JSON_MAX_DEPTH = 128
+# The stdlib decoder's own constant values: it reuses one NaN object, so an unchanged record that
+# holds NaN still compares equal across reads (a fresh float("nan") never equals itself).
+_DEFAULT_PARSE_CONSTANT: Callable[[str], Any] = json.JSONDecoder().parse_constant
 
 ARCHIVE_DIR_NAME = "archive"
 REVIEW_TASK_FLAG_FIELDS = (
@@ -246,9 +249,9 @@ def parse_task_record(path: Path, raw: bytes, *, display_unknown_schema: bool = 
     """
     constants: list[str] = []
 
-    def constant(token: str) -> float:
+    def constant(token: str) -> Any:
         constants.append(token)
-        return float(token)
+        return _DEFAULT_PARSE_CONSTANT(token)
 
     try:
         decoded = raw.decode("utf-8")
