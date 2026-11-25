@@ -611,6 +611,11 @@ def test_non_ascii_origin_refuses_with_module_typed_errors(tmp_path):
         closeout_cli._checkout_repository(repo)
     with pytest.raises(_gemini_review.GeminiChangedPathListError, match="not valid ASCII"):
         _gemini_review.resolve_same_repo_pr_head(9, repo_root=str(repo))
+    state = tmp_path / "undecodable-origin.json"
+    proc = _run_cli(state, "target", "--mode", "pr", "--pr", "9", "--repo-root", str(repo))
+    assert proc.returncode == 1
+    assert json.loads(proc.stderr) == {"error": "checkout origin is not valid ASCII"}
+    assert not state.exists()
 
 
 pytestmark = pytest.mark.usefixtures("configured_roots")

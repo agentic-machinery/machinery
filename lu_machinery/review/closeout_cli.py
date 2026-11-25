@@ -193,6 +193,18 @@ def _cmd_target(args: argparse.Namespace) -> int:
     except (TargetResolutionError, OSError, subprocess.TimeoutExpired) as exc:
         print(json.dumps({"error": str(repository_target_error(args.repo, exc))}), file=sys.stderr)
         return 1
+    except UnicodeDecodeError:
+        print(
+            json.dumps(
+                {
+                    "error": str(
+                        repository_target_error(args.repo, TargetResolutionError("checkout origin is not valid ASCII"))
+                    )
+                }
+            ),
+            file=sys.stderr,
+        )
+        return 1
 
     state["target"] = asdict(target)
     # PR mode has no --base. Keep the ref GitHub named, or a frozen target
@@ -384,6 +396,9 @@ def _cmd_check_expansion(args: argparse.Namespace) -> int:
     except TargetResolutionError as exc:
         print(json.dumps({"error": str(exc)}), file=sys.stderr)
         return 1
+    except UnicodeDecodeError:
+        print(json.dumps({"error": "repository metadata is not valid UTF-8"}), file=sys.stderr)
+        return 1
 
     result = check_expansion_breaker(baseline, current_files, current_non_test_loc)
     print(json.dumps({"triggered": result.triggered, "reason": result.reason}, indent=2))
@@ -508,6 +523,8 @@ def _cmd_resolve_reviewer(args: argparse.Namespace) -> int:
             literal_paths = git_changed_paths(repo_root, base_sha, target.head_sha)
         except TargetResolutionError as exc:
             raise CloseoutStateError(str(exc)) from exc
+        except UnicodeDecodeError as exc:
+            raise CloseoutStateError("repository metadata is not valid UTF-8") from exc
         changed_paths = tuple(dict.fromkeys((*changed_paths, *literal_paths)))
         if target.mode != "local":
             # A committed target has complete Git authorship: select from the
