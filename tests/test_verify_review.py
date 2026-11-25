@@ -1389,8 +1389,8 @@ def test_cli_receipt_path_refuses_direct_task_store_and_allows_task_artifacts(tm
     assert allowed.is_file()
 
     # F2 regression: without a configured state root, a symlinked conventional batch_state/tasks
-    # (or archive) pointing to a differently named backing directory still refuses direct writes,
-    # while allowing writes under <task>.artifacts/.
+    # (or archive), including when reached through parent-directory aliases, still refuses direct
+    # writes while allowing writes under <task>.artifacts/. Symlink loops also fail closed cleanly.
     from lu_machinery.common import repo_root as repo_root_mod
 
     monkeypatch.delenv("LU_TASKS_DIR", raising=False)
@@ -1407,11 +1407,24 @@ def test_cli_receipt_path_refuses_direct_task_store_and_allows_task_artifacts(tm
     conv_tasks = conv_parent / "tasks"
     conv_tasks.symlink_to(backing)
     (backing / "archive").symlink_to(backing_archive)
+    alias_tasks = tmp_path / "alias-tasks"
+    alias_tasks.symlink_to(conv_tasks)
+    alias_parent = tmp_path / "alias-parent"
+    alias_parent.symlink_to(conv_parent)
+    loop_a = tmp_path / "loop-a"
+    loop_b = tmp_path / "loop-b"
+    loop_a.symlink_to(loop_b)
+    loop_b.symlink_to(loop_a)
 
     for conv_blocked in (
         conv_tasks / "t2.behavior-receipt.json",
         conv_tasks / "archive" / "t2.behavior-receipt.json",
         conv_tasks / "t2.artifacts" / ".." / "t2.behavior-receipt.json",
+        alias_tasks / "t2.behavior-receipt.json",
+        alias_tasks / "archive" / "t2.behavior-receipt.json",
+        alias_tasks / "t2.artifacts" / ".." / "t2.behavior-receipt.json",
+        alias_parent / "tasks" / "t2.behavior-receipt.json",
+        loop_a / "t2.behavior-receipt.json",
     ):
         capsys.readouterr()
         code_conv = verify_review_cli.main(
@@ -1428,18 +1441,21 @@ def test_cli_receipt_path_refuses_direct_task_store_and_allows_task_artifacts(tm
     assert not (backing / "t2.behavior-receipt.json").exists()
     assert not (backing_archive / "t2.behavior-receipt.json").exists()
 
-    conv_allowed = conv_tasks / "t2.artifacts" / "behavior-receipt.json"
-    code_conv_ok = verify_review_cli.main(
-        [
-            "--review-file",
-            str(review),
-            *_cli_envelope_args(repo),
-            "--receipt-path",
-            str(conv_allowed),
-        ]
-    )
-    assert code_conv_ok == EXIT_CLEAN
-    assert conv_allowed.is_file()
+    for conv_allowed in (
+        conv_tasks / "t2.artifacts" / "behavior-receipt.json",
+        alias_tasks / "t3.artifacts" / "behavior-receipt.json",
+    ):
+        code_conv_ok = verify_review_cli.main(
+            [
+                "--review-file",
+                str(review),
+                *_cli_envelope_args(repo),
+                "--receipt-path",
+                str(conv_allowed),
+            ]
+        )
+        assert code_conv_ok == EXIT_CLEAN
+        assert conv_allowed.is_file()
 
 
 def test_cli_issue_mode_posts_opt_in_comment(tmp_path, monkeypatch, capsys):
