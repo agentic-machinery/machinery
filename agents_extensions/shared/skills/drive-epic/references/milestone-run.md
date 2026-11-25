@@ -304,7 +304,8 @@ then, until no row is added, those whose `parent_task_id` is a tree task's and w
 Then run `run-prs` for the turn, and again, with that task's ID and nonce, for each tree task
 that another tree row names as its parent: it lists only the direct children of the run it is
 given. This pass's PRs are all rows of all these runs, by `repo` and `number`, plus every PR an
-earlier pass listed. `run-prs` is the only PR search; the list only chooses the runs. `list
+earlier pass listed and, when any `run-prs` call exits 2, the open PRs the brief and the run's
+notes name. `run-prs` is the only PR search; the list only chooses the runs. `list
 --all` skips a record it cannot read, so trust the tree as complete only when the turn's
 `run-prs`, started after the list and reading every hot and archived record strictly, exits 0.
 
