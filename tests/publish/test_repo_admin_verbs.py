@@ -379,6 +379,32 @@ def test_public_row_transfer_pins_id_and_preserves_visibility(tmp_path, selector
         assert "pinned public repository" in receipt["detail"] and pub_journal.exists()
         pub_journal.unlink()
 
+    # Transient visibility mismatch on poll 1 followed by a matching public response on poll 2 must stop
+    # immediately on poll 1, exit 3 unverified, and keep the journal (never overwrite evidence with poll 2).
+    for first_doc in (
+        repository(pub_id, pub_dest, private=True),
+        {**repository(pub_id, pub_dest, private=False), "visibility": "private"},
+        {"id": pub_id, "full_name": pub_dest, "private": True, "visibility": None, "archived": False},
+    ):
+        sleeps = []
+        monkeypatch.setattr(pub, "_transfer_sleep", sleeps.append)
+        gh = public_gh()
+        mismatch_polls = []
+
+        def mismatch_then_match(args, bad=first_doc, calls=mismatch_polls):
+            calls.append(args)
+            if len(calls) == 1:
+                return answer(args, bad)
+            return answer(args, repository(pub_id, pub_dest, private=False))
+
+        gh.overrides[("GET", f"repos/{pub_dest}", True)] = mismatch_then_match
+        result, receipt = run("repo-transfer", gh, repo="public-move")
+        assert result.returncode == pub.REPO_ADMIN_UNSETTLED and receipt["outcome"] == "unverified"
+        assert "unexpected visibility" in receipt["detail"]
+        assert len(gh.posts) == 1 and len(mismatch_polls) == 1 and sleeps == list(pub.TRANSFER_VERIFY_DELAYS[:1])
+        assert pub_journal.exists()
+        pub_journal.unlink()
+
     # Visibility flipped to private at destination readback exits 3 unverified, keeps journal, and stays unreconciled
     # until destination is observed public with the pinned id.
     gh = public_gh()
@@ -700,6 +726,24 @@ def test_transfer_settles_after_async_accept(tmp_path, monkeypatch):
         assert result.returncode == pub.REPO_ADMIN_UNSETTLED and receipt["outcome"] == "unverified"
         assert len(gh.posts) == 1 and polls == [] and sleeps == [] and journal(tmp_path).exists()
         journal(tmp_path).unlink()
+
+    # Transient public visibility on destination poll 1 followed by private on poll 2 stops on poll 1 and keeps journal.
+    sleeps = []
+    monkeypatch.setattr(pub, "_transfer_sleep", sleeps.append)
+    gh = FakeGitHub()
+    mismatch_polls = []
+
+    def public_then_private(args):
+        mismatch_polls.append(args)
+        return answer(args, repository(REPO_ID, DESTINATION, private=len(mismatch_polls) > 1))
+
+    gh.overrides[("GET", f"repos/{DESTINATION}", True)] = public_then_private
+    result, receipt = run("repo-transfer", gh, repo="infra-private")
+    assert result.returncode == pub.REPO_ADMIN_UNSETTLED and receipt["outcome"] == "unverified"
+    assert "unexpected visibility" in receipt["detail"]
+    assert len(gh.posts) == 1 and len(mismatch_polls) == 1 and sleeps == list(pub.TRANSFER_VERIFY_DELAYS[:1])
+    assert journal(tmp_path).exists()
+    journal(tmp_path).unlink()
 
 
 def _applied_then(gh, reply):

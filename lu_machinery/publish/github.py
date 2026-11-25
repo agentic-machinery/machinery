@@ -2586,10 +2586,31 @@ def _repo_admin_readback(slug, repository_id, principal_before, reader, cwd, env
             detail = "the readback was unreadable or rate limited"
             continue
         try:
-            if document is not None and _repo_matches(_repo_identity(document), slug, repository_id, visibility):
-                break
+            identity = _repo_identity(document) if document is not None else None
         except ValueError:
-            pass
+            if (
+                isinstance(document, dict)
+                and type(document.get("id")) is int and document["id"] == repository_id
+                and _same_slug(document.get("full_name"), slug)
+                and (
+                    (type(document.get("private")) is bool and document["private"] is not (visibility == "private"))
+                    or (isinstance(document.get("visibility"), str) and document["visibility"] != visibility)
+                )
+            ):
+                raise ValueError(
+                    f"the readback found repository {repository_id} at {slug} with unexpected visibility "
+                    f"(private={document.get('private')!r}, visibility={document.get('visibility')!r}); "
+                    f"expected {visibility}"
+                ) from None
+            identity = None
+        if identity is not None:
+            if _repo_matches(identity, slug, repository_id, visibility):
+                break
+            if _same_slug(identity["full_name"], slug) and identity["id"] == repository_id:
+                raise ValueError(
+                    f"the readback found repository {repository_id} at {slug} with unexpected visibility "
+                    f"(private={identity['private']}, visibility={identity['visibility']!r}); expected {visibility}"
+                )
         detail = (
             "the readback found no repository at the expected slug" if document is None
             else "the readback found another repository, slug or visibility"
@@ -4947,10 +4968,12 @@ def _parse_args(argv):
                 "  name the pinned id and the row's visibility (private matching the row, and visibility matching if\n"
                 "  present). repo-transfer then polls GET repos/<destination> for the exact pinned repository (id,\n"
                 "  full_name, private, visibility matching the row) across 8 fresh reads over a bounded 180 s wait\n"
-                "  (backoff 0, 2, 4, 8, 16, 30, 60, 60 s), then re-reads GET /user after the last GitHub read to\n"
-                "  verify the same login and account id. Only after that bound (or on a mismatched POST answer or\n"
-                "  final GET /user) does it exit 3 (unverified) and keep the journal. Receipt JSON on stdout and in\n"
-                "  a new 0600 file; journal repo-transfer-<id>.pending there from just before the POST until verified.\n"
+                "  (backoff 0, 2, 4, 8, 16, 30, 60, 60 s), stopping immediately if the pinned repository is observed\n"
+                "  at the destination with mismatched visibility, then re-reads GET /user after the last GitHub read to\n"
+                "  verify the same login and account id. Only after that bound (or on a mismatched POST answer, observed\n"
+                "  destination visibility mismatch, or final GET /user) does it exit 3 (unverified) and keep the\n"
+                "  journal. Receipt JSON on stdout and in a new 0600 file; journal repo-transfer-<id>.pending there\n"
+                "  from just before the POST until verified.\n"
                 "Exit codes: 0 transferred and verified, already transferred, or dry run passed (a journal that could\n"
                 "  not be removed is named in the receipt); 2 invalid input, a caller or registry refusal, or a\n"
                 "  --create-receipt that cannot be loaded (the id is then unknown), or a refusal with no mutation sent\n"
