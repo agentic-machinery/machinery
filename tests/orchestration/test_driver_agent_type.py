@@ -8,6 +8,7 @@ import pytest
 
 from lu_machinery.orchestration.driver_agent_type import (
     DEFAULT_TAXONOMY_PATH,
+    DriverAgentConfigError,
     main,
     resolve_driver_agent_type,
 )
@@ -21,8 +22,6 @@ assignments:
   seminars:
     driver_agent_type: curriculum-orchestrator
     slots: [claude-folk, claude-bio]
-  broken:
-    slots: [claude-broken]
 """
 
 TAXONOMY_FIXTURE = """
@@ -119,10 +118,35 @@ def test_unknown_alias_fails_closed(assignments: Path, taxonomy: Path) -> None:
     )
 
 
-def test_unknown_lane_and_missing_type_return_none(assignments: Path) -> None:
+def test_unknown_lane_returns_none_and_missing_driver_agent_type_raises(assignments: Path, tmp_path: Path) -> None:
     assert resolve_driver_agent_type("nope", assignments_path=assignments) is None
-    assert resolve_driver_agent_type("broken", assignments_path=assignments) is None
     assert resolve_driver_agent_type("", assignments_path=assignments) is None
+
+    broken = tmp_path / "missing_type.yaml"
+    broken.write_text(
+        "schema_version: 1\nassignments:\n  broken:\n    slots: [claude-broken]\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(DriverAgentConfigError, match="driver_agent_type"):
+        resolve_driver_agent_type("broken", assignments_path=broken)
+    assert main(["--lane", "broken", "--assignments", str(broken)]) == 2
+
+
+def test_present_assignments_file_without_assignments_mapping_raises_config_error_and_exits_2(tmp_path: Path) -> None:
+    """Defect class (F7): present assignments file missing the required 'assignments' mapping exits 1 instead of 2."""
+    typo_assignments = tmp_path / "typo_assignments.yaml"
+    typo_assignments.write_text(
+        "schema_version: 1\nassignment:\n  atlas:\n    driver_agent_type: atlas-driver\n    slots: [claude-atlas]\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(DriverAgentConfigError, match="assignments"):
+        resolve_driver_agent_type("atlas", assignments_path=typo_assignments)
+    assert main(["--lane", "atlas", "--assignments", str(typo_assignments)]) == 2
+
+    # Absent explicit file still returns None / exits 1.
+    absent = tmp_path / "absent.yaml"
+    assert resolve_driver_agent_type("atlas", assignments_path=absent) is None
+    assert main(["--lane", "atlas", "--assignments", str(absent)]) == 1
 
 
 def test_unreadable_file_returns_none(tmp_path: Path) -> None:

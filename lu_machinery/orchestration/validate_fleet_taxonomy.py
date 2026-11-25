@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import functools
 import json
 import sys
 from pathlib import Path
@@ -16,12 +17,21 @@ if __package__ in {None, ""}:  # run as a file (launchers do): the repository ro
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from lu_machinery.common import json_depth, profile
 from lu_machinery.common.repo_root import machinery_path
-from lu_machinery.orchestration.fleet_taxonomy import DEFAULT_TAXONOMY_PATH, default_taxonomy_path
 
-# The packaged copy; readers resolve default_taxonomy_path() at call time.
-TAXONOMY_PATH = DEFAULT_TAXONOMY_PATH
+# The packaged copies; readers resolve the active profile at call time unless overridden.
+_PACKAGED_TAXONOMY_PATH = machinery_path("config/fleet_taxonomy.yaml")
+TAXONOMY_PATH = _PACKAGED_TAXONOMY_PATH
 _PACKAGED_ASSIGNMENTS_PATH = machinery_path("config/area_assignments.yaml")
 ASSIGNMENTS_PATH = _PACKAGED_ASSIGNMENTS_PATH
+
+
+def default_taxonomy_path() -> Path:
+    """Resolve ``fleet_taxonomy.yaml`` at call time via the active profile, else the packaged copy."""
+    if TAXONOMY_PATH != _PACKAGED_TAXONOMY_PATH:
+        return TAXONOMY_PATH
+    from lu_machinery.orchestration.fleet_taxonomy import default_taxonomy_path as _fleet_default_taxonomy_path
+
+    return _fleet_default_taxonomy_path()
 
 
 def default_assignments_path() -> Path:
@@ -29,27 +39,23 @@ def default_assignments_path() -> Path:
     if ASSIGNMENTS_PATH != _PACKAGED_ASSIGNMENTS_PATH:
         return ASSIGNMENTS_PATH
     return profile.config_path("area_assignments", default=_PACKAGED_ASSIGNMENTS_PATH)
-TAXONOMY_SCHEMA_PATH = (
-    machinery_path("schemas/fleet-taxonomy.v1.schema.json")
-)
-ASSIGNMENTS_SCHEMA_PATH = (
-    machinery_path("schemas/area-assignments.v1.schema.json")
-)
+
+
+TAXONOMY_SCHEMA_PATH = machinery_path("schemas/fleet-taxonomy.v1.schema.json")
+ASSIGNMENTS_SCHEMA_PATH = machinery_path("schemas/area-assignments.v1.schema.json")
 
 
 class FleetTaxonomyValidationError(ValueError):
     """Raised when fleet taxonomy or area assignments validation fails (a ``ValueError``, like the loaders' errors)."""
 
 
-def _load_yaml(path: Path) -> dict[str, Any]:
-    if not path.is_file():
-        raise FleetTaxonomyValidationError(f"File not found: {path}")
+def _load_yaml_bytes(content: bytes, source: Path) -> dict[str, Any]:
     try:
-        data = yaml.safe_load(path.read_text(encoding="utf-8"))
+        data = yaml.safe_load(content.decode("utf-8"))
     except Exception as exc:
-        raise FleetTaxonomyValidationError(f"YAML parse error in {path}: {exc}") from exc
+        raise FleetTaxonomyValidationError(f"YAML parse error in {source}: {exc}") from exc
     if not isinstance(data, dict):
-        raise FleetTaxonomyValidationError(f"Root of {path} must be a mapping/dict")
+        raise FleetTaxonomyValidationError(f"Root of {source} must be a mapping/dict")
     # JSON Schema (and every reader) expects a JSON tree: a YAML key such as `123` or `true` is not a
     # string, and an anchor that contains itself is a cycle. Shared acyclic anchors are walked once.
     done: set[int] = set()
@@ -64,15 +70,25 @@ def _load_yaml(path: Path) -> dict[str, Any]:
             done.add(id(node))
             continue
         if id(node) in on_path:
-            raise FleetTaxonomyValidationError(f"{path} has a YAML anchor that contains itself")
+            raise FleetTaxonomyValidationError(f"{source} has a YAML anchor that contains itself")
         if id(node) in done:
             continue
         if isinstance(node, dict) and not all(isinstance(key, str) for key in node):
-            raise FleetTaxonomyValidationError(f"{path} has a mapping key that is not a string")
+            raise FleetTaxonomyValidationError(f"{source} has a mapping key that is not a string")
         on_path.add(id(node))
         pending.append((node, True))
         pending.extend((child, False) for child in (node.values() if isinstance(node, dict) else node))
     return data
+
+
+def _load_yaml(path: Path) -> dict[str, Any]:
+    if not path.is_file():
+        raise FleetTaxonomyValidationError(f"File not found: {path}")
+    try:
+        content = path.read_bytes()
+    except OSError as exc:
+        raise FleetTaxonomyValidationError(f"Cannot read {path}: {exc}") from exc
+    return _load_yaml_bytes(content, path)
 
 
 def _load_schema(path: Path) -> dict[str, Any]:
@@ -87,6 +103,41 @@ def _load_schema(path: Path) -> dict[str, Any]:
     return data
 
 
+@functools.lru_cache(maxsize=8)
+def _compiled_validator(schema_path: Path, content: bytes) -> Draft202012Validator:
+    try:
+        schema = json_depth.loads(content.decode("utf-8"), max_depth=512)
+    except Exception as exc:
+        raise FleetTaxonomyValidationError(f"JSON parse error in schema {schema_path}: {exc}") from exc
+    if not isinstance(schema, dict):
+        raise FleetTaxonomyValidationError(f"Root of schema {schema_path} must be a dict")
+    return Draft202012Validator(schema, format_checker=FormatChecker())
+
+
+def _schema_validator(schema_path: Path) -> Draft202012Validator:
+    if not schema_path.is_file():
+        raise FleetTaxonomyValidationError(f"Schema file not found: {schema_path}")
+    try:
+        content = schema_path.read_bytes()
+    except OSError as exc:
+        raise FleetTaxonomyValidationError(f"Cannot read schema {schema_path}: {exc}") from exc
+    return _compiled_validator(schema_path.resolve(), content)
+
+
+def _validate_against_schema(data: dict[str, Any], *, schema_path: Path, label: str) -> None:
+    validator = _schema_validator(schema_path)
+    try:
+        errors = sorted(
+            validator.iter_errors(data),
+            key=lambda e: tuple((0, p) if isinstance(p, int) else (1, str(p)) for p in e.path),
+        )
+    except RecursionError as exc:
+        raise FleetTaxonomyValidationError(f"{label} schema validation exceeded recursion depth") from exc
+    if errors:
+        err = errors[0]
+        raise FleetTaxonomyValidationError(f"{label} schema violation: {err.message} at {err.json_path}")
+
+
 def validate_schemas(
     taxonomy_data: dict[str, Any],
     assignments_data: dict[str, Any],
@@ -95,24 +146,8 @@ def validate_schemas(
     assignments_schema_path: Path = ASSIGNMENTS_SCHEMA_PATH,
 ) -> None:
     """Validate raw loaded dicts against JSON Schemas."""
-    tax_schema = _load_schema(taxonomy_schema_path)
-    ass_schema = _load_schema(assignments_schema_path)
-
-    tax_validator = Draft202012Validator(tax_schema, format_checker=FormatChecker())
-    tax_errors = sorted(tax_validator.iter_errors(taxonomy_data), key=lambda e: e.path)
-    if tax_errors:
-        err = tax_errors[0]
-        raise FleetTaxonomyValidationError(
-            f"fleet_taxonomy schema violation: {err.message} at {err.json_path}"
-        )
-
-    ass_validator = Draft202012Validator(ass_schema, format_checker=FormatChecker())
-    ass_errors = sorted(ass_validator.iter_errors(assignments_data), key=lambda e: e.path)
-    if ass_errors:
-        err = ass_errors[0]
-        raise FleetTaxonomyValidationError(
-            f"area_assignments schema violation: {err.message} at {err.json_path}"
-        )
+    _validate_against_schema(taxonomy_data, schema_path=taxonomy_schema_path, label="fleet_taxonomy")
+    _validate_against_schema(assignments_data, schema_path=assignments_schema_path, label="area_assignments")
 
 
 def validate_injective_aliases(areas: dict[str, Any]) -> dict[str, str]:
@@ -125,7 +160,7 @@ def validate_injective_aliases(areas: dict[str, Any]) -> dict[str, str]:
             )
         aliases = area_data.get("aliases", [])
         names = set(aliases) | {area_id}
-        for name in names:
+        for name in sorted(names):
             if name in alias_to_area:
                 prev_area = alias_to_area[name]
                 raise FleetTaxonomyValidationError(
@@ -141,7 +176,7 @@ def validate_epic_uniqueness(areas: dict[str, Any]) -> dict[int, str]:
     for area_id, area_data in areas.items():
         for epic in area_data.get("epics", []):
             num = epic.get("number")
-            if not isinstance(num, int):
+            if isinstance(num, bool) or not isinstance(num, int):
                 raise FleetTaxonomyValidationError(
                     f"Epic number must be an integer in area '{area_id}'"
                 )
@@ -152,6 +187,75 @@ def validate_epic_uniqueness(areas: dict[str, Any]) -> dict[int, str]:
                 )
             epic_to_area[num] = area_id
     return epic_to_area
+
+
+def validate_taxonomy_data(
+    taxonomy_data: dict[str, Any],
+    *,
+    taxonomy_schema_path: Path = TAXONOMY_SCHEMA_PATH,
+) -> tuple[dict[str, str], dict[int, str]]:
+    """Validate a parsed ``fleet_taxonomy.yaml`` dict against its schema and semantic invariants."""
+    _validate_against_schema(taxonomy_data, schema_path=taxonomy_schema_path, label="fleet_taxonomy")
+    areas = taxonomy_data["areas"]
+    alias_to_area = validate_injective_aliases(areas)
+    epic_to_area = validate_epic_uniqueness(areas)
+    return alias_to_area, epic_to_area
+
+
+def validate_assignments_data(
+    assignments_data: dict[str, Any],
+    *,
+    assignments_schema_path: Path = ASSIGNMENTS_SCHEMA_PATH,
+) -> dict[str, Any]:
+    """Validate a parsed ``area_assignments.yaml`` dict against its schema and non-blank invariants."""
+    _validate_against_schema(assignments_data, schema_path=assignments_schema_path, label="area_assignments")
+    assignments: dict[str, Any] = assignments_data["assignments"]
+    for area_id, entry in assignments.items():
+        if not entry["driver_agent_type"].strip():
+            raise FleetTaxonomyValidationError(
+                f"area_assignments.yaml[{area_id!r}].driver_agent_type must be a non-empty string"
+            )
+        if any(not slot.strip() for slot in entry["slots"]):
+            raise FleetTaxonomyValidationError(
+                f"area_assignments.yaml[{area_id!r}].slots entries must be non-empty strings"
+            )
+    return assignments
+
+
+def parse_validated_taxonomy_bytes(
+    path: Path,
+    content: bytes,
+    *,
+    taxonomy_schema_path: Path = TAXONOMY_SCHEMA_PATH,
+) -> dict[str, Any]:
+    """Parse and validate ``fleet_taxonomy.yaml`` bytes under the single taxonomy contract."""
+    data = _load_yaml_bytes(content, path)
+    validate_taxonomy_data(data, taxonomy_schema_path=taxonomy_schema_path)
+    return data
+
+
+def parse_validated_assignments_bytes(
+    path: Path,
+    content: bytes,
+    *,
+    assignments_schema_path: Path = ASSIGNMENTS_SCHEMA_PATH,
+) -> dict[str, Any]:
+    """Parse and validate ``area_assignments.yaml`` bytes under the single assignments contract."""
+    data = _load_yaml_bytes(content, path)
+    validate_assignments_data(data, assignments_schema_path=assignments_schema_path)
+    return data
+
+
+def load_validated_assignments(
+    assignments_path: Path | None = None,
+    *,
+    assignments_schema_path: Path = ASSIGNMENTS_SCHEMA_PATH,
+) -> dict[str, Any]:
+    """Read and validate ``area_assignments.yaml`` from disk under the single assignments contract."""
+    resolved = default_assignments_path() if assignments_path is None else assignments_path
+    data = _load_yaml(resolved)
+    validate_assignments_data(data, assignments_schema_path=assignments_schema_path)
+    return data
 
 
 def validate_area_assignments_parity(
@@ -188,18 +292,13 @@ def validate_fleet_taxonomy(
     resolved_assignments = default_assignments_path() if assignments_path is None else assignments_path
     assignments_data = _load_yaml(resolved_assignments)
 
-    validate_schemas(
-        taxonomy_data,
-        assignments_data,
-        taxonomy_schema_path=taxonomy_schema_path,
-        assignments_schema_path=assignments_schema_path,
+    alias_to_area, epic_to_area = validate_taxonomy_data(
+        taxonomy_data, taxonomy_schema_path=taxonomy_schema_path
     )
-
+    assignments = validate_assignments_data(
+        assignments_data, assignments_schema_path=assignments_schema_path
+    )
     areas = taxonomy_data["areas"]
-    assignments = assignments_data["assignments"]
-
-    alias_to_area = validate_injective_aliases(areas)
-    epic_to_area = validate_epic_uniqueness(areas)
     validate_area_assignments_parity(areas, assignments)
 
     return {

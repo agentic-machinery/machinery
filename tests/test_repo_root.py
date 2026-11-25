@@ -1260,7 +1260,7 @@ def test_registry_loaders_resolve_profile_config_at_call_time(unconfigured, tmp_
             encoding="utf-8",
         )
         (root / "area_assignments.yaml").write_text(
-            f"version: 1\n"
+            f"schema_version: 1\n"
             f"assignments:\n"
             f"  {name}-area:\n"
             f"    slots: [{slot}]\n"
@@ -1268,7 +1268,7 @@ def test_registry_loaders_resolve_profile_config_at_call_time(unconfigured, tmp_
             encoding="utf-8",
         )
         (root / "fleet_taxonomy.yaml").write_text(
-            f"areas:\n  {name}-area:\n    aliases: [{name}-lane]\n    epics:\n      - number: {epic}\n        name: {name}\n",
+            f"schema_version: 1\nareas:\n  {name}-area:\n    id: {name}-area\n    aliases: [{name}-lane]\n    epics:\n      - number: {epic}\n        name: {name}\n",
             encoding="utf-8",
         )
         shutil.copyfile(driver_lanes.DATA_FILE, root / "driver_lanes.json")
@@ -1413,7 +1413,7 @@ def test_registry_loaders_resolve_profile_config_at_call_time(unconfigured, tmp_
         from lu_machinery.fleet_comms import authority
 
         (profile_b.parent / "area_assignments.yaml").write_text(
-            "version: 1\nexternal_recipients: eggbot\nassignments:\n  beta-area:\n    slots: [claude-beta]\n    driver_agent_type: 7\n",
+            "schema_version: 1\nexternal_recipients: eggbot\nassignments:\n  beta-area:\n    slots: [claude-beta]\n    driver_agent_type: 7\n",
             encoding="utf-8",
         )
         authority._ROSTER_CACHE.clear()
@@ -1427,7 +1427,7 @@ def test_registry_loaders_resolve_profile_config_at_call_time(unconfigured, tmp_
 
         # F7: mixed-type slots list raises SlotAssignmentsConfigError instead of falling back to suffix inference.
         (profile_b.parent / "area_assignments.yaml").write_text(
-            "version: 1\nassignments:\n  beta-area:\n    slots: [claude-beta, 7]\n",
+            "schema_version: 1\nassignments:\n  beta-area:\n    slots: [claude-beta, 7]\n",
             encoding="utf-8",
         )
         with pytest.raises(slot_routing.SlotAssignmentsConfigError, match="slots"):
@@ -1442,7 +1442,7 @@ def test_registry_loaders_resolve_profile_config_at_call_time(unconfigured, tmp_
         # F4: malformed assignments mapping raises ValueError in stalled_work.owner_lanes().
         from lu_machinery.orchestration import stalled_work
 
-        (profile_b.parent / "area_assignments.yaml").write_text("version: 1\nassignments: []\n", encoding="utf-8")
+        (profile_b.parent / "area_assignments.yaml").write_text("schema_version: 1\nassignments: []\n", encoding="utf-8")
         with pytest.raises(ValueError, match="assignments"):
             stalled_work.owner_lanes()
 
@@ -1453,3 +1453,81 @@ def test_registry_loaders_resolve_profile_config_at_call_time(unconfigured, tmp_
         assert external_roster == "unavailable"
     finally:
         git_credentials.repository_registry.cache_clear()
+
+
+def test_validate_fleet_taxonomy_refuses_deeply_nested_acyclic_aliases_without_recursion_error(tmp_path, capsys):
+    """Defect class (F8): deeply nested acyclic YAML values in uniqueItems arrays crash schema validation with RecursionError."""
+    from lu_machinery.orchestration import fleet_taxonomy, validate_fleet_taxonomy
+
+    valid_assignments = tmp_path / "area_assignments.yaml"
+    valid_assignments.write_text(
+        "schema_version: 1\nassignments:\n  atlas:\n    driver_agent_type: atlas-driver\n    slots: [claude-atlas]\n",
+        encoding="utf-8",
+    )
+    deep_a = "[" * 365 + "1" + "]" * 365
+    deep_b = "[" * 365 + "2" + "]" * 365
+    deep_taxonomy = tmp_path / "fleet_taxonomy.yaml"
+    deep_taxonomy.write_text(
+        f"schema_version: 1\nareas:\n  atlas:\n    id: atlas\n    aliases: [{deep_a}, {deep_b}]\n    epics: []\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(validate_fleet_taxonomy.FleetTaxonomyValidationError, match="recursion depth"):
+        validate_fleet_taxonomy.validate_fleet_taxonomy(
+            taxonomy_path=deep_taxonomy,
+            assignments_path=valid_assignments,
+        )
+    assert (
+        validate_fleet_taxonomy.main(
+            ["--taxonomy", str(deep_taxonomy), "--assignments", str(valid_assignments), "--json"]
+        )
+        == 1
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ok"] is False
+    assert "recursion depth" in payload["error"]
+
+    # Runtime taxonomy loader shares the same typed refusal.
+    with pytest.raises(fleet_taxonomy.FleetTaxonomyError, match="recursion depth"):
+        fleet_taxonomy.load_fleet_taxonomy(deep_taxonomy)
+
+    # Sibling: deeply nested external_recipients in area_assignments.yaml also returns a typed refusal.
+    valid_taxonomy = tmp_path / "valid_taxonomy.yaml"
+    valid_taxonomy.write_text(
+        "schema_version: 1\nareas:\n  atlas:\n    id: atlas\n    aliases: []\n    epics: []\n",
+        encoding="utf-8",
+    )
+    deep_assignments = tmp_path / "deep_assignments.yaml"
+    deep_assignments.write_text(
+        "schema_version: 1\n"
+        f"external_recipients: [{deep_a}, {deep_b}]\n"
+        "assignments:\n  atlas:\n    driver_agent_type: atlas-driver\n    slots: [claude-atlas]\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(validate_fleet_taxonomy.FleetTaxonomyValidationError, match="recursion depth"):
+        validate_fleet_taxonomy.validate_fleet_taxonomy(
+            taxonomy_path=valid_taxonomy,
+            assignments_path=deep_assignments,
+        )
+
+    # Shared acyclic anchors stay valid.
+    shared_taxonomy = tmp_path / "shared_taxonomy.yaml"
+    shared_taxonomy.write_text(
+        "schema_version: 1\nareas:\n  atlas:\n    id: atlas\n    aliases: []\n    epics: &ep []\n"
+        "  other:\n    id: other\n    aliases: []\n    epics: *ep\n",
+        encoding="utf-8",
+    )
+    shared_assignments = tmp_path / "shared_assignments.yaml"
+    shared_assignments.write_text(
+        "schema_version: 1\nassignments:\n"
+        "  atlas:\n    driver_agent_type: atlas-driver\n    slots: [claude-atlas]\n"
+        "  other:\n    driver_agent_type: other-driver\n    slots: [claude-other]\n",
+        encoding="utf-8",
+    )
+    assert (
+        validate_fleet_taxonomy.validate_fleet_taxonomy(
+            taxonomy_path=shared_taxonomy,
+            assignments_path=shared_assignments,
+        )["ok"]
+        is True
+    )

@@ -38,7 +38,10 @@ from lu_machinery.orchestration.fleet_repos import (
 from lu_machinery.orchestration.fleet_taxonomy import load_fleet_taxonomy
 from lu_machinery.orchestration.integration_sweep import GitHubAdapter, SweepError, lookup_verdict
 from lu_machinery.orchestration.task_record_store import iter_task_records, read_task_record
-from lu_machinery.orchestration.validate_fleet_taxonomy import _load_yaml, default_assignments_path
+from lu_machinery.orchestration.validate_fleet_taxonomy import (
+    load_validated_assignments,
+    validate_area_assignments_parity,
+)
 from lu_machinery.orchestration.worktree_claims import RELEASED_TASK_STATUSES
 from lu_machinery.session_streams.store import TURN_HOLDER_HARNESS
 from lu_machinery.session_supervisor.remote import RemoteEpicClient, RemoteSupervisorError, RemoteUnreachableError
@@ -122,27 +125,15 @@ def closed_pull_pager(slug: str):
 
 def owner_lanes() -> dict[str, str]:
     """Resolve current slots and retired initiators through their registered stream."""
-    raw_assignments = _load_yaml(default_assignments_path()).get("assignments")
-    if not isinstance(raw_assignments, dict):
-        raise ValueError("area_assignments.yaml 'assignments' must be a mapping")
-    # The validated taxonomy: an epic two areas claim refuses here (FleetTaxonomyError is a
-    # ValueError), never re-owned by the last area.
+    raw_assignments = load_validated_assignments()["assignments"]
     areas = load_fleet_taxonomy().areas
-    assignments: dict[str, list[str]] = {}
-    for area, entry in raw_assignments.items():
-        if not isinstance(area, str) or not isinstance(entry, dict):
-            raise ValueError(f"area_assignments.yaml entry {area!r} must be a mapping")
-        slots = entry.get("slots")
-        if not isinstance(slots, list) or not all(isinstance(slot, str) and slot.strip() for slot in slots):
-            raise ValueError(f"area_assignments.yaml[{area!r}].slots must be a list of non-empty strings")
-        assignments[area] = slots
-    lanes = {slot: slot for slots in assignments.values() for slot in slots}
-    stream_slots: dict[str, list[str]] = {}
-    for area, spec in areas.items():
-        if area not in assignments:
-            raise ValueError(f"area {area!r} is missing from area_assignments.yaml")
-        for epic in spec.epics:
-            stream_slots[f"epic:{epic.number}"] = assignments[area]
+    validate_area_assignments_parity(areas, raw_assignments)
+    lanes = {slot: slot for entry in raw_assignments.values() for slot in entry["slots"]}
+    stream_slots = {
+        f"epic:{epic.number}": raw_assignments[area]["slots"]
+        for area, spec in areas.items()
+        for epic in spec.epics
+    }
     succession, _ = succession_streams()
     for initiator, stream in succession.items():
         slots = stream_slots.get(stream, [])

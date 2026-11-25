@@ -742,6 +742,36 @@ def test_next_unreadable_fleet_taxonomy_is_registry_unavailable_503(monkeypatch,
     assert "registry_unavailable" in projection.text
 
 
+def test_next_and_projection_refuse_taxonomy_area_key_id_mismatch_503(monkeypatch, tmp_path):
+    """Defect class (F4 variant): runtime taxonomy loader ignores inner area id mismatch accepted as 200 while validator rejects it."""
+    from lu_machinery.orchestration import fleet_taxonomy
+
+    _warm_next_cache()
+    _patch_known_streams(monkeypatch)
+    taxonomy = tmp_path / "fleet_taxonomy.yaml"
+    monkeypatch.setattr(fleet_taxonomy, "DEFAULT_TAXONOMY_PATH", taxonomy)
+    taxonomy.write_text(
+        "schema_version: 1\nareas:\n  atlas:\n    id: atlas\n    aliases: [review-alias]\n    epics: []\n",
+        encoding="utf-8",
+    )
+    assert fleet_taxonomy.resolve_area("review-alias").id == "atlas"
+
+    # Replace the same file with a mismatched inner id: both Work API routes must refuse with 503.
+    taxonomy.write_text(
+        "schema_version: 1\nareas:\n  atlas:\n    id: other\n    aliases: [review-alias]\n    epics: []\n",
+        encoding="utf-8",
+    )
+    response = client.get("/api/work/v1/next?stream=review-alias")
+    assert response.status_code == 503, response.text
+    body = response.json()
+    assert body["error"] == "registry_unavailable"
+    assert "fleet_taxonomy.yaml" in body["diagnostic"]
+    assert response.headers.get("retry-after") == "3"
+    projection = client.get("/api/work/v1/projection?stream=review-alias")
+    assert projection.status_code == 503, projection.text
+    assert "registry_unavailable" in projection.text
+
+
 def test_projection_membership_and_epic_status():
     """Homed issues carry public-safe stream membership; epics get status=epic."""
     projection = build_projection(_next_sections(), repository_id=REPO)
