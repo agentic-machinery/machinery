@@ -552,6 +552,8 @@ def test_cli_uses_the_same_allowance(setup, capsys):
     assert "Actions run ID" in help_text and "not a PR number" in help_text
     assert "/actions/runs/<RUN_ID>" in help_text and "--number 12345678901" in help_text
     assert "only failed jobs" in help_text and "--failed" in help_text
+    assert "incoherent check row" in help_text and "omits --failed" in help_text
+    assert "coherent all-green run is refused with RECOVERY_RUN_INVALID" in help_text
     assert "Outputs:" in help_text and "one PR-head recovery allowance" in help_text
     assert "Exit codes: 0 request accepted, job results unverified" in help_text
     assert "2 invalid input, unknown lookup, policy refusal or transport error" in help_text
@@ -1039,6 +1041,299 @@ def test_cancelled_merge_group_no_artifact_refuses_on_failure_or_invalid_state(s
         )
 
     if case in {"pr-merge-failing-job", "pr-merge-conflicting-pr-association"}:
+        with pytest.raises(gate.PublishBlocked, match=expected_error):
+            pub.publish(
+                "pr-merge",
+                number=42,
+                repo="unit/public",
+                match_head=HEAD,
+                expect_queue="true",
+                recovery_run_id=123,
+                cwd=root,
+                env={},
+                runner=transport,
+            )
+    else:
+        with pytest.raises(gate.PublishBlocked, match=expected_error):
+            pub.publish("run-rerun", number=123, repo="unit/public", cwd=root, env={}, runner=transport)
+    assert transport.writes == []
+    assert pub.recovery.first_attempt(pub.recovery.ledger_path(root), "github.com/unit/public", 42, HEAD) is None
+
+
+@pytest.mark.parametrize("mode", ["single-in-progress-pr", "multiple-incoherent-noncompleted", "neutral-skipped-passing"])
+def test_incoherent_check_row_all_green_run_recovers_with_full_rerun(setup, mode):
+    """Defect class: completed all-green PR run with an incoherent check row (non-completed status with conclusion and completed_at set) recovers via governed full-run rerun without --failed while sharing the one-per-head allowance."""
+    root, transport = setup
+    transport.event = "pull_request"
+    transport.status = "completed"
+    transport.conclusion = "success" if mode != "neutral-skipped-passing" else "neutral"
+    completed_at = "2026-11-25T21:54:06Z"
+    if mode == "single-in-progress-pr":
+        transport.jobs = [
+            {
+                "id": 100,
+                "run_id": 123,
+                "run_attempt": 1,
+                "head_sha": TESTED,
+                "status": "completed",
+                "conclusion": "success",
+                "completed_at": completed_at,
+                "steps": [{"name": "Run checks", "status": "completed", "conclusion": "success"}],
+            },
+            {
+                "id": 456,
+                "run_id": 123,
+                "run_attempt": 1,
+                "head_sha": TESTED,
+                "status": "in_progress",
+                "conclusion": "success",
+                "completed_at": completed_at,
+                "steps": [
+                    {"name": "Lint", "status": "completed", "conclusion": "success"},
+                    {"name": "Skip cache", "status": "completed", "conclusion": "skipped"},
+                ],
+            },
+        ]
+        incoherent_ids = [456]
+    elif mode == "multiple-incoherent-noncompleted":
+        transport.jobs = [
+            {
+                "id": 456,
+                "run_id": 123,
+                "run_attempt": 1,
+                "head_sha": TESTED,
+                "status": "in_progress",
+                "conclusion": "success",
+                "completed_at": completed_at,
+                "steps": [{"name": "Lint", "status": "completed", "conclusion": "success"}],
+            },
+            {
+                "id": 457,
+                "run_id": 123,
+                "run_attempt": 1,
+                "head_sha": TESTED,
+                "status": "queued",
+                "conclusion": "skipped",
+                "completed_at": completed_at,
+                "steps": [],
+            },
+        ]
+        incoherent_ids = [456, 457]
+    else:
+        transport.jobs = [
+            {
+                "id": 100,
+                "run_id": 123,
+                "run_attempt": 1,
+                "head_sha": TESTED,
+                "status": "completed",
+                "conclusion": "skipped",
+                "completed_at": completed_at,
+                "steps": [],
+            },
+            {
+                "id": 456,
+                "run_id": 123,
+                "run_attempt": 1,
+                "head_sha": TESTED,
+                "status": "waiting",
+                "conclusion": "neutral",
+                "completed_at": completed_at,
+                "steps": [{"name": "Check", "status": "completed", "conclusion": "neutral"}],
+            },
+        ]
+        incoherent_ids = [456]
+    transport.proof = {
+        "pr": 42,
+        "head": HEAD,
+        "run_id": 123,
+        "job_ids": incoherent_ids,
+        "tested_sha": TESTED,
+        "failure_evidence": "job row reports non-completed status with passing conclusion and completed_at set",
+        "unrelated_to_diff": "GitHub check-run state inconsistency on completed green run",
+    }
+
+    result = pub.publish("run-rerun", number=123, repo="unit/public", cwd=root, env={}, runner=transport)
+    assert result.returncode == 0
+    assert transport.writes == [["gh", "run", "rerun", "123", "--repo", "unit/public"]]
+    prior = pub.recovery.first_attempt(pub.recovery.ledger_path(root), "github.com/unit/public", 42, HEAD)
+    assert prior is not None
+    assert prior["action"] == "run-rerun"
+    assert prior["recovery_mode"] == pub.recovery.INCOHERENT_CHECK_RECOVERY_MODE
+    assert prior["job_ids"] == incoherent_ids
+    with pytest.raises(gate.PublishBlocked, match=r"RECOVERY_ALLOWANCE_SPENT.*run-rerun"):
+        pub.publish("run-rerun", number=123, repo="unit/public", cwd=root, env={}, runner=transport)
+    assert len(transport.writes) == 1
+
+    # A failed run with any failing job still uses failed-only (--failed) on a new head.
+    transport.head = NEW_HEAD
+    transport.conclusion = "failure"
+    transport.jobs = [
+        {
+            "id": 456,
+            "run_id": 123,
+            "run_attempt": 1,
+            "head_sha": TESTED,
+            "status": "completed",
+            "conclusion": "failure",
+            "completed_at": completed_at,
+            "steps": [{"name": "Checkout", "status": "completed", "conclusion": "failure"}],
+        },
+        {
+            "id": 457,
+            "run_id": 123,
+            "run_attempt": 1,
+            "head_sha": TESTED,
+            "status": "in_progress",
+            "conclusion": "success",
+            "completed_at": completed_at,
+            "steps": [{"name": "Lint", "status": "completed", "conclusion": "success"}],
+        },
+    ]
+    transport.proof = {
+        "pr": 42,
+        "head": NEW_HEAD,
+        "run_id": 123,
+        "job_ids": [456],
+        "tested_sha": TESTED,
+        "failure_evidence": "runner checkout failure on job 456",
+        "unrelated_to_diff": "failed before changed code ran",
+    }
+    failed_result = pub.publish("run-rerun", number=123, repo="unit/public", cwd=root, env={}, runner=transport)
+    assert failed_result.returncode == 0
+    assert transport.writes[-1] == ["gh", "run", "rerun", "123", "--repo", "unit/public", "--failed"]
+
+
+@pytest.mark.parametrize(
+    "case,expected_error",
+    [
+        ("coherent-all-green", r"RECOVERY_RUN_INVALID: coherent all-green run"),
+        ("coherent-all-green-no-evidence", r"RECOVERY_RUN_INVALID: coherent all-green run"),
+        ("running-job-no-conclusion", "RECOVERY_RUN_INVALID"),
+        ("incoherent-missing-completed-at", "RECOVERY_RUN_INVALID"),
+        ("incoherent-invalid-completed-at", "RECOVERY_RUN_INVALID"),
+        ("coherent-missing-completed-at", "RECOVERY_RUN_INVALID"),
+        ("failing-job-on-green-run", "RECOVERY_RUN_INVALID"),
+        ("failing-step-on-incoherent-job", "RECOVERY_RUN_INVALID"),
+        ("incomplete-step-on-incoherent-job", "RECOVERY_RUN_INVALID"),
+        ("missing-steps-field", "RECOVERY_RUN_INVALID"),
+        ("unknown-job-status", "RECOVERY_RUN_INVALID"),
+        ("mismatched-job-run-id", "RECOVERY_RUN_INVALID"),
+        ("mismatched-job-head-sha", "RECOVERY_RUN_INVALID"),
+        ("mismatched-job-run-attempt", "RECOVERY_RUN_INVALID"),
+        ("empty-jobs", "RECOVERY_RUN_INVALID"),
+        ("jobs-missing-total-count", "RECOVERY_LOOKUP_UNKNOWN"),
+        ("uncompleted-run", "RECOVERY_RUN_INVALID"),
+        ("unapproved-pr", "RECOVERY_APPROVAL_MISSING"),
+        ("missing-evidence", "RECOVERY_EVIDENCE_MISSING"),
+        ("job-id-mismatch", "RECOVERY_EVIDENCE_MISMATCH"),
+        ("tested-sha-mismatch", "RECOVERY_EVIDENCE_MISMATCH"),
+        ("prior-attempt", r"RECOVERY_ALLOWANCE_SPENT.*prior workflow"),
+        ("failed-tests-in-evidence", "RECOVERY_TEST_FAILURE_FORBIDDEN"),
+        ("undermines-approval", "RECOVERY_REVIEW_DISPOSITION_REQUIRED"),
+        ("non-infra-diagnosis", "RECOVERY_INFRA_DIAGNOSIS_REQUIRED"),
+        ("head-moved-during-preflight", "RECOVERY_HEAD_MOVED"),
+        ("pr-merge-incoherent-run", "RECOVERY_RUN_INVALID"),
+    ],
+)
+def test_coherent_or_invalid_all_green_run_refuses_recovery(setup, case, expected_error):
+    """Defect class: coherent all-green runs (nothing to recover), incomplete/failing/malformed job or step rows, incomplete pagination, missing gates, or pr-merge misuse refuse without writing or consuming allowance."""
+    root, transport = setup
+    completed_at = "2026-11-25T21:54:06Z"
+    transport.event = "pull_request"
+    transport.status = "completed"
+    transport.conclusion = "success"
+    transport.jobs = [
+        {
+            "id": 100,
+            "run_id": 123,
+            "run_attempt": 1,
+            "head_sha": TESTED,
+            "status": "completed",
+            "conclusion": "success",
+            "completed_at": completed_at,
+            "steps": [{"name": "Run checks", "status": "completed", "conclusion": "success"}],
+        },
+        {
+            "id": 456,
+            "run_id": 123,
+            "run_attempt": 1,
+            "head_sha": TESTED,
+            "status": "in_progress",
+            "conclusion": "success",
+            "completed_at": completed_at,
+            "steps": [{"name": "Lint", "status": "completed", "conclusion": "success"}],
+        },
+    ]
+    transport.proof = {
+        "pr": 42,
+        "head": HEAD,
+        "run_id": 123,
+        "job_ids": [456],
+        "tested_sha": TESTED,
+        "failure_evidence": "job 456 reports in_progress with conclusion success and completed_at set",
+        "unrelated_to_diff": "GitHub check-run state inconsistency",
+    }
+
+    if case == "coherent-all-green":
+        transport.jobs[1]["status"] = "completed"
+    elif case == "coherent-all-green-no-evidence":
+        transport.jobs[1]["status"] = "completed"
+        transport.proof = None
+    elif case == "running-job-no-conclusion":
+        transport.jobs[1]["conclusion"] = None
+        transport.jobs[1]["completed_at"] = None
+    elif case == "incoherent-missing-completed-at":
+        transport.jobs[1]["completed_at"] = None
+    elif case == "incoherent-invalid-completed-at":
+        transport.jobs[1]["completed_at"] = "not-a-timestamp"
+    elif case == "coherent-missing-completed-at":
+        transport.jobs[0]["completed_at"] = None
+    elif case == "failing-job-on-green-run":
+        transport.jobs[0]["conclusion"] = "failure"
+    elif case == "failing-step-on-incoherent-job":
+        transport.jobs[1]["steps"] = [{"name": "Lint", "status": "completed", "conclusion": "failure"}]
+    elif case == "incomplete-step-on-incoherent-job":
+        transport.jobs[1]["steps"] = [{"name": "Lint", "status": "in_progress", "conclusion": "success"}]
+    elif case == "missing-steps-field":
+        del transport.jobs[1]["steps"]
+    elif case == "unknown-job-status":
+        transport.jobs[1]["status"] = "bogus"
+    elif case == "mismatched-job-run-id":
+        transport.jobs[1]["run_id"] = 999
+    elif case == "mismatched-job-head-sha":
+        transport.jobs[1]["head_sha"] = HEAD
+    elif case == "mismatched-job-run-attempt":
+        transport.jobs[1]["run_attempt"] = 2
+    elif case == "empty-jobs":
+        transport.jobs = []
+    elif case == "jobs-missing-total-count":
+        transport.jobs_pages = [{"jobs": transport.jobs}]
+    elif case == "uncompleted-run":
+        transport.status = "in_progress"
+    elif case == "unapproved-pr":
+        transport.approved = False
+    elif case == "missing-evidence":
+        transport.proof = None
+    elif case == "job-id-mismatch":
+        transport.proof["job_ids"] = [999]
+    elif case == "tested-sha-mismatch":
+        transport.proof["tested_sha"] = HEAD
+    elif case == "prior-attempt":
+        transport.attempt = 2
+    elif case == "failed-tests-in-evidence":
+        transport.proof["failed_tests"] = ["tests/test_x.py::test_fail"]
+    elif case == "undermines-approval":
+        transport.proof["undermines_approval"] = True
+    elif case == "non-infra-diagnosis":
+        transport.proof["diagnosis"] = "test_failure"
+    elif case == "head-moved-during-preflight":
+        transport.moved = True
+    elif case == "pr-merge-incoherent-run":
+        transport.event = "merge_group"
+        transport.proof.update(diagnosis="infrastructure", undermines_approval=False, failed_tests=[])
+
+    if case == "pr-merge-incoherent-run":
         with pytest.raises(gate.PublishBlocked, match=expected_error):
             pub.publish(
                 "pr-merge",

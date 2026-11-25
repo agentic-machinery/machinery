@@ -18,11 +18,86 @@ MARKER = re.compile(r"<!-- ci-recovery-evidence\s+(\{.*?\})\s*-->", re.S)
 SHA = re.compile(r"[0-9a-f]{40}\Z")
 RECOVERY_ACTIONS = frozenset({"run-rerun", "re-enqueue"})
 CANCELLED_MERGE_GROUP_RECOVERY_MODE = "cancelled_merge_group_no_artifact"
+INCOHERENT_CHECK_RECOVERY_MODE = "incoherent_check_row_full_rerun"
 DEFAULT_REQUIRED_WORKFLOW = ".github/workflows/ci.yml"
+PASSING_RUN_CONCLUSIONS = frozenset({"success", "skipped", "neutral"})
+_PASSING_JOB_CONCLUSIONS = frozenset({"success", "skipped", "neutral"})
+_INCOHERENT_JOB_STATUSES = frozenset({"in_progress", "queued", "pending", "waiting", "expected", "requested", "stale"})
+_ISO_TIMESTAMP = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})\Z")
 _WORKFLOW_PATH = re.compile(r"\.github/workflows/[A-Za-z0-9._-]+\.ya?ml\Z")
 _MERGE_GROUP_BRANCH = re.compile(r"gh-readonly-queue/(main)/pr-([1-9][0-9]*)-[0-9a-f]{40}")
 _CLEAN_CANCELLED_JOB_CONCLUSIONS = frozenset({"success", "skipped", "neutral", "cancelled"})
 _CLEAN_CANCELLED_STEP_CONCLUSIONS = frozenset({None, "success", "skipped", "neutral", "cancelled"})
+
+
+def _is_valid_timestamp(value: object) -> bool:
+    """True when *value* is an ISO-8601 UTC/offset timestamp string."""
+    if not isinstance(value, str) or not _ISO_TIMESTAMP.fullmatch(value):
+        return False
+    try:
+        datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    return True
+
+
+def incoherent_completed_run_job_ids(run: object, jobs: object) -> set[int] | None:
+    """Return incoherent job IDs for a completed all-green run, empty set if coherent, or None if invalid.
+
+    Every job in *jobs* must have a passing conclusion, a valid ``completed_at`` timestamp,
+    and completed passing steps. A job with status ``completed`` is coherent; a job with a
+    known non-completed status (such as ``in_progress``) while ``conclusion`` and
+    ``completed_at`` are set is incoherent. Any failing, running, missing-field, or
+    mismatched row returns ``None`` so recovery fails closed.
+    """
+    if not isinstance(run, dict) or not isinstance(jobs, list) or not jobs:
+        return None
+    run_id = run.get("id")
+    if type(run_id) is not int or run_id <= 0:
+        return None
+    if run.get("status") != "completed" or run.get("conclusion") not in PASSING_RUN_CONCLUSIONS:
+        return None
+    run_head_sha = run.get("head_sha")
+    if not isinstance(run_head_sha, str) or not SHA.fullmatch(run_head_sha):
+        return None
+    run_attempt = run.get("run_attempt")
+    if type(run_attempt) is not int or run_attempt < 1:
+        return None
+    incoherent_ids: set[int] = set()
+    for job in jobs:
+        if not isinstance(job, dict):
+            return None
+        job_id = job.get("id")
+        if type(job_id) is not int or job_id <= 0:
+            return None
+        if "run_id" in job and (type(job["run_id"]) is not int or job["run_id"] != run_id):
+            return None
+        if "run_attempt" in job and (type(job["run_attempt"]) is not int or job["run_attempt"] != run_attempt):
+            return None
+        if "head_sha" in job and (not isinstance(job["head_sha"], str) or job["head_sha"] != run_head_sha):
+            return None
+        if job.get("conclusion") not in _PASSING_JOB_CONCLUSIONS:
+            return None
+        if not _is_valid_timestamp(job.get("completed_at")):
+            return None
+        status = job.get("status")
+        if status == "completed":
+            pass
+        elif isinstance(status, str) and status in _INCOHERENT_JOB_STATUSES:
+            incoherent_ids.add(job_id)
+        else:
+            return None
+        if "steps" not in job or not isinstance(job["steps"], list):
+            return None
+        for step in job["steps"]:
+            if (
+                not isinstance(step, dict)
+                or step.get("status") != "completed"
+                or "conclusion" not in step
+                or step["conclusion"] not in _PASSING_JOB_CONCLUSIONS
+            ):
+                return None
+    return incoherent_ids
 
 
 def is_valid_workflow_path(value: object) -> bool:
