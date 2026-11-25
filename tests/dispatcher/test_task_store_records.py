@@ -850,7 +850,8 @@ def test_review_reply_slug_readers_reject_kelvin_sign_lookalikes(tmp_path, monke
     ],
 )
 def test_task_record_write_refuses_non_finite_numbers_and_names_the_field(tmp_path, fields, path):
-    """Defect class (#1440): a task record is written with NaN or Infinity, which strict JSON readers refuse."""
+    """Defect class (#1440): a task record is written with NaN or Infinity, which strict JSON readers refuse,
+    or settlement of such a record (provider ``usage``) publishes no terminal failure."""
     target = tmp_path / "worker.json"
     record = {"task_id": "worker", "run_nonce": "nonce", "status": "failed"}
     store.replace(dict(record), target)
@@ -859,18 +860,28 @@ def test_task_record_write_refuses_non_finite_numbers_and_names_the_field(tmp_pa
         store.replace({**record, **fields}, target)
     assert refused.value.code == f"TASK_RECORD_NON_FINITE: {path}"
     assert target.read_bytes() == before
+    # Settlement's fallback publishes the terminal failure with the field cleared and named.
+    store.publish_failed_record({**record, **fields, "status": "running"}, target)
+    published = json.loads(target.read_text())
+    assert (published["status"], published["error"], published[next(iter(fields))]) == (
+        "crashed", f"TASK_RECORD_NON_FINITE: {path}", None)
     assert sorted(entry.name for entry in tmp_path.iterdir()) == ["worker.json", "worker.json.lock"]
 
 
-@pytest.mark.parametrize("value", ["nan", "inf", "-inf", "1e400"])
-def test_dispatch_refuses_a_non_finite_hard_timeout_at_parse_time(value, capsys):
+@pytest.mark.parametrize(
+    ("flag", "value"),
+    [("hard-timeout", "nan"), ("hard-timeout", "inf"), ("hard-timeout", "-inf"), ("hard-timeout", "1e400"),
+     ("max-tokens", "inf"), ("max-budget-usd", "nan")],
+)
+def test_dispatch_refuses_a_non_finite_numeric_option_at_parse_time(flag, value, capsys):
     """Defect class (#1440): ``--hard-timeout nan`` or ``inf`` reaches the task record as a non-finite number."""
     argv = ["dispatch", "--agent", "codex", "--model", "m", "--prompt", "p"]
-    assert cli.build_parser().parse_args([*argv, "--hard-timeout=7200.5"]).hard_timeout == 7200.5
+    parsed = cli.build_parser().parse_args([*argv, "--hard-timeout=7200.5", "--max-tokens=100", "--max-budget-usd=abc"])
+    assert (parsed.hard_timeout, parsed.max_tokens, parsed.max_budget_usd) == (7200.5, "100", "abc")
     with pytest.raises(SystemExit) as exited:
-        cli.build_parser().parse_args([*argv, f"--hard-timeout={value}"])
+        cli.build_parser().parse_args([*argv, f"--{flag}={value}"])
     assert exited.value.code == 2
-    assert f"--hard-timeout: must be a finite number of seconds, got {value!r}" in capsys.readouterr().err
+    assert f"--{flag}: must be a finite number" in capsys.readouterr().err
 
 
 pytestmark = pytest.mark.usefixtures("configured_roots")
