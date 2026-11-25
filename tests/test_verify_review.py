@@ -1400,8 +1400,10 @@ def test_cli_receipt_path_refuses_direct_task_store_and_allows_task_artifacts(tm
     )
     backing = tmp_path / "external-backing"
     backing_archive = tmp_path / "external-archive-backing"
-    backing.mkdir()
+    backing_deep = backing / "deep" / "dir"
+    backing_deep.mkdir(parents=True)
     backing_archive.mkdir()
+    (backing / "nested").symlink_to(backing_deep)
     conv_parent = tmp_path / "conv" / "batch_state"
     conv_parent.mkdir(parents=True)
     conv_tasks = conv_parent / "tasks"
@@ -1415,6 +1417,8 @@ def test_cli_receipt_path_refuses_direct_task_store_and_allows_task_artifacts(tm
     loop_b = tmp_path / "loop-b"
     loop_a.symlink_to(loop_b)
     loop_b.symlink_to(loop_a)
+    existing_file = tmp_path / "existing-file"
+    existing_file.write_text("not a dir\n", encoding="utf-8")
 
     for conv_blocked in (
         conv_tasks / "t2.behavior-receipt.json",
@@ -1423,8 +1427,10 @@ def test_cli_receipt_path_refuses_direct_task_store_and_allows_task_artifacts(tm
         alias_tasks / "t2.behavior-receipt.json",
         alias_tasks / "archive" / "t2.behavior-receipt.json",
         alias_tasks / "t2.artifacts" / ".." / "t2.behavior-receipt.json",
+        alias_tasks / "nested" / ".." / ".." / "t2.behavior-receipt.json",
         alias_parent / "tasks" / "t2.behavior-receipt.json",
         loop_a / "t2.behavior-receipt.json",
+        existing_file / "t2.behavior-receipt.json",
     ):
         capsys.readouterr()
         code_conv = verify_review_cli.main(
