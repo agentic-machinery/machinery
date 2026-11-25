@@ -30,7 +30,12 @@ if __package__ in (None, ""):  # run as a file: put the repository root on sys.p
 from lu_machinery.common import json_depth
 from lu_machinery.common.git_context import sanitized_git_env
 from lu_machinery.common.repo_root import MachineryConfigError
-from lu_machinery.common.task_store_paths import require_not_direct_task_store_path, tasks_dir
+from lu_machinery.common.safe_open import UnsafeEntryError
+from lu_machinery.common.task_store_paths import (
+    require_not_direct_task_store_path,
+    tasks_dir,
+    write_non_task_store_bytes,
+)
 from lu_machinery.fleet import claude_account_lane, credit_lane
 from lu_machinery.identity import UNKNOWN_AUTHOR_FAMILY, resolve_author_family
 from lu_machinery.review.evidence import compute_target_input_fingerprint
@@ -98,9 +103,11 @@ def _require_writable_path(path: Path, *, label: str) -> None:
 
 
 def _save_state(state_file: Path, state: dict) -> None:
-    _require_writable_path(state_file, label="closeout state")
-    state_file.parent.mkdir(parents=True, exist_ok=True)
-    state_file.write_text(json.dumps(state, indent=2, sort_keys=True), encoding="utf-8")
+    payload = json.dumps(state, indent=2, sort_keys=True).encode("utf-8")
+    try:
+        write_non_task_store_bytes(state_file, payload, label="closeout state")
+    except (ValueError, UnsafeEntryError) as exc:
+        raise CloseoutStateError(str(exc)) from None
 
 
 def _target_from_dict(data: object) -> ReviewTarget:
@@ -981,10 +988,15 @@ def _cmd_behavior_proof_receipt(args: argparse.Namespace) -> int:
     except ContractError as exc:
         print(json.dumps({"error": str(exc)}), file=sys.stderr)
         return 1
-    # Resolve once, here, so a relative --state-file still prints a path reconciliation accepts.
-    receipt_path = args.state_file.with_name(f"{args.state_file.stem}.ukrainian-behavior-proof-receipt.json").resolve()
+    # Validate and write through one verified directory descriptor without following destination symlinks,
+    # reporting the exact canonical path bound to that write.
     receipt_bytes = (json.dumps(receipt, ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode()
-    receipt_path.write_bytes(receipt_bytes)
+    try:
+        receipt_path = write_non_task_store_bytes(
+            raw_receipt_path, receipt_bytes, label="behavior-proof receipt",
+        )
+    except (ValueError, UnsafeEntryError) as exc:
+        raise CloseoutStateError(str(exc)) from None
     print(
         json.dumps(
             {
