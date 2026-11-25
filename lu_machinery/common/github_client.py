@@ -4234,15 +4234,20 @@ def _rest_read(operation, repo, fields, *, runner=None, env=None, cwd=None, **kw
         elif operation in {"issue-parent", "issue-scope", "subissues", "subissues-next", "subissue-batch"}:
 
             def _repo_slug(row):
-                from lu_machinery.orchestration.fleet_repos import ascii_repo_slug
-
                 if not isinstance(row, dict):
                     raise ValueError("malformed GitHub issue row")
                 repo_url = row.get("repository_url")
                 if not isinstance(repo_url, str) or not repo_url.isascii() or "/repos/" not in repo_url:
                     raise ValueError("malformed GitHub repository_url")
                 slug = repo_url.split("/repos/", 1)[1].strip()
-                if ascii_repo_slug(slug, strip=False) is None:
+                owner, sep, name = slug.partition("/")
+                if (
+                    not sep
+                    or not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", slug)
+                    or slug.endswith(".git")
+                    or owner in {".", ".."}
+                    or name in {".", ".."}
+                ):
                     raise ValueError("malformed GitHub repository_url")
                 return slug
 
