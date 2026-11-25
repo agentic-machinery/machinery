@@ -220,15 +220,49 @@ def test_v2_record_under_another_name_raises_identity_mismatch_with_its_content(
     assert not isinstance(non_string.value, store.TaskIdentityMismatch)
 
 
-def test_blank_v2_named_record_is_damaged_not_foreign(tmp_path):
-    """Defect class: an empty or NUL-filled v2-named record read as foreign (#12219)."""
+def test_blank_record_file_is_damaged_not_foreign(tmp_path):
+    """Defect class: an empty or NUL-filled record read as foreign (#12219), whatever its name (#1440)."""
     for raw in (b"", b" \n\t", b"\x00" * 64, b"\xef\xbb\xbf\x00"):
-        for name in ("worker.json", "worker.20261023T091234Z.7.archived.json"):
+        for name in ("worker.json", "worker.20261023T091234Z.7.archived.json", "not a task id.json"):
             path = tmp_path / name
             with pytest.raises(ValueError, match=re.escape(f"task record {path} is empty")):
                 store.parse_task_record(path, raw)
-    # A blank file no dispatch could have named stays foreign.
-    assert store.parse_task_record(tmp_path / "not a task id.json", b"") is None
+
+
+@pytest.mark.parametrize(
+    ("raw", "match"),
+    [
+        pytest.param(b'"task_id": "worker", "schema_version": 2, "status": "running"', "Extra data", id="bare-members"),
+        pytest.param(
+            b'[{"task_id": "worker", "schema_version": 2, "status": "running"}]', "is not a JSON object",
+            id="array-of-record",
+        ),
+        pytest.param(b'["note"]', "is not a JSON object", id="non-empty-array"),
+        pytest.param(b"42", "is not a JSON object", id="number"),
+        pytest.param(b'"worker"', "is not a JSON object", id="string"),
+        pytest.param(b"null", "is not a JSON object", id="null"),
+        pytest.param(b'{"status": "ok", "elapsed_s": NaN}', "non-JSON constant NaN", id="nan"),
+        pytest.param(b'{"status": "ok", "elapsed_s": Infinity}', "non-JSON constant Infinity", id="infinity"),
+        pytest.param(b'{"status": "ok", "elapsed_s": -Infinity}', "non-JSON constant -Infinity", id="negative-infinity"),
+        pytest.param(b"NaN", "is not a JSON object", id="bare-nan"),
+    ],
+)
+def test_parser_refuses_input_that_is_not_an_object_or_empty_array(tmp_path, raw, match):
+    """Defect class: a reader skips a parser ``None`` that may hold a record (#1440).
+
+    Bare record members, an array holding a record, a scalar and an object that is not strict JSON
+    are not a foreign object, so the parser refuses them under every name instead of calling them
+    foreign.
+    """
+    for name in ("worker.json", "worker.ac-policy.json", "not a task id.json"):
+        with pytest.raises(ValueError, match=match):
+            store.parse_task_record(tmp_path / name, raw)
+    # A record object holding a non-JSON constant parses as before: the dispatcher's writer can emit one.
+    record = store.parse_task_record(tmp_path / "worker.json", b'{"task_id": "worker", "status": "running", "cost": NaN}')
+    assert record is not None and record["task_id"] == "worker"
+    # A foreign object and exactly [] stay foreign.
+    assert store.parse_task_record(tmp_path / "worker.ac-policy.json", b'{"criteria": []}') is None
+    assert store.parse_task_record(tmp_path / "worker.ac-policy.json", b" [ ]\n") is None
 
 
 def test_foreign_filename_cannot_inject_log_lines(tmp_path, caplog):

@@ -36,6 +36,11 @@ from lu_machinery.common import json_depth
 
 # Deepest JSON this module reads (json_depth): dispatcher task records.
 _JSON_MAX_DEPTH = 128
+# The stdlib decoder's own constant values: it reuses one NaN object, so an unchanged record that
+# holds NaN still compares equal across reads (a fresh float("nan") never equals itself).
+_JSON_CONSTANTS: dict[str, Any] = {
+    token: json_depth.loads(token, max_depth=1) for token in ("NaN", "Infinity", "-Infinity")
+}
 
 ARCHIVE_DIR_NAME = "archive"
 REVIEW_TASK_FLAG_FIELDS = (
@@ -226,46 +231,61 @@ def _report_foreign(path: Path, raw: bytes) -> None:
 atexit.register(_flush_foreign_reports, force=True)
 
 
-def _has_v2_record_name(path: Path) -> bool:
-    """Whether dispatch could have written ``path`` as a v2 record, archive collision stamps included."""
-    if not path.name.endswith(".json"):
-        return False
-    stem = path.name[:-5]
-    while match := _REDISPATCH_ARCHIVED_STEM_RE.fullmatch(stem):
-        stem = match["base"]
-    return _V2_TASK_ID_RE.fullmatch(stem) is not None and ".." not in stem
-
-
 def parse_task_record(path: Path, raw: bytes, *, display_unknown_schema: bool = False) -> dict[str, Any] | None:
     """Distinguish records from sidecars without hiding damaged record claims.
 
+    Only a strict JSON object or exactly ``[]`` can be foreign (``None``): the
+    object classification below decides whether an object claims a run. Every
+    other input raises ``ValueError``, so no reader can skip a file that may
+    hold a record: text that is not JSON (bare record members, a truncated
+    object), an empty, whitespace, BOM or NUL-only file (a crash can leave a
+    record zero-filled), any other array or scalar (an array can hold a
+    record), and an object that would be foreign but holds ``NaN`` or
+    ``Infinity`` (not strict JSON). A record object holding one still parses:
+    the dispatcher's writer can emit them, so refusing them here first would
+    turn a writer quirk into a store-wide refusal (#1440).
+
     Dispatch writes an integer schema version and a task-id basename; legacy
     records may identify a run by filename and lifecycle fields alone. The v2
-    basename and archive collision stamps follow the by-id naming contract. A
-    broken JSON object may have lost its markers to truncation, so it remains
-    a record claim and fails closed. So does a file carrying a v2 record name
-    whose bytes are empty, whitespace, BOM or NUL only: a crash can leave a
-    record zero-filled, and a blank file has no content that marks it foreign.
+    basename and archive collision stamps follow the by-id naming contract.
     """
+    constants: list[str] = []
+
+    def constant(token: str) -> Any:
+        constants.append(token)
+        return _JSON_CONSTANTS[token]
+
     try:
         decoded = raw.decode("utf-8")
-        record = json_depth.loads(decoded, max_depth=_JSON_MAX_DEPTH)
+        record = json_depth.loads(decoded, max_depth=_JSON_MAX_DEPTH, parse_constant=constant)
     except RecursionError as exc:
         raise ValueError(f"task record {path} exceeds JSON parser nesting") from exc
     except ValueError as exc:
-        if isinstance(exc, UnicodeDecodeError):
-            raise
-        prefix = 0
-        while prefix < len(decoded) and (decoded[prefix].isspace() or decoded[prefix] in "\ufeff\x00"):
-            prefix += 1
-        if decoded.startswith("{", prefix):
-            raise
-        if prefix == len(decoded) and _has_v2_record_name(path):
+        if not isinstance(exc, UnicodeDecodeError) and all(ch.isspace() or ch in "\ufeff\x00" for ch in decoded):
             raise ValueError(f"task record {path} is empty") from None
-        record = None
+        raise
     if not isinstance(record, dict):
+        if record != []:
+            raise ValueError(f"task record {path} is not a JSON object")
         _report_foreign(path, raw)
         return None
+    parsed = classify_task_object(path, record, display_unknown_schema=display_unknown_schema)
+    if parsed is None:
+        if constants:
+            raise ValueError(f"task record {path} holds non-JSON constant {constants[0]}")
+        _report_foreign(path, raw)
+    return parsed
+
+
+def classify_task_object(
+    path: Path, record: dict[str, Any], *, display_unknown_schema: bool = False
+) -> dict[str, Any] | None:
+    """Classify an already decoded JSON object read from ``path``, as :func:`parse_task_record` does.
+
+    Returns the record, ``None`` for an object that makes no record claim, or raises the
+    parser's refusals. It reports nothing: a reader that holds file bytes calls
+    :func:`parse_task_record`, which also refuses text that is not strict JSON.
+    """
     task_id = record.get("task_id")
     review_flagged = (any(record.get(name) not in (None, False, "", []) for name in REVIEW_TASK_FLAG_FIELDS)
                       or bool(record.get("review_mode") or record.get("type") == "review"))
@@ -282,7 +302,6 @@ def parse_task_record(path: Path, raw: bytes, *, display_unknown_schema: bool = 
     receipt = ("schema" in record and "schema_version" not in record
                and isinstance(task_id, str) and not candidate_task_record_names(task_id, (path.name,)))
     if (receipt and not legacy) or not ("task_id" in record or isinstance(record.get("schema_version"), int) or legacy):
-        _report_foreign(path, raw)
         return None
     if "schema_version" in record and (type(record["schema_version"]) is not int
                                        or record["schema_version"] not in {1, 2}):
