@@ -542,6 +542,9 @@ def test_machinery_readers_refuse_overlong_digit_captures_without_unbounded_int(
             "Dismiss alert #7 fixed in https://github.com/learn-ukrainian/machinery/pull/42 and HTTPS://github.com/learn-ukrainian/machinery/pull/0/files",
             "Dismiss alert #7 fixed in <https://github.com/learn-ukrainian/machinery/pull/42> and <https://github.com/learn-ukrainian/machinery/pull/42.>",
             "Dismiss alert #7 fixed in <https://github.com/learn-ukrainian/machinery/pull/42> and [bad](https://github.com/learn-ukrainian/machinery/pull/42.)",
+            "Dismiss alert #7 fixed in [bad]( https://github.com/learn-ukrainian/machinery/pull/42. )",
+            "Dismiss alert #7 fixed in [bad](\n  https://github.com/learn-ukrainian/machinery/pull/42.\n)",
+            "Dismiss alert #7 fixed in [ref][1]\n\n[1]: https://github.com/learn-ukrainian/machinery/pull/42.",
             "Dismiss alert #7 fixed in https://github.com/learn-ukrainian/machinery/pull/42/files",
         ):
             with pytest.raises(ValueError, match="comment needs an explanation and one same-repository merged PR"):
@@ -565,6 +568,8 @@ def test_machinery_readers_refuse_overlong_digit_captures_without_unbounded_int(
             "see https://github.com/learn-ukrainian/machinery/pull/42/files",
             "Dismiss alert #7 fixed in <https://github.com/learn-ukrainian/machinery/pull/42>. "
             "See https://github.com/learn-ukrainian/machinery/pull/42.",
+            "Dismiss alert #7 fixed in [PR]( https://github.com/learn-ukrainian/machinery/pull/42 )",
+            "Dismiss alert #7 fixed in [PR][1]\n\n[1]: https://github.com/learn-ukrainian/machinery/pull/42",
         ):
             fetched_endpoints.clear()
             with pytest.raises(LookupError, match="reached_pr_fetch"):

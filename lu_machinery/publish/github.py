@@ -3625,9 +3625,16 @@ def _dismiss_preflight(fields, gh_repo, dest, runner, cwd, environment, *, temp=
     for url_match in re.finditer(url_re, comment):
         raw_link = url_match.group(0)
         start, end = url_match.span()
+        prefix = comment[:start]
         explicit = (
             (start > 0 and end < len(comment) and comment[start - 1] == "<" and comment[end] == ">")
-            or (start >= 2 and comment[start - 2 : start] == "](")
+            or re.search(r"\]\([ \t]*(?:(?:\r\n|[\r\n])[ \t]*)?\Z", prefix) is not None
+            or re.search(
+                r"(?m)^(?:[ ]{0,3}>)*[ ]{0,3}\[[^\[\]]+\]:[ \t]*(?:(?:\r\n|[\r\n])[ \t]*)?\Z",
+                prefix,
+            )
+            is not None
+            or re.search(r"(?ai:\bhref)[ \t]*=[ \t]*['\"]\Z", prefix) is not None
         )
         link = raw_link if explicit else raw_link.rstrip(".,;:!?\"'`]")
         if seg_match := re.fullmatch(pr_segment_re, link, re.ASCII | re.IGNORECASE):
