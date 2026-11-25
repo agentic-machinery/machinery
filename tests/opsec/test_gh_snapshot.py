@@ -585,4 +585,14 @@ def test_publish_github_and_client_url_repo_mismatch_guards(tmp_path):
         fresh=True,
     )
     assert res.status == 400 and res.error == "github_invalid_command" and res.reason == "repository_mismatch"
+    res_kelvin = github_client._read_command(
+        DummyClient(),
+        "pr",
+        "view",
+        {"--repo": ["learn-u\u212arainian/machinery"], "--json": ["number"]},
+        ["https://github.com/learn-ukrainian/machinery/pull/5"],
+        timeout=5,
+        fresh=True,
+    )
+    assert res_kelvin.status == 400 and res_kelvin.error == "github_invalid_command" and res_kelvin.reason == "repository_mismatch"
     assert seen_paths == []

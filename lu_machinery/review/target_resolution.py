@@ -113,8 +113,10 @@ def _origin_github_repo(checkout: Path) -> str | None:
         proc = _run_git(["config", "--get", "remote.origin.url"], checkout)
     except OSError:
         raise OSError(REVIEW_ROOT_UNAVAILABLE) from None
-    if proc.returncode != 0 or not proc.stdout.isascii():
+    if proc.returncode != 0:
         return None
+    if not proc.stdout.isascii():
+        raise TargetResolutionError("checkout origin is not an exact owner/name")
     text = proc.stdout.strip()
     for pattern in _GITHUB_ORIGIN_PATTERNS:
         match = pattern.match(text)
