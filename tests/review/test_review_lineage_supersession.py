@@ -546,7 +546,10 @@ def test_a_rate_limited_codex_run_is_skipped_only_beside_its_bound_published_ret
         run = ReviewRun(run.task_id, {k: v for k, v in run.record.items()
                                       if k not in ("review_profile", "sources_mcp_call_count")}, run.reply)
     retry = (
-        _bound(run, nonce="b" * 32, result_sha256="cd" * 32, pr=1379 if case == "retry-for-another-pr" else RATE_LIMIT_PR),
+        _bound(
+            run, nonce="b" * 32, result_sha256="cd" * 32, pr=1379 if case == "retry-for-another-pr" else RATE_LIMIT_PR,
+            finished_at="2026-10-28T20:01:30.000001+00:00",
+        ),
         comment,
     )
     approve = review("rl-r2", APPROVED, "VERDICT: APPROVE", minute=2)

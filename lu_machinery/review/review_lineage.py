@@ -704,14 +704,15 @@ def _rate_limit_retried(
 ) -> bool:
     """Whether a rate-limited run's retry, started after it settled, published its own bound verdict.
 
-    The retry is a finished run with its own nonce, which with its task id names exactly one record,
-    and its own reply digest (``_read_run`` checks the reply against that digest), started strictly after the attempt settled, for the same repository, PR,
-    review branch and full SHA. Its reviewer family and normalized profile equal the attempt's. Every
-    trusted marker the recorder's login posted for it equals what its record re-derives: head,
-    verdict, model, family and profile, as in the lineage's own run check. Any verdict counts: a
-    genuine ``CHANGES_REQUESTED`` also proves the retry happened. The skipped run fills no seat, and
-    damaged evidence (an unparseable or out-of-range time, an untrusted or edited marker) is never
-    a retry.
+    The retry is a finished run that started strictly after the attempt settled and settled after its
+    own start. It is the only record with its task id and nonce, and the only one with its task id and
+    start (the key its markers carry). It has its own reply digest (``_read_run`` checks the reply
+    against it) and the attempt's repository, integer PR, review branch, full SHA, reviewer family and
+    normalized profile. Every trusted marker the recorder's login posted for it equals what its record
+    re-derives (head, verdict, model, family and profile), as in the lineage's own run check. Any
+    verdict counts: a genuine ``CHANGES_REQUESTED`` also proves the retry happened. The skipped run
+    fills no seat, and damaged evidence (an unparseable or out-of-range time, an untrusted or edited
+    marker) is never a retry.
     """
     if not _attested_rate_limit(run):
         return False
@@ -740,8 +741,10 @@ def _bound_retry(run: ReviewRun, runs: Sequence[ReviewRun], comments: Sequence[M
     # string nonce can bind a retry, so a sibling's malformed nonce is neither counted nor a candidate.
     nonces = [(item, item.record.get("run_nonce")) for item in runs]
     seen = Counter((item.task_id, nonce) for item, nonce in nonces if isinstance(nonce, str))
+    # A marker names its run by task id and start, so that pair must also name exactly one record.
+    publications = Counter((item.task_id, _start_or_none(item.record)) for item in runs)
     return any(
-        _binds_retry(retry, settled, identity, markers)
+        _binds_retry(retry, settled, identity, markers, publications)
         for retry, nonce in nonces
         if isinstance(nonce, str)
         and retry.task_id != run.task_id
@@ -750,21 +753,36 @@ def _bound_retry(run: ReviewRun, runs: Sequence[ReviewRun], comments: Sequence[M
     )
 
 
+def _start_or_none(record: Mapping[str, Any]) -> str | None:
+    try:
+        return _started(record)
+    except OverflowError:
+        return None
+
+
 def _binds_retry(
-    retry: ReviewRun, settled: datetime, identity: tuple[Any, ...], markers: Sequence[Mapping[str, Any]]
+    retry: ReviewRun,
+    settled: datetime,
+    identity: tuple[Any, ...],
+    markers: Sequence[Mapping[str, Any]],
+    publications: Counter[tuple[str, str | None]],
 ) -> bool:
     """Whether ``retry`` is a bound, published retry of the attempt ``identity`` names; damaged evidence binds nothing."""
     sha, repository, number, branch, family, profile = identity
     try:
         retry_start = _timestamp(retry.record.get("started_at"))
+        retry_finish = _timestamp(retry.record.get("finished_at"))
         evidence = _finished_verdict(retry)
         if (
             retry_start is None
             or retry_start <= settled
+            or retry_finish is None
+            or retry_finish < retry_start
             or evidence is None
             or not _supervised_review_binding(retry)
             or not _lower_sha256(retry.record.get("result_sha256"))
             or retry.record.get("repository") != repository
+            or type(retry.record.get("pr")) is not int
             or retry.record.get("pr") != number
             or recorder._review_branch(dict(retry.record)) != branch
             or _profile(retry.record) != profile
@@ -773,6 +791,8 @@ def _binds_retry(
     except (recorder.RecordError, OverflowError):
         return False
     retry_sha, verdict, _, model, retry_family, started = evidence
+    if publications[(retry.task_id, started)] != 1:
+        return False
     published = [marker for marker in markers if marker["task"] == retry.task_id and marker["started"] == started]
     return (
         (retry_sha, retry_family) == (sha, family)
