@@ -33,6 +33,7 @@ import hashlib
 import logging
 import os
 import stat
+from collections import Counter
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
@@ -703,8 +704,8 @@ def _rate_limit_retried(
 ) -> bool:
     """Whether a rate-limited run's retry, started after it settled, published its own bound verdict.
 
-    The retry is a finished run with its own nonce and reply digest (``_read_run`` checks the reply
-    against that digest), started strictly after the attempt settled, for the same repository, PR,
+    The retry is a finished run with its own nonce, which with its task id names exactly one record,
+    and its own reply digest (``_read_run`` checks the reply against that digest), started strictly after the attempt settled, for the same repository, PR,
     review branch and full SHA. Its reviewer family and normalized profile equal the attempt's. Every
     trusted marker the recorder's login posted for it equals what its record re-derives: head,
     verdict, model, family and profile, as in the lineage's own run check. Any verdict counts: a
@@ -735,10 +736,14 @@ def _bound_retry(run: ReviewRun, runs: Sequence[ReviewRun], comments: Sequence[M
     profile = _profile(record)
     markers = [marker for _, marker in _trusted_markers(comments, login)]
     identity = (sha, repository, number, branch, family, profile)
+    # A candidate's task id and nonce must name exactly one record, as bound_published_run requires.
+    seen = Counter((item.task_id, item.record.get("run_nonce")) for item in runs)
     return any(
         _binds_retry(retry, settled, identity, markers)
         for retry in runs
-        if retry.task_id != run.task_id and retry.record.get("run_nonce") != record.get("run_nonce")
+        if retry.task_id != run.task_id
+        and retry.record.get("run_nonce") != record.get("run_nonce")
+        and seen[(retry.task_id, retry.record.get("run_nonce"))] == 1
     )
 
 
