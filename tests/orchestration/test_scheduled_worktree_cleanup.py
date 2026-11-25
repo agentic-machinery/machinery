@@ -40,7 +40,7 @@ def _isolated_task_scratch_root(tmp_path_factory, monkeypatch) -> Path:
     return root
 
 
-def test_default_repositories_come_from_configured_roots(tmp_path: Path, monkeypatch, configured_roots) -> None:
+def test_default_repositories_come_from_configured_roots(tmp_path: Path, monkeypatch, capsys, configured_roots) -> None:
     """Defect class: a default repository taken from the state root or guessed as a sibling of another checkout.
 
     The Git-backed state root (here the configured primary) owns the task store, so the default
@@ -79,6 +79,13 @@ def test_default_repositories_come_from_configured_roots(tmp_path: Path, monkeyp
     assert seen["state"] == [cleanup.state_root(), repos / local_name]
     assert seen["rollover"] == [Path(root) / ".agent/thread-rollovers/claude" for root in seen["state"]]
     assert cleanup.state_root() != configured_roots.product
+    # The macOS agent's job carries no root settings, so its installer refuses this split layout.
+    from lu_machinery.orchestration import install_worktree_cleanup_launchd as launchd
+
+    with pytest.raises(SystemExit) as refused:
+        launchd.main(["--home", str(tmp_path / "home"), "render"])
+    assert refused.value.code == 2
+    assert "cannot serve a split layout" in capsys.readouterr().err
 
 
 @pytest.mark.parametrize("apply", [False, True])

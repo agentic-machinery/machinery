@@ -714,6 +714,34 @@ def test_next_registry_unavailable_503(monkeypatch):
     assert response.headers.get("retry-after") == "3"
 
 
+def test_next_unreadable_fleet_taxonomy_is_registry_unavailable_503(monkeypatch):
+    """Defect class: an alias registry that cannot be read reported as an unknown (invalid) stream."""
+    from lu_machinery.orchestration.fleet_taxonomy import FleetTaxonomyError, UnknownAreaError
+
+    _warm_next_cache()
+    _patch_known_streams(monkeypatch)
+
+    def unreadable(_name):
+        raise FleetTaxonomyError("Fleet taxonomy unavailable: declared target missing")
+
+    monkeypatch.setattr(work_router, "resolve_area", unreadable)
+    response = client.get("/api/work/v1/next?stream=atlas-intake")
+    assert response.status_code == 503, response.text
+    body = response.json()
+    assert body["error"] == "registry_unavailable"
+    assert "fleet_taxonomy.yaml" in body["diagnostic"]
+    assert body["retry_after_s"] > 0
+    assert response.headers.get("retry-after") == "3"
+
+    def unknown(name):
+        raise UnknownAreaError(name)
+
+    monkeypatch.setattr(work_router, "resolve_area", unknown)
+    response = client.get("/api/work/v1/next?stream=atlas-intake")
+    assert response.status_code == 400
+    assert response.json()["error"] == "unknown_stream"
+
+
 def test_projection_membership_and_epic_status():
     """Homed issues carry public-safe stream membership; epics get status=epic."""
     projection = build_projection(_next_sections(), repository_id=REPO)
@@ -1096,10 +1124,10 @@ def test_next_diagnoses_broken_launcher_alias_file(monkeypatch, tmp_path, reques
 
     response = client.get("/api/work/v1/next?stream=infra")
 
-    assert response.status_code == 400
+    assert response.status_code == 503
     body = response.json()
-    assert body["error"] == "unknown_stream"
-    assert body["valid_streams"] == NEXT_STREAMS
+    assert body["error"] == "registry_unavailable"
+    assert response.headers.get("retry-after") == "3"
     assert "launcher_stream_aliases.tsv" in body["diagnostic"]
     assert caplog.records
     warning = next(record for record in caplog.records if record.levelname == "WARNING")

@@ -26,7 +26,7 @@ from lu_machinery.api.state_helpers import (
     cache_set,
     ctx_cache_scope,
 )
-from lu_machinery.orchestration.fleet_taxonomy import FleetTaxonomyError, resolve_area
+from lu_machinery.orchestration.fleet_taxonomy import FleetTaxonomyError, UnknownAreaError, resolve_area
 from lu_machinery.orchestration.issue_stream_audit import load_registry
 from lu_machinery.orchestration.launcher_aliases import load_launcher_aliases
 from lu_machinery.orientation_packet import cap_projection
@@ -566,19 +566,23 @@ def _require_projection_stream(request: Request, ctx: MonitorContext) -> str:
         )
     requested = values[0].strip()
     stream = requested
-    alias_diagnostic = None
     if stream not in known:
-        stream, alias_diagnostic = _resolve_stream_alias(requested, known)
-        stream = stream or requested
+        aliased, alias_failure = _resolve_stream_alias(requested, known)
+        if alias_failure is not None:
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "error": "registry_unavailable",
+                    "message": "stream alias registry is unreadable; refusing to serve the projection",
+                    "diagnostic": alias_failure,
+                },
+            )
+        stream = aliased or requested
     if stream not in known:
-        detail: dict[str, Any] = {
-            "error": "unknown_stream",
-            "message": f"unknown stream {requested!r}",
-            "valid_streams": known,
-        }
-        if alias_diagnostic is not None:
-            detail["diagnostic"] = alias_diagnostic
-        raise HTTPException(status_code=400, detail=detail)
+        raise HTTPException(
+            status_code=400,
+            detail={"error": "unknown_stream", "message": f"unknown stream {requested!r}", "valid_streams": known},
+        )
     return stream
 
 
@@ -764,6 +768,8 @@ def _resolve_stream_alias(stream: str, known: list[str]) -> tuple[str | None, st
     The launcher compatibility map takes precedence because taxonomy areas
     may group different streams (``harness`` groups corpus, while the launcher
     assigns that selector to infra). Unknown or ambiguous names fail closed.
+    The second value names an alias registry that could not be read, so the
+    caller refuses with 503 rather than calling the stream unknown.
     """
     try:
         launcher_alias = load_launcher_aliases().get(stream)
@@ -778,8 +784,11 @@ def _resolve_stream_alias(stream: str, known: list[str]) -> tuple[str | None, st
         return (key if key in known else None), None
     try:
         area = resolve_area(stream)
-    except FleetTaxonomyError:
+    except UnknownAreaError:
         return None, None
+    except FleetTaxonomyError as exc:
+        log.warning("Could not load fleet_taxonomy.yaml: %s", exc)
+        return None, f"fleet_taxonomy.yaml load failed ({type(exc).__name__})"
     candidates = [name for name in (area.id, *area.aliases) if name in known]
     return (candidates[0] if len(candidates) == 1 else None), None
 
@@ -815,8 +824,9 @@ def work_next(
     holds the slot until its thread exits (#6984, revised by #12649).
     ``stream`` also accepts unambiguous
     fleet-taxonomy area aliases (``infra`` → ``infra-harness``); an
-    unreadable stream registry fails closed with 503 ``registry_unavailable``
-    rather than treating typos as an empty queue (#6890).
+    unreadable stream registry, or an alias registry needed to resolve the
+    requested name, fails closed with 503 ``registry_unavailable`` rather than
+    treating typos as an empty queue (#6890) or the name as unknown.
     """
     known = _known_streams(ctx)
     if known is None:
@@ -830,20 +840,30 @@ def work_next(
             headers={"Retry-After": str(int(NEXT_RETRY_AFTER_S))},
         )
     requested_stream = stream
-    alias_diagnostic = None
     if stream not in known:
-        aliased, alias_diagnostic = _resolve_stream_alias(stream, known)
+        aliased, alias_failure = _resolve_stream_alias(stream, known)
+        if alias_failure is not None:
+            return _next_error(
+                503,
+                {
+                    "error": "registry_unavailable",
+                    "message": "stream alias registry is unreadable; refusing to serve /next",
+                    "diagnostic": alias_failure,
+                    "retry_after_s": NEXT_RETRY_AFTER_S,
+                },
+                headers={"Retry-After": str(int(NEXT_RETRY_AFTER_S))},
+            )
         if aliased is not None:
             stream = aliased
     if stream not in known:
-        body = {
-            "error": "unknown_stream",
-            "message": f"unknown stream {requested_stream!r}",
-            "valid_streams": known,
-        }
-        if alias_diagnostic is not None:
-            body["diagnostic"] = alias_diagnostic
-        return _next_error(400, body)
+        return _next_error(
+            400,
+            {
+                "error": "unknown_stream",
+                "message": f"unknown stream {requested_stream!r}",
+                "valid_streams": known,
+            },
+        )
 
     _work_demand(ctx).touch()
     key = projection_cache_key({}, ctx)
