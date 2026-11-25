@@ -1172,9 +1172,10 @@ def _failed_check_run_ids(check_rows: Sequence[Mapping[str, Any]], head: str) ->
         for field in ("details_url", "html_url"):
             url = row.get(field)
             if isinstance(url, str):
-                match = re.search(r"/actions/runs/([1-9][0-9]*)", url)
+                match = re.search(r"/actions/runs/([^/?#]+)", url)
                 if match:
-                    parsed = parse_ascii_positive_int(match[1])
+                    raw_id = match[1]
+                    parsed = parse_ascii_positive_int(raw_id) if len(raw_id) <= 19 else None
                     if parsed is not None:
                         found.add(parsed)
                         break

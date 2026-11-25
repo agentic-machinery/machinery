@@ -142,7 +142,7 @@ _VERIFIED_COMMANDS = re.compile(r"^X-Verified: (?P<value>\S(?:.*\S)?)\Z", re.ASC
 _WELL_FORMED = re.compile(r"^X-Agent: (?P<value>[a-z][a-z0-9]*(?:-[a-z0-9]+)*/[A-Za-z0-9._-]+)$")
 _LINE_BREAKS = ("softbreak", "hardbreak")
 # The squash headline ends in the PR number; earlier "(#N)" references are issues.
-_PR_SUFFIX = re.compile(r"\(#(?P<number>[1-9][0-9]{0,18})\)$")
+_PR_SUFFIX = re.compile(r"\(#(?P<number>[1-9][0-9]*)\)$")
 _SHA = re.compile(r"^[0-9a-f]{40}$")
 _REPOSITORY = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 
@@ -439,7 +439,9 @@ def verification_findings(message: str, sha: str, pr: int | None) -> list[Violat
 def pr_number_from_subject(subject: str) -> int | None:
     """The terminal ``(#N)`` of a squash headline, else None."""
     match = _PR_SUFFIX.search(subject.rstrip())
-    return int(match.group("number")) if match else None
+    if match is None or len(match.group("number")) > 19:
+        return None
+    return int(match.group("number"))
 
 
 def _git_bytes(*args: str, env: dict[str, str] | None = None, cwd: Path | None = None) -> bytes:

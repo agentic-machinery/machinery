@@ -131,12 +131,14 @@ def _extract_supersede_hint(body: str | None) -> dict[str, Any]:
     out: dict[str, Any] = {}
     m = _SUPERSEDED_RE.search(body)
     if m:
-        parsed = parse_ascii_positive_int(m.group(1))
+        raw = m.group(1)
+        parsed = parse_ascii_positive_int(raw) if len(raw) <= 19 else None
         if parsed is not None:
             out["superseded_by"] = parsed
     m = _MERGED_IN_RE.search(body)
     if m:
-        parsed = parse_ascii_positive_int(m.group(1))
+        raw = m.group(1)
+        parsed = parse_ascii_positive_int(raw) if len(raw) <= 19 else None
         if parsed is not None:
             out["merged_in_pr"] = parsed
     return out

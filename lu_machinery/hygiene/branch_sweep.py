@@ -451,7 +451,7 @@ def _rescue(name: str) -> bool:
 def _numbers(pattern: re.Pattern[str], text: str) -> list[int]:
     found: list[int] = []
     for raw in pattern.findall(text):
-        number = parse_ascii_positive_int(raw)
+        number = parse_ascii_positive_int(raw) if len(raw) <= 19 else None
         if number is not None and number not in found:
             found.append(number)
     return found
@@ -583,12 +583,14 @@ def _pr_merge_index(repo: Path, cache: _EvidenceCache) -> dict[int, list[str]]:
         numbers: list[int] = []
         merge = _MERGE_SUBJECT_RE.search(subject)
         if merge:
-            parsed = parse_ascii_positive_int(merge.group(1))
+            raw_num = merge.group(1)
+            parsed = parse_ascii_positive_int(raw_num) if len(raw_num) <= 19 else None
             if parsed is not None:
                 numbers.append(parsed)
         squash = _SQUASH_SUBJECT_RE.search(subject)
         if squash:
-            parsed = parse_ascii_positive_int(squash.group(1))
+            raw_num = squash.group(1)
+            parsed = parse_ascii_positive_int(raw_num) if len(raw_num) <= 19 else None
             if parsed is not None:
                 numbers.append(parsed)
         for number in dict.fromkeys(numbers):
