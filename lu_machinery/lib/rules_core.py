@@ -364,8 +364,11 @@ def main(argv: list[str] | None = None) -> int:
         help="write to this file, e.g. rules.md (default: stdout)",
     )
     args = parser.parse_args(argv)
-    seat = resolve_seat(args.seat, lane=args.lane, provider=args.provider)
     try:
+        try:
+            seat = resolve_seat(args.seat, lane=args.lane, provider=args.provider)
+        except (OSError, ValueError, KeyError, IndexError, AttributeError, OverflowError, RecursionError) as exc:
+            raise RulesCoreError(f"seat resolution failed ({exc.__class__.__name__}): {exc}") from exc
         rendered = _render(args.format, seat, args.root)
     except RulesCoreMissing as exc:
         print(f"rules_core: {exc}", file=sys.stderr)
