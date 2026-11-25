@@ -1174,8 +1174,10 @@ def _failed_check_run_ids(check_rows: Sequence[Mapping[str, Any]], head: str) ->
             if isinstance(url, str):
                 match = re.search(r"/actions/runs/([1-9][0-9]*)", url)
                 if match:
-                    found.add(int(match[1]))
-                    break
+                    parsed = parse_ascii_positive_int(match[1])
+                    if parsed is not None:
+                        found.add(parsed)
+                        break
         else:
             row_id = row.get("id")
             if type(row_id) is int and row_id > 0:

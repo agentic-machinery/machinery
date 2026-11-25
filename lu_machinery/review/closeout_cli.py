@@ -438,6 +438,8 @@ def _checkout_repository(repo_root: Path) -> str:
     """
     try:
         origin = _origin_github_repo(repo_root)
+    except TargetResolutionError as exc:
+        raise CloseoutStateError(f"repository unknown: {exc}") from exc
     except (OSError, subprocess.TimeoutExpired):
         origin = None
     if origin is None:
@@ -1418,7 +1420,7 @@ def _checklist_diff(repo_root: Path, merge_base: str, head: str) -> list[dict[st
             if current is None:
                 raise CloseoutStateError(f"diff names a file the status list lacks: {name!r}")
         elif line.startswith("@@ "):
-            match = re.match(r"@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@", line)
+            match = re.match(r"@@ -([0-9]{1,10})(?:,([0-9]{1,10}))? \+([0-9]{1,10})(?:,([0-9]{1,10}))? @@", line)
             if match is None:
                 raise CloseoutStateError("unparseable diff hunk header")
             old_line, new_line = int(match.group(1)), int(match.group(3))

@@ -117,6 +117,7 @@ from markdown_it import MarkdownIt
 from markdown_it.token import Token
 
 from lu_machinery.common import github_client, json_depth
+from lu_machinery.orchestration.fleet_repos import parse_ascii_positive_int
 from lu_machinery.review.app_bot_authorship import verified_app_bot_login
 
 ENFORCE_ENV = "ATTRIBUTION_ENFORCE"
@@ -439,7 +440,7 @@ def verification_findings(message: str, sha: str, pr: int | None) -> list[Violat
 def pr_number_from_subject(subject: str) -> int | None:
     """The terminal ``(#N)`` of a squash headline, else None."""
     match = _PR_SUFFIX.search(subject.rstrip())
-    return int(match.group("number")) if match else None
+    return parse_ascii_positive_int(match.group("number")) if match else None
 
 
 def _git_bytes(*args: str, env: dict[str, str] | None = None, cwd: Path | None = None) -> bytes:
