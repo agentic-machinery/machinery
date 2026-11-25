@@ -9,7 +9,7 @@
 #                               (default 240, one deadline for the whole call)
 #
 # Tasks:
-#   postgres  scripts/ci/start_postgres.sh (bubblewrap, PostgreSQL 16, DSN check)
+#   postgres  start_postgres.sh (pinned bubblewrap, image PostgreSQL 18, DSN check)
 #   npm       npm ci --ignore-scripts from the setup-node cache, with bounded
 #             retries (needs setup-node first)
 set -euo pipefail

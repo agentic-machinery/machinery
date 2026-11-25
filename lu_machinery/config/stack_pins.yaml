@@ -162,11 +162,11 @@ pins:
     review_by: "2026-11-16"
     note: No install pin. scripts/lexicon/enrich_manifest.py requires sqlite 3.34.0 or newer for one FTS path.
   - name: postgresql
-    pinned: "16"
-    source: scripts/ci/start_postgres.sh
+    pinned: "18"
+    source: lu_machinery/ci/start_postgres.sh
     owner: DevOps
     review_by: "2026-11-16"
-    note: CI installs the postgresql-16 packages and starts cluster 16/main.
+    note: Machinery CI starts the Ubuntu 26.04 image's PostgreSQL service and verifies cluster 18/main.
   - name: prometheus
     pinned: unknown
     source: host

@@ -30,11 +30,11 @@ Every caller receives the exact same scanner binaries, GitHub Action SHAs and ru
 
 ## Select a runner
 
-The workflow uses `ubuntu-24.04` by default. Set `runs-on` to a JSON string or list of labels to use another Linux x64 runner. This example uses a repository variable for one label and defaults to `ubuntu-24.04` when the variable is unset.
+The workflow uses `ubuntu-26.04` by default. Set `runs-on` to a JSON string or list of labels to use another Linux x64 runner. This example uses a repository variable for one label and defaults to `ubuntu-26.04` when the variable is unset.
 
 ```yaml
 with:
-  runs-on: ${{ toJSON(vars.SECURITY_RUNNER || 'ubuntu-24.04') }}
+  runs-on: ${{ toJSON(vars.SECURITY_RUNNER || 'ubuntu-26.04') }}
 ```
 
 Use a Linux x64 runner with glibc, Bash, curl, jq, and standard GNU utilities, including coreutils, gzip, sed, and tar. Make Git available in `/usr/bin` or `/bin` and Python 3.10 or later at `/usr/bin/python3`. The workflow downloads and verifies its scanner binaries. On a runner without Docker, leave `run-trivy-image` disabled. Use self-hosted runners with private repositories. [GitHub runner guidance](https://docs.github.com/en/actions/how-tos/manage-runners/self-hosted-runners/add-runners)
@@ -53,7 +53,7 @@ Use a Linux x64 runner with glibc, Bash, curl, jq, and standard GNU utilities, i
 
 | Input | Type | Default | Meaning |
 | --- | --- | --- | --- |
-| `runs-on` | string | `'"ubuntu-24.04"'` | JSON runner label or label array for every job. |
+| `runs-on` | string | `'"ubuntu-26.04"'` | JSON runner label or label array for every job. |
 | `run-actionlint` | boolean | `false` | Lint workflows under `workflow-dir` with pinned `actionlint` + `shellcheck`. |
 | `workflow-dir` | string | `.github/workflows` | Repo-relative workflow directory for `actionlint`. |
 | `run-shellcheck` | boolean | `false` | Run pinned `shellcheck` over `shellcheck-paths`. |

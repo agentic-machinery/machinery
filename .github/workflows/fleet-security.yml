@@ -25,7 +25,7 @@ on:
       runs-on:
         description: JSON runner label or label array for every job (Linux x64)
         type: string
-        default: '"ubuntu-24.04"'
+        default: '"ubuntu-26.04"'
       run-actionlint:
         description: Run pinned actionlint (with pinned ShellCheck) over workflow files
         type: boolean
@@ -370,10 +370,6 @@ jobs:
                       value = str(directory / name)
                   elif required and not any(path in candidate for path in choices):
                       sys.exit("::error::Required scanner policy file absent at base and candidate")
-                  elif scanner == "actionlint":
-                      empty_config = directory / "empty-actionlint.yml"
-                      empty_config.write_text("{}\n", encoding="utf-8")
-                      value = str(empty_config)
 
               for path, (mode, oid) in materialize.items():
                   if mode not in regular_modes:
@@ -568,8 +564,18 @@ jobs:
               "-format",
               "{{json .}}",
           ]
+          config = None
           if os.environ.get("GITHUB_EVENT_NAME") in ("pull_request", "merge_group"):
-              cmd.extend(["-config-file", os.environ["TRUSTED_ACTIONLINT_CONFIG"]])
+              config = os.environ["TRUSTED_ACTIONLINT_CONFIG"]
+          elif not any((root / ".github" / name).exists() for name in ("actionlint.yaml", "actionlint.yml")):
+              config = ""
+          if config == "":
+              # Actionlint 1.7.12 predates GitHub's hosted Ubuntu 26.04 label.
+              default_config = work / "actionlint.yaml"
+              default_config.write_text("self-hosted-runner:\n  labels: [ubuntu-26.04]\n", encoding="utf-8")
+              config = str(default_config)
+          if config is not None:
+              cmd.extend(["-config-file", config])
           cmd.extend(["--", *files])
           with open(stdout_file, "wb") as out_fh, open(stderr_file, "wb") as err_fh:
               proc = subprocess.run(

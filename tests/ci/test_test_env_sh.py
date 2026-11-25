@@ -163,107 +163,17 @@ def test_postgres_start_resolves_sibling_from_foreign_cwd(tmp_path: Path) -> Non
     assert "sibling postgres started" in result.stdout
 
 
-def test_cache_lock_progress_does_not_mask_later_mirror_failure(tmp_path: Path) -> None:
-    """A past cache-lock wait must not suppress fallback for a later fetch error."""
-    setup = machinery_path("ci/setup_bubblewrap.sh").read_text()
-    # Only the classifier is evaluated. The host-changing setup body never runs.
-    classifier = setup.split("apt_failure_is_dpkg_lock() {", 1)[1].split("\n}\n", 1)[0]
-    log = tmp_path / "apt.log"
-    log.write_text(
-        "Waiting for cache lock: Could not get lock /var/lib/dpkg/lock-frontend. "
-        "It is held by process 123 (apt-get)\n"
-        "E: Failed to fetch https://mirror.invalid/package.deb Temporary failure resolving\n"
-    )
-    result = subprocess.run(
-        ["bash", "-c", "apt_failure_is_dpkg_lock() {" + classifier + "\n}\n"
-         'apt_failure_is_dpkg_lock 100 "$1"', "_", str(log)],
-        capture_output=True, text=True, timeout=10, check=False,
-    )
-    assert result.returncode == 1, result.stdout + result.stderr
-
-
-def test_snapshot_sources_restrict_components_to_main_and_preserve_integrity() -> None:
-    """Defect class: pulling unneeded archive components or regressing snapshot integrity/retries."""
-    setup = machinery_path("ci/setup_bubblewrap.sh").read_text()
-    sources_block = setup.split('cat > "$apt_dir/ubuntu.sources" <<EOF\n', 1)[1].split(
-        "\nEOF\n", 1
-    )[0]
-    sources = dict(line.split(": ", 1) for line in sources_block.splitlines())
-    assert sources["Components"] == "main"
-    assert sources["Suites"] == "noble noble-updates noble-security"
-    assert sources["Signed-By"] == "/usr/share/keyrings/ubuntu-archive-keyring.gpg"
-    assert sources["Snapshot"] == "no"
-    assert "-o Acquire::Retries=3" in setup
-    assert 'digest="$(read_pin CI_BUBBLEWRAP_SHA256)"' in setup
-    download = 'download_bubblewrap "$snapshot_url" "$apt_dir/$deb" "$digest"'
-    assert setup.index(download) < setup.index('missing+=("$apt_dir/$deb")')
-
-
-def test_snapshot_update_timeout_derives_from_apt_deadline_and_fails_closed() -> None:
-    """Defect class: hardcoded 60 s update cap, budget overrun past apt_deadline, or timeout 0."""
-    setup = machinery_path("ci/setup_bubblewrap.sh").read_text()
-    assert "apt_deadline=$((SECONDS + 195))" in setup
-    assert 'apt_install 55 40 "${missing[@]}"' in setup
-    update_block = setup.split("apt_deadline=$((SECONDS + 195))\n", 1)[1].split(
-        '\n  install_log="$apt_dir/install.log"', 1
-    )[0]
-    assert 'timeout --kill-after=5 "$update_cap"' in update_block
-    assert "--error-on=any" in update_block
-
-    # Only the extracted arithmetic/guard block is evaluated with a shell-function
-    # `sudo` stub; the host-changing setup script and real apt never run.
-    def _eval_update_block(deadline_offset: int, missing_native: int) -> subprocess.CompletedProcess[str]:
-        script = (
-            "set -euo pipefail\n"
-            "snapshot=20261122T000000Z\n"
-            "apt_dir=/unused/apt\n"
-            "apt_opts=(-o Acquire::Retries=3)\n"
-            f"missing_native={missing_native}\n"
-            'sudo() { printf "SUDO:%s\\n" "$*"; return 0; }\n'
-            f"apt_deadline=$((SECONDS + {deadline_offset}))\n"
-            f"{update_block}\n"
-            'printf "APT:%s\\n" "${apt_opts[*]}"\n'
-        )
-        return subprocess.run(
-            ["bash", "-c", script],
-            capture_output=True,
-            text=True,
-            timeout=10,
-            check=False,
-        )
-
-    fresh = _eval_update_block(195, 1)
-    assert fresh.returncode == 0, fresh.stdout + fresh.stderr
-    assert fresh.stdout.startswith("SUDO:timeout --kill-after=5 "), fresh.stdout
-    tokens = fresh.stdout.strip().split()
-    cap = int(tokens[2])
-    assert 129 <= cap <= 130, f"expected derived cap in 129..130, got {cap}"
-    assert "Dir::Etc::sourcelist=/unused/apt/ubuntu.sources" in fresh.stdout.splitlines()[0]
-    # Update cap + 5 s kill grace + first apt_install (55 s + 5 s kill grace) <= 195 s.
-    assert cap + 5 + 55 + 5 <= 195
-
-    for exhausted_offset in (65, 10):
-        exhausted = _eval_update_block(exhausted_offset, 1)
-        assert exhausted.returncode == 1, exhausted.stdout + exhausted.stderr
-        assert "SUDO:" not in exhausted.stdout
-        assert "::error::Could not update package indexes" in exhausted.stderr
-
-    local_only = _eval_update_block(10, 0)
-    assert local_only.returncode == 0, local_only.stdout + local_only.stderr
-    assert local_only.stdout == "APT:-o Acquire::Retries=3 -o Dir::Etc::sourcelist=/dev/null\n"
-
-
 _SNAPSHOT_ORIGIN = "https://snapshot.ubuntu.com/ubuntu/20250101T000000Z"
 _SECURITY_ORIGIN = "https://security.ubuntu.com/ubuntu"
 _DEB_NAME = "bubblewrap_9.9.9-1_amd64.deb"
 
 
-def _download(
-    tmp_path: Path, *, snapshot_503: bool, digest: str,
+def _prepare(
+    tmp_path: Path, *, snapshot_503: bool = False, digest: str, cache_hit: bool = False,
 ) -> subprocess.CompletedProcess[str]:
     setup = machinery_path("ci/setup_bubblewrap.sh").read_text()
-    # Evaluate only the download function. The privileged setup body never runs.
-    download = setup.split("download_bubblewrap() {", 1)[1].split("\n}\n", 1)[0]
+    # Evaluate the two archive functions only. The setup script never runs.
+    functions = setup[setup.index("download_bubblewrap() {"):setup.index("# dpkg has no lock timeout.")]
     return subprocess.run(
         [
             "bash", "-c",
@@ -286,29 +196,84 @@ def _download(
             '}\n'
             'snapshot="$1"\n'
             'snapshot_503="$2"\n'
-            "download_bubblewrap() {" + download + "\n}\n"
-            'download_bubblewrap "$snapshot" "$3" "$4"\n',
-            "_", _SNAPSHOT_ORIGIN, "yes" if snapshot_503 else "no", str(tmp_path / _DEB_NAME), digest,
+            + functions + 'prepare_bubblewrap_package "$snapshot" "$3" "$4" "$5"\n',
+            "_", _SNAPSHOT_ORIGIN, "yes" if snapshot_503 else "no",
+            str(tmp_path / "archive.deb"), _DEB_NAME, digest,
         ],
+        env={**os.environ, "BUBBLEWRAP_CACHE_HIT": "true" if cache_hit else ""},
         capture_output=True, text=True, timeout=10, check=False,
     )
 
 
+def test_bubblewrap_cache_hit_verifies_without_downloading(tmp_path: Path) -> None:
+    """A cache hit must use and verify the existing archive without contacting either mirror."""
+    archive = tmp_path / "archive.deb"
+    archive.write_bytes(b"fixture .deb bytes")
+    result = _prepare(tmp_path, cache_hit=True, digest=sha256(archive.read_bytes()).hexdigest())
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stdout.splitlines() == [f"Verified cached bubblewrap package {_DEB_NAME}"]
+    assert result.stderr == ""
+    assert archive.read_bytes() == b"fixture .deb bytes"
+
+
+def test_bubblewrap_cache_hit_rejects_missing_corrupt_or_linked_archive(tmp_path: Path) -> None:
+    """A cache hit with missing or untrusted bytes must fail without network access."""
+    archive = tmp_path / "archive.deb"
+    digest = sha256(b"fixture .deb bytes").hexdigest()
+
+    missing = _prepare(tmp_path, cache_hit=True, digest=digest)
+    assert missing.returncode == 1, missing.stdout + missing.stderr
+    assert missing.stdout == ""
+    assert "reported a hit without the pinned archive" in missing.stderr
+    assert not archive.exists()
+
+    archive.write_bytes(b"unexpected archive bytes")
+    corrupt = _prepare(tmp_path, cache_hit=True, digest=digest)
+    assert corrupt.returncode == 1, corrupt.stdout + corrupt.stderr
+    assert corrupt.stdout == ""
+    assert "pinned SHA-256" in corrupt.stderr
+    assert archive.read_bytes() == b"unexpected archive bytes"
+
+    archive.unlink()
+    target = tmp_path / "other.deb"
+    target.write_bytes(b"fixture .deb bytes")
+    archive.symlink_to(target)
+    linked = _prepare(tmp_path, cache_hit=True, digest=digest)
+    assert linked.returncode == 1, linked.stdout + linked.stderr
+    assert linked.stdout == ""
+    assert "not a regular file" in linked.stderr
+    assert archive.is_symlink()
+
+
+def test_bubblewrap_installs_only_the_verified_local_archive() -> None:
+    """The CI install must not fetch package indexes or resolve other packages."""
+    setup = machinery_path("ci/setup_bubblewrap.sh").read_text()
+    prepare = 'prepare_bubblewrap_package "$snapshot_url" "$archive" "$deb" "$digest"'
+    install = 'dpkg_with_lock_wait 120 --install -- "$archive"'
+    assert setup.index(prepare) < setup.index(install)
+    assert "apt-get" not in setup
+    assert "dpkg --configure" not in setup
+
+
 def test_bubblewrap_snapshot_503_falls_back_to_official_security_pool(tmp_path: Path) -> None:
     """A failed snapshot transfer must not leave CI dependent on that origin."""
-    result = _download(tmp_path, snapshot_503=True, digest=sha256(b"fixture .deb bytes").hexdigest())
+    result = _prepare(tmp_path, snapshot_503=True, digest=sha256(b"fixture .deb bytes").hexdigest())
     assert result.returncode == 0, result.stdout + result.stderr
     assert "503" in result.stderr
     assert result.stdout.splitlines() == [
-        f"{origin}/pool/main/b/bubblewrap/{_DEB_NAME}" for origin in (_SNAPSHOT_ORIGIN, _SECURITY_ORIGIN)
+        f"{_SNAPSHOT_ORIGIN}/pool/main/b/bubblewrap/{_DEB_NAME}",
+        f"{_SECURITY_ORIGIN}/pool/main/b/bubblewrap/{_DEB_NAME}",
+        f"Verified downloaded bubblewrap package {_DEB_NAME}",
     ]
-    assert (tmp_path / _DEB_NAME).read_bytes() == b"fixture .deb bytes"
+    assert (tmp_path / "archive.deb").read_bytes() == b"fixture .deb bytes"
+    assert sorted(path.name for path in tmp_path.iterdir()) == ["archive.deb"]
 
 
 def test_bubblewrap_hash_mismatch_fails_closed_at_either_source(tmp_path: Path) -> None:
     """An HTTP success must never authorize mismatched bytes or a retry after an integrity failure."""
     for snapshot_503, origins in ((False, (_SNAPSHOT_ORIGIN,)), (True, (_SNAPSHOT_ORIGIN, _SECURITY_ORIGIN))):
-        result = _download(tmp_path, snapshot_503=snapshot_503, digest="0" * 64)
+        result = _prepare(tmp_path, snapshot_503=snapshot_503, digest="0" * 64)
         assert result.returncode == 1, result.stdout + result.stderr
         assert result.stdout.splitlines() == [f"{origin}/pool/main/b/bubblewrap/{_DEB_NAME}" for origin in origins]
         assert f"::error::SHA-256 verification failed for {_DEB_NAME} from {origins[-1]}" in result.stderr
+        assert list(tmp_path.iterdir()) == []
