@@ -96,9 +96,8 @@ def _is_review_task(task: Mapping[str, Any]) -> bool:
 
     An advisory decision (``advisory_role``) is not a review; its consumer checks it.
     """
-    if any(
-        type(value := task.get(key)) is str and value.strip()
-        for key in ("advisory_role", "trial_label", "trial_role", "trial_qualified_task")
+    if task.get("advisory_role") is not None or any(
+        task.get(key) for key in ("trial_label", "trial_role", "trial_qualified_task")
     ):
         return False
     raw_role = task.get("research_role")
@@ -124,23 +123,35 @@ class ReviewRun:
     reply: str | None
 
 
-def _require_record_shape(task_id: str, record: Mapping[str, Any]) -> None:
+def _record_task_id(record: Mapping[str, Any], fallback: str) -> str:
+    recorded = record.get("task_id") if isinstance(record, Mapping) else None
+    return recorded if type(recorded) is str and REVIEW_TASK_ID.fullmatch(recorded) and ".." not in recorded else fallback
+
+
+def _require_record_shape(task_id: str, record: Mapping[str, Any], *, reply: str | None = None) -> None:
     """Check the ledger's wire types before interpreting any review evidence."""
+    if type(task_id) is not str or not REVIEW_TASK_ID.fullmatch(task_id) or ".." in task_id:
+        name = _record_task_id(record, "<unknown>")
+        raise LineageRefused(f"review task {name} has invalid task_id (expected a canonical task id)")
+
     def invalid(field: str, expected: str) -> LineageRefused:
         return LineageRefused(f"review task {task_id} has invalid {field} (expected {expected})")
 
     if not isinstance(record, Mapping):
         raise invalid("record", "a mapping")
-    if "task_id" in record:
-        recorded = record["task_id"]
-        if type(recorded) is not str or recorded != task_id or not REVIEW_TASK_ID.fullmatch(recorded) or ".." in recorded:
-            raise invalid("task_id", "the run's canonical task id")
+    if "task_id" in record and _record_task_id(record, "") != task_id:
+        raise invalid("task_id", "the run's canonical task id")
+    if reply is not None and type(reply) is not str:
+        raise invalid("reply", "a string or null")
     status = record.get("status")
-    if type(status) is not str or not status.strip():
+    if "status" in record and (type(status) is not str or not status.strip()):
         raise invalid("status", "a non-empty string")
+    repository = record.get("repository")
+    if "repository" in record and (type(repository) is not str or normalize_repository(repository) == "unknown"):
+        raise invalid("repository", "a recognizable repository name when present")
 
     for field in (
-        "agent", "model", "resolved_model", "resolved_model_source", "run_nonce", "mode", "repository",
+        "agent", "model", "resolved_model", "resolved_model_source", "run_nonce", "mode",
         "review_branch", "worktree_branch", "review_mode", "review_profile", "review_author_model", "review_risk",
         "research_role", "research_task_family", "task_family", "advisory_role", "type", "trial_label", "trial_role",
         "trial_qualified_task", "provider_terminal_status", "never_started_reason", "output_schema_path",
@@ -205,9 +216,7 @@ def _read_run(path: Path, record: Mapping[str, Any]) -> ReviewRun:
     is always the ``<stem>.result`` beside it (``stale_task_records._sidecar_names``),
     never another run's reply under the bare task id.
     """
-    recorded = record.get("task_id")
-    task_id = recorded if type(recorded) is str and recorded else path.stem
-    _require_record_shape(task_id, record)
+    task_id = _record_task_id(record, path.stem)
     result = path.with_suffix(".result")
     try:
         descriptor = os.open(result, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
@@ -349,6 +358,7 @@ def _warn_identical_copies(copies: list[tuple[str, str]]) -> None:
 
 def _review_records(task_root: Path, *, repository: str) -> list[tuple[Path, dict[str, Any]]]:
     paths = [*sorted((task_root / ARCHIVE_DIR_NAME).glob("*.json")), *sorted(task_root.glob("*.json"))]
+    repository = normalize_repository(repository)
     records = []
     copies: list[tuple[str, str]] = []
     try:
@@ -374,13 +384,17 @@ def _review_records(task_root: Path, *, repository: str) -> list[tuple[Path, dic
                 raise LineageRefused(f"task record {path.name} unreadable: {exc}") from None
             if not isinstance(record, dict):
                 continue
-            if record.get("status") in ("dry_run", "dry-run") or not _is_review_task(record):
+            if record.get("status") in ("dry_run", "dry-run"):
                 continue
-            if not isinstance(record.get("repository"), str) or normalize_repository(
-                record["repository"]
-            ) != normalize_repository(repository):
+            recorded_repository = record.get("repository")
+            if "repository" not in record:
                 continue
-            records.append((path, record))
+            if type(recorded_repository) is str and normalize_repository(recorded_repository) not in (repository, "unknown"):
+                continue
+            # An invalid repository or role cannot establish that this is another repository's work or a non-review.
+            _require_record_shape(_record_task_id(record, path.stem), record)
+            if _is_review_task(record):
+                records.append((path, record))
     finally:
         _warn_identical_copies(copies)
     return records
@@ -406,17 +420,15 @@ def lineage_runs(
         with task_archive_lock(task_root):
             if records is None:
                 records = _review_records(task_root, repository=repository)
-            runs = []
-            for path, record in records:
-                pr = record.get("pr")
-                if type(pr) is int and 1 <= pr <= _INT32_MAX:
-                    belongs = pr == number
-                else:
-                    # A corrupt PR number cannot hide a run that the recorded branch identifies.
-                    belongs = branch in _review_branches(record)
-                if belongs:
-                    runs.append(_read_run(path, record))
-            return runs
+            else:
+                for path, record in records:
+                    _require_record_shape(_record_task_id(record, path.stem), record)
+            return [
+                _read_run(path, record)
+                for path, record in records
+                if (number is not None and record.get("pr") == number)
+                or (record.get("pr") is None and branch in _review_branches(record))
+            ]
     except OSError as exc:
         raise LineageRefused(f"task ledger unavailable: {exc}") from None
 
@@ -907,7 +919,7 @@ def check_lineage(
     round being recorded, which is not part of the lineage before it.
     """
     for run in runs:
-        _require_record_shape(run.task_id, run.record)
+        _require_record_shape(run.task_id, run.record, reply=run.reply)
     markers = [item for item in _trusted_markers(comments, login) if item[1]["sha"] != exclude_head]
     try:
         failures = [event for event in capability_failure.events(comments, login) if event.sha != exclude_head]

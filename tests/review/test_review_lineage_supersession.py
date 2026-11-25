@@ -147,6 +147,7 @@ class UnhashableString(str):
         pytest.param("schema_version", None, id="schema_version-null"),
         pytest.param("review_attempt", {}, id="review_attempt-empty"),
         pytest.param("status", "", id="status-empty"),
+        pytest.param("status", None, id="status-null"),
         pytest.param("status", UnhashableString("done"), id="status-str-subclass"),
         pytest.param("agent", UnhashableString("codex"), id="agent-str-subclass"),
         pytest.param("model", "", id="model-empty"),
@@ -156,16 +157,52 @@ class UnhashableString(str):
         pytest.param("result_sha256", "A" * 64, id="result_sha256-uppercase"),
         pytest.param("output_schema_sha256", "a" * 63, id="output_schema_sha256-short"),
         pytest.param("output_schema_path", "", id="output_schema_path-empty"),
+        pytest.param("run.task_id", [], id="run-task_id-list"),
+        pytest.param("run.task_id", UnhashableString("malformed-r1"), id="run-task_id-str-subclass"),
+        pytest.param("run.reply", b"VERDICT: APPROVE", id="run-reply-bytes"),
+        pytest.param("run.reply", UnhashableString("VERDICT: APPROVE"), id="run-reply-str-subclass"),
+        pytest.param("disk.repository", ["org/repo"], id="disk-repository-list"),
+        pytest.param("disk.repository", " ", id="disk-repository-blank"),
+        pytest.param("disk.repository", None, id="disk-repository-null"),
+        pytest.param("disk.repository", "invalid-slug", id="disk-repository-invalid-slug"),
+        pytest.param("disk.research_role", ["review"], id="disk-role-list"),
+        pytest.param("disk.advisory_role", {}, id="disk-advisory-role-dict"),
+        pytest.param("disk.pr", "1398", id="disk-pr-string"),
+        pytest.param("disk.review_branch", [], id="disk-branch-list"),
+        pytest.param("supplied.pr", "1398", id="supplied-pr-string"),
+        pytest.param("supplied.review_branch", [], id="supplied-branch-list"),
     ],
 )
-def test_check_lineage_refuses_malformed_record_fields(field, value):
+def test_check_lineage_refuses_malformed_record_fields(field, value, tmp_path):
     """Defect class: malformed task-record values crash or bypass the review lineage gate."""
     run, comment = review("malformed-r1", APPROVED, "VERDICT: APPROVE", minute=1)
     record = {**run.record, "returncode": -15, "orphaned_child_tasks": [], "unknown_child_tasks": []}
-    damaged = ReviewRun(run.task_id, {**record, field: value}, run.reply)
-
-    with pytest.raises(LineageRefused, match=rf"\bmalformed-r1\b.*\b{field}\b"):
-        check_lineage(runs=[damaged], comments=[comment], login="fleet", approved=APPROVED)
+    source, _, name = field.rpartition(".")
+    task = "<unknown>" if field == "run.task_id" else run.task_id
+    with pytest.raises(LineageRefused, match=rf"review task {task} .*\b{name}\b"):
+        if source in {"disk", "supplied"}:
+            record.update(schema_version=2, repository="org/repo", review_branch="codex/other")
+            if name == "research_role":
+                record.pop("review_profile")
+                record["review_branch"] = "codex/target"
+            elif name not in {"pr", "review_branch"}:
+                record["pr"] = 1398
+            record[name] = value
+            path = tmp_path / f"{run.task_id}.json"
+            if source == "disk":
+                path.write_text(json.dumps(record))
+                path.with_suffix(".result").write_text(run.reply)
+            records = [(path, record)] if source == "supplied" else None
+            selected = lineage_runs(tmp_path, repository="org/repo", number=1398, branch="codex/target", records=records)
+        elif field == "run.task_id":
+            # A legacy record can leave its task identity to the enclosing run.
+            del record["task_id"]
+            selected = [ReviewRun(value, record, run.reply)]
+        elif field == "run.reply":
+            selected = [ReviewRun(run.task_id, record, value)]
+        else:
+            selected = [ReviewRun(run.task_id, {**record, name: value}, run.reply)]
+        check_lineage(runs=selected, comments=[comment], login="fleet", approved=APPROVED)
 
 
 def test_lineage_keeps_the_reply_when_a_listed_review_moves_to_archive(tmp_path, monkeypatch):
