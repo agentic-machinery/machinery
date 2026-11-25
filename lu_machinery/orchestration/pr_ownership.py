@@ -430,7 +430,7 @@ def load(path: Path, *, strict_keys: bool = False) -> dict[str, Any]:
         attempts = data.setdefault("heal_attempts", {})
         if not isinstance(attempts, dict):
             raise TypeError("heal_attempts")
-        normalized_attempts = {}
+        normalized_attempts: dict[str, dict[str, Any]] = {}
         for key, row in attempts.items():
             if (
                 not isinstance(key, str) or not isinstance(row, dict)

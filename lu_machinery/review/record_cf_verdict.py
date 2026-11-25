@@ -14,7 +14,7 @@ import subprocess
 import sys
 import time
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from functools import cache, partial
@@ -75,6 +75,8 @@ from lu_machinery.orchestration.fleet_repos import (
     FleetRepo,
     FleetRepoError,
     load_fleet_repos,
+    repository_identity,
+    repository_slugs,
     resolve_fleet_repo_by_slug,
     resolve_payload_fleet_repo,
     same_repository,
@@ -1717,14 +1719,23 @@ def _repo_root() -> Path:
 @contextmanager
 def pr_lock(repository: str, number: int, lock_root: Path):
     """Serialize publication on one PR across its heads, so the comments a poster checked still hold."""
+    repositories = {repository}
+    try:
+        aliases = repository_slugs(repository)
+        identity = repository_identity(repository) if aliases else None
+    except FleetRepoError as exc:
+        raise RecordError("fleet repository identity is unavailable") from exc
+    if isinstance(identity, int):
+        # An older recorder still locks the slug it knows. Hold those files in the same order.
+        repositories.update(aliases)
+        repositories.add(str(identity))
     lock_root.mkdir(parents=True, exist_ok=True)
-    name = hashlib.sha256(f"{repository}\0pr\0{number}".encode()).hexdigest() + ".lock"
-    with (lock_root / name).open("a+") as lock_file:
-        fcntl.flock(lock_file, fcntl.LOCK_EX)
-        try:
-            yield
-        finally:
-            fcntl.flock(lock_file, fcntl.LOCK_UN)
+    with ExitStack() as locks:
+        for spelling in sorted(repositories):
+            name = hashlib.sha256(f"{spelling}\0pr\0{number}".encode()).hexdigest() + ".lock"
+            lock_file = locks.enter_context((lock_root / name).open("a+"))
+            fcntl.flock(lock_file, fcntl.LOCK_EX)
+        yield
 
 
 def _coverage_tokens(

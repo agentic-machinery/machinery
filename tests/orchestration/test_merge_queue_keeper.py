@@ -1817,6 +1817,8 @@ def test_pr_ci_infra_failure_alerts_without_rerun(tmp_path: Path) -> None:
 
 def test_ejected_repaired_head_reenqueues_once_only_with_repair_evidence(tmp_path: Path) -> None:
     """Defect class: ejected PR's approved repaired head re-enqueues without repair evidence, fails to re-enqueue with it, or re-enqueues twice."""
+    from lu_machinery.review import repair_round
+
     head_c = "c" * 40
     mq_cfg = _direct_cfg(repository="unit/public", allow_infra_reenqueue=True)
 
@@ -1834,6 +1836,28 @@ def test_ejected_repaired_head_reenqueues_once_only_with_repair_evidence(tmp_pat
     )
     assert not failed_np and "enqueue" not in mutations(no_proof) and "re-enqueue" not in mutations(no_proof)
     assert "#42 held: queued-before" in lines_np
+
+    # A consumed legacy receipt remains proof at the current slug for the same PR and heads.
+    old, current = "learn-ukrainian/machinery", "agentic-machinery/machinery"
+    receipts = tmp_path / "repair_receipts"
+    legacy = {
+        "schema": repair_round.RECEIPT_SCHEMA,
+        "repository": old,
+        "pr": 42,
+        "lineage_keys": [f"pr:{old}#42"],
+        "approved_head": HEAD_A,
+        "candidate_head": HEAD_B,
+    }
+    repair_round.record_admission(receipts, legacy)
+    repair_round.record_consumption(receipts, legacy, comment="fixture")
+    assert keeper._default_repair_proof(
+        no_proof, canonical_repo=current, number=42, head=HEAD_B, base_name="main", head_branch="codex/x",
+        comments=[], verdict_login="fixture", repair_receipt_root=receipts, ejected_heads=[HEAD_A],
+    ) == "repair-verified"
+    assert keeper._default_repair_proof(
+        no_proof, canonical_repo=current, number=43, head=HEAD_B, base_name="main", head_branch="codex/x",
+        comments=[], verdict_login="fixture", repair_receipt_root=receipts, ejected_heads=[HEAD_A],
+    ) is None
 
     # 2. Real git repo for F5 (cryptographic binding of REPAIR_VERIFIED digest to ejected head)
     # and F8 (isolated fetch clean-base-merge proof from base-only keeper checkout), with timeouts on all git calls.
