@@ -2368,6 +2368,9 @@ def test_scan_turn_children_skips_foreign_json_and_fails_closed_on_damaged_recor
     (task_store / "other-receipt.json").write_text(
         json.dumps({"schema": "proof.v1", "task_id": "unrelated-task"}), encoding="utf-8"
     )
+    (task_store / "review-findings.json").write_text(
+        json.dumps({"schema_version": "code-review-findings.v1", "findings": []}), encoding="utf-8"
+    )
     (task_store / "empty-list.json").write_text("[]", encoding="utf-8")
     arch_dir = task_store / "archive"
     arch_dir.mkdir()
@@ -2390,7 +2393,7 @@ def test_scan_turn_children_skips_foreign_json_and_fails_closed_on_damaged_recor
     assert "unreadable_child_records" not in turn
     assert len(releases) == 1
 
-    # Damaged, non-strict, non-object and invalid-identity files in hot and archive still fail closed.
+    # Damaged, non-strict, non-object, symlinked, and invalid-identity/invalid-schema files fail closed.
     (task_store / "bad-truncated.json").write_text("{", encoding="utf-8")
     (task_store / "bad-blank.json").write_text("   \n", encoding="utf-8")
     (task_store / "bad-array.json").write_text("[1, 2]", encoding="utf-8")
@@ -2399,6 +2402,18 @@ def test_scan_turn_children_skips_foreign_json_and_fails_closed_on_damaged_recor
     (task_store / "bad-legacy-no-id.json").write_text(
         json.dumps({"agent": "claude", "status": "running"}), encoding="utf-8"
     )
+    # R1-F1 defect class: a .json symlink to a regular foreign JSON file must still fail closed.
+    foreign_target = tmp_path / "external-foreign.json"
+    foreign_target.write_text(json.dumps({"schema": "ac-policy.v1", "rules": []}), encoding="utf-8")
+    (task_store / "bad-symlink-foreign.json").symlink_to(foreign_target)
+    (arch_dir / "arch-symlink-foreign.json").symlink_to(foreign_target)
+    # R1-F2 defect class: a partial child record with an invalid string schema_version and lifecycle fields
+    # (missing task_id) must fail closed rather than being classified foreign.
+    partial_bad_schema = json.dumps({
+        "schema_version": "2", "parent_task_id": turn["task_id"], "status": "running", "run_nonce": "rn-partial",
+    })
+    (task_store / "bad-partial-schema.json").write_text(partial_bad_schema, encoding="utf-8")
+    (arch_dir / "arch-partial-schema.json").write_text(partial_bad_schema, encoding="utf-8")
     (arch_dir / "arch-array-record.json").write_text('[{"task_id": "c1"}]', encoding="utf-8")
     (arch_dir / "arch-foreign-inf.json").write_text('{"x": Infinity}', encoding="utf-8")
     (arch_dir / "arch-legacy-no-id.json").write_text(
@@ -2413,6 +2428,10 @@ def test_scan_turn_children_skips_foreign_json_and_fails_closed_on_damaged_recor
         "bad-scalar.json",
         "bad-foreign-nan.json",
         "bad-legacy-no-id.json",
+        "bad-symlink-foreign.json",
+        "bad-partial-schema.json",
+        "archive/arch-symlink-foreign.json",
+        "archive/arch-partial-schema.json",
         "archive/arch-array-record.json",
         "archive/arch-foreign-inf.json",
         "archive/arch-legacy-no-id.json",

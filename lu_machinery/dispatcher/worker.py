@@ -830,7 +830,6 @@ def _scan_turn_children(record: dict) -> dict:
     from lu_machinery.orchestration.dispatch_admission import (
         _is_valid_run_identity,
         is_safe_identical_copy,
-        read_regular_task_record_bytes,
         scan_record_candidates,
     )
     from lu_machinery.orchestration.task_record_store import (
@@ -881,10 +880,22 @@ def _scan_turn_children(record: dict) -> dict:
         elif unsettled := _terminal_child_unsettled_state(other):
             (live if unsettled == "live" else unknown).append(child_id)
 
+    def read_regular_no_follow(path: Path) -> bytes:
+        flags = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_CLOEXEC", 0)
+        fd = os.open(path, flags)
+        try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                raise ValueError(f"non-regular task record {path.name}")
+        except BaseException:
+            os.close(fd)
+            raise
+        with os.fdopen(fd, "rb") as handle:
+            return handle.read()
+
     def scan_entry(listed: Path, label_prefix: str, key_prefix: str) -> None:
         label = f"{label_prefix}{listed.name}"
         try:
-            raw = read_regular_task_record_bytes(listed)
+            raw = read_regular_no_follow(listed)
             parsed = parse_task_record(listed, raw)
         except TaskIdentityMismatch as exc:
             if not is_safe_identical_copy(exc):
