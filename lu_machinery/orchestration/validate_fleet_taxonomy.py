@@ -6,6 +6,8 @@ from __future__ import annotations
 import argparse
 import functools
 import json
+import os
+import stat
 import sys
 from pathlib import Path
 from typing import Any
@@ -17,7 +19,6 @@ if __package__ in {None, ""}:  # run as a file (launchers do): the repository ro
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from lu_machinery.common import json_depth, profile
 from lu_machinery.common.repo_root import machinery_path
-from lu_machinery.orchestration.preparation_evidence import UniqueKeyLoader
 
 # The packaged copies; readers resolve the active profile at call time unless overridden.
 _PACKAGED_TAXONOMY_PATH = machinery_path("config/fleet_taxonomy.yaml")
@@ -50,9 +51,75 @@ class FleetTaxonomyValidationError(ValueError):
     """Raised when fleet taxonomy or area assignments validation fails (a ``ValueError``, like the loaders' errors)."""
 
 
+class _NoDuplicateKeySafeLoader(yaml.SafeLoader):
+    """SafeLoader that rejects literal duplicate keys in source mappings while preserving ``<<`` merge overrides."""
+
+    def __init__(self, stream: str) -> None:
+        super().__init__(stream)
+        self._checked_mapping_nodes: set[int] = set()
+        self._flattening_nodes: set[int] = set()
+
+    def flatten_mapping(self, node: yaml.nodes.MappingNode) -> None:
+        node_id = id(node)
+        if node_id in self._flattening_nodes:
+            raise FleetTaxonomyValidationError("YAML merge anchor contains itself")
+        if node_id not in self._checked_mapping_nodes:
+            self._checked_mapping_nodes.add(node_id)
+            seen: set[object] = set()
+            for key_node, _ in node.value:
+                if key_node.tag == "tag:yaml.org,2002:merge":
+                    continue
+                key: object = (
+                    "="
+                    if key_node.tag == "tag:yaml.org,2002:value"
+                    else self.construct_object(key_node, deep=True)
+                )
+                if key in seen:
+                    raise FleetTaxonomyValidationError(f"duplicate YAML key: {key!r}")
+                seen.add(key)
+        self._flattening_nodes.add(node_id)
+        try:
+            super().flatten_mapping(node)
+        finally:
+            self._flattening_nodes.discard(node_id)
+
+
+def read_regular_file_bytes(path: Path) -> tuple[Path, bytes]:
+    """Read bytes from a regular file without blocking on FIFOs or other special files."""
+    try:
+        st = os.stat(path)
+    except OSError as exc:
+        raise FleetTaxonomyValidationError(f"Cannot read {path}: {exc}") from exc
+    if not stat.S_ISREG(st.st_mode):
+        raise FleetTaxonomyValidationError(f"Not a regular file: {path}")
+    flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
+    try:
+        fd = os.open(path, flags)
+    except OSError as exc:
+        raise FleetTaxonomyValidationError(f"Cannot read {path}: {exc}") from exc
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise FleetTaxonomyValidationError(f"Not a regular file: {path}")
+        fh = os.fdopen(fd, "rb")
+        fd = -1
+        with fh:
+            content = fh.read()
+        resolved = path.resolve()
+    except FleetTaxonomyValidationError:
+        raise
+    except (OSError, RuntimeError) as exc:
+        raise FleetTaxonomyValidationError(f"Cannot read {path}: {exc}") from exc
+    finally:
+        if fd >= 0:
+            os.close(fd)
+    return resolved, content
+
+
 def _load_yaml_bytes(content: bytes, source: Path) -> dict[str, Any]:
     try:
-        data = yaml.load(content.decode("utf-8"), Loader=UniqueKeyLoader)
+        data = yaml.load(content.decode("utf-8"), Loader=_NoDuplicateKeySafeLoader)
+    except FleetTaxonomyValidationError:
+        raise
     except Exception as exc:
         raise FleetTaxonomyValidationError(f"YAML parse error in {source}: {exc}") from exc
     if not isinstance(data, dict):
@@ -83,20 +150,14 @@ def _load_yaml_bytes(content: bytes, source: Path) -> dict[str, Any]:
 
 
 def _load_yaml(path: Path) -> dict[str, Any]:
-    try:
-        content = path.read_bytes()
-    except (OSError, RuntimeError) as exc:
-        raise FleetTaxonomyValidationError(f"Cannot read {path}: {exc}") from exc
+    _, content = read_regular_file_bytes(path)
     return _load_yaml_bytes(content, path)
 
 
 def _load_schema(path: Path) -> dict[str, Any]:
+    _, content = read_regular_file_bytes(path)
     try:
-        raw = path.read_text(encoding="utf-8")
-    except (OSError, RuntimeError) as exc:
-        raise FleetTaxonomyValidationError(f"Cannot read schema {path}: {exc}") from exc
-    try:
-        data = json_depth.loads(raw, max_depth=512)
+        data = json_depth.loads(content.decode("utf-8"), max_depth=512)
     except Exception as exc:
         raise FleetTaxonomyValidationError(f"JSON parse error in schema {path}: {exc}") from exc
     if not isinstance(data, dict):
@@ -116,11 +177,7 @@ def _compiled_validator(schema_path: Path, content: bytes) -> Draft202012Validat
 
 
 def _schema_validator(schema_path: Path) -> Draft202012Validator:
-    try:
-        resolved = schema_path.resolve()
-        content = resolved.read_bytes()
-    except (OSError, RuntimeError) as exc:
-        raise FleetTaxonomyValidationError(f"Cannot read schema {schema_path}: {exc}") from exc
+    resolved, content = read_regular_file_bytes(schema_path)
     return _compiled_validator(resolved, content)
 
 

@@ -1539,3 +1539,35 @@ def test_validate_fleet_taxonomy_refuses_deeply_nested_acyclic_aliases_without_r
         )["ok"]
         is True
     )
+
+    # Valid YAML merge overrides (<<: *defaults with explicit id override) remain valid.
+    merge_taxonomy = tmp_path / "merge_taxonomy.yaml"
+    merge_taxonomy.write_text(
+        "schema_version: 1\nareas:\n"
+        "  atlas: &defaults\n    id: atlas\n    aliases: [atlas-alias]\n    epics: []\n"
+        "  other:\n    <<: *defaults\n    id: other\n    aliases: [other-alias]\n",
+        encoding="utf-8",
+    )
+    assert (
+        validate_fleet_taxonomy.validate_fleet_taxonomy(
+            taxonomy_path=merge_taxonomy,
+            assignments_path=shared_assignments,
+        )["ok"]
+        is True
+    )
+    assert fleet_taxonomy.load_fleet_taxonomy(merge_taxonomy).areas["other"].id == "other"
+
+    # Nonregular paths (e.g. a named pipe with no writer) fail closed immediately without blocking.
+    fifo = tmp_path / "taxonomy.fifo"
+    os.mkfifo(fifo)
+    assert (
+        validate_fleet_taxonomy.main(
+            ["--taxonomy", str(fifo), "--assignments", str(valid_assignments), "--json"]
+        )
+        == 1
+    )
+    fifo_payload = json.loads(capsys.readouterr().out)
+    assert fifo_payload["ok"] is False
+    assert "Not a regular file" in fifo_payload["error"]
+    with pytest.raises(fleet_taxonomy.FleetTaxonomyError, match="Not a regular file"):
+        fleet_taxonomy.load_fleet_taxonomy(fifo)

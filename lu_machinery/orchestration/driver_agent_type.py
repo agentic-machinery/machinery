@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import functools
 import os
+import stat
 import sys
 from pathlib import Path
 
@@ -29,6 +30,7 @@ from lu_machinery.orchestration.fleet_taxonomy import FleetTaxonomyError, defaul
 from lu_machinery.orchestration.validate_fleet_taxonomy import (
     FleetTaxonomyValidationError,
     parse_validated_assignments_bytes,
+    read_regular_file_bytes,
 )
 
 _PACKAGED_ASSIGNMENTS_PATH = machinery_path("config/area_assignments.yaml")
@@ -57,18 +59,40 @@ def _parse_assignments(path: Path, content: bytes) -> dict[str, tuple[str, tuple
     }
 
 
+def _inspect_optional_registry_path(path: Path) -> bool:
+    """Return ``False`` only when ``path`` is genuinely absent with no broken symlink components.
+
+    Raises :class:`DriverAgentConfigError` on permission errors, non-directory parents,
+    dangling symlinks (at any path component) or symlink loops.
+    """
+    cur = Path(path.anchor) if path.is_absolute() else Path.cwd()
+    parts = path.parts[1:] if path.is_absolute() else path.parts
+    for part in parts:
+        if part in ("", "."):
+            continue
+        cur = cur / part
+        try:
+            st = os.lstat(cur)
+        except FileNotFoundError:
+            return False
+        except OSError as exc:
+            raise DriverAgentConfigError(f"cannot inspect {path}: {exc}") from exc
+        if stat.S_ISLNK(st.st_mode):
+            try:
+                os.stat(cur)
+            except OSError as exc:
+                raise DriverAgentConfigError(f"cannot follow symlink component {cur} of {path}: {exc}") from exc
+    return True
+
+
 def _canonical_area_for_alias(lane: str, taxonomy_path: Path) -> str | None:
     """Map a stream alias to its canonical area id via ``fleet_taxonomy.yaml``.
 
     An absent file has no aliases; unreadable paths, dangling symlinks and invalid content
     raise :class:`DriverAgentConfigError`.
     """
-    try:
-        os.lstat(taxonomy_path)
-    except FileNotFoundError:
+    if not _inspect_optional_registry_path(taxonomy_path):
         return None
-    except OSError as exc:
-        raise DriverAgentConfigError(f"cannot inspect {taxonomy_path}: {exc}") from exc
     try:
         area = load_fleet_taxonomy(taxonomy_path).alias_to_area.get(lane)
     except FleetTaxonomyError as exc:
@@ -87,17 +111,12 @@ def resolve_driver_agent_type(
     if not lane:
         return None
     resolved_assignments = _default_assignments_path() if assignments_path is None else assignments_path
-    try:
-        os.lstat(resolved_assignments)
-    except FileNotFoundError:
+    if not _inspect_optional_registry_path(resolved_assignments):
         return None
-    except OSError as exc:
-        raise DriverAgentConfigError(f"cannot inspect {resolved_assignments}: {exc}") from exc
     try:
-        content = resolved_assignments.read_bytes()
-        resolved_key = resolved_assignments.resolve()
-    except (OSError, RuntimeError) as exc:
-        raise DriverAgentConfigError(f"cannot read {resolved_assignments}: {exc}") from exc
+        resolved_key, content = read_regular_file_bytes(resolved_assignments)
+    except FleetTaxonomyValidationError as exc:
+        raise DriverAgentConfigError(str(exc)) from exc
 
     assignments = _parse_assignments(resolved_key, content)
 

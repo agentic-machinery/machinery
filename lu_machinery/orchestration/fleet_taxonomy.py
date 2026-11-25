@@ -15,6 +15,7 @@ from lu_machinery.common.repo_root import machinery_path
 from lu_machinery.orchestration.validate_fleet_taxonomy import (
     FleetTaxonomyValidationError,
     parse_validated_taxonomy_bytes,
+    read_regular_file_bytes,
 )
 
 _PACKAGED_TAXONOMY_PATH = machinery_path("config/fleet_taxonomy.yaml")
@@ -74,9 +75,8 @@ def load_fleet_taxonomy(taxonomy_path: Path | None = None) -> TaxonomyRegistry:
         except profile.ProfileError as exc:
             raise FleetTaxonomyError(f"Fleet taxonomy unavailable: {exc}") from exc
     try:
-        path = taxonomy_path.resolve()
-        content = path.read_bytes()
-    except (OSError, RuntimeError) as exc:
+        path, content = read_regular_file_bytes(taxonomy_path)
+    except FleetTaxonomyValidationError as exc:
         raise FleetTaxonomyError(f"Fleet taxonomy file not found or unreadable: {exc}") from exc
     return _parse_fleet_taxonomy(path, content)
 

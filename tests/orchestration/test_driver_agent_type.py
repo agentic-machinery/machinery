@@ -191,6 +191,40 @@ def test_present_assignments_file_without_assignments_mapping_raises_config_erro
     finally:
         locked_dir.chmod(0o755)
 
+    # Dangling parent symlink must also fail closed (exit 2) for both taxonomy and assignments.
+    dangling_parent = tmp_path / "dangling-parent"
+    dangling_parent.symlink_to(tmp_path / "gone-dir")
+    with pytest.raises(DriverAgentConfigError):
+        resolve_driver_agent_type(
+            "review-alias",
+            assignments_path=valid_assignments,
+            taxonomy_path=dangling_parent / "fleet_taxonomy.yaml",
+        )
+    assert (
+        main(
+            [
+                "--lane",
+                "review-alias",
+                "--assignments",
+                str(valid_assignments),
+                "--taxonomy",
+                str(dangling_parent / "fleet_taxonomy.yaml"),
+            ]
+        )
+        == 2
+    )
+    with pytest.raises(DriverAgentConfigError):
+        resolve_driver_agent_type("atlas", assignments_path=dangling_parent / "area_assignments.yaml")
+    assert main(["--lane", "atlas", "--assignments", str(dangling_parent / "area_assignments.yaml")]) == 2
+
+    # A valid symlinked parent directory whose target file is genuinely absent still returns None / exits 1.
+    real_dir = tmp_path / "real-dir"
+    real_dir.mkdir()
+    good_parent = tmp_path / "good-parent"
+    good_parent.symlink_to(real_dir)
+    assert resolve_driver_agent_type("atlas", assignments_path=good_parent / "absent.yaml") is None
+    assert main(["--lane", "atlas", "--assignments", str(good_parent / "absent.yaml")]) == 1
+
 
 def test_unreadable_file_returns_none(tmp_path: Path) -> None:
     assert resolve_driver_agent_type("infra", assignments_path=tmp_path / "absent.yaml") is None

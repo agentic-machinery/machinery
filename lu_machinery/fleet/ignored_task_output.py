@@ -629,7 +629,10 @@ def succession_streams(path: Path | None = None) -> tuple[dict[str, str], str]:
     Exact keys only; a malformed file, duplicate key or an initiator listed under
     two streams refuses the whole map rather than choosing one.
     """
-    raw = (default_succession_map_path() if path is None else path).read_bytes()
+    target = default_succession_map_path() if path is None else path
+    if not stat.S_ISREG(os.stat(target).st_mode):
+        raise ValueError("succession map unreadable")
+    raw = target.read_bytes()
     try:
         data = yaml.load(raw.decode("utf-8"), Loader=UniqueKeyLoader)  # SafeLoader subclass
     except Exception as exc:
