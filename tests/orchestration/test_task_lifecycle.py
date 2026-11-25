@@ -3741,3 +3741,7 @@ def test_write_lifecycle_and_lock_refuse_direct_task_store_and_load_reads_existi
     assert task_closeout.main(["bind-pr", "--state-file", str(file_target_link), "--pr", "77", "--now", NOW]) == 2
     assert orig_path.read_bytes() == before
     assert not (tmp_path / "state-link.lock").exists()
+    # A spelling the kernel refuses outright (too long, from redundant separators) is refused, not normalised.
+    too_long = f"{orig_path.parent}{'/' * 5000}{orig_path.name}"
+    assert task_closeout.main(["bind-pr", "--state-file", too_long, "--pr", "77", "--now", NOW]) == 2
+    assert orig_path.read_bytes() == before
