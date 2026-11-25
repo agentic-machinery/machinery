@@ -178,7 +178,8 @@ def test_session_start_hook_wires_the_guard() -> None:
         / "session-setup.sh"
     )
     text = hook.read_text(encoding="utf-8")
-    assert '-m lu_machinery.hygiene.root_entry_guard --repo-root "$CANONICAL_ROOT" --json' in text
+    assert 'ROOT_GUARD_ROOT="$CANONICAL_ROOT"' in text
+    assert '-m lu_machinery.hygiene.root_entry_guard --repo-root "$ROOT_GUARD_ROOT" --json' in text
     assert "ROOT HYGIENE" in text
     # Evidence preservation: the hook must not turn the guard into a deleter.
     guard_block = text[text.index("Root-hygiene canary"):]
