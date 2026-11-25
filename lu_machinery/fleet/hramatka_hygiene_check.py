@@ -141,14 +141,25 @@ def _gh_issue(
     return data
 
 
+# The pointer is a whole token, bounded by allowlists: it starts at the text's start, whitespace or ASCII
+# punctuation other than ``#-./@_`` (so never inside another owner, path or word), and ends at the text's
+# end, whitespace or ASCII punctuation other than ``_`` (so never inside another number or word, of any script).
+_POINTER_START = r"(?<![^\s!\"$%&'()*+,:;<=>?\[\\\]^`{|}~])"
+_POINTER_END = r"(?![^\s!-/:-@\[-^`{-~])"
+
+
 def _pointer_pattern(private_repos: tuple[str, ...], private_board: int) -> re.Pattern[str]:
     """The board pointer at any of ``private_repos`` (the live spellings of the board's repository).
 
-    Whole tokens only: ``owner/board`` never matches inside ``new-owner/board``, nor ``#349`` inside ``#3490``
-    or ``#349a``. A URL's ``/`` before the owner and punctuation after the number still bound the token.
+    Two forms, each a whole token: ``owner/board#349`` and the issue URL ``https://github.com/owner/board/issues/349``.
+    ``owner/board`` never matches inside ``new-owner/board`` or another URL's path, nor ``#349`` inside ``#3490``
+    or ``#349é``.
     """
-    forms = [re.escape(f"{repo}{sep}{private_board}") for repo in private_repos for sep in ("#", "/issues/")]
-    return re.compile(r"(?<![A-Za-z0-9_.-])(?:" + "|".join(forms) + r")(?![A-Za-z0-9_])")
+    forms = [form for repo in private_repos for form in (
+        re.escape(f"{repo}#{private_board}"),
+        r"https?://(?:www\.)?github\.com/" + re.escape(f"{repo}/issues/{private_board}"),
+    )]
+    return re.compile(_POINTER_START + "(?:" + "|".join(forms) + ")" + _POINTER_END)
 
 
 def _count_task_list_items(body: str) -> tuple[int, int]:

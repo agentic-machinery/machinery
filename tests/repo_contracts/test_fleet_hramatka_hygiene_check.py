@@ -248,9 +248,11 @@ def test_stale_when_349_pointer_missing(hermetic_repo) -> None:
     assert receipt["status"] == "stale"
     assert receipt["queue_pointer_ok"] is False
     assert any("pointer" in reason for reason in receipt["reasons"])
-    # Defect class: the pointer matched as a substring of another repository or another issue number.
-    for near_miss in (f"other-{PRIVATE}#{BOARD}", f"https://github.com/x{PRIVATE}/issues/{BOARD}",
-                      f"{PRIVATE}#{BOARD}0", f"{PRIVATE}/issues/{BOARD}1", f"{PRIVATE}#{BOARD}a"):
+    # Defect class: the pointer matched inside a longer token (another owner, URL path, number or word, any script).
+    for near_miss in (f"other-{PRIVATE}#{BOARD}", f"é{PRIVATE}#{BOARD}", f"https://github.com/x{PRIVATE}/issues/{BOARD}",
+                      f"https://github.com/o/r/blob/main/{PRIVATE}/issues/{BOARD}", f"{PRIVATE}/issues/{BOARD}",
+                      f"{PRIVATE}#{BOARD}0", f"https://github.com/{PRIVATE}/issues/{BOARD}1", f"{PRIVATE}#{BOARD}a",
+                      f"{PRIVATE}#{BOARD}é"):
         reader = _reader({(PUBLIC, EPIC): {"number": EPIC, "body": f"Queue: {near_miss} here."},
                           (PRIVATE, BOARD): {"number": BOARD, "body": ""}})
         assert hygiene.hygiene_check(reader=reader, **_base_kwargs(repo_root, tasks_dir))["queue_pointer_ok"] is False
