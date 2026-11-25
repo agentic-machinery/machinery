@@ -799,11 +799,38 @@ def _prepare_recovery(verb, fields, dest, cwd, environment, runner):
     from lu_machinery.orchestration.integration_sweep import changes_learner_content, lookup_verdict, pr_file_paths
 
     # An inactive, ambiguous or selector-less spelling is refused before any evidence read.
-    _fleet_catalog_entry(dest, environment)
+    catalog_entry = _fleet_catalog_entry(dest, environment)
+
+    def _single_required_workflow() -> str | None:
+        if catalog_entry is None:
+            return None
+        raw = catalog_entry[1].get("required_workflow", recovery.DEFAULT_REQUIRED_WORKFLOW)
+        if isinstance(raw, str):
+            workflow = raw
+        elif isinstance(raw, list) and len(raw) == 1 and isinstance(raw[0], str):
+            workflow = raw[0]
+        else:
+            return None
+        return workflow if recovery.is_valid_workflow_path(workflow) else None
+
+    def _valid_artifact_listing(listing: object) -> bool:
+        return (
+            isinstance(listing, dict)
+            and type(listing.get("total_count")) is int
+            and listing["total_count"] >= 0
+            and isinstance(listing.get("artifacts"), list)
+            and listing["total_count"] == len(listing["artifacts"])
+            and all(
+                isinstance(row, dict) and isinstance(row.get("name"), str) and bool(row["name"].strip())
+                for row in listing["artifacts"]
+            )
+        )
 
     artifacts_cache: dict[int, dict] = {}
+    jobs_complete = False
 
     def fetch(name, **selectors):
+        nonlocal jobs_complete
         unknown = "RECOVERY_LOOKUP_UNKNOWN: live evidence unavailable"
         if verb == "run-rerun" and name == "run":
             unknown += "; Actions run lookup failed; --number requires an Actions run ID, not a PR number"
@@ -812,14 +839,9 @@ def _prepare_recovery(verb, fields, dest, cwd, environment, runner):
                 sel_num = selectors.get("number")
                 cached = artifacts_cache.get(sel_num) if set(selectors) == {"number"} and type(sel_num) is int else None
                 listing = cached if cached is not None else fetch("run-artifacts", **selectors)
+                if not _valid_artifact_listing(listing):
+                    raise ValueError("partial or malformed artifact listing")
                 artifacts = listing["artifacts"]
-                if (
-                    type(listing["total_count"]) is not int
-                    or listing["total_count"] != len(artifacts)
-                    or not isinstance(artifacts, list)
-                    or not all(isinstance(row, dict) for row in artifacts)
-                ):
-                    raise ValueError("partial artifact listing")
                 matches = [row for row in artifacts if row.get("name") == "ci-queue-candidate"]
                 if len(matches) != 1:
                     raise ValueError("missing or ambiguous queue candidate artifact")
@@ -870,13 +892,23 @@ def _prepare_recovery(verb, fields, dest, cwd, environment, runner):
                 ):
                     raise ValueError("jobs pagination incomplete")
                 collected = [job for page in value for job in page["jobs"]]
+                if not all(isinstance(job, dict) for job in collected):
+                    raise ValueError("jobs row malformed")
                 totals = [page["total_count"] for page in value if "total_count" in page]
-                if totals and (
-                    len(totals) != len(value)
-                    or any(type(total) is not int or total < 0 for total in totals)
-                    or len(collected) != totals[-1]
-                ):
-                    raise ValueError("jobs pagination incomplete")
+                if totals:
+                    if (
+                        len(totals) != len(value)
+                        or any(type(total) is not int or total < 0 for total in totals)
+                        or len(set(totals)) != 1
+                        or len(collected) != totals[0]
+                    ):
+                        raise ValueError("jobs pagination incomplete")
+                    ids = [job.get("id") for job in collected]
+                    if any(type(job_id) is not int or job_id <= 0 for job_id in ids) or len(set(ids)) != totals[0]:
+                        raise ValueError("jobs pagination incomplete or duplicate job IDs")
+                    jobs_complete = True
+                else:
+                    jobs_complete = False
                 return collected
             return value
         except github_client.GitHubRateLimited:
@@ -954,6 +986,7 @@ def _prepare_recovery(verb, fields, dest, cwd, environment, runner):
     failed_run = run
     live_jobs: list[dict] | None = None
     cancelled_no_artifact = False
+    required_workflow = _single_required_workflow()
     failure_conclusions = {"failure", "cancelled", "timed_out", "action_required", "startup_failure"}
 
     def load_jobs() -> list[dict]:
@@ -965,14 +998,7 @@ def _prepare_recovery(verb, fields, dest, cwd, environment, runner):
     def load_artifacts_listing() -> dict:
         if run_id not in artifacts_cache:
             listing = fetch("run-artifacts", number=run_id)
-            if (
-                not isinstance(listing, dict)
-                or type(listing.get("total_count")) is not int
-                or listing["total_count"] < 0
-                or not isinstance(listing.get("artifacts"), list)
-                or listing["total_count"] != len(listing["artifacts"])
-                or not all(isinstance(row, dict) for row in listing["artifacts"])
-            ):
+            if not _valid_artifact_listing(listing):
                 raise gate.PublishBlocked("RECOVERY_LOOKUP_UNKNOWN: live evidence unavailable")
             artifacts_cache[run_id] = listing
         return artifacts_cache[run_id]
@@ -995,7 +1021,10 @@ def _prepare_recovery(verb, fields, dest, cwd, environment, runner):
             raise
         jobs_check = load_jobs()
         if (
-            not recovery.cancelled_merge_group_without_failure(failed_run, jobs_check)
+            not jobs_complete
+            or not recovery.cancelled_merge_group_without_failure(
+                failed_run, jobs_check, required_workflow=required_workflow
+            )
             or any(
                 isinstance(job, dict) and job.get("conclusion") in failure_conclusions
                 for job in jobs_check
@@ -1035,7 +1064,9 @@ def _prepare_recovery(verb, fields, dest, cwd, environment, runner):
         listing = load_artifacts_listing()
         candidate_matches = [row for row in listing["artifacts"] if row.get("name") == "ci-queue-candidate"]
         if not candidate_matches:
-            if recovery.cancelled_merge_group_without_failure(failed_run, jobs):
+            if jobs_complete and recovery.cancelled_merge_group_without_failure(
+                failed_run, jobs, required_workflow=required_workflow
+            ):
                 cancelled_no_artifact = True
             else:
                 raise gate.PublishBlocked("RECOVERY_LOOKUP_UNKNOWN: live evidence unavailable")
@@ -4959,63 +4990,18 @@ def publish(
                     except Exception:
                         raise gate.PublishBlocked("QUEUE_STATE_UNKNOWN: enqueue refused before publication") from None
                     if in_queue:
-                        entry = before.get("mergeQueueEntry")
-                        entry_commit = entry.get("headCommit") if isinstance(entry, dict) else None
-                        entry_oid = entry_commit.get("oid") if isinstance(entry_commit, dict) else None
-                        if not isinstance(entry_oid, str) or entry_oid.lower() != evidence["tested_sha"].lower():
-                            raise gate.PublishBlocked(
-                                "RECOVERY_QUEUE_STATE_MISMATCH: PR is queued on a different or unknown merge-group candidate"
-                            )
+                        raise gate.PublishBlocked(
+                            "RECOVERY_STILL_QUEUED: PR is still in the merge queue and GitHub offers no "
+                            "candidate-conditional dequeue; verify the queue entry and run pr-dequeue manually "
+                            "before retrying recovery"
+                        )
                     try:
                         jump = queue_jump(before, number, head)
                     except github_client.GitHubRateLimited:
                         raise
                     except Exception:
                         print("queue-jump: priority evidence unreadable; enqueuing without jump", file=sys.stderr)
-                    recovery.consume(path, dest, number, head, action, {**evidence, "dequeued": in_queue})
-                    if in_queue:
-                        dequeue_payload = temp / "dequeue.json"
-                        dequeue_payload.write_bytes(json.dumps({
-                            "query": "mutation($id:ID!){dequeuePullRequest(input:{id:$id}){clientMutationId}}",
-                            "variables": {"id": default["id"]},
-                        }).encode("utf-8"))
-                        dequeue_argv = [
-                            "gh", "api", "--method", "POST", "graphql", "--input", str(dequeue_payload),
-                            *_hostname_flag(dest),
-                        ]
-                        dequeue_result = _send(
-                            dequeue_argv,
-                            environment=environment,
-                            runner=runner,
-                            cwd=cwd,
-                            capture_output=True,
-                            text=True,
-                            check=check,
-                            timeout=timeout,
-                        )
-                        if dequeue_result.returncode != 0:
-                            if not capture_output:
-                                if dequeue_result.stdout:
-                                    sys.stdout.write(str(dequeue_result.stdout))
-                                if dequeue_result.stderr:
-                                    sys.stderr.write(str(dequeue_result.stderr))
-                            elif not text:
-                                dequeue_result = subprocess.CompletedProcess(
-                                    dequeue_result.args,
-                                    dequeue_result.returncode,
-                                    str(dequeue_result.stdout or "").encode("utf-8"),
-                                    str(dequeue_result.stderr or "").encode("utf-8"),
-                                )
-                            return dequeue_result
-                        try:
-                            parsed_dequeue = github_client.parse_graphql_envelope(dequeue_result.stdout)
-                            if not isinstance(parsed_dequeue.get("data", {}).get("dequeuePullRequest"), dict):
-                                raise ValueError("missing dequeuePullRequest data")
-                        except Exception:
-                            raise gate.PublishBlocked(
-                                "RECOVERY_DEQUEUE_FAILED: dequeue returned malformed or error GraphQL response; "
-                                "check queue state before acting"
-                            ) from None
+                    recovery.consume(path, dest, number, head, action, evidence)
                     enqueue_payload = temp / "enqueue.json"
                     enqueue_payload.write_bytes(json.dumps({
                         "query": "mutation($id:ID!,$head:GitObjectID!){enqueuePullRequest(input:"
@@ -5302,9 +5288,10 @@ def _parse_args(argv):
                 "Outputs: requests a GitHub rerun with --failed on the original pinned run, not the latest PR head.\n"
                 "  PR recovery requires an eligible failed run, current-head approval and posted failure evidence.\n"
                 "  It consumes the one PR-head recovery allowance for reruns before sending the write.\n"
-                "  A completed cancelled merge_group run with no failing job or step and no ci-queue-candidate artifact\n"
-                "  recovers instead through the same one-per-head allowance by dequeueing (if still queued on that\n"
-                "  candidate) and enqueueing once at the approved PR head after the merge-readiness gates pass.\n"
+                "  A completed cancelled merge_group run of the configured CI workflow with no failing job or step and\n"
+                "  no ci-queue-candidate artifact recovers instead through the same one-per-head allowance by enqueueing\n"
+                "  once at the approved PR head after the merge-readiness gates pass (when still queued, it refuses with\n"
+                "  RECOVERY_STILL_QUEUED without consuming the allowance so the owner can run pr-dequeue manually).\n"
                 "  An unclassified run lookup failure stays RECOVERY_LOOKUP_UNKNOWN, sends no write and consumes no allowance.\n"
                 "Exit codes: 0 request accepted, job results unverified; 1 gh failure;\n"
                 "  2 invalid input, unknown lookup, policy refusal or transport error.\n"

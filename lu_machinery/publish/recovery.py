@@ -18,14 +18,28 @@ MARKER = re.compile(r"<!-- ci-recovery-evidence\s+(\{.*?\})\s*-->", re.S)
 SHA = re.compile(r"[0-9a-f]{40}\Z")
 RECOVERY_ACTIONS = frozenset({"run-rerun", "re-enqueue"})
 CANCELLED_MERGE_GROUP_RECOVERY_MODE = "cancelled_merge_group_no_artifact"
+DEFAULT_REQUIRED_WORKFLOW = ".github/workflows/ci.yml"
+_WORKFLOW_PATH = re.compile(r"\.github/workflows/[A-Za-z0-9._-]+\.ya?ml\Z")
 _MERGE_GROUP_BRANCH = re.compile(r"gh-readonly-queue/(main)/pr-[1-9][0-9]*-[0-9a-f]{40}")
 _CLEAN_CANCELLED_JOB_CONCLUSIONS = frozenset({"success", "skipped", "neutral", "cancelled"})
 _CLEAN_CANCELLED_STEP_CONCLUSIONS = frozenset({None, "success", "skipped", "neutral", "cancelled"})
 
 
-def cancelled_merge_group_without_failure(run: object, jobs: object) -> bool:
-    """True only for a completed cancelled merge-group run with zero failing jobs or steps."""
+def is_valid_workflow_path(value: object) -> bool:
+    """True when *value* is a single `.github/workflows/<file>.yml|.yaml` path."""
+    return isinstance(value, str) and bool(_WORKFLOW_PATH.fullmatch(value))
+
+
+def cancelled_merge_group_without_failure(
+    run: object,
+    jobs: object,
+    *,
+    required_workflow: str | None = None,
+) -> bool:
+    """True only for a completed cancelled merge-group run of the configured CI workflow with zero failing jobs or steps."""
     if not isinstance(run, dict) or not isinstance(jobs, list):
+        return False
+    if not is_valid_workflow_path(required_workflow):
         return False
     if (
         run.get("event") != "merge_group"
@@ -33,6 +47,10 @@ def cancelled_merge_group_without_failure(run: object, jobs: object) -> bool:
         or run.get("conclusion") != "cancelled"
     ):
         return False
+    raw_path = run.get("path")
+    if not isinstance(raw_path, str) or raw_path.split("@", 1)[0] != required_workflow:
+        return False
+    run_id = run.get("id")
     branch = run.get("head_branch")
     head = run.get("head_sha")
     if not isinstance(branch, str) or not _MERGE_GROUP_BRANCH.fullmatch(branch):
@@ -44,17 +62,21 @@ def cancelled_merge_group_without_failure(run: object, jobs: object) -> bool:
             return False
         if type(job.get("id")) is not int or job["id"] <= 0:
             return False
-        if "status" in job and job["status"] != "completed":
+        if "run_id" in job and (type(job["run_id"]) is not int or job["run_id"] != run_id):
+            return False
+        if job.get("status") != "completed":
             return False
         if job.get("conclusion") not in _CLEAN_CANCELLED_JOB_CONCLUSIONS:
             return False
-        if "steps" in job:
-            steps = job["steps"]
-            if not isinstance(steps, list):
+        if "steps" not in job or not isinstance(job["steps"], list):
+            return False
+        for step in job["steps"]:
+            if (
+                not isinstance(step, dict)
+                or "conclusion" not in step
+                or step["conclusion"] not in _CLEAN_CANCELLED_STEP_CONCLUSIONS
+            ):
                 return False
-            for step in steps:
-                if not isinstance(step, dict) or step.get("conclusion") not in _CLEAN_CANCELLED_STEP_CONCLUSIONS:
-                    return False
     return True
 
 
