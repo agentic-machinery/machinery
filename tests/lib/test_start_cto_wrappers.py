@@ -1092,13 +1092,16 @@ def test_cto_successor_signature_binds_the_launch_mode(tmp_path: Path, monkeypat
     args = ["--epic", "epics", "--model", "claude-opus-5-5", "--effort", "high", "kick", "--",
             "--dangerously-skip-permissions", "--append-system-prompt", "role"]
 
+    written = iter(range(1, 100))
+
     def template(launcher: Path | str, repo: Path = workspace) -> Path:
+        """A wrapper file of its own per call, so each row is checked with its own contents."""
         source = _WORKSPACE_TEMPLATE
         for key, value in {"REPO": str(repo), "CFG": str(config), "LAUNCHER": str(launcher),
                            "MODEL": "claude-opus-5-5", "EFFORT": "high", "KICK": "kick",
                            "ACCOUNT": str(tmp_path / "account")}.items():
             source = source.replace("@" + key + "@", shlex.quote(value))
-        path = tmp_path / "lu-start-cto"
+        path = tmp_path / f"lu-start-cto-{next(written)}"
         path.write_text(source)
         return path
 
@@ -1113,6 +1116,8 @@ def test_cto_successor_signature_binds_the_launch_mode(tmp_path: Path, monkeypat
     alias.symlink_to(workspace)
     renamed = tmp_path / "cto-launcher"
     renamed.symlink_to(package_wrapper)
+    stale = tmp_path / "stale-package-link"
+    stale.symlink_to(tmp_path / "removed-package")
     for wrapper, root, entry in (
         (template(stray), workspace, stray),  # a wrapper copy outside the package
         (template(package_wrapper), workspace, stray),  # an entrypoint other than the named launcher
@@ -1122,6 +1127,7 @@ def test_cto_successor_signature_binds_the_launch_mode(tmp_path: Path, monkeypat
         (template(f"{package_wrapper}/"), workspace, package_wrapper),  # exec of this spelling fails
         (template(f"{package_wrapper.parent}//{package_wrapper.name}"), workspace, package_wrapper),
         (template(f"{package_wrapper.parent}/./{package_wrapper.name}"), workspace, package_wrapper),
+        (template(f"{stale}/{package_wrapper.name}"), workspace, package_wrapper),  # a path exec cannot reach
     ):
         with pytest.raises(SupervisorError, match="cto-wrapper-unsupported"):
             cto_wrapper_signature(wrapper, root, entry, args)

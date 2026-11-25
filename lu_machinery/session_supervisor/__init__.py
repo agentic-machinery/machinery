@@ -129,7 +129,8 @@ def cto_wrapper_signature(wrapper: Path, root: Path, entrypoint: Path, args: lis
             # start-claude-cto.sh whose physical directory is the package: compare those
             # spellings, never resolved ones that the launcher would refuse.
             # Each literal is checked as the shell will use it: exec runs LAUNCHER as written,
-            # so a trailing slash, an empty, dot or dot-dot segment, or a doubled slash refuses.
+            # so a trailing slash, an empty, dot or dot-dot segment, a doubled slash, or a path
+            # that does not reach the package wrapper as an executable file now refuses.
             literal = policy["LAUNCHER"]
             directory, _, name = literal.rpartition("/")
             if (
@@ -140,6 +141,9 @@ def cto_wrapper_signature(wrapper: Path, root: Path, entrypoint: Path, args: lis
                 or "/../" in literal + "/"
                 or name != _CTO_PACKAGE_WRAPPER.name
                 or Path(os.path.realpath(directory or "/")) != _CTO_PACKAGE_WRAPPER.parent
+                or not os.path.isfile(literal)
+                or not os.access(literal, os.X_OK)
+                or Path(os.path.realpath(literal)) != _CTO_PACKAGE_WRAPPER
                 or entrypoint.name != _CTO_PACKAGE_WRAPPER.name
             ):
                 raise ValueError("unsupported workspace intent")

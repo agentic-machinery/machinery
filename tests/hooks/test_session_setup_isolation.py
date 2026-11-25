@@ -427,6 +427,8 @@ def test_workspace_session_reads_its_account_memory_and_writes_state_to_the_stat
 
     assert deploy_issues() == []
     (workspace / ".claude" / "rules" / "stray.md").write_text("stray\n")
+    # An inherited Git context naming another checkout cannot redirect the workspace check.
+    drift_env["GIT_DIR"] = str(primary / ".git")
     assert deploy_issues() == [
         "- DEPLOY DRIFT: 1 file(s) differ in this workspace's deployment. Run: "
         '"$LEARN_UKRAINIAN_PYTHON" -I -m lu_machinery.agent_deploy --workspace --project-root <workspace>'

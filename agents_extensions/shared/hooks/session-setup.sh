@@ -147,7 +147,10 @@ INFO=()
 if [ -n "${CODEX_CANONICAL_REPO_ROOT:-}" ]; then
   CANONICAL_ROOT="$CODEX_CANONICAL_REPO_ROOT"
 else
-  GIT_COMMON_DIR=$(_hook_deadline 2 git -C "$PROJECT_DIR" rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)
+  GIT_COMMON_DIR=""
+  if ! context_outside_checkouts "$PROJECT_DIR"; then
+    GIT_COMMON_DIR=$(_hook_deadline 2 git -C "$PROJECT_DIR" rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)
+  fi
   if [ -n "$GIT_COMMON_DIR" ] && [ "$(basename "$GIT_COMMON_DIR")" = ".git" ]; then
     CANONICAL_ROOT=$(dirname "$GIT_COMMON_DIR")
   else
@@ -411,7 +414,10 @@ unset ROOT_GUARD_RC ROOT_GUARD_JSON
 # replaced by '-', under its configuration directory (CLAUDE_CONFIG_DIR, one per
 # account, else ~/.claude).
 MEMORY_PROJECT="${CLAUDE_PROJECT_DIR:-$PROJECT_DIR}"
-MEMORY_GIT_COMMON=$(_hook_deadline 2 git -C "$MEMORY_PROJECT" rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)
+MEMORY_GIT_COMMON=""
+if ! context_outside_checkouts "$MEMORY_PROJECT"; then
+  MEMORY_GIT_COMMON=$(_hook_deadline 2 git -C "$MEMORY_PROJECT" rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)
+fi
 if [ -n "$MEMORY_GIT_COMMON" ] && [ "$(basename "$MEMORY_GIT_COMMON")" = ".git" ]; then
   MEMORY_PROJECT=$(dirname "$MEMORY_GIT_COMMON")
 fi
@@ -433,8 +439,7 @@ fi
 # root may be configured separately), else the product checkout, as before.
 DEPLOY_TARGET="$PROJECT_DIR"
 DEPLOY_CHECK_MODE=()
-if [ -n "${CLAUDE_PROJECT_DIR:-}" ] \
-  && [ -z "$(_hook_deadline 2 git -C "$CLAUDE_PROJECT_DIR" rev-parse --git-common-dir 2>/dev/null || true)" ]; then
+if [ -n "${CLAUDE_PROJECT_DIR:-}" ] && context_outside_checkouts "$CLAUDE_PROJECT_DIR"; then
   DEPLOY_TARGET="$CLAUDE_PROJECT_DIR"
   DEPLOY_CHECK_MODE=(--workspace)
 fi

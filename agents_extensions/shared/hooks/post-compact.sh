@@ -45,7 +45,10 @@ BOUNDED_RUNNER=""
 post_compact_bootstrap() {
   [ -n "$BOUNDED_PYTHON" ] && return 0
   context_machinery_bootstrap "${LU_PRODUCT_ROOT:-${CLAUDE_PROJECT_DIR:-}}" || exit 1
-  GIT_COMMON_DIR=$(git_common_dir) || GIT_COMMON_DIR=""
+  GIT_COMMON_DIR=""
+  if ! context_outside_checkouts "$PROJECT_DIR"; then
+    GIT_COMMON_DIR=$(git_common_dir) || GIT_COMMON_DIR=""
+  fi
   PRIMARY_ROOT=""
   if [ -n "$GIT_COMMON_DIR" ] && [ "$(basename "$GIT_COMMON_DIR")" = ".git" ]; then
     PRIMARY_ROOT=$(dirname "$GIT_COMMON_DIR")
@@ -230,7 +233,10 @@ fi
 # directory (CLAUDE_CONFIG_DIR, one per account, else ~/.claude); resolved
 # exactly as session-setup.sh resolves it.
 MEMORY_PROJECT="${CLAUDE_PROJECT_DIR:-$PROJECT_DIR}"
-MEMORY_GIT_COMMON=$(git_common_dir "$MEMORY_PROJECT") || MEMORY_GIT_COMMON=""
+MEMORY_GIT_COMMON=""
+if ! context_outside_checkouts "$MEMORY_PROJECT"; then
+  MEMORY_GIT_COMMON=$(git_common_dir "$MEMORY_PROJECT") || MEMORY_GIT_COMMON=""
+fi
 if [ -n "$MEMORY_GIT_COMMON" ] && [ "$(basename "$MEMORY_GIT_COMMON")" = ".git" ]; then
   MEMORY_PROJECT=$(dirname "$MEMORY_GIT_COMMON")
 fi

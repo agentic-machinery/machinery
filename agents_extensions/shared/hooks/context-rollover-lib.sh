@@ -231,12 +231,30 @@ context_canonical_root() {
     printf '%s\n' "$CODEX_CANONICAL_REPO_ROOT"
     return 0
   fi
+  if context_outside_checkouts "$project_dir"; then
+    context_state_root "$project_dir"
+    return
+  fi
   git_common_dir=$(git -C "$project_dir" rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)
   if [ -n "$git_common_dir" ] && [ "$(basename "$git_common_dir")" = ".git" ]; then
     dirname "$git_common_dir"
   else
     context_state_root "$project_dir"
   fi
+}
+
+# True when <dir> is an existing directory outside every checkout: no .git entry
+# (directory, file or symlink) at its physical path or any ancestor, the rule the
+# launcher and the deployer's workspace mode use. Decided from the filesystem only,
+# so an inherited GIT_DIR or GIT_WORK_TREE cannot make a workspace look like one.
+context_outside_checkouts() {
+  local dir
+  dir="$(_context_physical_dir "${1:-}")" || return 1
+  while :; do
+    [ ! -e "$dir/.git" ] && [ ! -L "$dir/.git" ] || return 1
+    [ -n "$dir" ] && [ "$dir" != / ] || return 0
+    dir="${dir%/*}"
+  done
 }
 
 # The runtime-state root for a project directory outside every checkout: the
