@@ -229,7 +229,7 @@ are the tie-breakers.
     every finding blocking or non-blocking by real impact and likelihood; a theoretical edge case
     that an existing safety net already bounds is non-blocking. Every driver and reviewer applies
     the concrete [review stopping rule](../skills/drive-epic/references/review-merge-cleanup.md#review-stopping-rule)
-    for review scope, blockers, tracked follow-ups and approach changes.
+    for review scope, blockers, follow-ups and approach changes.
     When two designs both meet the outcome, pick the one that is
     easier to understand, test and undo. "Adequate" still means every quality gate above passes.
 16. **Authentic Ukrainian sources are used; their rights are decided, never a blocker.** The curriculum
