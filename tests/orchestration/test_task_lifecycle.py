@@ -13,6 +13,7 @@ from pathlib import Path
 import pytest
 
 from lu_machinery.orchestration import task_closeout, task_identity, task_lifecycle
+from tests.test_fleet_repos import transferred_catalog
 
 NOW = "2026-07-16T10:00:00Z"
 HEAD = "a" * 40
@@ -774,6 +775,108 @@ def test_merged_pr_with_open_issue_is_nonterminal() -> None:
     assert result["state"] == "MERGED"
     assert result["disposition"] == "waiting"
     assert "actually closed issue" in " ".join(result["waiting"])
+
+
+@pytest.mark.parametrize(("record", "field", "path"), [
+    ("identity", "github_issue_url", "issues/42"),
+    ("pr", "url", "pull/77"),
+])
+def test_stored_lifecycle_url_accepts_only_the_bound_repository(monkeypatch, record, field, path):
+    """Defect class: the ledger misidentifies a saved issue or PR URL after a transfer."""
+    transferred_catalog(monkeypatch)
+    ledger = _ledger()
+    ledger[record][field] = f"https://github.com/neworg/repo/{path}"
+    assert task_lifecycle.validate_lifecycle(ledger) == ledger
+
+    ledger[record][field] = f"https://github.com/other/repo/{path}"
+    with pytest.raises(task_lifecycle.LifecycleError, match="URL does not match repository and"):
+        task_lifecycle.validate_lifecycle(ledger)
+
+
+@pytest.mark.parametrize(("site", "blocker"), [
+    ("repository", "authoritative GitHub repository does not match task identity"),
+    ("issue", "authoritative GitHub issue URL does not match task identity"),
+    ("pr", "authoritative PR does not match the lifecycle binding"),
+    ("comments", "AC-REVIEW: review receipt URL is absent from authoritative PR comments"),
+])
+def test_merged_reconciliation_matches_each_observed_repository_across_transfer(monkeypatch, site, blocker):
+    """Defect class: a valid live field blocks a pre-transfer ledger, or a foreign field clears it."""
+    transferred_catalog(monkeypatch)
+    ledger = _add(_ready_evidence(_ledger()), "AC-MERGE", "github")
+    observation = _observation(_body(checked=True), pr_state="MERGED")
+    github = observation["github"]
+    target, key = (
+        (github, "repository") if site == "repository"
+        else (github["comments"][0] if site == "comments" else github[site], "url")
+    )
+    original = target[key]
+    target[key] = original.replace("org/repo", "neworg/repo")
+    updated, receipt, _ = task_lifecycle.reconcile(ledger, observation, now=NOW)
+    assert receipt["state"] == "MERGED"
+    assert receipt["hard_blockers"] == []
+    for field in ("identity", "pr", "evidence"):
+        assert updated[field] == ledger[field]
+
+    target[key] = original.replace("org/repo", "other/repo")
+    result = task_lifecycle.evaluate(ledger, observation)
+    assert result["state"] == "BLOCKED_WITH_RECEIPT"
+    assert blocker in result["hard_blockers"]
+
+
+@pytest.mark.parametrize("supersedes", [False, True], ids=["evidence-subject", "supersession"])
+def test_evidence_binding_accepts_a_subject_under_either_registered_slug(monkeypatch, supersedes):
+    """Defect class: evidence or its correction refuses an unchanged repository after a transfer."""
+    transferred_catalog(monkeypatch)
+    ledger = _add(_ledger(), "AC-IMPL", "test")
+    record = ledger["evidence"][0]
+    record["subject"]["repository"] = "neworg/repo"
+    record["id"] = task_lifecycle.digest(task_lifecycle._evidence_payload(record))
+
+    if supersedes:
+        corrected, replacement = _replacement(ledger, record)
+        assert corrected["evidence"] == [record, replacement]
+        assert replacement["subject"]["repository"] == "org/repo"
+    else:
+        assert task_lifecycle.validate_lifecycle(ledger)["evidence"] == [record]
+    record["subject"]["repository"] = "other/repo"
+    record["id"] = task_lifecycle.digest(task_lifecycle._evidence_payload(record))
+    with pytest.raises(task_lifecycle.LifecycleError, match="evidence repository does not match task identity"):
+        task_lifecycle.validate_lifecycle(ledger)
+
+
+@pytest.mark.parametrize("site", ["issue-repository", "epic-repository", "unchanged-thread"])
+def test_successor_binding_keeps_the_pre_transfer_ledger_binding(tmp_path, monkeypatch, site):
+    """Defect class: a transfer splits the issue's ledger or is mistaken for a successor thread."""
+    transferred_catalog(monkeypatch)
+    predecessor = _ledger()
+    successor = deepcopy(predecessor["identity"])
+    if site != "epic-repository":
+        successor.update(repository="neworg/repo", github_issue_url="https://github.com/neworg/repo/issues/42")
+    if site != "issue-repository":
+        successor["stream_epic_url"] = "https://github.com/neworg/repo/issues/10"
+    if site != "unchanged-thread":
+        successor.update(replacement_task_id="thread-successor", generation=3)
+    kwargs = {
+        "identity": successor,
+        "author_family": predecessor["author_family"],
+        "ac_snapshot": predecessor["ac_snapshot"],
+        "required_checks": predecessor["required_checks"],
+        "pr_number": None,
+        "archive_path": tmp_path / "predecessor.json",
+        "archive_sha256": task_lifecycle.digest(predecessor),
+        "now": NOW,
+    }
+
+    if site == "unchanged-thread":
+        with pytest.raises(task_lifecycle.EvidencePolicyError, match="successor identity equals the predecessor"):
+            task_lifecycle.bind_successor(predecessor, **kwargs)
+    else:
+        bound = task_lifecycle.bind_successor(predecessor, **kwargs)
+        assert bound["lifecycle_id"] == predecessor["lifecycle_id"]
+        assert bound["pr"] == predecessor["pr"]
+        assert bound["identity"] == {
+            **predecessor["identity"], "replacement_task_id": "thread-successor", "generation": 3,
+        }
 
 
 def test_auto_close_keyword_is_not_treated_as_issue_closeout() -> None:
@@ -3032,11 +3135,15 @@ def _seat_comment(family: str, url: str, *, author_model: str = "claude-opus-5-5
         "missing_separate_review_evidence",
         "singular_reviewer_without_chunks",
         "chunk_identity_mismatch",
+        "transferred_seat_chunk_urls",
+        "transferred_separate_review_urls",
         "stale_head",
     ],
 )
-def test_ukrainian_behavior_proof_reconciles_recorded_seat_quorum(tmp_path: Path, case: str) -> None:
+def test_ukrainian_behavior_proof_reconciles_recorded_seat_quorum(tmp_path: Path, monkeypatch, case: str) -> None:
     """Reconciliation accepts the chunked seat set bound to pr.head_sha, and nothing thinner."""
+    if case in {"transferred_seat_chunk_urls", "transferred_separate_review_urls"}:
+        transferred_catalog(monkeypatch)
     google_url = "https://github.com/org/repo/pull/77#issuecomment-11"
     openai_url = "https://github.com/org/repo/pull/77#issuecomment-12"
     comments = [
@@ -3060,7 +3167,10 @@ def test_ukrainian_behavior_proof_reconciles_recorded_seat_quorum(tmp_path: Path
             },
         )
     else:
-        reference = _ukrainian_receipt(tmp_path, head=HEAD, comments=comments[1:])
+        seat_comments = comments[1:]
+        if case == "transferred_seat_chunk_urls":
+            seat_comments = [{**item, "url": item["url"].replace("org/repo", "neworg/repo")} for item in seat_comments]
+        reference = _ukrainian_receipt(tmp_path, head=HEAD, comments=seat_comments)
         if case in {"chunk_identity_mismatch", "merge_commit_sha_rejected"}:
             path = Path(reference["behavior_proof_receipt"]["receipt_path"])
             receipt = json.loads(path.read_text(encoding="utf-8"))
@@ -3081,6 +3191,8 @@ def test_ukrainian_behavior_proof_reconciles_recorded_seat_quorum(tmp_path: Path
     )
     if case != "missing_separate_review_evidence":
         for url, family in ((google_url, "google"), (openai_url, "openai")):
+            if case == "transferred_separate_review_urls":
+                url = url.replace("org/repo", "neworg/repo")
             ledger = _add(
                 ledger,
                 "AC-REVIEW",
@@ -3095,7 +3207,9 @@ def test_ukrainian_behavior_proof_reconciles_recorded_seat_quorum(tmp_path: Path
         observation["github"]["pr"]["head_sha"] = "d" * 40
     result = task_lifecycle.evaluate(ledger, observation)
     blockers = " ".join(result["hard_blockers"])
-    if case in {"open_pr_head_sha", "merged_pr_same_head_sha"}:
+    if case in {
+        "open_pr_head_sha", "merged_pr_same_head_sha", "transferred_seat_chunk_urls", "transferred_separate_review_urls",
+    }:
         assert "behavior_proof" in result["valid_evidence"]["AC-IMPL"]
         assert "behavior-proof" not in blockers
         assert "ukrainian" not in blockers
@@ -3455,8 +3569,6 @@ def test_stream_epic_binding_accepts_either_baked_slug_of_the_registry_row(tmp_p
 
     from lu_machinery.common import git_credentials
     from lu_machinery.orchestration import fleet_repos
-    from tests.test_fleet_repos import transferred_catalog
-
     row = transferred_catalog(monkeypatch, role="public-monorepo")
     identity = {"repository": repository, "stream_epic": 10,
                 "stream_epic_url": f"https://github.com/{repository}/issues/10"}

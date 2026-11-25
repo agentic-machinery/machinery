@@ -15,6 +15,7 @@ from lu_machinery.orchestration import fleet_repos, issue_stream_audit, task_clo
 from tests.helpers.product_tree import configured_roots as configured_roots
 from tests.orchestration import closeout_fixtures as run_evidence
 from tests.orchestration.test_merge_queue_keeper import product_policy as product_policy
+from tests.test_fleet_repos import transferred_catalog
 
 pytestmark = pytest.mark.usefixtures("configured_roots")
 
@@ -1272,6 +1273,44 @@ def test_cli_fresh_init_reuse_refuses_another_threads_ledger(
     command[command.index("--fresh-task-id") + 1] = "another-native-thread"
     assert task_closeout.main([*command, "--reuse"]) == 2
     assert "exact fresh task identity" in capsys.readouterr().err
+    assert path.read_bytes() == before
+
+
+@pytest.mark.parametrize("fresh", [False, True], ids=["ledger-scope", "fresh-thread"])
+def test_cli_init_reuse_accepts_transferred_repository_without_rewriting_ledger(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys, fresh: bool,
+) -> None:
+    """Defect class: CLI reuse refuses the same ledger or fresh thread at the transferred slug."""
+    _stub_fresh_init(tmp_path, monkeypatch)
+    row = transferred_catalog(monkeypatch, role="public-monorepo")
+    monkeypatch.setattr(fleet_repos, "_bundled_catalog", lambda: {row.key: row})
+    active = "org/repo"
+    monkeypatch.setattr(
+        fleet_repos, "resolve_active_fleet_repo", lambda *_args, **_kwargs: fleet_repos.ActiveFleetRepo(row, active),
+    )
+    path = tmp_path / "lifecycle.json"
+    identity_path = tmp_path / "identity.json"
+    if fresh:
+        args = task_closeout.build_parser().parse_args([*_fresh_init_command(tmp_path), "--state-file", str(path)])
+    else:
+        _write_json(identity_path, _identity_dict())
+        args = _init_args(tmp_path, identity_path)
+
+    assert task_closeout.cmd_init(args) == 0
+    capsys.readouterr()
+    before = path.read_bytes()
+    active = "neworg/repo"
+    if fresh:
+        args.repository = active
+    else:
+        _write_json(identity_path, _identity_dict(
+            repository=active,
+            github_issue_url=f"https://github.com/{active}/issues/42",
+            stream_epic_url=f"https://github.com/{active}/issues/10",
+        ))
+
+    args.reuse = True
+    assert task_closeout.cmd_init(args) == 0
     assert path.read_bytes() == before
 
 
