@@ -401,6 +401,115 @@ def test_transfer_sends_once_and_verifies_exact_readback(tmp_path, monkeypatch):
         assert result.returncode == 0 and receipt["outcome"] == "already-transferred" and len(gh.posts) == 1
 
 
+def test_transfer_settles_after_async_accept(tmp_path, monkeypatch):
+    """Defect class: async 202 transfer acceptance rejected or settled without bounded destination and principal verification.
+
+    GitHub's POST /repos/{source}/transfer returns 202 Accepted with minimal-repository (where visibility
+    may be omitted and full_name may still name the source or an intermediate owner/name pair) while the
+    transfer runs asynchronously. repo-transfer must poll GET /repos/{destination} within TRANSFER_VERIFY_DELAYS
+    (8 reads over 180 s), re-read GET /user after the last GitHub read, and settle exit 0 with one POST once
+    the pinned private repository appears; it must fail closed (exit 3, journal kept) on bound expiry, a
+    switched final principal, or a non-private / unrelated POST answer.
+    """
+    source_owner, source_name = SOURCE.split("/", 1)
+    dest_owner, dest_name = DESTINATION.split("/", 1)
+
+    def _run_async(ack_doc, *, appear_on_poll=3, after_login=None):
+        sleeps = []
+        monkeypatch.setattr(pub, "_transfer_sleep", sleeps.append)
+        gh = FakeGitHub(after_login=after_login)
+        gh.overrides[("POST", f"repos/{SOURCE}/transfer", False)] = lambda args: answer(args, ack_doc)
+        polls = []
+
+        def destination_poll(args):
+            polls.append(args)
+            if appear_on_poll is not None and len(polls) >= appear_on_poll:
+                gh.repos.pop(SOURCE, None)
+                moved = repository(REPO_ID, DESTINATION)
+                gh.repos[DESTINATION] = moved
+                return answer(args, moved)
+            return not_found(args)
+
+        gh.overrides[("GET", f"repos/{DESTINATION}", True)] = destination_poll
+        result, receipt = run("repo-transfer", gh, repo="infra-private")
+        return result, receipt, gh, polls, sleeps
+
+    # Async 202 acceptance shapes: source without optional visibility, source with visibility,
+    # and both intermediate owner/name pairs during an async transfer + rename.
+    for ack_doc, appear_on in (
+        ({"id": REPO_ID, "full_name": SOURCE, "private": True}, 3),
+        (repository(REPO_ID, SOURCE), 3),
+        ({"id": REPO_ID, "full_name": f"{dest_owner}/{source_name}", "private": True}, 2),
+        ({"id": REPO_ID, "full_name": f"{source_owner}/{dest_name}", "private": True}, 2),
+    ):
+        result, receipt, gh, polls, sleeps = _run_async(ack_doc, appear_on_poll=appear_on)
+        assert result.returncode == 0, receipt
+        assert receipt["outcome"] == "transferred" and receipt["mutations_sent"] == 1
+        assert len(gh.posts) == 1 and len(polls) == appear_on
+        assert sleeps == list(pub.TRANSFER_VERIFY_DELAYS[:appear_on])
+        assert gh.calls[-1] == ["gh", "api", "--method", "GET", "user"]
+        assert receipt["principal"]["before"] == receipt["principal"]["after"] == {"login": PRINCIPAL, "id": 7}
+        assert not journal(tmp_path).exists()
+
+    # Bound exhausted: destination never appears across all 8 polls (180 s) -> exit 3, journal kept, one POST.
+    result, receipt, gh, polls, sleeps = _run_async(
+        {"id": REPO_ID, "full_name": SOURCE, "private": True}, appear_on_poll=None,
+    )
+    assert result.returncode == pub.REPO_ADMIN_UNSETTLED and receipt["outcome"] == "unverified"
+    assert len(gh.posts) == 1 and len(polls) == len(pub.TRANSFER_VERIFY_DELAYS)
+    assert sleeps == list(pub.TRANSFER_VERIFY_DELAYS)
+    assert "8 reads over 180 s" in receipt["detail"]
+    assert journal(tmp_path).exists()
+    journal(tmp_path).unlink()
+
+    # F14 re-read-last: destination appears on poll 3, then principal switches (login or account id) before final
+    # GET /user -> exit 3, journal kept.
+    result, receipt, gh, polls, sleeps = _run_async(
+        {"id": REPO_ID, "full_name": SOURCE, "private": True}, appear_on_poll=3, after_login="someone-else",
+    )
+    assert result.returncode == pub.REPO_ADMIN_UNSETTLED and receipt["outcome"] == "unverified"
+    assert len(gh.posts) == 1 and len(polls) == 3 and "someone-else" in receipt["detail"]
+    assert journal(tmp_path).exists()
+    journal(tmp_path).unlink()
+
+    sleeps = []
+    monkeypatch.setattr(pub, "_transfer_sleep", sleeps.append)
+    gh = FakeGitHub()
+    gh.overrides[("POST", f"repos/{SOURCE}/transfer", False)] = lambda args: answer(
+        args, {"id": REPO_ID, "full_name": SOURCE, "private": True},
+    )
+    polls = []
+
+    def appear_on_third(args):
+        polls.append(args)
+        if len(polls) >= 3:
+            gh.repos.pop(SOURCE, None)
+            moved = repository(REPO_ID, DESTINATION)
+            gh.repos[DESTINATION] = moved
+            return answer(args, moved)
+        return not_found(args)
+
+    gh.overrides[("GET", f"repos/{DESTINATION}", True)] = appear_on_third
+    gh.overrides[("GET", "user", True)] = lambda args: answer(args, {"login": PRINCIPAL, "id": 22})
+    result, receipt = run("repo-transfer", gh, repo="infra-private")
+    assert result.returncode == pub.REPO_ADMIN_UNSETTLED and receipt["outcome"] == "unverified"
+    assert len(gh.posts) == 1 and len(polls) == 3 and "principal id changed" in receipt["detail"]
+    assert journal(tmp_path).exists()
+    journal(tmp_path).unlink()
+
+    # Fail-closed POST answers: explicit non-private visibility, null visibility, private=False, or unrelated slug.
+    for bad_ack in (
+        {"id": REPO_ID, "full_name": SOURCE, "private": True, "visibility": "public"},
+        {"id": REPO_ID, "full_name": SOURCE, "private": True, "visibility": None},
+        {"id": REPO_ID, "full_name": SOURCE, "private": False},
+        {"id": REPO_ID, "full_name": "other-org/other-repo", "private": True},
+    ):
+        result, receipt, gh, polls, sleeps = _run_async(bad_ack, appear_on_poll=1)
+        assert result.returncode == pub.REPO_ADMIN_UNSETTLED and receipt["outcome"] == "unverified"
+        assert len(gh.posts) == 1 and polls == [] and sleeps == [] and journal(tmp_path).exists()
+        journal(tmp_path).unlink()
+
+
 def _applied_then(gh, reply):
     """A POST answer that applies the transfer and then answers *reply* (a document or an exception)."""
     def respond(args):

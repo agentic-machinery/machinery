@@ -329,7 +329,15 @@ journal binds the login and account id that started the transfer; only that prin
 Every exit 0 that sends no POST (an already-transferred repository, with or without a journal, and
 each verb's dry run) and every journal removal (a refusal before the POST included) re-reads
 `GET /user` after its last GitHub read and requires that login and id; a failed or mismatched re-read
-exits 3 and keeps the journal.
+exits 3 and keeps the journal. Because GitHub executes `POST /repos/<source>/transfer` asynchronously
+(`202 Accepted` with a `minimal-repository` payload whose `visibility` may be omitted and whose
+`full_name` may still name the source or an intermediate owner/name pair), `repo-transfer` accepts
+that POST answer once it proves the pinned private repository id, then polls `GET /repos/<destination>`
+across 8 fresh reads over a bounded 180 s wait (`0, 2, 4, 8, 16, 30, 60, 60` s backoff) until the
+exact pinned private repository (`id`, `full_name`, `private`, `visibility: "private"`) appears at the
+destination, and re-reads `GET /user` after the last GitHub read before removing the journal and
+exiting 0; only after that bound (or on a mismatched POST answer or final `GET /user`) does it exit 3
+(`unverified`) and keep the journal.
 
 ## Review contract canary
 
