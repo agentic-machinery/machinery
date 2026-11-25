@@ -4,7 +4,7 @@
 # plan v1 section 4 step 4) and the shared fleet security workflow
 # (fleet-security.yml, machinery #1080). This file is the record.
 # tests.yml reads NODE_VERSION and NPM_VERSION directly.
-# lu_machinery/ci/setup_bubblewrap.sh reads CI_UBUNTU_SNAPSHOT directly.
+# lu_machinery/ci/setup_bubblewrap.sh reads the Ubuntu snapshot and bubblewrap pins directly.
 # lu_machinery/ci/linux_fs_parity.sh reads LINUX_FS_PARITY_IMAGE, UV_VERSION
 # and UV_LINUX_X86_64_SHA256 directly.
 # tests/test_installed_shell_product_roots.py reads UV_VERSION and
@@ -106,9 +106,12 @@ CI_GATE_RUNNER=ubuntu-24.04
 #   image fixed when ubuntu-latest moves.
 CI_UBUNTU_SNAPSHOT=20261122T000000Z
 #   https://snapshot.ubuntu.com/ubuntu/20261122T000000Z/
-#   Noble, noble-updates and noble-security InRelease files and the existing
-#   checksum-pinned bubblewrap .deb were available on 2026-11-23. The CI
-#   bootstrap reads this pin directly in both the checkout and the wheel.
+#   Signed noble, noble-updates and noble-security APT indexes for other
+#   native CI packages. Also the primary source of the pinned bubblewrap .deb.
+CI_BUBBLEWRAP_DEB=bubblewrap_0.11.1-1ubuntu0.3_amd64.deb
+CI_BUBBLEWRAP_SHA256=d3a6c1b6b0e0474eaed6dbd055c0d601fd875af153976a0dc4aae75f4ea10868
+#   The snapshot and https://security.ubuntu.com/ubuntu both serve this file
+#   under pool/main/b/bubblewrap/. Both downloads matched this SHA-256 on 2026-11-25.
 CI_GATE_PYTHON=.python-version
 #   Machinery jobs default to the uv-managed CPython named in the repository's
 #   .python-version (3.14.10 on 2026-11-20).
