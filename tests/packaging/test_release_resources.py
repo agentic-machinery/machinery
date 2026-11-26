@@ -219,7 +219,9 @@ def test_missing_resource_admission_bypass(release):
         core.write_bytes(saved)
 
 
-HARNESSES = ("claude", "codex", "agy", "cursor")
+# Each harness's native skill discovery directory, fixed here so a manifest entry cannot redefine it.
+NATIVE_SKILLS = {"claude": ".claude/skills", "codex": ".agents/skills", "agy": ".agent/skills", "cursor": ".cursor/skills"}
+HARNESSES = tuple(NATIVE_SKILLS)
 CATALOG = """
 import json, sys, types
 from lu_machinery.dispatcher import runtime_context
@@ -257,8 +259,12 @@ def _wheel_digests(wheel):
     return digests
 
 
+def _native(path, harness):
+    return f"{NATIVE_SKILLS[harness]}/{path.removeprefix('skills/')}"
+
+
 def test_catalog_skill_missing_harness_destination(release):
-    """Every skill the dispatcher advertises has a release destination for each of the four harnesses."""
+    """Every skill the dispatcher advertises has a release destination in each harness's native skill directory."""
     _, wheel, _, _ = release
     advertised = _catalog(release)
     assert "skills/verify-ukrainian/SKILL.md" in advertised
@@ -267,7 +273,7 @@ def test_catalog_skill_missing_harness_destination(release):
     for path in advertised:
         assert path in files, path
         for harness in HARNESSES:
-            assert files[path]["targets"].get(harness), (path, harness)
+            assert _native(path, harness) in files[path]["targets"].get(harness, []), (path, harness)
 
 
 def test_deployed_skill_stale_bytes(release):
@@ -283,8 +289,9 @@ def test_deployed_skill_stale_bytes(release):
         released = digests[SHARED + path]
         assert hashlib.sha256((REPO / SHARED / path).read_bytes()).hexdigest() == released, path
         assert hashlib.sha256(opened.read_bytes()).hexdigest() == released, path
-        outputs = [target for harness in HARNESSES for target in files[path]["targets"][harness]]
-        for target in outputs:
+        outputs = {_native(path, harness) for harness in HARNESSES}
+        outputs.update(target for targets in files[path]["targets"].values() for target in targets)
+        for target in sorted(outputs):
             assert hashlib.sha256((consumer / target).read_bytes()).hexdigest() == released, target
 
 
