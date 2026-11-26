@@ -11,6 +11,7 @@ from pathlib import PurePosixPath
 # file it regenerates. Add an entry only once that producer, input and output are established.
 GENERATED_OUTPUTS = {
     "scripts/lexicon": "site/src/data/lexicon-manifest.fingerprint.json",  # atlas-lexicon-fingerprint-drift
+    "site/src/components": "docs/lesson-schema.yaml",  # lesson-schema-drift
 }
 
 
