@@ -34,8 +34,11 @@ _MAX_BYTES = 64 * 1024
 _KEY = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9_-]*")
 _DIGEST = re.compile(r"[a-fA-F0-9]{64}")
 _CONFIG_KEYS = (
-    r"^(remote\.origin\.url|include\..*|includeif\..*|url\..*|core\.worktree|extensions\.worktreeconfig)$"
+    r"^(remote\.origin\.url|remote\..+\.(pushurl|vcs|uploadpack|receivepack|proxy)|"
+    r"remote\.pushdefault|branch\..+\.(pushremote|remote)|include\..*|includeif\..*|url\..*|"
+    r"core\.(worktree|sshcommand|gitproxy)|http\.(.+\.)?(proxy|sslverify)|extensions\.worktreeconfig)$"
 )
+_REMOTE_SELECTION_KEYS = re.compile(rb"(remote\.pushdefault|branch\..+\.(pushremote|remote))")
 
 
 class HostContextError(ValueError):
@@ -142,6 +145,7 @@ def _monitor_url(value: Any) -> str:
             and parsed.hostname
             and parsed.username is None
             and parsed.password is None
+            and parsed.path in {"", "/"}
             and not (parsed.query or parsed.fragment)
             and (parsed.port is None or parsed.port > 0)
             and not any(char.isspace() or char in "\\?#" for char in url)
@@ -254,7 +258,10 @@ def _assert_legacy(
         # Profiles can redirect packaged policy and cannot assert an equivalent host binding.
         "LU_PROFILE_PATH": None,
     }
-    for name in ("LU_MONITOR_LOOPBACK", "MONITOR_API_BASE_URL", "MONITOR_API_URL", "AB_MONITOR_URL"):
+    for name in (
+        "LU_MONITOR_LOOPBACK", "MONITOR_API_BASE_URL", "MONITOR_API_URL", "AB_MONITOR_URL",
+        "MONITOR_API_URLS", "AB_MONITOR_URLS", "MONITOR_BASE_URLS", "DELEGATE_MONITOR_API",
+    ):
         assertions[name] = context.monitor_url
     if "LU_REPOS_ROOT" in env:
         parents = {path.parent for path in context.repos.values()}
@@ -296,7 +303,8 @@ def _git(path: Path, *args: str) -> bytes:
     from lu_machinery.orchestration.execution_safe_git import GIT, safe_git_env
 
     try:
-        result = subprocess.run(
+        # Git and its subcommands are fixed by the checker. The binding supplies only path operands.
+        result = subprocess.run(  # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit
             [GIT, "--no-pager", "--no-lazy-fetch", "-C", str(path), *args],
             cwd="/", env=safe_git_env({}), stdin=subprocess.DEVNULL, capture_output=True,
             timeout=10, check=True,
@@ -317,12 +325,16 @@ def _check_repo(path: Path, origins: tuple[str, ...]) -> None:
         raise HostContextError("repo_not_primary", "repo must be a primary checkout with its own Git directory")
     _outside_git(path.parent, code="repo_not_primary", label="checkout parent")
     config = _git(path, "config", "--file", str(git_dir / "config"), "--no-includes", "--null", "--get-regexp", _CONFIG_KEYS)
-    entries = config.removesuffix(b"\0").split(b"\0")
-    prefix = b"remote.origin.url\n"
-    if len(entries) != 1 or not entries[0].startswith(prefix):
+    urls = []
+    for entry in config.removesuffix(b"\0").split(b"\0"):
+        key, _, value = entry.partition(b"\n")
+        if key == b"remote.origin.url":
+            urls.append(value)
+        elif not (_REMOTE_SELECTION_KEYS.fullmatch(key) and value == b"origin"):
+            raise HostContextError("repo_origin_mismatch", "checkout config can override the registered origin")
+    if len(urls) != 1:
         raise HostContextError("repo_origin_mismatch", "checkout must declare exactly one unambiguous origin")
-    origin = entries[0][len(prefix):]
-    if origin.lower() not in {value.encode("ascii").lower() for value in origins}:
+    if urls[0].lower() not in {value.encode("ascii").lower() for value in origins}:
         raise HostContextError("repo_origin_mismatch", "checkout origin must match the packaged registry")
     layout = _git(
         path, "rev-parse", "--path-format=absolute", "--is-inside-work-tree",
@@ -344,7 +356,8 @@ def _check_python(path: Path, version: str) -> None:
     if not path.is_file() or not os.access(path, os.X_OK):
         raise HostContextError("invalid_interpreter", "configured Python must be an executable file")
     try:
-        result = subprocess.run(
+        # The protected binding names the interpreter. Its flags and probe are constants and use no shell.
+        result = subprocess.run(  # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit
             [path, "-I", "-B", "-c", _VERSION_PROBE],
             cwd="/", env={}, stdin=subprocess.DEVNULL, capture_output=True, timeout=15, check=True,
         )
