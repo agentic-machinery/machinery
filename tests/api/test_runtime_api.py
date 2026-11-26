@@ -1162,6 +1162,77 @@ def test_acp_transcript_state_body_expired_withholds_inline_and_handles_race(tmp
     assert cross_data["messages"][1]["body"] == "turn 2 stays live"
     assert turn1_secret not in cross_resp.text
 
+    # Single-statement final retention check (F1): CAS turn + legacy inline turn sharing one digest
+    # both expire together in one snapshot when retention commits while opening a later turn.
+    shared_root = tmp_path / "plane-shared-digest"
+    shared_secret = "SHARED_CAS_AND_INLINE_EXPIRED_SECRET"
+    conv_shared, shared_records = _create_controller_conversation(
+        shared_root,
+        deadline_at="2020-01-01T00:00:00Z",
+        turns=[
+            ("request", "root", "codex", shared_secret, 1),
+            ("reply", "codex", "root", "trigger turn 3", 1),
+        ],
+    )
+    shared_store = ArtifactStore(root=shared_root)
+    try:
+        shared_store.connection.execute(
+            "UPDATE comms_messages SET created_at = ? WHERE message_id = ?",
+            (old_ts, shared_records[0][0]),
+        )
+        shared_store.connection.execute(
+            "UPDATE artifacts SET created_at = ? WHERE artifact_id = ?",
+            (old_ts, shared_records[0][1]),
+        )
+        # Add a legacy inline-only turn sharing the same content_sha256 (body_artifact_id IS NULL).
+        shared_store.connection.execute(
+            """INSERT INTO comms_messages(
+                message_id, conversation_id, kind, sender, recipient, body_inline,
+                body_artifact_id, content_sha256, metadata_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                "msg-inline-shared", conv_shared, "reply", "claude", "root", shared_secret,
+                None, shared_records[0][2], "{}", old_ts,
+            ),
+        )
+        shared_store.connection.execute(
+            """INSERT INTO acp_conversation_events(
+                event_id, conversation_id, sequence, event_type, state, sender, recipient,
+                round, outcome, message_id, metadata_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                "evt-inline-shared", conv_shared, 50, "CALL_TERMINAL", "COMPLETE", "claude", "root",
+                1, "succeeded", "msg-inline-shared", "{}", old_ts,
+            ),
+        )
+        shared_store.connection.commit()
+        os.utime(shared_store.blob_path_for(shared_records[0][2]), (1_577_836_800, 1_577_836_800))
+    finally:
+        shared_store.close()
+
+    trigger_sha = shared_records[1][2]
+
+    def _expire_shared_on_trigger(plane_root: Path, sha256: str) -> int:
+        if sha256 == trigger_sha:
+            s = ArtifactStore(root=shared_root)
+            try:
+                rep = s.expire_message_blobs(older_than_days=30, grace_seconds=60, apply=True)
+                assert rep.removed == 1
+            finally:
+                s.close()
+        return real_open(plane_root, sha256)
+
+    monkeypatch.setattr(runtime_router, "_open_acp_blob_no_follow", _expire_shared_on_trigger)
+    monkeypatch.setenv("FLEET_COMMS_ROOT", str(shared_root))
+    shared_resp = _loopback_transcript_client().get(f"/api/runtime/acp/conversations/{conv_shared}/transcript")
+    assert shared_resp.status_code == 200
+    shared_data = shared_resp.json()
+    assert shared_data["state"] == "body_expired"
+    assert [m["state"] for m in shared_data["messages"]] == ["body_expired", "ok", "body_expired"]
+    assert shared_data["messages"][0]["body"] is None
+    assert shared_data["messages"][2]["body"] is None
+    assert shared_secret not in shared_resp.text
+
 
 def test_acp_transcript_state_missing_or_corrupt_covers_blobs_turns_and_participants(tmp_path, monkeypatch):
     """Defect class: corrupt blobs, missing rows, or malformed/unhashable participants drop turns or raise TypeError."""
@@ -1469,6 +1540,79 @@ def test_acp_transcript_state_oversized_or_partial_preserves_turns_without_404(t
     assert [m["state"] for m in data_budget["messages"]] == ["ok", "oversized_or_partial"]
     assert data_budget["messages"][1]["reason"] == "response_budget_exceeded"
     assert data_budget["messages"][1]["body"] is None
+
+    # 2b. Two live 261,900-byte turns whose exact serialized payload fits <=512 KiB are both admitted (F5).
+    root_fit = tmp_path / "plane-fit"
+    fit_chunk = "F" * 261_900
+    conv_fit, _ = _create_controller_conversation(
+        root_fit,
+        turns=[
+            ("request", "root", "codex", fit_chunk, 1),
+            ("reply", "codex", "root", fit_chunk, 1),
+        ],
+    )
+    monkeypatch.setenv("FLEET_COMMS_ROOT", str(root_fit))
+    resp_fit = local.get(f"/api/runtime/acp/conversations/{conv_fit}/transcript")
+    assert resp_fit.status_code == 200
+    assert len(resp_fit.content) <= runtime_router._ACP_TRANSCRIPT_MAX_RESPONSE_BYTES
+    data_fit = resp_fit.json()
+    assert data_fit["state"] == "ok"
+    assert [m["state"] for m in data_fit["messages"]] == ["ok", "ok"]
+    assert data_fit["messages"][1]["body"] == fit_chunk
+
+    # 2c. Bodies expired during read do not consume response budget for surviving live turns (F5).
+    root_reclaim = tmp_path / "plane-reclaim"
+    old_ts = "2020-01-01T00:00:00Z"
+    turn_200k_1 = "1" * (200 * 1024)
+    turn_200k_2 = "2" * (200 * 1024)
+    turn_200k_3 = "3" * (200 * 1024)
+    conv_reclaim, rec_reclaim = _create_controller_conversation(
+        root_reclaim,
+        deadline_at=old_ts,
+        turns=[
+            ("request", "root", "codex", turn_200k_1, 1),
+            ("reply", "codex", "root", turn_200k_2, 1),
+            ("synthesis", "codex", "root", turn_200k_3, None),
+        ],
+    )
+    reclaim_store = ArtifactStore(root=root_reclaim)
+    try:
+        for msg_id, art_id, sha in rec_reclaim[:2]:
+            reclaim_store.connection.execute(
+                "UPDATE comms_messages SET created_at = ? WHERE message_id = ?", (old_ts, msg_id)
+            )
+            reclaim_store.connection.execute(
+                "UPDATE artifacts SET created_at = ? WHERE artifact_id = ?", (old_ts, art_id)
+            )
+            os.utime(reclaim_store.blob_path_for(sha), (1_577_836_800, 1_577_836_800))
+        reclaim_store.connection.commit()
+    finally:
+        reclaim_store.close()
+
+    real_open = runtime_router._open_acp_blob_no_follow
+    third_sha = rec_reclaim[2][2]
+
+    def _expire_first_two_on_third(plane_root: Path, sha256: str) -> int:
+        if sha256 == third_sha:
+            s = ArtifactStore(root=root_reclaim)
+            try:
+                rep = s.expire_message_blobs(older_than_days=30, grace_seconds=60, apply=True)
+                assert rep.removed == 2
+            finally:
+                s.close()
+        return real_open(plane_root, sha256)
+
+    monkeypatch.setattr(runtime_router, "_open_acp_blob_no_follow", _expire_first_two_on_third)
+    monkeypatch.setenv("FLEET_COMMS_ROOT", str(root_reclaim))
+    resp_reclaim = local.get(f"/api/runtime/acp/conversations/{conv_reclaim}/transcript")
+    assert resp_reclaim.status_code == 200
+    assert len(resp_reclaim.content) <= runtime_router._ACP_TRANSCRIPT_MAX_RESPONSE_BYTES
+    data_reclaim = resp_reclaim.json()
+    assert data_reclaim["state"] == "body_expired"
+    assert [m["state"] for m in data_reclaim["messages"]] == ["body_expired", "body_expired", "ok"]
+    assert data_reclaim["messages"][0]["body"] is None
+    assert data_reclaim["messages"][1]["body"] is None
+    assert data_reclaim["messages"][2]["body"] == turn_200k_3
 
     # 3. Message count limit (>32 turns) returns HTTP 200 (not 404) with first 32 turns and truncated=True.
     root_many = tmp_path / "plane-many"

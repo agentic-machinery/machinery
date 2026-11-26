@@ -142,9 +142,6 @@ _ACP_TRANSCRIPT_STATE_LABELS: dict[str, str] = {
     _ACP_TRANSCRIPT_STATE_BACKEND_UNAVAILABLE: "backend unavailable",
     _ACP_TRANSCRIPT_STATE_OVERSIZED_OR_PARTIAL: "oversized or partial",
 }
-_ACP_TRANSCRIPT_WORST_STATE = _ACP_TRANSCRIPT_STATE_OVERSIZED_OR_PARTIAL
-_ACP_TRANSCRIPT_WORST_LABEL = _ACP_TRANSCRIPT_STATE_LABELS[_ACP_TRANSCRIPT_WORST_STATE]
-_ACP_TRANSCRIPT_WORST_REASON = "malformed_artifact_reference"
 _ACP_EVENT_TYPE_ALIASES = {
     "created": "CONVERSATION_CREATED",
     "conversation_created": "CONVERSATION_CREATED",
@@ -1615,7 +1612,7 @@ def _open_acp_transcript_store(ctx: MonitorContext) -> tuple[Path, SQLiteConnect
         connection = cast(SQLiteConnection, open_readonly(db_path))
     except _AcpBackendUnavailable:
         raise
-    except (OSError, sqlite3.Error, ValueError):
+    except (OSError, sqlite3.Error, RuntimeError, ValueError):
         raise _AcpBackendUnavailable("store_unavailable") from None
     connection.row_factory = sqlite3.Row
     try:
@@ -1788,6 +1785,24 @@ def _read_acp_artifact_body(
     return _ACP_TRANSCRIPT_STATE_OK, None, text
 
 
+def _acp_transcript_payload(
+    conversation_id: str,
+    entries: list[dict[str, Any]],
+    *,
+    truncated: bool,
+) -> dict[str, Any]:
+    """Assemble one HTTP 200 ACP transcript payload with its derived top-level state."""
+    transcript_state, transcript_reason = _acp_transcript_summary_state(entries, truncated=truncated)
+    return {
+        "conversation_id": conversation_id,
+        "state": transcript_state,
+        "label": _ACP_TRANSCRIPT_STATE_LABELS[transcript_state],
+        "reason": transcript_reason,
+        "truncated": truncated,
+        "messages": entries,
+    }
+
+
 def _acp_transcript_entries(
     connection: SQLiteConnection,
     plane_root: Path,
@@ -1826,108 +1841,69 @@ def _acp_transcript_entries(
     has_message_artifacts_table = _acp_table_exists(connection, "message_artifacts")
     allowed_lanes = frozenset({"root", "codex", *participants})
 
-    # Pre-build every turn's worst-case metadata skeleton so the full serialized response
-    # (envelope + metadata + separators + admitted bodies) never exceeds _ACP_TRANSCRIPT_MAX_RESPONSE_BYTES.
-    prepared: list[tuple[sqlite3.Row, dict[str, Any], int, bool]] = []
-    skeleton_entries: list[dict[str, Any]] = []
+    entries: list[dict[str, Any]] = []
+    candidates: list[tuple[int, str, str | None, str | None]] = []
+
     for index, row in enumerate(rows, start=1):
         round_number = _acp_int(row["round"], minimum=1)
+        artifact_id: str | None = None
+        digest_lower: str | None = None
         if row["message_id"] is None:
             kind = sender = recipient = created_at = None
-            metadata_valid = False
+            state = _ACP_TRANSCRIPT_STATE_MISSING_OR_CORRUPT
+            reason: str | None = "message_row_missing"
+            body: str | None = None
         else:
             kind = _acp_text(row["kind"], allowed=_ACP_TRANSCRIPT_KINDS)
             sender = _acp_text(row["sender"], allowed=allowed_lanes)
             recipient = _acp_text(row["recipient"], allowed=allowed_lanes)
             created_at = _acp_timestamp(row["created_at"])
-            metadata_valid = None not in (kind, sender, recipient, created_at)
-        skeleton: dict[str, Any] = {
-            "ordinal": index,
-            "state": _ACP_TRANSCRIPT_WORST_STATE,
-            "label": _ACP_TRANSCRIPT_WORST_LABEL,
-            "reason": _ACP_TRANSCRIPT_WORST_REASON,
-            "kind": kind,
-            "sender": sender,
-            "recipient": recipient,
-            "created_at": created_at,
-            "body": None,
-        }
-        if round_number is not None:
-            skeleton["round"] = round_number
-        skeleton_entries.append(skeleton)
-        prepared.append((row, skeleton, len(_acp_json_bytes(skeleton)), metadata_valid))
-
-    # Reserve worst-case envelope + all skeleton turns (use truncated=False since "false" is 1 byte longer than "true").
-    baseline_envelope = {
-        "conversation_id": conversation_id,
-        "state": _ACP_TRANSCRIPT_WORST_STATE,
-        "label": _ACP_TRANSCRIPT_WORST_LABEL,
-        "reason": _ACP_TRANSCRIPT_WORST_REASON,
-        "truncated": False,
-        "messages": skeleton_entries,
-    }
-    remaining_bytes = max(0, _ACP_TRANSCRIPT_MAX_RESPONSE_BYTES - len(_acp_json_bytes(baseline_envelope)))
-
-    entries: list[dict[str, Any]] = []
-    recheck_targets: list[tuple[dict[str, Any], str | None, str | None]] = []
-
-    for row, skeleton, skeleton_len, metadata_valid in prepared:
-        artifact_id: str | None = None
-        inline_digest_lower: str | None = None
-        if row["message_id"] is None:
-            state = _ACP_TRANSCRIPT_STATE_MISSING_OR_CORRUPT
-            reason: str | None = "message_row_missing"
-            body: str | None = None
-        elif not metadata_valid:
-            state = _ACP_TRANSCRIPT_STATE_MISSING_OR_CORRUPT
-            reason = "malformed_turn_metadata"
-            body = None
-        else:
-            raw_artifact_id = row["body_artifact_id"]
-            artifact_ref_error: str | None = None
-            if raw_artifact_id is not None:
-                if isinstance(raw_artifact_id, str) and raw_artifact_id.strip():
-                    artifact_id = raw_artifact_id
-                else:
-                    artifact_ref_error = "malformed_artifact_reference"
-            elif has_message_artifacts_table:
-                linked = connection.execute(
-                    """SELECT artifact_id FROM message_artifacts
-                       WHERE message_id = ? AND relation = 'body'
-                       ORDER BY artifact_id ASC LIMIT 2""",
-                    (row["message_id"],),
-                ).fetchall()
-                if len(linked) == 1:
-                    linked_id = linked[0]["artifact_id"]
-                    if isinstance(linked_id, str) and linked_id.strip():
-                        artifact_id = linked_id
+            if None in (kind, sender, recipient, created_at):
+                state = _ACP_TRANSCRIPT_STATE_MISSING_OR_CORRUPT
+                reason = "malformed_turn_metadata"
+                body = None
+            else:
+                raw_artifact_id = row["body_artifact_id"]
+                artifact_ref_error: str | None = None
+                if raw_artifact_id is not None:
+                    if isinstance(raw_artifact_id, str) and raw_artifact_id.strip():
+                        artifact_id = raw_artifact_id
                     else:
                         artifact_ref_error = "malformed_artifact_reference"
-                elif len(linked) > 1:
-                    artifact_ref_error = "malformed_artifact_reference"
+                elif has_message_artifacts_table:
+                    linked = connection.execute(
+                        """SELECT artifact_id FROM message_artifacts
+                           WHERE message_id = ? AND relation = 'body'
+                           ORDER BY artifact_id ASC LIMIT 2""",
+                        (row["message_id"],),
+                    ).fetchall()
+                    if len(linked) == 1:
+                        linked_id = linked[0]["artifact_id"]
+                        if isinstance(linked_id, str) and linked_id.strip():
+                            artifact_id = linked_id
+                        else:
+                            artifact_ref_error = "malformed_artifact_reference"
+                    elif len(linked) > 1:
+                        artifact_ref_error = "malformed_artifact_reference"
 
-            if artifact_ref_error is not None:
-                state = _ACP_TRANSCRIPT_STATE_MISSING_OR_CORRUPT
-                reason = artifact_ref_error
-                body = None
-            elif artifact_id is not None:
-                if not has_artifacts_table:
-                    raise _AcpBackendUnavailable("schema_unavailable")
-                state, reason, body = _read_acp_artifact_body(
-                    connection,
-                    plane_root,
-                    artifact_id,
-                    content_sha256=row["content_sha256"],
-                )
-            else:
                 raw_digest = row["content_sha256"]
-                if (
-                    has_artifacts_table
-                    and isinstance(raw_digest, str)
-                    and _ACP_SHA256_RE.fullmatch(raw_digest.lower())
-                ):
-                    inline_digest_lower = raw_digest.lower()
-                if inline_digest_lower is not None and _acp_digest_is_expired(connection, inline_digest_lower):
+                if isinstance(raw_digest, str) and _ACP_SHA256_RE.fullmatch(raw_digest.lower()):
+                    digest_lower = raw_digest.lower()
+
+                if artifact_ref_error is not None:
+                    state = _ACP_TRANSCRIPT_STATE_MISSING_OR_CORRUPT
+                    reason = artifact_ref_error
+                    body = None
+                elif artifact_id is not None:
+                    if not has_artifacts_table:
+                        raise _AcpBackendUnavailable("schema_unavailable")
+                    state, reason, body = _read_acp_artifact_body(
+                        connection,
+                        plane_root,
+                        artifact_id,
+                        content_sha256=row["content_sha256"],
+                    )
+                elif has_artifacts_table and digest_lower is not None and _acp_digest_is_expired(connection, digest_lower):
                     state = _ACP_TRANSCRIPT_STATE_BODY_EXPIRED
                     reason = "body_expired"
                     body = None
@@ -1937,58 +1913,87 @@ def _acp_transcript_entries(
                         content_sha256=row["content_sha256"],
                     )
 
-        entry = dict(skeleton)
-        entry["state"] = state
-        entry["label"] = _ACP_TRANSCRIPT_STATE_LABELS[state]
-        entry["reason"] = reason
-        entry["body"] = body
-
-        if state == _ACP_TRANSCRIPT_STATE_OK:
-            delta_bytes = max(0, len(_acp_json_bytes(entry)) - skeleton_len)
-            if delta_bytes > remaining_bytes:
-                entry["state"] = _ACP_TRANSCRIPT_STATE_OVERSIZED_OR_PARTIAL
-                entry["label"] = _ACP_TRANSCRIPT_STATE_LABELS[_ACP_TRANSCRIPT_STATE_OVERSIZED_OR_PARTIAL]
-                entry["reason"] = "response_budget_exceeded"
-                entry["body"] = None
-            else:
-                remaining_bytes -= delta_bytes
-                recheck_targets.append((entry, artifact_id, inline_digest_lower))
-
+        entry: dict[str, Any] = {
+            "ordinal": index,
+            "state": state,
+            "label": _ACP_TRANSCRIPT_STATE_LABELS[state],
+            "reason": reason,
+            "kind": kind,
+            "sender": sender,
+            "recipient": recipient,
+            "created_at": created_at,
+            "body": body,
+        }
+        if round_number is not None:
+            entry["round"] = round_number
         entries.append(entry)
+        if state == _ACP_TRANSCRIPT_STATE_OK and body is not None:
+            candidates.append((len(entries) - 1, body, artifact_id, digest_lower))
 
-    # Recheck retention in one consistent snapshot after the last blob read finishes so any
-    # turn expired while later turns were being read is cleared before building the response.
-    if recheck_targets and has_artifacts_table:
-        art_ids = sorted({art_id for _, art_id, _ in recheck_targets if art_id is not None})
+    # Recheck retention for ALL candidate turns (both CAS artifact IDs and inline digests) in ONE
+    # single SQLite SELECT snapshot after the last blob read finishes, BEFORE response budgeting.
+    surviving: list[tuple[int, str]] = []
+    if candidates and has_artifacts_table:
+        art_ids = sorted({art_id for _, _, art_id, _ in candidates if art_id is not None})
+        digests = sorted({digest for _, _, _, digest in candidates if digest is not None})
         expired_art_ids: set[str] = set()
-        if art_ids:
-            placeholders = ",".join("?" for _ in art_ids)
-            for row in connection.execute(
-                f"SELECT artifact_id, retention_class FROM artifacts WHERE artifact_id IN ({placeholders})",
-                art_ids,
-            ).fetchall():
-                klass = row["retention_class"]
-                if isinstance(klass, str) and klass.startswith(RETENTION_EXPIRED_PREFIX):
-                    expired_art_ids.add(str(row["artifact_id"]))
-        digests = sorted({digest for _, art_id, digest in recheck_targets if art_id is None and digest is not None})
         expired_digests: set[str] = set()
+        where_parts: list[str] = []
+        params: list[str] = []
+        if art_ids:
+            where_parts.append(f"artifact_id IN ({','.join('?' for _ in art_ids)})")
+            params.extend(art_ids)
         if digests:
-            placeholders = ",".join("?" for _ in digests)
-            for row in connection.execute(
-                f"SELECT sha256, retention_class FROM artifacts WHERE sha256 IN ({placeholders})",
-                digests,
+            where_parts.append(f"sha256 IN ({','.join('?' for _ in digests)})")
+            params.extend(digests)
+        if where_parts:
+            for art_row in connection.execute(
+                f"SELECT artifact_id, sha256, retention_class FROM artifacts WHERE {' OR '.join(where_parts)}",
+                params,
             ).fetchall():
-                klass = row["retention_class"]
+                klass = art_row["retention_class"]
                 if isinstance(klass, str) and klass.startswith(RETENTION_EXPIRED_PREFIX):
-                    expired_digests.add(str(row["sha256"]).lower())
-        for entry, art_id, digest_lower in recheck_targets:
+                    expired_art_ids.add(str(art_row["artifact_id"]))
+                    raw_sha = art_row["sha256"]
+                    if isinstance(raw_sha, str):
+                        expired_digests.add(raw_sha.lower())
+        for entry_idx, text, art_id, digest_lower in candidates:
             if (art_id is not None and art_id in expired_art_ids) or (
-                art_id is None and digest_lower is not None and digest_lower in expired_digests
+                digest_lower is not None and digest_lower in expired_digests
             ):
-                entry["state"] = _ACP_TRANSCRIPT_STATE_BODY_EXPIRED
-                entry["label"] = _ACP_TRANSCRIPT_STATE_LABELS[_ACP_TRANSCRIPT_STATE_BODY_EXPIRED]
-                entry["reason"] = "body_expired"
-                entry["body"] = None
+                entries[entry_idx]["state"] = _ACP_TRANSCRIPT_STATE_BODY_EXPIRED
+                entries[entry_idx]["label"] = _ACP_TRANSCRIPT_STATE_LABELS[_ACP_TRANSCRIPT_STATE_BODY_EXPIRED]
+                entries[entry_idx]["reason"] = "body_expired"
+                entries[entry_idx]["body"] = None
+            else:
+                surviving.append((entry_idx, text))
+    else:
+        surviving = [(entry_idx, text) for entry_idx, text, _, _ in candidates]
+
+    # Budget only the bodies that survived retention using the exact serialized HTTP response size.
+    if surviving and len(
+        _acp_json_bytes(_acp_transcript_payload(conversation_id, entries, truncated=truncated))
+    ) > _ACP_TRANSCRIPT_MAX_RESPONSE_BYTES:
+        for entry_idx, _ in surviving:
+            entries[entry_idx]["state"] = _ACP_TRANSCRIPT_STATE_OVERSIZED_OR_PARTIAL
+            entries[entry_idx]["label"] = _ACP_TRANSCRIPT_STATE_LABELS[_ACP_TRANSCRIPT_STATE_OVERSIZED_OR_PARTIAL]
+            entries[entry_idx]["reason"] = "response_budget_exceeded"
+            entries[entry_idx]["body"] = None
+        for entry_idx, text in surviving:
+            entries[entry_idx]["state"] = _ACP_TRANSCRIPT_STATE_OK
+            entries[entry_idx]["label"] = _ACP_TRANSCRIPT_STATE_LABELS[_ACP_TRANSCRIPT_STATE_OK]
+            entries[entry_idx]["reason"] = None
+            entries[entry_idx]["body"] = text
+            if (
+                len(_acp_json_bytes(_acp_transcript_payload(conversation_id, entries, truncated=truncated)))
+                > _ACP_TRANSCRIPT_MAX_RESPONSE_BYTES
+            ):
+                entries[entry_idx]["state"] = _ACP_TRANSCRIPT_STATE_OVERSIZED_OR_PARTIAL
+                entries[entry_idx]["label"] = _ACP_TRANSCRIPT_STATE_LABELS[
+                    _ACP_TRANSCRIPT_STATE_OVERSIZED_OR_PARTIAL
+                ]
+                entries[entry_idx]["reason"] = "response_budget_exceeded"
+                entries[entry_idx]["body"] = None
 
     return entries, truncated
 
@@ -2064,18 +2069,7 @@ def get_acp_conversation_transcript(
     finally:
         connection.close()
 
-    transcript_state, transcript_reason = _acp_transcript_summary_state(entries, truncated=truncated)
-    return (
-        200,
-        {
-            "conversation_id": safe_id,
-            "state": transcript_state,
-            "label": _ACP_TRANSCRIPT_STATE_LABELS[transcript_state],
-            "reason": transcript_reason,
-            "truncated": truncated,
-            "messages": entries,
-        },
-    )
+    return 200, _acp_transcript_payload(safe_id, entries, truncated=truncated)
 
 
 @router.get("/agents")
