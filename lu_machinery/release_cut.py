@@ -1369,8 +1369,14 @@ class Cut:
         self.step = "promote"
         notes_file = self.work / "notes-release.md"
         notes_file.write_text(notes, encoding="utf-8")
-        self.publisher("release-edit", "--repo", self.machinery_repo, "--tag", f"v{self.version}",
-                       "--notes-file", str(notes_file), "--no-prerelease")
+        tag = f"v{self.version}"
+        # GitHub leaves Latest where it is when a pre-release becomes a full release unless the edit asks for it.
+        self.publisher("release-edit", "--repo", self.machinery_repo, "--tag", tag,
+                       "--notes-file", str(notes_file), "--no-prerelease", "--latest")
+        latest = self.run(["gh", "api", f"repos/{self.machinery_repo}/releases/latest", "--jq", ".tag_name"],
+                          timeout=120).stdout.strip()
+        if latest != tag:
+            raise CutError(f"releases/latest is {latest or 'empty'}, not {tag}; mark {tag} as Latest")
         if self.adopt_pr is not None:
             self.publisher("pr-ready", "--repo", self.product_repo, "--number", str(self.adopt_pr))
         self.say(f"v{self.version} is a full release; adopt PR #{self.adopt_pr} is ready for review")

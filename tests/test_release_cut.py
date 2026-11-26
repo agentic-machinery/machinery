@@ -1408,6 +1408,8 @@ def test_publisher_uses_release_interpreter_not_stale_host_python(tmp_path, monk
             for path in files.values():
                 (published / path.name).write_bytes(path.read_bytes())
             return subprocess.CompletedProcess(command, 0, "", "")
+        if command[:3] == ["gh", "api", f"repos/{REPO}/releases/latest"]:
+            return subprocess.CompletedProcess(command, 0, "v0.1.62\n", "")
         return original_run(argv, **kwargs)
 
     cut.run = run
@@ -2067,3 +2069,23 @@ def test_ci_receipt_recorded_under_either_baked_slug_proves_the_active_repositor
             validate()
     else:
         assert validate() is None
+
+
+def test_promotion_refuses_a_cut_that_leaves_an_older_release_as_latest(tmp_path):
+    """Defect class: release cut leaves an older release as Latest, because the promoting edit does not ask for
+    Latest or nothing reads releases/latest back afterwards."""
+    cut = Cut(work=tmp_path, dry_run=False, machinery_remote="unused", product_remote="unused",
+              machinery_repo=REPO, product_repo="unused", host_python=Path(sys.executable), primary=tmp_path,
+              alert=False, x_agent="codex/test", version="0.1.80", adopt_pr=1)
+    published: list[tuple[str, ...]] = []
+    cut.publisher = lambda *args: published.append(args) or ""
+    cut.run = lambda argv, **_kwargs: subprocess.CompletedProcess(argv, 0, "v0.1.22\n", "")
+
+    with pytest.raises(CutError, match=r"releases/latest is v0\.1\.22, not v0\.1\.80"):
+        cut.promote("notes\n")
+
+    assert [args[0] for args in published] == ["release-edit"]
+    assert {"--no-prerelease", "--latest"} <= set(published[0])
+    cut.run = lambda argv, **_kwargs: subprocess.CompletedProcess(argv, 0, "v0.1.80\n", "")
+    cut.promote("notes\n")
+    assert published[-1][0] == "pr-ready"
