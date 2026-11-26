@@ -260,7 +260,7 @@ def grant_task(tmp_path, monkeypatch):
     monkeypatch.delenv(ownership.TASK_ID_ENV, raising=False)
     monkeypatch.setenv("SESSION_HANDOFF_AGENT", "coordinator")
     record = dict(schema_version=2, task_id="worker", run_nonce="nonce", status="running",
-                  mode="workspace-write", worktree_path=str(root), repository_id="org/repo",
+                  mode="workspace-write", worktree_path=str(root), repo="public", repository_id="org/repo",
                   owned_paths=["original.txt"], options={})
     store.record_path("worker").parent.mkdir()
     store.replace(record)
