@@ -291,6 +291,11 @@ def child_env(spec: TaskSpec) -> dict[str, str]:
             configured = os.environ.get(name, "")
             if configured:
                 env[name] = configured
+    if spec.mode == "read-only" and spec.agent == "agy" and (fleet := os.environ.get("FLEET_COMMS_ROOT", "")):
+        # The read-only AGY launcher runs on the host with this environment. It refuses a task artifacts directory
+        # that overlaps the dispatcher's Fleet store, as the write boundary does with its --host-env copy. Its
+        # sandbox builds AGY's own environment from fixed names, so the provider never receives it.
+        env["FLEET_COMMS_ROOT"] = fleet
     options = getattr(spec, "options", None)
     orch_stream = options.get("orchestrator_stream") if isinstance(options, dict) else None
     if orch_stream:
