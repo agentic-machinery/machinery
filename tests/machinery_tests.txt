@@ -20,6 +20,7 @@
 #   Each needs the product checkout, which this repository does not hold.
 
 # [run]
+tests/host_context/test_host_context.py
 tests/common/test_json_depth.py
 tests/lint/test_json_readers.py
 tests/property/test_path_safety_props.py
@@ -711,6 +712,8 @@ tests/drill/test_clean_machine_kit.py
 # Security-alert watcher and routed fix brief (#1077).
 tests/security/test_alerts.py
 # [support]
+tests/host_context/__init__.py
+tests/host_context/conftest.py
 tests/property/conftest.py
 tests/fixtures/product_tree/agents_extensions/codex-home/AGENTS.md
 tests/fixtures/product_tree/agents_extensions/codex-home/agents/luna_coder_high.toml
