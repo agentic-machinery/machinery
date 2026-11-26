@@ -9,6 +9,24 @@ this file.
 
 ## [Unreleased]
 
+<a id="v0.1.77"></a>
+## [0.1.77] - 2026-11-26
+
+### Changed
+
+- Stop lane-health redaction endpoint tests depending on test order ([#1486](https://github.com/agentic-machinery/machinery/pull/1486))
+
+### Fixed
+
+- Skip foreign JSON files in turn child-settlement scan ([#1473](https://github.com/agentic-machinery/machinery/pull/1473))
+- Recover cancelled merge-group runs missing candidate artifact ([#1474](https://github.com/agentic-machinery/machinery/pull/1474))
+- Read product, repos and consumer config from configured roots; one config-key rule and non-blocking reads (supersedes #1476) ([#1479](https://github.com/agentic-machinery/machinery/pull/1479))
+- Never write a task record with NaN or Infinity; report only confirmed heals (#1440) ([#1480](https://github.com/agentic-machinery/machinery/pull/1480))
+- Select tests of indirect PR dependencies within budget ([#1483](https://github.com/agentic-machinery/machinery/pull/1483))
+- Keep non-record files out of the task store with one closed refusal list (#1441) ([#1484](https://github.com/agentic-machinery/machinery/pull/1484))
+- Recover completed all-green runs with incoherent check rows (supersedes #1482) ([#1487](https://github.com/agentic-machinery/machinery/pull/1487))
+- Use current GitHub names for transferred repositories ([#1485](https://github.com/agentic-machinery/machinery/pull/1485))
+
 <a id="v0.1.76"></a>
 ## [0.1.76] - 2026-11-25
 
@@ -1755,7 +1773,8 @@ First release: the machinery extracted from learn-ukrainian as the installable `
 - Rollover confirms replacement bindings without a self-answered quiz. ([#65](https://github.com/learn-ukrainian/machinery/pull/65))
 - Deploy derives release identity from packaged bytes. ([#145](https://github.com/learn-ukrainian/machinery/pull/145))
 
-[Unreleased]: https://github.com/agentic-machinery/machinery/compare/v0.1.76...HEAD
+[Unreleased]: https://github.com/agentic-machinery/machinery/compare/v0.1.77...HEAD
+[0.1.77]: https://github.com/agentic-machinery/machinery/compare/v0.1.76...v0.1.77
 [0.1.76]: https://github.com/agentic-machinery/machinery/compare/v0.1.75...v0.1.76
 [0.1.75]: https://github.com/learn-ukrainian/machinery/compare/v0.1.74...v0.1.75
 [0.1.74]: https://github.com/learn-ukrainian/machinery/compare/v0.1.73...v0.1.74
