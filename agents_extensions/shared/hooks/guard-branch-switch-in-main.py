@@ -139,8 +139,28 @@ def _configured_primary_root() -> Path | None:
         raise RootsConfigurationError(str(exc)) from exc
 
 
-# Protect the configured product primary and any explicitly configured state
-# primary. The private infrastructure checkout retains its existing protection.
+def _infra_primary_root(public: Path) -> Path | None:
+    """The fleet registry's ``infra-private`` checkout beside *public*, or None.
+
+    The registry is the only source of the checkout's directory name. An unreadable
+    registry leaves the infra primary unprotected and says so on stderr; it never
+    blocks a command, so the public primary keeps its protection either way.
+    """
+    try:
+        from lu_machinery.orchestration.fleet_repos import resolve_fleet_repo
+
+        return resolve_fleet_repo("infra-private", primary_root=public, require_checkout=False)[1]
+    except Exception as exc:
+        print(
+            "guard-branch-switch-in-main: infra-private primary not protected; "
+            f"fleet registry unresolved ({type(exc).__name__}: {exc})",
+            file=sys.stderr,
+        )
+        return None
+
+
+# Protect the configured product primary, any explicitly configured state
+# primary and the registry's private infrastructure checkout.
 # Resolve on first use because ordinary commands never reach a branch verb.
 PROTECTED_ROOTS: list[Path] | None = None
 
@@ -148,11 +168,13 @@ PROTECTED_ROOTS: list[Path] | None = None
 def _protected_roots() -> set[Path]:
     global PROTECTED_ROOTS
     if PROTECTED_ROOTS is None:
+        public = _public_primary_root()
         configured = _configured_primary_root()
+        infra = _infra_primary_root(public)
         PROTECTED_ROOTS = [
-            _public_primary_root(),
+            public,
             *([] if configured is None else [configured]),
-            Path("~/projects/learn-ukrainian-infra-private").expanduser().resolve(),
+            *([] if infra is None else [infra]),
         ]
     return {root.resolve() for root in PROTECTED_ROOTS}
 

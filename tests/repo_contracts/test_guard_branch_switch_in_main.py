@@ -1421,3 +1421,40 @@ def test_issue_9479_r8_unquoted_branch_expansion_executes_bash(repos, tmp_path, 
         ["git", str(repos[start]), "commit", "-m", "It's active: " if apostrophe else "active: "],
     ]
     assert (guard._command_danger_reason(command, repos[start]) is not None) == (start == "public")
+
+
+def _registry_roots(monkeypatch, public: Path) -> None:
+    """Resolve PROTECTED_ROOTS through the hook itself, with *public* as the product primary."""
+    monkeypatch.setattr(guard, "PROTECTED_ROOTS", None)
+    monkeypatch.setattr(guard, "_public_primary_root", lambda: public)
+    monkeypatch.setattr(guard, "_configured_primary_root", lambda: None)
+    for name in ("LU_REPOS_ROOT", "LU_PROFILE_PATH"):
+        monkeypatch.delenv(name, raising=False)
+
+
+def test_registry_named_infra_primary_switch_is_refused(repos, tmp_path, monkeypatch):
+    """Defect class: the hook protects an infra path the fleet registry no longer names."""
+    from lu_machinery.orchestration.fleet_repos import load_fleet_repos
+
+    infra = tmp_path / load_fleet_repos()["infra-private"].local_name
+    infra.mkdir()
+    _git(infra, "init", "-b", "main")
+    _git(infra, "-c", "user.name=Guard Test", "-c", "user.email=guard@example.invalid", "commit", "--allow-empty", "-m", "initial")
+    _registry_roots(monkeypatch, repos["public"])
+
+    assert guard._command_danger_reason(f"git -C {infra} switch -c topic", repos["other"]) is not None
+    assert guard._command_danger_reason(f"git -C {repos['other']} switch -c topic", repos["public"]) is None
+
+
+def test_unreadable_registry_keeps_public_protection_and_blocks_nothing_else(repos, tmp_path, monkeypatch, capsys):
+    """Defect class: a registry read failure crashes the hook or blocks unrelated repositories."""
+    from lu_machinery.orchestration import fleet_repos
+
+    broken = tmp_path / "fleet_repos.yaml"
+    broken.write_text("repos: [unterminated\n", encoding="utf-8")
+    monkeypatch.setattr(fleet_repos, "_CONFIG_PATH", broken)
+    _registry_roots(monkeypatch, repos["public"])
+
+    assert guard._command_danger_reason(f"git -C {repos['other']} switch -c topic", repos["other"]) is None
+    assert guard._command_danger_reason(f"git -C {repos['public']} switch -c topic", repos["other"]) is not None
+    assert "infra-private primary not protected" in capsys.readouterr().err

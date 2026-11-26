@@ -189,7 +189,7 @@ def test_every_registered_repository_resolves_to_a_sibling_checkout_path(tmp_pat
     assert catalog["infra-private"].visibility == "private"
     assert catalog["infra-private"].github == "agentic-machinery/machinery-infra"
     assert catalog["infra-private"].alternate_github == "learn-ukrainian/learn-ukrainian-infra-private"
-    assert catalog["infra-private"].local_name == "learn-ukrainian-infra-private"
+    assert catalog["infra-private"].local_name == "machinery-infra"
     for key in ("machinery", "infra-private"):
         row = catalog[key]
         assert row.transfer_complete
