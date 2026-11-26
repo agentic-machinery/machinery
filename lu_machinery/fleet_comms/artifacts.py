@@ -68,6 +68,7 @@ from lu_machinery.fleet_comms.pg_schema import (
     apply_pg_schema,
     verify_pg_schema,
 )
+from lu_machinery.lib.readonly_sqlite import SQLiteConnection
 
 DEFAULT_ROOT = DEFAULT_ROOT_REL
 _SAFE_NAME = re.compile(r"^[A-Za-z0-9._@+=,-][A-Za-z0-9._@+=, -]{0,200}$")
@@ -830,6 +831,10 @@ class ArtifactStoreError(RuntimeError):
 
 class ArtifactExpiredError(ArtifactStoreError):
     """The blob was removed by the retention rule; row and digest remain."""
+
+
+class ArtifactTooLargeError(ArtifactStoreError):
+    """The bounded reader cannot return this artifact."""
 
 
 class _CutShort(ArtifactStoreError):
@@ -2470,3 +2475,68 @@ class ArtifactStore:
             raise ArtifactStoreError(
                 "commit=False requires a caller-owned active transaction"
             )
+
+def read_message_body_bounded(
+    connection: SQLiteConnection, root: Path, message_id: str, *, max_bytes: int
+) -> bytes:
+    """Read a message's linked SQLite CAS body using the caller's read-only connection.
+
+    Verify both the message and artifact digests and the body reference before
+    opening the blob. Never fall back to the inline copy.
+    """
+    statement = """
+        SELECT a.sha256, a.bytes, substr(a.retention_class, 1, ?) AS retention,
+               m.content_sha256 = a.sha256 AS digest_matches
+        FROM comms_messages AS m
+        JOIN message_artifacts AS r ON r.message_id = m.message_id
+            AND r.artifact_id = m.body_artifact_id AND r.relation = 'body'
+        JOIN artifacts AS a ON a.artifact_id = r.artifact_id
+        WHERE m.message_id = ? AND typeof(a.sha256) = 'text' AND length(CAST(a.sha256 AS BLOB)) = 64
+            AND typeof(a.retention_class) = 'text' AND length(a.retention_class) > 0
+    """
+    params = (len(RETENTION_EXPIRED_PREFIX), message_id)
+    record = connection.execute(statement, params).fetchone()
+    if record is None:
+        raise ArtifactStoreError("body artifact or reference missing")
+    digest, size, retention, digest_matches = record
+    if retention == RETENTION_EXPIRED_PREFIX:
+        raise ArtifactExpiredError("body expired")
+    if not digest_matches or not re.fullmatch(r"[0-9a-f]{64}", digest) or type(size) is not int or size < 0:
+        raise ArtifactStoreError("invalid body artifact metadata")
+    if size > max_bytes:
+        raise ArtifactTooLargeError("body exceeds read limit")
+
+    try:
+        with contextlib.ExitStack() as stack:
+            dir_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+            parent = os.open(root, dir_flags)
+            stack.callback(os.close, parent)
+            for part in ("blobs", "sha256", digest[:2]):
+                parent = os.open(part, dir_flags, dir_fd=parent)
+                stack.callback(os.close, parent)
+            fd = os.open(digest, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
+            stack.callback(os.close, fd)
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode):
+                raise ArtifactStoreError("body blob is not a regular file")
+            if info.st_size > max_bytes:
+                raise ArtifactTooLargeError("body exceeds read limit")
+            if info.st_size != size:
+                raise ArtifactStoreError("body blob size mismatch")
+            with os.fdopen(fd, "rb", closefd=False) as blob:
+                data = blob.read(max_bytes + 1)
+    except FileNotFoundError:
+        data = None
+
+    # Retention marks a row before unlinking. Observe that mark even if the
+    # blob still exists or was opened before the unlink.
+    current = connection.execute(statement, params).fetchone()
+    if current is not None and current[2] == RETENTION_EXPIRED_PREFIX:
+        raise ArtifactExpiredError("body expired")
+    if current != record or data is None:
+        raise ArtifactStoreError("body artifact changed or is missing")
+    if len(data) > max_bytes:
+        raise ArtifactTooLargeError("body exceeds read limit")
+    if len(data) != size or hashlib.sha256(data).hexdigest() != digest:
+        raise ArtifactStoreError("body blob digest mismatch")
+    return data

@@ -24,6 +24,8 @@ def test_fleet_routes_are_registered_get_only_and_contracted() -> None:
         "/api/fleet/endpoints",
         "/api/fleet/seats",
         "/api/fleet/deliveries",
+        "/api/fleet/messages/{message_id}/body",
+        "/api/fleet/messages/{message_id}/thread",
         "/api/fleet/requests",
         "/api/fleet/authority/jobs",
         "/api/fleet/migrations",

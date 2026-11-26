@@ -68,6 +68,11 @@
       <button type="button" class="retry" data-clear-filters>Clear filters</button>
     </form>
     <p id="messages-status" class="visually-hidden" aria-live="polite" aria-atomic="true"></p>
+    <section id="message-reader" aria-label="Message reader" tabindex="-1" hidden>
+      <div id="message-body" aria-live="polite"></div>
+      <h3>Thread</h3>
+      <div id="message-thread"></div>
+    </section>
     <div id="messages-content">Loading…</div>
   </section>
   <section class="wide" id="fleet">
@@ -483,7 +488,9 @@ function renderMessages(payload) {
       text(when || null),
       text(from === null && to === null ? null : `${from ?? "—"} → ${to ?? "—"}`),
       text(kind),
-      messageId === null ? text(null) : td(escapeHtml(messageId)),
+      messageId === null ? text(null) : td(
+        `<button type="button" class="retry" aria-controls="message-reader" data-open-message="${escapeHtml(messageId)}">${escapeHtml(messageId)}</button>`
+      ),
       text(state),
       text(attempts === null ? null : String(attempts), attempts !== null && attempts < 0 ? "num warn" : "num"),
       waited === null ? text(null, "num") : waited < 0 ? text("?", "num warn") : text(span(waited), "num"),
@@ -621,6 +628,16 @@ function bindMessageFilters() {
   document.addEventListener("click", event => {
     const target = event.target;
     if (typeof target?.closest !== "function") return;
+    const message = target.closest("button[data-open-message]");
+    if (message?.dataset.openMessage) {
+      const id = message.dataset.openMessage;
+      const reader = document.getElementById("message-reader");
+      reader.hidden = false;
+      loadMessageBody(id);
+      loadMessageThread(id);
+      reader.focus();
+      return;
+    }
     if (target.closest("[data-clear-filters]")) {
       event.preventDefault();
       assignPage("");
@@ -696,6 +713,78 @@ function setNodeChildren(container, nodes) {
   }
   while (container.firstChild) container.removeChild(container.firstChild);
   for (const node of nodes) container.appendChild(node);
+}
+
+const MESSAGE_URL = "/api/fleet/messages";
+let messageBodyRequest = 0;
+let messageThreadRequest = 0;
+
+async function loadMessageBody(id) {
+  const seq = ++messageBodyRequest;
+  const box = document.getElementById("message-body");
+  const heading = discussionEl("h3", "", `Message ${id}`);
+  setNodeChildren(box, [heading, discussionEl("p", "muted", "Loading message…")]);
+  let content;
+  try {
+    const response = await fetch(`${MESSAGE_URL}/${encodeURIComponent(id)}/body`, {cache: "no-store"});
+    const payload = await response.json();
+    if (response.ok && payload.state === "ok" && payload.message_id === id && typeof payload.body === "string") {
+      content = discussionEl("pre", "", payload.body || "Empty message");
+      content.style.whiteSpace = "pre-wrap";
+      content.style.overflowWrap = "anywhere";
+    } else {
+      const message = {
+        expired: "Body expired.",
+        oversized: "Message exceeds the size limit.",
+        not_found: "Message unavailable.",
+        withheld: "Message withheld.",
+        missing_or_corrupt: "Message body missing or corrupt.",
+      };
+      const label = Object.hasOwn(message, payload?.state) ? message[payload.state] : "Message could not load.";
+      content = discussionEl("p", "error", label);
+    }
+  } catch {
+    content = discussionEl("p", "error", "Message could not load.");
+  }
+  if (seq === messageBodyRequest) setNodeChildren(box, [heading, content]);
+}
+
+async function loadMessageThread(id, offset = 0) {
+  const seq = ++messageThreadRequest;
+  const box = document.getElementById("message-thread");
+  setNodeChildren(box, [discussionEl("p", "muted", "Loading thread…")]);
+  try {
+    const response = await fetch(
+      `${MESSAGE_URL}/${encodeURIComponent(id)}/thread?offset=${offset}`, {cache: "no-store"}
+    );
+    const payload = await response.json();
+    if (seq !== messageThreadRequest) return;
+    if (!response.ok || !Array.isArray(payload.messages)) throw new Error("Thread unavailable");
+    const list = discussionEl("ul");
+    for (const row of payload.messages) {
+      const item = discussionEl("li");
+      const open = discussionEl("button", "retry", row.message_id);
+      open.type = "button";
+      open.addEventListener("click", () => loadMessageBody(row.message_id));
+      item.appendChild(open);
+      item.appendChild(discussionEl("span", "muted", ` ${row.kind} · ${utc(row.created_at) || "Unknown time"}`));
+      list.appendChild(item);
+    }
+    const nodes = [list];
+    for (const [label, position] of [
+      ["Previous", offset > 0 ? Math.max(0, offset - payload.limit) : null],
+      ["Next", payload.next_offset],
+    ]) {
+      if (!Number.isSafeInteger(position)) continue;
+      const button = discussionEl("button", "retry", label);
+      button.type = "button";
+      button.addEventListener("click", () => loadMessageThread(id, position));
+      nodes.push(button);
+    }
+    setNodeChildren(box, nodes);
+  } catch {
+    if (seq === messageThreadRequest) setNodeChildren(box, [discussionEl("p", "error", "Thread could not load.")]);
+  }
 }
 
 function discussionTranscriptUrl(conversationId) {
