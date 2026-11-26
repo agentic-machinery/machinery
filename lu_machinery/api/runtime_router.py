@@ -1669,6 +1669,7 @@ def _redact_and_sanitize_json_value(value: Any, *, depth: int) -> Any:
     if isinstance(value, _AcpJsonObject):
         cleaned: dict[str, Any] = {}
         served_keys: dict[str, str] = {}
+        next_suffix: dict[str, int] = {}
         for raw_key, item in value:
             cleaned_key = _redact_and_sanitize_text(raw_key, _depth=depth + 1)
             # Validate every member before a secret key or a later duplicate key discards it.
@@ -1678,9 +1679,11 @@ def _redact_and_sanitize_json_value(value: Any, *, depth: int) -> Any:
             served_key = served_keys.get(raw_key)
             if served_key is None:
                 # Distinct keys that redact to the same text keep distinct members: "#2", "#3", ...
-                served_key, suffix = cleaned_key, 2
+                # Each cleaned key resumes from its next free suffix, so collisions cost linear time.
+                served_key, suffix = cleaned_key, next_suffix.get(cleaned_key, 2)
                 while served_key in cleaned:
                     served_key, suffix = f"{cleaned_key}#{suffix}", suffix + 1
+                next_suffix[cleaned_key] = suffix
                 served_keys[raw_key] = served_key
             cleaned[served_key] = cleaned_item  # a repeated raw key keeps JSON's last-member value
         return cleaned
