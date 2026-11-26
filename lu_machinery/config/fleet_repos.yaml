@@ -51,8 +51,10 @@
 #
 # Dual-slug transfer bridge (PLAN NEW-ORG-1122 A01):
 # - `alternate_github` (optional, owner/name) names the one exact alternate slug
-#   for a repository being transferred. Both `github` and `alternate_github`
+#   for a planned or completed transfer. Both `github` and `alternate_github`
 #   resolve to the same registry row.
+# - `transfer_complete: true` records a completed transfer. `github` then names
+#   the destination and `alternate_github` retains the historical source.
 # - `repository_id` (optional positive integer; required with `alternate_github`)
 #   records the immutable GitHub repository ID from an authenticated API readback,
 #   never filled by hand.
@@ -96,8 +98,9 @@ repos:
     sources_server: .mcp/servers/sources/server.py
     admission_policy: scripts/curriculum/admission_policy.v1.json
   infra-private:
-    github: learn-ukrainian/learn-ukrainian-infra-private
-    alternate_github: agentic-machinery/machinery-infra
+    github: agentic-machinery/machinery-infra
+    alternate_github: learn-ukrainian/learn-ukrainian-infra-private
+    transfer_complete: true
     repository_id: 1282510453
     visibility: private
     local_name: learn-ukrainian-infra-private
@@ -152,8 +155,9 @@ repos:
   # machinery: the public machinery repository. Role avoids "public-monorepo" (learn-ukrainian-only
   # audits, Kimi and DeepSeek admission) and keeps the "public-" prefix for publisher privacy handling.
   machinery:
-    github: learn-ukrainian/machinery
-    alternate_github: agentic-machinery/machinery
+    github: agentic-machinery/machinery
+    alternate_github: learn-ukrainian/machinery
+    transfer_complete: true
     repository_id: 1445647449
     visibility: public
     local_name: machinery

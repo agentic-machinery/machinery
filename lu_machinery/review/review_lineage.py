@@ -45,6 +45,7 @@ from lu_machinery.agent_runtime.model_pause import normalize_role
 from lu_machinery.dispatcher.admission import review_typed
 from lu_machinery.guardrails.delegate_ownership import TERMINAL_TASK_STATUSES
 from lu_machinery.opsec.prepublish import normalize_repository
+from lu_machinery.orchestration.fleet_repos import FleetRepoError, repository_identity, same_repository
 from lu_machinery.orchestration.integration_sweep import (
     MARKER_PREFIX,
     REJECTED,
@@ -128,13 +129,21 @@ def _record_task_id(record: Mapping[str, Any], fallback: str) -> str:
     return recorded if type(recorded) is str and REVIEW_TASK_ID.fullmatch(recorded) and ".." not in recorded else fallback
 
 
-def _repository_key(value: object) -> str | None:
+def _repository_key(value: object) -> int | str | None:
     if type(value) is not str:
         return None
     # The dispatcher stores an absolute origin for file transport. Paths compare verbatim.
     if value.isprintable() and Path(value).is_absolute():
         return value
     hosted = normalize_repository(value)
+    host, _, slug = hosted.partition("/")
+    if host == "github.com":
+        try:
+            identity = repository_identity(slug)
+        except FleetRepoError:
+            raise LineageRefused("fleet repository identity is unavailable") from None
+        if isinstance(identity, int):
+            return identity
     return hosted if hosted != "unknown" else None
 
 
@@ -260,7 +269,8 @@ def require_run_binding(
         if not record.get(recorded) or evidence.get(field) != record[recorded]:
             raise LineageRefused(f"{evidence['task_id']}: missing or mismatched {field}")
     if (record.get("status") != "done" or record.get("task_id") != evidence["task_id"]
-            or (number is not None and record.get("pr") != number) or record.get("repository") != repository
+            or (number is not None and record.get("pr") != number)
+            or not same_repository(record.get("repository"), repository)
             or recorder._review_branch(dict(record)) != branch
             or record.get("pinned_head") not in (None, evidence["reviewed_sha"])):
         raise LineageRefused(f"{evidence['task_id']}: run does not match repository, PR, lineage or pinned head")
@@ -888,7 +898,7 @@ def _binds_retry(
             or evidence is None
             or not _supervised_review_binding(retry)
             or not _lower_sha256(retry.record.get("result_sha256"))
-            or retry.record.get("repository") != repository
+            or not same_repository(retry.record.get("repository"), repository)
             or type(retry.record.get("pr")) is not int
             or retry.record.get("pr") != number
             or recorder._review_branch(dict(retry.record)) != branch

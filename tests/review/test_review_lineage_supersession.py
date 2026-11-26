@@ -565,10 +565,10 @@ def test_a_run_recorded_for_another_pr_on_the_same_branch_is_not_this_prs_lineag
     branch = "claude/shared-dispatch"
     repository = "learn-ukrainian/machinery"
 
-    def recorded(task_id, pr):
+    def recorded(task_id, pr, repo=repository):
         body = {
             "task_id": task_id,
-            "repository": repository,
+            "repository": repo,
             "schema_version": 2,
             "review_branch": branch,
             "review_mode": "cross_family",
@@ -589,6 +589,16 @@ def test_a_run_recorded_for_another_pr_on_the_same_branch_is_not_this_prs_lineag
 
     assert counted(13076) == ["pr-b", "unattributed"]
     assert counted(13075) == ["pr-a", "unattributed"]
+
+    # Records saved before the transfer still count on the current slug. A different repository
+    # with the same PR number and branch must never spend this review budget.
+    current = "agentic-machinery/machinery"
+    records.extend([recorded("current", 13075, current), recorded("unrelated", 13075, "elsewhere/machinery")])
+    for path, body in records:
+        path.write_text(json.dumps(body), encoding="utf-8")
+    for slug in (current, repository):
+        runs = lineage_runs(tmp_path, repository=slug, number=13075, branch=branch)
+        assert {run.task_id for run in runs} == {"current", "pr-a", "unattributed"}
 
 
 RATE_LIMIT_PR = 1378

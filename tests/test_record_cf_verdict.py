@@ -190,6 +190,32 @@ def test_repair_receipts_stay_private_on_admission_and_consumption(tmp_path, mon
     finally:
         os.umask(previous)
 
+    old, current = "learn-ukrainian/machinery", "agentic-machinery/machinery"
+    branch = "codex/example"
+    transferred = tmp_path / "transferred"
+    legacy = {
+        **receipt,
+        "repository": old,
+        "lineage_keys": [f"pr:{old}#1", f"branch:{old}:{branch}", f"issue:{old}#7"],
+    }
+    repair_round.record_admission(transferred, legacy)
+    keys = repair_round.lineage_keys(current, 1, branch, [7])
+    assert keys == repair_round.lineage_keys(old, 1, branch, [7])
+    assert {"pr:1445647449#1", f"branch:1445647449:{branch}", "issue:1445647449#7"} <= set(keys)
+    assert set(legacy["lineage_keys"]) <= set(keys)
+    assert repair_round.repair_heads(transferred, repository=current, number=1, branch=branch) == {"b" * 40}
+    prior = repair_round.receipt_at(transferred, repository=current, number=1, branch=branch, head="b" * 40)
+    assert prior is not None and prior["repository"] == old
+    current_receipt = {**legacy, "repository": current, "lineage_keys": keys}
+    with pytest.raises(repair_round.RepairRefused, match="took its repair round concurrently"):
+        repair_round.record_admission(transferred, {**current_receipt, "candidate_head": "c" * 40})
+    assert len(list(transferred.glob("*.json"))) == len(legacy["lineage_keys"])
+    repair_round.record_consumption(transferred, legacy, comment="fixture")
+    repair_round.record_admission(transferred, current_receipt)
+    assert all(repair_round._receipt_path(transferred, key).is_file() for key in keys)
+    prior = repair_round.receipt_at(transferred, repository=current, number=1, branch=branch, head="b" * 40)
+    assert prior is not None and prior["state"] == "consumed"
+
 
 def test_same_family_refused(monkeypatch, low_review, tmp_path):
     tasks, comments, statuses, files, _admit = low_review

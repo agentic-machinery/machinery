@@ -946,6 +946,8 @@ def test_cleanup_report_keeps_criterion_eligibility_separate(tmp_path, monkeypat
 
 
 def test_criterion_receipts_skip_non_ledger_files(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from lu_machinery.orchestration import task_closeout
+
     monkeypatch.setattr(tl, "canonical_state_root", lambda _: tmp_path)
     snapshot = tl.build_ac_snapshot(
         "- [x] **AC-ONE** — Done.\n",
@@ -973,6 +975,26 @@ def test_criterion_receipts_skip_non_ledger_files(tmp_path: Path, monkeypatch: p
     )
 
     assert reports == []
+
+    old, current = "learn-ukrainian/machinery", "agentic-machinery/machinery"
+    identity = _identity()
+    identity.update(
+        repository=old,
+        github_issue_url=f"https://github.com/{old}/issues/{identity['github_issue_number']}",
+        stream_epic_url=f"https://github.com/{old}/issues/{identity['stream_epic']}",
+    )
+    legacy = tl.build_lifecycle(
+        identity, author_family="codex", ac_snapshot=snapshot,
+        required_checks=["CI Gate"], now=NOW, pr_number=77,
+    )
+    tl.write_lifecycle(tl.lifecycle_path(tmp_path, identity), legacy)
+    monkeypatch.setattr(
+        task_closeout.GhGitHubAdapter, "observe", lambda *a, **k: {"github": {"pr": {"head_sha": "b" * 40}}},
+    )
+    reports = mc.collect_criterion_receipts(
+        tmp_path, mc.PullRequestInfo(77, "MERGED", "codex/branch", "a" * 40), repo=current,
+    )
+    assert reports == [{"closure_ready": False, "error": "CLOSEOUT_PR_HEAD_MOVED"}]
 
 
 def test_merged_run_evidence_reads_the_repository_required_workflow(bound_case, tmp_path, monkeypatch) -> None:
@@ -1309,7 +1331,7 @@ def test_main_missing_catalog_checkout_refuses_exit_2(
     assert exit_code == 2
     assert payload["ok"] is False
     assert "sibling checkout" in payload["error"]
-    assert "learn-ukrainian/machinery" in payload["error"]
+    assert "agentic-machinery/machinery" in payload["error"]
 
 
 @pytest.mark.parametrize("spelling", ["infra-private", "learn-ukrainian/learn-ukrainian-infra-private"])

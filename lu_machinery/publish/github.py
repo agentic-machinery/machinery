@@ -1322,6 +1322,7 @@ def _catalog_fleet_repos(raw_catalog=None):
         if visibility is not None and (not isinstance(visibility, str) or visibility not in {"public", "private"}):
             raise gate.PublishBlocked("OPSEC: repository allowlist malformed; write refused.")
         alt_raw = row.get("alternate_github")
+        transfer_complete = row.get("transfer_complete", False)
         alt_slug = None
         if alt_raw is not None:
             if not isinstance(alt_raw, str):
@@ -1331,6 +1332,8 @@ def _catalog_fleet_repos(raw_catalog=None):
                 raise gate.PublishBlocked("OPSEC: repository allowlist malformed; write refused.")
             if alt_slug.casefold() == slug.casefold() or repo_id is None or visibility is None:
                 raise gate.PublishBlocked("OPSEC: repository allowlist malformed; write refused.")
+        if type(transfer_complete) is not bool or (transfer_complete and alt_slug is None):
+            raise gate.PublishBlocked("OPSEC: repository allowlist malformed; write refused.")
         repos[key] = fleet_repos.FleetRepo(
             key=key,
             github=slug,
@@ -1340,6 +1343,7 @@ def _catalog_fleet_repos(raw_catalog=None):
             repository_id=repo_id,
             visibility=visibility,
             alternate_github=alt_slug,
+            transfer_complete=transfer_complete,
         )
     if defaults != 1:
         raise gate.PublishBlocked("OPSEC: repository allowlist malformed; write refused.")
@@ -2959,15 +2963,12 @@ def _repo_admin_readback(
 
 
 def _rehearsal_slugs(verb, row, name):
-    """The fixture's slug in the row's organization, and its exact rehearsal destination.
-
-    Like the move itself, the rehearsal changes both owner and name: ``<name>`` in the row's
-    organization becomes ``<name>-moved`` in the alternate organization.
-    """
+    """Use the recorded transfer direction for creation and for older fixture receipts."""
     destination_name = name + _REHEARSAL_SUFFIX
     if len(destination_name) > _GITHUB_REPOSITORY_NAME_LIMIT:
         raise _repo_refused(verb, f"the rehearsal destination name exceeds {_GITHUB_REPOSITORY_NAME_LIMIT} characters")
-    return f"{row.owner}/{name}", f"{row.alternate_github.split('/', 1)[0]}/{destination_name}"
+    source, destination = row.transfer_slugs
+    return f"{source.split('/', 1)[0]}/{name}", f"{destination.split('/', 1)[0]}/{destination_name}"
 
 
 def _repo_create_plan(verb, fields, repos, row, environment):
@@ -3134,20 +3135,24 @@ def _repo_transfer_plan(verb, fields, repos, row, environment):
             raise _repo_refused(verb, "the creation receipt names a registered repository")
         mode = "rehearsal"
     else:
+        source, destination = row.transfer_slugs
+        mode, repository_id = "move", row.repository_id
         # Selector problems are judged after the destination and journal reads, so a pending transfer still settles.
-        try:
-            active = fleet_repos.resolve_active_fleet_repo(row.key, repos=repos, env=environment)
-        except Exception as exc:
-            # Any selector failure, the parser's RecursionError included, is judged after the pending journal.
-            detail = str(exc) if isinstance(exc, fleet_repos.FleetRepoError) else type(exc).__name__
-            selector = f"the fleet repository selector cannot bind {row.key}: {detail}"
+        if row.transfer_complete:
+            selector = f"the registry marks the transfer of {row.key} complete, but repository {repository_id} is not at {destination}"
         else:
-            if not _same_slug(active.active_github, row.github):
-                selector = (
-                    f"the selector already names {active.active_github} for {row.key}, but repository "
-                    f"{row.repository_id} is not at {row.alternate_github}; the move is not pending"
-                )
-        mode, source, destination, repository_id = "move", row.github, row.alternate_github, row.repository_id
+            try:
+                active = fleet_repos.resolve_active_fleet_repo(row.key, repos=repos, env=environment)
+            except Exception as exc:
+                # Any selector failure, the parser's RecursionError included, is judged after the pending journal.
+                detail = str(exc) if isinstance(exc, fleet_repos.FleetRepoError) else type(exc).__name__
+                selector = f"the fleet repository selector cannot bind {row.key}: {detail}"
+            else:
+                if not _same_slug(active.active_github, source):
+                    selector = (
+                        f"the selector already names {active.active_github} for {row.key}, but repository "
+                        f"{repository_id} is not at {destination}; the move is not pending"
+                    )
     return {
         "selector_refusal": selector,
         "stem": f"repo-transfer-{repository_id}",
@@ -5462,9 +5467,8 @@ def _parse_args(argv):
                 "--principal octo-admin --dry-run\n"
                 f"  .venv/bin/python -m {_PUBLISHER} repo-create --repo infra-private --name move-rehearsal-1 "
                 "--principal octo-admin\n"
-                f"The --repo row of {_FLEET_REPOS} (alternate_github, repository_id, private) names both\n"
-                "  organizations: the fixture is <github owner>/<name>, and its exact rehearsal destination is\n"
-                "  <alternate_github owner>/<name>-moved (owner and name change, like the move itself).\n"
+                f"The --repo row of {_FLEET_REPOS} names both organizations. The fixture is created in the\n"
+                "  original organization and its rehearsal destination is <destination owner>/<name>-moved.\n"
                 "Checks before the mutation: LU_PRODUCT_ROOT names the product checkout, which the private\n"
                 "  directory below must stay outside (unset: exit 2); no worker marker; none of GH_TOKEN,\n"
                 "  GITHUB_TOKEN, GH_ENTERPRISE_TOKEN, GITHUB_ENTERPRISE_TOKEN, GH_CONFIG_DIR, XDG_CONFIG_HOME set;\n"
@@ -5493,7 +5497,7 @@ def _parse_args(argv):
             )
         if verb == "repo-transfer":
             sub.description = (
-                "Transfer one registered dual-slug repository to its alternate organization, exactly once.\n"
+                "Transfer one registered dual-slug repository to the configured destination, exactly once.\n"
                 "Use only from an operator-run script for the approved move or its rehearsal; workers are refused."
             )
             sub.formatter_class = argparse.RawDescriptionHelpFormatter
@@ -5507,6 +5511,8 @@ def _parse_args(argv):
                 "Move: source and destination are the --repo row's github and alternate_github slugs, the id is its\n"
                 "  repository_id, its visibility matches the row (public or private) and must stay unchanged, and\n"
                 "  LU_FLEET_REPO_SELECTOR_FILE must still name the github slug (else refused).\n"
+                "Completed move (transfer_complete): github is the destination. The command can verify that\n"
+                "  the move already happened and reconcile its journal. It sends no new transfer.\n"
                 "Rehearsal (--create-receipt, private rows only): the repo-create receipt from the private state\n"
                 "  directory binds the fixture's id and its exact <name>-moved destination; registered ids and names\n"
                 "  are refused.\n"

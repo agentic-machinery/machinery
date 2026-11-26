@@ -408,13 +408,11 @@ def hygiene_check(
     pointer_repos: tuple[str, ...] = () if private_repo is None else (private_repo,)
     if private_repo is None:
         try:
-            # The board is read at the row's active slug; an unknown row or a transferred row without a
-            # trusted selector is unknown, never the slug it may have left. The epic's pointer is a stored
-            # document: it may name the active slug or the row's github slug, the transfer source GitHub
-            # redirects once moved, but never an alternate the selector has not made live.
+            # Read at the active slug. The stored pointer may also name the original repository
+            # slug, which GitHub redirects after the transfer.
             active = resolve_active_fleet_repo("infra-private", repos=load_fleet_repos())
             private_repo = active.active_github
-            pointer_repos = tuple(dict.fromkeys((active.active_github, active.repo.github)))
+            pointer_repos = tuple(dict.fromkeys((active.active_github, active.repo.transfer_slugs[0])))
         except FleetRepoError:
             return _receipt(
                 status=Status.UNKNOWN,

@@ -63,6 +63,7 @@ from lu_machinery.orchestration.fleet_repos import (
     ascii_repo_slug,
     canonical_repository,
     parse_ascii_positive_int,
+    repository_identity,
     same_repository,
 )
 
@@ -159,6 +160,15 @@ def state_path() -> Path:
 def pr_key(repo: str, number: int) -> str:
     """The persisted key shared by both registered spellings of a repository."""
     return f"{canonical_repository(repo)}#{number}"
+
+
+def _pr_identity(value: object) -> str | None:
+    """A stored PR reference's identity, independent of the slug it was written with."""
+    try:
+        repo, number = _parse_pr_ref(value, "ownership state")
+    except OwnershipError:
+        return None
+    return f"{repository_identity(repo)}#{number}"
 
 
 def _empty() -> dict[str, Any]:
@@ -420,6 +430,7 @@ def load(path: Path, *, strict_keys: bool = False) -> dict[str, Any]:
         attempts = data.setdefault("heal_attempts", {})
         if not isinstance(attempts, dict):
             raise TypeError("heal_attempts")
+        normalized_attempts: dict[str, dict[str, Any]] = {}
         for key, row in attempts.items():
             if (
                 not isinstance(key, str) or not isinstance(row, dict)
@@ -427,6 +438,13 @@ def load(path: Path, *, strict_keys: bool = False) -> dict[str, Any]:
                 or row.get("postcondition") not in {"true", "false", "unknown"}
             ):
                 raise TypeError(key)
+            name, _, head = key.rpartition(":")
+            identity = _pr_identity(name)
+            attempt_key = f"{identity}:{head}" if identity is not None else key
+            if attempt_key in normalized_attempts and normalized_attempts[attempt_key] != row:
+                raise OwnershipError("ownership state has conflicting heal attempts for one repository")
+            normalized_attempts[attempt_key] = row
+        data["heal_attempts"] = normalized_attempts
     except (AttributeError, KeyError, TypeError, ValueError) as exc:
         raise OwnershipError(f"ownership state malformed: {type(exc).__name__}") from exc
     return data
@@ -654,6 +672,7 @@ def _reconcile_seated_outbox(outbox: list[dict[str, str]], seated: set[str]) -> 
     """
     if not seated:
         return
+    seated_identities = {_pr_identity(name) for name in seated} - {None}
     kept: list[dict[str, str]] = []
     for entry in outbox:
         raw = entry.get("rows")
@@ -665,10 +684,12 @@ def _reconcile_seated_outbox(outbox: list[dict[str, str]], seated: set[str]) -> 
         except json.JSONDecodeError:
             kept.append(entry)
             continue
-        if not isinstance(rows, list) or not any(isinstance(row, dict) and row.get("pr") in seated for row in rows):
+        if not isinstance(rows, list) or not any(
+            isinstance(row, dict) and _pr_identity(row.get("pr")) in seated_identities for row in rows
+        ):
             kept.append(entry)
             continue
-        remaining = [row for row in rows if isinstance(row, dict) and row.get("pr") not in seated]
+        remaining = [row for row in rows if isinstance(row, dict) and _pr_identity(row.get("pr")) not in seated_identities]
         if remaining:
             kept.extend(outbox_entries({entry["kind"]: remaining}))
     outbox[:] = kept
@@ -1718,7 +1739,7 @@ def _seat_decision_owner(
     if state != "OPEN" or not _single_line(finding.reason):
         return None
     attempts = data.setdefault("heal_attempts", {})
-    attempt_key = f"{key}:{head}"
+    attempt_key = f"{_pr_identity(key) or key}:{head}"
     prior = attempts.get(attempt_key)
     if isinstance(prior, dict):
         if (
@@ -1917,7 +1938,7 @@ def custody_view(data: Mapping[str, Any]) -> dict[str, Any]:
     def attempts_for_episode(key: str, since: datetime) -> tuple[list[dict[str, Any]], bool]:
         # The prefix ends in ":", so repo#1: does not match an attempt for repo#10.
         # A clock that cannot be read does not prove the attempt predates this episode.
-        prefix = f"{key}:"
+        prefix = f"{_pr_identity(key) or key}:"
         tied: list[dict[str, Any]] = []
         unreadable = False
         for attempt_key, row in attempts.items():
@@ -1954,7 +1975,7 @@ def custody_view(data: Mapping[str, Any]) -> dict[str, Any]:
             unknown[key] = {"pr": key, "why": "handoff has fields outside ownership", "alerted": False}
             continue
         head = handoff.get("head")
-        matched = attempts.get(f"{key}:{head}") if isinstance(head, str) else None
+        matched = attempts.get(f"{_pr_identity(key) or key}:{head}") if isinstance(head, str) else None
         recorded[key] = {
             "pr": key,
             "decision_owner": handoff.get("decision_owner"),

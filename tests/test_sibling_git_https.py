@@ -33,8 +33,8 @@ world = world_fixture
 
 _REAL_INIT = sg.Git.__init__
 _REAL_REGISTRY = sg._REGISTRY_PATH
-INTENDED_PRIVATE_SLUG = "learn-ukrainian/learn-ukrainian-infra-private"
-INTENDED_PRIVATE_URL = "https://github.com/learn-ukrainian/learn-ukrainian-infra-private.git"
+INTENDED_PRIVATE_SLUG = "agentic-machinery/machinery-infra"
+INTENDED_PRIVATE_URL = "https://github.com/agentic-machinery/machinery-infra.git"
 TOKEN = "synthetic-credential"
 HEADER = "Basic " + base64.b64encode(f"x-access-token:{TOKEN}".encode()).decode()
 
@@ -506,7 +506,7 @@ def test_registry_opts_in_exactly_the_private_sibling(https_world, tmp_path, mon
     )
     # The intended slug and URL are pinned as literals, independent of the registry value.
     assert shipped.github == INTENDED_PRIVATE_SLUG
-    assert shipped.alternate_github == "agentic-machinery/machinery-infra"
+    assert shipped.alternate_github == "learn-ukrainian/learn-ukrainian-infra-private"
     assert shipped.repository_id == 1282510453
     assert shipped.visibility == "private"
     sel_dir = tmp_path / "host-selector"

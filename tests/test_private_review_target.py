@@ -125,9 +125,10 @@ def review_repositories(tmp_path, monkeypatch):
 
     monkeypatch.setattr(fleet_repos, "load_fleet_repos", _load)
     monkeypatch.setattr(target_resolution, "load_fleet_repos", _load)
+    private_origin = fleet_repos.resolve_active_fleet_repo("infra-private", repos=catalog).active_github
     origins = {
         public: f"https://github.com/{catalog['public'].github}.git",
-        private: f"https://github.com/{catalog['infra-private'].github}.git",
+        private: f"https://github.com/{private_origin}.git",
     }
     heads = [
         _init_committed_repo(public, origins[public], "public.py"),
