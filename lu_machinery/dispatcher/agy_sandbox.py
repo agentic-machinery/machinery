@@ -18,8 +18,10 @@ launches AGY directly. ``providers/agy.py`` returns this module's launcher, whic
 * runs AGY under bubblewrap (``review.isolation``). The root is empty except for read-only binds of
   the system runtime, the AGY binary, the task worktree, its Git metadata, the project virtual environment
   (exposed as the worktree's untracked ``.venv`` link so reviews can run the interpreter and tests) and the selected primary databases and their existing sidecars. PID, IPC, UTS and network namespaces and procfs are private, every capability is
-  dropped and the root is remounted read-only, so the runtime (which holds TMPDIR) is the only
-  writable path;
+  dropped and the root is remounted read-only, so the runtime (which holds TMPDIR) and, with
+  ``--task-artifacts``, the task's own ``<task-id>.artifacts`` directory (the grant
+  ``write_boundary.grant_task_artifacts`` gives read-only Claude and Codex runs) are the only
+  writable paths. The launcher always passes it, so a read-only report outlives the scratch;
 * copies each explicit input's hashed bytes into the private scratch and bind-mounts that
   copy read-only at ``/agy-inputs/<n>``. The host path is not mounted. A file that is missing or
   whose digest changed is refused before AGY starts;
@@ -218,7 +220,7 @@ def launcher(spec, agy_argv: list[str]) -> list[str]:
     argv = [
         sys.executable, "-I", "-c", _BOOTSTRAP, str(machinery_path("dispatcher/agy_sandbox.py").parent.parent.parent),
         "--task-id", spec.task_id, "--worktree", str(spec.worktree), "--scratch", str(scratch(spec.task_id)),
-        "--receipt", str(receipt_file(spec.final_file)),
+        "--receipt", str(receipt_file(spec.final_file)), "--task-artifacts",
     ]
     for item in _inputs_from_spec(spec):
         argv += ["--input", item["path"], "--input-sha256", item["sha256"]]
@@ -1415,6 +1417,15 @@ class _Boundary:
         reads, hidden = full_review_reads(self.worktree)
         shared, tasks = runtime_context.read_roots()
         own = runtime_context.task_reads(self.args.task_id)
+        artifacts = None
+        if self.args.task_artifacts:
+            # The Claude and Codex read-only grant (write_boundary): only this task's own directory is writable.
+            from lu_machinery.dispatcher import store as task_store
+            from lu_machinery.dispatcher.write_boundary import grant_task_artifacts
+
+            record = task_store.read(self.args.task_id, missing_ok=True) or {}
+            artifacts, _nonce = grant_task_artifacts(self.args.task_id, record, Path(self.args.receipt), self.receipt,
+                                                     (common, self.worktree))
         corpus = (repository / "data").resolve()
         reads = [path for path in reads if path != corpus]
         databases = []
@@ -1440,6 +1451,8 @@ class _Boundary:
         probes += [{"op": "stat", "path": str(path), "expect": "OK"} for path in own]
         probes.append({"op": "stat", "path": str(tasks / f"{self.args.task_id}.json"), "expect": "ENOENT"})
         probes.append({"op": "create", "path": str(tasks / f"canary-{nonce}"), "expect": "EROFS"})
+        if artifacts is not None:
+            probes.append({"op": "scratch_cycle", "path": str(artifacts / f".agy-canary-{nonce}"), "expect": "OK"})
         for slot, target in databases:
             store = "sources" if slot.name == "sources.db" else "vesum"
             probes.append({"op": "store_read", "path": str(self.worktree), "store": store,
@@ -1503,6 +1516,9 @@ class _Boundary:
         masks += ["--tmpfs", str(tasks)]
         for path in own:
             masks += ["--ro-bind", str(path), str(path)]
+        if artifacts is not None:
+            # Before the store's remount, which still needs to create the mount point; it does not recurse.
+            masks += ["--bind", str(artifacts), str(artifacts)]
         masks += ["--remount-ro", str(tasks)]
         masks += [argument for copy, source in overlays for argument in ("--ro-bind", str(copy), str(source))]
         for link, target in databases:
@@ -1702,6 +1718,8 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--receipt", required=True)
     parser.add_argument("--input", action="append", help="Host path of one recorded input")
     parser.add_argument("--input-sha256", action="append", help="SHA-256 recorded for the matching --input")
+    parser.add_argument("--task-artifacts", action="store_true",
+                        help="Make this task's own <task-id>.artifacts directory writable (created if absent)")
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args(argv)
     receipt = {"schema": SCHEMA, "task_id": args.task_id, "status": "refused", "started_at": _now()}
