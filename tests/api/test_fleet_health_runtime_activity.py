@@ -254,10 +254,10 @@ def message_reader(fleet_panels, fleet_root):
 
         def seed(
             index, body, *, conversation="conversation", channel="first",
-            thread="thread", recipient="driver-sender", linked=True, digest=None,
+            thread="thread", recipient="driver-sender", linked=True, digest=None, message_id=None,
         ):
             artifact = store.store_bytes(body, producer="authority-message", retention_class="message-body")
-            mid = f"message_{index:032x}"
+            mid = message_id or f"message_{index:032x}"
             created = f"2026-11-26T11:00:{index:02d}Z"
             with closing(sqlite3.connect(db)) as connection, connection:
                 connection.execute(
@@ -296,7 +296,7 @@ def test_message_reader_refuses_cross_record_disclosure_and_pages_visible_member
     """Defect class: another channel, conversation, thread, or hidden delivery discloses content."""
     client, seed, db = message_reader
     anchor, _ = seed(1, b"First visible body")
-    member, _ = seed(2, b"Second visible body")
+    member, _ = seed(2, b"Second visible body", message_id=f"legacy-message-{2:032x}")
     foreign_channel, _ = seed(3, b"Other channel", channel="foreign")
     foreign_conversation, _ = seed(4, b"Other conversation", conversation="foreign")
     foreign_thread, _ = seed(5, b"Other thread", thread="foreign")
@@ -324,6 +324,7 @@ def test_message_reader_refuses_cross_record_disclosure_and_pages_visible_member
         }
     for path in (foreign_channel, foreign_conversation, foreign_thread):
         assert client.get(f"{path}/thread").json()["messages"][0]["message_id"] == path.rsplit("/", 1)[1]
+    assert client.get(f"{member}/body").json()["body"] == "Second visible body"
     for path in (hidden, orphan, discussion):
         for suffix in ("body", "thread"):
             response = client.get(f"{path}/{suffix}")
@@ -332,11 +333,13 @@ def test_message_reader_refuses_cross_record_disclosure_and_pages_visible_member
         response = client.get(f"{anchor}/{suffix}", headers={"Origin": "http://127.0.0.1:8764"})
         assert response.status_code == 403
         assert response.headers["cache-control"] == "no-store"
-    invalid_id = client.get("/api/fleet/messages/invalid/body")
-    invalid_page = client.get(f"{anchor}/thread?limit=101")
-    for response, state in ((invalid_id, "invalid_message_id"), (invalid_page, "invalid_page")):
-        assert (response.status_code, response.json()["state"]) == (400, state)
+    for message_id in ("invalid", f"M_{1:032x}", f"message_{'g' * 32}", f"{'a' * 96}_{1:032x}"):
+        response = client.get(f"/api/fleet/messages/{message_id}/body")
+        assert (response.status_code, response.json()["state"]) == (400, "invalid_message_id")
         assert response.headers["cache-control"] == "no-store"
+    invalid_page = client.get(f"{anchor}/thread?limit=101")
+    assert (invalid_page.status_code, invalid_page.json()["state"]) == (400, "invalid_page")
+    assert invalid_page.headers["cache-control"] == "no-store"
 
 
 @pytest.mark.parametrize(

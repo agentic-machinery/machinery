@@ -2287,9 +2287,15 @@ def _message_not_available(reason: str) -> JSONResponse:
 
 
 def _message_id_valid(value: object) -> bool:
-    return (
-        isinstance(value, str) and len(value) <= _MESSAGE_MAX_ID
-        and AUTHORITY_MESSAGE_ID_RE.fullmatch(value) is not None
+    if not isinstance(value, str) or not 34 <= len(value) <= _MESSAGE_MAX_ID:
+        return False
+    prefix, digest = value[:-32], value[-32:]
+    if any(char not in "0123456789abcdef" for char in digest):
+        return False
+    if prefix == "legacy-message-":
+        return True
+    return prefix.endswith("_") and "a" <= prefix[0] <= "z" and all(
+        "a" <= char <= "z" or "0" <= char <= "9" or char == "-" for char in prefix[1:-1]
     )
 
 
