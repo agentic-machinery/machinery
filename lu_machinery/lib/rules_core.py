@@ -118,6 +118,10 @@ TASK_SCOPES: dict[str, TaskScope] = {
     "review": TaskScope("Code/infra review", (f"{_SKILLS}/local-code-review/SKILL.md",)),
     "task-family": TaskScope("Task archive", (f"{_SKILLS}/task-family-manager/SKILL.md",)),
     "rollover": TaskScope("Rollover preparation", (f"{_SKILLS}/thread-rollover/SKILL.md",)),
+    "ukrainian": TaskScope(
+        "Any seat writing, repairing, or reviewing Ukrainian",
+        (f"{_SKILLS}/verify-ukrainian/SKILL.md",),
+    ),
 }
 
 
