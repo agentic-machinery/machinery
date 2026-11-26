@@ -5,9 +5,12 @@ from __future__ import annotations
 import hashlib
 import inspect
 import json
+import math
+import random
 import sqlite3
 import subprocess
 import threading
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from pathlib import Path
@@ -1206,3 +1209,367 @@ def test_wrapped_json_redaction_class_and_depth_bounds(
             assert reparsed == {"note": "password=[REDACTED_SECRET]", "keep": "sibling_intact"}
     else:
         assert turn["body"] is None, (case_id, turn)
+
+
+# --- Seeded generator over the body redaction parser --------------------------------------
+# Defect class: a redaction parser input that raises, leaks or is classified inconsistently.
+# Stdlib ``random`` with a fixed seed; the oracle below states the route contract on its own
+# terms (Python's json decoder decides "complete valid JSON") instead of reusing the parser.
+
+_GEN_SEED = 1506
+_GEN_EXAMPLES = 3000
+_GEN_OVERSIZED_INT = "9" * 4301  # one digit past CPython's default int conversion limit
+_GEN_NON_FINITE = ("1e400", "-1e400", "NaN", "Infinity", "-Infinity")
+_GEN_WORDS = ("alpha", "Київ", "events", "recorded", "note", "x", "", " ", "a b", "😀", " ", "tab\there")
+_GEN_SECRET_KEYS = ("password", "api_key", "token", "client_secret")
+_GEN_JSON_WS = (" ", "\t", "\n", "\r")
+
+
+class _GenObject(list):
+    """JSON object as ordered (key, value) pairs, so duplicate keys can be generated."""
+
+
+class _GenNumber(str):
+    """JSON number or constant emitted verbatim."""
+
+
+class _GenNested:
+    """A string leaf whose content is another serialized JSON document."""
+
+    def __init__(self, doc: object) -> None:
+        self.doc = doc
+
+
+class _GenPlanted:
+    """Planted values: ``always`` must never survive in text output; ``structured`` must not
+    survive when the whole input is complete valid JSON (plain text has no key structure)."""
+
+    def __init__(self, rng) -> None:
+        self.rng = rng
+        self.always: list[str] = []
+        self.structured: list[str] = []
+
+    def _chars(self, alphabet: str, size: int) -> str:
+        return "".join(self.rng.choice(alphabet) for _ in range(size))
+
+    def token(self) -> str:
+        alnum = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789"
+        value = self.rng.choice(
+            (
+                "ghp_" + self._chars(alnum, 28),
+                "sk-ant-" + self._chars(alnum, 28),
+                "AKIA" + self._chars("ABCDEFGHJKLMNPQRSTUVWXYZ234567", 16),
+            )
+        )
+        self.always.append(value)
+        return value
+
+    def path(self) -> str:
+        value = f"/home/{self._chars('abcdefghij', 6)}/{self._chars('klmnopqrst', 5)}.key"
+        self.always.append(value)
+        return value
+
+    def key_secret(self) -> str:
+        value = "kv" + self._chars("0123456789abcdef", 14)
+        self.structured.append(value)
+        return value
+
+
+def _gen_string(rng, planted: _GenPlanted) -> str:
+    pick = rng.random()
+    if pick < 0.15:
+        return planted.token()
+    if pick < 0.28:
+        return planted.path()
+    if pick < 0.36:
+        return f"password={planted.key_secret()}"
+    if pick < 0.42:
+        return f"see {planted.token()} and {planted.path()} here"
+    if pick < 0.46:
+        return rng.choice((_GEN_OVERSIZED_INT, "-" + _GEN_OVERSIZED_INT, "12", "3.5"))
+    if pick < 0.48:
+        return rng.choice(_GEN_NON_FINITE)
+    if pick < 0.52:
+        return "[" + _GEN_OVERSIZED_INT + " events recorded]"
+    if pick < 0.55:
+        return "\ud800 lone" if rng.random() < 0.5 else "x\udfff"
+    return rng.choice(_GEN_WORDS)
+
+
+def _gen_number(rng) -> _GenNumber:
+    pick = rng.random()
+    if pick < 0.06:
+        return _GenNumber(rng.choice((_GEN_OVERSIZED_INT, "-" + _GEN_OVERSIZED_INT)))
+    if pick < 0.12:
+        return _GenNumber(rng.choice(_GEN_NON_FINITE))
+    return _GenNumber(rng.choice(("0", "-7", "42", "3.25", "-1e-3", "6.02e23", "9" * 300)))
+
+
+def _gen_value(rng, planted: _GenPlanted, *, depth: int, nest: int, allow_bad_numbers: bool = True) -> object:
+    pick = rng.random()
+    if depth < 6 and pick < 0.22:
+        return [
+            _gen_value(rng, planted, depth=depth + 1, nest=nest, allow_bad_numbers=allow_bad_numbers)
+            for _ in range(rng.randrange(4))
+        ]
+    if depth < 6 and pick < 0.44:
+        obj = _GenObject()
+        for _ in range(rng.randrange(4)):
+            key_pick = rng.random()
+            if key_pick < 0.25:
+                obj.append((rng.choice(_GEN_SECRET_KEYS), planted.key_secret()))
+                continue
+            if key_pick < 0.35:
+                key: object = planted.path()
+            elif key_pick < 0.4:
+                key = planted.token()
+            elif key_pick < 0.45 and nest > 0:
+                key = _GenNested(_GenObject([("token", planted.key_secret())]))
+            else:
+                key = rng.choice(_GEN_WORDS)
+            obj.append((key, _gen_value(rng, planted, depth=depth + 1, nest=nest, allow_bad_numbers=allow_bad_numbers)))
+        if obj and rng.random() < 0.1:
+            obj.append((obj[0][0], 1))  # a later duplicate overwrites the first member
+        return obj
+    if nest > 0 and pick < 0.56:
+        return _GenNested(_gen_value(rng, planted, depth=0, nest=nest - 1, allow_bad_numbers=allow_bad_numbers))
+    if pick < 0.7:
+        number = _gen_number(rng)
+        if not allow_bad_numbers and (number.lstrip("-") == _GEN_OVERSIZED_INT or number in _GEN_NON_FINITE):
+            return _GenNumber("1")
+        return number
+    if pick < 0.76:
+        return rng.choice((True, False, None))
+    text = _gen_string(rng, planted)
+    if not allow_bad_numbers and text.strip() in {*_GEN_NON_FINITE}:
+        return "word"
+    return text
+
+
+def _gen_ws(rng) -> str:
+    return "".join(rng.choice(_GEN_JSON_WS) for _ in range(rng.choice((0, 0, 0, 1, 2))))
+
+
+def _gen_dump_string(rng, text: str, *, escape: float) -> str:
+    out = ['"']
+    for ch in text:
+        code = ord(ch)
+        if ch in '"\\' or code < 0x20 or 0xD800 <= code <= 0xDFFF:
+            out.append(f"\\u{code:04x}")
+        elif code < 0x10000 and rng.random() < escape:
+            out.append(f"\\u{code:04x}")  # JSON escapes must not hide a secret or a path
+        else:
+            out.append(ch)
+    out.append('"')
+    return "".join(out)
+
+
+def _gen_dump(rng, value: object, *, escape: float) -> str:
+    """Serialize with random JSON whitespace and random \\u escapes (same document, new text)."""
+    ws = _gen_ws(rng)
+    if isinstance(value, _GenNested):
+        inner = _gen_dump(rng, value.doc, escape=escape)
+        if isinstance(value.doc, _GenNumber) or not isinstance(value.doc, (list, str, _GenNested)):  # scalar leaf text
+            inner = inner.strip("".join(_GEN_JSON_WS))
+        return ws + _gen_dump_string(rng, inner, escape=escape) + ws
+    if isinstance(value, _GenObject):
+        members = [
+            _gen_dump(rng, key if isinstance(key, _GenNested) else str(key), escape=escape)
+            + ":"
+            + _gen_dump(rng, item, escape=escape)
+            for key, item in value
+        ]
+        return ws + "{" + ",".join(members) + _gen_ws(rng) + "}" + ws
+    if isinstance(value, list):
+        return ws + "[" + ",".join(_gen_dump(rng, item, escape=escape) for item in value) + _gen_ws(rng) + "]" + ws
+    if isinstance(value, _GenNumber):
+        return ws + str(value) + ws
+    if isinstance(value, str):
+        return ws + _gen_dump_string(rng, value, escape=escape) + ws
+    return ws + json.dumps(value) + ws
+
+
+def _gen_malform(rng, text: str) -> str:
+    pick = rng.random()
+    if pick < 0.35 and text:
+        return text[: rng.randrange(len(text))]
+    if pick < 0.55:
+        at = rng.randrange(len(text) + 1)
+        return text[:at] + rng.choice('{}[]",:\\ -') + text[at:]
+    if pick < 0.7 and text:
+        at = rng.randrange(len(text))
+        return text[:at] + text[at + 1 :]
+    if pick < 0.8:
+        return "[" + _GEN_OVERSIZED_INT + " " + text
+    if pick < 0.9:
+        return "[" * rng.randrange(60, 120) + " prose " + text
+    return text + " trailing prose"
+
+
+def _gen_arbitrary(rng, planted: _GenPlanted) -> str:
+    alphabet = '{}[]",:\\ \t\n\r0123456789.eE+-aNInfinityЖї😀  \x1c\ud800'
+    parts = []
+    for _ in range(rng.randrange(1, 8)):
+        pick = rng.random()
+        if pick < 0.2:
+            parts.append(f" {planted.token()} ")
+        elif pick < 0.35:
+            parts.append(f" {planted.path()} ")
+        elif pick < 0.45:
+            parts.append(rng.choice((_GEN_OVERSIZED_INT, *_GEN_NON_FINITE, "[" * 50)))
+        else:
+            parts.append("".join(rng.choice(alphabet) for _ in range(rng.randrange(1, 12))))
+    text = "".join(parts)
+    if rng.random() < 0.15:
+        text = rng.choice((" ", " ", "\x1c", "﻿")) + text  # non-JSON whitespace prefix
+    return text
+
+
+def _gen_outcome(text: str) -> tuple[str, str | None]:
+    try:
+        return "text", runtime_router._redact_and_sanitize_text(text)
+    except runtime_router._AcpRedactionDepthExceeded:
+        return "depth_exceeded", None
+    except runtime_router._AcpBodyEncodingError:
+        return "encoding_error", None
+
+
+def _gen_oracle(text: str) -> tuple[str, bool, bool, int]:
+    """Classify ``text`` by the contract: (kind, non_finite, oversized_int, container_depth).
+
+    kind is ``invalid`` (not complete valid JSON), ``scalar`` or ``structured``.
+    """
+    flags = {"non_finite": False, "oversized": False}
+
+    def _int(raw: str) -> int:
+        try:
+            return int(raw)
+        except ValueError:
+            flags["oversized"] = True
+            return 0
+
+    def _float(raw: str) -> float:
+        number = float(raw)
+        flags["non_finite"] = flags["non_finite"] or not math.isfinite(number)
+        return number
+
+    def _constant(_raw: str) -> float:
+        flags["non_finite"] = True
+        return 0.0
+
+    try:
+        parsed = json.loads(text, parse_int=_int, parse_float=_float, parse_constant=_constant)
+    except json.JSONDecodeError:
+        return "invalid", False, False, 0
+    depth, pending = 0, [(parsed, 0)]
+    while pending:
+        item, level = pending.pop()
+        if isinstance(item, (dict, list)):
+            depth = max(depth, level + 1)
+            pending.extend((child, level + 1) for child in (item.values() if isinstance(item, dict) else item))
+    kind = "structured" if isinstance(parsed, (dict, list, str)) else "scalar"
+    return kind, flags["non_finite"], flags["oversized"], depth
+
+
+def _gen_word_bounded(text: str, value: str) -> bool:
+    """True when every literal occurrence of ``value`` in ``text`` sits between non-word characters.
+
+    The plain-text redactors recognize tokens and paths at word boundaries; a value glued to a
+    letter by a malformed edit is a different token. Escaped (absent) occurrences count as bounded.
+    """
+    start = text.find(value)
+    while start >= 0:
+        end = start + len(value)
+        for ch in (text[start - 1 : start], text[end : end + 1]):
+            if ch and (ch.isalnum() or ch == "_"):
+                return False
+        start = text.find(value, start + 1)
+    return True
+
+
+def _gen_check(
+    text: str, planted: _GenPlanted, label: str, *, context_intact: bool = True
+) -> tuple[str, str | None]:
+    """``context_intact`` is False when edits may have broken the key or assignment around a value."""
+    try:
+        outcome, output = _gen_outcome(text)
+    except Exception as exc:  # any untyped exception is the defect this test exists for
+        pytest.fail(f"{label}: untyped {type(exc).__name__} for input {text[:120]!r}")
+    kind, non_finite, oversized, depth = _gen_oracle(text)
+    plain = runtime_router._redact_and_sanitize_plain_text(text)
+    if kind == "invalid":
+        assert (outcome, output) == ("text", plain), (label, "invalid JSON must take the plain-text path", text[:120])
+    elif kind == "scalar":
+        expected = ("encoding_error", None) if non_finite else ("text", plain)
+        assert (outcome, output) == expected, (label, "standalone scalar", text[:120])
+    else:
+        if depth > 64:
+            assert outcome == "depth_exceeded", (label, depth, text[:120])
+        elif non_finite or oversized:
+            assert outcome == "encoding_error", (label, "unconvertible number at any position", text[:120])
+        if outcome == "text":
+            json.loads(output)  # structured output stays valid JSON
+    if output is not None:
+        for value in planted.always + (planted.structured if context_intact and kind != "invalid" else []):
+            if _gen_word_bounded(text, value):
+                assert value not in output, (label, "planted value survived", value, text[:120])
+    return outcome, output
+
+
+def test_redaction_parser_generator_never_raises_leaks_or_misclassifies() -> None:
+    """Defect class: a redaction parser input that raises, leaks or is classified inconsistently.
+
+    Seeded generator (stdlib random, fixed seed) over ``_redact_and_sanitize_text``: arbitrary
+    text, truncated and malformed JSON, oversized and non-finite numbers at any position, lone
+    surrogates, JSON nested in JSON strings up to and over the depth cap, \\u-escaped planted
+    secrets and home paths. Invariants: only typed refusals are raised; text that is not complete
+    valid JSON takes the plain-text path whatever it starts with; an unconvertible number gives
+    the same typed state wherever it sits; no planted secret or path survives in text output;
+    valid JSON and the same JSON with different whitespace and escapes give the same outcome.
+    """
+    rng = random.Random(_GEN_SEED)
+    seen: Counter[str] = Counter()
+    for index in range(_GEN_EXAMPLES):
+        planted = _GenPlanted(rng)
+        family = rng.choice(("valid", "valid", "malformed", "arbitrary", "placement"))
+        label = f"seed={_GEN_SEED} example={index} family={family}"
+        if family == "arbitrary":
+            outcome, _ = _gen_check(_gen_arbitrary(rng, planted), planted, label, context_intact=False)
+        elif family == "placement":
+            # Same typed state wherever an unconvertible number sits: top level, nested, under a
+            # secret key, overwritten by a duplicate key, or inside a nested JSON string.
+            doc = _GenObject([("k", _gen_value(rng, planted, depth=0, nest=2, allow_bad_numbers=False))])
+            bad = _GenNumber(rng.choice((_GEN_OVERSIZED_INT, *_GEN_NON_FINITE)))
+            spot = rng.randrange(5)
+            if spot == 0:
+                doc.append(("n", bad))
+            elif spot == 1:
+                doc.append(("n", [[_GenObject([("deep", bad)])]]))
+            elif spot == 2:
+                doc.append((rng.choice(_GEN_SECRET_KEYS), bad))
+            elif spot == 3:
+                doc.extend([("dup", bad), ("dup", 1)])
+            else:
+                doc.append(("n", _GenNested(_GenNested([bad]))))
+            outcome, _ = _gen_check(_gen_dump(rng, doc, escape=0.1), planted, label)
+            assert outcome == "encoding_error", (label, spot)
+        else:
+            doc = _gen_value(rng, planted, depth=0, nest=rng.randrange(6))
+            if rng.random() < 0.05:
+                doc = [doc]
+                for _ in range(rng.randrange(60, 70)):
+                    doc = [doc]
+            first = _gen_dump(rng, doc, escape=0.0)
+            if family == "malformed":
+                outcome, _ = _gen_check(_gen_malform(rng, first), planted, label, context_intact=False)
+            else:
+                outcome, output = _gen_check(first, planted, label)
+                other = _gen_check(_gen_dump(rng, doc, escape=0.3), planted, label + " variant")
+                assert other == (outcome, output) or (_gen_oracle(first)[0] == "scalar" and other[0] == outcome), (
+                    label,
+                    "whitespace or escapes changed the outcome",
+                    first[:120],
+                )
+        seen[outcome] += 1
+    # The generator must reach every outcome, or it proves nothing about the missing one.
+    assert set(seen) == {"text", "depth_exceeded", "encoding_error"}, seen

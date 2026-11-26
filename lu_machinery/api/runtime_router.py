@@ -136,6 +136,9 @@ _ACP_TRANSCRIPT_MAX_RESPONSE_BYTES = 512 * 1024
 _ACP_TRANSCRIPT_SQLITE_TIMEOUT_S = 0.5
 _ACP_TRANSCRIPT_MAX_CONCURRENCY = 4
 _ACP_TRANSCRIPT_JSON_REDACT_MAX_DEPTH = 4
+_ACP_TRANSCRIPT_JSON_REDACT_MAX_CONTAINER_DEPTH = 64
+# JSON whitespace (RFC 8259 section 2), not str.strip()'s Unicode whitespace.
+_ACP_JSON_WHITESPACE = " \t\n\r"
 _ACP_TRANSCRIPT_CONCURRENCY_LOCK = Lock()
 _ACP_TRANSCRIPT_ACTIVE_READS = 0
 _ACP_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -1656,69 +1659,85 @@ def _redact_and_sanitize_json_value(value: Any, *, depth: int) -> Any:
 def _redact_and_sanitize_text(value: str, *, _depth: int = 0) -> str:
     """Run server-side ``redact_text`` then ``sanitize_text`` (secrets and filesystem paths only).
 
-    Structured JSON payloads — objects, arrays, and JSON-string wrappers, recursively across
-    string leaves and object keys up to ``_ACP_TRANSCRIPT_JSON_REDACT_MAX_DEPTH`` — are decoded,
-    redacted structurally (using ``secret_redactor`` key/text rules and ``opsec_sanitize``), and
-    re-serialized directly so valid JSON delimiters are preserved and JSON escapes cannot conceal
-    secrets or paths. Structured bodies that exceed either container depth (64) or nested-JSON
-    depth fail closed by raising ``_AcpRedactionDepthExceeded`` rather than falling back to
-    plain-text filters; parser conversion errors, non-finite JSON scalars/floats (detected during
-    parsing before redaction or duplicate-key collapsing), and decoded lone surrogates raise
-    ``_AcpBodyEncodingError``.
+    Classification: only text that is one complete JSON object, array or string (after JSON
+    whitespace) takes the structured path; every other text, whatever it starts with, takes the
+    plain-text path. A standalone JSON number or constant is the one exception: a non-finite one
+    (``NaN``, ``Infinity``, ``1e309``) raises ``_AcpBodyEncodingError``, and a finite one, including
+    an integer of any length, stays plain text.
+
+    The structured path decodes objects, arrays and JSON-string wrappers recursively across string
+    leaves and object keys up to ``_ACP_TRANSCRIPT_JSON_REDACT_MAX_DEPTH``, redacts them
+    structurally (``secret_redactor`` key/text rules and ``opsec_sanitize``), and re-serializes them
+    so JSON delimiters are preserved and JSON escapes cannot conceal secrets or paths. The parser's
+    number hooks never raise, so a syntax error always reaches ``JSONDecodeError`` and the plain-text
+    path. A parsed document fails closed: container depth above 64 or nested-JSON depth above the cap
+    raises ``_AcpRedactionDepthExceeded``; a non-finite number or an integer too long to convert,
+    anywhere in it (including under redacted or overwritten duplicate keys), and a decoded lone
+    surrogate raise ``_AcpBodyEncodingError``. Text nested more than ``json_depth.MAX_DEPTH_CEILING``
+    levels before its first syntax error cannot be classified by the bounded parser and raises
+    ``_AcpRedactionDepthExceeded``.
     """
-    stripped = value.strip()
+    stripped = value.strip(_ACP_JSON_WHITESPACE)
     if stripped in {"NaN", "Infinity", "-Infinity"} or (
         stripped and _ACP_JSON_FLOAT_RE.fullmatch(stripped) is not None
     ):
-        try:
-            numeric = float(stripped)
-        except ValueError:
-            raise _AcpBodyEncodingError() from None
-        if not math.isfinite(numeric):
+        if not math.isfinite(float(stripped)):
             raise _AcpBodyEncodingError()
         return _redact_and_sanitize_plain_text(value)
     if stripped and stripped[0] in '{["':
-        saw_non_finite = False
+        saw_unconvertible_number = False
 
         def _parse_json_float(raw: str) -> float:
-            nonlocal saw_non_finite
+            nonlocal saw_unconvertible_number
             number = float(raw)
             if not math.isfinite(number):
-                saw_non_finite = True
+                saw_unconvertible_number = True
             return number
 
+        def _parse_json_int(raw: str) -> int:
+            nonlocal saw_unconvertible_number
+            try:
+                return int(raw)
+            except ValueError:  # longer than sys.get_int_max_str_digits()
+                saw_unconvertible_number = True
+                return 0
+
         def _parse_json_constant(_raw: str) -> float:
-            nonlocal saw_non_finite
-            saw_non_finite = True
+            nonlocal saw_unconvertible_number
+            saw_unconvertible_number = True
             return 0.0
 
         try:
             parsed = json_depth.loads(
                 stripped,
-                max_depth=64,
+                max_depth=json_depth.MAX_DEPTH_CEILING,
                 parse_float=_parse_json_float,
+                parse_int=_parse_json_int,
                 parse_constant=_parse_json_constant,
             )
         except RecursionError:
             raise _AcpRedactionDepthExceeded() from None
         except json.JSONDecodeError:
-            parsed = None
+            return _redact_and_sanitize_plain_text(value)
         except (TypeError, ValueError):
             raise _AcpBodyEncodingError() from None
-        if parsed is not None and saw_non_finite:
+        try:
+            json_depth.check_depth(parsed, max_depth=_ACP_TRANSCRIPT_JSON_REDACT_MAX_CONTAINER_DEPTH)
+        except RecursionError:
+            raise _AcpRedactionDepthExceeded() from None
+        if saw_unconvertible_number:
             raise _AcpBodyEncodingError()
-        if isinstance(parsed, (dict, list, str)):
-            if _depth >= _ACP_TRANSCRIPT_JSON_REDACT_MAX_DEPTH:
-                raise _AcpRedactionDepthExceeded()
-            try:
-                cleaned = sanitize_document(_redact_and_sanitize_json_value(parsed, depth=_depth))
-                serialized = json.dumps(cleaned, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
-                serialized.encode("utf-8")
-            except RecursionError:
-                raise _AcpRedactionDepthExceeded() from None
-            except (TypeError, ValueError, UnicodeError):
-                raise _AcpBodyEncodingError() from None
-            return serialized
+        if _depth >= _ACP_TRANSCRIPT_JSON_REDACT_MAX_DEPTH:
+            raise _AcpRedactionDepthExceeded()
+        try:
+            cleaned = sanitize_document(_redact_and_sanitize_json_value(parsed, depth=_depth))
+            serialized = json.dumps(cleaned, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
+            serialized.encode("utf-8")
+        except RecursionError:
+            raise _AcpRedactionDepthExceeded() from None
+        except (TypeError, ValueError, UnicodeError):
+            raise _AcpBodyEncodingError() from None
+        return serialized
     return _redact_and_sanitize_plain_text(value)
 
 

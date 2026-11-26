@@ -416,6 +416,12 @@ ROUTE_CONTRACTS: tuple[RouteContract, ...] = (
         "IP addresses are not redacted). "
         "Redaction covers plain text and JSON (including JSON nested inside JSON strings up to the depth "
         "cap); other encodings (base64, URL-encoding, HTML entities, compression) are out of scope. "
+        "Only a body (or nested string) that is one complete JSON object, array or string is redacted "
+        "structurally; any other text, whatever it starts with, is plain text and its JSON escapes are not "
+        "decoded. A standalone finite number stays plain text; a non-finite number, or an integer too long "
+        "to convert anywhere inside structured JSON, is missing_or_corrupt (body_redaction_failed). "
+        "Structured JSON deeper than 64 containers or 4 nested JSON strings, and text nested more than 512 "
+        "levels before its first syntax error, is withheld (redaction_depth_exceeded). "
         "Bounded by raw-body bytes, whole serialized response bytes, SQL "
         "row count checked before materialization, SQLite busy timeout, and a concurrency semaphore.",
         "Fleet Comms SQLite store (read-only) and content-addressed body artifacts under blobs/sha256.",

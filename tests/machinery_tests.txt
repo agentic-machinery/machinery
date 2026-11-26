@@ -234,6 +234,7 @@ tests/api/test_delegate_router_cache.py
 tests/api/test_epics_registry_seed.py
 tests/api/test_epics_router.py
 tests/api/test_fleet_dashboard_contract.py
+tests/api/test_fleet_discussions_reader.py
 tests/api/test_fleet_health_runtime_activity.py
 tests/api/test_fleet_workers_sanitize.py
 tests/api/test_fleet_workers_unmocked.py
@@ -244,6 +245,7 @@ tests/api/test_github_graphql_budget.py
 tests/api/test_host_path_guard.py
 tests/api/test_hramatka_teacher_dashboard_contract.py
 tests/api/test_issues_auth_api.py
+tests/api/test_journal_router.py
 tests/api/test_lane_health.py
 tests/api/test_lane_health_redaction.py
 tests/api/test_launchd_supervisor.py
