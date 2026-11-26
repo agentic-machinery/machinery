@@ -279,14 +279,14 @@ def test_redact_text_superlinear_redaction_scan_stays_linear():
     Each unit once made a scan restart at every match or word boundary and
     reread the rest of the text: the URL iterator, the URL scheme search, the
     private-key block and the JWT pattern. Eight times the input costs about
-    8x when linear and 64x when quadratic; the bound is 24x. The small input
-    takes the best of three runs, and the large one passes on any of three.
+    8x when linear and 64x when quadratic; the bound is 24x. Each size is
+    timed as the best of three runs, the usual way to discount scheduler noise.
     """
     header = "-----BEGIN " + "PRIVATE KEY-----"
     for unit, small_size in (("a://-", 128 * 1024), ("a.", 32 * 1024), ("eyJ-", 32 * 1024), (header, 32 * 1024)):
         small, large = (unit * (size // len(unit)) for size in (small_size, 8 * small_size))
-        bound = 24 * min(_redaction_seconds(small) for _ in range(3))
-        assert any(_redaction_seconds(large) < bound for _ in range(3)), (unit, bound)
+        small_best, large_best = (min(_redaction_seconds(text) for _ in range(3)) for text in (small, large))
+        assert large_best < 24 * small_best, (unit, small_best, large_best)
 
 
 def _redaction_seconds(text):
