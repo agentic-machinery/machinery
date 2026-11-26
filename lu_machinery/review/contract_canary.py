@@ -31,6 +31,8 @@ from pathlib import Path
 from typing import Any, cast
 
 from lu_machinery.common import github_client, json_depth
+from lu_machinery.common.git_credentials import SELECTOR_ENV
+from lu_machinery.common.repo_root import MACHINERY_ENV_VARS
 
 # The machinery package's directory name, which a change lists its files under, from this module's
 # unresolved location: a symlinked package keeps its checkout name, and a short import spelling
@@ -401,8 +403,7 @@ def _run_steps(
     )
     commands = []
     # Passing named context explicitly is necessary: the user manager does not inherit this shell's env.
-    context = ["PATH", "LEARN_UKRAINIAN_PRIMARY_REPO_ROOT", "LU_PRODUCT_ROOT", "LEARN_UKRAINIAN_STATE_ROOT",
-               "LEARN_UKRAINIAN_PYTHON"]
+    context = ("PATH", "LU_PRODUCT_ROOT", "LU_TASKS_DIR", SELECTOR_ENV, *MACHINERY_ENV_VARS)
     for route in routes:
         model, *account = _RUN_MODELS[route]
         unit = f"{work.name.lstrip('.')}-{route}"
@@ -466,6 +467,7 @@ def run(args: argparse.Namespace) -> int:
         primary_root,
         product_root,
         project_interpreter,
+        state_root,
     )
     from lu_machinery.dispatcher.git import resolve_repo
     from lu_machinery.orchestration.fleet_repos import FleetRepoError, resolve_active_fleet_repo
@@ -486,7 +488,18 @@ def run(args: argparse.Namespace) -> int:
     env = sanitized_git_env(strip_config_injection=True)
     env.pop("PYTHONPATH", None)
     env.pop("PYTHONHOME", None)
-    env.update(LEARN_UKRAINIAN_PRIMARY_REPO_ROOT=str(primary_root()), LU_PRODUCT_ROOT=str(product_root()))
+    primary = str(primary_root())
+    state = state_root()
+    # Keep dispatch, wait, record and score on the same plane, even if the user
+    # manager has old root settings or this caller has a task-scoped override.
+    env.update(
+        LU_PRIMARY_REPO_ROOT=primary,
+        LEARN_UKRAINIAN_PRIMARY_REPO_ROOT=primary,
+        LU_PRODUCT_ROOT=str(product_root()),
+        LU_STATE_ROOT=str(state),
+        LEARN_UKRAINIAN_STATE_ROOT=str(state),
+        LU_TASKS_DIR=str(state / "batch_state" / "tasks"),
+    )
     head = args.head
     if args.pr is not None:
         result = github_client.run(

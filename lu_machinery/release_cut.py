@@ -695,7 +695,9 @@ class Cut:
     def env(self, **extra: str) -> dict[str, str]:
         env = {key: value for key, value in sanitized_git_env(strip_config_injection=True).items()
                if key not in {"PYTHONPATH", "PYTHONHOME"}}
-        env.update(LEARN_UKRAINIAN_PRIMARY_REPO_ROOT=str(self.primary), LU_PRODUCT_ROOT=str(self.primary))
+        env["LEARN_UKRAINIAN_PRIMARY_REPO_ROOT"] = str(self.primary)
+        if not env.get("LU_PRODUCT_ROOT"):
+            env["LU_PRODUCT_ROOT"] = str(self.primary)  # Legacy colocated cut.
         env.update(extra)
         return env
 
@@ -1424,9 +1426,11 @@ class Cut:
         return tagged, release, adopt
 
     def _recovery_env_prefix(self) -> str:
-        root = shlex.quote(str(self.primary.absolute()))
-        host_py = shlex.quote(str(self.host_python.absolute()))
-        return f"LEARN_UKRAINIAN_PRIMARY_REPO_ROOT={root} LU_PRODUCT_ROOT={root} LU_PYTHON={host_py}"
+        env = self.env(LU_PYTHON=str(self.host_python.absolute()))
+        roots = ("LEARN_UKRAINIAN_PRIMARY_REPO_ROOT", "LU_PRODUCT_ROOT", "LU_PYTHON",
+                 "LU_STATE_ROOT", "LEARN_UKRAINIAN_STATE_ROOT", "LU_REPOS_ROOT", "LU_PROFILE_PATH",
+                 "LU_FLEET_REPO_SELECTOR_FILE")
+        return " ".join(f"{key}={shlex.quote(env[key])}" for key in roots if env.get(key))
 
     def _manual_post_release_command(self, argv: Sequence[str]) -> str | None:
         """Shell-quoted publisher command for installed-venv / work/accept runs only.

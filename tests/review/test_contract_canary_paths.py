@@ -336,6 +336,7 @@ def test_runner_dry_run_never_mounts_dispatches_or_writes(runner_roots, monkeypa
     assert output.count("systemd-run --user") == 4
     assert list(runner_roots.iterdir()) == []
     assert canary.main(["run", "--head", "a" * 40]) == 2
+
     assert "outside a dispatched worker" in capsys.readouterr().err
     monkeypatch.setenv(canary.WHEELHOUSE_ENV, "relative/wheelhouse")
     assert canary.main(["run", "--head", "a" * 40, "--dry-run"]) == 2
@@ -433,6 +434,41 @@ def test_runner_failures_cannot_score_green_or_delete_a_live_mount(
         assert list(runner_roots.iterdir()) == []
     if failure not in {"mount", "unmount", "unmount-noop", "interrupt", "unit-lost", "submit-interrupt"}:
         assert sum("-u" in cmd for cmd in commands) == 1
+
+
+def test_detached_release_canary_uses_configured_product_and_state(
+    runner_roots, configured_roots, tmp_path, monkeypatch, capsys,
+):
+    """Defect class: detached host resolves the Sources server from the machinery checkout."""
+    import sys
+
+    from lu_machinery.agent_runtime.sources_read_only import SERVER_RELATIVE_PATH, sources_tool_sets
+    from lu_machinery.release_cut import Cut
+
+    state = tmp_path / "state"
+    state.mkdir()
+    monkeypatch.setenv("LU_STATE_ROOT", str(state))
+    monkeypatch.setenv("LU_TASKS_DIR", str(configured_roots.primary / "batch_state" / "tasks"))
+    cut = Cut(
+        work=tmp_path, dry_run=True, machinery_remote="", product_remote="",
+        machinery_repo="example/machinery", product_repo="example/product",
+        host_python=Path(sys.executable), primary=configured_roots.primary,
+        alert=False, x_agent="codex/fixture",
+    )
+    env = cut.env()
+    product = env["LU_PRODUCT_ROOT"]
+    assert product == str(configured_roots.product)
+    assert sources_tool_sets(Path(product) / SERVER_RELATIVE_PATH)[0]
+    assert env["LU_STATE_ROOT"] == str(state)
+    assert canary.main(["run", "--head", "a" * 40, "--dry-run"]) == 0
+    output = capsys.readouterr().out
+    commands = [line for line in output.splitlines() if line.startswith("systemd-run ")]
+    assert len(commands) == len(canary.required_routes())
+    for line in commands:
+        assert f"--setenv=LU_PRODUCT_ROOT={product}" in line
+        assert f"--setenv=LU_STATE_ROOT={state}" in line
+        assert f"--setenv=LU_TASKS_DIR={state / 'batch_state' / 'tasks'}" in line
+    assert not (configured_roots.primary / "batch_state").exists()
 
 
 def test_runner_starts_all_routes_before_waiting_for_settlement(runner_roots, monkeypatch):

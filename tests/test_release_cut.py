@@ -1335,6 +1335,11 @@ def test_publisher_uses_release_interpreter_not_stale_host_python(tmp_path, monk
     fleet.mkdir()
     primary = fleet / "learn-ukrainian"
     _init_repo(primary)
+    state = tmp_path / "state"
+    state.mkdir()
+    monkeypatch.delenv("LU_FLEET_REPO_SELECTOR_FILE", raising=False)
+    monkeypatch.setenv("LU_STATE_ROOT", str(state))
+    monkeypatch.setenv("LU_PRODUCT_ROOT", str(product_seed))
     sibling_machinery = fleet / "machinery"
     _init_repo(sibling_machinery)
     host_log = tmp_path / "host-publish.log"
@@ -1369,7 +1374,7 @@ def test_publisher_uses_release_interpreter_not_stale_host_python(tmp_path, monk
         '[ "${1:-}" = "-I" ] || { printf "missing -I: %s\\n" "$*" >&2; exit 11; }\n'
         '[ "${2:-}" = "-m" ] && [ "${3:-}" = "lu_machinery.publish" ] || { printf "bad module: %s\\n" "$*" >&2; exit 12; }\n'
         f'[ "${{LEARN_UKRAINIAN_PRIMARY_REPO_ROOT:-}}" = {shlex.quote(str(primary))} ] || {{ printf "bad primary=%s\\n" "${{LEARN_UKRAINIAN_PRIMARY_REPO_ROOT:-}}" >&2; exit 14; }}\n'
-        f'[ "${{LU_PRODUCT_ROOT:-}}" = {shlex.quote(str(primary))} ] || {{ printf "bad product=%s\\n" "${{LU_PRODUCT_ROOT:-}}" >&2; exit 15; }}\n'
+        f'[ "${{LU_PRODUCT_ROOT:-}}" = {shlex.quote(str(product_seed))} ] || {{ printf "bad product=%s\\n" "${{LU_PRODUCT_ROOT:-}}" >&2; exit 15; }}\n'
         'if [ -e "$venv_root/lib/python3.14/site-packages/zz-release-cut-consumer.pth" ]; then\n'
         '  printf "contaminated publisher venv: overlay present\\n" >&2; exit 16\n'
         "fi\n"
@@ -1477,6 +1482,8 @@ def test_publisher_uses_release_interpreter_not_stale_host_python(tmp_path, monk
     monkeypatch.setattr(cut, "remote_state", lambda: (True, "released", [1275]))
     custom_resume_msg = cut.clean_up("post-release PR")
     quoted_root = shlex.quote(str(primary.absolute()))
+    quoted_product = shlex.quote(str(product_seed))
+    quoted_state = shlex.quote(str(state))
     quoted_host_py = shlex.quote(str(host_python.absolute()))
     assert "--no-alert --machinery-remote <original-machinery-remote>" in custom_resume_msg
     assert str(tmp_path / "machinery.git") not in custom_resume_msg
@@ -1488,8 +1495,8 @@ def test_publisher_uses_release_interpreter_not_stale_host_python(tmp_path, monk
         default_remote_ctx.setattr(cut, "alert", True)
         alert_on_msg = cut.clean_up("post-release PR")
     expected_resume = (
-        f"LEARN_UKRAINIAN_PRIMARY_REPO_ROOT={quoted_root} LU_PRODUCT_ROOT={quoted_root} "
-        f"LU_PYTHON={quoted_host_py} "
+        f"LEARN_UKRAINIAN_PRIMARY_REPO_ROOT={quoted_root} LU_PRODUCT_ROOT={quoted_product} "
+        f"LU_PYTHON={quoted_host_py} LU_STATE_ROOT={quoted_state} "
         f"{shlex.quote(str(installed))} -I -m lu_machinery.release_cut post-release "
         f"--x-agent claude/claude-opus-5-5 --no-alert"
     )
@@ -1534,6 +1541,7 @@ def test_publisher_uses_release_interpreter_not_stale_host_python(tmp_path, monk
             "LEARN_UKRAINIAN_PRIMARY_REPO_ROOT", "LU_PRIMARY_REPO_ROOT", "LU_PRODUCT_ROOT",
             "LU_PYTHON", "LEARN_UKRAINIAN_PYTHON", "LU_TASKS_DIR",
             "LU_STATE_ROOT", "LEARN_UKRAINIAN_STATE_ROOT", "LEARN_UKRAINIAN_DISPATCH_TASK_ID",
+            "LU_FLEET_REPO_SELECTOR_FILE",
         }
     }
     clean_shell_env["HOME"] = str(probe_home)
@@ -1596,8 +1604,9 @@ def test_publisher_uses_release_interpreter_not_stale_host_python(tmp_path, monk
         manual_line = err_text.splitlines()[-1].strip()
         assert manual_line in out_text
         assert f"LEARN_UKRAINIAN_PRIMARY_REPO_ROOT={quoted_root}" in manual_line
-        assert f"LU_PRODUCT_ROOT={quoted_root}" in manual_line
+        assert f"LU_PRODUCT_ROOT={quoted_product}" in manual_line
         assert f"LU_PYTHON={quoted_host_py}" in manual_line
+        assert f"LU_STATE_ROOT={quoted_state}" in manual_line
         assert f"--body-file {shlex.quote(str((work / 'post-release-body.md').absolute()))}" in manual_line
         assert (work / "post-release-body.md").is_file()
     manual_result = subprocess.run(
