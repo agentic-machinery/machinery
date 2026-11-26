@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
+import os
 import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -17,6 +19,8 @@ import lu_machinery.api.fleet_router as fleet_router
 import lu_machinery.api.runtime_router as runtime_router
 from lu_machinery.agent_runtime.acpx_discuss import AcpxDiscussionController
 from lu_machinery.api.main import app
+from lu_machinery.control_plane.storage import Authority
+from lu_machinery.fleet_comms.artifacts import ArtifactStore
 
 client = TestClient(app, raise_server_exceptions=False)
 _LISTENER_ORIGIN = f"http://{api_config.API_HOST}:{api_config.API_PORT}"
@@ -43,7 +47,13 @@ def _write_usage_file(path, records: list[dict]) -> None:
             handle.write(json.dumps(record) + "\n")
 
 
-def _write_acp_db(root, conversations: list[tuple], events: list[tuple]) -> None:
+def _write_acp_db(
+    root,
+    conversations: list[tuple],
+    events: list[tuple],
+    *,
+    include_artifact_tables: bool = True,
+) -> None:
     root.mkdir(parents=True, exist_ok=True)
     connection = sqlite3.connect(root / "comms.sqlite3")
     try:
@@ -94,6 +104,28 @@ def _write_acp_db(root, conversations: list[tuple], events: list[tuple]) -> None
             );
             """
         )
+        if include_artifact_tables:
+            (root / "blobs" / "sha256").mkdir(parents=True, exist_ok=True)
+            connection.executescript(
+                """
+                CREATE TABLE artifacts (
+                    artifact_id TEXT PRIMARY KEY,
+                    sha256 TEXT NOT NULL UNIQUE,
+                    bytes INTEGER NOT NULL,
+                    mime_type TEXT,
+                    logical_filename TEXT,
+                    producer TEXT NOT NULL,
+                    retention_class TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE TABLE message_artifacts (
+                    message_id TEXT NOT NULL,
+                    artifact_id TEXT NOT NULL,
+                    relation TEXT NOT NULL,
+                    PRIMARY KEY (message_id, artifact_id, relation)
+                );
+                """
+            )
         connection.executemany(
             "INSERT INTO acp_conversations VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             conversations,
@@ -283,7 +315,7 @@ def test_acp_transcript_is_loopback_only_ordered_allowlisted_and_no_store(tmp_pa
     root = tmp_path / "plane"
     now = datetime.now(UTC)
     conversation = (
-        "conv-transcript", "secret", "secret", "secret", 1, "[]", _iso(now), None, 1, 1,
+        "conv-transcript", "secret", "secret", "secret", 1, '["codex", "claude"]', _iso(now), None, 1, 1,
     )
     events = [
         (
@@ -302,6 +334,25 @@ def test_acp_transcript_is_loopback_only_ordered_allowlisted_and_no_store(tmp_pa
     _write_acp_db(root, [conversation], events)
     connection = sqlite3.connect(root / "comms.sqlite3")
     try:
+        artifacts_data = [
+            ("artifact-secret-later", "second body"),
+            ("artifact-secret-early", "first body"),
+            ("artifact-secret-synth", "final synthesis"),
+        ]
+        digests: dict[str, str] = {}
+        for art_id, body_text in artifacts_data:
+            raw = body_text.encode("utf-8")
+            digest = hashlib.sha256(raw).hexdigest()
+            digests[art_id] = digest
+            blob_path = root / "blobs" / "sha256" / digest[:2] / digest
+            blob_path.parent.mkdir(parents=True, exist_ok=True)
+            blob_path.write_bytes(raw)
+            connection.execute(
+                """INSERT INTO artifacts(
+                    artifact_id, sha256, bytes, mime_type, logical_filename, producer, retention_class, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (art_id, digest, len(raw), "text/plain; charset=utf-8", "msg.txt", "acpx-discuss:codex", "acpx-discussion", _iso(now)),
+            )
         connection.executemany(
             """INSERT INTO comms_messages(
                 message_id, conversation_id, kind, sender, recipient, body_inline,
@@ -310,15 +361,15 @@ def test_acp_transcript_is_loopback_only_ordered_allowlisted_and_no_store(tmp_pa
             [
                 (
                     "message-later", "conv-transcript", "reply", "codex", "root", "second body",
-                    "artifact-secret", "hash-secret", '{"credential":"secret"}', _iso(now + timedelta(seconds=2)),
+                    "artifact-secret-later", digests["artifact-secret-later"], '{"credential":"secret"}', _iso(now + timedelta(seconds=2)),
                 ),
                 (
                     "message-early", "conv-transcript", "request", "root", "codex", "first body",
-                    "artifact-secret", "hash-secret", '{"command":"secret"}', _iso(now + timedelta(seconds=1)),
+                    "artifact-secret-early", digests["artifact-secret-early"], '{"command":"secret"}', _iso(now + timedelta(seconds=1)),
                 ),
                 (
                     "message-synthesis", "conv-transcript", "synthesis", "codex", "root", "final synthesis",
-                    "artifact-secret", "hash-secret", '{}', _iso(now + timedelta(seconds=3)),
+                    "artifact-secret-synth", digests["artifact-secret-synth"], '{}', _iso(now + timedelta(seconds=3)),
                 ),
             ],
         )
@@ -339,9 +390,16 @@ def test_acp_transcript_is_loopback_only_ordered_allowlisted_and_no_store(tmp_pa
     assert response.headers["cache-control"] == "no-store"
     assert response.json() == {
         "conversation_id": "conv-transcript",
+        "state": "ok",
+        "label": "ok",
+        "reason": None,
+        "truncated": False,
         "messages": [
             {
                 "ordinal": 1,
+                "state": "ok",
+                "label": "ok",
+                "reason": None,
                 "kind": "request",
                 "sender": "root",
                 "recipient": "codex",
@@ -351,6 +409,9 @@ def test_acp_transcript_is_loopback_only_ordered_allowlisted_and_no_store(tmp_pa
             },
             {
                 "ordinal": 2,
+                "state": "ok",
+                "label": "ok",
+                "reason": None,
                 "kind": "reply",
                 "sender": "codex",
                 "recipient": "root",
@@ -360,6 +421,9 @@ def test_acp_transcript_is_loopback_only_ordered_allowlisted_and_no_store(tmp_pa
             },
             {
                 "ordinal": 3,
+                "state": "ok",
+                "label": "ok",
+                "reason": None,
                 "kind": "synthesis",
                 "sender": "codex",
                 "recipient": "root",
@@ -369,7 +433,14 @@ def test_acp_transcript_is_loopback_only_ordered_allowlisted_and_no_store(tmp_pa
         ],
     }
     for private_value in (
-        "message-later", "message-early", "artifact-secret", "hash-secret", "metadata_json", "secret",
+        "message-later",
+        "message-early",
+        "artifact-secret-later",
+        "artifact-secret-early",
+        "artifact-secret-synth",
+        *digests.values(),
+        "metadata_json",
+        "secret",
     ):
         assert private_value not in response.text
 
@@ -407,7 +478,7 @@ def test_acp_transcript_is_loopback_only_ordered_allowlisted_and_no_store(tmp_pa
 def _seed_transcript_db(root: Path) -> None:
     now = datetime.now(UTC)
     conversation = (
-        "conv-guarded", "secret", "secret", "secret", 1, "[]", _iso(now), None, 1, 1,
+        "conv-guarded", "secret", "secret", "secret", 1, '["codex", "claude"]', _iso(now), None, 1, 1,
     )
     events = [
         (
@@ -805,7 +876,7 @@ def test_acp_transcript_hides_unavailable_malformed_and_body_free_routes(tmp_pat
     root = tmp_path / "plane"
     now = datetime.now(UTC)
     conversation = (
-        "conv-malformed", "secret", "secret", "secret", 1, "[]", _iso(now), None, 1, 1,
+        "conv-malformed", "secret", "secret", "secret", 1, '["codex", "claude"]', _iso(now), None, 1, 1,
     )
     _write_acp_db(root, [conversation], [])
     connection = sqlite3.connect(root / "comms.sqlite3")
@@ -851,8 +922,9 @@ def test_acp_transcript_hides_unavailable_malformed_and_body_free_routes(tmp_pat
 
     monkeypatch.setenv("FLEET_COMMS_ROOT", str(tmp_path / "missing"))
     unavailable = loopback_client.get("/api/runtime/acp/conversations/conv-malformed/transcript")
-    assert unavailable.status_code == 404
+    assert unavailable.status_code == 503
     assert unavailable.headers["cache-control"] == "no-store"
+    assert unavailable.json()["state"] == "backend_unavailable"
 
     malformed_root = tmp_path / "malformed"
     malformed_root.mkdir()
@@ -864,8 +936,896 @@ def test_acp_transcript_hides_unavailable_malformed_and_body_free_routes(tmp_pat
         malformed_db.close()
     monkeypatch.setenv("FLEET_COMMS_ROOT", str(malformed_root))
     malformed_storage = loopback_client.get("/api/runtime/acp/conversations/conv-malformed/transcript")
-    assert malformed_storage.status_code == 404
+    assert malformed_storage.status_code == 503
     assert malformed_storage.headers["cache-control"] == "no-store"
+    assert malformed_storage.json()["state"] == "backend_unavailable"
+
+
+def _loopback_transcript_client() -> TestClient:
+    return TestClient(
+        app,
+        raise_server_exceptions=False,
+        client=("127.0.0.1", 50000),
+        base_url=_LISTENER_ORIGIN,
+    )
+
+
+def _create_controller_conversation(
+    root: Path,
+    *,
+    participants: tuple[str, ...] = ("codex", "claude"),
+    deadline_at: str = "2099-01-01T00:00:00Z",
+    turns: list[tuple[str, str, str, str, int | None]],
+) -> tuple[str, list[tuple[str, str, str]]]:
+    """Create a real Fleet Comms ACP conversation with CAS blobs and return ``(conv_id, [(msg_id, art_id, sha256)])``."""
+    controller = AcpxDiscussionController(root=root)
+    try:
+        conversation_id, _ = controller._reserve(
+            task_digest=f"task-{len(turns)}-{participants[0]}",
+            correlation_digest=f"corr-{len(turns)}-{participants[0]}",
+            idempotency_digest=f"idem-{len(turns)}-{'-'.join(participants)}-{deadline_at}",
+            rounds=1,
+            deadline_at=deadline_at,
+            participants=participants,
+        )
+        records: list[tuple[str, str, str]] = []
+        for idx, (kind, sender, recipient, body, round_no) in enumerate(turns, start=2):
+            message_id = controller._message(
+                conversation_id,
+                sender=sender,
+                recipient=recipient,
+                body=body,
+                reply_to=None,
+                kind=kind,
+            )
+            controller._append(
+                conversation_id,
+                event_type="SYNTHESIS_TERMINAL" if kind == "synthesis" else "CALL_TERMINAL",
+                state="COMPLETE" if idx == len(turns) + 1 else "INITIAL_FANOUT",
+                sender=sender,
+                recipient=recipient,
+                round_no=round_no,
+                outcome="succeeded",
+                message_id=message_id,
+            )
+            row = controller.conn.execute(
+                "SELECT body_artifact_id, content_sha256 FROM comms_messages WHERE message_id = ?",
+                (message_id,),
+            ).fetchone()
+            records.append((message_id, str(row[0]), str(row[1])))
+        return conversation_id, records
+    finally:
+        controller.close()
+
+
+def test_acp_transcript_state_ok_reads_verified_cas_body_and_multi_participants(tmp_path, monkeypatch):
+    """Defect class: ACP transcript reader returns truncated inline prefix instead of verified CAS body or drops 3-participant turns."""
+    root = tmp_path / "plane"
+    full_body = "A" * 620 + " tail-only-in-cas-blob"
+    conv_id, records = _create_controller_conversation(
+        root,
+        participants=("codex", "claude", "agy"),
+        turns=[
+            ("request", "root", "claude", "prompt for three seats", 1),
+            ("reply", "agy", "root", full_body, 1),
+            ("synthesis", "codex", "root", "three-seat synthesis", None),
+        ],
+    )
+    # Simulate an authority-style 500-char inline prefix while CAS holds the full verified body.
+    conn = sqlite3.connect(root / "comms.sqlite3")
+    try:
+        conn.execute(
+            "UPDATE comms_messages SET body_inline = ? WHERE message_id = ?",
+            (full_body[:500], records[1][0]),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    monkeypatch.setenv("FLEET_COMMS_ROOT", str(root))
+    resp = _loopback_transcript_client().get(f"/api/runtime/acp/conversations/{conv_id}/transcript")
+
+    assert resp.status_code == 200
+    assert resp.headers["cache-control"] == "no-store"
+    data = resp.json()
+    assert data["conversation_id"] == conv_id
+    assert data["state"] == "ok"
+    assert data["label"] == "ok"
+    assert data["reason"] is None
+    assert data["truncated"] is False
+    assert [m["state"] for m in data["messages"]] == ["ok", "ok", "ok"]
+    assert [m["sender"] for m in data["messages"]] == ["root", "agy", "codex"]
+    assert data["messages"][1]["body"] == full_body
+    for msg_id, art_id, sha in records:
+        for secret in (msg_id, art_id, sha, str(root)):
+            assert secret not in resp.text
+
+
+def test_acp_transcript_state_body_expired_withholds_inline_and_handles_race(tmp_path, monkeypatch):
+    """Defect class: expired CAS bodies leak via body_inline or Phase-1 markers, or mark/unlink race reports corrupt."""
+    root = tmp_path / "plane"
+    expired_secret = "EXPIRED_INLINE_CREDENTIAL_SENTINEL"
+    phase1_secret = "PHASE1_MARKED_BLOB_SENTINEL"
+    race_secret = "RACE_UNLINK_CREDENTIAL_SENTINEL"
+    conv_id, records = _create_controller_conversation(
+        root,
+        deadline_at="2020-01-01T00:00:00Z",
+        turns=[
+            ("request", "root", "codex", "still live turn", 1),
+            ("reply", "codex", "root", expired_secret, 1),
+            ("reply", "claude", "root", phase1_secret, 1),
+            ("synthesis", "codex", "root", race_secret, None),
+        ],
+    )
+
+    # Backdate turn 2 so real retention expires and unlinks its blob while body_inline stays in SQLite.
+    old_ts = "2020-01-01T00:00:00Z"
+    store = ArtifactStore(root=root)
+    try:
+        store.connection.execute(
+            "UPDATE comms_messages SET created_at = ? WHERE message_id = ?",
+            (old_ts, records[1][0]),
+        )
+        store.connection.execute(
+            "UPDATE artifacts SET created_at = ? WHERE artifact_id = ?",
+            (old_ts, records[1][1]),
+        )
+        store.connection.commit()
+        blob2 = store.blob_path_for(records[1][2])
+        os.utime(blob2, (1_577_836_800, 1_577_836_800))
+        report = store.expire_message_blobs(older_than_days=30, grace_seconds=60, apply=True)
+        assert report.removed == 1
+        assert not blob2.exists()
+        # Simulate retention Phase 1 (marked expired while blob file is still present on disk).
+        store.connection.execute(
+            "UPDATE artifacts SET retention_class = 'expired:acpx-discussion' WHERE artifact_id = ?",
+            (records[2][1],),
+        )
+        store.connection.commit()
+        assert store.blob_path_for(records[2][2]).is_file()
+    finally:
+        store.close()
+
+    # Simulate the retention mark/unlink race on turn 4: reader reads live metadata, then
+    # retention commits Phase 1 (expired marker) and Phase 2 (unlinks blob) before blob open.
+    race_art_id, race_sha = records[3][1], records[3][2]
+    real_open = runtime_router._open_acp_blob_no_follow
+
+    def _racy_open(plane_root: Path, sha256: str) -> int:
+        if sha256 == race_sha:
+            writer = sqlite3.connect(root / "comms.sqlite3")
+            try:
+                writer.execute(
+                    "UPDATE artifacts SET retention_class = 'expired:acpx-discussion' WHERE artifact_id = ?",
+                    (race_art_id,),
+                )
+                writer.commit()
+            finally:
+                writer.close()
+            (plane_root / "blobs" / "sha256" / sha256[:2] / sha256).unlink(missing_ok=True)
+        return real_open(plane_root, sha256)
+
+    monkeypatch.setattr(runtime_router, "_open_acp_blob_no_follow", _racy_open)
+    monkeypatch.setenv("FLEET_COMMS_ROOT", str(root))
+
+    resp = _loopback_transcript_client().get(f"/api/runtime/acp/conversations/{conv_id}/transcript")
+    assert resp.status_code == 200
+    assert resp.headers["cache-control"] == "no-store"
+    data = resp.json()
+    assert data["state"] == "body_expired"
+    assert data["label"] == "body expired"
+    assert data["reason"] == "body_expired"
+    assert data["messages"][0]["state"] == "ok"
+    assert data["messages"][0]["body"] == "still live turn"
+    for idx in (1, 2, 3):
+        turn = data["messages"][idx]
+        assert turn["state"] == "body_expired", idx
+        assert turn["label"] == "body expired", idx
+        assert turn["reason"] == "body_expired", idx
+        assert turn["body"] is None, idx
+    for leaked in (expired_secret, phase1_secret, race_secret):
+        assert leaked not in resp.text
+
+    # Cross-turn retention race (F1): turn 1 is expired and unlinked while opening turn 2 -> turn 1 is cleared.
+    cross_root = tmp_path / "plane-cross-turn"
+    turn1_secret = "CROSS_TURN_EXPIRED_TURN1_SECRET"
+    conv_cross, cross_records = _create_controller_conversation(
+        cross_root,
+        deadline_at="2020-01-01T00:00:00Z",
+        turns=[
+            ("request", "root", "codex", turn1_secret, 1),
+            ("reply", "codex", "root", "turn 2 stays live", 1),
+        ],
+    )
+    cross_store = ArtifactStore(root=cross_root)
+    try:
+        cross_store.connection.execute(
+            "UPDATE comms_messages SET created_at = ? WHERE message_id = ?",
+            (old_ts, cross_records[0][0]),
+        )
+        cross_store.connection.execute(
+            "UPDATE artifacts SET created_at = ? WHERE artifact_id = ?",
+            (old_ts, cross_records[0][1]),
+        )
+        cross_store.connection.commit()
+        os.utime(cross_store.blob_path_for(cross_records[0][2]), (1_577_836_800, 1_577_836_800))
+    finally:
+        cross_store.close()
+
+    turn2_sha = cross_records[1][2]
+
+    def _expire_turn1_on_turn2_open(plane_root: Path, sha256: str) -> int:
+        if sha256 == turn2_sha:
+            s = ArtifactStore(root=cross_root)
+            try:
+                rep = s.expire_message_blobs(older_than_days=30, grace_seconds=60, apply=True)
+                assert rep.removed == 1
+            finally:
+                s.close()
+        return real_open(plane_root, sha256)
+
+    monkeypatch.setattr(runtime_router, "_open_acp_blob_no_follow", _expire_turn1_on_turn2_open)
+    monkeypatch.setenv("FLEET_COMMS_ROOT", str(cross_root))
+    cross_resp = _loopback_transcript_client().get(f"/api/runtime/acp/conversations/{conv_cross}/transcript")
+    assert cross_resp.status_code == 200
+    assert cross_resp.headers["cache-control"] == "no-store"
+    cross_data = cross_resp.json()
+    assert cross_data["state"] == "body_expired"
+    assert cross_data["messages"][0]["state"] == "body_expired"
+    assert cross_data["messages"][0]["label"] == "body expired"
+    assert cross_data["messages"][0]["body"] is None
+    assert cross_data["messages"][1]["state"] == "ok"
+    assert cross_data["messages"][1]["body"] == "turn 2 stays live"
+    assert turn1_secret not in cross_resp.text
+
+    # Single-statement final retention check (F1): CAS turn + legacy inline turn sharing one digest
+    # both expire together in one snapshot when retention commits while opening a later turn.
+    shared_root = tmp_path / "plane-shared-digest"
+    shared_secret = "SHARED_CAS_AND_INLINE_EXPIRED_SECRET"
+    conv_shared, shared_records = _create_controller_conversation(
+        shared_root,
+        deadline_at="2020-01-01T00:00:00Z",
+        turns=[
+            ("request", "root", "codex", shared_secret, 1),
+            ("reply", "codex", "root", "trigger turn 3", 1),
+        ],
+    )
+    shared_store = ArtifactStore(root=shared_root)
+    try:
+        shared_store.connection.execute(
+            "UPDATE comms_messages SET created_at = ? WHERE message_id = ?",
+            (old_ts, shared_records[0][0]),
+        )
+        shared_store.connection.execute(
+            "UPDATE artifacts SET created_at = ? WHERE artifact_id = ?",
+            (old_ts, shared_records[0][1]),
+        )
+        # Add a legacy inline-only turn sharing the same content_sha256 (body_artifact_id IS NULL),
+        # plus a legacy inline-only turn with content_sha256 IS NULL holding the same bytes (PR1498-F1).
+        shared_store.connection.executemany(
+            """INSERT INTO comms_messages(
+                message_id, conversation_id, kind, sender, recipient, body_inline,
+                body_artifact_id, content_sha256, metadata_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            [
+                (
+                    "msg-inline-shared", conv_shared, "reply", "claude", "root", shared_secret,
+                    None, shared_records[0][2], "{}", old_ts,
+                ),
+                (
+                    "msg-inline-null-sha", conv_shared, "reply", "claude", "root", shared_secret,
+                    None, None, "{}", old_ts,
+                ),
+            ],
+        )
+        shared_store.connection.executemany(
+            """INSERT INTO acp_conversation_events(
+                event_id, conversation_id, sequence, event_type, state, sender, recipient,
+                round, outcome, message_id, metadata_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            [
+                (
+                    "evt-inline-shared", conv_shared, 50, "CALL_TERMINAL", "COMPLETE", "claude", "root",
+                    1, "succeeded", "msg-inline-shared", "{}", old_ts,
+                ),
+                (
+                    "evt-inline-null-sha", conv_shared, 51, "CALL_TERMINAL", "COMPLETE", "claude", "root",
+                    1, "succeeded", "msg-inline-null-sha", "{}", old_ts,
+                ),
+            ],
+        )
+        shared_store.connection.commit()
+        os.utime(shared_store.blob_path_for(shared_records[0][2]), (1_577_836_800, 1_577_836_800))
+    finally:
+        shared_store.close()
+
+    trigger_sha = shared_records[1][2]
+
+    def _expire_shared_on_trigger(plane_root: Path, sha256: str) -> int:
+        if sha256 == trigger_sha:
+            s = ArtifactStore(root=shared_root)
+            try:
+                rep = s.expire_message_blobs(older_than_days=30, grace_seconds=60, apply=True)
+                assert rep.removed == 1
+            finally:
+                s.close()
+        return real_open(plane_root, sha256)
+
+    monkeypatch.setattr(runtime_router, "_open_acp_blob_no_follow", _expire_shared_on_trigger)
+    monkeypatch.setenv("FLEET_COMMS_ROOT", str(shared_root))
+    shared_resp = _loopback_transcript_client().get(f"/api/runtime/acp/conversations/{conv_shared}/transcript")
+    assert shared_resp.status_code == 200
+    shared_data = shared_resp.json()
+    assert shared_data["state"] == "body_expired"
+    assert [m["state"] for m in shared_data["messages"]] == ["body_expired", "ok", "body_expired", "body_expired"]
+    assert shared_data["messages"][0]["body"] is None
+    assert shared_data["messages"][2]["body"] is None
+    assert shared_data["messages"][3]["body"] is None
+    assert shared_secret not in shared_resp.text
+
+
+def test_acp_transcript_state_missing_or_corrupt_covers_blobs_turns_and_participants(tmp_path, monkeypatch):
+    """Defect class: corrupt blobs, missing rows, or malformed/unhashable participants drop turns or raise TypeError."""
+    root = tmp_path / "plane"
+    unlinked_secret = "UNLINKED_NON_EXPIRED_SECRET"
+    tampered_secret = "TAMPERED_BLOB_INLINE_SECRET"
+    conv_id, records = _create_controller_conversation(
+        root,
+        turns=[
+            ("request", "root", "codex", "healthy turn", 1),
+            ("reply", "codex", "root", unlinked_secret, 1),
+            ("reply", "claude", "root", tampered_secret, 1),
+            ("reply", "codex", "root", "non-utf8 body", 1),
+            ("reply", "claude", "root", "missing artifact row", 1),
+            ("reply", "codex", "root", "poisoned metadata body", 1),
+            ("reply", "claude", "root", "overflow timestamp body", 1),
+            ("reply", "codex", "root", "broken round body", 1),
+            ("reply", "claude", "root", "null round call body", 1),
+            ("synthesis", "codex", "root", "valid synthesis without round", None),
+        ],
+    )
+    # 1. Missing blob WITHOUT expired marker.
+    blob_missing = root / "blobs" / "sha256" / records[1][2][:2] / records[1][2]
+    blob_missing.unlink()
+    # 2. Tampered blob bytes (same length -> digest mismatch).
+    blob_tampered = root / "blobs" / "sha256" / records[2][2][:2] / records[2][2]
+    blob_tampered.write_bytes(b"X" * len(tampered_secret.encode("utf-8")))
+    # 3. Non-UTF8 blob with matching digest and byte count.
+    bad_utf8 = b"\xff\xfe\xfd"
+    bad_sha = hashlib.sha256(bad_utf8).hexdigest()
+    bad_blob = root / "blobs" / "sha256" / bad_sha[:2] / bad_sha
+    bad_blob.parent.mkdir(parents=True, exist_ok=True)
+    bad_blob.write_bytes(bad_utf8)
+
+    conn = sqlite3.connect(root / "comms.sqlite3")
+    try:
+        conn.execute(
+            "UPDATE artifacts SET sha256 = ?, bytes = ? WHERE artifact_id = ?",
+            (bad_sha, len(bad_utf8), records[3][1]),
+        )
+        conn.execute(
+            "UPDATE comms_messages SET content_sha256 = ? WHERE message_id = ?",
+            (bad_sha, records[3][0]),
+        )
+        # 4. Missing artifact row referenced by turn 5.
+        conn.execute(
+            "UPDATE comms_messages SET body_artifact_id = 'art-does-not-exist' WHERE message_id = ?",
+            (records[4][0],),
+        )
+        # 5. Malformed metadata (unallowlisted sender) on turn 6.
+        conn.execute(
+            "UPDATE comms_messages SET sender = 'intruder-seat' WHERE message_id = ?",
+            (records[5][0],),
+        )
+        # 5b. Timestamp that overflows UTC conversion on turn 7 (F4).
+        conn.execute(
+            "UPDATE comms_messages SET created_at = '0001-01-01T00:00:00+00:01' WHERE message_id = ?",
+            (records[6][0],),
+        )
+        # 5c. Non-integer event round on turn 8 and NULL round on round-bound CALL_TERMINAL turn 9 (PR1498-F4).
+        conn.execute(
+            "UPDATE acp_conversation_events SET round = 'broken-round' WHERE message_id = ?",
+            (records[7][0],),
+        )
+        conn.execute(
+            "UPDATE acp_conversation_events SET round = NULL WHERE message_id = ?",
+            (records[8][0],),
+        )
+        # 6. Dangling event referencing a missing comms_messages row.
+        conn.execute(
+            """INSERT INTO acp_conversation_events(
+                event_id, conversation_id, sequence, event_type, state, sender, recipient,
+                round, outcome, message_id, metadata_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                "evt-dangling", conv_id, 99, "CALL_TERMINAL", "COMPLETE", "codex", "root",
+                1, "succeeded", "msg-missing-row", "{}", "2026-01-01T00:00:00Z",
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    monkeypatch.setenv("FLEET_COMMS_ROOT", str(root))
+    local = _loopback_transcript_client()
+    resp = local.get(f"/api/runtime/acp/conversations/{conv_id}/transcript")
+    assert resp.status_code == 200
+    assert resp.headers["cache-control"] == "no-store"
+    data = resp.json()
+    assert data["state"] == "missing_or_corrupt"
+    assert data["label"] == "missing or corrupt"
+    assert len(data["messages"]) == 11
+    assert data["messages"][0]["state"] == "ok"
+    assert data["messages"][0]["body"] == "healthy turn"
+    assert data["messages"][9]["state"] == "ok"
+    assert data["messages"][9]["body"] == "valid synthesis without round"
+    assert "round" not in data["messages"][9]
+    expected_reasons = [
+        (1, "blob_missing"),
+        (2, "blob_digest_mismatch"),
+        (3, "body_not_utf8"),
+        (4, "artifact_row_missing"),
+        (5, "malformed_turn_metadata"),
+        (6, "malformed_turn_metadata"),
+        (7, "malformed_turn_metadata"),
+        (8, "malformed_turn_metadata"),
+        (10, "message_row_missing"),
+    ]
+    for idx, expected_reason in expected_reasons:
+        turn = data["messages"][idx]
+        assert turn["state"] == "missing_or_corrupt", (idx, turn)
+        assert turn["label"] == "missing or corrupt", (idx, turn)
+        assert turn["reason"] == expected_reason, (idx, turn)
+        assert turn["body"] is None, (idx, turn)
+    assert "round" not in data["messages"][7]
+    assert "round" not in data["messages"][8]
+    for forbidden in (
+        unlinked_secret,
+        tampered_secret,
+        "intruder-seat",
+        "poisoned metadata body",
+        "overflow timestamp body",
+        "broken round body",
+        "null round call body",
+    ):
+        assert forbidden not in resp.text
+
+    # Malformed participant items (empty [], over-deep JSON, unhashable, >4 seats, <2 seats, unknown seats) refused.
+    over_deep_participants = "[" * 513 + "]" * 513
+    for bad_participants in (
+        '[]',
+        over_deep_participants,
+        '[{"nested": 1}]',
+        '[["codex"]]',
+        '[123, "codex"]',
+        '["codex", "evil"]',
+        '["codex"]',
+        '["codex", "claude", "agy", "grok", "cursor"]',
+        'not-json',
+        '{}',
+    ):
+        conn = sqlite3.connect(root / "comms.sqlite3")
+        try:
+            conn.execute(
+                "UPDATE acp_conversations SET participants_json = ? WHERE conversation_id = ?",
+                (bad_participants, conv_id),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        bad_resp = local.get(f"/api/runtime/acp/conversations/{conv_id}/transcript")
+        assert bad_resp.status_code == 200, bad_participants
+        assert bad_resp.headers["cache-control"] == "no-store"
+        assert bad_resp.json() == {
+            "conversation_id": conv_id,
+            "state": "missing_or_corrupt",
+            "label": "missing or corrupt",
+            "reason": "malformed_participants",
+            "truncated": False,
+            "messages": [],
+        }
+        assert "TypeError" not in bad_resp.text
+        assert "unhashable" not in bad_resp.text
+        assert "healthy turn" not in bad_resp.text
+
+    # Body-free routes also tolerate unhashable, over-deep, or >4 participant items without raising 500.
+    for body_free_participants in (
+        over_deep_participants,
+        '[{"nested": 1}]',
+        '["codex", "claude", "agy", "grok", "cursor"]',
+    ):
+        conn = sqlite3.connect(root / "comms.sqlite3")
+        try:
+            conn.execute(
+                "UPDATE acp_conversations SET participants_json = ? WHERE conversation_id = ?",
+                (body_free_participants, conv_id),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        detail_resp = client.get(f"/api/runtime/acp/conversations/{conv_id}")
+        assert detail_resp.status_code == 200
+        assert detail_resp.json()["participants"] == ["codex", "grok"]
+        assert client.get("/api/runtime/acp/conversations").status_code == 200
+
+
+def test_acp_transcript_state_backend_unavailable_returns_503_and_reserves_404(tmp_path, monkeypatch):
+    """Defect class: storage, schema, authority, or blob backend errors return 404 instead of 503 backend_unavailable."""
+    local = _loopback_transcript_client()
+
+    # 1. Missing store directory / comms.sqlite3 -> 503 even for unknown id.
+    monkeypatch.setenv("FLEET_COMMS_ROOT", str(tmp_path / "does-not-exist"))
+    missing_store = local.get("/api/runtime/acp/conversations/unknown-conv/transcript")
+    assert missing_store.status_code == 503
+    assert missing_store.headers["cache-control"] == "no-store"
+    assert missing_store.json()["state"] == "backend_unavailable"
+    assert missing_store.json()["label"] == "backend unavailable"
+    assert missing_store.json()["reason"] == "store_unavailable"
+    assert str(tmp_path) not in missing_store.text
+
+    # 2. Corrupt non-SQLite database file -> 503.
+    corrupt_root = tmp_path / "corrupt-db"
+    corrupt_root.mkdir()
+    (corrupt_root / "comms.sqlite3").write_bytes(b"not a sqlite file at all")
+    monkeypatch.setenv("FLEET_COMMS_ROOT", str(corrupt_root))
+    corrupt_resp = local.get("/api/runtime/acp/conversations/conv-1/transcript")
+    assert corrupt_resp.status_code == 503
+    assert corrupt_resp.headers["cache-control"] == "no-store"
+    assert corrupt_resp.json()["state"] == "backend_unavailable"
+    assert corrupt_resp.json()["reason"] == "store_unavailable"
+
+    # 3. Missing artifacts or message_artifacts tables -> 503 schema_unavailable for existing and unknown IDs (PR1498-F2).
+    no_art_root = tmp_path / "no-artifacts-table"
+    now = datetime.now(UTC)
+    _write_acp_db(
+        no_art_root,
+        [("conv-no-art", "t", "c", "i", 1, '["codex", "claude"]', _iso(now), None, 1, 1)],
+        [("evt-1", "conv-no-art", 1, "CALL_TERMINAL", "COMPLETE", "codex", "root", 1, "ok", 1, 1, "s", "msg-1", "{}", _iso(now))],
+        include_artifact_tables=False,
+    )
+    conn = sqlite3.connect(no_art_root / "comms.sqlite3")
+    try:
+        conn.execute(
+            """INSERT INTO comms_messages(
+                message_id, conversation_id, kind, sender, recipient, body_inline, body_artifact_id, metadata_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            ("msg-1", "conv-no-art", "reply", "codex", "root", "must not leak", "art-1", "{}", _iso(now)),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    monkeypatch.setenv("FLEET_COMMS_ROOT", str(no_art_root))
+    for target_id in ("conv-no-art", "unknown-id"):
+        no_art_resp = local.get(f"/api/runtime/acp/conversations/{target_id}/transcript")
+        assert no_art_resp.status_code == 503
+        assert no_art_resp.headers["cache-control"] == "no-store"
+        assert no_art_resp.json()["state"] == "backend_unavailable"
+        assert no_art_resp.json()["reason"] == "schema_unavailable"
+        assert "must not leak" not in no_art_resp.text
+
+    no_msg_art_root = tmp_path / "no-message-artifacts-table"
+    conv_no_ma, _ = _create_controller_conversation(
+        no_msg_art_root,
+        turns=[("request", "root", "codex", "cas body must not leak", 1)],
+    )
+    conn = sqlite3.connect(no_msg_art_root / "comms.sqlite3")
+    try:
+        conn.execute("DROP TABLE message_artifacts")
+        conn.commit()
+    finally:
+        conn.close()
+    monkeypatch.setenv("FLEET_COMMS_ROOT", str(no_msg_art_root))
+    for target_id in (conv_no_ma, "unknown-id"):
+        no_ma_resp = local.get(f"/api/runtime/acp/conversations/{target_id}/transcript")
+        assert no_ma_resp.status_code == 503
+        assert no_ma_resp.headers["cache-control"] == "no-store"
+        assert no_ma_resp.json()["state"] == "backend_unavailable"
+        assert no_ma_resp.json()["reason"] == "schema_unavailable"
+        assert "cas body must not leak" not in no_ma_resp.text
+
+    # 4. Real store: unknown conversation id -> 404 ONLY after successful lookup.
+    good_root = tmp_path / "good-plane"
+    conv_id, _ = _create_controller_conversation(
+        good_root,
+        turns=[("request", "root", "codex", "hello", 1)],
+    )
+    monkeypatch.setenv("FLEET_COMMS_ROOT", str(good_root))
+    not_found = local.get("/api/runtime/acp/conversations/unknown-id/transcript")
+    assert not_found.status_code == 404
+    assert not_found.headers["cache-control"] == "no-store"
+    assert not_found.json() == {"detail": "Conversation not found", "reason": "conversation_not_found"}
+
+    # 5. Shared CAS directory usability class (PR1493-F2): unusable modes, symlinks, files,
+    # missing directories, and OSErrors must map to 503 blob_store_unavailable (never 404);
+    # read-only searchable mode 0500 remains usable (200 existing, 404 absent).
+    bad_blobs_root = tmp_path / "bad-blobs-dir"
+    conv_bad_dir, _ = _create_controller_conversation(
+        bad_blobs_root,
+        turns=[("request", "root", "codex", "cannot open blobs dir", 1)],
+    )
+    import errno as _errno
+    import shutil
+
+    monkeypatch.setenv("FLEET_COMMS_ROOT", str(bad_blobs_root))
+
+    # 5a. Parametrized mode variants on both blobs/sha256 and blobs (0000/0100/0200/0400 -> 503; 0500 -> usable).
+    mode_cases = [
+        (bad_blobs_root / "blobs" / "sha256", 0o000, False),
+        (bad_blobs_root / "blobs" / "sha256", 0o100, False),
+        (bad_blobs_root / "blobs" / "sha256", 0o200, False),
+        (bad_blobs_root / "blobs" / "sha256", 0o400, False),
+        (bad_blobs_root / "blobs" / "sha256", 0o500, True),
+        (bad_blobs_root / "blobs", 0o000, False),
+        (bad_blobs_root / "blobs", 0o100, False),
+        (bad_blobs_root / "blobs", 0o200, False),
+        (bad_blobs_root / "blobs", 0o400, False),
+        (bad_blobs_root / "blobs", 0o500, True),
+    ]
+    for target_dir, mode, usable in mode_cases:
+        os.chmod(target_dir, mode)
+        try:
+            existing_resp = local.get(f"/api/runtime/acp/conversations/{conv_bad_dir}/transcript")
+            absent_resp = local.get("/api/runtime/acp/conversations/unknown-id/transcript")
+        finally:
+            os.chmod(target_dir, 0o700)
+        if usable:
+            assert existing_resp.status_code == 200, f"mode={oct(mode)} dir={target_dir.name}"
+            assert existing_resp.json()["state"] == "ok"
+            assert absent_resp.status_code == 404, f"mode={oct(mode)} dir={target_dir.name}"
+            assert absent_resp.json() == {"detail": "Conversation not found", "reason": "conversation_not_found"}
+        else:
+            for resp in (existing_resp, absent_resp):
+                assert resp.status_code == 503, f"mode={oct(mode)} dir={target_dir.name}"
+                assert resp.headers["cache-control"] == "no-store"
+                assert resp.json()["state"] == "backend_unavailable"
+                assert resp.json()["reason"] == "blob_store_unavailable"
+                assert "PermissionError" not in resp.text
+                assert "Errno" not in resp.text
+                assert str(tmp_path) not in resp.text
+                assert "cannot open blobs dir" not in resp.text
+
+    # 5b. OSError variants (EPERM, EIO) while proving searchability -> 503 with no exception text.
+    real_stat = os.stat
+    for err_no in (_errno.EPERM, _errno.EIO):
+        def _fail_dir_stat(path, *args, _err=err_no, **kwargs):
+            if path == "." and kwargs.get("dir_fd") is not None:
+                raise OSError(_err, f"secret host fault {_err}")
+            return real_stat(path, *args, **kwargs)
+
+        monkeypatch.setattr(runtime_router.os, "stat", _fail_dir_stat)
+        for target_id in (conv_bad_dir, "unknown-id"):
+            err_resp = local.get(f"/api/runtime/acp/conversations/{target_id}/transcript")
+            assert err_resp.status_code == 503
+            assert err_resp.headers["cache-control"] == "no-store"
+            assert err_resp.json()["state"] == "backend_unavailable"
+            assert err_resp.json()["reason"] == "blob_store_unavailable"
+            assert "secret host fault" not in err_resp.text
+            assert "OSError" not in err_resp.text
+    monkeypatch.setattr(runtime_router.os, "stat", real_stat)
+
+    # 5c. Symlink, regular file (ENOTDIR), and missing (ENOENT) in place of blobs/sha256 and blobs -> 503.
+    decoy_dir = tmp_path / "decoy-cas-dir"
+    decoy_dir.mkdir()
+    for rel_path in (("blobs", "sha256"), ("blobs",)):
+        target_path = bad_blobs_root.joinpath(*rel_path)
+        backup_path = target_path.parent / f"{target_path.name}-backup"
+        target_path.rename(backup_path)
+        try:
+            for kind in ("missing", "file", "symlink"):
+                if kind == "file":
+                    target_path.write_text("not a directory", encoding="utf-8")
+                elif kind == "symlink":
+                    target_path.symlink_to(decoy_dir)
+                try:
+                    for target_id in (conv_bad_dir, "unknown-id"):
+                        resp = local.get(f"/api/runtime/acp/conversations/{target_id}/transcript")
+                        assert resp.status_code == 503, f"path={rel_path} kind={kind} id={target_id}"
+                        assert resp.headers["cache-control"] == "no-store"
+                        assert resp.json()["state"] == "backend_unavailable"
+                        assert resp.json()["reason"] == "blob_store_unavailable"
+                        assert str(tmp_path) not in resp.text
+                        assert "cannot open blobs dir" not in resp.text
+                finally:
+                    if target_path.is_symlink() or target_path.is_file():
+                        target_path.unlink()
+        finally:
+            backup_path.rename(target_path)
+    shutil.rmtree(decoy_dir)
+
+    # 6. Blob backend OSError (not FileNotFoundError) -> 503 blob_store_unavailable.
+    monkeypatch.setenv("FLEET_COMMS_ROOT", str(good_root))
+    def _fail_blob_open(_plane_root: Path, _sha256: str) -> int:
+        raise PermissionError("secret host path /private/blob")
+
+    monkeypatch.setattr(runtime_router, "_open_acp_blob_no_follow", _fail_blob_open)
+    io_err = local.get(f"/api/runtime/acp/conversations/{conv_id}/transcript")
+    assert io_err.status_code == 503
+    assert io_err.headers["cache-control"] == "no-store"
+    assert io_err.json()["state"] == "backend_unavailable"
+    assert io_err.json()["reason"] == "blob_store_unavailable"
+    assert "PermissionError" not in io_err.text
+    assert "/private/blob" not in io_err.text
+
+    # 7. Unsupported PG authority -> 503 authority_unsupported_component.
+    monkeypatch.setattr(runtime_router, "resolve_authority", lambda _store_id: Authority.PG)
+    pg_resp = local.get(f"/api/runtime/acp/conversations/{conv_id}/transcript")
+    assert pg_resp.status_code == 503
+    assert pg_resp.headers["cache-control"] == "no-store"
+    assert pg_resp.json()["state"] == "backend_unavailable"
+    assert pg_resp.json()["reason"] == "authority_unsupported_component"
+
+
+def test_acp_transcript_state_oversized_or_partial_preserves_turns_without_404(tmp_path, monkeypatch):
+    """Defect class: oversized turns, response byte budget, or >32 turns silently drop turns or return 404."""
+    local = _loopback_transcript_client()
+
+    # 1. Single oversized turn (>256 KiB) preserved with state=oversized_or_partial alongside an ok turn.
+    root_big = tmp_path / "plane-big"
+    oversized_body = "B" * (runtime_router._ACP_TRANSCRIPT_MAX_BODY_BYTES + 128)
+    conv_big, _ = _create_controller_conversation(
+        root_big,
+        turns=[
+            ("request", "root", "codex", "small turn", 1),
+            ("reply", "codex", "root", oversized_body, 1),
+        ],
+    )
+    monkeypatch.setenv("FLEET_COMMS_ROOT", str(root_big))
+    resp_big = local.get(f"/api/runtime/acp/conversations/{conv_big}/transcript")
+    assert resp_big.status_code == 200
+    assert resp_big.headers["cache-control"] == "no-store"
+    data_big = resp_big.json()
+    assert data_big["state"] == "oversized_or_partial"
+    assert data_big["label"] == "oversized or partial"
+    assert data_big["reason"] == "body_too_large"
+    assert data_big["truncated"] is False
+    assert data_big["messages"][0]["state"] == "ok"
+    assert data_big["messages"][0]["body"] == "small turn"
+    assert data_big["messages"][1]["state"] == "oversized_or_partial"
+    assert data_big["messages"][1]["label"] == "oversized or partial"
+    assert data_big["messages"][1]["reason"] == "body_too_large"
+    assert data_big["messages"][1]["body"] is None
+
+    # 2. Total response byte budget (<=512 KiB including JSON envelope and turn metadata, F5).
+    root_budget = tmp_path / "plane-budget"
+    near_half = "C" * (runtime_router._ACP_TRANSCRIPT_MAX_BODY_BYTES - 2)
+    conv_budget, _ = _create_controller_conversation(
+        root_budget,
+        turns=[
+            ("request", "root", "codex", near_half, 1),
+            ("reply", "codex", "root", near_half, 1),
+        ],
+    )
+    monkeypatch.setenv("FLEET_COMMS_ROOT", str(root_budget))
+    resp_budget = local.get(f"/api/runtime/acp/conversations/{conv_budget}/transcript")
+    assert resp_budget.status_code == 200
+    assert len(resp_budget.content) <= runtime_router._ACP_TRANSCRIPT_MAX_RESPONSE_BYTES
+    data_budget = resp_budget.json()
+    assert data_budget["state"] == "oversized_or_partial"
+    assert data_budget["reason"] == "response_budget_exceeded"
+    assert data_budget["truncated"] is False
+    assert [m["state"] for m in data_budget["messages"]] == ["ok", "oversized_or_partial"]
+    assert data_budget["messages"][1]["reason"] == "response_budget_exceeded"
+    assert data_budget["messages"][1]["body"] is None
+
+    # 2b. Two live 261,900-byte turns whose exact serialized payload fits <=512 KiB are both admitted (F5).
+    root_fit = tmp_path / "plane-fit"
+    fit_chunk = "F" * 261_900
+    conv_fit, _ = _create_controller_conversation(
+        root_fit,
+        turns=[
+            ("request", "root", "codex", fit_chunk, 1),
+            ("reply", "codex", "root", fit_chunk, 1),
+        ],
+    )
+    monkeypatch.setenv("FLEET_COMMS_ROOT", str(root_fit))
+    resp_fit = local.get(f"/api/runtime/acp/conversations/{conv_fit}/transcript")
+    assert resp_fit.status_code == 200
+    assert len(resp_fit.content) <= runtime_router._ACP_TRANSCRIPT_MAX_RESPONSE_BYTES
+    data_fit = resp_fit.json()
+    assert data_fit["state"] == "ok"
+    assert [m["state"] for m in data_fit["messages"]] == ["ok", "ok"]
+    assert data_fit["messages"][1]["body"] == fit_chunk
+
+    # 2c. Bodies expired during read do not consume response budget for surviving live turns (F5).
+    root_reclaim = tmp_path / "plane-reclaim"
+    old_ts = "2020-01-01T00:00:00Z"
+    turn_200k_1 = "1" * (200 * 1024)
+    turn_200k_2 = "2" * (200 * 1024)
+    turn_200k_3 = "3" * (200 * 1024)
+    conv_reclaim, rec_reclaim = _create_controller_conversation(
+        root_reclaim,
+        deadline_at=old_ts,
+        turns=[
+            ("request", "root", "codex", turn_200k_1, 1),
+            ("reply", "codex", "root", turn_200k_2, 1),
+            ("synthesis", "codex", "root", turn_200k_3, None),
+        ],
+    )
+    reclaim_store = ArtifactStore(root=root_reclaim)
+    try:
+        for msg_id, art_id, sha in rec_reclaim[:2]:
+            reclaim_store.connection.execute(
+                "UPDATE comms_messages SET created_at = ? WHERE message_id = ?", (old_ts, msg_id)
+            )
+            reclaim_store.connection.execute(
+                "UPDATE artifacts SET created_at = ? WHERE artifact_id = ?", (old_ts, art_id)
+            )
+            os.utime(reclaim_store.blob_path_for(sha), (1_577_836_800, 1_577_836_800))
+        reclaim_store.connection.commit()
+    finally:
+        reclaim_store.close()
+
+    real_open = runtime_router._open_acp_blob_no_follow
+    third_sha = rec_reclaim[2][2]
+
+    def _expire_first_two_on_third(plane_root: Path, sha256: str) -> int:
+        if sha256 == third_sha:
+            s = ArtifactStore(root=root_reclaim)
+            try:
+                rep = s.expire_message_blobs(older_than_days=30, grace_seconds=60, apply=True)
+                assert rep.removed == 2
+            finally:
+                s.close()
+        return real_open(plane_root, sha256)
+
+    monkeypatch.setattr(runtime_router, "_open_acp_blob_no_follow", _expire_first_two_on_third)
+    monkeypatch.setenv("FLEET_COMMS_ROOT", str(root_reclaim))
+    resp_reclaim = local.get(f"/api/runtime/acp/conversations/{conv_reclaim}/transcript")
+    assert resp_reclaim.status_code == 200
+    assert len(resp_reclaim.content) <= runtime_router._ACP_TRANSCRIPT_MAX_RESPONSE_BYTES
+    data_reclaim = resp_reclaim.json()
+    assert data_reclaim["state"] == "body_expired"
+    assert [m["state"] for m in data_reclaim["messages"]] == ["body_expired", "body_expired", "ok"]
+    assert data_reclaim["messages"][0]["body"] is None
+    assert data_reclaim["messages"][1]["body"] is None
+    assert data_reclaim["messages"][2]["body"] == turn_200k_3
+
+    # 2d. Smaller-representation reservation: [262144, 261243, 1, 262144] admits turns 1-3 at exact 512 KiB (PR1493-F5).
+    root_exact = tmp_path / "plane-exact-pack"
+    exact_t1 = "1" * 262_144
+    exact_t2 = "2" * 261_243
+    exact_t3 = "3"
+    exact_t4 = "4" * 262_144
+    conv_exact, _ = _create_controller_conversation(
+        root_exact,
+        turns=[
+            ("reply", "codex", "root", exact_t1, 1),
+            ("reply", "codex", "root", exact_t2, 1),
+            ("reply", "codex", "root", exact_t3, 1),
+            ("reply", "codex", "root", exact_t4, 2),
+        ],
+    )
+    monkeypatch.setenv("FLEET_COMMS_ROOT", str(root_exact))
+    resp_exact = local.get(f"/api/runtime/acp/conversations/{conv_exact}/transcript")
+    assert resp_exact.status_code == 200
+    assert len(resp_exact.content) == runtime_router._ACP_TRANSCRIPT_MAX_RESPONSE_BYTES
+    data_exact = resp_exact.json()
+    assert data_exact["state"] == "oversized_or_partial"
+    assert data_exact["reason"] == "response_budget_exceeded"
+    assert [m["state"] for m in data_exact["messages"]] == ["ok", "ok", "ok", "oversized_or_partial"]
+    assert data_exact["messages"][0]["body"] == exact_t1
+    assert data_exact["messages"][1]["body"] == exact_t2
+    assert data_exact["messages"][2]["body"] == exact_t3
+    assert data_exact["messages"][3]["body"] is None
+    assert data_exact["messages"][3]["reason"] == "response_budget_exceeded"
+
+    # 3. Message count limit (>32 turns) returns HTTP 200 (not 404) with first 32 turns and truncated=True.
+    root_many = tmp_path / "plane-many"
+    many_turns = [
+        ("reply", "codex", "root", f"turn-{i}", 1)
+        for i in range(runtime_router._ACP_TRANSCRIPT_MAX_MESSAGES + 2)
+    ]
+    conv_many, _ = _create_controller_conversation(root_many, turns=many_turns)
+    monkeypatch.setenv("FLEET_COMMS_ROOT", str(root_many))
+    resp_many = local.get(f"/api/runtime/acp/conversations/{conv_many}/transcript")
+    assert resp_many.status_code == 200
+    data_many = resp_many.json()
+    assert data_many["state"] == "oversized_or_partial"
+    assert data_many["label"] == "oversized or partial"
+    assert data_many["reason"] == "message_limit_exceeded"
+    assert data_many["truncated"] is True
+    assert len(data_many["messages"]) == runtime_router._ACP_TRANSCRIPT_MAX_MESSAGES
+    assert all(m["state"] == "ok" for m in data_many["messages"])
 
 
 def test_acp_conversations_refuse_poisoned_rows_and_hide_unavailable_storage(tmp_path, monkeypatch):
