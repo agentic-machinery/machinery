@@ -59,12 +59,16 @@ class SupervisorError(ValueError):
 
 # The two admitted ``lu-start-cto`` templates, by the SHA-256 of their normalized
 # statements. The checkout template runs the product checkout's start-claude-cto.sh
-# from REPO, the product checkout. The workspace template (DETACH step 4b) exports
-# LC_WORKSPACE_ROOT=$REPO and runs the installed package's start-claude-cto.sh, named
-# by its LAUNCHER policy line, from REPO, the CTO workspace. Each binds its own mode:
-# neither template's successor is admitted from a launch of the other mode.
+# from REPO, the product checkout. The workspace template is the released
+# lib/lu-start-cto.workspace.sh: it exports LC_WORKSPACE_ROOT=$REPO and runs the
+# installed package's start-claude-cto.sh, named by its LAUNCHER policy line, from REPO,
+# the CTO workspace. Each binds its own mode: neither template's successor is admitted
+# from a launch of the other mode. The workspace pin moved from 067bc187... (DETACH step
+# 4b) when the template took the host start's safeguards (SELECTOR_PROFILE sourcing,
+# start.lock with in-place successor re-entry, bounded auth check) and gave its tmux pane
+# the caller's selector instead of a reused server's stale one.
 _CTO_CHECKOUT_TEMPLATE = "44dedafd91b354e31b9fcd8a4948518b57dc9f41cce9f34fd02e5cae36157280"
-_CTO_WORKSPACE_TEMPLATE = "067bc1879e47adab40f3b6a97069b5820960f7dd64382d8fb1ac79aef074744f"
+_CTO_WORKSPACE_TEMPLATE = "b103a47a15f4e695b846757b483369091235fdd691511d1b47d42198743f6a59"
 _CTO_PACKAGE_WRAPPER = Path(__file__).resolve().parents[1] / "start-claude-cto.sh"
 
 
@@ -102,7 +106,7 @@ def cto_wrapper_signature(wrapper: Path, root: Path, entrypoint: Path, args: lis
             line = line.strip(" \t")
             if not line or line.startswith("#"):
                 continue
-            match = re.fullmatch(r"(REPO|CFG|LAUNCHER|MODEL|EFFORT|KICK)=(.*)", line)
+            match = re.fullmatch(r"(REPO|CFG|LAUNCHER|SELECTOR_PROFILE|MODEL|EFFORT|KICK)=(.*)", line)
             if match:
                 key, value = match.groups()
                 lexer = shlex.shlex(value, posix=True, punctuation_chars=";&|<>()")
@@ -138,9 +142,11 @@ def cto_wrapper_signature(wrapper: Path, root: Path, entrypoint: Path, args: lis
             # library from that spelling, so only the canonical physical wrapper path is
             # admitted, exactly as an executable file now. REPO must be the exported
             # physical workspace, still outside every checkout as the launcher requires.
+            # The wrapper refuses a relative selector profile, so that refuses here first.
             repo = policy["REPO"]
             if (
                 policy["LAUNCHER"] != str(_CTO_PACKAGE_WRAPPER)
+                or not Path(policy["SELECTOR_PROFILE"]).is_absolute()
                 or not os.path.isfile(_CTO_PACKAGE_WRAPPER)
                 or not os.access(_CTO_PACKAGE_WRAPPER, os.X_OK)
                 or repo != workspace

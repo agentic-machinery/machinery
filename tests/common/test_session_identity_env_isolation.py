@@ -65,6 +65,7 @@ _HOST_CONFIG_EXPORTS = frozenset(
         "LEARN_UKRAINIAN_PRIMARY_REPO_ROOT",  # shared-state anchor, the installed launcher's helper root
         "LEARN_UKRAINIAN_PYTHON",  # configured interpreter, #177
         "LU_DRIVER_STATE_PYTHON",  # interpreter configuration, shared across sessions
+        "LU_FLEET_REPO_SELECTOR_FILE",  # host-owned selector path, shared by every session
         "LU_AGENT_COMM_TRANSPORT",  # fleet comms transport choice
         "LU_MONITOR_HOST_ID",  # this host, shared by every session on it
         "LU_PRODUCT_ROOT",  # product checkout path, not a session
