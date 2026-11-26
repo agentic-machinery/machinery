@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import functools
+import hashlib
 import importlib.util
 import inspect
 import ipaddress
@@ -11,6 +13,7 @@ import json
 import os
 import re
 import sqlite3
+import stat
 from collections import Counter, defaultdict
 from collections.abc import Mapping
 from datetime import UTC, date, datetime, timedelta
@@ -37,9 +40,12 @@ from lu_machinery.agent_runtime.usage import _iter_usage_records as _iter_usage_
 from lu_machinery.common import json_depth
 from lu_machinery.common.repo_root import machinery_path
 from lu_machinery.common.task_store_paths import read_cached_task_record
+from lu_machinery.control_plane.storage import Authority, ControlPlaneError, StoreId, resolve_authority
 from lu_machinery.dispatcher.admission import review_typed
 from lu_machinery.dispatcher.types import StartRefusal
 from lu_machinery.fleet_comms import message_plane
+from lu_machinery.fleet_comms.artifacts import RETENTION_EXPIRED_PREFIX
+from lu_machinery.fleet_comms.paths import PlaneRootAnchorError
 from lu_machinery.lib.readonly_sqlite import SQLiteConnection, import_named_module, open_readonly
 from lu_machinery.orchestration import codex_transport_health, dispatch_admission
 from lu_machinery.orchestration.dead_worker_state import worker_liveness
@@ -121,6 +127,19 @@ _ACP_TRANSCRIPT_KINDS = frozenset({"request", "reply", "synthesis"})
 _ACP_TRANSCRIPT_MAX_MESSAGES = 32
 _ACP_TRANSCRIPT_MAX_BODY_BYTES = 256 * 1024
 _ACP_TRANSCRIPT_MAX_RESPONSE_BYTES = 512 * 1024
+_ACP_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+_ACP_TRANSCRIPT_STATE_OK = "ok"
+_ACP_TRANSCRIPT_STATE_BODY_EXPIRED = "body_expired"
+_ACP_TRANSCRIPT_STATE_MISSING_OR_CORRUPT = "missing_or_corrupt"
+_ACP_TRANSCRIPT_STATE_BACKEND_UNAVAILABLE = "backend_unavailable"
+_ACP_TRANSCRIPT_STATE_OVERSIZED_OR_PARTIAL = "oversized_or_partial"
+_ACP_TRANSCRIPT_STATE_LABELS: dict[str, str] = {
+    _ACP_TRANSCRIPT_STATE_OK: "ok",
+    _ACP_TRANSCRIPT_STATE_BODY_EXPIRED: "body expired",
+    _ACP_TRANSCRIPT_STATE_MISSING_OR_CORRUPT: "missing or corrupt",
+    _ACP_TRANSCRIPT_STATE_BACKEND_UNAVAILABLE: "backend unavailable",
+    _ACP_TRANSCRIPT_STATE_OVERSIZED_OR_PARTIAL: "oversized or partial",
+}
 _ACP_EVENT_TYPE_ALIASES = {
     "created": "CONVERSATION_CREATED",
     "conversation_created": "CONVERSATION_CREATED",
@@ -1013,7 +1032,10 @@ def _acp_db_path(ctx: MonitorContext) -> Path:
 
 def _open_acp_db_readonly(ctx: MonitorContext) -> SQLiteConnection | None:
     """Open fleet-comms storage read-only, returning ``None`` when unavailable."""
-    db_path = _acp_db_path(ctx)
+    try:
+        db_path = _acp_db_path(ctx)
+    except (PlaneRootAnchorError, OSError, RuntimeError, ValueError):
+        return None
     if not db_path.is_file():
         return None
     try:
@@ -1078,8 +1100,8 @@ def _acp_identifier(value: Any) -> str | None:
     return value
 
 
-def _acp_discussion_participants(value: Any) -> tuple[str, str]:
-    """Return a privacy-safe enabled pair, tolerating legacy stored shapes."""
+def _acp_discussion_participants(value: Any) -> tuple[str, ...]:
+    """Return a privacy-safe enabled participant tuple, tolerating legacy stored shapes."""
     try:
         decoded = json_depth.loads(value, max_depth=512) if isinstance(value, str) else value
     except (TypeError, ValueError, json.JSONDecodeError):
@@ -1087,10 +1109,10 @@ def _acp_discussion_participants(value: Any) -> tuple[str, str]:
     enabled: list[str] = []
     if isinstance(decoded, list):
         for item in decoded:
-            if item in _ACP_ENABLED_PARTICIPANTS and item not in enabled:
+            if isinstance(item, str) and item in _ACP_ENABLED_PARTICIPANTS and item not in enabled:
                 enabled.append(item)
-    if len(enabled) == 2:
-        return enabled[0], enabled[1]
+    if len(enabled) >= 2:
+        return tuple(enabled)
     return _ACP_LEGACY_PARTICIPANTS
 
 
@@ -1189,7 +1211,7 @@ def _sanitize_acp_event(
 def _acp_events(
     connection: SQLiteConnection,
     conversation_id: str,
-    participants: tuple[str, str],
+    participants: tuple[str, ...],
 ) -> list[dict[str, Any]]:
     try:
         rows = connection.execute(
@@ -1215,7 +1237,7 @@ def _acp_events(
 
 
 def _acp_rounds_completed(
-    events: list[dict[str, Any]], participants: tuple[str, str]
+    events: list[dict[str, Any]], participants: tuple[str, ...]
 ) -> int:
     lanes_by_round: dict[int, set[str]] = defaultdict(set)
     for event in events:
@@ -1241,7 +1263,7 @@ def _acp_rounds_completed(
 def _acp_summary(
     row: sqlite3.Row,
     events: list[dict[str, Any]],
-    participants: tuple[str, str],
+    participants: tuple[str, ...],
 ) -> dict[str, Any] | None:
     conversation_id = _acp_identifier(row["conversation_id"])
     created_at = _acp_timestamp(row["created_at"])
@@ -1527,108 +1549,444 @@ def _acp_transcript_access_refusal(request: Request) -> str | None:
     return None
 
 
-def _acp_transcript_body(value: Any, *, remaining_bytes: int) -> str | None:
-    """Return a bounded JSON-safe body or reject the whole malformed row."""
+class _AcpBackendUnavailable(Exception):
+    """Internal typed backend failure; reason is a closed static code."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
+def _acp_transcript_participants(value: Any) -> tuple[tuple[str, ...] | None, str | None]:
+    """Validate stored ACP participants strictly for transcript membership checks."""
     if not isinstance(value, str):
-        return None
+        return None, "malformed_participants"
+    try:
+        decoded = json_depth.loads(value, max_depth=512)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None, "malformed_participants"
+    if not isinstance(decoded, list):
+        return None, "malformed_participants"
+    if not decoded:
+        return _ACP_LEGACY_PARTICIPANTS, None
+    enabled: list[str] = []
+    for item in decoded:
+        if not isinstance(item, str) or item not in _ACP_ENABLED_PARTICIPANTS or item in enabled:
+            return None, "malformed_participants"
+        enabled.append(item)
+    if len(enabled) < 2:
+        return None, "malformed_participants"
+    return tuple(enabled), None
+
+
+def _open_acp_transcript_store(ctx: MonitorContext) -> tuple[Path, SQLiteConnection]:
+    """Open the Fleet Comms SQLite store read-only for transcript reads, or raise a typed backend failure."""
+    try:
+        authority = resolve_authority(StoreId.FLEET_COMMS)
+    except (ControlPlaneError, OSError, RuntimeError, ValueError):
+        raise _AcpBackendUnavailable("store_root_unavailable") from None
+    if authority is Authority.PG:
+        raise _AcpBackendUnavailable("authority_unsupported_component")
+    try:
+        plane_root = message_plane.default_plane_root(repo_root=ctx.roots.state_root).resolve()
+    except (PlaneRootAnchorError, OSError, RuntimeError, ValueError):
+        raise _AcpBackendUnavailable("store_root_unavailable") from None
+    db_path = plane_root / "comms.sqlite3"
+    if not db_path.is_file():
+        raise _AcpBackendUnavailable("store_unavailable")
+    try:
+        connection = cast(SQLiteConnection, open_readonly(db_path))
+    except (OSError, sqlite3.Error, ValueError):
+        raise _AcpBackendUnavailable("store_unavailable") from None
+    connection.row_factory = sqlite3.Row
+    try:
+        has_tables = all(
+            _acp_table_exists(connection, table)
+            for table in ("acp_conversations", "acp_conversation_events", "comms_messages")
+        )
+    except sqlite3.Error:
+        connection.close()
+        raise _AcpBackendUnavailable("store_unavailable") from None
+    if not has_tables:
+        connection.close()
+        raise _AcpBackendUnavailable("schema_unavailable")
+    return plane_root, connection
+
+
+def _open_acp_blob_no_follow(plane_root: Path, sha256: str) -> int:
+    """Open a CAS blob file under ``plane_root/blobs/sha256/<aa>/<sha256>`` without following symlinks."""
+    cloexec = getattr(os, "O_CLOEXEC", 0)
+    dir_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | cloexec
+    file_flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | cloexec
+    parent_fd = os.open(plane_root, os.O_RDONLY | os.O_DIRECTORY | cloexec)
+    try:
+        for part in ("blobs", "sha256", sha256[:2]):
+            next_fd = os.open(part, dir_flags, dir_fd=parent_fd)
+            os.close(parent_fd)
+            parent_fd = next_fd
+        return os.open(sha256, file_flags, dir_fd=parent_fd)
+    finally:
+        os.close(parent_fd)
+
+
+def _acp_artifact_is_expired(connection: SQLiteConnection, artifact_id: str) -> bool:
+    """Re-read ``artifacts.retention_class`` to detect retention expiry including the mark/unlink race."""
+    row = connection.execute(
+        "SELECT retention_class FROM artifacts WHERE artifact_id = ?",
+        (artifact_id,),
+    ).fetchone()
+    if row is None:
+        return False
+    retention_class = row["retention_class"]
+    return isinstance(retention_class, str) and retention_class.startswith(RETENTION_EXPIRED_PREFIX)
+
+
+def _acp_transcript_inline_body(
+    value: Any,
+    *,
+    content_sha256: Any,
+    remaining_bytes: int,
+) -> tuple[str, str | None, str | None, int]:
+    """Validate a legacy inline-only ACP body and return ``(state, reason, body, serialized_bytes)``."""
+    if not isinstance(value, str):
+        return _ACP_TRANSCRIPT_STATE_MISSING_OR_CORRUPT, "body_missing", None, 0
     try:
         encoded = value.encode("utf-8")
         serialized = json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     except UnicodeError:
-        return None
-    if len(encoded) > _ACP_TRANSCRIPT_MAX_BODY_BYTES or len(serialized) > remaining_bytes:
-        return None
-    return value
+        return _ACP_TRANSCRIPT_STATE_MISSING_OR_CORRUPT, "body_not_utf8", None, 0
+    if content_sha256 is not None:
+        if not isinstance(content_sha256, str) or not _ACP_SHA256_RE.fullmatch(content_sha256.lower()):
+            return _ACP_TRANSCRIPT_STATE_MISSING_OR_CORRUPT, "content_digest_mismatch", None, 0
+        if hashlib.sha256(encoded).hexdigest() != content_sha256.lower():
+            return _ACP_TRANSCRIPT_STATE_MISSING_OR_CORRUPT, "content_digest_mismatch", None, 0
+    if len(encoded) > _ACP_TRANSCRIPT_MAX_BODY_BYTES:
+        return _ACP_TRANSCRIPT_STATE_OVERSIZED_OR_PARTIAL, "body_too_large", None, 0
+    if len(serialized) > remaining_bytes:
+        return _ACP_TRANSCRIPT_STATE_OVERSIZED_OR_PARTIAL, "response_budget_exceeded", None, 0
+    return _ACP_TRANSCRIPT_STATE_OK, None, value, len(serialized)
+
+
+def _read_acp_artifact_body(
+    connection: SQLiteConnection,
+    plane_root: Path,
+    artifact_id: str,
+    *,
+    content_sha256: Any,
+    remaining_bytes: int,
+) -> tuple[str, str | None, str | None, int]:
+    """Read an integrity-checked CAS body, withholding expired blobs and handling the mark/unlink race."""
+    artifact_row = connection.execute(
+        "SELECT sha256, bytes, retention_class FROM artifacts WHERE artifact_id = ?",
+        (artifact_id,),
+    ).fetchone()
+    if artifact_row is None:
+        return _ACP_TRANSCRIPT_STATE_MISSING_OR_CORRUPT, "artifact_row_missing", None, 0
+
+    retention_class = artifact_row["retention_class"]
+    if not isinstance(retention_class, str):
+        return _ACP_TRANSCRIPT_STATE_MISSING_OR_CORRUPT, "artifact_metadata_corrupt", None, 0
+    if retention_class.startswith(RETENTION_EXPIRED_PREFIX):
+        return _ACP_TRANSCRIPT_STATE_BODY_EXPIRED, "body_expired", None, 0
+
+    raw_sha = artifact_row["sha256"]
+    if not isinstance(raw_sha, str) or not _ACP_SHA256_RE.fullmatch(raw_sha.lower()):
+        return _ACP_TRANSCRIPT_STATE_MISSING_OR_CORRUPT, "artifact_metadata_corrupt", None, 0
+    sha256 = raw_sha.lower()
+
+    if content_sha256 is not None and (not isinstance(content_sha256, str) or content_sha256.lower() != sha256):
+        return _ACP_TRANSCRIPT_STATE_MISSING_OR_CORRUPT, "content_digest_mismatch", None, 0
+
+    declared_bytes = artifact_row["bytes"]
+    if isinstance(declared_bytes, bool) or not isinstance(declared_bytes, int) or declared_bytes < 0:
+        return _ACP_TRANSCRIPT_STATE_MISSING_OR_CORRUPT, "artifact_metadata_corrupt", None, 0
+
+    try:
+        blob_fd = _open_acp_blob_no_follow(plane_root, sha256)
+    except FileNotFoundError:
+        if _acp_artifact_is_expired(connection, artifact_id):
+            return _ACP_TRANSCRIPT_STATE_BODY_EXPIRED, "body_expired", None, 0
+        return _ACP_TRANSCRIPT_STATE_MISSING_OR_CORRUPT, "blob_missing", None, 0
+    except OSError as exc:
+        if exc.errno in (errno.ELOOP, errno.ENOTDIR, errno.EISDIR):
+            return _ACP_TRANSCRIPT_STATE_MISSING_OR_CORRUPT, "blob_not_regular_file", None, 0
+        raise _AcpBackendUnavailable("blob_store_unavailable") from None
+
+    try:
+        try:
+            st = os.fstat(blob_fd)
+        except OSError:
+            raise _AcpBackendUnavailable("blob_store_unavailable") from None
+        if not stat.S_ISREG(st.st_mode):
+            return _ACP_TRANSCRIPT_STATE_MISSING_OR_CORRUPT, "blob_not_regular_file", None, 0
+        if st.st_size != declared_bytes:
+            return _ACP_TRANSCRIPT_STATE_MISSING_OR_CORRUPT, "blob_digest_mismatch", None, 0
+        if declared_bytes > _ACP_TRANSCRIPT_MAX_BODY_BYTES:
+            if _acp_artifact_is_expired(connection, artifact_id):
+                return _ACP_TRANSCRIPT_STATE_BODY_EXPIRED, "body_expired", None, 0
+            return _ACP_TRANSCRIPT_STATE_OVERSIZED_OR_PARTIAL, "body_too_large", None, 0
+        try:
+            with os.fdopen(blob_fd, "rb") as handle:
+                blob_fd = -1
+                raw = handle.read(_ACP_TRANSCRIPT_MAX_BODY_BYTES + 1)
+        except OSError:
+            raise _AcpBackendUnavailable("blob_store_unavailable") from None
+    finally:
+        if blob_fd >= 0:
+            os.close(blob_fd)
+
+    if _acp_artifact_is_expired(connection, artifact_id):
+        return _ACP_TRANSCRIPT_STATE_BODY_EXPIRED, "body_expired", None, 0
+    if len(raw) != declared_bytes or hashlib.sha256(raw).hexdigest() != sha256:
+        return _ACP_TRANSCRIPT_STATE_MISSING_OR_CORRUPT, "blob_digest_mismatch", None, 0
+    try:
+        text = raw.decode("utf-8")
+        serialized_len = len(json.dumps(text, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+    except UnicodeError:
+        return _ACP_TRANSCRIPT_STATE_MISSING_OR_CORRUPT, "body_not_utf8", None, 0
+    if serialized_len > remaining_bytes:
+        return _ACP_TRANSCRIPT_STATE_OVERSIZED_OR_PARTIAL, "response_budget_exceeded", None, 0
+    return _ACP_TRANSCRIPT_STATE_OK, None, text, serialized_len
 
 
 def _acp_transcript_entries(
     connection: SQLiteConnection,
+    plane_root: Path,
     conversation_id: str,
-    participants: tuple[str, str],
-) -> list[dict[str, Any]] | None:
-    """Read a bounded, allowlisted ACP transcript without exposing store IDs."""
-    try:
-        rows = connection.execute(
-            """
-            SELECT messages.kind, messages.sender, messages.recipient,
-                   messages.body_inline, messages.created_at, event_round.round
-            FROM comms_messages AS messages
-            JOIN (
-                SELECT message_id, MIN(sequence) AS message_sequence,
-                       CASE
-                           WHEN MIN(round) = MAX(round) AND MIN(round) >= 1
-                           THEN MIN(round)
-                       END AS round
-                FROM acp_conversation_events
-                WHERE conversation_id = ? AND message_id IS NOT NULL
-                GROUP BY message_id
-            ) AS event_round ON event_round.message_id = messages.message_id
-            WHERE messages.conversation_id = ?
-            ORDER BY event_round.message_sequence ASC
-            LIMIT ?
-            """,
-            (conversation_id, conversation_id, _ACP_TRANSCRIPT_MAX_MESSAGES + 1),
-        ).fetchall()
-    except sqlite3.Error:
-        return None
-    if len(rows) > _ACP_TRANSCRIPT_MAX_MESSAGES:
-        return None
+    participants: tuple[str, ...],
+) -> tuple[list[dict[str, Any]], bool]:
+    """Read a bounded, allowlisted ACP transcript with an explicit state for every turn."""
+    rows = connection.execute(
+        """
+        SELECT messages.message_id, messages.kind, messages.sender, messages.recipient,
+               messages.body_inline, messages.body_artifact_id, messages.content_sha256,
+               messages.created_at, event_round.round
+        FROM (
+            SELECT message_id, MIN(sequence) AS message_sequence,
+                   CASE
+                       WHEN MIN(round) = MAX(round) AND MIN(round) >= 1
+                       THEN MIN(round)
+                   END AS round
+            FROM acp_conversation_events
+            WHERE conversation_id = ? AND message_id IS NOT NULL
+            GROUP BY message_id
+        ) AS event_round
+        LEFT JOIN comms_messages AS messages
+               ON messages.message_id = event_round.message_id
+              AND messages.conversation_id = ?
+        ORDER BY event_round.message_sequence ASC
+        LIMIT ?
+        """,
+        (conversation_id, conversation_id, _ACP_TRANSCRIPT_MAX_MESSAGES + 1),
+    ).fetchall()
 
+    truncated = len(rows) > _ACP_TRANSCRIPT_MAX_MESSAGES
+    rows = rows[:_ACP_TRANSCRIPT_MAX_MESSAGES]
+
+    has_artifacts_table = _acp_table_exists(connection, "artifacts")
+    has_message_artifacts_table = _acp_table_exists(connection, "message_artifacts")
+    allowed_lanes = frozenset({"root", "codex", *participants})
     entries: list[dict[str, Any]] = []
     remaining_bytes = _ACP_TRANSCRIPT_MAX_RESPONSE_BYTES
-    for row in rows:
+
+    for index, row in enumerate(rows, start=1):
+        round_number = _acp_int(row["round"], minimum=1)
+        if row["message_id"] is None:
+            entry: dict[str, Any] = {
+                "ordinal": index,
+                "state": _ACP_TRANSCRIPT_STATE_MISSING_OR_CORRUPT,
+                "label": _ACP_TRANSCRIPT_STATE_LABELS[_ACP_TRANSCRIPT_STATE_MISSING_OR_CORRUPT],
+                "reason": "message_row_missing",
+                "kind": None,
+                "sender": None,
+                "recipient": None,
+                "created_at": None,
+                "body": None,
+            }
+            if round_number is not None:
+                entry["round"] = round_number
+            entries.append(entry)
+            continue
+
         kind = _acp_text(row["kind"], allowed=_ACP_TRANSCRIPT_KINDS)
-        allowed_lanes = frozenset({"root", "codex", *participants})
         sender = _acp_text(row["sender"], allowed=allowed_lanes)
         recipient = _acp_text(row["recipient"], allowed=allowed_lanes)
         created_at = _acp_timestamp(row["created_at"])
-        body = _acp_transcript_body(row["body_inline"], remaining_bytes=remaining_bytes)
-        if None in (kind, sender, recipient, created_at, body):
-            continue
-        entry: dict[str, Any] = {
-            "ordinal": len(entries) + 1,
+
+        if None in (kind, sender, recipient, created_at):
+            state = _ACP_TRANSCRIPT_STATE_MISSING_OR_CORRUPT
+            reason: str | None = "malformed_turn_metadata"
+            body: str | None = None
+        else:
+            raw_artifact_id = row["body_artifact_id"]
+            artifact_id: str | None = None
+            artifact_ref_error: str | None = None
+            if raw_artifact_id is not None:
+                if isinstance(raw_artifact_id, str) and raw_artifact_id.strip():
+                    artifact_id = raw_artifact_id
+                else:
+                    artifact_ref_error = "malformed_artifact_reference"
+            elif has_message_artifacts_table:
+                linked = connection.execute(
+                    """SELECT artifact_id FROM message_artifacts
+                       WHERE message_id = ? AND relation = 'body'
+                       ORDER BY artifact_id ASC LIMIT 2""",
+                    (row["message_id"],),
+                ).fetchall()
+                if len(linked) == 1:
+                    linked_id = linked[0]["artifact_id"]
+                    if isinstance(linked_id, str) and linked_id.strip():
+                        artifact_id = linked_id
+                    else:
+                        artifact_ref_error = "malformed_artifact_reference"
+                elif len(linked) > 1:
+                    artifact_ref_error = "malformed_artifact_reference"
+
+            if artifact_ref_error is not None:
+                state = _ACP_TRANSCRIPT_STATE_MISSING_OR_CORRUPT
+                reason = artifact_ref_error
+                body = None
+            elif artifact_id is not None:
+                if not has_artifacts_table:
+                    raise _AcpBackendUnavailable("schema_unavailable")
+                state, reason, body, consumed = _read_acp_artifact_body(
+                    connection,
+                    plane_root,
+                    artifact_id,
+                    content_sha256=row["content_sha256"],
+                    remaining_bytes=remaining_bytes,
+                )
+                remaining_bytes -= consumed
+            else:
+                # Legacy inline-only row: still withhold if content_sha256 matches an expired artifact.
+                expired_by_digest = False
+                raw_digest = row["content_sha256"]
+                if (
+                    has_artifacts_table
+                    and isinstance(raw_digest, str)
+                    and _ACP_SHA256_RE.fullmatch(raw_digest.lower())
+                ):
+                    digest_row = connection.execute(
+                        "SELECT retention_class FROM artifacts WHERE sha256 = ?",
+                        (raw_digest.lower(),),
+                    ).fetchone()
+                    if digest_row is not None:
+                        digest_class = digest_row["retention_class"]
+                        expired_by_digest = isinstance(digest_class, str) and digest_class.startswith(
+                            RETENTION_EXPIRED_PREFIX
+                        )
+                if expired_by_digest:
+                    state = _ACP_TRANSCRIPT_STATE_BODY_EXPIRED
+                    reason = "body_expired"
+                    body = None
+                else:
+                    state, reason, body, consumed = _acp_transcript_inline_body(
+                        row["body_inline"],
+                        content_sha256=row["content_sha256"],
+                        remaining_bytes=remaining_bytes,
+                    )
+                    remaining_bytes -= consumed
+
+        entry = {
+            "ordinal": index,
+            "state": state,
+            "label": _ACP_TRANSCRIPT_STATE_LABELS[state],
+            "reason": reason,
             "kind": kind,
             "sender": sender,
             "recipient": recipient,
             "created_at": created_at,
             "body": body,
         }
-        round_number = _acp_int(row["round"], minimum=1)
         if round_number is not None:
             entry["round"] = round_number
         entries.append(entry)
-        remaining_bytes -= len(
-            json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-        )
-    return entries
+    return entries, truncated
 
 
-def get_acp_conversation_transcript(conversation_id: str, *, ctx: MonitorContext) -> dict[str, Any] | None:
-    """Return a single bounded ACP transcript, or ``None`` without diagnostics."""
+def _acp_transcript_summary_state(
+    entries: list[dict[str, Any]],
+    *,
+    truncated: bool,
+) -> tuple[str, str | None]:
+    """Derive the transcript-level state and typed reason from its turns and truncation flag."""
+    for entry in entries:
+        if entry["state"] == _ACP_TRANSCRIPT_STATE_MISSING_OR_CORRUPT:
+            return _ACP_TRANSCRIPT_STATE_MISSING_OR_CORRUPT, cast(str, entry["reason"])
+    if truncated:
+        return _ACP_TRANSCRIPT_STATE_OVERSIZED_OR_PARTIAL, "message_limit_exceeded"
+    for entry in entries:
+        if entry["state"] == _ACP_TRANSCRIPT_STATE_OVERSIZED_OR_PARTIAL:
+            return _ACP_TRANSCRIPT_STATE_OVERSIZED_OR_PARTIAL, cast(str, entry["reason"])
+    for entry in entries:
+        if entry["state"] == _ACP_TRANSCRIPT_STATE_BODY_EXPIRED:
+            return _ACP_TRANSCRIPT_STATE_BODY_EXPIRED, "body_expired"
+    return _ACP_TRANSCRIPT_STATE_OK, None
+
+
+def _acp_backend_unavailable_response(conversation_id: str | None, reason: str) -> tuple[int, dict[str, Any]]:
+    return (
+        503,
+        {
+            "conversation_id": conversation_id,
+            "state": _ACP_TRANSCRIPT_STATE_BACKEND_UNAVAILABLE,
+            "label": _ACP_TRANSCRIPT_STATE_LABELS[_ACP_TRANSCRIPT_STATE_BACKEND_UNAVAILABLE],
+            "reason": reason,
+            "detail": "ACP transcript store unavailable",
+        },
+    )
+
+
+def get_acp_conversation_transcript(
+    conversation_id: str, *, ctx: MonitorContext
+) -> tuple[int, dict[str, Any]]:
+    """Return ``(http_status, payload)`` for one bounded ACP transcript with explicit typed states."""
     safe_id = _acp_identifier(conversation_id)
-    if safe_id is None:
-        return None
-    connection = _open_acp_db_readonly(ctx)
-    if connection is None:
-        return None
     try:
-        if not all(
-            _acp_table_exists(connection, table)
-            for table in ("acp_conversations", "acp_conversation_events", "comms_messages")
-        ):
-            return None
+        plane_root, connection = _open_acp_transcript_store(ctx)
+    except _AcpBackendUnavailable as exc:
+        return _acp_backend_unavailable_response(safe_id, exc.reason)
+    try:
+        if safe_id is None:
+            return 404, {"detail": "Conversation not found", "reason": "invalid_conversation_id"}
         conversation = connection.execute(
             "SELECT participants_json FROM acp_conversations WHERE conversation_id = ?", (safe_id,)
         ).fetchone()
         if conversation is None:
-            return None
-        participants = _acp_discussion_participants(conversation["participants_json"])
-        entries = _acp_transcript_entries(connection, safe_id, participants)
-        return {"conversation_id": safe_id, "messages": entries} if entries is not None else None
+            return 404, {"detail": "Conversation not found", "reason": "conversation_not_found"}
+        participants, participant_error = _acp_transcript_participants(conversation["participants_json"])
+        if participants is None:
+            return (
+                200,
+                {
+                    "conversation_id": safe_id,
+                    "state": _ACP_TRANSCRIPT_STATE_MISSING_OR_CORRUPT,
+                    "label": _ACP_TRANSCRIPT_STATE_LABELS[_ACP_TRANSCRIPT_STATE_MISSING_OR_CORRUPT],
+                    "reason": participant_error or "malformed_participants",
+                    "truncated": False,
+                    "messages": [],
+                },
+            )
+        entries, truncated = _acp_transcript_entries(connection, plane_root, safe_id, participants)
+    except _AcpBackendUnavailable as exc:
+        return _acp_backend_unavailable_response(safe_id, exc.reason)
     except sqlite3.Error:
-        return None
+        return _acp_backend_unavailable_response(safe_id, "store_query_failed")
     finally:
         connection.close()
+
+    transcript_state, transcript_reason = _acp_transcript_summary_state(entries, truncated=truncated)
+    return (
+        200,
+        {
+            "conversation_id": safe_id,
+            "state": transcript_state,
+            "label": _ACP_TRANSCRIPT_STATE_LABELS[transcript_state],
+            "reason": transcript_reason,
+            "truncated": truncated,
+            "messages": entries,
+        },
+    )
 
 
 @router.get("/agents")
@@ -1667,7 +2025,7 @@ async def runtime_acp_conversation_transcript(
     request: Request,
     ctx: MonitorContext = Depends(get_ctx),
 ):
-    """Read body-inline ACP content for the local UI only; never mutate storage."""
+    """Read ACP transcript content for the local UI with explicit states; never mutate storage."""
     no_store = {"Cache-Control": "no-store"}
     refusal = _acp_transcript_access_refusal(request)
     if refusal is not None:
@@ -1676,14 +2034,10 @@ async def runtime_acp_conversation_transcript(
             content={"detail": "Forbidden", "reason": refusal},
             headers=no_store,
         )
-    transcript = await asyncio.to_thread(get_acp_conversation_transcript, conversation_id, ctx=ctx)
-    if transcript is None:
-        return JSONResponse(
-            status_code=404,
-            content={"detail": "Conversation not found"},
-            headers=no_store,
-        )
-    return JSONResponse(content=transcript, headers=no_store)
+    status_code, payload = await asyncio.to_thread(
+        get_acp_conversation_transcript, conversation_id, ctx=ctx
+    )
+    return JSONResponse(status_code=status_code, content=payload, headers=no_store)
 
 
 
