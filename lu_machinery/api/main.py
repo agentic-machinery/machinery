@@ -37,7 +37,6 @@ from prometheus_client import CollectorRegistry, Counter, Histogram, generate_la
 from prometheus_client.core import Metric
 from prometheus_client.exposition import CONTENT_TYPE_PLAIN_0_0_4
 from starlette.exceptions import HTTPException as StarletteHTTPException
-from starlette.routing import compile_path, get_route_path
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 import lu_machinery.github_rest_cache as github_rest
@@ -2048,41 +2047,6 @@ class PrometheusMetricsMiddleware:
             self._errors.labels(**labels).inc()
 
 
-_ACP_TRANSCRIPT_PATH_REGEX = compile_path("/api/runtime/acp/conversations/{conversation_id}/transcript")[0]
-
-
-def _is_acp_transcript_path(scope: Scope) -> bool:
-    """Return True when ``scope`` targets or slash-redirects to the mounted ACP transcript route.
-
-    Uses Starlette's ``get_route_path`` and ``compile_path`` regex on the decoded
-    path (plus trailing-slash stripping for ``redirect_slashes``) so single-segment
-    matching, ``root_path``, and regex end-of-string semantics (including decoded
-    trailing newlines) stay aligned with FastAPI routing without collapsing distinct
-    contributed routes.
-    """
-    raw_path = scope.get("path")
-    if not isinstance(raw_path, str) or not raw_path:
-        return False
-    route_path = get_route_path(scope)
-    if not route_path:
-        return False
-    if _ACP_TRANSCRIPT_PATH_REGEX.match(route_path) is not None:
-        return True
-    if route_path.endswith("/") and route_path != "/":
-        return _ACP_TRANSCRIPT_PATH_REGEX.match(route_path.rstrip("/")) is not None
-    return False
-
-
-class _ScopedCORSMiddleware(CORSMiddleware):
-    """Apply the app CORS policy except on private local-only transcript routes."""
-
-    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
-        if scope.get("type") == "http" and _is_acp_transcript_path(scope):
-            await self.app(scope, receive, send)
-            return
-        await super().__call__(scope, receive, send)
-
-
 def create_app(
     context: MonitorContext,
     *,
@@ -2126,9 +2090,9 @@ def create_app(
     factory_app.state.metrics_snapshot = metrics.snapshot
     install_providers(product)
     factory_app.add_middleware(
-        _ScopedCORSMiddleware,
+        CORSMiddleware,
         allow_origins=["*"],
-        allow_credentials=True,
+        allow_credentials=False,
         allow_methods=["*"],
         allow_headers=["*"],
     )

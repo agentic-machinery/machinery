@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
-from fastapi import APIRouter
 from fastapi.testclient import TestClient
 from starlette.requests import Request
 
@@ -16,8 +16,7 @@ import lu_machinery.api.config as api_config
 import lu_machinery.api.fleet_router as fleet_router
 import lu_machinery.api.runtime_router as runtime_router
 from lu_machinery.agent_runtime.acpx_discuss import AcpxDiscussionController
-from lu_machinery.api.main import app, create_app
-from lu_machinery.api.product_contribution import ProductContribution, RouterMount
+from lu_machinery.api.main import app
 
 client = TestClient(app, raise_server_exceptions=False)
 _LISTENER_ORIGIN = f"http://{api_config.API_HOST}:{api_config.API_PORT}"
@@ -452,8 +451,8 @@ def _raw_transcript_request(
     return Request(scope)
 
 
-def test_acp_transcript_refuses_foreign_origin_and_omits_cors(tmp_path, monkeypatch):
-    """Defect class: cross-origin/cross-site browser reads or wildcard credentialed CORS expose ACP transcripts."""
+def test_acp_transcript_refuses_foreign_origin_and_omits_credentialed_cors(tmp_path, monkeypatch):
+    """Defect class: cross-origin/cross-site browser reads or credentialed wildcard CORS expose ACP transcripts."""
     root = tmp_path / "plane"
     _seed_transcript_db(root)
     monkeypatch.setenv("FLEET_COMMS_ROOT", str(root))
@@ -475,8 +474,8 @@ def test_acp_transcript_refuses_foreign_origin_and_omits_cors(tmp_path, monkeypa
         assert resp.status_code == 403, bad_origin
         assert resp.headers["cache-control"] == "no-store"
         assert resp.json() == {"detail": "Forbidden", "reason": "invalid_origin"}
-        assert "access-control-allow-origin" not in resp.headers
         assert "access-control-allow-credentials" not in resp.headers
+        assert resp.headers.get("access-control-allow-origin") != bad_origin or bad_origin == ""
         assert "guarded transcript body" not in resp.text
 
     dup_origin = _raw_transcript_request(
@@ -495,6 +494,7 @@ def test_acp_transcript_refuses_foreign_origin_and_omits_cors(tmp_path, monkeypa
         assert resp.json() == {"detail": "Forbidden", "reason": "cross_site_request"}
         assert "access-control-allow-origin" not in resp.headers
         assert "access-control-allow-credentials" not in resp.headers
+        assert "guarded transcript body" not in resp.text
 
     dup_fetch_site = _raw_transcript_request(
         [
@@ -505,68 +505,118 @@ def test_acp_transcript_refuses_foreign_origin_and_omits_cors(tmp_path, monkeypa
     )
     assert runtime_router._acp_transcript_access_refusal(dup_fetch_site) == "cross_site_request"
 
-    # Cover canonical path, trailing slash, decoded terminal newline (%0a), slash-redirected %0a/, and percent-encoding.
-    for preflight_path in (
-        url,
-        f"{url}/",
-        f"{url}%0a",
-        f"{url}%0a/",
-        "/api/runtime/acp/conversations/%63onv-guarded/%74ranscript",
-    ):
-        preflight = local.options(
-            preflight_path,
-            headers={
-                "Origin": "https://evil.example",
-                "Access-Control-Request-Method": "GET",
-            },
-        )
-        assert preflight.status_code != 200, preflight_path
-        assert "access-control-allow-origin" not in preflight.headers
-        assert "access-control-allow-credentials" not in preflight.headers
-
-    newline_get = local.get(f"{url}%0a", headers={"Origin": "https://evil.example"})
-    assert newline_get.status_code == 403
-    assert newline_get.json() == {"detail": "Forbidden", "reason": "invalid_origin"}
-    assert "access-control-allow-origin" not in newline_get.headers
-    assert "access-control-allow-credentials" not in newline_get.headers
-
-    # Other Monitor routes (body-free ACP routes, ID named "transcript", and extra-segment routes including dot-segments)
-    # keep existing CORS.
+    # Other Monitor routes keep non-credentialed CORS (no Access-Control-Allow-Credentials).
     for other_path in ("/api/runtime/acp/conversations", "/api/runtime/acp/conversations/transcript"):
         other = local.get(other_path, headers={"Origin": "https://viewer.example"})
-        assert other.headers.get("access-control-allow-origin") == "https://viewer.example"
-        assert other.headers.get("access-control-allow-credentials") == "true"
+        assert other.headers.get("access-control-allow-origin") == "*"
+        assert "access-control-allow-credentials" not in other.headers
 
-    extra_router = APIRouter()
 
-    @extra_router.get("/conversations/{group}/{item}/transcript")
-    def _contributed_extra_segment(group: str, item: str) -> dict[str, str]:
-        return {"group": group, "item": item}
+def _run_raw_asgi_get(path: str, *, origin: str) -> tuple[int, dict[str, str], str]:
+    """Send an unnormalized HTTP GET directly through the ASGI app."""
+    status_code = 0
+    headers_out: dict[str, str] = {}
+    body_chunks: list[bytes] = []
 
-    extra_app = create_app(
-        app.state.ctx,
-        product=ProductContribution(routers=(RouterMount(extra_router, "/api/runtime/acp"),)),
-    )
-    extra_client = TestClient(
-        extra_app, raise_server_exceptions=False, client=("127.0.0.1", 50000), base_url=_LISTENER_ORIGIN
-    )
-    for contributed_path, expected_item in (
-        ("/api/runtime/acp/conversations/team/item-1/transcript", "item-1"),
-        ("/api/runtime/acp/conversations/team/.%2ftranscript", "."),
-        ("/api/runtime/acp/conversations/team/..%2ftranscript", ".."),
+    async def _invoke() -> None:
+        nonlocal status_code
+        scope = {
+            "type": "http",
+            "asgi": {"version": "3.0"},
+            "http_version": "1.1",
+            "method": "GET",
+            "scheme": "http",
+            "path": path,
+            "raw_path": path.encode("latin-1"),
+            "query_string": b"",
+            "root_path": "",
+            "headers": [
+                (b"host", f"{api_config.API_HOST}:{api_config.API_PORT}".encode()),
+                (b"origin", origin.encode("latin-1")),
+            ],
+            "client": ("127.0.0.1", 50000),
+            "server": (api_config.API_HOST, api_config.API_PORT),
+        }
+
+        async def _receive() -> dict[str, object]:
+            return {"type": "http.request", "body": b"", "more_body": False}
+
+        async def _send(message: dict[str, object]) -> None:
+            nonlocal status_code
+            if message["type"] == "http.response.start":
+                status_code = int(message["status"])  # type: ignore[arg-type]
+                for k, v in message.get("headers", []):  # type: ignore[union-attr]
+                    headers_out[k.decode("latin-1").lower()] = v.decode("latin-1")
+            elif message["type"] == "http.response.body":
+                chunk = message.get("body", b"")
+                if isinstance(chunk, bytes):
+                    body_chunks.append(chunk)
+
+        await app(scope, _receive, _send)
+
+    asyncio.run(_invoke())
+    return status_code, headers_out, b"".join(body_chunks).decode("utf-8", errors="replace")
+
+
+def test_acp_transcript_refuses_foreign_origin_across_path_spellings(tmp_path, monkeypatch):
+    """Defect class: alternate path spellings (trailing slash, dot-segment, encoding, newline) bypass origin refusal."""
+    root = tmp_path / "plane"
+    _seed_transcript_db(root)
+    monkeypatch.setenv("FLEET_COMMS_ROOT", str(root))
+
+    local = TestClient(app, raise_server_exceptions=False, client=("127.0.0.1", 50000), base_url=_LISTENER_ORIGIN)
+    url = "/api/runtime/acp/conversations/conv-guarded/transcript"
+    foreign_headers = {"Origin": "https://evil.example"}
+
+    # Trailing-slash spellings never serve a transcript (404 on Monitor's router; 307->403 where redirect_slashes fires).
+    for trailing_path in (f"{url}/", "/api/runtime/acp/conversations/conv-guarded/x/../transcript/"):
+        for follow in (False, True):
+            resp = local.get(trailing_path, headers=foreign_headers, follow_redirects=follow)
+            assert resp.status_code == 404, (trailing_path, follow)
+            assert "guarded transcript body" not in resp.text
+            assert "access-control-allow-credentials" not in resp.headers
+
+    # Slash-redirected %0a/ exercises Starlette redirect_slashes: both the 307 and followed 403 return no transcript.
+    redirect_resp = local.get(f"{url}%0a/", headers=foreign_headers, follow_redirects=False)
+    assert redirect_resp.status_code == 307
+    assert "guarded transcript body" not in redirect_resp.text
+    assert "access-control-allow-credentials" not in redirect_resp.headers
+
+    # Dot-segments, percent-encoding, and decoded terminal newline reaching the route all refuse with no transcript.
+    for path_spelling in (
+        "/api/runtime/acp/conversations/conv-guarded/./transcript",
+        "/api/runtime/acp/conversations/other/../conv-guarded/transcript",
+        "/api/runtime/acp/conversations/%63onv-guarded/%74ranscript",
+        f"{url}%0a",
+        f"{url}%0a/",
     ):
-        extra_resp = extra_client.get(contributed_path, headers={"Origin": "https://viewer.example"})
-        assert extra_resp.status_code == 200, contributed_path
-        assert extra_resp.json() == {"group": "team", "item": expected_item}
-        assert extra_resp.headers.get("access-control-allow-origin") == "https://viewer.example"
-        assert extra_resp.headers.get("access-control-allow-credentials") == "true"
-        extra_preflight = extra_client.options(
-            contributed_path,
-            headers={"Origin": "https://viewer.example", "Access-Control-Request-Method": "GET"},
+        resp = local.get(path_spelling, headers=foreign_headers, follow_redirects=True)
+        assert resp.status_code == 403, path_spelling
+        assert resp.headers["cache-control"] == "no-store"
+        assert resp.json() == {"detail": "Forbidden", "reason": "invalid_origin"}
+        assert "guarded transcript body" not in resp.text
+        assert "access-control-allow-credentials" not in resp.headers
+
+    # Unnormalized dot-segments, trailing slash, and decoded newline sent directly at the ASGI layer yield no transcript.
+    for raw_path, expected_status in (
+        (f"{url}/", 404),
+        ("/api/runtime/acp/conversations/conv-guarded/./transcript", 404),
+        ("/api/runtime/acp/conversations/other/../conv-guarded/transcript", 403),
+        (f"{url}\n", 403),
+    ):
+        status_code, resp_headers, body_text = _run_raw_asgi_get(raw_path, origin="https://evil.example")
+        assert status_code == expected_status, (raw_path, status_code)
+        assert "guarded transcript body" not in body_text
+        assert "access-control-allow-credentials" not in resp_headers
+
+    # Preflight OPTIONS never emits credentialed CORS or transcript content.
+    for preflight_path in (url, f"{url}/"):
+        preflight = local.options(
+            preflight_path,
+            headers={"Origin": "https://evil.example", "Access-Control-Request-Method": "GET"},
         )
-        assert extra_preflight.status_code == 200, contributed_path
-        assert extra_preflight.headers.get("access-control-allow-origin") == "https://viewer.example"
-        assert extra_preflight.headers.get("access-control-allow-credentials") == "true"
+        assert "guarded transcript body" not in preflight.text
+        assert "access-control-allow-credentials" not in preflight.headers
 
 
 def test_acp_transcript_refuses_mismatched_missing_or_duplicate_host(tmp_path, monkeypatch):
@@ -668,8 +718,9 @@ def test_acp_transcript_allows_same_origin_and_no_origin_local_reads(tmp_path, m
         resp = local.get(url, headers=headers)
         assert resp.status_code == 200, headers
         assert resp.headers["cache-control"] == "no-store"
-        assert "access-control-allow-origin" not in resp.headers
         assert "access-control-allow-credentials" not in resp.headers
+        if "Origin" not in headers:
+            assert "access-control-allow-origin" not in resp.headers
         assert resp.json()["messages"][0]["body"] == "guarded transcript body"
 
     # Alternate bound loopback port (e.g. launchd_supervisor start --port 9876) authorizes its own exact origin.
