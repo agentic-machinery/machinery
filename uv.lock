@@ -994,7 +994,7 @@ wheels = [
 
 [[package]]
 name = "lu-machinery"
-version = "0.1.77"
+version = "0.1.78"
 source = { editable = "." }
 dependencies = [
     { name = "fastapi" },
