@@ -1614,6 +1614,35 @@ def test_acp_transcript_state_oversized_or_partial_preserves_turns_without_404(t
     assert data_reclaim["messages"][1]["body"] is None
     assert data_reclaim["messages"][2]["body"] == turn_200k_3
 
+    # 2d. Smaller-representation reservation: [262144, 261243, 1, 262144] admits turns 1-3 at exact 512 KiB (PR1493-F5).
+    root_exact = tmp_path / "plane-exact-pack"
+    exact_t1 = "1" * 262_144
+    exact_t2 = "2" * 261_243
+    exact_t3 = "3"
+    exact_t4 = "4" * 262_144
+    conv_exact, _ = _create_controller_conversation(
+        root_exact,
+        turns=[
+            ("reply", "codex", "root", exact_t1, 1),
+            ("reply", "codex", "root", exact_t2, 1),
+            ("reply", "codex", "root", exact_t3, 1),
+            ("reply", "codex", "root", exact_t4, 2),
+        ],
+    )
+    monkeypatch.setenv("FLEET_COMMS_ROOT", str(root_exact))
+    resp_exact = local.get(f"/api/runtime/acp/conversations/{conv_exact}/transcript")
+    assert resp_exact.status_code == 200
+    assert len(resp_exact.content) == runtime_router._ACP_TRANSCRIPT_MAX_RESPONSE_BYTES
+    data_exact = resp_exact.json()
+    assert data_exact["state"] == "oversized_or_partial"
+    assert data_exact["reason"] == "response_budget_exceeded"
+    assert [m["state"] for m in data_exact["messages"]] == ["ok", "ok", "ok", "oversized_or_partial"]
+    assert data_exact["messages"][0]["body"] == exact_t1
+    assert data_exact["messages"][1]["body"] == exact_t2
+    assert data_exact["messages"][2]["body"] == exact_t3
+    assert data_exact["messages"][3]["body"] is None
+    assert data_exact["messages"][3]["reason"] == "response_budget_exceeded"
+
     # 3. Message count limit (>32 turns) returns HTTP 200 (not 404) with first 32 turns and truncated=True.
     root_many = tmp_path / "plane-many"
     many_turns = [
