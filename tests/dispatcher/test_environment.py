@@ -14,7 +14,7 @@ from pathlib import Path
 import pytest
 
 from lu_machinery.common.git_credentials import SELECTOR_ENV
-from lu_machinery.dispatcher import agy_sandbox, environment, git, site_deps, store, worker, write_boundary
+from lu_machinery.dispatcher import agy_sandbox, environment, git, scope, site_deps, store, worker, write_boundary
 from lu_machinery.dispatcher.types import Invocation, ParsedResult, TaskSpec
 from tests.dispatcher.conftest import await_file as await_file
 from tests.dispatcher.conftest import prior_worktree as prior_worktree
@@ -384,6 +384,12 @@ def test_owning_a_lexicon_path_also_owns_the_fingerprint_its_gate_regenerates(sa
     assert (Path(record["cwd"]) / fingerprint).exists() is gains
     (sandbox.tasks / f"{task[0]}.release").touch()
     assert sandbox.settle(task, expected=1)["worktree_disposition"] == "removed"
+
+
+def test_owning_a_site_component_also_owns_the_lesson_schema_its_gate_regenerates():
+    """A component owner is not blocked by the unowned schema the lesson-schema-drift hook rewrites (#12169)."""
+    owned = ["site/src/components/LexiconPractice.tsx"]
+    assert scope.with_generated_outputs(owned) == ([*owned, "docs/lesson-schema.yaml"], ["docs/lesson-schema.yaml"])
 
 
 @pytest.mark.usefixtures('configured_roots')

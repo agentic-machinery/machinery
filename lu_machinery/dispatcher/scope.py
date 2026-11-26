@@ -9,8 +9,12 @@ from pathlib import PurePosixPath
 
 # One entry per gate, matching its hook in .pre-commit-config.yaml: the input tree it watches and the
 # file it regenerates. Add an entry only once that producer, input and output are established.
+# The hooks live in the product repository, but every entry applies to whichever repository a task
+# targets, so a task elsewhere may own an output its repository has no gate for. That over-grant is
+# accepted until each repository declares its own generated outputs (follow-up, PR #1494 review).
 GENERATED_OUTPUTS = {
     "scripts/lexicon": "site/src/data/lexicon-manifest.fingerprint.json",  # atlas-lexicon-fingerprint-drift
+    "site/src/components": "docs/lesson-schema.yaml",  # lesson-schema-drift
 }
 
 
