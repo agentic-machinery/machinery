@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -932,79 +933,20 @@ pytestmark = [pytest.mark.usefixtures('configured_roots'), pytest.mark.usefixtur
 
 # --------------------------------------------------------------------------- DETACH step 4b: CTO workspace
 
-# The workspace lu-start-cto template: the checkout template above with a LAUNCHER policy
-# line, LC_WORKSPACE_ROOT set for the launch, and the installed package wrapper.
-_WORKSPACE_TEMPLATE = r"""#!/usr/bin/env bash
-set -euo pipefail
-REPO=@REPO@
-CFG=@CFG@
-LAUNCHER=@LAUNCHER@
-ROLE=$CFG/CTO-ROLE-PROMPT.txt
-ACCT_FILE=$CFG/claude-account
-MODEL=@MODEL@
-EFFORT=@EFFORT@
-KICK=@KICK@
+# The released workspace lu-start-cto template: the host start's safeguards (selector profile,
+# start.lock, bounded auth check) for a launch from the CTO workspace through the package wrapper.
+_WORKSPACE_TEMPLATE = machinery_path("lib/lu-start-cto.workspace.sh").read_text()
 
-HERE=0
-ACCT=""
-for arg in "$@"; do
-  case "$arg" in
-    --here) HERE=1 ;;
-    a|b) ACCT=$arg ;;
-    -h|--help) sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
-    *) echo "unknown argument: $arg (usage: lu-start-cto [a|b] [--here])" >&2; exit 2 ;;
-  esac
-done
-[ -r "$ROLE" ] || { echo "missing $ROLE" >&2; exit 4; }
-pgrep -f "operator-appointed CTO AND cross-epic" >/dev/null && { echo "refused: a CTO process is still running" >&2; exit 3; }
-if [ -z "$ACCT" ]; then
-  ACCT=$(tr -d '[:space:]' < "$ACCT_FILE" 2>/dev/null || true)
-  [ "$ACCT" = b ] || ACCT=a
-fi
-if [ "$ACCT" = b ]; then DIR=@ACCOUNT@; else DIR=@ACCOUNT@; fi
-[ -s "$DIR/.credentials.json" ] || { echo "refused: account $ACCT ($DIR) is not logged in" >&2; exit 4; }
-CLAUDE_CONFIG_DIR=$DIR claude auth status 2>/dev/null | grep -q '"loggedIn": true' \
-  || { echo "refused: account $ACCT is not logged in; run: CLAUDE_CONFIG_DIR=$DIR claude, then /login" >&2; exit 4; }
-printf '%s\n' "$ACCT" > "$ACCT_FILE"
-export CLAUDE_CONFIG_DIR=$DIR
-echo "CTO seat: Claude account $ACCT ($DIR)"
 
-LAUNCH=("$LAUNCHER" --epic epics --model "$MODEL" --effort "$EFFORT" "$KICK" -- --dangerously-skip-permissions --append-system-prompt "$(cat "$ROLE")")
-cd -- "$REPO"
-if [ "$HERE" = 1 ]; then
-  LC_WORKSPACE_ROOT="$REPO" exec "${LAUNCH[@]}"
-fi
-tmux has-session -t =cto 2>/dev/null && { echo "refused: tmux session cto exists (use --here inside it)" >&2; exit 3; }
-# Enter REPO in the pane so a tmux config-client cwd cannot override it.
-# Propagate caller root/interpreter settings (clearing stale server values when
-# unset) and override a reused server's workspace selector with an empty value.
-# Escape trailing semicolons in tmux arguments.
-ROOT_ENV_VARS=(
-  LU_PRIMARY_REPO_ROOT LEARN_UKRAINIAN_PRIMARY_REPO_ROOT
-  LU_STATE_ROOT LEARN_UKRAINIAN_STATE_ROOT
-  LU_PRODUCT_ROOT
-  LU_PYTHON LEARN_UKRAINIAN_PYTHON
-  LU_REPOS_ROOT LU_PROFILE_PATH
-  LU_GITHUB_SLUG LEARN_UKRAINIAN_GITHUB_SLUG
-)
-TMUX_ARGS=(
-  new-session -d -s cto -e "CLAUDE_CONFIG_DIR=$DIR" -e "LC_WORKSPACE_ROOT="
-)
-for var in "${ROOT_ENV_VARS[@]}"; do
-  TMUX_ARGS+=(-e "$var=${!var:-}")
-done
-TMUX_ARGS+=(
-  bash -c 'unset LC_WORKSPACE_ROOT; for v in LU_PRIMARY_REPO_ROOT LEARN_UKRAINIAN_PRIMARY_REPO_ROOT LU_STATE_ROOT LEARN_UKRAINIAN_STATE_ROOT LU_PRODUCT_ROOT LU_PYTHON LEARN_UKRAINIAN_PYTHON LU_REPOS_ROOT LU_PROFILE_PATH LU_GITHUB_SLUG LEARN_UKRAINIAN_GITHUB_SLUG; do [ -n "${!v:-}" ] || unset "$v"; done; cd -- "$1" || exit; LC_WORKSPACE_ROOT="$1" "${@:2}"; exec bash'
-  bash "$REPO" "${LAUNCH[@]}"
-)
-for index in "${!TMUX_ARGS[@]}"; do
-  if [[ "${TMUX_ARGS[index]}" == *';' ]]; then
-    TMUX_ARGS[index]="${TMUX_ARGS[index]%;}\\;"
-  fi
-done
-env -u LC_WORKSPACE_ROOT tmux "${TMUX_ARGS[@]}"
-echo "created tmux session cto; attach with: tmux attach -t cto"
-"""
+def _render_workspace_template(path: Path, **values: str) -> Path:
+    """Render the released template the way a host does: each @NAME@ becomes one quoted literal."""
+    source = _WORKSPACE_TEMPLATE
+    for key, value in values.items():
+        source = source.replace("@" + key + "@", shlex.quote(value))
+    assert re.search(r"@[A-Z_]+@", source) is None, "every placeholder is rendered"
+    path.write_text(source)
+    path.chmod(0o755)
+    return path
 
 
 def _workspace_roots(tmp_path: Path) -> tuple[Path, Path, Path]:
@@ -1188,16 +1130,12 @@ def test_cto_successor_signature_binds_the_launch_mode(tmp_path: Path, monkeypat
 
     written = iter(range(1, 100))
 
-    def template(launcher: Path | str, repo: Path = workspace) -> Path:
+    def template(launcher: Path | str, repo: Path = workspace, selector: str = str(tmp_path / "selector profile.sh")) -> Path:
         """A wrapper file of its own per call, so each row is checked with its own contents."""
-        source = _WORKSPACE_TEMPLATE
-        for key, value in {"REPO": str(repo), "CFG": str(config), "LAUNCHER": str(launcher),
-                           "MODEL": "claude-opus-5-5", "EFFORT": "high", "KICK": "kick",
-                           "ACCOUNT": str(tmp_path / "account")}.items():
-            source = source.replace("@" + key + "@", shlex.quote(value))
-        path = tmp_path / f"lu-start-cto-{next(written)}"
-        path.write_text(source)
-        return path
+        return _render_workspace_template(
+            tmp_path / f"lu-start-cto-{next(written)}", REPO=str(repo), CFG=str(config), LAUNCHER=str(launcher),
+            SELECTOR_PROFILE=selector, MODEL="claude-opus-5-5", EFFORT="high",
+            KICK="kick", ACCOUNT_A=str(tmp_path / "account"), ACCOUNT_B=str(tmp_path / "account-b"))
 
     monkeypatch.chdir(workspace)
     monkeypatch.setenv("LC_WORKSPACE_ROOT", str(workspace))
@@ -1226,6 +1164,8 @@ def test_cto_successor_signature_binds_the_launch_mode(tmp_path: Path, monkeypat
         (template(f"{stale}/{package_wrapper.name}"), workspace, package_wrapper),  # a path exec cannot reach
         (template(f"{live}/{package_wrapper.name}"), workspace, package_wrapper),  # not the canonical path
         (template(package_wrapper), workspace, live / package_wrapper.name),
+        (template(package_wrapper, selector="selector-profile.sh"), workspace, package_wrapper),  # wrapper refuses it
+        (template(package_wrapper, selector=f"{tmp_path}:~/profile.sh"), workspace, package_wrapper),  # Bash expands ~
     ):
         with pytest.raises(SupervisorError, match="cto-wrapper-unsupported"):
             cto_wrapper_signature(wrapper, root, entry, args)
@@ -1245,3 +1185,165 @@ def test_cto_successor_signature_binds_the_launch_mode(tmp_path: Path, monkeypat
     monkeypatch.delenv("LC_WORKSPACE_ROOT")
     with pytest.raises(SupervisorError, match="cto-wrapper-unsupported"):
         cto_wrapper_signature(template(package_wrapper), workspace, package_wrapper, args)
+
+
+def _workspace_start_host(tmp_path: Path, launcher_body: str) -> tuple[Path, dict[str, str], Path]:
+    """A rendered workspace start with fake process, auth and launcher programs and a selector profile.
+
+    The launcher stand-in records its working directory, argv and environment; the real flock and
+    timeout run. The profile sets the configured selector, as the deployed one does.
+    """
+    workspace, config, bindir = tmp_path / "cto-workspace", tmp_path / "cto config", tmp_path / "bin"
+    for directory in (workspace, config, bindir):
+        directory.mkdir()
+    (config / "CTO-ROLE-PROMPT.txt").write_text("operator role text\n")
+    account = tmp_path / "account a"
+    account.mkdir()
+    (account / ".credentials.json").write_text("fixture-only")
+    profile = tmp_path / "lu-fleet-repo-selector.sh"
+    profile.write_text("LU_FLEET_REPO_SELECTOR_FILE=/configured/host/selector.yaml\n")
+    calls = tmp_path / "calls"
+    for name, body in {
+        "pgrep": "exit 1",
+        "claude": f'printf "claude %s\\n" "$*" >> {shlex.quote(str(calls))}\nprintf \'%s\\n\' \'{{"loggedIn": true}}\'',
+        "cto-launcher": launcher_body,
+    }.items():
+        (bindir / name).write_text("#!/bin/bash\n" + body + "\n")
+        (bindir / name).chmod(0o755)
+    wrapper = _render_workspace_template(
+        tmp_path / "lu-start-cto", REPO=str(workspace), CFG=str(config), LAUNCHER=str(bindir / "cto-launcher"),
+        SELECTOR_PROFILE=str(profile), MODEL="claude-opus-5-5", EFFORT="high", KICK="kick;",
+        ACCOUNT_A=str(account), ACCOUNT_B=str(tmp_path / "absent-account-b"))
+    env = launcher_environment(tmp_path=tmp_path)
+    env["PATH"] = f"{bindir}{os.pathsep}{env['PATH']}"
+    return wrapper, env, config
+
+
+def _recorded(path: Path) -> tuple[list[str], dict[str, str]]:
+    argv = path.with_suffix(".argv").read_bytes().split(b"\0")[:-1]
+    pairs = (item.partition(b"=") for item in path.with_suffix(".env").read_bytes().split(b"\0")[:-1])
+    return [arg.decode() for arg in argv], {key.decode(): value.decode() for key, _, value in pairs}
+
+
+def test_cto_workspace_start_gives_the_pane_the_callers_selector_and_roots(tmp_path: Path) -> None:
+    """Defect class: a pane started from a reused tmux server running with that server's stale
+    selector, state root, product root or interpreter instead of the configured ones. The new
+    session takes the deployed profile's selector and the caller's roots, an unset caller root is
+    cleared rather than inherited, the role text stays out of the tmux client argv, and the pane
+    runs the start again so its checks and launcher run under the start.lock it holds."""
+    record, lock = tmp_path / "launch", tmp_path / "cto config/start.lock"
+    wrapper, env, _config = _workspace_start_host(
+        tmp_path, f'{{ printf "%s\\0" "$PWD" "$@"; }} > {shlex.quote(str(record))}.argv\n'
+                  f'{{ flock -n {shlex.quote(str(lock))} true && echo free || echo held; cat "/proc/$PPID/comm"; }}'
+                  f' > {shlex.quote(str(record))}.lock\n'
+                  f'env -0 > {shlex.quote(str(record))}.env')
+    tmux_argv = tmp_path / "tmux-argv"
+    stale = ["LU_FLEET_REPO_SELECTOR_FILE=/stale/tmux/selector.yaml", "LU_STATE_ROOT=/stale/state",
+             "LU_PRODUCT_ROOT=/stale/product", "LEARN_UKRAINIAN_PYTHON=/stale/python",
+             "LC_WORKSPACE_ROOT=/stale/workspace", f"PATH={env['PATH']}", f"HOME={env['HOME']}"]
+    # A reused server: the pane starts from the server's environment, overlaid by each -e, and
+    # runs after new-session returns. Its inherited output pipes make the run below wait for it.
+    (tmp_path / "bin/tmux").write_text(
+        "#!/bin/bash\n"
+        f'printf "%s\\0" "$@" >> {shlex.quote(str(tmux_argv))}\n'
+        '[ "$1" = new-session ] || exit 1\n'
+        f'printf "%s\\0" "$@" > {shlex.quote(str(tmux_argv))}.session\nshift\n'
+        f"server=({' '.join(shlex.quote(item) for item in stale)})\n"
+        'while [ $# -gt 0 ]; do case "$1" in -d) shift ;; -s) shift 2 ;; -e) server+=("$2"); shift 2 ;; *) break ;; esac; done\n'
+        r'pane=(); for a in "$@"; do [[ $a == *"\;" ]] && a="${a%\\;};"; pane+=("$a"); done' "\n"
+        '(cd / && exec env -i "${server[@]}" "${pane[@]}" </dev/null) &\n')
+    (tmp_path / "bin/tmux").chmod(0o755)
+    caller = {**env, "LU_FLEET_REPO_SELECTOR_FILE": "/stale/caller/selector.yaml", "LU_STATE_ROOT": "/configured/state",
+              "LEARN_UKRAINIAN_PYTHON": "/configured/python"}
+    caller.pop("LU_PRODUCT_ROOT", None)
+
+    result = subprocess.run([str(wrapper)], cwd=tmp_path, env=caller, capture_output=True, text=True,
+                            check=False, timeout=60)
+    assert result.returncode == 0, result.stdout + result.stderr
+    argv, pane = _recorded(record)
+    assert argv[0] == str(tmp_path / "cto-workspace")
+    assert argv[1:] == ["--epic", "epics", "--model", "claude-opus-5-5", "--effort", "high", "kick;", "--",
+                        "--dangerously-skip-permissions", "--append-system-prompt", "operator role text"]
+    assert pane["LU_FLEET_REPO_SELECTOR_FILE"] == "/configured/host/selector.yaml"
+    assert pane["LU_STATE_ROOT"] == "/configured/state" and pane["LEARN_UKRAINIAN_PYTHON"] == "/configured/python"
+    assert pane["LC_WORKSPACE_ROOT"] == str(tmp_path / "cto-workspace")
+    assert "LU_PRODUCT_ROOT" not in pane and "LU_PYTHON" not in pane
+    assert pane["CLAUDE_CONFIG_DIR"] == str(tmp_path / "account a")
+    assert b"operator role text" not in tmux_argv.read_bytes()
+    # The pane runs this start again (--pane): its checks, account save and launcher all run
+    # under the start.lock its own flock holds, not on the detached client's earlier checks.
+    session = tmux_argv.with_suffix(".session").read_bytes().split(b"\0")[:-1]
+    assert [arg.decode() for arg in session[-3:]] == [str(wrapper), "a", "--pane"]
+    assert record.with_suffix(".lock").read_text().split() == ["held", "flock"]
+    assert (tmp_path / "calls").read_text().count("claude auth status") == 2
+    assert (tmp_path / "cto config/claude-account").read_text() == "a\n"
+
+    # In place, the profile's selector also replaces a stale one the caller carries.
+    (tmp_path / "bin/tmux").write_text("#!/bin/bash\nexit 1\n")
+    result = subprocess.run([str(wrapper), "--here"], cwd=tmp_path, env=caller, capture_output=True, text=True,
+                            check=False, timeout=60)
+    assert result.returncode == 0, result.stdout + result.stderr
+    _argv, here = _recorded(record)
+    assert here["LU_FLEET_REPO_SELECTOR_FILE"] == "/configured/host/selector.yaml"
+    assert here["LC_WORKSPACE_ROOT"] == str(tmp_path / "cto-workspace")
+
+
+def test_cto_workspace_start_holds_start_lock_and_admits_its_supervised_successor(tmp_path: Path) -> None:
+    """Defect class: a workspace start without start.lock, so a concurrent start passes the
+    process check and authenticates beside a running one; or a lock and process check that
+    refuse the start's own supervised successor after its predecessor stopped. A held lock refuses
+    (exit 3) before any auth call or launch. In the real chain (flock, then the scope waiter
+    whose argv carries the role text, then the scoped launcher that execs the successor) the
+    successor starts under the still-held lock, while its descendants' in-place starts refuse."""
+    record, mark, lock = tmp_path / "launch", tmp_path / "first-run-done", tmp_path / "cto config/start.lock"
+    wrapper = tmp_path / "lu-start-cto"
+    q = shlex.quote
+    # First call: the scope waiter, as start-claude-cto.sh runs it outside the scope. Its child is
+    # the scoped launcher (LU_DRIVER_SCOPE_PID is itself), which execs the successor once woken.
+    # Second call: the successor's launcher records what it sees, and what an in-place start by a
+    # descendant that inherits its environment (another process) gets.
+    launcher = (
+        f"if [ ! -e {q(str(mark))} ]; then : > {q(str(mark))}\n"
+        f"  bash -c 'export LU_DRIVER_SCOPE_PID=$$ SESSION_SUPERVISOR_WAKE_DELIVERY=wake-1; exec \"$0\" --here' {q(str(wrapper))} &\n"
+        '  wait "$!"; exit\nfi\n'
+        f'{{ printf "%s\\0" "$PWD" "$@"; }} > {q(str(record))}.argv\n'
+        f"{{ flock -n {q(str(lock))} true && echo free || echo held\n"
+        f"  {q(str(wrapper))} --here >/dev/null 2>&1; echo \"descendant=$?\"\n"
+        f"}} > {q(str(record))}.lock\nenv -0 > {q(str(record))}.env"
+    )
+    wrapper, env, config = _workspace_start_host(tmp_path, launcher)
+    assert lock.parent == config
+    role = "You are the operator-appointed CTO AND cross-epic lead.\n"
+    (config / "CTO-ROLE-PROMPT.txt").write_text(role)
+    # Real pgrep, limited to this test's processes, so a host CTO never answers for the fixture.
+    tree = f"LU_TEST_CTO_TREE={tmp_path.name}"
+    real_pgrep = shutil.which("pgrep", path=os.pathsep.join(
+        part for part in env["PATH"].split(os.pathsep) if part != str(tmp_path / "bin")))
+    assert real_pgrep
+    (tmp_path / "bin/pgrep").write_text(
+        "#!/bin/bash\nfound=1\n"
+        f'for pid in $({q(real_pgrep)} "$@"); do\n'
+        f'  if tr "\\0" "\\n" < "/proc/$pid/environ" 2>/dev/null | grep -qx {q(tree)}; then echo "$pid"; found=0; fi\n'
+        'done\nexit "$found"\n')
+    (tmp_path / "bin/tmux").write_text("#!/bin/bash\nexit 1\n")
+    (tmp_path / "bin/tmux").chmod(0o755)
+    env["LU_TEST_CTO_TREE"] = tmp_path.name
+    calls = tmp_path / "calls"
+
+    import fcntl
+
+    with open(lock, "a") as held:
+        fcntl.flock(held, fcntl.LOCK_EX)
+        for args in ([], ["--here"]):
+            refused = subprocess.run([str(wrapper), *args], cwd=tmp_path, env=env, capture_output=True, text=True,
+                                     check=False, timeout=60)
+            assert refused.returncode == 3, refused.stdout + refused.stderr
+    assert not calls.exists() and not mark.exists() and not record.with_suffix(".argv").exists()
+
+    result = subprocess.run([str(wrapper), "--here"], cwd=tmp_path, env=env, capture_output=True, text=True,
+                            check=False, timeout=60)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert mark.exists() and calls.read_text().count("claude auth status") == 2
+    assert record.with_suffix(".lock").read_text().split() == ["held", "descendant=3"]
+    argv, _env = _recorded(record)
+    assert argv[-2:] == ["--append-system-prompt", role.rstrip("\n")]

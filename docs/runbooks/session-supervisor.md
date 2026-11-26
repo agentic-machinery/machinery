@@ -34,6 +34,29 @@ The launcher rechecks the bound signature before successor exec;
 source drift or a subsequent wrapper refusal fails without direct-launch
 fallback. Codex CTO and other driver successors retain their existing routes.
 
+A CTO started from its non-Git workspace uses the released template
+`lu_machinery/lib/lu-start-cto.workspace.sh`. The host renders it by replacing
+each `@`-delimited name with one quoted literal. Admission pins its normalized
+statements; `SELECTOR_PROFILE` is a per-host policy value, like `REPO` and
+`CFG`, and must be absolute. No policy value may contain `~`, which Bash
+expands after a colon in an assignment. The template sources that deployed profile for
+`LU_FLEET_REPO_SELECTOR_FILE`. It then holds `CFG/start.lock` from before the
+process, session and bounded `claude auth status` checks through launch. A
+`--here` run keeps the lock for its life in a `flock -o` parent, so
+descendants cannot pin it. The in-place supervisory successor is the
+predecessor's scoped launcher. It carries `SESSION_SUPERVISOR_WAKE_DELIVERY`,
+and its `LU_DRIVER_SCOPE_PID` is its own process. It takes no new lock. Its own
+ancestors, the scope waiter and any flock still holding the lock, do not count
+as another running CTO. Any other CTO process still refuses it. A new tmux
+session gets the selector, root and interpreter settings from the caller and
+clears any the caller left unset, so a reused tmux server's stale values never
+reach the pane. The pane runs the start again with the chosen account and
+`--pane`, a `--here` start that waits up to 30 seconds for the detached start to
+release `start.lock`. Its process, session and auth checks, its account save
+and its launch all run under the lock it then holds for its launcher's life.
+Whichever start takes the lock first runs on its own checks. Only that start
+reads the role text.
+
 The inbox watcher receives the launcher's entrypoint and helper metadata through
 its inherited environment. Exact captured Claude CTO arguments travel as raw
 NUL-delimited bytes through an inherited descriptor on an unlinked file, avoiding
