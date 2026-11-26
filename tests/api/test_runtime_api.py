@@ -8,6 +8,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
+from fastapi import APIRouter
 from fastapi.testclient import TestClient
 from starlette.requests import Request
 
@@ -15,7 +16,8 @@ import lu_machinery.api.config as api_config
 import lu_machinery.api.fleet_router as fleet_router
 import lu_machinery.api.runtime_router as runtime_router
 from lu_machinery.agent_runtime.acpx_discuss import AcpxDiscussionController
-from lu_machinery.api.main import app
+from lu_machinery.api.main import app, create_app
+from lu_machinery.api.product_contribution import ProductContribution, RouterMount
 
 client = TestClient(app, raise_server_exceptions=False)
 _LISTENER_ORIGIN = f"http://{api_config.API_HOST}:{api_config.API_PORT}"
@@ -400,7 +402,7 @@ def test_acp_transcript_is_loopback_only_ordered_allowlisted_and_no_store(tmp_pa
     )
     rebound_response = rebound.get("/api/runtime/acp/conversations/conv-transcript/transcript")
     assert rebound_response.status_code == 403
-    assert rebound_response.json() == {"detail": "Forbidden", "reason": "invalid_host"}
+    assert rebound_response.json() == {"detail": "Forbidden", "reason": "invalid_listener"}
 
 
 def _seed_transcript_db(root: Path) -> None:
@@ -433,6 +435,7 @@ def _raw_transcript_request(
     *,
     scheme: str = "http",
     peer: tuple[str, int] | None = ("127.0.0.1", 50000),
+    server: tuple[str, int] | None = (api_config.API_HOST, api_config.API_PORT),
 ) -> Request:
     scope: dict[str, object] = {
         "type": "http",
@@ -441,8 +444,9 @@ def _raw_transcript_request(
         "path": "/api/runtime/acp/conversations/conv-guarded/transcript",
         "query_string": b"",
         "headers": headers,
-        "server": (api_config.API_HOST, api_config.API_PORT),
     }
+    if server is not None:
+        scope["server"] = server
     if peer is not None:
         scope["client"] = peer
     return Request(scope)
@@ -501,7 +505,13 @@ def test_acp_transcript_refuses_foreign_origin_and_omits_cors(tmp_path, monkeypa
     )
     assert runtime_router._acp_transcript_access_refusal(dup_fetch_site) == "cross_site_request"
 
-    for preflight_path in (url, f"{url}/", "/api/runtime/acp/conversations/conv-guarded/./transcript"):
+    # Cover canonical path, trailing slash, dot-segment, and decoded terminal newline (%0a) routed by FastAPI.
+    for preflight_path in (
+        url,
+        f"{url}/",
+        f"{url}%0a",
+        "/api/runtime/acp/conversations/conv-guarded/./transcript",
+    ):
         preflight = local.options(
             preflight_path,
             headers={
@@ -513,33 +523,71 @@ def test_acp_transcript_refuses_foreign_origin_and_omits_cors(tmp_path, monkeypa
         assert "access-control-allow-origin" not in preflight.headers
         assert "access-control-allow-credentials" not in preflight.headers
 
-    # Other Monitor routes (including body-free ACP routes and an ID named "transcript") keep existing CORS.
+    newline_get = local.get(f"{url}%0a", headers={"Origin": "https://evil.example"})
+    assert newline_get.status_code == 403
+    assert newline_get.json() == {"detail": "Forbidden", "reason": "invalid_origin"}
+    assert "access-control-allow-origin" not in newline_get.headers
+    assert "access-control-allow-credentials" not in newline_get.headers
+
+    # Other Monitor routes (body-free ACP routes, ID named "transcript", and extra-segment routes) keep existing CORS.
     for other_path in ("/api/runtime/acp/conversations", "/api/runtime/acp/conversations/transcript"):
         other = local.get(other_path, headers={"Origin": "https://viewer.example"})
         assert other.headers.get("access-control-allow-origin") == "https://viewer.example"
         assert other.headers.get("access-control-allow-credentials") == "true"
 
+    extra_router = APIRouter()
+
+    @extra_router.get("/conversations/{group}/{item}/transcript")
+    def _contributed_extra_segment(group: str, item: str) -> dict[str, str]:
+        return {"group": group, "item": item}
+
+    extra_app = create_app(
+        app.state.ctx,
+        product=ProductContribution(routers=(RouterMount(extra_router, "/api/runtime/acp"),)),
+    )
+    extra_client = TestClient(
+        extra_app, raise_server_exceptions=False, client=("127.0.0.1", 50000), base_url=_LISTENER_ORIGIN
+    )
+    extra_resp = extra_client.get(
+        "/api/runtime/acp/conversations/team/item-1/transcript",
+        headers={"Origin": "https://viewer.example"},
+    )
+    assert extra_resp.status_code == 200
+    assert extra_resp.headers.get("access-control-allow-origin") == "https://viewer.example"
+    assert extra_resp.headers.get("access-control-allow-credentials") == "true"
+
 
 def test_acp_transcript_refuses_mismatched_missing_or_duplicate_host(tmp_path, monkeypatch):
-    """Defect class: DNS rebinding, wrong listener authority/scheme, missing/duplicate Host, or bad config bypasses guard."""
+    """Defect class: DNS rebinding, wrong listener authority/scheme, missing/duplicate Host, or bad listener bypasses guard."""
     root = tmp_path / "plane"
     _seed_transcript_db(root)
     monkeypatch.setenv("FLEET_COMMS_ROOT", str(root))
 
     url = "/api/runtime/acp/conversations/conv-guarded/transcript"
-    for bad_base_url, expected_reason in (
-        ("http://monitor.example", "invalid_host"),
-        (f"http://localhost:{api_config.API_PORT}", "invalid_host"),
-        (f"http://{api_config.API_HOST}:{api_config.API_PORT + 1}", "invalid_host"),
-        (f"http://{api_config.API_HOST}", "invalid_host"),
-        (f"https://{api_config.API_HOST}:{api_config.API_PORT}", "invalid_scheme"),
+    local = TestClient(app, raise_server_exceptions=False, client=("127.0.0.1", 50000), base_url=_LISTENER_ORIGIN)
+
+    for bad_host in (
+        "monitor.example",
+        f"localhost:{api_config.API_PORT}",
+        f"{api_config.API_HOST}:{api_config.API_PORT + 1}",
+        api_config.API_HOST,
     ):
-        other = TestClient(app, raise_server_exceptions=False, client=("127.0.0.1", 50000), base_url=bad_base_url)
-        resp = other.get(url)
-        assert resp.status_code == 403, bad_base_url
+        resp = local.get(url, headers={"Host": bad_host})
+        assert resp.status_code == 403, bad_host
         assert resp.headers["cache-control"] == "no-store"
-        assert resp.json() == {"detail": "Forbidden", "reason": expected_reason}
+        assert resp.json() == {"detail": "Forbidden", "reason": "invalid_host"}
         assert "guarded transcript body" not in resp.text
+
+    https_client = TestClient(
+        app,
+        raise_server_exceptions=False,
+        client=("127.0.0.1", 50000),
+        base_url=f"https://{api_config.API_HOST}:{api_config.API_PORT}",
+    )
+    https_resp = https_client.get(url)
+    assert https_resp.status_code == 403
+    assert https_resp.headers["cache-control"] == "no-store"
+    assert https_resp.json() == {"detail": "Forbidden", "reason": "invalid_scheme"}
 
     expected_host = f"{api_config.API_HOST}:{api_config.API_PORT}".encode()
     assert runtime_router._acp_transcript_access_refusal(_raw_transcript_request([])) == "invalid_host"
@@ -555,12 +603,13 @@ def test_acp_transcript_refuses_mismatched_missing_or_duplicate_host(tmp_path, m
         )
         == "non_loopback_peer"
     )
-
-    local = TestClient(app, raise_server_exceptions=False, client=("127.0.0.1", 50000), base_url=_LISTENER_ORIGIN)
-    monkeypatch.setattr(api_config, "API_HOST", "0.0.0.0")
-    bad_cfg = local.get(url)
-    assert bad_cfg.status_code == 403
-    assert bad_cfg.json() == {"detail": "Forbidden", "reason": "invalid_listener_config"}
+    for bad_server in (None, ("0.0.0.0", api_config.API_PORT), ("monitor.example", 80), ("127.0.0.1", 0)):
+        assert (
+            runtime_router._acp_transcript_access_refusal(
+                _raw_transcript_request([(b"host", expected_host)], server=bad_server)
+            )
+            == "invalid_listener"
+        )
 
 
 def test_acp_transcript_refuses_forwarding_headers(tmp_path, monkeypatch):
@@ -591,7 +640,7 @@ def test_acp_transcript_refuses_forwarding_headers(tmp_path, monkeypatch):
 
 
 def test_acp_transcript_allows_same_origin_and_no_origin_local_reads(tmp_path, monkeypatch):
-    """Defect class: listener/Origin/CORS hardening breaks authorized local same-origin or no-Origin reads."""
+    """Defect class: listener/Origin/CORS hardening breaks authorized local reads across ports or IPv6 listeners."""
     root = tmp_path / "plane"
     _seed_transcript_db(root)
     monkeypatch.setenv("FLEET_COMMS_ROOT", str(root))
@@ -611,16 +660,45 @@ def test_acp_transcript_allows_same_origin_and_no_origin_local_reads(tmp_path, m
         assert "access-control-allow-credentials" not in resp.headers
         assert resp.json()["messages"][0]["body"] == "guarded transcript body"
 
-    # Listener host/port comes from config settings, not a hardcoded constant.
-    monkeypatch.setattr(api_config, "API_PORT", 9876)
-    reconfigured_origin = f"http://{api_config.API_HOST}:9876"
-    assert local.get(url).status_code == 403
-    reconfigured = TestClient(
-        app, raise_server_exceptions=False, client=("127.0.0.1", 50000), base_url=reconfigured_origin
+    # Alternate bound loopback port (e.g. launchd_supervisor start --port 9876) authorizes its own exact origin.
+    alt_origin = "http://127.0.0.1:9876"
+    alt_client = TestClient(app, raise_server_exceptions=False, client=("127.0.0.1", 50000), base_url=alt_origin)
+    for headers in ({}, {"Origin": alt_origin, "Sec-Fetch-Site": "same-origin"}):
+        alt_ok = alt_client.get(url, headers=headers)
+        assert alt_ok.status_code == 200, headers
+        assert alt_ok.json()["messages"][0]["body"] == "guarded transcript body"
+    assert alt_client.get(url, headers={"Origin": _LISTENER_ORIGIN}).json() == {
+        "detail": "Forbidden",
+        "reason": "invalid_origin",
+    }
+    assert alt_client.get(url, headers={"Host": f"{api_config.API_HOST}:{api_config.API_PORT}"}).json() == {
+        "detail": "Forbidden",
+        "reason": "invalid_host",
+    }
+
+    # IPv4-mapped IPv6 listener uses WHATWG browser serialization ([::ffff:7f00:1]:port) for Host and Origin.
+    mapped_browser_host = f"[::ffff:7f00:1]:{api_config.API_PORT}".encode()
+    mapped_browser_origin = f"http://[::ffff:7f00:1]:{api_config.API_PORT}".encode()
+    assert (
+        runtime_router._acp_transcript_access_refusal(
+            _raw_transcript_request(
+                [(b"host", mapped_browser_host), (b"origin", mapped_browser_origin)],
+                peer=("::ffff:127.0.0.1", 50000),
+                server=("::ffff:127.0.0.1", api_config.API_PORT),
+            )
+        )
+        is None
     )
-    ok = reconfigured.get(url, headers={"Origin": reconfigured_origin})
-    assert ok.status_code == 200
-    assert ok.json()["messages"][0]["body"] == "guarded transcript body"
+    assert (
+        runtime_router._acp_transcript_access_refusal(
+            _raw_transcript_request(
+                [(b"host", f"[::ffff:127.0.0.1]:{api_config.API_PORT}".encode())],
+                peer=("::ffff:127.0.0.1", 50000),
+                server=("::ffff:127.0.0.1", api_config.API_PORT),
+            )
+        )
+        == "invalid_host"
+    )
 
 
 def test_acp_transcript_hides_unavailable_malformed_and_body_free_routes(tmp_path, monkeypatch):
