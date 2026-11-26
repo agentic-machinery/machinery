@@ -1428,26 +1428,39 @@ def _registry_roots(monkeypatch, public: Path) -> None:
     monkeypatch.setattr(guard, "PROTECTED_ROOTS", None)
     monkeypatch.setattr(guard, "_public_primary_root", lambda: public)
     monkeypatch.setattr(guard, "_configured_primary_root", lambda: None)
-    for name in ("LU_REPOS_ROOT", "LU_PROFILE_PATH"):
+    for name in ("LU_REPOS_ROOT", "LU_PROFILE_PATH", "LEARN_UKRAINIAN_PRIMARY_REPO_ROOT"):
         monkeypatch.delenv(name, raising=False)
 
 
+def _primary_repo(root: Path) -> Path:
+    root.mkdir(parents=True)
+    _git(root, "init", "-b", "main")
+    _git(root, "-c", "user.name=Guard Test", "-c", "user.email=guard@example.invalid", "commit", "--allow-empty", "-m", "initial")
+    return root
+
+
 def test_registry_named_infra_primary_switch_is_refused(repos, tmp_path, monkeypatch):
-    """Defect class: the hook protects an infra path the fleet registry no longer names."""
+    """Defect class: the hook protects an infra path other than the one tools resolve from the registry.
+
+    The configured primary lives apart from the product primary, so dispatch's base
+    (``repos_root()``) and the sibling resolver's base (the product primary's parent) differ.
+    """
     from lu_machinery.orchestration.fleet_repos import load_fleet_repos
 
-    infra = tmp_path / load_fleet_repos()["infra-private"].local_name
-    infra.mkdir()
-    _git(infra, "init", "-b", "main")
-    _git(infra, "-c", "user.name=Guard Test", "-c", "user.email=guard@example.invalid", "commit", "--allow-empty", "-m", "initial")
+    local_name = load_fleet_repos()["infra-private"].local_name
+    beside_public = _primary_repo(tmp_path / local_name)
+    plane_primary = _primary_repo(tmp_path / "plane" / "primary")
+    beside_plane = _primary_repo(tmp_path / "plane" / local_name)
     _registry_roots(monkeypatch, repos["public"])
+    monkeypatch.setenv("LU_PRIMARY_REPO_ROOT", str(plane_primary))
 
-    assert guard._command_danger_reason(f"git -C {infra} switch -c topic", repos["other"]) is not None
+    for infra in (beside_public, beside_plane):
+        assert guard._command_danger_reason(f"git -C {infra} switch -c topic", repos["other"]) is not None
     assert guard._command_danger_reason(f"git -C {repos['other']} switch -c topic", repos["public"]) is None
 
 
 def test_unreadable_registry_keeps_public_protection_and_blocks_nothing_else(repos, tmp_path, monkeypatch, capsys):
-    """Defect class: a registry read failure crashes the hook or blocks unrelated repositories."""
+    """Defect class: a registry read failure crashes the hook, blocks unrelated repositories or prints its path."""
     from lu_machinery.orchestration import fleet_repos
 
     broken = tmp_path / "fleet_repos.yaml"
@@ -1457,4 +1470,6 @@ def test_unreadable_registry_keeps_public_protection_and_blocks_nothing_else(rep
 
     assert guard._command_danger_reason(f"git -C {repos['other']} switch -c topic", repos["other"]) is None
     assert guard._command_danger_reason(f"git -C {repos['public']} switch -c topic", repos["other"]) is not None
-    assert "infra-private primary not protected" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert "infra-private primary not protected" in err
+    assert str(tmp_path) not in err

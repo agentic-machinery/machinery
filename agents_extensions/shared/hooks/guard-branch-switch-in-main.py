@@ -59,7 +59,7 @@ try:
         strip_skippable_heredoc_bodies,
     )
 except Exception as exc:
-    print(f"guard dependency unavailable: shell_shlex ({exc})", file=sys.stderr)
+    print(f"guard dependency unavailable: shell_shlex ({type(exc).__name__})", file=sys.stderr)
     raise SystemExit(2) from exc
 
 try:
@@ -71,7 +71,7 @@ try:
         unknown_repository_segments,
     )
 except Exception as exc:
-    print(f"guard dependency unavailable: shell_redirects ({exc})", file=sys.stderr)
+    print(f"guard dependency unavailable: shell_redirects ({type(exc).__name__})", file=sys.stderr)
     raise SystemExit(2) from exc
 
 # Words that, when seen as the FIRST token after `git`, indicate a branch
@@ -139,24 +139,41 @@ def _configured_primary_root() -> Path | None:
         raise RootsConfigurationError(str(exc)) from exc
 
 
-def _infra_primary_root(public: Path) -> Path | None:
-    """The fleet registry's ``infra-private`` checkout beside *public*, or None.
+def _infra_primary_roots(public: Path) -> list[Path]:
+    """The fleet registry's ``infra-private`` checkout under each base a tool resolves it from.
 
-    The registry is the only source of the checkout's directory name. An unreadable
-    registry leaves the infra primary unprotected and says so on stderr; it never
+    Dispatch joins ``local_name`` to ``repos_root()`` (``LU_REPOS_ROOT``, else the configured
+    primary's parent); ``resolve_fleet_repo`` (sibling Git, review targets) joins it to
+    ``LU_REPOS_ROOT``, else *public*'s parent. Both are protected. The registry is the only
+    source of the directory name. A base that cannot be resolved stays unprotected and is
+    reported on stderr by exception class only (its text can carry private paths); it never
     blocks a command, so the public primary keeps its protection either way.
     """
+    roots: list[Path] = []
+    failures: list[str] = []
     try:
-        from lu_machinery.orchestration.fleet_repos import resolve_fleet_repo
+        from lu_machinery.common.repo_root import repos_root
+        from lu_machinery.orchestration.fleet_repos import load_fleet_repos, resolve_fleet_repo
 
-        return resolve_fleet_repo("infra-private", primary_root=public, require_checkout=False)[1]
+        resolvers = (
+            lambda: repos_root() / load_fleet_repos()["infra-private"].local_name,
+            lambda: resolve_fleet_repo("infra-private", primary_root=public, require_checkout=False)[1],
+        )
     except Exception as exc:
+        failures.append(type(exc).__name__)
+        resolvers = ()
+    for resolve in resolvers:
+        try:
+            roots.append(resolve())
+        except Exception as exc:
+            failures.append(type(exc).__name__)
+    if failures:
         print(
-            "guard-branch-switch-in-main: infra-private primary not protected; "
-            f"fleet registry unresolved ({type(exc).__name__}: {exc})",
+            "guard-branch-switch-in-main: infra-private primary not protected under every base; "
+            f"fleet registry or repositories root unresolved ({', '.join(failures)})",
             file=sys.stderr,
         )
-        return None
+    return roots
 
 
 # Protect the configured product primary, any explicitly configured state
@@ -170,11 +187,10 @@ def _protected_roots() -> set[Path]:
     if PROTECTED_ROOTS is None:
         public = _public_primary_root()
         configured = _configured_primary_root()
-        infra = _infra_primary_root(public)
         PROTECTED_ROOTS = [
             public,
             *([] if configured is None else [configured]),
-            *([] if infra is None else [infra]),
+            *_infra_primary_roots(public),
         ]
     return {root.resolve() for root in PROTECTED_ROOTS}
 
@@ -748,7 +764,7 @@ def main() -> int:
     try:
         reason = _command_danger_reason(command)
     except RootsConfigurationError as exc:
-        reason = f"machinery roots configuration unusable ({exc})"
+        reason = f"machinery roots configuration unusable ({type(exc.__cause__ or exc).__name__})"
     except Exception:
         reason = "nested shell command could not be parsed safely"
     if reason:
