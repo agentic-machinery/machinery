@@ -23,34 +23,48 @@ _TASK = "wb-art"
 _WRITE_BINDS = ("--bind", "--bind-try", "--dev-bind", "--dev-bind-try")
 
 
-# Host locations the launcher and the in-process boundary read from the environment (credential stores, the
-# selected login, pre-commit's store, the product checkout, the SSH agent); every one is test-owned or absent here.
-_HOST_LOCATIONS = ("CLAUDE_CONFIG_DIR", "CODEX_HOME", "LU_PRODUCT_ROOT", "SSH_AUTH_SOCK")
-
-
 @pytest.fixture(autouse=True)
-def _test_owned_home_and_git(tmp_path, monkeypatch):
-    """No inherited Git, XDG or pre-commit setting and no host location, before any fixture runs Git.
-
-    Autouse, so it runs before ``primary``, whose first ``git commit`` precedes its own HOME. Every ``GIT_*`` name
-    goes (repository selection, inline ``GIT_CONFIG_COUNT``/``KEY``/``VALUE`` and ``GIT_CONFIG_PARAMETERS``
-    settings, templates, identities), and the global and system files are empty, so no developer setting
-    (signing, hooks) decides these tests. The XDG and pre-commit roots, the selected logins, the product checkout
-    and the SSH agent are dropped, and gh's configuration is a test path, so neither the launcher nor the boundary
-    reads or masks a host store. ``XDG_RUNTIME_DIR`` stays: the boundary derives the runtime directory from the uid.
-    """
-    for name in list(os.environ):
-        if name.startswith(("GIT_", "XDG_", "PRE_COMMIT_")) and name != "XDG_RUNTIME_DIR":
-            monkeypatch.delenv(name)
-    for name in _HOST_LOCATIONS:
-        monkeypatch.delenv(name, raising=False)
+def _boundary_environment(tmp_path, monkeypatch):
+    """Build a minimal environment before the primary fixture runs Git."""
     home = tmp_path / "test-home"
     home.mkdir()
-    monkeypatch.setenv("HOME", str(home))
-    monkeypatch.setenv("GH_CONFIG_DIR", str(tmp_path / "gh-config"))
-    monkeypatch.setenv("GIT_CONFIG_GLOBAL", os.devnull)
-    monkeypatch.setenv("GIT_CONFIG_SYSTEM", os.devnull)
-    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    env = {
+        "PATH": os.defpath,
+        "LANG": "C",
+        "HOME": str(home),
+        "GH_CONFIG_DIR": str(tmp_path / "gh-config"),
+        "FLEET_COMMS_ROOT": str(tmp_path / "fleet"),
+        "LEARN_UKRAINIAN_PYTHON": sys.executable,
+        "LU_SCRATCH_ROOT": str(tmp_path / "scratch"),
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_CONFIG_SYSTEM": os.devnull,
+        "GIT_CONFIG_NOSYSTEM": "1",
+    }
+    for name in os.environ.keys() - env.keys():
+        monkeypatch.delenv(name)
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+    # Pytest adds the calling test's ID. Its Cursor execution tripwire adds its
+    # test-local Python import path and subprocess guard settings on the first spawn.
+    return env.keys() | {
+        "LU_TASKS_DIR",
+        "PYTEST_CURRENT_TEST",
+        "PYTHONPATH",
+        "LU_TEST_CURSOR_ROOTS",
+        "LU_TEST_CURSOR_TARGETS",
+        "LU_TEST_CURSOR_SESSION_TOKEN",
+    }
+
+
+@pytest.fixture
+def run_boundary(_boundary_environment):
+    def run(args: list[str]) -> int:
+        # Defect class: any unlisted host environment variable reaches the in-process boundary.
+        extra = os.environ.keys() - _boundary_environment
+        assert not extra, f"Unexpected boundary environment names: {sorted(extra)}"
+        return write_boundary.main(args)
+
+    return run
 
 
 def _spec(worktree: Path, agent: str, provider: str | None, mode: str = "read-only") -> TaskSpec:
@@ -60,7 +74,7 @@ def _spec(worktree: Path, agent: str, provider: str | None, mode: str = "read-on
 
 def _boundary_args(spec: TaskSpec, command: list[str], task_file: Path) -> list[str]:
     """The launcher's own arguments for ``write_boundary.main``, without the host context it applies to itself."""
-    env = {"PATH": os.environ["PATH"], "HOME": os.environ["HOME"]}  # the test's own HOME (autouse fixture)
+    env = {name: os.environ[name] for name in ("PATH", "LANG", "HOME")}
     argv = write_boundary.launcher(spec, Invocation(command, None, env, None), task_file)
     args, index = [], 5  # past the interpreter, -I, -c, the bootstrap and the package root
     while index < len(argv):
@@ -136,7 +150,7 @@ def _writable(log: Path) -> set[str]:
 
 
 @pytest.mark.parametrize(("agent", "provider"), ROUTES)
-def test_read_only_route_writes_only_its_own_task_artifacts(primary, tmp_path, monkeypatch, agent, provider):
+def test_read_only_route_writes_only_its_own_task_artifacts(primary, tmp_path, monkeypatch, run_boundary, agent, provider):
     """Defect class: a read-only Cursor or OpenCode report is lost with the scratch because its own ``.artifacts``
     is not writable, or the grant reaches further: another task's artifacts, the task store or the checkout become
     writable, or the sandbox gains any writable path besides that one directory."""
@@ -159,11 +173,11 @@ def test_read_only_route_writes_only_its_own_task_artifacts(primary, tmp_path, m
     # The same launch without the grant: the writable binds it gives are the baseline.
     without = [arg for arg in args if arg != "--task-artifacts"]
     without[without.index("--") + 3] = "exit 0"
-    assert write_boundary.main(without) == 0, json.loads(receipt_path.read_text())
+    assert run_boundary(without) == 0, json.loads(receipt_path.read_text())
     baseline = _writable(log)
     assert not own.exists()
 
-    code = write_boundary.main(args)
+    code = run_boundary(args)
     receipt = json.loads(receipt_path.read_text())
     assert (code, receipt["status"]) == (0, "ran"), receipt.get("reason")
     assert receipt["canary"]["passed"] is True
@@ -181,8 +195,9 @@ def test_read_only_route_writes_only_its_own_task_artifacts(primary, tmp_path, m
 
 
 @pytest.mark.parametrize(("agent", "provider"), ROUTES)
-def test_read_only_route_refuses_before_start_when_the_artifacts_bind_is_missing(primary, tmp_path, monkeypatch,
-                                                                              agent, provider):
+def test_read_only_route_refuses_before_start_when_the_artifacts_bind_is_missing(
+    primary, tmp_path, monkeypatch, run_boundary, agent, provider,
+):
     """Defect class: the artifacts directory is granted but not mounted writable, and the provider starts anyway,
     so its report is lost; the canary must refuse the run before the provider runs."""
     repo, worktree, _ = primary
@@ -196,7 +211,7 @@ def test_read_only_route_refuses_before_start_when_the_artifacts_bind_is_missing
     args = _boundary_args(_spec(worktree, agent, provider), ["/bin/sh", "-c", f"printf ran > {shlex.quote(str(marker))}"],
                           task_file)
     args[args.index("--"):args.index("--")] = ["--output", str(marker)]
-    code = write_boundary.main(args)
+    code = run_boundary(args)
     receipt = json.loads(write_boundary.receipt_file(task_file).read_text())
     assert code == write_boundary.REFUSED and receipt["status"] == "refused", receipt
     assert receipt["canary"]["passed"] is False
