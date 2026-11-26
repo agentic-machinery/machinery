@@ -5,6 +5,7 @@
 from lu_machinery.review.contract_canary import CONTRACT_PATHS, touches_contract
 import hashlib
 import json
+import shlex
 import shutil
 import subprocess
 from pathlib import Path
@@ -323,10 +324,14 @@ def test_runner_dry_run_never_mounts_dispatches_or_writes(runner_roots, monkeypa
     assert "--codex-account sub" in output and "--claude-account b" in output
     assert "--codex-account b-sub" not in output
     # Only the Codex unit drops an inherited Codex home or key, so it runs on account a's login.
-    unset = "'--property=UnsetEnvironment=CODEX_HOME OPENAI_API_KEY CODEX_API_KEY CODEX_ACCESS_TOKEN'"
-    assert output.count(unset) == 1
-    unit = output[output.index(unset) :].split("systemd-run --user")[0]
-    assert "--agent codex --model gpt-6.2-sol --codex-account sub" in unit
+    for line in output.splitlines():
+        if line.startswith("systemd-run "):
+            unit_args = shlex.split(line.partition(" -I -B -c ")[0])
+            unset = next(arg.removeprefix("--property=UnsetEnvironment=").split()
+                         for arg in unit_args
+                         if arg.startswith("--property=UnsetEnvironment="))
+            codex_unit = any(arg.startswith("--unit=") and arg.endswith("-codex") for arg in unit_args)
+            assert ("CODEX_HOME" in unset) == codex_unit
     assert "--require-hashes" in output and "contract-canary.pth" in output
     assert "--pinned-head " + "a" * 40 in output
     assert "check --head " + "a" * 40 in output
@@ -336,7 +341,6 @@ def test_runner_dry_run_never_mounts_dispatches_or_writes(runner_roots, monkeypa
     assert output.count("systemd-run --user") == 4
     assert list(runner_roots.iterdir()) == []
     assert canary.main(["run", "--head", "a" * 40]) == 2
-
     assert "outside a dispatched worker" in capsys.readouterr().err
     monkeypatch.setenv(canary.WHEELHOUSE_ENV, "relative/wheelhouse")
     assert canary.main(["run", "--head", "a" * 40, "--dry-run"]) == 2
@@ -448,7 +452,12 @@ def test_detached_release_canary_uses_configured_product_and_state(
     state = tmp_path / "state"
     state.mkdir()
     monkeypatch.setenv("LU_STATE_ROOT", str(state))
+    monkeypatch.setenv("LEARN_UKRAINIAN_STATE_ROOT", str(state))
     monkeypatch.setenv("LU_TASKS_DIR", str(configured_roots.primary / "batch_state" / "tasks"))
+    monkeypatch.delenv("LU_PROFILE_PATH", raising=False)
+    monkeypatch.delenv("LU_FLEET_REPO_SELECTOR_FILE", raising=False)
+    monkeypatch.delenv("LU_GITHUB_SLUG", raising=False)
+    monkeypatch.delenv("LEARN_UKRAINIAN_GITHUB_SLUG", raising=False)
     cut = Cut(
         work=tmp_path, dry_run=True, machinery_remote="", product_remote="",
         machinery_repo="example/machinery", product_repo="example/product",
@@ -468,6 +477,14 @@ def test_detached_release_canary_uses_configured_product_and_state(
         assert f"--setenv=LU_PRODUCT_ROOT={product}" in line
         assert f"--setenv=LU_STATE_ROOT={state}" in line
         assert f"--setenv=LU_TASKS_DIR={state / 'batch_state' / 'tasks'}" in line
+        assert f"--setenv=LU_PYTHON={sys.executable}" in line
+        assert f"--setenv=LEARN_UKRAINIAN_PYTHON={sys.executable}" in line
+        assert "--setenv=LEARN_UKRAINIAN_STATE_ROOT=" not in line
+        unset_arg = next(arg.removeprefix("--property=UnsetEnvironment=")
+                         for arg in shlex.split(line.partition(" -I -B -c ")[0])
+                         if arg.startswith("--property=UnsetEnvironment="))
+        assert {"LEARN_UKRAINIAN_STATE_ROOT", "LU_PROFILE_PATH", "LU_FLEET_REPO_SELECTOR_FILE",
+                "LU_GITHUB_SLUG", "LEARN_UKRAINIAN_GITHUB_SLUG"} <= set(unset_arg.split())
     assert not (configured_roots.primary / "batch_state").exists()
 
 

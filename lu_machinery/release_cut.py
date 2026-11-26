@@ -38,6 +38,8 @@ from typing import Literal
 
 from lu_machinery.common import json_depth
 from lu_machinery.common.git_context import sanitized_git_env
+from lu_machinery.common.git_credentials import SELECTOR_ENV
+from lu_machinery.common.repo_root import ENV_ALIASES, MACHINERY_ENV_VARS, PRIMARY_ROOT_ENV, PRODUCT_ROOT_ENV
 
 # The post-release PR's title. A range holding only these PRs is unchanged.
 BUMP_TITLE = "chore(release): record {released} and start {next}"
@@ -695,9 +697,14 @@ class Cut:
     def env(self, **extra: str) -> dict[str, str]:
         env = {key: value for key, value in sanitized_git_env(strip_config_injection=True).items()
                if key not in {"PYTHONPATH", "PYTHONHOME"}}
-        env["LEARN_UKRAINIAN_PRIMARY_REPO_ROOT"] = str(self.primary)
-        if not env.get("LU_PRODUCT_ROOT"):
-            env["LU_PRODUCT_ROOT"] = str(self.primary)  # Legacy colocated cut.
+        extra.setdefault(PRIMARY_ROOT_ENV, str(self.primary))
+        if not env.get(PRODUCT_ROOT_ENV):
+            env[PRODUCT_ROOT_ENV] = str(self.primary)  # Legacy colocated cut.
+        for setting, alias in ENV_ALIASES.items():
+            if setting in extra:
+                env.pop(alias, None)
+            elif alias in extra:
+                env.pop(setting, None)
         env.update(extra)
         return env
 
@@ -1427,10 +1434,13 @@ class Cut:
 
     def _recovery_env_prefix(self) -> str:
         env = self.env(LU_PYTHON=str(self.host_python.absolute()))
-        roots = ("LEARN_UKRAINIAN_PRIMARY_REPO_ROOT", "LU_PRODUCT_ROOT", "LU_PYTHON",
-                 "LU_STATE_ROOT", "LEARN_UKRAINIAN_STATE_ROOT", "LU_REPOS_ROOT", "LU_PROFILE_PATH",
-                 "LU_FLEET_REPO_SELECTOR_FILE")
-        return " ".join(f"{key}={shlex.quote(env[key])}" for key in roots if env.get(key))
+        context = (PRODUCT_ROOT_ENV, SELECTOR_ENV, "LU_TASKS_DIR", *MACHINERY_ENV_VARS)
+        argv = ["env"]
+        for key in context:
+            if not env.get(key):
+                argv.extend(("-u", key))
+        argv.extend(f"{key}={env[key]}" for key in context if env.get(key))
+        return shlex.join(argv)
 
     def _manual_post_release_command(self, argv: Sequence[str]) -> str | None:
         """Shell-quoted publisher command for installed-venv / work/accept runs only.

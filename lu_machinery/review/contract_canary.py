@@ -32,7 +32,7 @@ from typing import Any, cast
 
 from lu_machinery.common import github_client, json_depth
 from lu_machinery.common.git_credentials import SELECTOR_ENV
-from lu_machinery.common.repo_root import MACHINERY_ENV_VARS
+from lu_machinery.common.repo_root import MACHINERY_ENV_VARS, STATE_ROOT_ENV
 
 # The machinery package's directory name, which a change lists its files under, from this module's
 # unresolved location: a symlinked package keeps its checkout name, and a short import spelling
@@ -403,16 +403,19 @@ def _run_steps(
     )
     commands = []
     # Passing named context explicitly is necessary: the user manager does not inherit this shell's env.
-    context = ("PATH", "LU_PRODUCT_ROOT", "LU_TASKS_DIR", SELECTOR_ENV, *MACHINERY_ENV_VARS)
+    context = ("PATH", "LU_PRODUCT_ROOT", "LU_TASKS_DIR", SELECTOR_ENV,
+               "FLEET_COMMS_ROOT", "LU_GITHUB_CACHE_DIR", *MACHINERY_ENV_VARS)
+    unset_context = [key for key in context if not env.get(key)]
     for route in routes:
         model, *account = _RUN_MODELS[route]
         unit = f"{work.name.lstrip('.')}-{route}"
         argv = ["systemd-run", "--user", "--wait", "--pipe", "--collect", "--service-type=exec",
                 f"--unit={unit}", f"--working-directory={work}"]
-        if route == "codex":
-            # Account a is the login under HOME; a Codex home or key inherited from the user manager would replace it.
-            argv.append(f"--property=UnsetEnvironment={' '.join(_CODEX_UNIT_UNSET)}")
-        argv += [f"--setenv={key}={env[key]}" for key in context if key in env]
+        # Account a is the login under HOME; an inherited Codex home or key would replace it.
+        unset = [*unset_context, *_CODEX_UNIT_UNSET] if route == "codex" else unset_context
+        if unset:
+            argv.append(f"--property=UnsetEnvironment={' '.join(unset)}")
+        argv += [f"--setenv={key}={env[key]}" for key in context if env.get(key)]
         argv += [python, "-I", "-B", "-c", _RUN_ROUTE, "dispatch", "--repo", repo_key,
                  "--agent", route, "--model", model, *account, "--effort", "high", "--mode", "read-only",
                  "--worktree", "--task-id", f"{unit}", "--pinned-head", head, "--base", head,
@@ -490,6 +493,8 @@ def run(args: argparse.Namespace) -> int:
     env.pop("PYTHONHOME", None)
     primary = str(primary_root())
     state = state_root()
+    # Native hooks reserve the compatibility state variable for the Git checkout.
+    env.pop(STATE_ROOT_ENV, None)
     # Keep dispatch, wait, record and score on the same plane, even if the user
     # manager has old root settings or this caller has a task-scoped override.
     env.update(
@@ -497,7 +502,6 @@ def run(args: argparse.Namespace) -> int:
         LEARN_UKRAINIAN_PRIMARY_REPO_ROOT=primary,
         LU_PRODUCT_ROOT=str(product_root()),
         LU_STATE_ROOT=str(state),
-        LEARN_UKRAINIAN_STATE_ROOT=str(state),
         LU_TASKS_DIR=str(state / "batch_state" / "tasks"),
     )
     head = args.head
@@ -515,6 +519,7 @@ def run(args: argparse.Namespace) -> int:
     if set(routes) != set(_RUN_MODELS):
         raise CanaryError("required routes changed; update the supported canary model map before running")
     interpreter = project_interpreter()
+    env.update(LU_PYTHON=str(interpreter), LEARN_UKRAINIAN_PYTHON=str(interpreter))
     wheelhouse = os.environ.get(WHEELHOUSE_ENV, "")
     if wheelhouse and not (os.path.isabs(wheelhouse) and os.path.isdir(wheelhouse)):
         raise CanaryError(f"{WHEELHOUSE_ENV} must be the absolute path of an existing wheelhouse directory")
