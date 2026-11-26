@@ -8,7 +8,7 @@
   "dependencies": {
     "@agentclientprotocol/claude-agent-acp": "0.109.0",
     "@agentclientprotocol/codex-acp": "2.7.0",
-    "@agentclientprotocol/sdk": "2.7.0",
+    "@agentclientprotocol/sdk": "2.8.0",
     "@cfworker/json-schema": "4.1.6",
     "@modelcontextprotocol/server": "2.4.0",
     "acpx": "0.22.0",
