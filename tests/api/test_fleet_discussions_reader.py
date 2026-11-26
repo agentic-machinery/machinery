@@ -261,6 +261,10 @@ def test_secrets_paths_nested_json_and_labels_redacted_in_json(tmp_path: Path, m
         over_deep_nested = json.dumps({"wrap": over_deep_nested})
     # F2: syntactically valid JSON containing a float outside Python's finite range (1e309 -> inf).
     non_finite_json = '{"overflow": 1e309, "note": "must not 500"}'
+    # F4: syntactically valid JSON containing an integer exceeding Python's 4300-digit conversion limit
+    # alongside a secret must fail closed as body_redaction_failed (never fall back to plain-text filters).
+    over_digit_secret = "OVER_DIGIT_INT_SECRET_MUST_NOT_LEAK"
+    over_digit_int_json = '{"huge": ' + ("9" * 4400) + ', "nested": "{\\"password\\": \\"' + over_digit_secret + '\\"}"}'
 
     conv_id, _ = _seed_conversation(
         root,
@@ -270,14 +274,17 @@ def test_secrets_paths_nested_json_and_labels_redacted_in_json(tmp_path: Path, m
             ("reply", "claude", "root", over_deep_container, 2),
             ("reply", "codex", "root", over_deep_nested, 2),
             ("reply", "claude", "root", non_finite_json, 2),
+            ("reply", "codex", "root", over_digit_int_json, 2),
         ],
         suffix="redaction",
     )
     monkeypatch.setenv("FLEET_COMMS_ROOT", str(root))
 
-    # Labels as well as bodies pass through redact_text then sanitize_text server-side.
-    poisoned_label = f"ok {planted_ant} {planted_home}"
-    monkeypatch.setitem(runtime_router._ACP_TRANSCRIPT_STATE_LABELS, "ok", poisoned_label)
+    # Both top-level and per-turn labels pass through redact_text then sanitize_text server-side.
+    poisoned_ok_label = f"ok {planted_ant} {planted_home}"
+    poisoned_corrupt_label = f"missing or corrupt {planted_ant} {planted_home}"
+    monkeypatch.setitem(runtime_router._ACP_TRANSCRIPT_STATE_LABELS, "ok", poisoned_ok_label)
+    monkeypatch.setitem(runtime_router._ACP_TRANSCRIPT_STATE_LABELS, "missing_or_corrupt", poisoned_corrupt_label)
 
     resp = _loopback_client().get(f"/api/runtime/acp/conversations/{conv_id}/transcript")
     assert resp.status_code == 200
@@ -295,6 +302,7 @@ def test_secrets_paths_nested_json_and_labels_redacted_in_json(tmp_path: Path, m
         deep_secret,
         nested_depth_secret,
         "must not 500",
+        over_digit_secret,
     ):
         assert forbidden not in resp.text, forbidden
 
@@ -313,6 +321,11 @@ def test_secrets_paths_nested_json_and_labels_redacted_in_json(tmp_path: Path, m
     assert data["messages"][4]["state"] == "missing_or_corrupt"
     assert data["messages"][4]["reason"] == "body_redaction_failed"
     assert data["messages"][4]["body"] is None
+    assert data["messages"][5]["state"] == "missing_or_corrupt"
+    assert data["messages"][5]["reason"] == "body_redaction_failed"
+    assert data["messages"][5]["body"] is None
+    assert "[REDACTED_SECRET]" in data["label"]
+    assert "[redacted-path]" in data["label"]
     assert "[REDACTED_SECRET]" in data["messages"][0]["label"]
     assert "[redacted-path]" in data["messages"][0]["label"]
 
@@ -648,8 +661,10 @@ def test_each_e3_cap_trips_with_typed_state(tmp_path: Path, monkeypatch) -> None
     assert executed_sql.index(begin_queries[0]) < executed_sql.index(count_queries[0]) < executed_sql.index(join_queries[0])
     assert "LIMIT ?" in join_queries[0].split("LEFT JOIN comms_messages")[0]
 
-    # 3b. F3 snapshot consistency: a 33rd turn committed between COUNT(*) and the capped join is NOT seen
-    # in that snapshot (truncated=False matches the exact 32-turn snapshot), then a subsequent read sees 33.
+    # 3b. F3/F6 snapshot consistency: insert a 33rd turn at sequence=0 (inside the capped 32-row window,
+    # before existing message sequences 2..33 while leaving CONVERSATION_CREATED at sequence=1 intact)
+    # right after COUNT(*) sees 32. Without one read transaction, the capped join would observe
+    # sequence=0 and displace snap-31 while truncated stayed False.
     root_snap = tmp_path / "plane-snap"
     exact_32 = [("reply", "codex", "root", f"snap-{i}", 1) for i in range(runtime_router._ACP_TRANSCRIPT_MAX_MESSAGES)]
     conv_snap, _ = _seed_conversation(root_snap, turns=exact_32, suffix="snap-cap")
@@ -665,9 +680,9 @@ def test_each_e3_cap_trips_with_typed_state(tmp_path: Path, monkeypatch) -> None
             if "COUNT(*) AS message_count" in sql and not injected["done"]:
                 injected["done"] = True
                 _insert_custom_turn(
-                    root_snap, conv_snap, sequence=500, message_id="msg-snap-33",
+                    root_snap, conv_snap, sequence=0, message_id="msg-snap-seq0",
                     kind="reply", sender="codex", recipient="root",
-                    body="snap-33-after-count", producer="acpx-discuss:codex",
+                    body="snap-inserted-seq-0", producer="acpx-discuss:codex",
                 )
             return cursor
 
@@ -686,13 +701,18 @@ def test_each_e3_cap_trips_with_typed_state(tmp_path: Path, monkeypatch) -> None
     monkeypatch.setattr(runtime_router, "_open_acp_transcript_store", real_open_store)
     assert injected["done"] is True
     assert snap_resp.status_code == 200
-    assert snap_resp.json()["truncated"] is False
-    assert len(snap_resp.json()["messages"]) == runtime_router._ACP_TRANSCRIPT_MAX_MESSAGES
-    assert "snap-33-after-count" not in snap_resp.text
+    snap_data = snap_resp.json()
+    assert snap_data["truncated"] is False
+    assert len(snap_data["messages"]) == runtime_router._ACP_TRANSCRIPT_MAX_MESSAGES
+    assert snap_data["messages"][0]["body"] == "snap-0"
+    assert snap_data["messages"][-1]["body"] == f"snap-{runtime_router._ACP_TRANSCRIPT_MAX_MESSAGES - 1}"
+    assert "snap-inserted-seq-0" not in snap_resp.text
     after_snap = local.get(f"/api/runtime/acp/conversations/{conv_snap}/transcript")
     assert after_snap.status_code == 200
-    assert after_snap.json()["truncated"] is True
-    assert after_snap.json()["reason"] == "message_limit_exceeded"
+    after_data = after_snap.json()
+    assert after_data["truncated"] is True
+    assert after_data["reason"] == "message_limit_exceeded"
+    assert after_data["messages"][0]["body"] == "snap-inserted-seq-0"
 
     # 4. SQLite busy timeout (configured via open_readonly timeout alone -> 500 ms default, 503 store_busy on lock).
     root_busy = tmp_path / "plane-busy"
