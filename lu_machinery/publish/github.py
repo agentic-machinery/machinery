@@ -137,6 +137,7 @@ SCHEMAS = {
             "notes_file": "file",
             "draft": "bool",
             "prerelease": "bool",
+            "latest": "bool",
         },
     ),
     "release-upload": ({"tag", "assets"}, {**COMMON, "tag": "text", **ASSETS, "clobber": "bool"}),
@@ -4963,7 +4964,7 @@ def publish(
             for key in ("title", "target"):
                 option(key)
             body_file("notes")
-            for key in ("draft", "prerelease"):
+            for key in ("draft", "prerelease", "latest"):
                 if key in fields:
                     argv.append(f"--{key}={str(fields[key]).lower()}")
             if fields.get("clobber"):

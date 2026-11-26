@@ -1367,13 +1367,21 @@ class Cut:
 
     def promote(self, notes: str) -> None:
         self.step = "promote"
+        tag = f"v{self.version}"
         notes_file = self.work / "notes-release.md"
         notes_file.write_text(notes, encoding="utf-8")
-        self.publisher("release-edit", "--repo", self.machinery_repo, "--tag", f"v{self.version}",
-                       "--notes-file", str(notes_file), "--no-prerelease")
+        self.publisher("release-edit", "--repo", self.machinery_repo, "--tag", tag,
+                       "--notes-file", str(notes_file), "--no-prerelease", "--latest")
+        latest = self.probe(
+            ["gh", "api", f"repos/{self.machinery_repo}/releases/latest", "--jq", ".tag_name"],
+            lambda viewed: viewed.stdout.strip() if viewed.returncode == 0 else None,
+        )
+        if latest != tag:
+            raise CutError(f"expected {tag} as the latest release; GitHub returned {latest or 'unknown'}")
         if self.adopt_pr is not None:
+            self.step = "mark adopt PR ready"
             self.publisher("pr-ready", "--repo", self.product_repo, "--number", str(self.adopt_pr))
-        self.say(f"v{self.version} is a full release; adopt PR #{self.adopt_pr} is ready for review")
+        self.say(f"{tag} is the latest release; adopt PR #{self.adopt_pr} is ready for review")
 
     def probe[T](self, argv: Sequence[str | Path], parse: Callable[[subprocess.CompletedProcess[str]], T]) -> T | None:
         """One read of remote state. Any failure, a timeout included, is unknown (None), never an exception."""
@@ -1450,6 +1458,8 @@ class Cut:
         if tagged is None or release is None:
             return f"remote state of {tag} unknown (tag {tagged}, release {release}); nothing withdrawn"
         if release == "released":
+            if cause == "promote":
+                return f"{tag} is a full release. Verify GitHub reports it as Latest before continuing adoption."
             env_prefix = self._recovery_env_prefix()
             x_agent_flag = f" --x-agent {shlex.quote(self.x_agent)}" if self.x_agent else ""
             no_alert_flag = "" if self.alert else " --no-alert"
