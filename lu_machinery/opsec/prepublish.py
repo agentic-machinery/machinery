@@ -85,10 +85,14 @@ def internal_environment(source: Mapping[str, str] | None = None) -> dict[str, s
 
 
 def _git_primary(cwd: Path | None) -> Path | None:
+    environment = internal_environment()
+    if cwd is not None:
+        # Git's inherited repository context belongs to the push, not a named checkout.
+        environment = {key: value for key, value in environment.items() if not key.startswith("GIT_")}
     result = subprocess.run(
         ["git", "rev-parse", "--path-format=absolute", "--git-common-dir"],
         cwd=cwd,
-        env=internal_environment(),
+        env=environment,
         capture_output=True,
         text=True,
         check=False,
@@ -124,8 +128,9 @@ def _policy_checkout() -> Path:
     """Keep executable policy anchored to the configured primary or the in-tree scanner."""
     try:
         from lu_machinery.common.repo_root import primary_root as configured_or_source_primary
+        from lu_machinery.common.repo_root import resolve_path
 
-        return configured_or_source_primary()
+        return resolve_path(configured_or_source_primary(), strict=True)
     except (ImportError, OSError, ValueError):
         raise PublishBlocked("OPSEC: policy checkout unavailable; set LU_PRIMARY_REPO_ROOT.") from None
 

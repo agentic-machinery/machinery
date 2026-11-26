@@ -415,7 +415,8 @@ def _load_private_usage() -> ModuleType | None:
     try:
         from lu_machinery.opsec.prepublish import catalog  # noqa: PLC0415  # lazy-ok: private binding lookup
 
-        path = primary_root().parent / catalog()["infra-private"]["local_name"] / "tools/fleet_usage/usage.py"
+        checkout = primary_root().resolve(strict=True)
+        path = checkout.parent / catalog()["infra-private"]["local_name"] / "tools/fleet_usage/usage.py"
         spec = importlib.util.spec_from_file_location(name, path)
         if spec is None or spec.loader is None:
             raise ImportError

@@ -667,7 +667,10 @@ def test_state_root_is_not_repository_context(configured_roots, monkeypatch, tmp
     state.mkdir()
     pushing = tmp_path / "pushing"
     subprocess.run(["git", "init", "-q", str(pushing)], check=True, capture_output=True, timeout=30)
-    monkeypatch.setenv("LU_PRIMARY_REPO_ROOT", str(configured_roots.primary))
+    alias = tmp_path / "primary-alias"
+    alias.symlink_to(configured_roots.primary, target_is_directory=True)
+    monkeypatch.setenv("LU_PRIMARY_REPO_ROOT", str(alias))
+    monkeypatch.setenv("LEARN_UKRAINIAN_PRIMARY_REPO_ROOT", str(alias))
     monkeypatch.setenv("LU_STATE_ROOT", str(state))
     make_tooling(configured_roots.primary.parent / "private-fixture/tools/public_opsec_scan")
 
@@ -675,6 +678,15 @@ def test_state_root_is_not_repository_context(configured_roots, monkeypatch, tmp
     assert gate.primary_root() == configured_roots.primary
     assert gate.primary_root(pushing) == pushing
     gate.check_texts("github.com/unit/public", ["ordinary public text"], environment={})
+    with monkeypatch.context() as git_environment:
+        git_environment.setenv("GIT_DIR", str(pushing / ".git"))
+        git_environment.setenv("GIT_COMMON_DIR", str(pushing / ".git"))
+        assert gate.primary_root(configured_roots.primary) == configured_roots.primary
+        with pytest.raises(gate.PublishBlocked, match="repository context unavailable"):
+            gate.primary_root(state)
+    with monkeypatch.context() as git_environment:
+        git_environment.setenv("GIT_DIR", str(state / "missing.git"))
+        assert gate.primary_root() == configured_roots.primary
 
     monkeypatch.chdir(pushing)
     assert gate.primary_root() == pushing
