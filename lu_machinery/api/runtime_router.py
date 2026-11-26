@@ -1103,7 +1103,7 @@ def _acp_discussion_participants(value: Any) -> tuple[str, ...]:
     """Return a privacy-safe enabled participant tuple (2-4 seats), tolerating legacy stored shapes."""
     try:
         decoded = json_depth.loads(value, max_depth=512) if isinstance(value, str) else value
-    except (TypeError, ValueError, json.JSONDecodeError):
+    except (TypeError, ValueError, json.JSONDecodeError, RecursionError):
         decoded = None
     enabled: list[str] = []
     if isinstance(decoded, list):
@@ -1577,12 +1577,10 @@ def _acp_transcript_participants(value: Any) -> tuple[tuple[str, ...] | None, st
         return None, "malformed_participants"
     try:
         decoded = json_depth.loads(value, max_depth=512)
-    except (TypeError, ValueError, json.JSONDecodeError):
+    except (TypeError, ValueError, json.JSONDecodeError, RecursionError):
         return None, "malformed_participants"
     if not isinstance(decoded, list):
         return None, "malformed_participants"
-    if not decoded:
-        return _ACP_LEGACY_PARTICIPANTS, None
     enabled: list[str] = []
     for item in decoded:
         if not isinstance(item, str) or item not in _ACP_ENABLED_PARTICIPANTS or item in enabled:
@@ -1618,7 +1616,13 @@ def _open_acp_transcript_store(ctx: MonitorContext) -> tuple[Path, SQLiteConnect
     try:
         has_tables = all(
             _acp_table_exists(connection, table)
-            for table in ("acp_conversations", "acp_conversation_events", "comms_messages")
+            for table in (
+                "acp_conversations",
+                "acp_conversation_events",
+                "comms_messages",
+                "artifacts",
+                "message_artifacts",
+            )
         )
     except sqlite3.Error:
         connection.close()
@@ -1632,8 +1636,10 @@ def _open_acp_transcript_store(ctx: MonitorContext) -> tuple[Path, SQLiteConnect
 def _open_acp_blob_no_follow(plane_root: Path, sha256: str) -> int:
     """Open a CAS blob file under ``plane_root/blobs/sha256/<aa>/<sha256>`` without following symlinks.
 
-    Non-missing errors on shared CAS directories raise ``_AcpBackendUnavailable``; missing
-    directory or leaf components raise ``FileNotFoundError``; leaf-file ``OSError`` propagates.
+    Any error (including missing) on shared CAS root directories (``plane_root``, ``blobs``,
+    ``blobs/sha256``) and any non-missing error on the shard directory raises
+    ``_AcpBackendUnavailable``; a missing shard or leaf component raises ``FileNotFoundError``;
+    leaf-file ``OSError`` propagates.
     """
     cloexec = getattr(os, "O_CLOEXEC", 0)
     dir_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | cloexec
@@ -1643,15 +1649,21 @@ def _open_acp_blob_no_follow(plane_root: Path, sha256: str) -> int:
     except OSError:
         raise _AcpBackendUnavailable("blob_store_unavailable") from None
     try:
-        for part in ("blobs", "sha256", sha256[:2]):
+        for part in ("blobs", "sha256"):
             try:
                 next_fd = os.open(part, dir_flags, dir_fd=parent_fd)
-            except FileNotFoundError:
-                raise
             except OSError:
                 raise _AcpBackendUnavailable("blob_store_unavailable") from None
             os.close(parent_fd)
             parent_fd = next_fd
+        try:
+            shard_fd = os.open(sha256[:2], dir_flags, dir_fd=parent_fd)
+        except FileNotFoundError:
+            raise
+        except OSError:
+            raise _AcpBackendUnavailable("blob_store_unavailable") from None
+        os.close(parent_fd)
+        parent_fd = shard_fd
         return os.open(sha256, file_flags, dir_fd=parent_fd)
     finally:
         os.close(parent_fd)
@@ -1670,38 +1682,39 @@ def _acp_artifact_is_expired(connection: SQLiteConnection, artifact_id: str) -> 
 
 
 def _acp_digest_is_expired(connection: SQLiteConnection, sha256_lower: str) -> bool:
-    """Check whether an ``artifacts`` row matching ``sha256_lower`` carries the retention expiry marker."""
-    row = connection.execute(
-        "SELECT retention_class FROM artifacts WHERE sha256 = ?",
+    """Check whether any ``artifacts`` row matching ``sha256_lower`` carries the retention expiry marker."""
+    rows = connection.execute(
+        "SELECT retention_class FROM artifacts WHERE LOWER(sha256) = ?",
         (sha256_lower,),
-    ).fetchone()
-    if row is None:
-        return False
-    retention_class = row["retention_class"]
-    return isinstance(retention_class, str) and retention_class.startswith(RETENTION_EXPIRED_PREFIX)
+    ).fetchall()
+    return any(
+        isinstance(row["retention_class"], str) and row["retention_class"].startswith(RETENTION_EXPIRED_PREFIX)
+        for row in rows
+    )
 
 
 def _acp_transcript_inline_body(
     value: Any,
     *,
     content_sha256: Any,
-) -> tuple[str, str | None, str | None]:
-    """Validate a legacy inline-only ACP body and return ``(state, reason, body)``."""
+) -> tuple[str, str | None, str | None, str | None]:
+    """Validate a legacy inline-only ACP body and return ``(state, reason, body, sha256)``."""
     if not isinstance(value, str):
-        return _ACP_TRANSCRIPT_STATE_MISSING_OR_CORRUPT, "body_missing", None
+        return _ACP_TRANSCRIPT_STATE_MISSING_OR_CORRUPT, "body_missing", None, None
     try:
         encoded = value.encode("utf-8")
         _acp_json_bytes(value)
     except (UnicodeError, ValueError):
-        return _ACP_TRANSCRIPT_STATE_MISSING_OR_CORRUPT, "body_not_utf8", None
+        return _ACP_TRANSCRIPT_STATE_MISSING_OR_CORRUPT, "body_not_utf8", None, None
+    computed_sha256 = hashlib.sha256(encoded).hexdigest()
     if content_sha256 is not None:
         if not isinstance(content_sha256, str) or not _ACP_SHA256_RE.fullmatch(content_sha256.lower()):
-            return _ACP_TRANSCRIPT_STATE_MISSING_OR_CORRUPT, "content_digest_mismatch", None
-        if hashlib.sha256(encoded).hexdigest() != content_sha256.lower():
-            return _ACP_TRANSCRIPT_STATE_MISSING_OR_CORRUPT, "content_digest_mismatch", None
+            return _ACP_TRANSCRIPT_STATE_MISSING_OR_CORRUPT, "content_digest_mismatch", None, None
+        if computed_sha256 != content_sha256.lower():
+            return _ACP_TRANSCRIPT_STATE_MISSING_OR_CORRUPT, "content_digest_mismatch", None, None
     if len(encoded) > _ACP_TRANSCRIPT_MAX_BODY_BYTES:
-        return _ACP_TRANSCRIPT_STATE_OVERSIZED_OR_PARTIAL, "body_too_large", None
-    return _ACP_TRANSCRIPT_STATE_OK, None, value
+        return _ACP_TRANSCRIPT_STATE_OVERSIZED_OR_PARTIAL, "body_too_large", None, computed_sha256
+    return _ACP_TRANSCRIPT_STATE_OK, None, value, computed_sha256
 
 
 def _read_acp_artifact_body(
@@ -1710,44 +1723,44 @@ def _read_acp_artifact_body(
     artifact_id: str,
     *,
     content_sha256: Any,
-) -> tuple[str, str | None, str | None]:
+) -> tuple[str, str | None, str | None, str | None]:
     """Read an integrity-checked CAS body, withholding expired blobs and handling the mark/unlink race."""
     artifact_row = connection.execute(
         "SELECT sha256, bytes, retention_class FROM artifacts WHERE artifact_id = ?",
         (artifact_id,),
     ).fetchone()
     if artifact_row is None:
-        return _ACP_TRANSCRIPT_STATE_MISSING_OR_CORRUPT, "artifact_row_missing", None
+        return _ACP_TRANSCRIPT_STATE_MISSING_OR_CORRUPT, "artifact_row_missing", None, None
 
     retention_class = artifact_row["retention_class"]
     if not isinstance(retention_class, str):
-        return _ACP_TRANSCRIPT_STATE_MISSING_OR_CORRUPT, "artifact_metadata_corrupt", None
+        return _ACP_TRANSCRIPT_STATE_MISSING_OR_CORRUPT, "artifact_metadata_corrupt", None, None
     if retention_class.startswith(RETENTION_EXPIRED_PREFIX):
-        return _ACP_TRANSCRIPT_STATE_BODY_EXPIRED, "body_expired", None
+        return _ACP_TRANSCRIPT_STATE_BODY_EXPIRED, "body_expired", None, None
 
     raw_sha = artifact_row["sha256"]
     if not isinstance(raw_sha, str) or not _ACP_SHA256_RE.fullmatch(raw_sha.lower()):
-        return _ACP_TRANSCRIPT_STATE_MISSING_OR_CORRUPT, "artifact_metadata_corrupt", None
+        return _ACP_TRANSCRIPT_STATE_MISSING_OR_CORRUPT, "artifact_metadata_corrupt", None, None
     sha256 = raw_sha.lower()
 
     if content_sha256 is not None and (not isinstance(content_sha256, str) or content_sha256.lower() != sha256):
-        return _ACP_TRANSCRIPT_STATE_MISSING_OR_CORRUPT, "content_digest_mismatch", None
+        return _ACP_TRANSCRIPT_STATE_MISSING_OR_CORRUPT, "content_digest_mismatch", None, None
 
     declared_bytes = artifact_row["bytes"]
     if isinstance(declared_bytes, bool) or not isinstance(declared_bytes, int) or declared_bytes < 0:
-        return _ACP_TRANSCRIPT_STATE_MISSING_OR_CORRUPT, "artifact_metadata_corrupt", None
+        return _ACP_TRANSCRIPT_STATE_MISSING_OR_CORRUPT, "artifact_metadata_corrupt", None, None
 
     try:
         blob_fd = _open_acp_blob_no_follow(plane_root, sha256)
     except FileNotFoundError:
         if _acp_artifact_is_expired(connection, artifact_id):
-            return _ACP_TRANSCRIPT_STATE_BODY_EXPIRED, "body_expired", None
-        return _ACP_TRANSCRIPT_STATE_MISSING_OR_CORRUPT, "blob_missing", None
+            return _ACP_TRANSCRIPT_STATE_BODY_EXPIRED, "body_expired", None, sha256
+        return _ACP_TRANSCRIPT_STATE_MISSING_OR_CORRUPT, "blob_missing", None, sha256
     except _AcpBackendUnavailable:
         raise
     except OSError as exc:
         if exc.errno in (errno.ELOOP, errno.ENOTDIR, errno.EISDIR):
-            return _ACP_TRANSCRIPT_STATE_MISSING_OR_CORRUPT, "blob_not_regular_file", None
+            return _ACP_TRANSCRIPT_STATE_MISSING_OR_CORRUPT, "blob_not_regular_file", None, sha256
         raise _AcpBackendUnavailable("blob_store_unavailable") from None
 
     try:
@@ -1756,13 +1769,13 @@ def _read_acp_artifact_body(
         except OSError:
             raise _AcpBackendUnavailable("blob_store_unavailable") from None
         if not stat.S_ISREG(st.st_mode):
-            return _ACP_TRANSCRIPT_STATE_MISSING_OR_CORRUPT, "blob_not_regular_file", None
+            return _ACP_TRANSCRIPT_STATE_MISSING_OR_CORRUPT, "blob_not_regular_file", None, sha256
         if st.st_size != declared_bytes:
-            return _ACP_TRANSCRIPT_STATE_MISSING_OR_CORRUPT, "blob_digest_mismatch", None
+            return _ACP_TRANSCRIPT_STATE_MISSING_OR_CORRUPT, "blob_digest_mismatch", None, sha256
         if declared_bytes > _ACP_TRANSCRIPT_MAX_BODY_BYTES:
             if _acp_artifact_is_expired(connection, artifact_id):
-                return _ACP_TRANSCRIPT_STATE_BODY_EXPIRED, "body_expired", None
-            return _ACP_TRANSCRIPT_STATE_OVERSIZED_OR_PARTIAL, "body_too_large", None
+                return _ACP_TRANSCRIPT_STATE_BODY_EXPIRED, "body_expired", None, sha256
+            return _ACP_TRANSCRIPT_STATE_OVERSIZED_OR_PARTIAL, "body_too_large", None, sha256
         try:
             with os.fdopen(blob_fd, "rb") as handle:
                 blob_fd = -1
@@ -1774,15 +1787,15 @@ def _read_acp_artifact_body(
             os.close(blob_fd)
 
     if _acp_artifact_is_expired(connection, artifact_id):
-        return _ACP_TRANSCRIPT_STATE_BODY_EXPIRED, "body_expired", None
+        return _ACP_TRANSCRIPT_STATE_BODY_EXPIRED, "body_expired", None, sha256
     if len(raw) != declared_bytes or hashlib.sha256(raw).hexdigest() != sha256:
-        return _ACP_TRANSCRIPT_STATE_MISSING_OR_CORRUPT, "blob_digest_mismatch", None
+        return _ACP_TRANSCRIPT_STATE_MISSING_OR_CORRUPT, "blob_digest_mismatch", None, sha256
     try:
         text = raw.decode("utf-8")
         _acp_json_bytes(text)
     except (UnicodeError, ValueError):
-        return _ACP_TRANSCRIPT_STATE_MISSING_OR_CORRUPT, "body_not_utf8", None
-    return _ACP_TRANSCRIPT_STATE_OK, None, text
+        return _ACP_TRANSCRIPT_STATE_MISSING_OR_CORRUPT, "body_not_utf8", None, sha256
+    return _ACP_TRANSCRIPT_STATE_OK, None, text, sha256
 
 
 def _acp_transcript_payload(
@@ -1825,13 +1838,24 @@ def _acp_transcript_entries(
         """
         SELECT messages.message_id, messages.kind, messages.sender, messages.recipient,
                messages.body_inline, messages.body_artifact_id, messages.content_sha256,
-               messages.created_at, event_round.round
+               messages.created_at, event_round.round, event_round.round_invalid
         FROM (
             SELECT message_id, MIN(sequence) AS message_sequence,
                    CASE
-                       WHEN MIN(round) = MAX(round) AND MIN(round) >= 1
+                       WHEN COUNT(round) = 0 THEN NULL
+                       WHEN COUNT(round) = COUNT(*)
+                            AND SUM(CASE WHEN typeof(round) != 'integer' OR round < 1 THEN 1 ELSE 0 END) = 0
+                            AND MIN(round) = MAX(round)
                        THEN MIN(round)
-                   END AS round
+                   END AS round,
+                   CASE
+                       WHEN COUNT(round) = 0 THEN 0
+                       WHEN COUNT(round) = COUNT(*)
+                            AND SUM(CASE WHEN typeof(round) != 'integer' OR round < 1 THEN 1 ELSE 0 END) = 0
+                            AND MIN(round) = MAX(round)
+                       THEN 0
+                       ELSE 1
+                   END AS round_invalid
             FROM acp_conversation_events
             WHERE conversation_id = ? AND message_id IS NOT NULL
             GROUP BY message_id
@@ -1848,15 +1872,16 @@ def _acp_transcript_entries(
     truncated = len(rows) > _ACP_TRANSCRIPT_MAX_MESSAGES
     rows = rows[:_ACP_TRANSCRIPT_MAX_MESSAGES]
 
-    has_artifacts_table = _acp_table_exists(connection, "artifacts")
-    has_message_artifacts_table = _acp_table_exists(connection, "message_artifacts")
     allowed_lanes = frozenset({"root", "codex", *participants})
 
     entries: list[dict[str, Any]] = []
     candidates: list[tuple[int, str, str | None, str | None]] = []
 
     for index, row in enumerate(rows, start=1):
-        round_number = _acp_int(row["round"], minimum=1)
+        round_invalid = bool(row["round_invalid"])
+        round_number = None if round_invalid else _acp_int(row["round"], minimum=1)
+        if not round_invalid and row["round"] is not None and round_number is None:
+            round_invalid = True
         artifact_id: str | None = None
         digest_lower: str | None = None
         if row["message_id"] is None:
@@ -1869,7 +1894,7 @@ def _acp_transcript_entries(
             sender = _acp_text(row["sender"], allowed=allowed_lanes)
             recipient = _acp_text(row["recipient"], allowed=allowed_lanes)
             created_at = _acp_timestamp(row["created_at"])
-            if None in (kind, sender, recipient, created_at):
+            if round_invalid or None in (kind, sender, recipient, created_at):
                 state = _ACP_TRANSCRIPT_STATE_MISSING_OR_CORRUPT
                 reason = "malformed_turn_metadata"
                 body = None
@@ -1881,7 +1906,7 @@ def _acp_transcript_entries(
                         artifact_id = raw_artifact_id
                     else:
                         artifact_ref_error = "malformed_artifact_reference"
-                elif has_message_artifacts_table:
+                else:
                     linked = connection.execute(
                         """SELECT artifact_id FROM message_artifacts
                            WHERE message_id = ? AND relation = 'body'
@@ -1906,23 +1931,29 @@ def _acp_transcript_entries(
                     reason = artifact_ref_error
                     body = None
                 elif artifact_id is not None:
-                    if not has_artifacts_table:
-                        raise _AcpBackendUnavailable("schema_unavailable")
-                    state, reason, body = _read_acp_artifact_body(
+                    state, reason, body, artifact_sha256 = _read_acp_artifact_body(
                         connection,
                         plane_root,
                         artifact_id,
                         content_sha256=row["content_sha256"],
                     )
-                elif has_artifacts_table and digest_lower is not None and _acp_digest_is_expired(connection, digest_lower):
+                    if artifact_sha256 is not None:
+                        digest_lower = artifact_sha256
+                elif digest_lower is not None and _acp_digest_is_expired(connection, digest_lower):
                     state = _ACP_TRANSCRIPT_STATE_BODY_EXPIRED
                     reason = "body_expired"
                     body = None
                 else:
-                    state, reason, body = _acp_transcript_inline_body(
+                    state, reason, body, inline_sha256 = _acp_transcript_inline_body(
                         row["body_inline"],
                         content_sha256=row["content_sha256"],
                     )
+                    if inline_sha256 is not None:
+                        digest_lower = inline_sha256
+                        if _acp_digest_is_expired(connection, inline_sha256):
+                            state = _ACP_TRANSCRIPT_STATE_BODY_EXPIRED
+                            reason = "body_expired"
+                            body = None
 
         entry: dict[str, Any] = {
             "ordinal": index,
@@ -1941,10 +1972,11 @@ def _acp_transcript_entries(
         if state == _ACP_TRANSCRIPT_STATE_OK and body is not None:
             candidates.append((len(entries) - 1, body, artifact_id, digest_lower))
 
-    # Recheck retention for ALL candidate turns (both CAS artifact IDs and inline digests) in ONE
+    # Recheck retention for ALL candidate turns (both CAS artifact IDs and inline digests,
+    # including legacy inline rows whose digest was derived from validated UTF-8 bytes) in ONE
     # single SQLite SELECT snapshot after the last blob read finishes, BEFORE response budgeting.
     surviving: list[tuple[int, str]] = []
-    if candidates and has_artifacts_table:
+    if candidates:
         art_ids = sorted({art_id for _, _, art_id, _ in candidates if art_id is not None})
         digests = sorted({digest for _, _, _, digest in candidates if digest is not None})
         expired_art_ids: set[str] = set()
@@ -1955,7 +1987,7 @@ def _acp_transcript_entries(
             where_parts.append(f"artifact_id IN ({','.join('?' for _ in art_ids)})")
             params.extend(art_ids)
         if digests:
-            where_parts.append(f"sha256 IN ({','.join('?' for _ in digests)})")
+            where_parts.append(f"LOWER(sha256) IN ({','.join('?' for _ in digests)})")
             params.extend(digests)
         if where_parts:
             for art_row in connection.execute(
@@ -1978,8 +2010,6 @@ def _acp_transcript_entries(
                 entries[entry_idx]["body"] = None
             else:
                 surviving.append((entry_idx, text))
-    else:
-        surviving = [(entry_idx, text) for entry_idx, text, _, _ in candidates]
 
     # Budget surviving turns per the response-cap contract: reserve each undecided turn's smaller
     # serialized representation (ok when ok <= oversized_or_partial, else oversized_or_partial),

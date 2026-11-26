@@ -47,7 +47,13 @@ def _write_usage_file(path, records: list[dict]) -> None:
             handle.write(json.dumps(record) + "\n")
 
 
-def _write_acp_db(root, conversations: list[tuple], events: list[tuple]) -> None:
+def _write_acp_db(
+    root,
+    conversations: list[tuple],
+    events: list[tuple],
+    *,
+    include_artifact_tables: bool = True,
+) -> None:
     root.mkdir(parents=True, exist_ok=True)
     connection = sqlite3.connect(root / "comms.sqlite3")
     try:
@@ -98,6 +104,27 @@ def _write_acp_db(root, conversations: list[tuple], events: list[tuple]) -> None
             );
             """
         )
+        if include_artifact_tables:
+            connection.executescript(
+                """
+                CREATE TABLE artifacts (
+                    artifact_id TEXT PRIMARY KEY,
+                    sha256 TEXT NOT NULL UNIQUE,
+                    bytes INTEGER NOT NULL,
+                    mime_type TEXT,
+                    logical_filename TEXT,
+                    producer TEXT NOT NULL,
+                    retention_class TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE TABLE message_artifacts (
+                    message_id TEXT NOT NULL,
+                    artifact_id TEXT NOT NULL,
+                    relation TEXT NOT NULL,
+                    PRIMARY KEY (message_id, artifact_id, relation)
+                );
+                """
+            )
         connection.executemany(
             "INSERT INTO acp_conversations VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             conversations,
@@ -287,7 +314,7 @@ def test_acp_transcript_is_loopback_only_ordered_allowlisted_and_no_store(tmp_pa
     root = tmp_path / "plane"
     now = datetime.now(UTC)
     conversation = (
-        "conv-transcript", "secret", "secret", "secret", 1, "[]", _iso(now), None, 1, 1,
+        "conv-transcript", "secret", "secret", "secret", 1, '["codex", "claude"]', _iso(now), None, 1, 1,
     )
     events = [
         (
@@ -306,18 +333,6 @@ def test_acp_transcript_is_loopback_only_ordered_allowlisted_and_no_store(tmp_pa
     _write_acp_db(root, [conversation], events)
     connection = sqlite3.connect(root / "comms.sqlite3")
     try:
-        connection.execute(
-            """CREATE TABLE artifacts (
-                artifact_id TEXT PRIMARY KEY,
-                sha256 TEXT NOT NULL UNIQUE,
-                bytes INTEGER NOT NULL,
-                mime_type TEXT,
-                logical_filename TEXT,
-                producer TEXT NOT NULL,
-                retention_class TEXT NOT NULL,
-                created_at TEXT NOT NULL
-            )"""
-        )
         artifacts_data = [
             ("artifact-secret-later", "second body"),
             ("artifact-secret-early", "first body"),
@@ -462,7 +477,7 @@ def test_acp_transcript_is_loopback_only_ordered_allowlisted_and_no_store(tmp_pa
 def _seed_transcript_db(root: Path) -> None:
     now = datetime.now(UTC)
     conversation = (
-        "conv-guarded", "secret", "secret", "secret", 1, "[]", _iso(now), None, 1, 1,
+        "conv-guarded", "secret", "secret", "secret", 1, '["codex", "claude"]', _iso(now), None, 1, 1,
     )
     events = [
         (
@@ -860,7 +875,7 @@ def test_acp_transcript_hides_unavailable_malformed_and_body_free_routes(tmp_pat
     root = tmp_path / "plane"
     now = datetime.now(UTC)
     conversation = (
-        "conv-malformed", "secret", "secret", "secret", 1, "[]", _iso(now), None, 1, 1,
+        "conv-malformed", "secret", "secret", "secret", 1, '["codex", "claude"]', _iso(now), None, 1, 1,
     )
     _write_acp_db(root, [conversation], [])
     connection = sqlite3.connect(root / "comms.sqlite3")
@@ -1184,26 +1199,39 @@ def test_acp_transcript_state_body_expired_withholds_inline_and_handles_race(tmp
             "UPDATE artifacts SET created_at = ? WHERE artifact_id = ?",
             (old_ts, shared_records[0][1]),
         )
-        # Add a legacy inline-only turn sharing the same content_sha256 (body_artifact_id IS NULL).
-        shared_store.connection.execute(
+        # Add a legacy inline-only turn sharing the same content_sha256 (body_artifact_id IS NULL),
+        # plus a legacy inline-only turn with content_sha256 IS NULL holding the same bytes (PR1498-F1).
+        shared_store.connection.executemany(
             """INSERT INTO comms_messages(
                 message_id, conversation_id, kind, sender, recipient, body_inline,
                 body_artifact_id, content_sha256, metadata_json, created_at
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (
-                "msg-inline-shared", conv_shared, "reply", "claude", "root", shared_secret,
-                None, shared_records[0][2], "{}", old_ts,
-            ),
+            [
+                (
+                    "msg-inline-shared", conv_shared, "reply", "claude", "root", shared_secret,
+                    None, shared_records[0][2], "{}", old_ts,
+                ),
+                (
+                    "msg-inline-null-sha", conv_shared, "reply", "claude", "root", shared_secret,
+                    None, None, "{}", old_ts,
+                ),
+            ],
         )
-        shared_store.connection.execute(
+        shared_store.connection.executemany(
             """INSERT INTO acp_conversation_events(
                 event_id, conversation_id, sequence, event_type, state, sender, recipient,
                 round, outcome, message_id, metadata_json, created_at
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (
-                "evt-inline-shared", conv_shared, 50, "CALL_TERMINAL", "COMPLETE", "claude", "root",
-                1, "succeeded", "msg-inline-shared", "{}", old_ts,
-            ),
+            [
+                (
+                    "evt-inline-shared", conv_shared, 50, "CALL_TERMINAL", "COMPLETE", "claude", "root",
+                    1, "succeeded", "msg-inline-shared", "{}", old_ts,
+                ),
+                (
+                    "evt-inline-null-sha", conv_shared, 51, "CALL_TERMINAL", "COMPLETE", "claude", "root",
+                    1, "succeeded", "msg-inline-null-sha", "{}", old_ts,
+                ),
+            ],
         )
         shared_store.connection.commit()
         os.utime(shared_store.blob_path_for(shared_records[0][2]), (1_577_836_800, 1_577_836_800))
@@ -1228,9 +1256,10 @@ def test_acp_transcript_state_body_expired_withholds_inline_and_handles_race(tmp
     assert shared_resp.status_code == 200
     shared_data = shared_resp.json()
     assert shared_data["state"] == "body_expired"
-    assert [m["state"] for m in shared_data["messages"]] == ["body_expired", "ok", "body_expired"]
+    assert [m["state"] for m in shared_data["messages"]] == ["body_expired", "ok", "body_expired", "body_expired"]
     assert shared_data["messages"][0]["body"] is None
     assert shared_data["messages"][2]["body"] is None
+    assert shared_data["messages"][3]["body"] is None
     assert shared_secret not in shared_resp.text
 
 
@@ -1249,6 +1278,8 @@ def test_acp_transcript_state_missing_or_corrupt_covers_blobs_turns_and_particip
             ("reply", "claude", "root", "missing artifact row", 1),
             ("reply", "codex", "root", "poisoned metadata body", 1),
             ("reply", "claude", "root", "overflow timestamp body", 1),
+            ("reply", "codex", "root", "broken round body", 1),
+            ("synthesis", "codex", "root", "valid synthesis without round", None),
         ],
     )
     # 1. Missing blob WITHOUT expired marker.
@@ -1289,6 +1320,11 @@ def test_acp_transcript_state_missing_or_corrupt_covers_blobs_turns_and_particip
             "UPDATE comms_messages SET created_at = '0001-01-01T00:00:00+00:01' WHERE message_id = ?",
             (records[6][0],),
         )
+        # 5c. Non-integer event round on turn 8 (PR1498-F4).
+        conn.execute(
+            "UPDATE acp_conversation_events SET round = 'broken-round' WHERE message_id = ?",
+            (records[7][0],),
+        )
         # 6. Dangling event referencing a missing comms_messages row.
         conn.execute(
             """INSERT INTO acp_conversation_events(
@@ -1312,9 +1348,12 @@ def test_acp_transcript_state_missing_or_corrupt_covers_blobs_turns_and_particip
     data = resp.json()
     assert data["state"] == "missing_or_corrupt"
     assert data["label"] == "missing or corrupt"
-    assert len(data["messages"]) == 8
+    assert len(data["messages"]) == 10
     assert data["messages"][0]["state"] == "ok"
     assert data["messages"][0]["body"] == "healthy turn"
+    assert data["messages"][8]["state"] == "ok"
+    assert data["messages"][8]["body"] == "valid synthesis without round"
+    assert "round" not in data["messages"][8]
     expected_reasons = [
         (1, "blob_missing"),
         (2, "blob_digest_mismatch"),
@@ -1322,7 +1361,8 @@ def test_acp_transcript_state_missing_or_corrupt_covers_blobs_turns_and_particip
         (4, "artifact_row_missing"),
         (5, "malformed_turn_metadata"),
         (6, "malformed_turn_metadata"),
-        (7, "message_row_missing"),
+        (7, "malformed_turn_metadata"),
+        (9, "message_row_missing"),
     ]
     for idx, expected_reason in expected_reasons:
         turn = data["messages"][idx]
@@ -1330,11 +1370,22 @@ def test_acp_transcript_state_missing_or_corrupt_covers_blobs_turns_and_particip
         assert turn["label"] == "missing or corrupt", (idx, turn)
         assert turn["reason"] == expected_reason, (idx, turn)
         assert turn["body"] is None, (idx, turn)
-    for forbidden in (unlinked_secret, tampered_secret, "intruder-seat", "poisoned metadata body", "overflow timestamp body"):
+    assert "round" not in data["messages"][7]
+    for forbidden in (
+        unlinked_secret,
+        tampered_secret,
+        "intruder-seat",
+        "poisoned metadata body",
+        "overflow timestamp body",
+        "broken round body",
+    ):
         assert forbidden not in resp.text
 
-    # Malformed participant items (unhashable dicts/lists, >4 seats, <2 seats, unknown seats) refused with typed reason.
+    # Malformed participant items (empty [], over-deep JSON, unhashable, >4 seats, <2 seats, unknown seats) refused.
+    over_deep_participants = "[" * 513 + "]" * 513
     for bad_participants in (
+        '[]',
+        over_deep_participants,
         '[{"nested": 1}]',
         '[["codex"]]',
         '[123, "codex"]',
@@ -1368,8 +1419,12 @@ def test_acp_transcript_state_missing_or_corrupt_covers_blobs_turns_and_particip
         assert "unhashable" not in bad_resp.text
         assert "healthy turn" not in bad_resp.text
 
-    # Body-free routes also tolerate unhashable or >4 participant items without raising TypeError.
-    for body_free_participants in ('[{"nested": 1}]', '["codex", "claude", "agy", "grok", "cursor"]'):
+    # Body-free routes also tolerate unhashable, over-deep, or >4 participant items without raising 500.
+    for body_free_participants in (
+        over_deep_participants,
+        '[{"nested": 1}]',
+        '["codex", "claude", "agy", "grok", "cursor"]',
+    ):
         conn = sqlite3.connect(root / "comms.sqlite3")
         try:
             conn.execute(
@@ -1410,13 +1465,14 @@ def test_acp_transcript_state_backend_unavailable_returns_503_and_reserves_404(t
     assert corrupt_resp.json()["state"] == "backend_unavailable"
     assert corrupt_resp.json()["reason"] == "store_unavailable"
 
-    # 3. Missing artifacts table when a message references body_artifact_id -> 503 schema_unavailable.
+    # 3. Missing artifacts or message_artifacts tables -> 503 schema_unavailable for existing and unknown IDs (PR1498-F2).
     no_art_root = tmp_path / "no-artifacts-table"
     now = datetime.now(UTC)
     _write_acp_db(
         no_art_root,
-        [("conv-no-art", "t", "c", "i", 1, "[]", _iso(now), None, 1, 1)],
+        [("conv-no-art", "t", "c", "i", 1, '["codex", "claude"]', _iso(now), None, 1, 1)],
         [("evt-1", "conv-no-art", 1, "CALL_TERMINAL", "COMPLETE", "codex", "root", 1, "ok", 1, 1, "s", "msg-1", "{}", _iso(now))],
+        include_artifact_tables=False,
     )
     conn = sqlite3.connect(no_art_root / "comms.sqlite3")
     try:
@@ -1430,11 +1486,33 @@ def test_acp_transcript_state_backend_unavailable_returns_503_and_reserves_404(t
     finally:
         conn.close()
     monkeypatch.setenv("FLEET_COMMS_ROOT", str(no_art_root))
-    no_art_resp = local.get("/api/runtime/acp/conversations/conv-no-art/transcript")
-    assert no_art_resp.status_code == 503
-    assert no_art_resp.json()["state"] == "backend_unavailable"
-    assert no_art_resp.json()["reason"] == "schema_unavailable"
-    assert "must not leak" not in no_art_resp.text
+    for target_id in ("conv-no-art", "unknown-id"):
+        no_art_resp = local.get(f"/api/runtime/acp/conversations/{target_id}/transcript")
+        assert no_art_resp.status_code == 503
+        assert no_art_resp.headers["cache-control"] == "no-store"
+        assert no_art_resp.json()["state"] == "backend_unavailable"
+        assert no_art_resp.json()["reason"] == "schema_unavailable"
+        assert "must not leak" not in no_art_resp.text
+
+    no_msg_art_root = tmp_path / "no-message-artifacts-table"
+    conv_no_ma, _ = _create_controller_conversation(
+        no_msg_art_root,
+        turns=[("request", "root", "codex", "cas body must not leak", 1)],
+    )
+    conn = sqlite3.connect(no_msg_art_root / "comms.sqlite3")
+    try:
+        conn.execute("DROP TABLE message_artifacts")
+        conn.commit()
+    finally:
+        conn.close()
+    monkeypatch.setenv("FLEET_COMMS_ROOT", str(no_msg_art_root))
+    for target_id in (conv_no_ma, "unknown-id"):
+        no_ma_resp = local.get(f"/api/runtime/acp/conversations/{target_id}/transcript")
+        assert no_ma_resp.status_code == 503
+        assert no_ma_resp.headers["cache-control"] == "no-store"
+        assert no_ma_resp.json()["state"] == "backend_unavailable"
+        assert no_ma_resp.json()["reason"] == "schema_unavailable"
+        assert "cas body must not leak" not in no_ma_resp.text
 
     # 4. Real store: unknown conversation id -> 404 ONLY after successful lookup.
     good_root = tmp_path / "good-plane"
@@ -1448,7 +1526,7 @@ def test_acp_transcript_state_backend_unavailable_returns_503_and_reserves_404(t
     assert not_found.headers["cache-control"] == "no-store"
     assert not_found.json() == {"detail": "Conversation not found", "reason": "conversation_not_found"}
 
-    # 5. Shared CAS directory replaced with a regular file (ENOTDIR) -> 503 blob_store_unavailable (F2).
+    # 5. Shared CAS directory missing or replaced with a regular file -> 503 blob_store_unavailable (PR1493-F2).
     bad_blobs_root = tmp_path / "bad-blobs-dir"
     conv_bad_dir, _ = _create_controller_conversation(
         bad_blobs_root,
@@ -1456,9 +1534,26 @@ def test_acp_transcript_state_backend_unavailable_returns_503_and_reserves_404(t
     )
     import shutil
 
-    shutil.rmtree(bad_blobs_root / "blobs")
-    (bad_blobs_root / "blobs").write_text("not a directory", encoding="utf-8")
+    # 5a. Missing blobs/sha256 directory -> 503.
+    (bad_blobs_root / "blobs" / "sha256").rename(bad_blobs_root / "blobs" / "sha256-moved")
     monkeypatch.setenv("FLEET_COMMS_ROOT", str(bad_blobs_root))
+    missing_sha_dir_resp = local.get(f"/api/runtime/acp/conversations/{conv_bad_dir}/transcript")
+    assert missing_sha_dir_resp.status_code == 503
+    assert missing_sha_dir_resp.headers["cache-control"] == "no-store"
+    assert missing_sha_dir_resp.json()["state"] == "backend_unavailable"
+    assert missing_sha_dir_resp.json()["reason"] == "blob_store_unavailable"
+
+    # 5b. Missing blobs directory (renamed aside) -> 503.
+    (bad_blobs_root / "blobs").rename(bad_blobs_root / "blobs-moved")
+    missing_blobs_resp = local.get(f"/api/runtime/acp/conversations/{conv_bad_dir}/transcript")
+    assert missing_blobs_resp.status_code == 503
+    assert missing_blobs_resp.headers["cache-control"] == "no-store"
+    assert missing_blobs_resp.json()["state"] == "backend_unavailable"
+    assert missing_blobs_resp.json()["reason"] == "blob_store_unavailable"
+
+    # 5c. Regular file in place of blobs directory (ENOTDIR) -> 503.
+    shutil.rmtree(bad_blobs_root / "blobs-moved")
+    (bad_blobs_root / "blobs").write_text("not a directory", encoding="utf-8")
     bad_dir_resp = local.get(f"/api/runtime/acp/conversations/{conv_bad_dir}/transcript")
     assert bad_dir_resp.status_code == 503
     assert bad_dir_resp.headers["cache-control"] == "no-store"
