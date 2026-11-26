@@ -1686,6 +1686,25 @@
         ]
       }
     },
+    "skills/verify-ukrainian/SKILL.md": {
+      "mode": 420,
+      "owner": "fleet",
+      "targets": {
+        "agy": [
+          ".agent/skills/verify-ukrainian/SKILL.md",
+          ".agents/skills/verify-ukrainian/SKILL.md"
+        ],
+        "claude": [
+          ".claude/skills/verify-ukrainian/SKILL.md"
+        ],
+        "codex": [
+          ".agents/skills/verify-ukrainian/SKILL.md"
+        ],
+        "cursor": [
+          ".cursor/skills/verify-ukrainian/SKILL.md"
+        ]
+      }
+    },
     "skills/verify/SKILL.md": {
       "mode": 420,
       "owner": "fleet",
