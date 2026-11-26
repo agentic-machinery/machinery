@@ -1228,6 +1228,12 @@ def test_incoherent_check_row_all_green_run_recovers_with_full_rerun(setup, mode
         ("failed-run-malformed-sibling-conclusion", "RECOVERY_RUN_INVALID"),
         ("failed-run-unknown-sibling-conclusion", "RECOVERY_RUN_INVALID"),
         ("failed-run-malformed-sibling-id", "RECOVERY_RUN_INVALID"),
+        ("failed-run-malformed-sibling-id-no-total-count", "RECOVERY_RUN_INVALID"),
+        ("failed-run-non-dict-job-row", "RECOVERY_RUN_INVALID"),
+        ("merge-group-incoherent-run", "RECOVERY_RUN_INVALID"),
+        ("non-pr-event-with-pr-association", "RECOVERY_RUN_INVALID"),
+        ("malformed-pr-association-head-null", "RECOVERY_RUN_INVALID"),
+        ("malformed-pr-association-head-sha", "RECOVERY_RUN_INVALID"),
         ("failing-job-on-green-run", "RECOVERY_RUN_INVALID"),
         ("failing-step-on-incoherent-job", "RECOVERY_RUN_INVALID"),
         ("incomplete-step-on-incoherent-job", "RECOVERY_RUN_INVALID"),
@@ -1338,12 +1344,49 @@ def test_coherent_or_invalid_all_green_run_refuses_recovery(setup, case, expecte
         transport.conclusion = "failure"
         transport.jobs_pages = [
             {
+                "total_count": 2,
+                "jobs": [
+                    {"id": 456, "status": "completed", "conclusion": "failure"},
+                    {"id": [457], "status": "completed", "conclusion": "failure"},
+                ],
+            }
+        ]
+    elif case == "failed-run-malformed-sibling-id-no-total-count":
+        transport.conclusion = "failure"
+        transport.jobs_pages = [
+            {
                 "jobs": [
                     {"id": 456, "status": "completed", "conclusion": "failure"},
                     {"id": [457], "status": "completed", "conclusion": "failure"},
                 ]
             }
         ]
+    elif case == "failed-run-non-dict-job-row":
+        transport.conclusion = "failure"
+        transport.jobs_pages = [
+            {
+                "total_count": 2,
+                "jobs": [
+                    {"id": 456, "status": "completed", "conclusion": "failure"},
+                    "not-a-job-dict",
+                ],
+            }
+        ]
+    elif case == "merge-group-incoherent-run":
+        transport.event = "merge_group"
+        transport.proof.update(
+            diagnosis="infrastructure",
+            undermines_approval=False,
+            failed_tests=[],
+            queue_group_diff={"base_sha": "d" * 40, "head_sha": TESTED, "paths": ["scripts/build.py"]},
+        )
+    elif case == "non-pr-event-with-pr-association":
+        transport.event = "push"
+        transport.associations = [{"number": 42, "head": {"sha": HEAD}}]
+    elif case == "malformed-pr-association-head-null":
+        transport.associations = [{"number": 42, "head": None}]
+    elif case == "malformed-pr-association-head-sha":
+        transport.associations = [{"number": 42, "head": {"sha": "not-a-sha"}}]
     elif case == "failing-job-on-green-run":
         transport.jobs[0]["conclusion"] = "failure"
     elif case == "failing-step-on-incoherent-job":

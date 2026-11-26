@@ -20,6 +20,7 @@ RECOVERY_ACTIONS = frozenset({"run-rerun", "re-enqueue"})
 CANCELLED_MERGE_GROUP_RECOVERY_MODE = "cancelled_merge_group_no_artifact"
 INCOHERENT_CHECK_RECOVERY_MODE = "incoherent_check_row_full_rerun"
 DEFAULT_REQUIRED_WORKFLOW = ".github/workflows/ci.yml"
+PR_WORKFLOW_EVENTS = frozenset({"pull_request", "pull_request_target"})
 PASSING_RUN_CONCLUSIONS = frozenset({"success", "skipped", "neutral"})
 _PASSING_JOB_CONCLUSIONS = frozenset({"success", "skipped", "neutral"})
 _INCOHERENT_JOB_STATUSES = frozenset({"in_progress", "queued", "pending", "waiting", "expected", "requested", "stale"})
@@ -57,6 +58,10 @@ def incoherent_completed_run_job_ids(run: object, jobs: object) -> set[int] | No
     run_id = run.get("id")
     if type(run_id) is not int or run_id <= 0:
         return None
+    if "event" in run:
+        run_event = run.get("event")
+        if not isinstance(run_event, str) or run_event not in PR_WORKFLOW_EVENTS:
+            return None
     run_conclusion = run.get("conclusion")
     if (
         run.get("status") != "completed"

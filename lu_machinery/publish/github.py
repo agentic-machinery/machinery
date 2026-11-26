@@ -892,26 +892,30 @@ def _prepare_recovery(verb, fields, dest, cwd, environment, runner):
                 ):
                     raise ValueError("jobs pagination incomplete")
                 collected = [job for page in value for job in page["jobs"]]
-                if not all(isinstance(job, dict) for job in collected):
-                    raise ValueError("jobs row malformed")
                 totals = [page["total_count"] for page in value if "total_count" in page]
+                if totals and (
+                    len(totals) != len(value)
+                    or any(type(total) is not int or total < 0 for total in totals)
+                    or len(set(totals)) != 1
+                    or len(collected) != totals[0]
+                ):
+                    raise ValueError("jobs pagination incomplete")
+                if not all(isinstance(job, dict) for job in collected):
+                    raise gate.PublishBlocked("RECOVERY_RUN_INVALID: malformed job metadata")
+                ids = [job.get("id") for job in collected]
+                if any(type(job_id) is not int or job_id <= 0 for job_id in ids):
+                    raise gate.PublishBlocked("RECOVERY_RUN_INVALID: malformed job metadata")
                 if totals:
-                    if (
-                        len(totals) != len(value)
-                        or any(type(total) is not int or total < 0 for total in totals)
-                        or len(set(totals)) != 1
-                        or len(collected) != totals[0]
-                    ):
-                        raise ValueError("jobs pagination incomplete")
-                    ids = [job.get("id") for job in collected]
-                    if any(type(job_id) is not int or job_id <= 0 for job_id in ids) or len(set(ids)) != totals[0]:
-                        raise ValueError("jobs pagination incomplete or duplicate job IDs")
+                    if len(set(ids)) != totals[0]:
+                        raise ValueError("jobs pagination duplicate job IDs")
                     jobs_complete = True
                 else:
                     jobs_complete = False
                 return collected
             return value
         except github_client.GitHubRateLimited:
+            raise
+        except gate.PublishBlocked:
             raise
         except subprocess.CalledProcessError as exc:
             refusal = github_client.refusal_of(exc, injected=runner is not None)
@@ -942,17 +946,26 @@ def _prepare_recovery(verb, fields, dest, cwd, environment, runner):
         if associations == [] and isinstance(event, str) and event and event not in {"pull_request", "pull_request_target", "merge_group"}:
             return None
         run_conclusion = run.get("conclusion")
+        is_pr_event = isinstance(event, str) and event in recovery.PR_WORKFLOW_EVENTS
+        allowed_initial_conclusions = (
+            failed_run_conclusions | recovery.PASSING_RUN_CONCLUSIONS
+            if is_pr_event
+            else failed_run_conclusions
+        )
         if (
             run.get("status") != "completed"
             or not isinstance(run_conclusion, str)
-            or run_conclusion not in (failed_run_conclusions | recovery.PASSING_RUN_CONCLUSIONS)
+            or run_conclusion not in allowed_initial_conclusions
         ):
             raise gate.PublishBlocked(
-                "RECOVERY_RUN_INVALID: completed failed or incoherent all-green run required"
+                "RECOVERY_RUN_INVALID: completed failed or incoherent all-green PR run required"
+                if is_pr_event
+                else "RECOVERY_RUN_INVALID: completed failed run required"
             )
-        incoherent_candidate = run_conclusion in recovery.PASSING_RUN_CONCLUSIONS
+        incoherent_candidate = is_pr_event and run_conclusion in recovery.PASSING_RUN_CONCLUSIONS
         if run.get("event") == "merge_group":
-            branch_pr = extract_pr_number(run.get("head_branch", ""))
+            head_branch = run.get("head_branch")
+            branch_pr = extract_pr_number(head_branch if isinstance(head_branch, str) else "")
             number = (
                 branch_pr
                 if type(branch_pr) is int and branch_pr > 0 and _merge_group_associations_consistent(associations, branch_pr)
@@ -965,11 +978,17 @@ def _prepare_recovery(verb, fields, dest, cwd, environment, runner):
         if type(number) is not int or number <= 0:
             raise gate.PublishBlocked("RECOVERY_PR_UNKNOWN: run must identify one PR")
         pull = fetch("pull", number=number)
-        head = pull.get("head", {}).get("sha")
-        if pull.get("state") != "open" or not isinstance(head, str) or not recovery.SHA.fullmatch(head):
+        pull_head = pull.get("head") if isinstance(pull, dict) else None
+        head = pull_head.get("sha") if isinstance(pull_head, dict) else None
+        if not isinstance(pull, dict) or pull.get("state") != "open" or not isinstance(head, str) or not recovery.SHA.fullmatch(head):
             raise gate.PublishBlocked("RECOVERY_HEAD_UNKNOWN: open PR head required")
-        if run.get("event") != "merge_group" and associations[0].get("head", {}).get("sha") != head:
-            raise gate.PublishBlocked("RECOVERY_HEAD_MOVED: run belongs to another PR head")
+        if run.get("event") != "merge_group":
+            assoc_head = associations[0].get("head")
+            assoc_sha = assoc_head.get("sha") if isinstance(assoc_head, dict) else None
+            if not isinstance(assoc_sha, str) or not recovery.SHA.fullmatch(assoc_sha):
+                raise gate.PublishBlocked("RECOVERY_RUN_INVALID: malformed PR association head")
+            if assoc_sha != head:
+                raise gate.PublishBlocked("RECOVERY_HEAD_MOVED: run belongs to another PR head")
         action = "run-rerun"
         require_infra_diagnosis = False
     elif verb == "pr-merge":
@@ -988,7 +1007,8 @@ def _prepare_recovery(verb, fields, dest, cwd, environment, runner):
             or run_conclusion not in failed_run_conclusions
         ):
             raise gate.PublishBlocked("RECOVERY_RUN_INVALID: completed failed run required")
-        if extract_pr_number(run.get("head_branch", "")) != number:
+        head_branch = run.get("head_branch")
+        if extract_pr_number(head_branch if isinstance(head_branch, str) else "") != number:
             raise gate.PublishBlocked("RECOVERY_PR_UNKNOWN: merge_group run does not identify this PR")
         if not _merge_group_associations_consistent(run.get("pull_requests"), number):
             raise gate.PublishBlocked("RECOVERY_PR_UNKNOWN: merge_group run has conflicting PR associations")
@@ -1006,7 +1026,8 @@ def _prepare_recovery(verb, fields, dest, cwd, environment, runner):
     comments = fetch("comments", number=number)
     files = fetch("pr-files", number=number)
     content = changes_learner_content(files)
-    login = fetch("identity").get("login")
+    identity = fetch("identity")
+    login = identity.get("login") if isinstance(identity, dict) else None
     if not isinstance(login, str) or not login:
         raise gate.PublishBlocked("RECOVERY_APPROVAL_MISSING: exact-head recorded approval required")
     verdict_login = _configured_verdict_login(dest, login, environment)
@@ -1151,7 +1172,9 @@ def _prepare_recovery(verb, fields, dest, cwd, environment, runner):
     elif failed_run.get("event") == "merge_group":
         recovery.require_queue_diff(evidence, failed_run, fetch)
     current = fetch("pull", number=number)
-    if current.get("state") != "open" or current.get("head", {}).get("sha") != head:
+    current_head = current.get("head") if isinstance(current, dict) else None
+    current_sha = current_head.get("sha") if isinstance(current_head, dict) else None
+    if not isinstance(current, dict) or current.get("state") != "open" or current_sha != head:
         raise gate.PublishBlocked("RECOVERY_HEAD_MOVED: PR changed during preflight")
     return path, number, head, action, evidence, rerun_mode
 
