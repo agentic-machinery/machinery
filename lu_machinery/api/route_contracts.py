@@ -413,7 +413,10 @@ ROUTE_CONTRACTS: tuple[RouteContract, ...] = (
         "(request, reply, synthesis) are served; anything off-allowlist is withheld with a typed reason. "
         "Every allowed body and label passes through redact_text then sanitize_text server-side before caps "
         "and serialization; redaction is best-effort for secrets and filesystem paths only (hostnames and "
-        "IP addresses are not redacted). Bounded by raw-body bytes, whole serialized response bytes, SQL "
+        "IP addresses are not redacted). "
+        "Redaction covers plain text and JSON (including JSON nested inside JSON strings up to the depth "
+        "cap); other encodings (base64, URL-encoding, HTML entities, compression) are out of scope. "
+        "Bounded by raw-body bytes, whole serialized response bytes, SQL "
         "row count checked before materialization, SQLite busy timeout, and a concurrency semaphore.",
         "Fleet Comms SQLite store (read-only) and content-addressed body artifacts under blobs/sha256.",
         "Read live per request; no route cache (Cache-Control: no-store); GET never mutates storage.",

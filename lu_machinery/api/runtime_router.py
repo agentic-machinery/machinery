@@ -50,7 +50,7 @@ from lu_machinery.lib.readonly_sqlite import SQLiteConnection, import_named_modu
 from lu_machinery.orchestration import codex_transport_health, dispatch_admission
 from lu_machinery.orchestration.dead_worker_state import worker_liveness
 from lu_machinery.review.model_catalog import VALID_CODEX_EFFORTS, canonical_model_id, load_model_catalog
-from lu_machinery.secret_redactor import redact_text, redact_value
+from lu_machinery.secret_redactor import REDACTION, redact_text, redact_value
 
 from . import account_logins, panel_values, subscriptions
 from . import delegate_router as delegate_api
@@ -1617,15 +1617,25 @@ class _AcpBodyEncodingError(Exception):
     """Structured body could not be safely re-serialized or UTF-8 encoded after redaction."""
 
 
+def _is_redacted_json_key(key: str) -> bool:
+    """Return True iff ``secret_redactor.redact_value`` classifies ``key`` as a secret key."""
+    return bool(redact_value({key: None}).get(key) == REDACTION)
+
+
 def _redact_and_sanitize_json_value(value: Any, *, depth: int) -> Any:
-    """Recursively redact and path-sanitize strings inside a JSON value, including nested JSON strings."""
+    """Recursively redact and path-sanitize JSON containers and leaves, including nested JSON strings."""
     if isinstance(value, str):
         return _redact_and_sanitize_text(value, _depth=depth + 1)
     if isinstance(value, Mapping):
-        return {
-            _redact_and_sanitize_text(str(key), _depth=depth + 1): _redact_and_sanitize_json_value(item, depth=depth)
-            for key, item in value.items()
-        }
+        cleaned: dict[str, Any] = {}
+        for raw_key, item in value.items():
+            key_text = str(raw_key)
+            cleaned_key = _redact_and_sanitize_text(key_text, _depth=depth + 1)
+            if _is_redacted_json_key(key_text) or _is_redacted_json_key(cleaned_key):
+                cleaned[cleaned_key] = REDACTION
+            else:
+                cleaned[cleaned_key] = _redact_and_sanitize_json_value(item, depth=depth)
+        return cleaned
     if isinstance(value, list):
         return [_redact_and_sanitize_json_value(item, depth=depth) for item in value]
     return value
@@ -1634,14 +1644,17 @@ def _redact_and_sanitize_json_value(value: Any, *, depth: int) -> Any:
 def _redact_and_sanitize_text(value: str, *, _depth: int = 0) -> str:
     """Run server-side ``redact_text`` then ``sanitize_text`` (secrets and filesystem paths only).
 
-    Structured JSON payloads (including nested JSON strings up to ``_ACP_TRANSCRIPT_JSON_REDACT_MAX_DEPTH``)
-    also pass through ``redact_value`` and ``sanitize_document`` before final text redaction so
-    escaped quotes inside nested JSON strings cannot conceal secrets or paths. Structured bodies
-    that exceed either container depth (64) or nested-JSON depth fail closed by raising
-    ``_AcpRedactionDepthExceeded`` rather than falling back to plain-text filters.
+    Structured JSON payloads — objects, arrays, and JSON-string wrappers, recursively across
+    string leaves and object keys up to ``_ACP_TRANSCRIPT_JSON_REDACT_MAX_DEPTH`` — are decoded,
+    redacted structurally (using ``secret_redactor`` key/text rules and ``opsec_sanitize``), and
+    re-serialized before final text redaction so JSON escapes cannot conceal secrets or paths.
+    Structured bodies that exceed either container depth (64) or nested-JSON depth fail closed by
+    raising ``_AcpRedactionDepthExceeded`` rather than falling back to plain-text filters; parser
+    conversion failures and unencodable outputs (non-finite floats, lone surrogates) raise
+    ``_AcpBodyEncodingError``.
     """
     stripped = value.strip()
-    if stripped and stripped[0] in "{[":
+    if stripped and stripped[0] in '{["':
         try:
             parsed = json_depth.loads(stripped, max_depth=64)
         except RecursionError:
@@ -1650,13 +1663,16 @@ def _redact_and_sanitize_text(value: str, *, _depth: int = 0) -> str:
             parsed = None
         except (TypeError, ValueError):
             raise _AcpBodyEncodingError() from None
-        if isinstance(parsed, (dict, list)):
+        if isinstance(parsed, (dict, list, str)):
             if _depth >= _ACP_TRANSCRIPT_JSON_REDACT_MAX_DEPTH:
                 raise _AcpRedactionDepthExceeded()
-            cleaned = sanitize_document(_redact_and_sanitize_json_value(redact_value(parsed), depth=_depth))
             try:
+                cleaned = sanitize_document(_redact_and_sanitize_json_value(parsed, depth=_depth))
                 serialized = json.dumps(cleaned, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
-            except (TypeError, ValueError):
+                serialized.encode("utf-8")
+            except RecursionError:
+                raise _AcpRedactionDepthExceeded() from None
+            except (TypeError, ValueError, UnicodeError):
                 raise _AcpBodyEncodingError() from None
             return sanitize_text(redact_text(serialized) or "")
     redacted = redact_text(value)

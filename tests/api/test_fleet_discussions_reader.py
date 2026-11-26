@@ -12,6 +12,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 
 import lu_machinery.api.config as api_config
@@ -335,6 +336,8 @@ def test_secrets_paths_nested_json_and_labels_redacted_in_json(tmp_path: Path, m
     assert route_contract.match == "exact"
     assert route_contract.mutates is False
     assert "secrets and filesystem paths only" in route_contract.purpose.lower()
+    assert "other encodings" in route_contract.purpose.lower()
+    assert "out of scope" in route_contract.purpose.lower()
     page_contract = contract_for_page("fleet.html")
     assert page_contract is not None
     assert "secrets-and-paths" in page_contract.purpose.lower()
@@ -1003,3 +1006,135 @@ globalThis.fetch = async (url) => {
         timeout=15,
     )
     assert ran.returncode == 0, ran.stderr
+
+
+@pytest.mark.parametrize(
+    ("case_id", "body", "expected_state", "expected_reason", "forbidden", "expected_tokens"),
+    [
+        (
+            "top-level-json-string-object",
+            json.dumps(json.dumps({"password": "top_str_obj_secret_1", "dir": "/home/alice/top-str.key"})),
+            "ok",
+            None,
+            ("top_str_obj_secret_1", "/home/alice/top-str.key"),
+            ("[REDACTED_SECRET]", "[redacted-path]"),
+        ),
+        (
+            "top-level-json-string-array",
+            json.dumps(json.dumps([{"api_key": "top_str_arr_secret_2"}, "plain"])),
+            "ok",
+            None,
+            ("top_str_arr_secret_2",),
+            ("[REDACTED_SECRET]",),
+        ),
+        (
+            "leaf-double-encoded-and-newline-sibling",
+            json.dumps(
+                {
+                    "leaf": json.dumps(json.dumps({"password": "leaf_double_secret_3"})),
+                    "sibling": '{"api_key": 123\n, "inner": "{\\"secret\\": \\"leaf_newline_secret_4\\"}"}',
+                }
+            ),
+            "ok",
+            None,
+            ("leaf_double_secret_3", "leaf_newline_secret_4"),
+            ("[REDACTED_SECRET]",),
+        ),
+        (
+            "object-key-wrapped-json-and-path",
+            json.dumps(
+                {
+                    json.dumps({"password": "key_wrapped_secret_5"}): "under_secret_key_val_6",
+                    "/home/alice/key-path.txt": "harmless",
+                }
+            ),
+            "ok",
+            None,
+            ("key_wrapped_secret_5", "under_secret_key_val_6", "/home/alice/key-path.txt"),
+            ("[REDACTED_SECRET]", "[redacted-path]"),
+        ),
+        (
+            "depth-exactly-at-cap-top-level-string",
+            # 4 JSON layers: top-level str -> str -> str -> dict (at cap = 4 -> ok, redacted).
+            json.dumps(json.dumps(json.dumps(json.dumps({"token": "depth_at_cap_secret_7"})))),
+            "ok",
+            None,
+            ("depth_at_cap_secret_7",),
+            ("[REDACTED_SECRET]",),
+        ),
+        (
+            "depth-over-cap-top-level-string",
+            # 5 JSON layers: top-level str -> str -> str -> str -> dict (over cap = 4 -> withheld).
+            json.dumps(json.dumps(json.dumps(json.dumps(json.dumps({"token": "depth_over_top_secret_8"}))))),
+            "withheld",
+            "redaction_depth_exceeded",
+            ("depth_over_top_secret_8",),
+            (),
+        ),
+        (
+            "depth-over-cap-leaf-json-string",
+            # 5 JSON layers: dict -> leaf str -> leaf str -> leaf str -> leaf dict (over cap = 4 -> withheld).
+            json.dumps({"wrap": json.dumps(json.dumps(json.dumps(json.dumps({"token": "depth_over_leaf_secret_9"}))))}),
+            "withheld",
+            "redaction_depth_exceeded",
+            ("depth_over_leaf_secret_9",),
+            (),
+        ),
+        (
+            "top-level-string-over-digit-int",
+            json.dumps('{"huge": ' + ("9" * 4400) + ', "password": "over_digit_wrapped_secret_10"}'),
+            "missing_or_corrupt",
+            "body_redaction_failed",
+            ("over_digit_wrapped_secret_10",),
+            (),
+        ),
+        (
+            "top-level-string-lone-surrogate",
+            r'"{\"bad\": \"\uD800\", \"password\": \"surrogate_wrapped_secret_11\"}"',
+            "missing_or_corrupt",
+            "body_redaction_failed",
+            ("surrogate_wrapped_secret_11",),
+            (),
+        ),
+        (
+            "plain-prose-quoted-not-json",
+            '"quoted prose" followed by password="plain_quoted_secret_12" and /home/alice/prose.txt',
+            "ok",
+            None,
+            ("plain_quoted_secret_12", "/home/alice/prose.txt"),
+            ("[REDACTED_SECRET]", "[redacted-path]"),
+        ),
+    ],
+)
+def test_wrapped_json_redaction_class_and_depth_bounds(
+    tmp_path: Path,
+    monkeypatch,
+    case_id: str,
+    body: str,
+    expected_state: str,
+    expected_reason: str | None,
+    forbidden: tuple[str, ...],
+    expected_tokens: tuple[str, ...],
+) -> None:
+    """Defect class (F7): JSON string wrappers (top-level, leaf, or object key) skip structured redaction or exceed depth cap."""
+    root = tmp_path / f"plane-{case_id}"
+    conv_id, _ = _seed_conversation(
+        root,
+        turns=[("reply", "codex", "root", body, 1)],
+        suffix=case_id[:16],
+    )
+    monkeypatch.setenv("FLEET_COMMS_ROOT", str(root))
+    resp = _loopback_client().get(f"/api/runtime/acp/conversations/{conv_id}/transcript")
+    assert resp.status_code == 200
+    assert resp.headers["cache-control"] == "no-store"
+    for secret in forbidden:
+        assert secret not in resp.text, (case_id, secret)
+    turn = resp.json()["messages"][0]
+    assert turn["state"] == expected_state, (case_id, turn)
+    assert turn["reason"] == expected_reason, (case_id, turn)
+    if expected_state == "ok":
+        assert isinstance(turn["body"], str)
+        for token in expected_tokens:
+            assert token in turn["body"], (case_id, token, turn["body"])
+    else:
+        assert turn["body"] is None, (case_id, turn)
