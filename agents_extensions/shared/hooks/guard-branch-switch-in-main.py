@@ -220,22 +220,8 @@ def _in_main_worktree(project_root: Path) -> bool:
     worktree we're in. So they match iff we're in the main worktree.
     """
     try:
-        gd = subprocess.run(
-            ["git", "rev-parse", "--git-dir"],
-            cwd=project_root,
-            capture_output=True,
-            text=True,
-            check=True,
-            env=_git_probe_env(),
-        ).stdout.strip()
-        cd = subprocess.run(
-            ["git", "rev-parse", "--git-common-dir"],
-            cwd=project_root,
-            capture_output=True,
-            text=True,
-            check=True,
-            env=_git_probe_env(),
-        ).stdout.strip()
+        gd = _git_path_output(["rev-parse", "--git-dir"], project_root)
+        cd = _git_path_output(["rev-parse", "--git-common-dir"], project_root)
     except (subprocess.CalledProcessError, FileNotFoundError):
         # Not a git repo or git missing → nothing to enforce.
         return False
@@ -467,20 +453,25 @@ def _git_invocation(seg: list[str], effective_cwd: Path | None) -> tuple[str, li
     return seg[i], seg[i + 1 :], git_cwd
 
 
+def _git_path_output(args: list[str], cwd: Path) -> str:
+    """One path Git prints, byte for byte: only its final line feed is dropped.
+
+    Text mode would decode with the locale and translate carriage returns, and stripping
+    would drop whitespace a checkout name may end in, so a path dispatch accepts could read
+    as a different one (#1496 F1). ``os.fsdecode`` matches how ``Path`` spells the name.
+    """
+    out = subprocess.run(
+        ["git", *args], cwd=cwd, capture_output=True, check=True, env=_git_probe_env()
+    ).stdout
+    return os.fsdecode(out.removesuffix(b"\n"))
+
+
 def _git_repo_root(git_cwd: Path) -> Path | None:
     """Resolve the root of the repo a git invocation actually targets."""
     try:
-        root = subprocess.run(
-            ["git", "rev-parse", "--path-format=absolute", "--show-toplevel"],
-            cwd=git_cwd,
-            capture_output=True,
-            text=True,
-            check=True,
-            env=_git_probe_env(),
-        ).stdout.removesuffix("\n")
+        root = _git_path_output(["rev-parse", "--path-format=absolute", "--show-toplevel"], git_cwd)
     except (subprocess.CalledProcessError, FileNotFoundError):
         return None
-    # Only Git's line terminator is dropped: a checkout name may end in whitespace (#1496 F1).
     return Path(root).resolve()
 
 

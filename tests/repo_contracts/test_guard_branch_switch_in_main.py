@@ -1444,7 +1444,8 @@ def test_registry_named_infra_primary_switch_is_refused(repos, tmp_path, monkeyp
 
     The configured primary lives apart from the product primary, so dispatch's base and the
     sibling resolver's base differ; dispatch also reads the registry value verbatim, while the
-    fleet loader trims it, so a trailing space names different directories.
+    fleet loader trims it, so a trailing space names different directories. The separate base
+    holds a carriage return, which a text-mode read of Git's output would translate.
     """
     from lu_machinery.dispatcher import git as dispatch_git
     from lu_machinery.orchestration.fleet_repos import load_fleet_repos
@@ -1456,14 +1457,14 @@ def test_registry_named_infra_primary_switch_is_refused(repos, tmp_path, monkeyp
     registry.write_text(packaged.replace(f"local_name: {local_name}\n", f"local_name: '{local_name} '\n"), encoding="utf-8")
     monkeypatch.setattr(dispatch_git, "_fleet_repos_path", lambda: registry)
     beside_public = _primary_repo(tmp_path / local_name)
-    plane_primary = _primary_repo(tmp_path / "plane" / "primary")
-    beside_plane = _primary_repo(tmp_path / "plane" / f"{local_name} ")
+    plane_primary = _primary_repo(tmp_path / "pla\rne" / "primary")
+    beside_plane = _primary_repo(tmp_path / "pla\rne" / f"{local_name} ")
     _registry_roots(monkeypatch, repos["public"])
     monkeypatch.setenv("LU_PRIMARY_REPO_ROOT", str(plane_primary))
 
     assert dispatch_git.resolve_repo("infra-private")[0] == beside_plane.resolve()
     for infra in (beside_public, beside_plane):
-        assert guard._command_danger_reason(f"git -C '{infra}' switch -c topic", repos["other"]) is not None
+        assert guard._command_danger_reason("git switch -c topic", infra) is not None
     assert guard._command_danger_reason(f"git -C {repos['other']} switch -c topic", repos["public"]) is None
 
 
