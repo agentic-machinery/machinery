@@ -69,7 +69,7 @@
     </form>
     <p id="messages-status" class="visually-hidden" aria-live="polite" aria-atomic="true"></p>
     <section id="message-reader" aria-label="Message reader" tabindex="-1" hidden>
-      <div id="message-body" aria-live="polite"></div>
+      <div id="message-body"></div>
       <h3>Thread</h3>
       <div id="message-thread"></div>
     </section>
@@ -724,7 +724,9 @@ async function loadMessageBody(id) {
   const box = document.getElementById("message-body");
   const heading = discussionEl("h3", "", `Message ${id}`);
   setNodeChildren(box, [heading, discussionEl("p", "muted", "Loading message…")]);
+  rememberStatus("messages", "Loading message…");
   let content;
+  let status = "Message could not load.";
   try {
     const response = await fetch(`${MESSAGE_URL}/${encodeURIComponent(id)}/body`, {cache: "no-store"});
     const payload = await response.json();
@@ -732,6 +734,7 @@ async function loadMessageBody(id) {
       content = discussionEl("pre", "", payload.body || "Empty message");
       content.style.whiteSpace = "pre-wrap";
       content.style.overflowWrap = "anywhere";
+      status = "Message loaded.";
     } else {
       const message = {
         expired: "Body expired.",
@@ -740,13 +743,15 @@ async function loadMessageBody(id) {
         withheld: "Message withheld.",
         missing_or_corrupt: "Message body missing or corrupt.",
       };
-      const label = Object.hasOwn(message, payload?.state) ? message[payload.state] : "Message could not load.";
-      content = discussionEl("p", "error", label);
+      if (Object.hasOwn(message, payload?.state)) status = message[payload.state];
+      content = discussionEl("p", "error", status);
     }
   } catch {
-    content = discussionEl("p", "error", "Message could not load.");
+    content = discussionEl("p", "error", status);
   }
-  if (seq === messageBodyRequest) setNodeChildren(box, [heading, content]);
+  if (seq !== messageBodyRequest) return;
+  setNodeChildren(box, [heading, content]);
+  rememberStatus("messages", status);
 }
 
 async function loadMessageThread(id, offset = 0) {

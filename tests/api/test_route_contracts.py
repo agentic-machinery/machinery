@@ -677,6 +677,7 @@ assert.match(M.prChips(unknownTotalPrs).join(''), /<b>1<\/b> open PRs observed Â
       const bodyNode = document.getElementById('message-body').children[1];
       assert.equal(bodyNode.tag, 'pre');
       assert.equal(bodyNode.textContent, literalBody);
+      assert.equal(document.getElementById('messages-status').textContent, 'Message loaded.');
       await timers[0]();
       assert.equal(pending.size, 0, 'A poll while the reader is open requests zero bodies and threads');
       const [members, next] = document.getElementById('message-thread').children;
