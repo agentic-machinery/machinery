@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import os
@@ -218,10 +219,88 @@ def test_missing_resource_admission_bypass(release):
         core.write_bytes(saved)
 
 
-def test_wheel_only_deployer_isolation_idempotency_and_false_green(release):
-    """A real installed wheel deploys a non-curriculum consumer and detects tampering."""
+# Each harness's native skill discovery directories, fixed here so a manifest entry cannot redefine them.
+NATIVE_SKILLS = {"claude": (".claude/skills",), "codex": (".agents/skills",),
+                 "agy": (".agent/skills", ".agents/skills"), "cursor": (".cursor/skills",)}
+HARNESSES = tuple(NATIVE_SKILLS)
+CATALOG = """
+import json, sys, types
+from lu_machinery.dispatcher import runtime_context
+raw = runtime_context.prompt(types.SimpleNamespace(), b"")
+context = json.loads(raw.split(b"<dispatch-context>\\n", 1)[1].split(b"\\n</dispatch-context>", 1)[0])
+print(json.dumps({"shared": str(runtime_context.shared_root()), "skills": context["skills"]}))
+"""
+
+
+def _catalog(release):
+    """The skills the installed dispatcher advertises to every adapter, keyed by release path."""
+    scratch, _, executable, env = release
+    tasks = scratch / "tasks"
+    tasks.mkdir(exist_ok=True)
+    ran = _run([str(executable), "-I", "-c", CATALOG], cwd=scratch, env={**env, "LU_TASKS_DIR": str(tasks)})
+    assert ran.returncode == 0, ran.stdout + ran.stderr
+    data = json.loads(ran.stdout)
+    shared = Path(data["shared"])
+    assert shared.is_relative_to(executable.parent.parent)
+    return {Path(skill["path"]).relative_to(shared).as_posix(): Path(skill["path"]) for skill in data["skills"]}
+
+
+def _wheel_digests(wheel):
+    """SHA-256 of each shipped file as the wheel's RECORD declares it."""
+    with zipfile.ZipFile(wheel) as archive:
+        record = next(name for name in archive.namelist() if name.endswith(".dist-info/RECORD"))
+        rows = archive.read(record).decode().splitlines()
+    digests = {}
+    for row in rows:
+        name, digest, _ = row.rsplit(",", 2)
+        if digest:
+            algorithm, value = digest.split("=", 1)
+            assert algorithm == "sha256", row
+            digests[name] = base64.urlsafe_b64decode(value + "=" * (-len(value) % 4)).hex()
+    return digests
+
+
+def _native(path, harness):
+    return [f"{directory}/{path.removeprefix('skills/')}" for directory in NATIVE_SKILLS[harness]]
+
+
+def test_catalog_skill_missing_harness_destination(release):
+    """Every skill the dispatcher advertises has a release destination in each harness's native skill directory."""
+    _, wheel, _, _ = release
+    advertised = _catalog(release)
+    assert "skills/verify-ukrainian/SKILL.md" in advertised
+    with zipfile.ZipFile(wheel) as archive:
+        files = json.loads(archive.read("lu_machinery/agent_deploy/release.v1.json"))["files"]
+    for path in advertised:
+        assert path in files, path
+        for harness in HARNESSES:
+            for native in _native(path, harness):
+                assert native in files[path]["targets"].get(harness, []), (path, harness, native)
+
+
+def test_deployed_skill_stale_bytes(release):
+    """Catalog bytes and every deployed copy of each advertised skill carry the wheel's recorded digest."""
+    _, wheel, _, _ = release
+    advertised = _catalog(release)
+    consumer, _, deployed = _deploy_consumer(release, "parity-consumer", list(HARNESSES))
+    assert deployed.returncode == 0, deployed.stdout + deployed.stderr
+    digests = _wheel_digests(wheel)
+    with zipfile.ZipFile(wheel) as archive:
+        files = json.loads(archive.read("lu_machinery/agent_deploy/release.v1.json"))["files"]
+    for path, opened in advertised.items():
+        released = digests[SHARED + path]
+        assert hashlib.sha256((REPO / SHARED / path).read_bytes()).hexdigest() == released, path
+        assert hashlib.sha256(opened.read_bytes()).hexdigest() == released, path
+        outputs = {native for harness in HARNESSES for native in _native(path, harness)}
+        outputs.update(target for targets in files[path]["targets"].values() for target in targets)
+        for target in sorted(outputs):
+            assert hashlib.sha256((consumer / target).read_bytes()).hexdigest() == released, target
+
+
+def _deploy_consumer(release, name, providers):
+    """Deploy the installed wheel into a fresh Git consumer that has one product skill."""
     scratch, wheel, executable, env = release
-    consumer = scratch / "agent-consumer"
+    consumer = scratch / name
     consumer.mkdir()
     subprocess.run(["git", "init", "-q", str(consumer)], check=True)
     source = consumer / "agents_extensions/shared"
@@ -230,14 +309,14 @@ def test_wheel_only_deployer_isolation_idempotency_and_false_green(release):
     skill.write_text("---\nname: consumer\ndescription: Consumer example\n---\nRead this example.\n")
     with zipfile.ZipFile(wheel) as archive:
         inventory = json.loads(archive.read("lu_machinery/agent_deploy/release.v1.json"))
-    descriptor = {"providers": ["claude", "codex", "agy"], "sources": {
+    descriptor = {"providers": providers, "sources": {
         "shared": {"path": "agents_extensions/shared", "required": True},
         "codex": {"path": "agents_extensions/codex", "required": True}}, "preserve": []}
     (consumer / "agents_extensions/deployment.v1.json").write_text(json.dumps(descriptor))
     # Configurations are input fixtures. Independent assertions below never use
     # the inventory to derive expected output paths, bytes, modes, or counts.
     for provider, configs in inventory["required_hooks"].items():
-        for destination, requirements in configs.items():
+        for _destination, requirements in configs.items():
             data = {}
             for requirement in requirements:
                 node = data
@@ -251,7 +330,13 @@ def test_wheel_only_deployer_isolation_idempotency_and_false_green(release):
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(json.dumps(data))
     command = [str(executable), "-I", "-m", "lu_machinery.agent_deploy", "--project-root", str(consumer)]
-    first = _run(command, cwd=scratch, env=env)
+    return consumer, command, _run(command, cwd=scratch, env=env)
+
+
+def test_wheel_only_deployer_isolation_idempotency_and_false_green(release):
+    """A real installed wheel deploys a non-curriculum consumer and detects tampering."""
+    scratch, _, executable, env = release
+    consumer, command, first = _deploy_consumer(release, "agent-consumer", ["claude", "codex", "agy"])
     assert first.returncode == 0, first.stdout + first.stderr
     assert (consumer / ".agents/skills/consumer/SKILL.md").read_text() == "---\nname: consumer\ndescription: Consumer example\n---\nRead this example.\n"
     assert not (consumer / ".claude/rules/core.md").exists()

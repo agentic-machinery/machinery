@@ -113,6 +113,7 @@ include agents_extensions/shared/skills/thread-rollover/references/archive.md
 include agents_extensions/shared/skills/thread-rollover/references/health.md
 include agents_extensions/shared/skills/thread-rollover/references/prepare.md
 include agents_extensions/shared/skills/thread-rollover/references/resume.md
+include agents_extensions/shared/skills/verify-ukrainian/SKILL.md
 include agents_extensions/shared/skills/verify/SKILL.md
 global-exclude *.py[cod]
 
