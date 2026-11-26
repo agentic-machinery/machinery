@@ -45,7 +45,7 @@ from lu_machinery.orchestration import codex_transport_health, dispatch_admissio
 from lu_machinery.orchestration.dead_worker_state import worker_liveness
 from lu_machinery.review.model_catalog import VALID_CODEX_EFFORTS, canonical_model_id, load_model_catalog
 
-from . import account_logins, panel_values, subscriptions
+from . import account_logins, config, panel_values, subscriptions
 from . import delegate_router as delegate_api
 from .model_stats_rows import current_catalog_model_ids
 from .monitor_context import MonitorContext, get_ctx, resolve_context
@@ -1370,36 +1370,110 @@ def get_acp_conversation(conversation_id: str, *, ctx: MonitorContext) -> dict[s
         connection.close()
 
 
-def _acp_transcript_client_is_loopback(request: Request) -> bool:
-    """Accept only direct loopback peers addressed through a loopback host.
+_ACP_TRANSCRIPT_ALLOWED_FETCH_SITES = frozenset({"same-origin", "none"})
 
-    ``request.client`` is supplied by the accepted connection, rather than a
-    forwarding header. Requiring a loopback URL host as well closes the usual
-    DNS-rebinding path from a non-local browser origin.
+
+def _is_loopback_ip(address: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    mapped = getattr(address, "ipv4_mapped", None)
+    # ipaddress.{IPv4,IPv6}Address.is_loopback is a boolean property, not a method.
+    return address.is_loopback or bool(mapped and mapped.is_loopback)  # nosemgrep: python.lang.maintainability.is-function-without-parentheses
+
+
+def _configured_acp_listener() -> tuple[frozenset[str], str] | None:
+    """Return ``(allowed_raw_hosts, exact_origin)`` for the configured loopback HTTP listener.
+
+    Fails closed (returns ``None``) if ``config.API_HOST`` or ``config.API_PORT`` is
+    malformed or non-loopback.
     """
+    raw_host = config.API_HOST
+    raw_port = config.API_PORT
+    if (
+        not isinstance(raw_host, str)
+        or not isinstance(raw_port, int)
+        or isinstance(raw_port, bool)
+        or not (1 <= raw_port <= 65535)
+    ):
+        return None
+    if not raw_host or any(ord(ch) <= 0x20 or ord(ch) >= 0x7F or ch in "/?#@\\%" for ch in raw_host):
+        return None
+    if raw_host.lower() == "localhost":
+        authority_host = "localhost"
+    else:
+        if raw_host.startswith("[") or raw_host.endswith("]"):
+            if not (raw_host.startswith("[") and raw_host.endswith("]")):
+                return None
+            try:
+                address: ipaddress.IPv4Address | ipaddress.IPv6Address = ipaddress.IPv6Address(raw_host[1:-1])
+            except ValueError:
+                return None
+        else:
+            try:
+                address = ipaddress.ip_address(raw_host)
+            except ValueError:
+                return None
+        if isinstance(address, ipaddress.IPv6Address) and address.scope_id is not None:
+            return None
+        if not _is_loopback_ip(address):
+            return None
+        authority_host = f"[{address.compressed}]" if isinstance(address, ipaddress.IPv6Address) else address.compressed
+    if raw_port == 80:
+        return frozenset({authority_host, f"{authority_host}:80"}), f"http://{authority_host}"
+    authority = f"{authority_host}:{raw_port}"
+    return frozenset({authority}), f"http://{authority}"
+
+
+def _acp_transcript_access_refusal(request: Request) -> str | None:
+    """Return a typed refusal reason when the request violates the local-listener boundary.
+
+    Returns ``None`` only when:
+    - the configured listener in ``config`` is a valid loopback HTTP listener,
+    - no ``Forwarded`` or ``X-Forwarded-*`` header is present,
+    - ``request.client`` is a direct loopback IP,
+    - the request scheme is ``http`` and exactly one raw ``Host`` matches the configured listener,
+    - any ``Origin`` header is singular and equals that exact origin (scheme, host, port), and
+    - any ``Sec-Fetch-Site`` header is singular and in ``{"same-origin", "none"}``.
+    """
+    listener = _configured_acp_listener()
+    if listener is None:
+        return "invalid_listener_config"
+    expected_hosts, expected_origin = listener
+
+    hosts: list[str] = []
+    origins: list[str] = []
+    fetch_sites: list[str] = []
+    for raw_name, raw_value in request.headers.raw:
+        name = raw_name.decode("latin-1").strip().lower()
+        if name == "forwarded" or name.startswith("x-forwarded-"):
+            return "forwarding_header_present"
+        if name == "host":
+            hosts.append(raw_value.decode("latin-1"))
+        elif name == "origin":
+            origins.append(raw_value.decode("latin-1"))
+        elif name == "sec-fetch-site":
+            fetch_sites.append(raw_value.decode("latin-1"))
+
     client = request.client
     client_host = client.host if client else None
     if not isinstance(client_host, str):
-        return False
+        return "non_loopback_peer"
     try:
         client_address = ipaddress.ip_address(client_host)
     except ValueError:
-        return False
-    client_mapped = getattr(client_address, "ipv4_mapped", None)
-    if not client_address.is_loopback and not (client_mapped and client_mapped.is_loopback):
-        return False
+        return "non_loopback_peer"
+    if isinstance(client_address, ipaddress.IPv6Address) and client_address.scope_id is not None:
+        return "non_loopback_peer"
+    if not _is_loopback_ip(client_address):
+        return "non_loopback_peer"
 
-    url_host = request.url.hostname
-    if url_host == "localhost":
-        return True
-    if not isinstance(url_host, str):
-        return False
-    try:
-        url_address = ipaddress.ip_address(url_host)
-    except ValueError:
-        return False
-    url_mapped = getattr(url_address, "ipv4_mapped", None)
-    return url_address.is_loopback or bool(url_mapped and url_mapped.is_loopback)
+    if request.scope.get("scheme") != "http":
+        return "invalid_scheme"
+    if len(hosts) != 1 or hosts[0] not in expected_hosts:
+        return "invalid_host"
+    if len(origins) > 1 or (len(origins) == 1 and origins[0] != expected_origin):
+        return "invalid_origin"
+    if len(fetch_sites) > 1 or (len(fetch_sites) == 1 and fetch_sites[0] not in _ACP_TRANSCRIPT_ALLOWED_FETCH_SITES):
+        return "cross_site_request"
+    return None
 
 
 def _acp_transcript_body(value: Any, *, remaining_bytes: int) -> str | None:
@@ -1544,8 +1618,13 @@ async def runtime_acp_conversation_transcript(
 ):
     """Read body-inline ACP content for the local UI only; never mutate storage."""
     no_store = {"Cache-Control": "no-store"}
-    if not _acp_transcript_client_is_loopback(request):
-        return JSONResponse(status_code=403, content={"detail": "Forbidden"}, headers=no_store)
+    refusal = _acp_transcript_access_refusal(request)
+    if refusal is not None:
+        return JSONResponse(
+            status_code=403,
+            content={"detail": "Forbidden", "reason": refusal},
+            headers=no_store,
+        )
     transcript = await asyncio.to_thread(get_acp_conversation_transcript, conversation_id, ctx=ctx)
     if transcript is None:
         return JSONResponse(

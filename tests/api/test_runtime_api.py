@@ -9,13 +9,16 @@ from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
+from starlette.requests import Request
 
+import lu_machinery.api.config as api_config
 import lu_machinery.api.fleet_router as fleet_router
 import lu_machinery.api.runtime_router as runtime_router
 from lu_machinery.agent_runtime.acpx_discuss import AcpxDiscussionController
 from lu_machinery.api.main import app
 
 client = TestClient(app, raise_server_exceptions=False)
+_LISTENER_ORIGIN = f"http://{api_config.API_HOST}:{api_config.API_PORT}"
 def _ctx_with_batch_state_dir(batch_state_dir: Path):
     """Return a MonitorContext pinned to a disposable ``batch_state`` root.
 
@@ -327,7 +330,7 @@ def test_acp_transcript_is_loopback_only_ordered_allowlisted_and_no_store(tmp_pa
         app,
         raise_server_exceptions=False,
         client=("127.0.0.1", 50000),
-        base_url="http://localhost",
+        base_url=_LISTENER_ORIGIN,
     )
     response = loopback_client.get("/api/runtime/acp/conversations/conv-transcript/transcript")
 
@@ -373,19 +376,19 @@ def test_acp_transcript_is_loopback_only_ordered_allowlisted_and_no_store(tmp_pa
         app,
         raise_server_exceptions=False,
         client=("203.0.113.10", 50000),
-        base_url="http://localhost",
+        base_url=_LISTENER_ORIGIN,
     )
     denied = remote.get("/api/runtime/acp/conversations/conv-transcript/transcript")
     assert denied.status_code == 403
     assert denied.headers["cache-control"] == "no-store"
-    assert denied.json() == {"detail": "Forbidden"}
+    assert denied.json() == {"detail": "Forbidden", "reason": "non_loopback_peer"}
 
     for host in ("127.0.0.1", "::1", "::ffff:127.0.0.1"):
         loopback = TestClient(
             app,
             raise_server_exceptions=False,
             client=(host, 50000),
-            base_url="http://localhost",
+            base_url=_LISTENER_ORIGIN,
         )
         assert loopback.get("/api/runtime/acp/conversations/conv-transcript/transcript").status_code == 200
 
@@ -395,7 +398,229 @@ def test_acp_transcript_is_loopback_only_ordered_allowlisted_and_no_store(tmp_pa
         client=("127.0.0.1", 50000),
         base_url="http://monitor.example",
     )
-    assert rebound.get("/api/runtime/acp/conversations/conv-transcript/transcript").status_code == 403
+    rebound_response = rebound.get("/api/runtime/acp/conversations/conv-transcript/transcript")
+    assert rebound_response.status_code == 403
+    assert rebound_response.json() == {"detail": "Forbidden", "reason": "invalid_host"}
+
+
+def _seed_transcript_db(root: Path) -> None:
+    now = datetime.now(UTC)
+    conversation = (
+        "conv-guarded", "secret", "secret", "secret", 1, "[]", _iso(now), None, 1, 1,
+    )
+    events = [
+        (
+            "event-1", "conv-guarded", 1, "CALL_TERMINAL", "COMPLETE", "codex", "root", 1,
+            "ok", 1, 1, "secret", "message-1", "{}", _iso(now),
+        ),
+    ]
+    _write_acp_db(root, [conversation], events)
+    connection = sqlite3.connect(root / "comms.sqlite3")
+    try:
+        connection.execute(
+            """INSERT INTO comms_messages(
+                message_id, conversation_id, kind, sender, recipient, body_inline, metadata_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            ("message-1", "conv-guarded", "reply", "codex", "root", "guarded transcript body", "{}", _iso(now)),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def _raw_transcript_request(
+    headers: list[tuple[bytes, bytes]],
+    *,
+    scheme: str = "http",
+    peer: tuple[str, int] | None = ("127.0.0.1", 50000),
+) -> Request:
+    scope: dict[str, object] = {
+        "type": "http",
+        "method": "GET",
+        "scheme": scheme,
+        "path": "/api/runtime/acp/conversations/conv-guarded/transcript",
+        "query_string": b"",
+        "headers": headers,
+        "server": (api_config.API_HOST, api_config.API_PORT),
+    }
+    if peer is not None:
+        scope["client"] = peer
+    return Request(scope)
+
+
+def test_acp_transcript_refuses_foreign_origin_and_omits_cors(tmp_path, monkeypatch):
+    """Defect class: cross-origin/cross-site browser reads or wildcard credentialed CORS expose ACP transcripts."""
+    root = tmp_path / "plane"
+    _seed_transcript_db(root)
+    monkeypatch.setenv("FLEET_COMMS_ROOT", str(root))
+
+    local = TestClient(app, raise_server_exceptions=False, client=("127.0.0.1", 50000), base_url=_LISTENER_ORIGIN)
+    url = "/api/runtime/acp/conversations/conv-guarded/transcript"
+
+    for bad_origin in (
+        "https://evil.example",
+        f"http://{api_config.API_HOST}:{api_config.API_PORT + 1}",
+        f"http://localhost:{api_config.API_PORT}",
+        f"https://{api_config.API_HOST}:{api_config.API_PORT}",
+        f"http://{api_config.API_HOST}",
+        f"{_LISTENER_ORIGIN}/",
+        "null",
+        "",
+    ):
+        resp = local.get(url, headers={"Origin": bad_origin})
+        assert resp.status_code == 403, bad_origin
+        assert resp.headers["cache-control"] == "no-store"
+        assert resp.json() == {"detail": "Forbidden", "reason": "invalid_origin"}
+        assert "access-control-allow-origin" not in resp.headers
+        assert "access-control-allow-credentials" not in resp.headers
+        assert "guarded transcript body" not in resp.text
+
+    dup_origin = _raw_transcript_request(
+        [
+            (b"host", f"{api_config.API_HOST}:{api_config.API_PORT}".encode()),
+            (b"origin", _LISTENER_ORIGIN.encode()),
+            (b"origin", _LISTENER_ORIGIN.encode()),
+        ]
+    )
+    assert runtime_router._acp_transcript_access_refusal(dup_origin) == "invalid_origin"
+
+    for bad_fetch_site in ("cross-site", "same-site", ""):
+        resp = local.get(url, headers={"Sec-Fetch-Site": bad_fetch_site})
+        assert resp.status_code == 403, bad_fetch_site
+        assert resp.headers["cache-control"] == "no-store"
+        assert resp.json() == {"detail": "Forbidden", "reason": "cross_site_request"}
+        assert "access-control-allow-origin" not in resp.headers
+        assert "access-control-allow-credentials" not in resp.headers
+
+    dup_fetch_site = _raw_transcript_request(
+        [
+            (b"host", f"{api_config.API_HOST}:{api_config.API_PORT}".encode()),
+            (b"sec-fetch-site", b"same-origin"),
+            (b"sec-fetch-site", b"same-origin"),
+        ]
+    )
+    assert runtime_router._acp_transcript_access_refusal(dup_fetch_site) == "cross_site_request"
+
+    for preflight_path in (url, f"{url}/", "/api/runtime/acp/conversations/conv-guarded/./transcript"):
+        preflight = local.options(
+            preflight_path,
+            headers={
+                "Origin": "https://evil.example",
+                "Access-Control-Request-Method": "GET",
+            },
+        )
+        assert preflight.status_code != 200, preflight_path
+        assert "access-control-allow-origin" not in preflight.headers
+        assert "access-control-allow-credentials" not in preflight.headers
+
+    # Other Monitor routes (including body-free ACP routes and an ID named "transcript") keep existing CORS.
+    for other_path in ("/api/runtime/acp/conversations", "/api/runtime/acp/conversations/transcript"):
+        other = local.get(other_path, headers={"Origin": "https://viewer.example"})
+        assert other.headers.get("access-control-allow-origin") == "https://viewer.example"
+        assert other.headers.get("access-control-allow-credentials") == "true"
+
+
+def test_acp_transcript_refuses_mismatched_missing_or_duplicate_host(tmp_path, monkeypatch):
+    """Defect class: DNS rebinding, wrong listener authority/scheme, missing/duplicate Host, or bad config bypasses guard."""
+    root = tmp_path / "plane"
+    _seed_transcript_db(root)
+    monkeypatch.setenv("FLEET_COMMS_ROOT", str(root))
+
+    url = "/api/runtime/acp/conversations/conv-guarded/transcript"
+    for bad_base_url, expected_reason in (
+        ("http://monitor.example", "invalid_host"),
+        (f"http://localhost:{api_config.API_PORT}", "invalid_host"),
+        (f"http://{api_config.API_HOST}:{api_config.API_PORT + 1}", "invalid_host"),
+        (f"http://{api_config.API_HOST}", "invalid_host"),
+        (f"https://{api_config.API_HOST}:{api_config.API_PORT}", "invalid_scheme"),
+    ):
+        other = TestClient(app, raise_server_exceptions=False, client=("127.0.0.1", 50000), base_url=bad_base_url)
+        resp = other.get(url)
+        assert resp.status_code == 403, bad_base_url
+        assert resp.headers["cache-control"] == "no-store"
+        assert resp.json() == {"detail": "Forbidden", "reason": expected_reason}
+        assert "guarded transcript body" not in resp.text
+
+    expected_host = f"{api_config.API_HOST}:{api_config.API_PORT}".encode()
+    assert runtime_router._acp_transcript_access_refusal(_raw_transcript_request([])) == "invalid_host"
+    assert (
+        runtime_router._acp_transcript_access_refusal(
+            _raw_transcript_request([(b"host", expected_host), (b"host", expected_host)])
+        )
+        == "invalid_host"
+    )
+    assert (
+        runtime_router._acp_transcript_access_refusal(
+            _raw_transcript_request([(b"host", expected_host)], peer=None)
+        )
+        == "non_loopback_peer"
+    )
+
+    local = TestClient(app, raise_server_exceptions=False, client=("127.0.0.1", 50000), base_url=_LISTENER_ORIGIN)
+    monkeypatch.setattr(api_config, "API_HOST", "0.0.0.0")
+    bad_cfg = local.get(url)
+    assert bad_cfg.status_code == 403
+    assert bad_cfg.json() == {"detail": "Forbidden", "reason": "invalid_listener_config"}
+
+
+def test_acp_transcript_refuses_forwarding_headers(tmp_path, monkeypatch):
+    """Defect class: proxied requests carrying Forwarded or X-Forwarded-* headers read ACP transcripts."""
+    root = tmp_path / "plane"
+    _seed_transcript_db(root)
+    monkeypatch.setenv("FLEET_COMMS_ROOT", str(root))
+
+    local = TestClient(app, raise_server_exceptions=False, client=("127.0.0.1", 50000), base_url=_LISTENER_ORIGIN)
+    url = "/api/runtime/acp/conversations/conv-guarded/transcript"
+
+    for header_name, header_value in (
+        ("Forwarded", "for=127.0.0.1"),
+        ("Forwarded", ""),
+        ("X-Forwarded-For", "127.0.0.1"),
+        ("X-Forwarded-Host", f"{api_config.API_HOST}:{api_config.API_PORT}"),
+        ("X-Forwarded-Proto", "http"),
+        ("X-Forwarded-Port", str(api_config.API_PORT)),
+        ("X-FoRwArDeD-For", "198.51.100.1"),
+    ):
+        resp = local.get(url, headers={header_name: header_value})
+        assert resp.status_code == 403, (header_name, header_value)
+        assert resp.headers["cache-control"] == "no-store"
+        assert resp.json() == {"detail": "Forbidden", "reason": "forwarding_header_present"}
+        assert "access-control-allow-origin" not in resp.headers
+        assert "access-control-allow-credentials" not in resp.headers
+        assert "guarded transcript body" not in resp.text
+
+
+def test_acp_transcript_allows_same_origin_and_no_origin_local_reads(tmp_path, monkeypatch):
+    """Defect class: listener/Origin/CORS hardening breaks authorized local same-origin or no-Origin reads."""
+    root = tmp_path / "plane"
+    _seed_transcript_db(root)
+    monkeypatch.setenv("FLEET_COMMS_ROOT", str(root))
+
+    local = TestClient(app, raise_server_exceptions=False, client=("127.0.0.1", 50000), base_url=_LISTENER_ORIGIN)
+    url = "/api/runtime/acp/conversations/conv-guarded/transcript"
+
+    for headers in (
+        {"Origin": _LISTENER_ORIGIN, "Sec-Fetch-Site": "same-origin"},
+        {"Sec-Fetch-Site": "none"},
+        {},
+    ):
+        resp = local.get(url, headers=headers)
+        assert resp.status_code == 200, headers
+        assert resp.headers["cache-control"] == "no-store"
+        assert "access-control-allow-origin" not in resp.headers
+        assert "access-control-allow-credentials" not in resp.headers
+        assert resp.json()["messages"][0]["body"] == "guarded transcript body"
+
+    # Listener host/port comes from config settings, not a hardcoded constant.
+    monkeypatch.setattr(api_config, "API_PORT", 9876)
+    reconfigured_origin = f"http://{api_config.API_HOST}:9876"
+    assert local.get(url).status_code == 403
+    reconfigured = TestClient(
+        app, raise_server_exceptions=False, client=("127.0.0.1", 50000), base_url=reconfigured_origin
+    )
+    ok = reconfigured.get(url, headers={"Origin": reconfigured_origin})
+    assert ok.status_code == 200
+    assert ok.json()["messages"][0]["body"] == "guarded transcript body"
 
 
 def test_acp_transcript_hides_unavailable_malformed_and_body_free_routes(tmp_path, monkeypatch):
@@ -429,7 +654,7 @@ def test_acp_transcript_hides_unavailable_malformed_and_body_free_routes(tmp_pat
         app,
         raise_server_exceptions=False,
         client=("127.0.0.1", 50000),
-        base_url="http://localhost",
+        base_url=_LISTENER_ORIGIN,
     )
     body_free = client.get("/api/runtime/acp/conversations/conv-malformed")
     transcript = loopback_client.get("/api/runtime/acp/conversations/conv-malformed/transcript")

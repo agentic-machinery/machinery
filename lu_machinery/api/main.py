@@ -13,6 +13,7 @@ import importlib.metadata
 import logging
 import mimetypes
 import os
+import posixpath
 import re
 import socket
 import stat
@@ -2047,6 +2048,43 @@ class PrometheusMetricsMiddleware:
             self._errors.labels(**labels).inc()
 
 
+_ACP_TRANSCRIPT_PREFIX = "/api/runtime/acp/conversations/"
+_ACP_TRANSCRIPT_SUFFIX = "/transcript"
+
+
+def _is_acp_transcript_path(scope: Scope) -> bool:
+    """Return True for any HTTP path spelling that targets the private ACP transcript route."""
+    raw_path = scope.get("path")
+    if not isinstance(raw_path, str) or not raw_path:
+        return False
+    candidates = [raw_path]
+    root_path = scope.get("root_path")
+    if isinstance(root_path, str) and root_path and raw_path.startswith(root_path):
+        stripped = raw_path[len(root_path) :]
+        if stripped:
+            candidates.append(stripped)
+    for item in list(candidates):
+        candidates.append(posixpath.normpath("/" + item.lstrip("/")))
+    for candidate in candidates:
+        trimmed = "/" + candidate.strip("/")
+        if not trimmed.startswith(_ACP_TRANSCRIPT_PREFIX):
+            continue
+        remainder = trimmed[len(_ACP_TRANSCRIPT_PREFIX) :]
+        if remainder.endswith(_ACP_TRANSCRIPT_SUFFIX) and len(remainder) > len(_ACP_TRANSCRIPT_SUFFIX):
+            return True
+    return False
+
+
+class _ScopedCORSMiddleware(CORSMiddleware):
+    """Apply the app CORS policy except on private local-only transcript routes."""
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope.get("type") == "http" and _is_acp_transcript_path(scope):
+            await self.app(scope, receive, send)
+            return
+        await super().__call__(scope, receive, send)
+
+
 def create_app(
     context: MonitorContext,
     *,
@@ -2090,7 +2128,7 @@ def create_app(
     factory_app.state.metrics_snapshot = metrics.snapshot
     install_providers(product)
     factory_app.add_middleware(
-        CORSMiddleware,
+        _ScopedCORSMiddleware,
         allow_origins=["*"],
         allow_credentials=True,
         allow_methods=["*"],
