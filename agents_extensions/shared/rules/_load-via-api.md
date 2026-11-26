@@ -65,6 +65,7 @@ run receives the core as an appended system prompt:
     scope=task:review      agents_extensions/shared/skills/local-code-review/SKILL.md
     scope=task:task-family agents_extensions/shared/skills/task-family-manager/SKILL.md
     scope=task:rollover    agents_extensions/shared/skills/thread-rollover/SKILL.md
+    scope=task:ukrainian   agents_extensions/shared/skills/verify-ukrainian/SKILL.md
 
 These files no longer auto-load into the Claude Code system prompt
 (moved out of `.claude/rules/` deploy target) — read them directly
