@@ -18,11 +18,102 @@ MARKER = re.compile(r"<!-- ci-recovery-evidence\s+(\{.*?\})\s*-->", re.S)
 SHA = re.compile(r"[0-9a-f]{40}\Z")
 RECOVERY_ACTIONS = frozenset({"run-rerun", "re-enqueue"})
 CANCELLED_MERGE_GROUP_RECOVERY_MODE = "cancelled_merge_group_no_artifact"
+INCOHERENT_CHECK_RECOVERY_MODE = "incoherent_check_row_full_rerun"
 DEFAULT_REQUIRED_WORKFLOW = ".github/workflows/ci.yml"
+PR_WORKFLOW_EVENTS = frozenset({"pull_request", "pull_request_target"})
+PASSING_RUN_CONCLUSIONS = frozenset({"success", "skipped", "neutral"})
+_PASSING_JOB_CONCLUSIONS = frozenset({"success", "skipped", "neutral"})
+_INCOHERENT_JOB_STATUSES = frozenset({"in_progress", "queued", "pending", "waiting", "expected", "requested", "stale"})
+_ISO_TIMESTAMP = re.compile(
+    r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-](?:[01]\d|2[0-3]):[0-5]\d)\Z"
+)
 _WORKFLOW_PATH = re.compile(r"\.github/workflows/[A-Za-z0-9._-]+\.ya?ml\Z")
 _MERGE_GROUP_BRANCH = re.compile(r"gh-readonly-queue/(main)/pr-([1-9][0-9]*)-[0-9a-f]{40}")
 _CLEAN_CANCELLED_JOB_CONCLUSIONS = frozenset({"success", "skipped", "neutral", "cancelled"})
 _CLEAN_CANCELLED_STEP_CONCLUSIONS = frozenset({None, "success", "skipped", "neutral", "cancelled"})
+
+
+def _is_valid_timestamp(value: object) -> bool:
+    """True when *value* is an ISO-8601 UTC/offset timestamp string."""
+    if not isinstance(value, str) or not _ISO_TIMESTAMP.fullmatch(value):
+        return False
+    try:
+        datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    return True
+
+
+def incoherent_completed_run_job_ids(run: object, jobs: object) -> set[int] | None:
+    """Return incoherent job IDs for a completed all-green run, empty set if coherent, or None if invalid.
+
+    Every job in *jobs* must have a passing conclusion, a valid ``completed_at`` timestamp,
+    and completed passing steps with valid ``completed_at`` timestamps. A job with status
+    ``completed`` is coherent; a job with a known non-completed status (such as
+    ``in_progress``) while ``conclusion`` and ``completed_at`` are set is incoherent. Any
+    failing, running, missing-field, or mismatched row returns ``None`` so recovery fails closed.
+    """
+    if not isinstance(run, dict) or not isinstance(jobs, list) or not jobs:
+        return None
+    run_id = run.get("id")
+    if type(run_id) is not int or run_id <= 0:
+        return None
+    if "event" in run:
+        run_event = run.get("event")
+        if not isinstance(run_event, str) or run_event not in PR_WORKFLOW_EVENTS:
+            return None
+    run_conclusion = run.get("conclusion")
+    if (
+        run.get("status") != "completed"
+        or not isinstance(run_conclusion, str)
+        or run_conclusion not in PASSING_RUN_CONCLUSIONS
+    ):
+        return None
+    run_head_sha = run.get("head_sha")
+    if not isinstance(run_head_sha, str) or not SHA.fullmatch(run_head_sha):
+        return None
+    run_attempt = run.get("run_attempt")
+    if type(run_attempt) is not int or run_attempt < 1:
+        return None
+    incoherent_ids: set[int] = set()
+    for job in jobs:
+        if not isinstance(job, dict):
+            return None
+        job_id = job.get("id")
+        if type(job_id) is not int or job_id <= 0:
+            return None
+        if "run_id" in job and (type(job["run_id"]) is not int or job["run_id"] != run_id):
+            return None
+        if "run_attempt" in job and (type(job["run_attempt"]) is not int or job["run_attempt"] != run_attempt):
+            return None
+        if "head_sha" in job and (not isinstance(job["head_sha"], str) or job["head_sha"] != run_head_sha):
+            return None
+        job_conclusion = job.get("conclusion")
+        if not isinstance(job_conclusion, str) or job_conclusion not in _PASSING_JOB_CONCLUSIONS:
+            return None
+        if not _is_valid_timestamp(job.get("completed_at")):
+            return None
+        status = job.get("status")
+        if status == "completed":
+            pass
+        elif isinstance(status, str) and status in _INCOHERENT_JOB_STATUSES:
+            incoherent_ids.add(job_id)
+        else:
+            return None
+        if "steps" not in job or not isinstance(job["steps"], list):
+            return None
+        for step in job["steps"]:
+            if not isinstance(step, dict):
+                return None
+            step_conclusion = step.get("conclusion")
+            if (
+                step.get("status") != "completed"
+                or not isinstance(step_conclusion, str)
+                or step_conclusion not in _PASSING_JOB_CONCLUSIONS
+                or not _is_valid_timestamp(step.get("completed_at"))
+            ):
+                return None
+    return incoherent_ids
 
 
 def is_valid_workflow_path(value: object) -> bool:
@@ -70,15 +161,17 @@ def cancelled_merge_group_without_failure(
             return False
         if job.get("status") != "completed":
             return False
-        if job.get("conclusion") not in _CLEAN_CANCELLED_JOB_CONCLUSIONS:
+        job_conclusion = job.get("conclusion")
+        if not isinstance(job_conclusion, str) or job_conclusion not in _CLEAN_CANCELLED_JOB_CONCLUSIONS:
             return False
         if "steps" not in job or not isinstance(job["steps"], list):
             return False
         for step in job["steps"]:
-            if (
-                not isinstance(step, dict)
-                or "conclusion" not in step
-                or step["conclusion"] not in _CLEAN_CANCELLED_STEP_CONCLUSIONS
+            if not isinstance(step, dict) or "conclusion" not in step:
+                return False
+            step_conclusion = step["conclusion"]
+            if step_conclusion is not None and (
+                not isinstance(step_conclusion, str) or step_conclusion not in _CLEAN_CANCELLED_STEP_CONCLUSIONS
             ):
                 return False
     return True
