@@ -1523,6 +1523,29 @@ def test_origin_scratch_ref_is_not_deleted_for_containing_itself(tmp_path: Path,
     assert "rescue/only-here" in remote_heads.splitlines()
 
 
+def test_oversized_or_leading_zero_review_branch_number_is_not_a_pr_number() -> None:
+    """Defect class: an oversized or leading-zero PR number in a review branch name is not treated as a PR number."""
+    assert cleanup._review_checkout_pr_number("pr-7020") == 7020
+    assert cleanup._review_checkout_pr_number("review-9") == 9
+    assert cleanup._review_checkout_pr_number("pr-42-review") == 42
+    assert cleanup._review_checkout_pr_number("review-42-tmp") == 42
+    assert cleanup._review_checkout_pr_number("pr-" + "9" * 19) == int("9" * 19)
+
+    rejected = (
+        "pr-0",
+        "pr-01",
+        "pr-007",
+        "review-01",
+        "pr-01-review",
+        "review-007-tmp",
+        "pr-" + "1" + "0" * 19,
+        "review-" + "9" * 20 + "-tmp",
+        "pr-" + "0" * 19,
+    )
+    for branch in rejected:
+        assert cleanup._review_checkout_pr_number(branch) is None
+
+
 def test_review_checkout_unrelated_commit_is_preserved(tmp_path: Path, monkeypatch) -> None:
     repo = _repo(tmp_path)
     _git(repo, "checkout", "-b", "pr-7020")

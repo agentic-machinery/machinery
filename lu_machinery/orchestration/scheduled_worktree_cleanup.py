@@ -50,7 +50,7 @@ from lu_machinery.maintenance.claude_session_scratch import sweep_sessions
 from lu_machinery.orchestration import backup_failure_alert, disk_watermark_alert, worktree_git
 from lu_machinery.orchestration.execution_safe_git import GIT
 from lu_machinery.orchestration.execution_safe_git import run_git as safe_git
-from lu_machinery.orchestration.fleet_repos import FleetRepoError, load_fleet_repos
+from lu_machinery.orchestration.fleet_repos import FleetRepoError, load_fleet_repos, parse_ascii_positive_int
 from lu_machinery.orchestration.pool_headroom import _read_limit
 from lu_machinery.orchestration.task_record_store import iter_task_records, task_archive_lock
 from lu_machinery.orchestration.task_record_store import read_listed_task_record as read_task_record
@@ -232,10 +232,16 @@ def _is_protected_local_branch(branch: str) -> bool:
 
 
 def _review_checkout_pr_number(branch: str) -> int | None:
+    """Return the review-checkout PR number, or None when the branch is not one.
+
+    The captured digits are a PR number only when the shared bounded parser
+    accepts them. Leading zeros and values longer than 19 digits are refused,
+    and the caller then treats the branch as any other non-review name.
+    """
     match = _REVIEW_CHECKOUT_RE.fullmatch(branch)
     if match is None:
         return None
-    return int(match.group(1))
+    return parse_ascii_positive_int(match.group(1))
 
 
 def _gone_local_branches(repo_root: Path) -> list[tuple[str, str]]:
