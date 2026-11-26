@@ -38,6 +38,7 @@ from prometheus_client import CollectorRegistry, Counter, Histogram, generate_la
 from prometheus_client.core import Metric
 from prometheus_client.exposition import CONTENT_TYPE_PLAIN_0_0_4
 from starlette.exceptions import HTTPException as StarletteHTTPException
+from starlette.routing import compile_path, get_route_path
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 import lu_machinery.github_rest_cache as github_rest
@@ -2048,31 +2049,30 @@ class PrometheusMetricsMiddleware:
             self._errors.labels(**labels).inc()
 
 
-_ACP_TRANSCRIPT_PREFIX = "/api/runtime/acp/conversations/"
-_ACP_TRANSCRIPT_SUFFIX = "/transcript"
+_ACP_TRANSCRIPT_PATH_REGEX = compile_path("/api/runtime/acp/conversations/{conversation_id}/transcript")[0]
 
 
 def _is_acp_transcript_path(scope: Scope) -> bool:
-    """Return True for any HTTP path spelling that targets the private ACP transcript route."""
+    """Return True when ``scope`` targets the mounted ACP transcript route.
+
+    Uses Starlette's ``get_route_path`` and ``compile_path`` regex so single-segment
+    matching, trailing-slash redirection, dot-segments, and regex end-of-string
+    semantics (including decoded trailing newlines) stay aligned with FastAPI routing
+    without stripping CORS from unrelated routes.
+    """
     raw_path = scope.get("path")
     if not isinstance(raw_path, str) or not raw_path:
         return False
-    candidates = [raw_path]
-    root_path = scope.get("root_path")
-    if isinstance(root_path, str) and root_path and raw_path.startswith(root_path):
-        stripped = raw_path[len(root_path) :]
-        if stripped:
-            candidates.append(stripped)
-    for item in list(candidates):
-        candidates.append(posixpath.normpath("/" + item.lstrip("/")))
-    for candidate in candidates:
-        trimmed = "/" + candidate.strip("/")
-        if not trimmed.startswith(_ACP_TRANSCRIPT_PREFIX):
-            continue
-        remainder = trimmed[len(_ACP_TRANSCRIPT_PREFIX) :]
-        if remainder.endswith(_ACP_TRANSCRIPT_SUFFIX) and len(remainder) > len(_ACP_TRANSCRIPT_SUFFIX):
-            return True
-    return False
+    route_path = get_route_path(scope)
+    if not route_path:
+        return False
+    candidates = {route_path}
+    if route_path.startswith("/"):
+        candidates.add(posixpath.normpath("/" + route_path.lstrip("/")))
+    for candidate in list(candidates):
+        if candidate.endswith("/") and candidate != "/":
+            candidates.add(candidate.rstrip("/"))
+    return any(_ACP_TRANSCRIPT_PATH_REGEX.match(candidate) is not None for candidate in candidates)
 
 
 class _ScopedCORSMiddleware(CORSMiddleware):
