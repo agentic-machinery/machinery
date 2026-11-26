@@ -68,7 +68,7 @@ class SupervisorError(ValueError):
 # start.lock with in-place successor re-entry, bounded auth check) and gave its tmux pane
 # the caller's selector instead of a reused server's stale one.
 _CTO_CHECKOUT_TEMPLATE = "44dedafd91b354e31b9fcd8a4948518b57dc9f41cce9f34fd02e5cae36157280"
-_CTO_WORKSPACE_TEMPLATE = "63241e9962f604c83f648935d1a19f722099a80a07027f5e3e8085c6285f2cf1"
+_CTO_WORKSPACE_TEMPLATE = "e64182413ab76da9e542aac358f4bc1eb5d9e6f3d15fea325c6a64b1e403157c"
 _CTO_PACKAGE_WRAPPER = Path(__file__).resolve().parents[1] / "start-claude-cto.sh"
 
 

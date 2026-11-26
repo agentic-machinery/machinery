@@ -50,10 +50,12 @@ ancestors, the scope waiter and any flock still holding the lock, do not count
 as another running CTO. Any other CTO process still refuses it. A new tmux
 session gets the selector, root and interpreter settings from the caller and
 clears any the caller left unset, so a reused tmux server's stale values never
-reach the pane. Only the pane reads the role text. The pane takes
-`start.lock` with a bounded wait after the detached start releases it, and holds
-it for its launcher's life. No other start passes the process check before the
-pane's launcher is visible to it.
+reach the pane. The pane runs the start again with the chosen account and
+`--pane`, a `--here` start that waits up to 30 seconds for the detached start to
+release `start.lock`. Its process, session and auth checks, its account save
+and its launch all run under the lock it then holds for its launcher's life.
+Whichever start takes the lock first runs on its own checks. Only that start
+reads the role text.
 
 The inbox watcher receives the launcher's entrypoint and helper metadata through
 its inherited environment. Exact captured Claude CTO arguments travel as raw

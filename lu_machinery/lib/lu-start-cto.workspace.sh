@@ -6,14 +6,15 @@
 #   a|b     Claude account for this start. Optional; it is also saved as the default, so
 #           automatic relaunches use it too. Omitted: the saved default in CFG/claude-account.
 #   --here  restart inside the current pane (a pane in session cto if that session exists);
-#           without it a new tmux session "cto" is created.
+#           without it a new tmux session "cto" is created, whose pane runs this start again
+#           with --pane: --here that waits up to 30 s for the detached start to release the lock.
 # Roots and the interpreter (LU_PRIMARY_REPO_ROOT, LU_STATE_ROOT, LEARN_UKRAINIAN_PYTHON, ...)
 # come from the caller; the fleet repository selector comes only from SELECTOR_PROFILE.
 # This is the only supported way to start the CTO seat from its workspace.
 #
 # Rendering (the released template; supervised rollover admits only its statements, pinned in
 # lu_machinery.session_supervisor): replace each @-delimited name with one shell-quoted literal,
-# no $, `, \ or leading ~. REPO is the CTO workspace's physical path; LAUNCHER is the installed package's
+# no ~, $, `, or \. REPO is the CTO workspace's physical path; LAUNCHER is the installed package's
 # start-claude-cto.sh by its physical path; SELECTOR_PROFILE is the deployed profile that sets
 # LU_FLEET_REPO_SELECTOR_FILE; ACCOUNT_A and ACCOUNT_B are the two Claude account directories.
 set -euo pipefail
@@ -27,6 +28,8 @@ KICK=@KICK@
 ROLE=$CFG/CTO-ROLE-PROMPT.txt
 ACCT_FILE=$CFG/claude-account
 LOCK=$CFG/start.lock
+# This start's own path, before any cd, for the pane that runs it again.
+SELF="$(CDPATH='' cd -P -- "$(dirname -- "$0")" && pwd -P)/${0##*/}"
 # The selector, root and interpreter settings (lu_machinery.common.repo_root) a new pane takes
 # from this caller, never from a reused tmux server's environment; an unset one is cleared.
 PANE_ENV_VARS=(
@@ -40,12 +43,14 @@ PANE_ENV_VARS=(
 )
 
 HERE=0
+PANE=0
 ACCT=""
 for arg in "$@"; do
   case "$arg" in
     --here) HERE=1 ;;
+    --pane) HERE=1 PANE=1 ;;
     a|b) ACCT=$arg ;;
-    -h|--help) sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "unknown argument: $arg (usage: lu-start-cto [a|b] [--here])" >&2; exit 2 ;;
   esac
 done
@@ -57,13 +62,16 @@ done
 # and, for a --here start, the flock holding start.lock) keep running, so it takes no new lock
 # and its ancestors are not another CTO process.
 SUCCESSOR=0
-if [ "$HERE" = 1 ] && [ -n "${SESSION_SUPERVISOR_WAKE_DELIVERY:-}" ] && [ "${LU_DRIVER_SCOPE_PID:-}" = "$$" ]; then
+if [ "$HERE" = 1 ] && [ "$PANE" = 0 ] && [ -n "${SESSION_SUPERVISOR_WAKE_DELIVERY:-}" ] && [ "${LU_DRIVER_SCOPE_PID:-}" = "$$" ]; then
   SUCCESSOR=1
 fi
 # Every other start holds start.lock from before the checks through launch, in the flock parent
 # only (-o keeps descendants from pinning it); a --here start holds it for its whole life. The
 # start re-runs itself as the flock's child, which finds its parent holding this exact lock.
 LOCK_ARGV=(flock -n -E 3 -o "$LOCK")
+if [ "$PANE" = 1 ]; then
+  LOCK_ARGV=(flock -w 30 -E 3 -o "$LOCK")
+fi
 if [ "$SUCCESSOR" = 0 ]; then
   HOLDER=()
   { mapfile -d '' -t HOLDER < "/proc/$PPID/cmdline"; } 2>/dev/null || HOLDER=()
@@ -142,23 +150,19 @@ if [ "$HERE" = 1 ]; then
   ROLE_TEXT=$(cat "$ROLE")
   LC_WORKSPACE_ROOT="$REPO" exec "${LAUNCH[@]}" --append-system-prompt "$ROLE_TEXT"
 fi
-TMUX_ARGS=(
-  new-session -d -s cto -e "CLAUDE_CONFIG_DIR=$CLAUDE_CONFIG_DIR" -e "LC_WORKSPACE_ROOT="
-  -e "CLAUDE_CODE_EXPERIMENTAL_CODE_MODE=$CLAUDE_CODE_EXPERIMENTAL_CODE_MODE"
-)
+TMUX_ARGS=(new-session -d -s cto -e "CLAUDE_CONFIG_DIR=$CLAUDE_CONFIG_DIR" -e "LC_WORKSPACE_ROOT=")
 for var in "${PANE_ENV_VARS[@]}"; do
   TMUX_ARGS+=(-e "$var=${!var:-}")
 done
-# Only the pane reads the role text: a new tmux server can retain this client's argv, which
-# must not look like a running CTO to the process check. The pane enters REPO itself, so a
-# tmux config cwd cannot override it, and clears the settings this caller left unset. This
-# start holds start.lock until tmux returns; the pane then takes it (bounded wait) and keeps
-# it for its launcher's life, as a --here start does, so no start passes the process check
-# before this pane's launcher is visible to it. Whichever start takes the lock first runs.
+# The pane runs this start again with this account and --pane, after clearing the settings
+# this caller left unset. Its process, session and auth checks, its account save and its
+# launch all run under the start.lock it takes, as any --here start's do, so whichever start
+# takes the lock first runs on its own checks. Only that start reads the role text: a new
+# tmux server can retain this client's argv, which must not look like a running CTO.
 # shellcheck disable=SC2016
 TMUX_ARGS+=(
-  bash -c 'repo=$1 role_file=$2 lock=$3 count=$4; shift 4; for v in "${@:1:count}"; do [ -n "${!v:-}" ] || unset "$v"; done; shift "$count"; unset LC_WORKSPACE_ROOT; if role=$(cat "$role_file") && cd -- "$repo"; then LC_WORKSPACE_ROOT="$repo" flock -w 30 -E 75 -o "$lock" "$@" --append-system-prompt "$role" || [ "$?" != 75 ] || echo "refused: start.lock stayed held; this pane did not start the CTO" >&2; fi; exec bash'
-  lu-start-cto "$REPO" "$ROLE" "$LOCK" "${#PANE_ENV_VARS[@]}" "${PANE_ENV_VARS[@]}" "${LAUNCH[@]}"
+  bash -c 'count=$1; shift; for v in "${@:1:count}"; do [ -n "${!v:-}" ] || unset "$v"; done; shift "$count"; unset LC_WORKSPACE_ROOT; "$@" || echo "lu-start-cto exited with status $?" >&2; exec bash'
+  lu-start-cto "${#PANE_ENV_VARS[@]}" "${PANE_ENV_VARS[@]}" "$SELF" "$ACCT" --pane
 )
 # tmux reads an argument's trailing semicolon as a command separator.
 for index in "${!TMUX_ARGS[@]}"; do

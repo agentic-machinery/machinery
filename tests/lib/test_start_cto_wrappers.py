@@ -1229,8 +1229,8 @@ def test_cto_workspace_start_gives_the_pane_the_callers_selector_and_roots(tmp_p
     """Defect class: a pane started from a reused tmux server running with that server's stale
     selector, state root, product root or interpreter instead of the configured ones. The new
     session takes the deployed profile's selector and the caller's roots, an unset caller root is
-    cleared rather than inherited, the role text stays out of the tmux client argv, and the pane's
-    launcher runs under start.lock."""
+    cleared rather than inherited, the role text stays out of the tmux client argv, and the pane
+    runs the start again so its checks and launcher run under the start.lock it holds."""
     record, lock = tmp_path / "launch", tmp_path / "cto config/start.lock"
     wrapper, env, _config = _workspace_start_host(
         tmp_path, f'{{ printf "%s\\0" "$PWD" "$@"; }} > {shlex.quote(str(record))}.argv\n'
@@ -1246,7 +1246,8 @@ def test_cto_workspace_start_gives_the_pane_the_callers_selector_and_roots(tmp_p
     (tmp_path / "bin/tmux").write_text(
         "#!/bin/bash\n"
         f'printf "%s\\0" "$@" >> {shlex.quote(str(tmux_argv))}\n'
-        '[ "$1" = new-session ] || exit 1\nshift\n'
+        '[ "$1" = new-session ] || exit 1\n'
+        f'printf "%s\\0" "$@" > {shlex.quote(str(tmux_argv))}.session\nshift\n'
         f"server=({' '.join(shlex.quote(item) for item in stale)})\n"
         'while [ $# -gt 0 ]; do case "$1" in -d) shift ;; -s) shift 2 ;; -e) server+=("$2"); shift 2 ;; *) break ;; esac; done\n'
         r'pane=(); for a in "$@"; do [[ $a == *"\;" ]] && a="${a%\\;};"; pane+=("$a"); done' "\n"
@@ -1269,8 +1270,13 @@ def test_cto_workspace_start_gives_the_pane_the_callers_selector_and_roots(tmp_p
     assert "LU_PRODUCT_ROOT" not in pane and "LU_PYTHON" not in pane
     assert pane["CLAUDE_CONFIG_DIR"] == str(tmp_path / "account a")
     assert b"operator role text" not in tmux_argv.read_bytes()
-    # The pane's launcher runs under start.lock, so no start slips in before it is visible.
+    # The pane runs this start again (--pane): its checks, account save and launcher all run
+    # under the start.lock its own flock holds, not on the detached client's earlier checks.
+    session = tmux_argv.with_suffix(".session").read_bytes().split(b"\0")[:-1]
+    assert [arg.decode() for arg in session[-3:]] == [str(wrapper), "a", "--pane"]
     assert record.with_suffix(".lock").read_text().split() == ["held", "flock"]
+    assert (tmp_path / "calls").read_text().count("claude auth status") == 2
+    assert (tmp_path / "cto config/claude-account").read_text() == "a\n"
 
     # In place, the profile's selector also replaces a stale one the caller carries.
     (tmp_path / "bin/tmux").write_text("#!/bin/bash\nexit 1\n")
