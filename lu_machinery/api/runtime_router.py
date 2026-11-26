@@ -1423,8 +1423,8 @@ def _whatwg_ipv6_serialize(address: ipaddress.IPv6Address) -> str:
     return "".join(out)
 
 
-def _bound_acp_listener(request: Request) -> tuple[frozenset[str], str] | None:
-    """Return ``(allowed_raw_hosts, exact_origin)`` for the local loopback HTTP listener.
+def _bound_acp_listener(request: Request) -> tuple[str, str] | None:
+    """Return ``(expected_host, exact_origin)`` for the local loopback HTTP listener.
 
     Reads the accepted connection's local interface and effective port from ASGI
     ``scope["server"]`` (which Uvicorn populates from ``socket.getsockname()``,
@@ -1468,9 +1468,9 @@ def _bound_acp_listener(request: Request) -> tuple[frozenset[str], str] | None:
     else:
         authority_host = address.compressed
     if raw_port == 80:
-        return frozenset({authority_host, f"{authority_host}:80"}), f"http://{authority_host}"
+        return authority_host, f"http://{authority_host}"
     authority = f"{authority_host}:{raw_port}"
-    return frozenset({authority}), f"http://{authority}"
+    return authority, f"http://{authority}"
 
 
 def _acp_transcript_access_refusal(request: Request) -> str | None:
@@ -1487,7 +1487,7 @@ def _acp_transcript_access_refusal(request: Request) -> str | None:
     listener = _bound_acp_listener(request)
     if listener is None:
         return "invalid_listener"
-    expected_hosts, expected_origin = listener
+    expected_host, expected_origin = listener
 
     hosts: list[str] = []
     origins: list[str] = []
@@ -1518,7 +1518,7 @@ def _acp_transcript_access_refusal(request: Request) -> str | None:
 
     if request.scope.get("scheme") != "http":
         return "invalid_scheme"
-    if len(hosts) != 1 or hosts[0] not in expected_hosts:
+    if len(hosts) != 1 or hosts[0] != expected_host:
         return "invalid_host"
     if len(origins) > 1 or (len(origins) == 1 and origins[0] != expected_origin):
         return "invalid_origin"

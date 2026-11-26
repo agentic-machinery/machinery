@@ -673,6 +673,43 @@ def test_acp_transcript_refuses_mismatched_missing_or_duplicate_host(tmp_path, m
             == "invalid_listener"
         )
 
+    # HTTP port 80 requires the canonical WHATWG Host without explicit ':80' (IPv4 and IPv6).
+    for server_host, canonical_host, peer_host in (
+        ("127.0.0.1", b"127.0.0.1", "127.0.0.1"),
+        ("::1", b"[::1]", "::1"),
+    ):
+        canonical_origin = b"http://" + canonical_host
+        assert (
+            runtime_router._acp_transcript_access_refusal(
+                _raw_transcript_request(
+                    [(b"host", canonical_host), (b"origin", canonical_origin)],
+                    peer=(peer_host, 50000),
+                    server=(server_host, 80),
+                )
+            )
+            is None
+        )
+        assert (
+            runtime_router._acp_transcript_access_refusal(
+                _raw_transcript_request(
+                    [(b"host", canonical_host + b":80")],
+                    peer=(peer_host, 50000),
+                    server=(server_host, 80),
+                )
+            )
+            == "invalid_host"
+        )
+        assert (
+            runtime_router._acp_transcript_access_refusal(
+                _raw_transcript_request(
+                    [(b"host", canonical_host), (b"origin", canonical_origin + b":80")],
+                    peer=(peer_host, 50000),
+                    server=(server_host, 80),
+                )
+            )
+            == "invalid_origin"
+        )
+
 
 def test_acp_transcript_refuses_forwarding_headers(tmp_path, monkeypatch):
     """Defect class: proxied requests carrying Forwarded or X-Forwarded-* headers read ACP transcripts."""
