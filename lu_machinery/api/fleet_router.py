@@ -1,8 +1,9 @@
 """Unified, read-only observer for the durable fleet communications plane.
 
 Health and overview read the resolved authority through read-only storage
-handles. SQLite-shaped detail routes refuse PostgreSQL explicitly. No read
-initializes schema, writes a receipt, invokes an agent, or retrieves artifacts.
+handles. SQLite-shaped detail routes refuse PostgreSQL explicitly. Only the
+guarded message body route reads artifacts. No read initializes schema, writes
+a receipt or invokes an agent.
 """
 
 from __future__ import annotations
@@ -20,9 +21,11 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from threading import BoundedSemaphore
+from time import monotonic
 from typing import Annotated, Any, get_args
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 
 from lu_machinery import agent_identity
@@ -31,6 +34,12 @@ from lu_machinery.common import json_depth
 from lu_machinery.control_plane import storage
 from lu_machinery.control_plane.health import read_failure_code
 from lu_machinery.fleet_comms import message_plane, migrations
+from lu_machinery.fleet_comms.artifacts import (
+    ArtifactExpiredError,
+    ArtifactStoreError,
+    ArtifactTooLargeError,
+    read_message_body_bounded,
+)
 from lu_machinery.fleet_comms.authority import (
     AUTHORITY_MESSAGE_ID_RE,
     DURABLE_CTO_RECIPIENT,
@@ -61,7 +70,15 @@ from lu_machinery.session_streams.model import STREAM_ID_RE, isoformat_z, parse_
 from . import fleet_workers_collect, panel_values
 from .monitor_context import MonitorContext, get_ctx, resolve_context
 from .product_contribution import fleet_batches
-from .runtime_router import get_acp_conversation, list_acp_conversations, recent_runtime_records
+from .runtime_router import (
+    _AcpBodyEncodingError,
+    _AcpRedactionDepthExceeded,
+    _redact_and_sanitize_text,
+    get_acp_conversation,
+    list_acp_conversations,
+    local_body_read_refusal_response,
+    recent_runtime_records,
+)
 from .state_helpers import swr_route
 
 _DATABASE_ERRORS: tuple[type[Exception], ...] = (sqlite3.Error,)
@@ -2236,6 +2253,184 @@ def fleet_acp_conversation_detail(
         },
         headers={"Cache-Control": "no-store"},
     )
+
+
+_MESSAGE_MAX_BODY_BYTES = 256 * 1024
+_MESSAGE_MAX_RESPONSE_BYTES = 512 * 1024
+_MESSAGE_MAX_ID = 128
+_MESSAGE_MAX_SCOPE = 512
+_MESSAGE_READ_SLOTS = BoundedSemaphore(4)
+_VISIBLE_MESSAGE_FROM = """
+    FROM authority_message_metadata AS meta
+    JOIN comms_messages AS m ON m.message_id = meta.message_id
+    JOIN conversations AS c
+        ON c.conversation_id = m.conversation_id AND c.source IN ('authority', 'authority-import')
+    WHERE EXISTS (
+        SELECT 1 FROM authority_deliveries AS d
+        WHERE d.message_id = m.message_id AND d.recipient IN (SELECT value FROM json_each(?))
+    ) AND NOT EXISTS (
+        SELECT 1 FROM acp_conversations AS acp WHERE acp.conversation_id = m.conversation_id
+    ) AND (meta.channel_id IS NULL OR EXISTS (
+        SELECT 1 FROM authority_channels AS ch WHERE ch.channel_id = meta.channel_id
+    ))
+"""
+
+
+def _message_response(status: int, **payload: Any) -> JSONResponse:
+    return JSONResponse(
+        status_code=status, content={"read_only": True, **payload}, headers={"Cache-Control": "no-store"}
+    )
+
+
+def _message_not_available(reason: str) -> JSONResponse:
+    return _message_response(503, state="backend_unavailable", reason=reason)
+
+
+def _message_id_valid(value: object) -> bool:
+    if not isinstance(value, str) or not 34 <= len(value) <= _MESSAGE_MAX_ID:
+        return False
+    prefix, digest = value[:-32], value[-32:]
+    if any(char not in "0123456789abcdef" for char in digest):
+        return False
+    if prefix == "legacy-message-":
+        return True
+    return prefix.endswith("_") and "a" <= prefix[0] <= "z" and all(
+        "a" <= char <= "z" or "0" <= char <= "9" or char == "-" for char in prefix[1:-1]
+    )
+
+
+def _message_thread(
+    connection: SQLiteConnection, recipients: str, scope: tuple[str, str, str | None], limit: int, offset: int
+) -> JSONResponse:
+    rows = connection.execute(
+        """
+        SELECT m.message_id,
+               CASE WHEN length(CAST(m.kind AS BLOB)) <= 40 THEN m.kind END AS kind,
+               CASE WHEN length(CAST(meta.created_at AS BLOB)) <= 40 THEN meta.created_at END AS created_at
+        """
+        + _VISIBLE_MESSAGE_FROM
+        + """
+        AND meta.thread_id = ? AND m.conversation_id = ? AND meta.channel_id IS ?
+        AND length(CAST(m.message_id AS BLOB)) <= ?
+        ORDER BY meta.created_at, meta.message_id LIMIT ? OFFSET ?
+        """,
+        (recipients, *scope, _MESSAGE_MAX_ID, limit + 1, offset),
+    ).fetchall()
+    items = [
+        {
+            "message_id": row["message_id"],
+            "kind": panel_values.choice(row["kind"], _DELIVERY_KINDS, "other"),
+            "created_at": panel_values.timestamp(row["created_at"]),
+        }
+        for row in rows[:limit]
+        if _message_id_valid(row["message_id"])
+    ]
+    return _message_response(
+        200, state="ok", messages=items, limit=limit, offset=offset,
+        next_offset=offset + limit if len(rows) > limit else None,
+    )
+
+
+def _message_body(connection: SQLiteConnection, root: Path, message_id: str) -> JSONResponse:
+    try:
+        raw = read_message_body_bounded(connection, root, message_id, max_bytes=_MESSAGE_MAX_BODY_BYTES)
+        body = _redact_and_sanitize_text(raw.decode("utf-8"))
+        if len(body.encode("utf-8")) > _MESSAGE_MAX_BODY_BYTES:
+            raise ArtifactTooLargeError("redacted body exceeds read limit")
+    except ArtifactExpiredError:
+        return _message_response(410, state="expired")
+    except ArtifactTooLargeError:
+        return _message_response(413, state="oversized")
+    except _AcpRedactionDepthExceeded:
+        return _message_response(422, state="withheld", reason="redaction_depth_exceeded")
+    except (ArtifactStoreError, _AcpBodyEncodingError, UnicodeError, ValueError):
+        return _message_response(422, state="missing_or_corrupt")
+    response = _message_response(200, state="ok", message_id=message_id, body=body)
+    if len(response.body) > _MESSAGE_MAX_RESPONSE_BYTES:
+        return _message_response(413, state="oversized")
+    return response
+
+
+def _read_visible_message(
+    ctx: MonitorContext, message_id: str, *, page: tuple[int, int] | None = None
+) -> JSONResponse:
+    if not _message_id_valid(message_id):
+        return _message_response(400, state="invalid_message_id")
+    if not _MESSAGE_READ_SLOTS.acquire(blocking=False):
+        return _message_not_available("concurrency_limit_exceeded")
+    try:
+        if storage.resolve_authority(storage.StoreId.FLEET_COMMS) is storage.Authority.PG:
+            return _message_not_available("authority_unsupported_component")
+        if message_plane.resolve_plane_mode() != "authority":
+            return _message_not_available("message_plane_not_authoritative")
+        root = message_plane.default_plane_root(repo_root=ctx.roots.state_root)
+        if (root / "comms.sqlite3").is_symlink():
+            return _message_not_available("plane_root_unavailable")
+        seats, drivers, external = _fleet_seat_roster()
+        if drivers != "available" or external != "available":
+            return _message_not_available("roster_unavailable")
+        recipients = json.dumps(sorted({name for seat in seats for name in seat.recipients}))
+        with _read_connection(ctx, plane_root=root) as (connection, availability):
+            if connection is None:
+                return _message_not_available(availability)
+            deadline = monotonic() + 0.5
+            connection.set_progress_handler(lambda: monotonic() > deadline, 1000)
+            if page is not None:
+                connection.execute("BEGIN")
+            anchor = connection.execute(
+                """
+                SELECT CASE WHEN length(CAST(meta.thread_id AS BLOB)) BETWEEN 1 AND ? THEN meta.thread_id END,
+                       CASE WHEN length(CAST(m.conversation_id AS BLOB)) BETWEEN 1 AND ? THEN m.conversation_id END,
+                       CASE WHEN length(CAST(meta.channel_id AS BLOB)) BETWEEN 1 AND ? THEN meta.channel_id END,
+                       meta.channel_id IS NULL
+                """
+                + _VISIBLE_MESSAGE_FROM
+                + " AND m.message_id = ?",
+                (_MESSAGE_MAX_SCOPE, _MESSAGE_MAX_SCOPE, _MESSAGE_MAX_SCOPE, recipients, message_id),
+            ).fetchone()
+            if anchor is None:
+                return _message_response(404, state="not_found")
+            thread, conversation, channel, direct = anchor
+            if not isinstance(thread, str) or not isinstance(conversation, str) or (
+                not direct and not isinstance(channel, str)
+            ):
+                return _message_response(422, state="missing_or_corrupt")
+            if page is not None:
+                return _message_thread(connection, recipients, (thread, conversation, channel), *page)
+            return _message_body(connection, root, message_id)
+    except PlaneRootAnchorError:
+        return _message_not_available("plane_root_unavailable")
+    except (OSError, sqlite3.Error, storage.ControlPlaneError, ValueError):
+        return _message_not_available("store_unavailable")
+    finally:
+        _MESSAGE_READ_SLOTS.release()
+
+
+@router.get("/messages/{message_id}/body")
+def fleet_message_body(
+    message_id: str, request: Request, ctx: MonitorContext = Depends(get_ctx),
+) -> JSONResponse:
+    """Read one selected message through the local-only body-read guard."""
+    refusal = local_body_read_refusal_response(request)
+    return refusal if refusal is not None else _read_visible_message(ctx, message_id)
+
+
+@router.get("/messages/{message_id}/thread")
+def fleet_message_thread(
+    message_id: str, request: Request, ctx: MonitorContext = Depends(get_ctx),
+) -> JSONResponse:
+    """List visible thread metadata, anchored to a visible message ID."""
+    refusal = local_body_read_refusal_response(request)
+    if refusal is not None:
+        return refusal
+    raw_limit = request.query_params.get("limit", str(DEFAULT_PAGE_SIZE))
+    raw_offset = request.query_params.get("offset", "0")
+    if not re.fullmatch(r"[0-9]{1,3}", raw_limit) or not re.fullmatch(r"[0-9]{1,10}", raw_offset):
+        return _message_response(400, state="invalid_page")
+    limit, offset = int(raw_limit), int(raw_offset)
+    if not 1 <= limit <= MAX_PAGE_SIZE or offset > 2_147_483_647:
+        return _message_response(400, state="invalid_page")
+    return _read_visible_message(ctx, message_id, page=(limit, offset))
 
 
 @router.get("/activity")

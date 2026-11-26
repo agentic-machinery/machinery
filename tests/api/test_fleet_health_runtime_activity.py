@@ -14,6 +14,7 @@ import sqlite3
 from contextlib import closing
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from unittest.mock import Mock
 
 import pytest
 from fastapi import FastAPI
@@ -22,7 +23,9 @@ from fastapi.testclient import TestClient
 import lu_machinery.api.fleet_router as fleet_router
 from lu_machinery import agent_identity
 from lu_machinery.api.monitor_context import fixture_context, production_context
+from lu_machinery.fleet_comms import artifacts
 from lu_machinery.fleet_comms.migrations import apply_migrations
+from lu_machinery.fleet_comms.paths import RETIRED_LOCAL_MARKER
 from lu_machinery.ops import driver_lanes
 from lu_machinery.orchestration import launcher_aliases
 from lu_machinery.session_streams import inventory
@@ -232,6 +235,237 @@ def _add_delivery(db, index, recipient, created, *, state="queued", completed=No
             (f"delivery-{index}", message_id, recipient, state, created, completed),
         )
     return message_id
+
+
+@pytest.fixture
+def message_reader(fleet_panels, fleet_root):
+    _, ctx, _, db = fleet_panels
+    app = FastAPI()
+    app.state.ctx = ctx
+    app.include_router(fleet_router.router, prefix="/api/fleet")
+    client = TestClient(app, client=("127.0.0.1", 50110), base_url="http://127.0.0.1:8765")
+    with closing(artifacts.ArtifactStore(fleet_root)) as store:
+        with closing(sqlite3.connect(db)) as connection, connection:
+            for channel in ("first", "foreign"):
+                connection.execute(
+                    "INSERT INTO authority_channels(channel_id, name, created_at) VALUES (?, ?, '2026-11-26')",
+                    (channel, channel),
+                )
+
+        def seed(
+            index, body, *, conversation="conversation", channel="first",
+            thread="thread", recipient="driver-sender", linked=True, digest=None, message_id=None,
+        ):
+            artifact = store.store_bytes(body, producer="authority-message", retention_class="message-body")
+            mid = message_id or f"message_{index:032x}"
+            created = f"2026-11-26T11:00:{index:02d}Z"
+            with closing(sqlite3.connect(db)) as connection, connection:
+                connection.execute(
+                    "INSERT OR IGNORE INTO conversations(conversation_id, source, created_at) VALUES (?, 'authority', ?)",
+                    (conversation, created),
+                )
+                connection.execute(
+                    """INSERT INTO comms_messages(
+                        message_id, conversation_id, sender, kind, body_inline,
+                        body_artifact_id, content_sha256, created_at
+                    ) VALUES (?, ?, 'driver-sender', 'message', 'inline-sentinel', ?, ?, ?)""",
+                    (mid, conversation, artifact.artifact_id, digest or artifact.sha256, created),
+                )
+                connection.execute(
+                    """INSERT INTO authority_message_metadata(message_id, channel_id, thread_id, created_at)
+                    VALUES (?, ?, ?, ?)""",
+                    (mid, channel, thread, created),
+                )
+                if linked:
+                    connection.execute(
+                        "INSERT INTO message_artifacts VALUES (?, ?, 'body')", (mid, artifact.artifact_id),
+                    )
+                if recipient:
+                    connection.execute(
+                        """INSERT INTO authority_deliveries(
+                            delivery_id, message_id, recipient, state, created_at, updated_at
+                        ) VALUES (?, ?, ?, 'queued', ?, ?)""",
+                        (f"delivery-{index}", mid, recipient, created, created),
+                    )
+            return f"/api/fleet/messages/{mid}", artifact
+
+        yield client, seed, db
+
+
+def test_message_reader_refuses_cross_record_disclosure_and_pages_visible_members(message_reader):
+    """Defect class: another channel, conversation, thread, or hidden delivery discloses content."""
+    client, seed, db = message_reader
+    anchor, _ = seed(1, b"First visible body")
+    member, _ = seed(2, b"Second visible body", message_id=f"legacy-message-{2:032x}")
+    foreign_channel, _ = seed(3, b"Other channel", channel="foreign")
+    foreign_conversation, _ = seed(4, b"Other conversation", conversation="foreign")
+    foreign_thread, _ = seed(5, b"Other thread", thread="foreign")
+    hidden, _ = seed(6, b"Hidden body", recipient="unlisted-sender")
+    orphan, _ = seed(7, b"No deliveries", recipient=None)
+    discussion, _ = seed(8, b"ACP turn", conversation="acp")
+    with closing(sqlite3.connect(db)) as connection, connection:
+        connection.execute(
+            """INSERT INTO acp_conversations VALUES(
+                'acp', 'task', 'correlation', 'idempotency', 1, '[]',
+                '2026-11-26', '2026-11-27', 0, 0
+            )"""
+        )
+    for path, next_offset in ((anchor, 1), (member, None)):
+        offset = 0 if path == anchor else 1
+        response = client.get(f"{anchor}/thread?limit=1&offset={offset}")
+        assert response.status_code == 200
+        assert response.headers["cache-control"] == "no-store"
+        assert response.json() == {
+            "read_only": True, "state": "ok", "limit": 1, "offset": offset,
+            "next_offset": next_offset, "messages": [
+                {"message_id": path.rsplit("/", 1)[1], "kind": "message",
+                 "created_at": f"2026-11-26T11:00:0{offset + 1}Z"},
+            ],
+        }
+    for path in (foreign_channel, foreign_conversation, foreign_thread):
+        assert client.get(f"{path}/thread").json()["messages"][0]["message_id"] == path.rsplit("/", 1)[1]
+    assert client.get(f"{member}/body").json()["body"] == "Second visible body"
+    for path in (hidden, orphan, discussion):
+        for suffix in ("body", "thread"):
+            response = client.get(f"{path}/{suffix}")
+            assert (response.status_code, response.json()["state"]) == (404, "not_found")
+    for suffix in ("body", "thread"):
+        response = client.get(f"{anchor}/{suffix}", headers={"Origin": "http://127.0.0.1:8764"})
+        assert response.status_code == 403
+        assert response.headers["cache-control"] == "no-store"
+    for message_id in ("invalid", f"M_{1:032x}", f"message_{'g' * 32}", f"{'a' * 96}_{1:032x}"):
+        response = client.get(f"/api/fleet/messages/{message_id}/body")
+        assert (response.status_code, response.json()["state"]) == (400, "invalid_message_id")
+        assert response.headers["cache-control"] == "no-store"
+    invalid_page = client.get(f"{anchor}/thread?limit=101")
+    assert (invalid_page.status_code, invalid_page.json()["state"]) == (400, "invalid_page")
+    assert invalid_page.headers["cache-control"] == "no-store"
+
+
+@pytest.mark.parametrize(
+    ("case", "http_status", "state"),
+    [
+        ("declared_oversize", 413, "oversized"),
+        ("actual_oversize", 413, "oversized"),
+        ("serialized_oversize", 413, "oversized"),
+        ("expired_present", 410, "expired"),
+        ("expired_removed_during_read", 410, "expired"),
+        ("wrong_digest", 422, "missing_or_corrupt"),
+        ("unlinked", 422, "missing_or_corrupt"),
+        ("malformed_utf8", 422, "missing_or_corrupt"),
+        ("malformed_scope", 422, "missing_or_corrupt"),
+        ("corrupt_blob", 422, "missing_or_corrupt"),
+    ],
+)
+def test_message_reader_refuses_unbounded_malformed_expired_or_foreign_artifacts(
+    message_reader, monkeypatch, case, http_status, state,
+):
+    """Defect class: invalid or oversized artifact data returns text, or retention exposes an inline copy."""
+    client, seed, db = message_reader
+    body = {
+        "declared_oversize": b"x" * (256 * 1024 + 1),
+        "serialized_oversize": b"\x00" * (100 * 1024),
+        "malformed_utf8": b"\xff",
+    }.get(case, b"complete message")
+    path, artifact = seed(
+        1, body, linked=case != "unlinked",
+        digest="0" * 64 if case == "wrong_digest" else None,
+        thread="x" * 513 if case == "malformed_scope" else "thread",
+    )
+    def mark_expired():
+        with closing(sqlite3.connect(db)) as connection, connection:
+            connection.execute(
+                "UPDATE artifacts SET retention_class = 'expired:message-body' WHERE artifact_id = ?",
+                (artifact.artifact_id,),
+            )
+
+    if case in {"declared_oversize", "actual_oversize"}:
+        if case == "actual_oversize":
+            artifact.blob_path.write_bytes(b"x" * (256 * 1024 + 1))
+        def refuse_unbounded_read(*_args, **_kwargs):
+            pytest.fail("an oversize body must be refused before reading the blob")
+        artifact_os = Mock(wraps=artifacts.os)
+        artifact_os.fdopen = refuse_unbounded_read
+        for flag in ("O_RDONLY", "O_DIRECTORY", "O_NOFOLLOW", "O_NONBLOCK"):
+            setattr(artifact_os, flag, getattr(artifacts.os, flag))
+        monkeypatch.setattr(artifacts, "os", artifact_os)
+    elif case == "expired_present":
+        mark_expired()
+    elif case == "expired_removed_during_read":
+        original_open = artifacts.os.open
+        def expire_on_open(name, *args, **kwargs):
+            if name == artifact.sha256:
+                mark_expired()
+                artifact.blob_path.unlink()
+            return original_open(name, *args, **kwargs)
+        monkeypatch.setattr(artifacts.os, "open", expire_on_open)
+    elif case == "corrupt_blob":
+        artifact.blob_path.write_bytes(b"!" * len(body))
+    response = client.get(f"{path}/body")
+    assert response.status_code == http_status
+    assert response.headers["cache-control"] == "no-store"
+    assert response.json()["state"] == state
+    assert "body" not in response.json()
+    assert "inline-sentinel" not in response.text
+    if case == "malformed_scope":
+        assert client.get(f"{path}/thread").json()["state"] == "missing_or_corrupt"
+    if case.startswith("expired"):
+        assert len(client.get(f"{path}/thread").json()["messages"]) == 1
+
+
+@pytest.mark.parametrize(
+    ("case", "reason"),
+    [
+        ("pg", "authority_unsupported_component"),
+        ("shadow", "message_plane_not_authoritative"),
+        ("retired", "plane_root_unavailable"),
+        ("symlink", "plane_root_unavailable"),
+        ("other", "db_missing"),
+    ],
+)
+def test_message_reader_refuses_stale_or_unsupported_authority(
+    message_reader, tmp_path, monkeypatch, case, reason,
+):
+    """Defect class: a read silently falls back to a stale or unsupported Fleet database."""
+    client, seed, db = message_reader
+    path, _ = seed(1, b"stale message body")
+    if case == "pg":
+        monkeypatch.setenv("LEARN_UKRAINIAN_CP_AUTHORITY_FLEET_COMMS", "pg")
+    elif case == "shadow":
+        monkeypatch.setenv("FLEET_COMMS_MESSAGE_PLANE", "shadow")
+    elif case == "retired":
+        (db.parent / RETIRED_LOCAL_MARKER).touch()
+    else:
+        root = tmp_path / "other-authority"
+        root.mkdir()
+        monkeypatch.setenv("FLEET_COMMS_ROOT", str(root))
+        if case == "symlink":
+            (root / db.name).symlink_to(db)
+    for suffix in ("body", "thread"):
+        response = client.get(f"{path}/{suffix}")
+        assert response.status_code == 503
+        assert response.json() == {"read_only": True, "state": "backend_unavailable", "reason": reason}
+
+
+def test_message_body_and_thread_gets_leave_the_store_intact(message_reader):
+    """Defect class: an observer GET claims, acknowledges, migrates or otherwise changes the plane."""
+    client, seed, db = message_reader
+    path, _ = seed(1, b"Full body\npassword=fixture-secret-sentinel\n")
+    def snapshot():
+        return {
+            path.relative_to(db.parent): (path.stat().st_mtime_ns, path.read_bytes())
+            for path in db.parent.rglob("*") if path.is_file() and not path.name.endswith("-shm")
+        }
+
+    before = snapshot()
+    response = client.get(f"{path}/body")
+    assert response.status_code == 200
+    assert response.headers["cache-control"] == "no-store"
+    assert response.json()["body"].startswith("Full body\n")
+    assert "fixture-secret-sentinel" not in response.text
+    assert "inline-sentinel" not in response.text
+    assert client.get(f"{path}/thread").status_code == 200
+    assert snapshot() == before
 
 
 def test_fleet_seats_uses_exact_mail_and_live_stream_activity(fleet_panels):

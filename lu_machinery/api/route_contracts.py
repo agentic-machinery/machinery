@@ -280,6 +280,32 @@ ROUTE_CONTRACTS: tuple[RouteContract, ...] = (
         mutates=False,
     ),
     RouteContract(
+        "/api/fleet/messages/{message_id}/body",
+        "exact",
+        "http",
+        "Read one visible Fleet message body. Returns typed expired, oversized, withheld, corrupt and unavailable states.",
+        "Canonical Fleet Comms SQLite authority, configured delivery roster and the message's verified CAS body reference.",
+        "Loopback-only, on demand, read-only and no-store. Bounds raw bytes, serialized response, SQLite work and concurrency.",
+        ("fleet.html", "operators"),
+        "Uses the same local access guard and secrets-and-paths redaction as the ACP transcript route.",
+        "high if body content crosses the operator boundary",
+        "keep as the on-demand Fleet message reader",
+        locality="cluster_authoritative",
+    ),
+    RouteContract(
+        "/api/fleet/messages/{message_id}/thread",
+        "exact",
+        "http",
+        "Page the visible metadata in the selected message's thread, channel and conversation.",
+        "Canonical Fleet Comms SQLite authority and configured delivery roster.",
+        "Loopback-only, on demand, read-only and no-store. An offset page contains no bodies.",
+        ("fleet.html", "operators"),
+        "The message body route uses the same visibility rule. This route supplies IDs for further selection.",
+        "high if unrelated or hidden message records appear in a thread",
+        "keep as the metadata-only Fleet thread reader",
+        locality="cluster_authoritative",
+    ),
+    RouteContract(
         "/api/fleet",
         "prefix",
         "http",
@@ -851,14 +877,15 @@ PAGE_CONTRACTS: tuple[PageContract, ...] = (
         "/fleet",
         "Fleet: live agent workers with optional open-PR status, recently finished dispatches and unfinished-record "
         "attention list, Fleet Comms store/queue/failure metrics, seats and deliveries, a seven-day token summary, "
-        "and an on-demand Discussions panel for reading loopback-only ACP discussion transcripts with best-effort "
-        "secrets-and-paths redaction only.",
+        "and on-demand loopback-only readers for Fleet messages and ACP discussions with best-effort "
+        "secrets-and-paths redaction.",
         "GET /api/delegate/active, /api/delegate/recent, /api/comms/v1/metrics, /api/fleet/seats, "
         "/api/fleet/deliveries, /api/fleet/model-stats?window=7d&view=tokens, optional /api/git/pull-requests, "
-        "and on-demand /api/fleet/acp/conversations plus /api/runtime/acp/conversations/{conversation_id}/transcript.",
-        "HTTP reads every 30 seconds for live panels. Discussions stays closed on load and polling makes zero "
-        "transcript requests; the conversation list loads when opened and one transcript loads on selection "
-        "(Cache-Control: no-store, textContent rendering).",
+        "and on-demand /api/fleet/messages/{message_id}/body, /api/fleet/messages/{message_id}/thread, "
+        "/api/fleet/acp/conversations and /api/runtime/acp/conversations/{conversation_id}/transcript.",
+        "HTTP reads every 30 seconds for live panels. Load and polling make zero body or transcript requests. "
+        "Selecting a message opens its body and paged thread metadata. Opening Discussions loads the ACP list, "
+        "and selecting a conversation opens its transcript. Bodies and transcripts use no-store and textContent rendering.",
         ("humans", "operators"),
         "Combines live agent dispatch activity, Fleet Comms metrics, and on-demand ACP transcript reading on one area page.",
         "medium if a stale reading is read as current; transcript redaction covers secrets and filesystem paths only",

@@ -19,7 +19,10 @@ def test_fleet_comms_routes_keep_observer_contract(path: str) -> None:
     assert contract.response_schema_version == "comms.v2"
 
 
-@pytest.mark.parametrize("path", ["/api/fleet/seats", "/api/fleet/deliveries"])
+@pytest.mark.parametrize("path", [
+    "/api/fleet/seats", "/api/fleet/deliveries",
+    "/api/fleet/messages/{message_id}/body", "/api/fleet/messages/{message_id}/thread",
+])
 def test_fleet_panels_have_exact_read_only_contracts(path: str) -> None:
     """Defect class: a Fleet panel inherits the umbrella contract instead of its own read policy."""
     contract = contract_for_route(path)
@@ -362,6 +365,7 @@ def test_machinery_split_pages_contracts_shared_assets_and_scoped_reads():
             "/api/git/pull-requests",
             "/api/fleet/seats",
             "/api/fleet/deliveries",
+            "/api/fleet/messages",
             "/api/fleet/model-stats",
             "/api/fleet/acp/conversations",
             "/api/runtime/acp/conversations",
@@ -607,6 +611,90 @@ assert.match(M.prChips(unknownTotalPrs).join(''), /<b>1<\/b> open PRs observed Â
   assert.doesNotMatch(afterFailure, /CI green/);
   assert.doesNotMatch(afterFailure, /queued 1/);
   assert.match(afterFailure, /#42/);
+
+  // Defect classes: request on page load or poll, stale selection, and body content interpreted as HTML.
+  {
+    const listeners = new Map();
+    const pending = new Map();
+    const requests = [];
+    const timers = [];
+    const firstId = 'message_00000000000000000000000000000001';
+    const secondId = 'message_00000000000000000000000000000002';
+    document.createElement = tag => ({
+      tag, children: [], dataset: {}, style: {}, textContent: '',
+      set innerHTML(_) { assert.fail('Message reader inserted HTML'); },
+      appendChild(child) { this.children.push(child); },
+      addEventListener(type, listener) { this[type] = listener; },
+    });
+    for (const id of ['message-body', 'message-thread']) {
+      document.getElementById(id).replaceChildren = function (...nodes) { this.children = nodes; };
+    }
+    document.getElementById('message-reader').focus = () => {};
+    document.addEventListener = (type, handler) => listeners.set(type, [...(listeners.get(type) || []), handler]);
+    const fetchPanel = globalThis.fetch;
+    globalThis.fetch = (url, options) => {
+      requests.push(url);
+      if (!url.startsWith('/api/fleet/messages/')) return fetchPanel(url);
+      assert.equal(options.cache, 'no-store');
+      return new Promise(resolve => pending.set(url, resolve));
+    };
+    const originalInterval = globalThis.setInterval;
+    globalThis.setInterval = callback => timers.push(callback);
+    try {
+      document._fleetFiltersBound = false;
+      new Function('Machinery', fleetBody + '\nrunner.start();')(M);
+      await new Promise(resolve => setImmediate(resolve));
+      assert.equal(pending.size, 0);
+      assert.ok(requests.some(url => url.startsWith('/api/fleet/deliveries')));
+      await timers[0]();
+      assert.equal(pending.size, 0);
+      const select = id => listeners.get('click').forEach(listener => listener({
+        target: {closest: selector => selector === 'button[data-open-message]' ? {dataset: {openMessage: id}} : null},
+      }));
+      const bodyUrl = id => `/api/fleet/messages/${id}/body`;
+      const threadUrl = id => `/api/fleet/messages/${id}/thread?offset=0`;
+      const resolve = (url, payload) => {
+        pending.get(url)({ok: true, json: async () => payload});
+        pending.delete(url);
+      };
+      select(firstId);
+      select(secondId);
+      assert.deepEqual([...pending.keys()], [
+        bodyUrl(firstId), threadUrl(firstId), bodyUrl(secondId), threadUrl(secondId),
+      ]);
+      assert.equal(document.getElementById('message-reader').hidden, false);
+      const literalBody = '<img src=x onerror="window.executed=true">';
+      resolve(bodyUrl(secondId), {state: 'ok', message_id: secondId, body: literalBody});
+      resolve(threadUrl(secondId), {
+        messages: [{message_id: firstId, kind: 'message', created_at: '2026-11-26T11:00:01Z'}],
+        limit: 50,
+        next_offset: 50,
+      });
+      await new Promise(resolve => setImmediate(resolve));
+      resolve(bodyUrl(firstId), {state: 'ok', message_id: firstId, body: 'late body'});
+      resolve(threadUrl(firstId), {messages: [], limit: 50, next_offset: null});
+      await new Promise(resolve => setImmediate(resolve));
+      const bodyNode = document.getElementById('message-body').children[1];
+      assert.equal(bodyNode.tag, 'pre');
+      assert.equal(bodyNode.textContent, literalBody);
+      assert.equal(document.getElementById('messages-status').textContent, 'Message loaded.');
+      await timers[0]();
+      assert.equal(pending.size, 0, 'A poll while the reader is open requests zero bodies and threads');
+      const [members, next] = document.getElementById('message-thread').children;
+      members.children[0].children[0].click();
+      assert.deepEqual([...pending.keys()], [bodyUrl(firstId)], 'A thread member loads only its own body');
+      next.click();
+      const nextPage = `/api/fleet/messages/${secondId}/thread?offset=50`;
+      assert.deepEqual([...pending.keys()], [bodyUrl(firstId), nextPage]);
+      resolve(bodyUrl(firstId), {state: 'ok', message_id: firstId, body: 'first body'});
+      resolve(nextPage, {messages: [], limit: 50, next_offset: null});
+      await new Promise(resolve => setImmediate(resolve));
+      assert.equal(document.getElementById('message-body').children[1].textContent, 'first body');
+    } finally {
+      globalThis.setInterval = originalInterval;
+      globalThis.fetch = fetchPanel;
+    }
+  }
 
   // F1 local-clock expiry + F6 on Overview and Pull requests (no extra API request on tick).
   let fakeNow = Date.now();
