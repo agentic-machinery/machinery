@@ -23,20 +23,34 @@ _TASK = "wb-art"
 _WRITE_BINDS = ("--bind", "--bind-try", "--dev-bind", "--dev-bind-try")
 
 
+# Host locations the launcher and the in-process boundary read from the environment (credential stores, the
+# selected login, pre-commit's store, the product checkout, the SSH agent); every one is test-owned or absent here.
+_HOST_LOCATIONS = ("CLAUDE_CONFIG_DIR", "CODEX_HOME", "LU_PRODUCT_ROOT", "SSH_AUTH_SOCK")
+
+
 @pytest.fixture(autouse=True)
 def _test_owned_home_and_git(tmp_path, monkeypatch):
-    """A test-owned HOME and no global or system Git configuration, before any fixture runs Git.
+    """No inherited Git, XDG or pre-commit setting and no host location, before any fixture runs Git.
 
-    Autouse, so it runs before ``primary``, whose first ``git commit`` precedes its own HOME: a developer's signing
-    or hook configuration must not decide these tests, and credential discovery must not read the real home.
+    Autouse, so it runs before ``primary``, whose first ``git commit`` precedes its own HOME. Every ``GIT_*`` name
+    goes (repository selection, inline ``GIT_CONFIG_COUNT``/``KEY``/``VALUE`` and ``GIT_CONFIG_PARAMETERS``
+    settings, templates, identities), and the global and system files are empty, so no developer setting
+    (signing, hooks) decides these tests. The XDG and pre-commit roots, the selected logins, the product checkout
+    and the SSH agent are dropped, and gh's configuration is a test path, so neither the launcher nor the boundary
+    reads or masks a host store. ``XDG_RUNTIME_DIR`` stays: the boundary derives the runtime directory from the uid.
     """
+    for name in list(os.environ):
+        if name.startswith(("GIT_", "XDG_", "PRE_COMMIT_")) and name != "XDG_RUNTIME_DIR":
+            monkeypatch.delenv(name)
+    for name in _HOST_LOCATIONS:
+        monkeypatch.delenv(name, raising=False)
     home = tmp_path / "test-home"
     home.mkdir()
     monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("GH_CONFIG_DIR", str(tmp_path / "gh-config"))
     monkeypatch.setenv("GIT_CONFIG_GLOBAL", os.devnull)
+    monkeypatch.setenv("GIT_CONFIG_SYSTEM", os.devnull)
     monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
-    for name in ("XDG_CONFIG_HOME", "CLAUDE_CONFIG_DIR", "CODEX_HOME"):
-        monkeypatch.delenv(name, raising=False)
 
 
 def _spec(worktree: Path, agent: str, provider: str | None, mode: str = "read-only") -> TaskSpec:
