@@ -1809,7 +1809,18 @@ def _acp_transcript_entries(
     conversation_id: str,
     participants: tuple[str, ...],
 ) -> tuple[list[dict[str, Any]], bool]:
-    """Read a bounded, allowlisted ACP transcript with an explicit state for every turn."""
+    """Read a bounded, allowlisted ACP transcript with an explicit state for every turn.
+
+    Response-cap contract (``_ACP_TRANSCRIPT_MAX_RESPONSE_BYTES``, 512 KiB): after finalizing
+    retention over all candidate turns in one snapshot, if the all-``ok`` serialized HTTP
+    response exceeds the cap, reserve for every not-yet-decided surviving turn the size of its
+    smaller serialized representation (``ok`` when its serialized ``ok`` entry fits within its
+    ``oversized_or_partial`` entry, else ``oversized_or_partial``), then walk surviving turns
+    in transcript order and admit each turn as ``ok`` if the exact serialized HTTP response
+    with that choice plus the reserved minimum of all remaining turns stays within the cap;
+    otherwise mark it ``oversized_or_partial`` (``reason="response_budget_exceeded"``,
+    ``body=None``). No turn is dropped and the serialized response stays within the cap.
+    """
     rows = connection.execute(
         """
         SELECT messages.message_id, messages.kind, messages.sender, messages.recipient,
@@ -1970,30 +1981,42 @@ def _acp_transcript_entries(
     else:
         surviving = [(entry_idx, text) for entry_idx, text, _, _ in candidates]
 
-    # Budget only the bodies that survived retention using the exact serialized HTTP response size.
+    # Budget surviving turns per the response-cap contract: reserve each undecided turn's smaller
+    # serialized representation (ok when ok <= oversized_or_partial, else oversized_or_partial),
+    # then walk in transcript order admitting ok whenever the exact serialized payload fits <= cap.
     if surviving and len(
         _acp_json_bytes(_acp_transcript_payload(conversation_id, entries, truncated=truncated))
     ) > _ACP_TRANSCRIPT_MAX_RESPONSE_BYTES:
-        for entry_idx, _ in surviving:
-            entries[entry_idx]["state"] = _ACP_TRANSCRIPT_STATE_OVERSIZED_OR_PARTIAL
-            entries[entry_idx]["label"] = _ACP_TRANSCRIPT_STATE_LABELS[_ACP_TRANSCRIPT_STATE_OVERSIZED_OR_PARTIAL]
-            entries[entry_idx]["reason"] = "response_budget_exceeded"
-            entries[entry_idx]["body"] = None
         for entry_idx, text in surviving:
-            entries[entry_idx]["state"] = _ACP_TRANSCRIPT_STATE_OK
-            entries[entry_idx]["label"] = _ACP_TRANSCRIPT_STATE_LABELS[_ACP_TRANSCRIPT_STATE_OK]
-            entries[entry_idx]["reason"] = None
-            entries[entry_idx]["body"] = text
+            entry = entries[entry_idx]
+            ok_size = len(_acp_json_bytes(entry))
+            entry["state"] = _ACP_TRANSCRIPT_STATE_OVERSIZED_OR_PARTIAL
+            entry["label"] = _ACP_TRANSCRIPT_STATE_LABELS[_ACP_TRANSCRIPT_STATE_OVERSIZED_OR_PARTIAL]
+            entry["reason"] = "response_budget_exceeded"
+            entry["body"] = None
+            if ok_size <= len(_acp_json_bytes(entry)):
+                entry["state"] = _ACP_TRANSCRIPT_STATE_OK
+                entry["label"] = _ACP_TRANSCRIPT_STATE_LABELS[_ACP_TRANSCRIPT_STATE_OK]
+                entry["reason"] = None
+                entry["body"] = text
+        for entry_idx, text in surviving:
+            entry = entries[entry_idx]
+            if entry["state"] == _ACP_TRANSCRIPT_STATE_OK:
+                continue
+            entry["state"] = _ACP_TRANSCRIPT_STATE_OK
+            entry["label"] = _ACP_TRANSCRIPT_STATE_LABELS[_ACP_TRANSCRIPT_STATE_OK]
+            entry["reason"] = None
+            entry["body"] = text
             if (
                 len(_acp_json_bytes(_acp_transcript_payload(conversation_id, entries, truncated=truncated)))
                 > _ACP_TRANSCRIPT_MAX_RESPONSE_BYTES
             ):
-                entries[entry_idx]["state"] = _ACP_TRANSCRIPT_STATE_OVERSIZED_OR_PARTIAL
-                entries[entry_idx]["label"] = _ACP_TRANSCRIPT_STATE_LABELS[
+                entry["state"] = _ACP_TRANSCRIPT_STATE_OVERSIZED_OR_PARTIAL
+                entry["label"] = _ACP_TRANSCRIPT_STATE_LABELS[
                     _ACP_TRANSCRIPT_STATE_OVERSIZED_OR_PARTIAL
                 ]
-                entries[entry_idx]["reason"] = "response_budget_exceeded"
-                entries[entry_idx]["body"] = None
+                entry["reason"] = "response_budget_exceeded"
+                entry["body"] = None
 
     return entries, truncated
 
