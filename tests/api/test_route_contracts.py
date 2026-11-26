@@ -363,6 +363,8 @@ def test_machinery_split_pages_contracts_shared_assets_and_scoped_reads():
             "/api/fleet/seats",
             "/api/fleet/deliveries",
             "/api/fleet/model-stats",
+            "/api/fleet/acp/conversations",
+            "/api/runtime/acp/conversations",
         },
         "pull-requests.html": {"/api/git/pull-requests"},
         "milestones.html": {"/api/milestones"},
