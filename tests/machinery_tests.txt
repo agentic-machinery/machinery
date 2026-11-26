@@ -646,6 +646,7 @@ tests/dispatcher/test_orchestrator_mode.py
 tests/dispatcher/test_pool_selector.py
 tests/dispatcher/test_providers_b.py
 tests/dispatcher/test_providers_c.py
+tests/dispatcher/test_readonly_provider_artifacts.py
 tests/dispatcher/test_retention_inventory.py
 tests/dispatcher/test_review_metadata.py
 tests/dispatcher/test_review_attempt.py
