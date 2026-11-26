@@ -9,6 +9,29 @@ this file.
 
 ## [Unreleased]
 
+<a id="v0.1.78"></a>
+## [0.1.78] - 2026-11-26
+
+### Added
+
+- Add the shared verify-ukrainian dictionary-check skill ([#1499](https://github.com/agentic-machinery/machinery/pull/1499))
+
+### Changed
+
+- Bump @agentclientprotocol/sdk from 2.7.0 to 2.8.0 in the npm group ([#1468](https://github.com/agentic-machinery/machinery/pull/1468))
+
+### Fixed
+
+- Ignore unbounded review-checkout branch numbers ([#1490](https://github.com/agentic-machinery/machinery/pull/1490))
+- Restrict ACP transcript route to local listener and disable wildcard CORS credentials ([#1491](https://github.com/agentic-machinery/machinery/pull/1491))
+- Let a read-only AGY run write its own task artifacts ([#1492](https://github.com/agentic-machinery/machinery/pull/1492))
+- Isolate stored documents ([#1495](https://github.com/agentic-machinery/machinery/pull/1495))
+- Own the lesson schema a site component's gate regenerates ([#1494](https://github.com/agentic-machinery/machinery/pull/1494))
+- Report typed ACP transcript states and withhold expired bodies ([#1500](https://github.com/agentic-machinery/machinery/pull/1500))
+- Name the infra checkout machinery-infra in the registry (r2) ([#1501](https://github.com/agentic-machinery/machinery/pull/1501))
+- Let read-only Cursor and OpenCode write their task artifacts ([#1504](https://github.com/agentic-machinery/machinery/pull/1504))
+- Drop the closed release milestone from the machinery registry row ([#1505](https://github.com/agentic-machinery/machinery/pull/1505))
+
 <a id="v0.1.77"></a>
 ## [0.1.77] - 2026-11-26
 
@@ -1773,7 +1796,8 @@ First release: the machinery extracted from learn-ukrainian as the installable `
 - Rollover confirms replacement bindings without a self-answered quiz. ([#65](https://github.com/learn-ukrainian/machinery/pull/65))
 - Deploy derives release identity from packaged bytes. ([#145](https://github.com/learn-ukrainian/machinery/pull/145))
 
-[Unreleased]: https://github.com/agentic-machinery/machinery/compare/v0.1.77...HEAD
+[Unreleased]: https://github.com/agentic-machinery/machinery/compare/v0.1.78...HEAD
+[0.1.78]: https://github.com/agentic-machinery/machinery/compare/v0.1.77...v0.1.78
 [0.1.77]: https://github.com/agentic-machinery/machinery/compare/v0.1.76...v0.1.77
 [0.1.76]: https://github.com/agentic-machinery/machinery/compare/v0.1.75...v0.1.76
 [0.1.75]: https://github.com/learn-ukrainian/machinery/compare/v0.1.74...v0.1.75
