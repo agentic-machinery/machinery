@@ -139,32 +139,36 @@ def _configured_primary_root() -> Path | None:
         raise RootsConfigurationError(str(exc)) from exc
 
 
-def _infra_primary_roots(public: Path) -> list[Path]:
-    """The fleet registry's ``infra-private`` checkout under each base a tool resolves it from.
+def _dispatch_infra_root(public: Path) -> Path:
+    """The ``infra-private`` checkout exactly as dispatch resolves it."""
+    from lu_machinery.dispatcher.git import resolve_repo
 
-    Dispatch joins ``local_name`` to ``repos_root()`` (``LU_REPOS_ROOT``, else the configured
-    primary's parent); ``resolve_fleet_repo`` (sibling Git, review targets) joins it to
-    ``LU_REPOS_ROOT``, else *public*'s parent. Both are protected. The registry is the only
-    source of the directory name. A base that cannot be resolved stays unprotected and is
-    reported on stderr by exception class only (its text can carry private paths); it never
-    blocks a command, so the public primary keeps its protection either way.
+    return resolve_repo("infra-private")[0]
+
+
+def _sibling_infra_root(public: Path) -> Path:
+    """The ``infra-private`` checkout as the fleet sibling resolver derives it from *public*."""
+    from lu_machinery.orchestration.fleet_repos import resolve_fleet_repo
+
+    return resolve_fleet_repo("infra-private", primary_root=public, require_checkout=False)[1]
+
+
+def _infra_primary_roots(public: Path) -> list[Path]:
+    """The fleet registry's ``infra-private`` checkout as each tool resolves it.
+
+    Dispatch (``resolve_repo``: ``LU_REPOS_ROOT``, else the configured primary's parent, plus
+    the registry value) and the sibling resolver (``resolve_fleet_repo``: ``LU_REPOS_ROOT``,
+    else *public*'s parent, plus the loaded registry value) can name different directories;
+    both are protected. Each candidate is imported, resolved and normalized inside its own
+    handler, so a failure leaves only that candidate unprotected. Failures are reported on
+    stderr by exception class only (their text can carry private paths) and never block a
+    command, so the public primary keeps its protection either way.
     """
     roots: list[Path] = []
     failures: list[str] = []
-    try:
-        from lu_machinery.common.repo_root import repos_root
-        from lu_machinery.orchestration.fleet_repos import load_fleet_repos, resolve_fleet_repo
-
-        resolvers = (
-            lambda: repos_root() / load_fleet_repos()["infra-private"].local_name,
-            lambda: resolve_fleet_repo("infra-private", primary_root=public, require_checkout=False)[1],
-        )
-    except Exception as exc:
-        failures.append(type(exc).__name__)
-        resolvers = ()
-    for resolve in resolvers:
+    for resolve in (_dispatch_infra_root, _sibling_infra_root):
         try:
-            roots.append(resolve())
+            roots.append(Path(resolve(public)).resolve())
         except Exception as exc:
             failures.append(type(exc).__name__)
     if failures:
@@ -473,9 +477,10 @@ def _git_repo_root(git_cwd: Path) -> Path | None:
             text=True,
             check=True,
             env=_git_probe_env(),
-        ).stdout.strip()
+        ).stdout.removesuffix("\n")
     except (subprocess.CalledProcessError, FileNotFoundError):
         return None
+    # Only Git's line terminator is dropped: a checkout name may end in whitespace (#1496 F1).
     return Path(root).resolve()
 
 
