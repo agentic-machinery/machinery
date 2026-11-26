@@ -1424,14 +1424,15 @@ def _whatwg_ipv6_serialize(address: ipaddress.IPv6Address) -> str:
 
 
 def _bound_acp_listener(request: Request) -> tuple[frozenset[str], str] | None:
-    """Return ``(allowed_raw_hosts, exact_origin)`` for the bound loopback HTTP listener.
+    """Return ``(allowed_raw_hosts, exact_origin)`` for the local loopback HTTP listener.
 
-    Reads the listening socket address from ASGI ``scope["server"]`` (which
-    Uvicorn populates from ``socket.getsockname()``, independent of HTTP headers),
-    so alternate loopback ports (such as ``launchd_supervisor start --port``) and
-    IPv6 / IPv4-mapped loopback listeners are authorized without extra plumbing.
-    Fails closed (returns ``None``) if ``scope["server"]`` is absent, malformed,
-    or non-loopback.
+    Reads the accepted connection's local interface and effective port from ASGI
+    ``scope["server"]`` (which Uvicorn populates from ``socket.getsockname()``,
+    independent of HTTP headers), so alternate loopback ports (such as
+    ``launchd_supervisor start --port``) and IPv6 / IPv4-mapped loopback listeners
+    authorize their own exact authority without extra launcher plumbing. Fails
+    closed (returns ``None``) if ``scope["server"]`` is absent, malformed, or
+    non-loopback.
     """
     server = request.scope.get("server")
     if not isinstance(server, (tuple, list)) or len(server) != 2:
