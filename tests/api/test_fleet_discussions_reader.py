@@ -777,6 +777,15 @@ def test_each_e3_cap_trips_with_typed_state(tmp_path: Path, monkeypatch) -> None
     after_resp = local.get(url_busy)
     assert after_resp.status_code == 200
 
+    # F3: opaque conversation IDs matching non-finite JSON scalars stay on plain-text sanitization (503, never 500).
+    monkeypatch.setenv("FLEET_COMMS_ROOT", str(tmp_path / "missing-plane-f3"))
+    opaque_resp = local.get("/api/runtime/acp/conversations/1e309/transcript")
+    assert opaque_resp.status_code == 503
+    assert opaque_resp.headers["cache-control"] == "no-store"
+    assert opaque_resp.json()["state"] == "backend_unavailable"
+    assert opaque_resp.json()["reason"] == "store_unavailable"
+    assert opaque_resp.json()["conversation_id"] == "1e309"
+
 
 def test_discussions_panel_text_only_on_demand_and_stale_response_guard() -> None:
     """Defect class: Discussions panel polls bodies on load, injects HTML via innerHTML, or lets a late response overwrite a newer selection."""
@@ -1127,6 +1136,30 @@ globalThis.fetch = async (url) => {
             "body_redaction_failed",
             ("Infinity",),
             (),
+        ),
+        (
+            "non-finite-under-secret-key",
+            '{"password": 1e309}',
+            "missing_or_corrupt",
+            "body_redaction_failed",
+            ("1e309",),
+            (),
+        ),
+        (
+            "non-finite-overwritten-by-duplicate-key",
+            '{"a": 1e309, "a": 1}',
+            "missing_or_corrupt",
+            "body_redaction_failed",
+            ("1e309",),
+            (),
+        ),
+        (
+            "prose-after-long-numeric-prefix",
+            ("9" * 4301) + " events recorded",
+            "ok",
+            None,
+            (),
+            ("events recorded",),
         ),
         (
             "plain-prose-quoted-not-json",

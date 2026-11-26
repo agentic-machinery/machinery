@@ -1618,6 +1618,17 @@ class _AcpBodyEncodingError(Exception):
     """Structured body could not be safely re-serialized or UTF-8 encoded after redaction."""
 
 
+_ACP_JSON_FLOAT_RE = re.compile(
+    r"^-?(?:0|[1-9][0-9]*)(?:\.[0-9]+(?:[eE][+-]?[0-9]+)?|[eE][+-]?[0-9]+)$"
+)
+
+
+def _redact_and_sanitize_plain_text(value: str) -> str:
+    """Run server-side ``redact_text`` then ``sanitize_text`` on plain text (IDs, labels, prose)."""
+    redacted = redact_text(value)
+    return sanitize_text("" if redacted is None else redacted)
+
+
 def _is_redacted_json_key(key: str) -> bool:
     """Return True iff ``secret_redactor.redact_value`` classifies ``key`` as a secret key."""
     return bool(redact_value({key: None}).get(key) == REDACTION)
@@ -1651,28 +1662,50 @@ def _redact_and_sanitize_text(value: str, *, _depth: int = 0) -> str:
     re-serialized directly so valid JSON delimiters are preserved and JSON escapes cannot conceal
     secrets or paths. Structured bodies that exceed either container depth (64) or nested-JSON
     depth fail closed by raising ``_AcpRedactionDepthExceeded`` rather than falling back to
-    plain-text filters; parser conversion errors, non-finite JSON scalars/floats, and decoded lone
-    surrogates raise ``_AcpBodyEncodingError``.
+    plain-text filters; parser conversion errors, non-finite JSON scalars/floats (detected during
+    parsing before redaction or duplicate-key collapsing), and decoded lone surrogates raise
+    ``_AcpBodyEncodingError``.
     """
     stripped = value.strip()
-    is_json_candidate = bool(
-        stripped
-        and (
-            stripped[0] in '{["'
-            or stripped in {"NaN", "Infinity", "-Infinity"}
-            or (stripped[0] in "-0123456789" and any(ch in stripped for ch in ".eE"))
-        )
-    )
-    if is_json_candidate:
+    if stripped in {"NaN", "Infinity", "-Infinity"} or (
+        stripped and _ACP_JSON_FLOAT_RE.fullmatch(stripped) is not None
+    ):
         try:
-            parsed = json_depth.loads(stripped, max_depth=64)
+            numeric = float(stripped)
+        except ValueError:
+            raise _AcpBodyEncodingError() from None
+        if not math.isfinite(numeric):
+            raise _AcpBodyEncodingError()
+        return _redact_and_sanitize_plain_text(value)
+    if stripped and stripped[0] in '{["':
+        saw_non_finite = False
+
+        def _parse_json_float(raw: str) -> float:
+            nonlocal saw_non_finite
+            number = float(raw)
+            if not math.isfinite(number):
+                saw_non_finite = True
+            return number
+
+        def _parse_json_constant(_raw: str) -> float:
+            nonlocal saw_non_finite
+            saw_non_finite = True
+            return 0.0
+
+        try:
+            parsed = json_depth.loads(
+                stripped,
+                max_depth=64,
+                parse_float=_parse_json_float,
+                parse_constant=_parse_json_constant,
+            )
         except RecursionError:
             raise _AcpRedactionDepthExceeded() from None
         except json.JSONDecodeError:
             parsed = None
         except (TypeError, ValueError):
             raise _AcpBodyEncodingError() from None
-        if isinstance(parsed, float) and not math.isfinite(parsed):
+        if parsed is not None and saw_non_finite:
             raise _AcpBodyEncodingError()
         if isinstance(parsed, (dict, list, str)):
             if _depth >= _ACP_TRANSCRIPT_JSON_REDACT_MAX_DEPTH:
@@ -1686,8 +1719,7 @@ def _redact_and_sanitize_text(value: str, *, _depth: int = 0) -> str:
             except (TypeError, ValueError, UnicodeError):
                 raise _AcpBodyEncodingError() from None
             return serialized
-    redacted = redact_text(value)
-    return sanitize_text("" if redacted is None else redacted)
+    return _redact_and_sanitize_plain_text(value)
 
 
 class _AcpBackendUnavailable(Exception):
@@ -1986,9 +2018,9 @@ def _acp_transcript_payload(
     """Assemble one HTTP 200 ACP transcript payload with its derived top-level state."""
     transcript_state, transcript_reason = _acp_transcript_summary_state(entries, truncated=truncated)
     return {
-        "conversation_id": _redact_and_sanitize_text(conversation_id),
+        "conversation_id": _redact_and_sanitize_plain_text(conversation_id),
         "state": transcript_state,
-        "label": _redact_and_sanitize_text(_ACP_TRANSCRIPT_STATE_LABELS[transcript_state]),
+        "label": _redact_and_sanitize_plain_text(_ACP_TRANSCRIPT_STATE_LABELS[transcript_state]),
         "reason": transcript_reason,
         "truncated": truncated,
         "messages": entries,
@@ -2119,17 +2151,17 @@ def _acp_transcript_entries(
             raw_kind = row["kind"]
             kind_malformed = not isinstance(raw_kind, str) or not raw_kind
             kind_off_allowlist = not kind_malformed and raw_kind not in _ACP_TRANSCRIPT_KINDS
-            kind = None if (kind_malformed or kind_off_allowlist) else _redact_and_sanitize_text(raw_kind)
+            kind = None if (kind_malformed or kind_off_allowlist) else _redact_and_sanitize_plain_text(raw_kind)
 
             raw_sender = row["sender"]
             sender = (
-                _redact_and_sanitize_text(raw_sender)
+                _redact_and_sanitize_plain_text(raw_sender)
                 if isinstance(raw_sender, str) and raw_sender in allowed_lanes
                 else None
             )
             raw_recipient = row["recipient"]
             recipient = (
-                _redact_and_sanitize_text(raw_recipient)
+                _redact_and_sanitize_plain_text(raw_recipient)
                 if isinstance(raw_recipient, str) and raw_recipient in allowed_lanes
                 else None
             )
@@ -2203,7 +2235,7 @@ def _acp_transcript_entries(
         entry: dict[str, Any] = {
             "ordinal": index,
             "state": state,
-            "label": _redact_and_sanitize_text(_ACP_TRANSCRIPT_STATE_LABELS[state]),
+            "label": _redact_and_sanitize_plain_text(_ACP_TRANSCRIPT_STATE_LABELS[state]),
             "reason": reason,
             "kind": kind,
             "sender": sender,
@@ -2249,7 +2281,7 @@ def _acp_transcript_entries(
                 digest_lower is not None and digest_lower in expired_digests
             ):
                 entries[entry_idx]["state"] = _ACP_TRANSCRIPT_STATE_BODY_EXPIRED
-                entries[entry_idx]["label"] = _redact_and_sanitize_text(
+                entries[entry_idx]["label"] = _redact_and_sanitize_plain_text(
                     _ACP_TRANSCRIPT_STATE_LABELS[_ACP_TRANSCRIPT_STATE_BODY_EXPIRED]
                 )
                 entries[entry_idx]["reason"] = "body_expired"
@@ -2263,10 +2295,10 @@ def _acp_transcript_entries(
     if surviving and len(
         _acp_json_bytes(_acp_transcript_payload(conversation_id, entries, truncated=truncated))
     ) > _ACP_TRANSCRIPT_MAX_RESPONSE_BYTES:
-        oversized_label = _redact_and_sanitize_text(
+        oversized_label = _redact_and_sanitize_plain_text(
             _ACP_TRANSCRIPT_STATE_LABELS[_ACP_TRANSCRIPT_STATE_OVERSIZED_OR_PARTIAL]
         )
-        ok_label = _redact_and_sanitize_text(_ACP_TRANSCRIPT_STATE_LABELS[_ACP_TRANSCRIPT_STATE_OK])
+        ok_label = _redact_and_sanitize_plain_text(_ACP_TRANSCRIPT_STATE_LABELS[_ACP_TRANSCRIPT_STATE_OK])
         for entry_idx, text in surviving:
             entry = entries[entry_idx]
             ok_size = len(_acp_json_bytes(entry))
@@ -2326,9 +2358,9 @@ def _acp_backend_unavailable_response(conversation_id: str | None, reason: str) 
     return (
         503,
         {
-            "conversation_id": _redact_and_sanitize_text(conversation_id) if conversation_id is not None else None,
+            "conversation_id": _redact_and_sanitize_plain_text(conversation_id) if conversation_id is not None else None,
             "state": _ACP_TRANSCRIPT_STATE_BACKEND_UNAVAILABLE,
-            "label": _redact_and_sanitize_text(
+            "label": _redact_and_sanitize_plain_text(
                 _ACP_TRANSCRIPT_STATE_LABELS[_ACP_TRANSCRIPT_STATE_BACKEND_UNAVAILABLE]
             ),
             "reason": reason,
@@ -2359,9 +2391,9 @@ def get_acp_conversation_transcript(
             return (
                 200,
                 {
-                    "conversation_id": _redact_and_sanitize_text(safe_id),
+                    "conversation_id": _redact_and_sanitize_plain_text(safe_id),
                     "state": _ACP_TRANSCRIPT_STATE_MISSING_OR_CORRUPT,
-                    "label": _redact_and_sanitize_text(
+                    "label": _redact_and_sanitize_plain_text(
                         _ACP_TRANSCRIPT_STATE_LABELS[_ACP_TRANSCRIPT_STATE_MISSING_OR_CORRUPT]
                     ),
                     "reason": participant_error or "malformed_participants",
