@@ -546,17 +546,10 @@ def _dispatch(args) -> int:
         args.review_attempt = str(Path(args.review_attempt).resolve())
     if args.require_review_verdict and args.mode != "read-only":
         raise ValueError("--require-review-verdict requires --mode read-only")
-    # Resolved once, before anything reads the owned paths: the advisory binding, bounded admission, the
-    # sparse checkout and the task record all see this set, and hooks and settlement read it from the record.
     from lu_machinery.guardrails.delegate_ownership import owned_path_matcher
 
     if any(owned_path_matcher(path) is None for path in (args.owned_path or ())):
         raise ValueError("invalid owned path")
-    args.owned_path, generated = scope.with_generated_outputs(args.owned_path)
-    for output in generated:
-        print(f"dispatcher: owned paths include {output}; a commit gate regenerates it from the owned paths",
-              file=sys.stderr)
-    excluded = git.sparse_excludes(args.sparse_include, [*args.owned_path, *args.research_owned_path])
     if (args.prompt is None) == (args.prompt_file is None):
         raise ValueError("provide exactly one of --prompt or --prompt-file")
     source = args.prompt if args.prompt is not None else args.prompt_file
@@ -624,9 +617,17 @@ def _dispatch(args) -> int:
     if budget is None and args.max_budget_usd is not None:
         raise ValueError("--max-budget-usd applies only to a Claude API-key account")
     args.codex_account = account_fields.get("codex_account")
+    if args.print_advisory_binding and (not args.task_id or source == "-"):
+        raise ValueError("--print-advisory-binding requires --task-id and a non-stdin prompt")
+    repo, info = git.resolve_repo(args.repo)
+    # The same repository-scoped paths feed advisory binding, bounded admission, the sparse checkout
+    # and the task record. Hooks and settlement read them from the record.
+    args.owned_path, generated = scope.with_generated_outputs(args.owned_path, info.get("key"))
+    for output in generated:
+        print(f"dispatcher: owned paths include {output}; a commit gate regenerates it from the owned paths",
+              file=sys.stderr)
+    excluded = git.sparse_excludes(args.sparse_include, [*args.owned_path, *args.research_owned_path])
     if args.print_advisory_binding:
-        if not args.task_id or source == "-":
-            raise ValueError("--print-advisory-binding requires --task-id and a non-stdin prompt")
         print(checks.advisory_binding(args, prompt)[2])
         return 0
     from lu_machinery.orchestration import task_record_store
@@ -647,7 +648,6 @@ def _dispatch(args) -> int:
                              "a tree (--cwd)")
     with admission.record_refusal(args, agent, StartRefusal.CAPACITY):
         host_admission.check_turn_child_cap(linkage)
-    repo, info = git.resolve_repo(args.repo)
     with admission.record_refusal(args, agent, StartRefusal.ELIGIBILITY):
         github: str = active_slug(info)[0] if info.get("alternate_github") is not None else info.get("github", "")
     # Absent unless given, so an omitted --read-path leaves every other route's advisory binding unchanged.

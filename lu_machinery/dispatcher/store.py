@@ -525,9 +525,11 @@ def publish_failed_record(record: dict, path: Path) -> None:
         raise TaskRecordError(f"TASK_RECORD_IO_ERROR: {type(exc).__name__}") from exc
 
 
-def _grant_paths_validated(root: Path, paths: list[str]) -> list[str]:
-    """Literal relative paths inside the existing worktree; no sparse checkout changes."""
+def _grant_paths_validated(record: dict, paths: list[str]) -> tuple[Path, list[str]]:
+    """Return the worktree and the literal grant paths it can already accommodate."""
     from lu_machinery.dispatcher import ownership, scope
+
+    root = _grant_worktree(record)
 
     def validate(raw: str) -> str:
         if (not isinstance(raw, str) or not raw or raw != raw.strip() or "\\" in raw
@@ -545,7 +547,7 @@ def _grant_paths_validated(root: Path, paths: list[str]) -> list[str]:
         return path
 
     paths = sorted(set(validate(path) for path in paths))
-    expanded, _ = scope.with_generated_outputs(paths)
+    expanded, _ = scope.with_generated_outputs(paths, record.get("repo"))
     paths = list(dict.fromkeys(validate(path) for path in expanded))
     run = ownership._local_git(root)
     sparse = subprocess.run(["git", "-C", str(root), "config", "--bool", "core.sparseCheckout"],
@@ -562,7 +564,7 @@ def _grant_paths_validated(root: Path, paths: list[str]) -> list[str]:
                         if path.startswith("S ") and not ownership.outside_owned([path[2:]], paths))
         if excluded:
             raise ValueError("grant path is sparse-excluded: " + ", ".join(sorted(excluded)[:10]))
-    return paths
+    return root, paths
 
 
 def _grant_worktree(record: dict) -> Path:
@@ -599,8 +601,8 @@ def grant_paths(task_id: str, run_nonce: str, paths: list[str], reason: str, app
         ancestor = parent.get("parent_task_id")
     path = record_path(task_id)
     snapshot = read(task_id, run_nonce)
-    root = _grant_worktree(snapshot)
-    normalized = _grant_paths_validated(root, paths)
+    assert snapshot is not None  # read raises when the record is missing
+    root, normalized = _grant_paths_validated(snapshot, paths)
     with task_state_lock(path):
         record = read(task_id, run_nonce)
         if _grant_worktree(record) != root:
