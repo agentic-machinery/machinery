@@ -18,6 +18,7 @@ One dictionary procedure for every seat that writes or reviews Ukrainian. It cov
 
 - Word tools take one word form: `verify_words` (one form per list entry), `check_russian_shadow`, `verify_stress`. Split a phrase into its word forms for them and keep the phrase as context. A phrase sent whole returns misleading output (no VESUM match, or a false Russian-shadow match). Judge the phrase itself only with the phrase sources in step 5.
 - Headword tools take the lemma: `query_cefr_level`, `query_sum20`, `query_ulif`, `verify_lemma`, `search_heritage`, `search_esum`, `search_slovnyk_me`, and `query_r2u` (which takes a Russian lemma). Query them with the context-supported VESUM lemma from step 2. When VESUM has no match for the form (the step 2 escalation, step 5), query them with the written form or with a candidate headword taken from tool output (for example a headword a `query_ulif` miss lists). Never invent a lookup key. Keep the original item in the row and record the exact key you sent as `checked_form`.
+- Lookup keys are bare. For every tool except `verify_stress`, remove stress marks (U+0301, U+0300) from the key, including from a headword copied out of tool output, and lowercase a word that is capitalized only because it starts a sentence or heading. Keep proper nouns as written. VESUM misses a stress-marked or sentence-capitalized form that it attests in bare lowercase, so a miss on an unnormalized key is no evidence. Send `verify_stress` the form as written and keep the original item for the stress row.
 
 ## Reading a Sources result
 
