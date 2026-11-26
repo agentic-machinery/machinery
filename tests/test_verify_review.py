@@ -1336,6 +1336,175 @@ def test_cli_receipt_path_and_forbidden_paths(tmp_path, monkeypatch):
     assert code2 == EXIT_INVALID
 
 
+def test_cli_receipt_path_refuses_direct_task_store_and_allows_task_artifacts(tmp_path, monkeypatch, capsys):
+    """Defect class: verify_review writes a receipt JSON directly into the flat task store."""
+    repo = _init_repo(tmp_path)
+    (repo / "app.py").write_text("print('v2')\n", encoding="utf-8")
+    review = tmp_path / "review.json"
+    review.write_text(json.dumps(_clean_payload()), encoding="utf-8")
+
+    store = tmp_path / "task-store"
+    (store / "archive").mkdir(parents=True)
+    monkeypatch.setenv("LU_TASKS_DIR", str(store))
+
+    link_dir = tmp_path / "tasks-link"
+    link_dir.symlink_to(store)
+    outside_link = tmp_path / "alias.behavior-receipt.json"
+    outside_link.symlink_to(store / "via-symlink.behavior-receipt.json")
+
+    for blocked in (
+        store / "t1.behavior-receipt.json",
+        store / "archive" / "t1.behavior-receipt.json",
+        link_dir / "t1.behavior-receipt.json",
+        outside_link,
+        tmp_path / "other" / "batch_state" / "tasks" / "t1.behavior-receipt.json",
+    ):
+        capsys.readouterr()
+        code = verify_review_cli.main(
+            [
+                "--review-file",
+                str(review),
+                *_cli_envelope_args(repo),
+                "--receipt-path",
+                str(blocked),
+            ]
+        )
+        assert code == EXIT_INVALID, f"expected EXIT_INVALID for {blocked}"
+        assert "receipt_path_forbidden" in capsys.readouterr().err
+        assert not (store / "t1.behavior-receipt.json").exists()
+        assert not (store / "archive" / "t1.behavior-receipt.json").exists()
+        assert not (store / "via-symlink.behavior-receipt.json").exists()
+
+    allowed = store / "t1.artifacts" / "behavior-receipt.json"
+    code_ok = verify_review_cli.main(
+        [
+            "--review-file",
+            str(review),
+            *_cli_envelope_args(repo),
+            "--receipt-path",
+            str(allowed),
+        ]
+    )
+    assert code_ok == EXIT_CLEAN
+    assert allowed.is_file()
+
+    # F2 regression: without a configured state root, a symlinked conventional batch_state/tasks
+    # (or archive), including when reached through parent-directory aliases, still refuses direct
+    # writes while allowing writes under <task>.artifacts/. Symlink loops also fail closed cleanly.
+    from lu_machinery.common import repo_root as repo_root_mod
+
+    monkeypatch.delenv("LU_TASKS_DIR", raising=False)
+    monkeypatch.setattr(
+        "lu_machinery.common.task_store_paths.state_root",
+        lambda: (_ for _ in ()).throw(repo_root_mod.MachineryConfigError("no state root")),
+    )
+    backing = tmp_path / "external-backing"
+    backing_archive = tmp_path / "external-archive-backing"
+    backing_deep = backing / "deep" / "dir"
+    backing_deep.mkdir(parents=True)
+    backing_archive.mkdir()
+    (backing / "nested").symlink_to(backing_deep)
+    conv_parent = tmp_path / "conv" / "batch_state"
+    conv_parent.mkdir(parents=True)
+    conv_tasks = conv_parent / "tasks"
+    conv_tasks.symlink_to(backing)
+    (backing / "archive").symlink_to(backing_archive)
+    alias_tasks = tmp_path / "alias-tasks"
+    alias_tasks.symlink_to(conv_tasks)
+    alias_parent = tmp_path / "alias-parent"
+    alias_parent.symlink_to(conv_parent)
+    loop_a = tmp_path / "loop-a"
+    loop_b = tmp_path / "loop-b"
+    loop_a.symlink_to(loop_b)
+    loop_b.symlink_to(loop_a)
+    existing_file = tmp_path / "existing-file"
+    existing_file.write_text("not a dir\n", encoding="utf-8")
+
+    for conv_blocked in (
+        conv_tasks / "t2.behavior-receipt.json",
+        conv_tasks / "archive" / "t2.behavior-receipt.json",
+        conv_tasks / "t2.artifacts" / ".." / "t2.behavior-receipt.json",
+        alias_tasks / "t2.behavior-receipt.json",
+        alias_tasks / "archive" / "t2.behavior-receipt.json",
+        alias_tasks / "t2.artifacts" / ".." / "t2.behavior-receipt.json",
+        alias_tasks / "nested" / ".." / ".." / "t2.behavior-receipt.json",
+        alias_parent / "tasks" / "t2.behavior-receipt.json",
+        loop_a / "t2.behavior-receipt.json",
+        existing_file / "t2.behavior-receipt.json",
+    ):
+        capsys.readouterr()
+        code_conv = verify_review_cli.main(
+            [
+                "--review-file",
+                str(review),
+                *_cli_envelope_args(repo),
+                "--receipt-path",
+                str(conv_blocked),
+            ]
+        )
+        assert code_conv == EXIT_INVALID, f"expected EXIT_INVALID for {conv_blocked}"
+        assert "receipt_path_forbidden" in capsys.readouterr().err
+    assert not (backing / "t2.behavior-receipt.json").exists()
+    assert not (backing_archive / "t2.behavior-receipt.json").exists()
+
+    for conv_allowed in (
+        conv_tasks / "t2.artifacts" / "behavior-receipt.json",
+        alias_tasks / "t3.artifacts" / "behavior-receipt.json",
+    ):
+        code_conv_ok = verify_review_cli.main(
+            [
+                "--review-file",
+                str(review),
+                *_cli_envelope_args(repo),
+                "--receipt-path",
+                str(conv_allowed),
+            ]
+        )
+        assert code_conv_ok == EXIT_CLEAN
+        assert conv_allowed.is_file()
+
+    # Closed-list rows outside the task store: a dangling symlink, a directory at the target and a
+    # `missing/..` spelling are refused before anything is created; a spelling over the kernel's path
+    # limit is refused as given; an OSError while writing is a typed refusal, not a traceback.
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    dangling = outside / "dangling.json"
+    dangling.symlink_to(outside / "dangling-target.json")
+    dir_target = outside / "dir-target.json"
+    dir_target.mkdir()
+    for refused in (dangling, dir_target, outside / "missing" / ".." / "receipt.json"):
+        capsys.readouterr()
+        code_refused = verify_review_cli.main(
+            ["--review-file", str(review), *_cli_envelope_args(repo), "--receipt-path", str(refused)]
+        )
+        assert code_refused == EXIT_INVALID, f"expected EXIT_INVALID for {refused}"
+        assert "receipt_path_unwritable" in capsys.readouterr().err
+    capsys.readouterr()
+    with pytest.raises(SystemExit) as too_long:
+        verify_review_cli.main(
+            ["--review-file", str(review), *_cli_envelope_args(repo), "--receipt-path", f"{outside}{'/' * 5000}r.json"]
+        )
+    assert too_long.value.code == 2
+    assert "path limit" in capsys.readouterr().err
+
+    disk_full = outside / "disk-full.json"
+    original_write_text = Path.write_text
+
+    def _write_text(self, *args, **kwargs):
+        if self == disk_full:
+            raise OSError(28, "No space left on device")
+        return original_write_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "write_text", _write_text)
+    code_full = verify_review_cli.main(
+        ["--review-file", str(review), *_cli_envelope_args(repo), "--receipt-path", str(disk_full)]
+    )
+    assert code_full == EXIT_INVALID
+    assert "receipt_path_unwritable" in capsys.readouterr().err
+    assert sorted(path.name for path in outside.iterdir()) == ["dangling.json", "dir-target.json"]
+    assert list(dir_target.iterdir()) == []
+
+
 def test_cli_issue_mode_posts_opt_in_comment(tmp_path, monkeypatch, capsys):
     repo = _init_repo(tmp_path)
     (repo / "app.py").write_text("print('v1')\nvalue = 2\n", encoding="utf-8")

@@ -3618,3 +3618,153 @@ def test_stream_epic_binding_accepts_either_baked_slug_of_the_registry_row(tmp_p
     finally:
         sel_dir.chmod(0o700)
         sel_file.chmod(0o600)
+
+
+def test_write_lifecycle_and_lock_refuse_direct_task_store_and_load_reads_existing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Defect class: lifecycle ledger or lock file written directly into the flat task store."""
+    store = tmp_path / "task-store"
+    (store / "archive").mkdir(parents=True)
+    monkeypatch.setenv("LU_TASKS_DIR", str(store))
+
+    ledger = _ledger()
+    link_dir = tmp_path / "tasks-link"
+    link_dir.symlink_to(store)
+    outside_link = tmp_path / "alias.closeout.json"
+    outside_link.symlink_to(store / "via-symlink.closeout.json")
+
+    for blocked in (
+        store / "t1.closeout.json",
+        store / "archive" / "t1.closeout.json",
+        link_dir / "t1.closeout.json",
+        outside_link,
+    ):
+        with pytest.raises(task_lifecycle.LifecycleError, match="task_store_direct_write_refused"):
+            task_lifecycle.write_lifecycle(blocked, ledger)
+        with (
+            pytest.raises(task_lifecycle.LifecycleError, match="task_store_direct_write_refused"),
+            task_lifecycle.lifecycle_lock(blocked),
+        ):
+            pass
+    assert not any(store.glob("*.json"))
+    assert not any(store.glob("*.lock"))
+    assert not any((store / "archive").glob("*.json"))
+    assert not any((store / "archive").glob("*.lock"))
+
+    # Writing and locking under <task>.artifacts/ succeeds.
+    allowed = store / "t1.artifacts" / "closeout.json"
+    with task_lifecycle.lifecycle_lock(allowed):
+        task_lifecycle.write_lifecycle(allowed, ledger)
+    assert allowed.is_file()
+    assert task_lifecycle.load_lifecycle(allowed)["lifecycle_id"] == ledger["lifecycle_id"]
+
+    # Pre-existing legacy files directly in the task store remain readable.
+    legacy = store / "legacy.closeout.json"
+    legacy.write_text(allowed.read_text(encoding="utf-8"), encoding="utf-8")
+    assert task_lifecycle.load_lifecycle(legacy)["lifecycle_id"] == ledger["lifecycle_id"]
+
+    # F1 regression: derived lock path symlinked into the flat task store and derived
+    # predecessor archive directory symlinked to the flat store/archive are both refused.
+    safe_dir = tmp_path / "safe-ledger"
+    safe_dir.mkdir()
+    safe_ledger = safe_dir / "issue-42.json"
+    (safe_dir / "issue-42.json.lock").symlink_to(store / "planted.lock")
+    with (
+        pytest.raises(task_lifecycle.LifecycleError, match="task_store_direct_write_refused"),
+        task_lifecycle.lifecycle_lock(safe_ledger),
+    ):
+        pass
+    assert not (store / "planted.lock").exists()
+
+    (safe_dir / "predecessors").symlink_to(store / "archive")
+    pred_path, pred_sha = task_lifecycle.predecessor_archive_path(safe_ledger, b'{"old": 1}\n')
+    with pytest.raises(task_lifecycle.LifecycleError, match="task_store_direct_write_refused"):
+        task_lifecycle.archive_predecessor(b'{"old": 1}\n', pred_path, pred_sha)
+    assert not any((store / "archive").glob("*.json"))
+
+    # F3 regression: task_closeout validates the un-resolved --state-file before resolving
+    # symlinks on mutating commands, while read-only `carrier` still reads a pre-existing file.
+    external_target = tmp_path / "external-ledger.json"
+    dangling_in_store = store / "dangling-link.json"
+    dangling_in_store.symlink_to(external_target)
+    rc_mut = task_closeout.main(["bind-pr", "--state-file", str(dangling_in_store), "--pr", "77", "--now", NOW])
+    assert rc_mut == 2
+    assert not external_target.exists()
+    assert not (tmp_path / "external-ledger.json.lock").exists()
+
+    rc_carrier = task_closeout.main(["carrier", "--state-file", str(legacy)])
+    assert rc_carrier == 0
+
+    # F4 regression (R2 F4 and PR1478-F4): a '..' component is refused before anything is created,
+    # because lexical normalisation and the kernel disagree on `symlink/..` and `missing/..`; an
+    # allowed symlinked artifact path with missing components writes where a lookup through the
+    # caller's own spelling finds the ledger, lock and archive.
+    nested_artifact = store / "t2.artifacts" / "nested"
+    nested_artifact.mkdir(parents=True)
+    missing_container = tmp_path / "not-created" / "via"
+    missing_container.parent.mkdir()
+    missing_container.symlink_to(nested_artifact)
+    refused_dotdot = r"'\.\.' component refused"
+    archive_bytes = b'{"prev": 2}\n'
+    for dotdot_path in (
+        missing_container / ".." / "sub" / "closeout.json",
+        missing_container / "missing" / ".." / "out" / "closeout.json",
+    ):
+        with pytest.raises(task_lifecycle.LifecycleError, match=refused_dotdot):
+            task_lifecycle.write_lifecycle(dotdot_path, ledger)
+        with pytest.raises(task_lifecycle.LifecycleError, match=refused_dotdot), task_lifecycle.lifecycle_lock(dotdot_path):
+            pass
+        dotdot_pred_path, dotdot_pred_sha = task_lifecycle.predecessor_archive_path(dotdot_path, archive_bytes)
+        with pytest.raises(task_lifecycle.LifecycleError, match=refused_dotdot):
+            task_lifecycle.archive_predecessor(archive_bytes, dotdot_pred_path, dotdot_pred_sha)
+        # The CLI checks a mutating --state-file before resolving it, so the same spelling is refused there too.
+        assert task_closeout.main(["bind-pr", "--state-file", str(dotdot_path), "--pr", "77", "--now", NOW]) == 2
+    assert list(nested_artifact.iterdir()) == []
+    assert not (store / "t2.artifacts" / "sub").exists()
+    assert not (tmp_path / "not-created" / "sub").exists()
+
+    orig_path = missing_container / "missing" / "out" / "closeout.json"
+    with task_lifecycle.lifecycle_lock(orig_path):
+        task_lifecycle.write_lifecycle(orig_path, ledger)
+    assert task_lifecycle.load_lifecycle(orig_path)["lifecycle_id"] == ledger["lifecycle_id"]
+    assert orig_path.with_suffix(".json.lock").is_file()
+    orig_pred_path, orig_pred_sha = task_lifecycle.predecessor_archive_path(orig_path, archive_bytes)
+    task_lifecycle.archive_predecessor(archive_bytes, orig_pred_path, orig_pred_sha)
+    assert orig_pred_path.read_bytes() == archive_bytes
+    assert not list(orig_path.parent.rglob("*.tmp"))
+
+    # A symlink whose target only resolves after normalisation (`closeout.json/`) is refused before any lock or write.
+    before = orig_path.read_bytes()
+    file_target_link = tmp_path / "state-link"
+    file_target_link.symlink_to(f"{orig_path}/")
+    assert task_closeout.main(["bind-pr", "--state-file", str(file_target_link), "--pr", "77", "--now", NOW]) == 2
+    assert orig_path.read_bytes() == before
+    assert not (tmp_path / "state-link.lock").exists()
+    # A spelling the kernel refuses outright (too long, from redundant separators) is refused, not normalised.
+    too_long = f"{orig_path.parent}{'/' * 5000}{orig_path.name}"
+    assert task_closeout.main(["bind-pr", "--state-file", too_long, "--pr", "77", "--now", NOW]) == 2
+    assert orig_path.read_bytes() == before
+    # A mutating --state-file is checked as given: a quoted leading "~" is refused, not expanded first
+    # (expansion could shorten a spelling past the length check, PR1484 R1 F4).
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / "closeout.json").write_bytes(before)
+    monkeypatch.setenv("HOME", str(home))
+    assert task_closeout.main(["bind-pr", "--state-file", "~/closeout.json", "--pr", "77", "--now", NOW]) == 2
+    assert (home / "closeout.json").read_bytes() == before
+    assert [path.name for path in home.iterdir()] == ["closeout.json"]
+
+    # A dangling symlink outside the store and a directory at the target are refused before any lock or write.
+    dangling_outside = tmp_path / "dangling-ledger.json"
+    dangling_outside.symlink_to(tmp_path / "dangling-ledger-target.json")
+    dir_target = tmp_path / "dir-ledger.json"
+    dir_target.mkdir()
+    for refused in (dangling_outside, dir_target):
+        with pytest.raises(task_lifecycle.LifecycleError, match="a directory at the target, or a component"):
+            task_lifecycle.write_lifecycle(refused, ledger)
+        assert task_closeout.main(["bind-pr", "--state-file", str(refused), "--pr", "77", "--now", NOW]) == 2
+    assert not (tmp_path / "dangling-ledger-target.json").exists()
+    assert not (tmp_path / "dangling-ledger.json.lock").exists()
+    assert not (tmp_path / "dir-ledger.json.lock").exists()
+    assert list(dir_target.iterdir()) == []

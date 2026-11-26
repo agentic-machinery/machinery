@@ -34,6 +34,11 @@ from lu_machinery.common.repo_root import (
     machinery_path,
     state_root_for_checkout,
 )
+from lu_machinery.common.task_store_paths import (
+    kernel_follows_write_path,
+    require_not_direct_task_store_path,
+    write_path_spelling_error,
+)
 from lu_machinery.github_check_rollup import group_collapsed_by_name
 from lu_machinery.orchestration import fleet_repos, issue_stream_audit, task_identity
 from lu_machinery.review.review_contract import finding_supports_approval, unverified_follow_up_notes
@@ -1315,18 +1320,68 @@ def load_lifecycle(path: Path) -> dict[str, Any]:
     return validate_lifecycle(payload)
 
 
+def _require_not_direct_task_store(path: Path, *, label: str = "lifecycle ledger") -> None:
+    try:
+        require_not_direct_task_store_path(path, label=label)
+    except ValueError as exc:
+        raise LifecycleError(str(exc)) from None
+
+
+def _validate_lifecycle_write_path(path: Path | str, *, label: str) -> None:
+    """Refuse a lifecycle write path that is malformed, has a ``..`` component or targets the task store.
+
+    Writers create, stage and publish through ``path`` itself, so a later lookup through the
+    same spelling finds what was written. A ``..`` component is refused because lexical
+    normalisation (``realpath``, or ``tempfile.mkstemp``'s ``abspath`` of ``dir``) collapses
+    ``missing/..`` or ``symlink/..`` where the kernel does not, which can move the write away
+    from where ``path`` resolves. No caller needs one: ``lifecycle_path`` builds from a resolved
+    state root, and ``task_closeout`` checks a mutating ``--state-file`` here before resolving it.
+    A string keeps a trailing ``/``, ``/.`` or ``/..`` that ``Path`` would drop, so it is checked
+    as given. A component the kernel cannot follow is refused too, so a caller that resolves the
+    path first never writes where its own spelling cannot be read back, and so is an existing
+    directory at the target.
+    """
+    raw = os.fspath(path)
+    reason = write_path_spelling_error(raw)
+    if reason is None and ".." in raw.split(os.sep):
+        reason = "'..' component"
+    if reason is not None:
+        raise LifecycleError(f"invalid {label} path ({reason} refused): {raw!r}")
+    _require_not_direct_task_store(Path(raw), label=label)
+    if not kernel_follows_write_path(raw):
+        raise LifecycleError(
+            f"invalid {label} path (a directory at the target, or a component the kernel cannot follow, "
+            f"refused): {raw!r}"
+        )
+
+
 def write_lifecycle(path: Path, payload: Mapping[str, Any]) -> None:
+    _validate_lifecycle_write_path(path, label="lifecycle ledger")
     ledger = validate_lifecycle(payload)
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + f".tmp.{os.getpid()}")
-    tmp.write_text(json.dumps(ledger, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    os.replace(tmp, path)
+    encoded = json.dumps(ledger, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    tmp_path = Path(tmp_name)
+    closed_fd = False
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            closed_fd = True
+            handle.write(encoded)
+            handle.flush()
+        os.replace(tmp_path, path)
+    finally:
+        if not closed_fd:
+            with suppress(OSError):
+                os.close(fd)
+        tmp_path.unlink(missing_ok=True)
 
 
 @contextmanager
 def lifecycle_lock(path: Path, *, blocking: bool = True) -> Iterator[None]:
     """Hold the ledger's exclusive lock; non-blocking callers refuse a held lock."""
+    _validate_lifecycle_write_path(path, label="lifecycle ledger")
     lock_path = path.with_suffix(path.suffix + ".lock")
+    _validate_lifecycle_write_path(lock_path, label="lifecycle lock")
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     with lock_path.open("a+", encoding="utf-8") as handle:
         try:
@@ -1353,17 +1408,24 @@ def predecessor_archive_path(path: Path, raw: bytes) -> tuple[Path, str]:
 
 def archive_predecessor(raw: bytes, archive_path: Path, archive_sha256: str) -> None:
     """Store predecessor bytes once, never overwriting a different archive."""
+    _validate_lifecycle_write_path(archive_path, label="predecessor archive")
     archive_path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = archive_path.with_name(archive_path.name + f".tmp.{os.getpid()}")
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{archive_path.name}.", suffix=".tmp", dir=archive_path.parent)
+    tmp_path = Path(tmp_name)
+    closed_fd = False
     try:
-        with tmp.open("wb") as handle:
+        with os.fdopen(fd, "wb") as handle:
+            closed_fd = True
             handle.write(raw)
             handle.flush()
             os.fsync(handle.fileno())
         with suppress(FileExistsError):
-            os.link(tmp, archive_path)
+            os.link(tmp_path, archive_path)
     finally:
-        tmp.unlink(missing_ok=True)
+        if not closed_fd:
+            with suppress(OSError):
+                os.close(fd)
+        tmp_path.unlink(missing_ok=True)
     stored = archive_path.read_bytes()
     if stored != raw or "sha256:" + hashlib.sha256(stored).hexdigest() != archive_sha256:
         raise EvidencePolicyError(

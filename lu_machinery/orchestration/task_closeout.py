@@ -1003,9 +1003,19 @@ def perform_mutation(
             ) from exc
 
 
-def _state_file(args: argparse.Namespace, identity: Mapping[str, Any] | None = None) -> Path:
-    if args.state_file:
-        return Path(args.state_file).expanduser().resolve()
+def _state_file(
+    args: argparse.Namespace, identity: Mapping[str, Any] | None = None, *, writable: bool = True,
+) -> Path:
+    if args.state_file is not None:
+        raw = args.state_file
+        if writable:
+            # Checked exactly as given, as closeout_cli and verify_review check theirs: no "~" expansion or
+            # normalisation first, so a leading "~", a trailing "/" and the length limit apply to the argument.
+            task_lifecycle._validate_lifecycle_write_path(raw, label="lifecycle ledger")
+        else:
+            # os.path.expanduser leaves an unknown ~user as given (Path.expanduser raises RuntimeError).
+            raw = os.path.expanduser(raw)
+        return Path(os.path.realpath(raw))
     if identity is None:
         raise task_lifecycle.LifecycleError("--state-file is required for this command")
     return task_lifecycle.lifecycle_path(Path(args.repo_root), identity)
@@ -1301,7 +1311,7 @@ def cmd_mutate(args: argparse.Namespace) -> int:
 
 
 def cmd_carrier(args: argparse.Namespace) -> int:
-    path = _state_file(args)
+    path = _state_file(args, writable=False)
     carrier = task_lifecycle.carrier_projection(
         task_lifecycle.load_lifecycle(path), state_file=str(path)
     )
@@ -1312,10 +1322,11 @@ def cmd_carrier(args: argparse.Namespace) -> int:
 def cmd_recover_local(args: argparse.Namespace) -> int:
     from lu_machinery.orchestration.lifecycle_observation import recover
 
+    state_file = _state_file(args)
     child_pr = None
     merged_pr = None
     if args.associate_child:
-        ledger = task_lifecycle.load_lifecycle(Path(args.state_file))
+        ledger = task_lifecycle.load_lifecycle(state_file)
         try:
             merged_pr = GhGitHubAdapter(args.repo_root)._read_pr(
                 ledger["identity"]["repository"], ledger["pr"]["number"]
@@ -1327,7 +1338,7 @@ def cmd_recover_local(args: argparse.Namespace) -> int:
         child_pr = merged_pr
     receipt, replayed = recover(
         args.repo_root,
-        state_file=Path(args.state_file),
+        state_file=state_file,
         task_file=Path(args.task_record),
         manifest_file=Path(args.preserved_manifest),
         push_file=Path(args.push_record),

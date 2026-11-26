@@ -45,6 +45,11 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 from lu_machinery.common import json_depth
+from lu_machinery.common.task_store_paths import (
+    is_direct_task_store_path,
+    kernel_follows_write_path,
+    write_path_argument,
+)
 from lu_machinery.opsec.prepublish import publication_cli
 from lu_machinery.publish.github import Request, request_run
 from lu_machinery.review.evidence import build_target_manifest
@@ -144,7 +149,9 @@ def _receipt_path_allowed(path: Path) -> bool:
         return False
     if "review" in parts and path.name.endswith("-review.md"):
         return False
-    return "telemetry" not in parts
+    if "telemetry" in parts:
+        return False
+    return not is_direct_task_store_path(path)
 
 
 def _load_behavior_proof_state(
@@ -326,7 +333,7 @@ Related: docs/review-protocol.md; lu_machinery/schemas/code-review-findings.v1.s
 
     parser.add_argument(
         "--receipt-path",
-        type=Path,
+        type=write_path_argument,
         help="Write full receipt JSON to this local path (must not be a forbidden artifact path)",
     )
     parser.add_argument(
@@ -534,7 +541,8 @@ def main(argv: list[str] | None = None) -> int:
                     {
                         "error": (
                             "receipt_path_forbidden: do not write receipts under "
-                            "status/, audit/*-review.md, review/*-review.md, or telemetry/"
+                            "status/, audit/*-review.md, review/*-review.md, telemetry/, "
+                            "or directly in the task store (use <task>.artifacts/ instead)"
                         )
                     },
                     ensure_ascii=False,
@@ -542,8 +550,29 @@ def main(argv: list[str] | None = None) -> int:
                 file=sys.stderr,
             )
             return EXIT_INVALID
-        args.receipt_path.parent.mkdir(parents=True, exist_ok=True)
-        args.receipt_path.write_text(receipt_json + "\n", encoding="utf-8")
+        if not kernel_follows_write_path(args.receipt_path):
+            print(
+                json.dumps(
+                    {
+                        "error": (
+                            f"receipt_path_unwritable: {args.receipt_path} is a directory, "
+                            "or a component of it cannot be followed"
+                        )
+                    },
+                    ensure_ascii=False,
+                ),
+                file=sys.stderr,
+            )
+            return EXIT_INVALID
+        try:
+            args.receipt_path.parent.mkdir(parents=True, exist_ok=True)
+            args.receipt_path.write_text(receipt_json + "\n", encoding="utf-8")
+        except OSError as exc:
+            print(
+                json.dumps({"error": f"receipt_path_unwritable: {args.receipt_path}: {exc}"}, ensure_ascii=False),
+                file=sys.stderr,
+            )
+            return EXIT_INVALID
 
     if args.post_comment:
         _post_summary(args.issue, result.receipt)

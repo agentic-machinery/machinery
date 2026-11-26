@@ -1618,3 +1618,107 @@ def test_checklist_refuses_a_running_copy_inside_a_submodule_of_the_checkout(tmp
 
     assert result.returncode == 1
     assert "running from the checkout under review" in result.stdout + result.stderr
+
+
+def test_closeout_cli_refuses_direct_task_store_writes_and_reads_existing_legacy_file(tmp_path, monkeypatch):
+    """Defect class: non-record closeout state or behavior-proof receipt written directly into the flat task store.
+
+    Refuses direct task-store paths, archive paths, traversal and symlink aliases before creating any file,
+    permits ``<task>.artifacts/``, and keeps read-only subcommands able to read pre-existing files.
+    """
+    repo = _init_repo(tmp_path)
+    (repo / "feature.py").write_text("value = 1\n", encoding="utf-8")
+    store = tmp_path / "task-store"
+    (store / "archive").mkdir(parents=True)
+    monkeypatch.setenv("LU_TASKS_DIR", str(store))
+
+    link_dir = tmp_path / "tasks-link"
+    link_dir.symlink_to(store)
+    outside_link = tmp_path / "alias.review-state.json"
+    outside_link.symlink_to(store / "via-symlink.review-state.json")
+
+    blocked_paths = (
+        store / "t1.review-state.json",
+        store / "archive" / "t1.review-state.json",
+        store / "t1.artifacts" / ".." / "t1.review-state.json",
+        link_dir / "t1.review-state.json",
+        outside_link,
+    )
+    for blocked in blocked_paths:
+        proc = _run_cli(blocked, "target", "--mode", "local", "--repo-root", str(repo))
+        assert proc.returncode == 1, f"expected refusal for {blocked}"
+        assert "task_store_direct_write_refused" in proc.stderr
+        assert not (store / "t1.review-state.json").exists()
+        assert not (store / "archive" / "t1.review-state.json").exists()
+        assert not (store / "via-symlink.review-state.json").exists()
+
+    # Writing under <task>.artifacts/ succeeds.
+    artifacts_state = store / "t1.artifacts" / "review-state.json"
+    ok_target = _run_cli(artifacts_state, "target", "--mode", "local", "--repo-root", str(repo))
+    assert ok_target.returncode == 0, ok_target.stderr
+    assert artifacts_state.is_file()
+
+    ok_freeze = _run_cli(
+        artifacts_state,
+        "freeze",
+        "--issue",
+        "#1441",
+        "--intended-behavior",
+        "keep non-record JSON under task artifacts",
+        "--non-goals",
+        "no moving live files",
+        "--owner-boundary",
+        "lu_machinery",
+        "--review-profile",
+        "infra",
+        "--risk",
+        "high",
+    )
+    assert ok_freeze.returncode == 0, ok_freeze.stderr
+
+    # A pre-existing legacy file directly in the task store remains readable by read-only subcommands,
+    # while behavior-proof receipt refuses to write a sibling receipt directly in the task store.
+    legacy = store / "legacy.review-state.json"
+    legacy.write_text(artifacts_state.read_text(encoding="utf-8"), encoding="utf-8")
+    read_proc = _run_cli(legacy, "check-expansion", "--repo-root", str(repo))
+    assert read_proc.returncode == 0, read_proc.stderr
+    assert json.loads(read_proc.stdout)["triggered"] is False
+
+    receipt_proc = _run_cli(legacy, "behavior-proof", "receipt")
+    assert receipt_proc.returncode == 1
+    assert "task_store_direct_write_refused" in receipt_proc.stderr
+    assert not (store / "legacy.review-state.ukrainian-behavior-proof-receipt.json").exists()
+
+    # R1 F1/F2 regressions: traversing through an existing regular file and passing a
+    # filename-less directory path both end in typed refusals instead of tracebacks; the
+    # filename-less spelling is refused as given, before Path drops its trailing component.
+    regular_file = tmp_path / "existing-file"
+    regular_file.write_text("not a directory\n", encoding="utf-8")
+    file_parent_proc = _run_cli(regular_file / "state.json", "target", "--mode", "local", "--repo-root", str(repo))
+    assert file_parent_proc.returncode == 1
+    assert "task_store_direct_write_refused" in file_parent_proc.stderr
+
+    dot_receipt_proc = _run_cli(Path("."), "behavior-proof", "receipt")
+    assert dot_receipt_proc.returncode == 2
+    assert "not a writable file path" in dot_receipt_proc.stderr
+
+    # Closed-list rows outside the task store: a dangling symlink, a directory at the target, a
+    # `missing/..` spelling and a spelling over the kernel's path limit each end in a typed refusal
+    # with nothing created (the last is passed as a string so Path cannot collapse its separators).
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    dangling = outside / "dangling.json"
+    dangling.symlink_to(outside / "dangling-target.json")
+    dir_target = outside / "dir-target.json"
+    dir_target.mkdir()
+    for refused, returncode, reason in (
+        (dangling, 1, "state_unwritable"),
+        (dir_target, 1, "state_unreadable"),
+        (outside / "missing" / ".." / "state.json", 1, "state_unwritable"),
+        (f"{outside}{'/' * 5000}state.json", 2, "path limit"),
+    ):
+        refused_proc = _run_cli(refused, "target", "--mode", "local", "--repo-root", str(repo))
+        assert refused_proc.returncode == returncode, f"expected exit {returncode} for {str(refused)[:80]}"
+        assert reason in refused_proc.stderr
+    assert sorted(path.name for path in outside.iterdir()) == ["dangling.json", "dir-target.json"]
+    assert list(dir_target.iterdir()) == []

@@ -30,7 +30,12 @@ if __package__ in (None, ""):  # run as a file: put the repository root on sys.p
 from lu_machinery.common import json_depth
 from lu_machinery.common.git_context import sanitized_git_env
 from lu_machinery.common.repo_root import MachineryConfigError
-from lu_machinery.common.task_store_paths import tasks_dir
+from lu_machinery.common.task_store_paths import (
+    kernel_follows_write_path,
+    require_not_direct_task_store_path,
+    tasks_dir,
+    write_path_argument,
+)
 from lu_machinery.fleet import claude_account_lane, credit_lane
 from lu_machinery.identity import UNKNOWN_AUTHOR_FAMILY, resolve_author_family
 from lu_machinery.review.evidence import compute_target_input_fingerprint
@@ -90,9 +95,24 @@ def _load_state(state_file: Path) -> dict:
     return state
 
 
+def _require_writable_path(path: Path, *, label: str) -> None:
+    try:
+        require_not_direct_task_store_path(path, label=label)
+    except ValueError as exc:
+        raise CloseoutStateError(str(exc)) from None
+
+
 def _save_state(state_file: Path, state: dict) -> None:
-    state_file.parent.mkdir(parents=True, exist_ok=True)
-    state_file.write_text(json.dumps(state, indent=2, sort_keys=True), encoding="utf-8")
+    _require_writable_path(state_file, label="closeout state")
+    if not kernel_follows_write_path(state_file):
+        raise CloseoutStateError(
+            f"state_unwritable: {state_file} is a directory, or a component of it cannot be followed"
+        )
+    try:
+        state_file.parent.mkdir(parents=True, exist_ok=True)
+        state_file.write_text(json.dumps(state, indent=2, sort_keys=True), encoding="utf-8")
+    except OSError as exc:
+        raise CloseoutStateError(f"state_unwritable:{exc}") from exc
 
 
 def _target_from_dict(data: object) -> ReviewTarget:
@@ -910,6 +930,8 @@ def _cmd_behavior_proof_receipt(args: argparse.Namespace) -> int:
     """Write the Ukrainian receipt from the frozen proof and the live PR comments."""
     from lu_machinery.review.review_contract import ContractError, build_ukrainian_behavior_receipt
 
+    raw_receipt_path = args.state_file.with_name(f"{args.state_file.stem}.ukrainian-behavior-proof-receipt.json")
+    _require_writable_path(raw_receipt_path, label="behavior-proof receipt")
     state = _load_state(args.state_file)
     if state.get("baseline") is None:
         print(json.dumps({"error": "no frozen baseline yet — run `freeze` first"}), file=sys.stderr)
@@ -971,10 +993,20 @@ def _cmd_behavior_proof_receipt(args: argparse.Namespace) -> int:
     except ContractError as exc:
         print(json.dumps({"error": str(exc)}), file=sys.stderr)
         return 1
-    # Resolve once, here, so a relative --state-file still prints a path reconciliation accepts.
-    receipt_path = args.state_file.with_name(f"{args.state_file.stem}.ukrainian-behavior-proof-receipt.json").resolve()
+    # Re-validate and resolve once before writing so a relative --state-file prints a path reconciliation accepts.
+    _require_writable_path(raw_receipt_path, label="behavior-proof receipt")
+    if not kernel_follows_write_path(raw_receipt_path):
+        raise CloseoutStateError(
+            f"receipt_unwritable: {raw_receipt_path} is a directory, or a component of it cannot be followed"
+        )
+    receipt_path = raw_receipt_path.resolve()
+    _require_writable_path(receipt_path, label="behavior-proof receipt")
     receipt_bytes = (json.dumps(receipt, ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode()
-    receipt_path.write_bytes(receipt_bytes)
+    try:
+        receipt_path.parent.mkdir(parents=True, exist_ok=True)
+        receipt_path.write_bytes(receipt_bytes)
+    except OSError as exc:
+        raise CloseoutStateError(f"receipt_unwritable:{exc}") from exc
     print(
         json.dumps(
             {
@@ -1725,7 +1757,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--state-file",
         required=True,
-        type=Path,
+        type=write_path_argument,
         help=(
             "Path to the closeout state JSON file (global argument — must precede the "
             "subcommand). Created on first write; subcommands merge into any existing state. "
