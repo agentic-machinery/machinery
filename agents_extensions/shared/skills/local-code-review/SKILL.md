@@ -71,8 +71,9 @@ a finding you are checking, and cite CI run ids for suite results.
 The [review policy](../review-loop/references/policy.md) decides findings,
 dispositions and rounds; the checklist applies it (#10665). The round-1 brief
 freezes the outcome, the input contract and the dispositions (checklist Step 2).
-Findings are one per root cause and violated invariant, with one representative
-case (Step 4). A P0–P2 finding blocks only when its trigger is reachable under
+Findings, their IDs, the class sweep and the threat-model rules for follow-ups
+and exclusions follow [policy section 3](../review-loop/references/policy.md#3-findings)
+(Step 4). A P0–P2 finding blocks only when its trigger is reachable under
 the input contract; demonstrated P0–P2 regressions caused by the PR and
 unresolved security findings block in every round. The author may answer with
 `not_applicable` and proof for the reviewer to confirm; when the acceptance

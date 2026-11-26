@@ -28,6 +28,15 @@ The template's **Target** and **Input contract** sections carry what the author 
 
 The reviewer brings its own independent adversarial cases; the author's cases narrow nothing.
 
+## Findings rules in every code or infra brief
+
+Every code or infra brief, round 1 and each delta, tells the reviewer to apply
+[policy section 3](policy.md#3-findings), read as the
+[merge-base holds it](#judge-inputs-come-from-the-merge-base). It names two of its rules: the
+class sweep before returning a round that reports a new finding or leaves one open, delta rounds
+included, and the conditions for carrying a confirmed defect as a follow-up or excluding an
+input.
+
 ## Judge inputs come from the merge-base
 
 The reviewer's checkout is the change under review, so a PR can edit the reply schema, this

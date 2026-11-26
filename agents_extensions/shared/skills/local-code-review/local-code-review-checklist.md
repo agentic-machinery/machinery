@@ -217,16 +217,15 @@ model, clearly labeled as advisory, if `selected` is null); for Ukrainian-conten
 changes, hand the review only to a GPT or Gemini seat, never to Claude and never
 to any other model, including an advisory seat. Ask it to find
 bugs, logic errors, missed edge cases, and security/reuse issues in the
-frozen target's diff — nothing outside `frozen_files`.
+frozen target's diff — nothing outside `frozen_files`, apart from the code the
+[policy section 3](../review-loop/references/policy.md#3-findings) class sweep
+reaches.
 
-**Findings by root cause (#10665)**: the reviewer reports one finding per root
-cause and violated invariant. One representative case is sufficient unless
-another reachable case changes the impact or the required fix. A sibling that
-proves the same reachable P0–P2 failure survived the fix stays on the original
-ID and blocks. A real sibling outside the frozen obligation that the PR neither
-introduces, exposes nor worsens, or an unrelated discovery with those same
-properties, is a P3 `follow_up` with an owner. A hypothetical case without a
-plausible path needs no finding. A P0–P2 finding cites `sources` that show its
+**Findings (#10665)**: the reviewer applies
+[policy section 3](../review-loop/references/policy.md#3-findings) in full: its
+finding IDs, its class sweep before returning a round that reports a new finding
+or leaves one open, and its threat-model rules for follow-ups and exclusions. A
+P0–P2 finding cites `sources` that show its
 trigger is reachable under the input contract and the
 [threat model](../review-loop/references/policy.md#3-findings), which decides
 when a one-shot run's pinned bytes bound its input. Reviewers keep their own independent
