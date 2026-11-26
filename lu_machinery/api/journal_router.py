@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import ipaddress
 import json
 import os
 import re
@@ -16,7 +15,7 @@ from fastapi import APIRouter, Query, Request
 from fastapi.responses import JSONResponse
 
 from lu_machinery.api import panel_values
-from lu_machinery.api.observer_presence import _direct_loopback_peer
+from lu_machinery.api.runtime_router import local_body_read_refusal_response
 from lu_machinery.common import json_depth
 from lu_machinery.orchestration.fleet_repos import FleetRepo, FleetRepoError, load_fleet_repos
 
@@ -51,8 +50,6 @@ _SINCE_WINDOWS: dict[str, timedelta] = {
     "30d": timedelta(days=30),
 }
 _ASCII_UINT_RE = re.compile(r"^[0-9]+$")
-_PORT_RE = re.compile(r"^[1-9][0-9]{0,4}$")
-_ORIGIN_SCHEME_RE = re.compile(r"^(?:http|https)://(.+)$", re.IGNORECASE)
 _RFC3339_RE = re.compile(
     r"^([0-9]{4})-([0-9]{2})-([0-9]{2})[Tt]([0-9]{2}):([0-9]{2}):([0-9]{2})"
     r"(?:\.([0-9]{1,9}))?(?:([Zz])|([+-])([0-9]{2}):([0-9]{2}))$"
@@ -62,79 +59,6 @@ _NO_STORE_HEADERS = {"Cache-Control": "no-store"}
 
 def _isoformat_z(value: datetime) -> str:
     return value.astimezone(UTC).isoformat().replace("+00:00", "Z")
-
-
-def _is_loopback_ip(address: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
-    mapped = getattr(address, "ipv4_mapped", None)
-    # ipaddress.{IPv4,IPv6}Address.is_loopback is a boolean property, not a method.
-    return address.is_loopback or bool(mapped and mapped.is_loopback)  # nosemgrep: python.lang.maintainability.is-function-without-parentheses
-
-
-def _valid_port(raw_port: str) -> bool:
-    return bool(_PORT_RE.fullmatch(raw_port)) and int(raw_port) <= 65535
-
-
-def _is_loopback_authority(raw: str) -> bool:
-    """Validate one raw HTTP authority (``host`` or ``host:port``) as strictly loopback."""
-    if not raw or any(ord(ch) <= 0x20 or ord(ch) >= 0x7F or ch in "/?#@\\%" for ch in raw):
-        return False
-    if raw.startswith("["):
-        end_bracket = raw.find("]")
-        if end_bracket <= 1:
-            return False
-        host_part = raw[1:end_bracket]
-        rest = raw[end_bracket + 1 :]
-        if rest and (not rest.startswith(":") or not _valid_port(rest[1:])):
-            return False
-        try:
-            address = ipaddress.IPv6Address(host_part)
-        except ValueError:
-            return False
-        if address.scope_id is not None:
-            return False
-        return _is_loopback_ip(address)
-
-    if "]" in raw:
-        return False
-    if ":" in raw:
-        host_part, sep, port_part = raw.partition(":")
-        if not sep or ":" in port_part or not _valid_port(port_part):
-            return False
-    else:
-        host_part = raw
-
-    if host_part.lower() == "localhost":
-        return True
-    try:
-        ipv4 = ipaddress.IPv4Address(host_part)
-    except ValueError:
-        return False
-    return _is_loopback_ip(ipv4)
-
-
-def _host_is_allowed(request: Request) -> bool:
-    """Require exactly one valid loopback Host header (never rely on Starlette's server fallback)."""
-    hosts = request.headers.getlist("host")
-    if len(hosts) != 1:
-        return False
-    return _is_loopback_authority(hosts[0])
-
-
-def _origin_is_allowed(request: Request) -> bool:
-    """Allow requests with no Origin header or a single strict loopback http(s) Origin."""
-    origins = request.headers.getlist("origin")
-    if not origins:
-        return True
-    if len(origins) != 1:
-        return False
-    match = _ORIGIN_SCHEME_RE.fullmatch(origins[0])
-    if match is None:
-        return False
-    return _is_loopback_authority(match.group(1))
-
-
-def _request_is_allowed(request: Request) -> bool:
-    return _direct_loopback_peer(request) and _host_is_allowed(request) and _origin_is_allowed(request)
 
 
 def _is_private_repo(repo: FleetRepo) -> bool:
@@ -396,8 +320,9 @@ def get_journal(
     offset: str | None = Query(default=None),
 ) -> JSONResponse:
     """Read newest-first project journal entries via the configured driver-state CLI."""
-    if not _request_is_allowed(request):
-        return JSONResponse(status_code=403, content={"detail": "Forbidden"}, headers=_NO_STORE_HEADERS)
+    refusal = local_body_read_refusal_response(request)
+    if refusal is not None:
+        return refusal
 
     for param_name in ("project", "type", "since", "after_id", "limit", "offset"):
         if len(request.query_params.getlist(param_name)) > 1:

@@ -10,6 +10,7 @@ import importlib.util
 import inspect
 import ipaddress
 import json
+import math
 import os
 import re
 import sqlite3
@@ -50,12 +51,14 @@ from lu_machinery.lib.readonly_sqlite import SQLiteConnection, import_named_modu
 from lu_machinery.orchestration import codex_transport_health, dispatch_admission
 from lu_machinery.orchestration.dead_worker_state import worker_liveness
 from lu_machinery.review.model_catalog import VALID_CODEX_EFFORTS, canonical_model_id, load_model_catalog
+from lu_machinery.secret_redactor import REDACTION, redact_text, redact_value
 
 from . import account_logins, panel_values, subscriptions
 from . import delegate_router as delegate_api
 from .model_stats_rows import current_catalog_model_ids
 from .monitor_context import MonitorContext, get_ctx, resolve_context
 from .monitor_context import production_context as production_context  # re-export: test monkeypatches
+from .opsec_sanitize import sanitize_document, sanitize_text
 from .state_helpers import cache_get_stored, cache_read_swr, ctx_cache_scope, swr_route
 
 router = APIRouter(tags=["runtime"])
@@ -126,18 +129,29 @@ _ACP_MESSAGE_EVENTS = frozenset({
     "SYNTHESIS_TERMINAL",
 })
 _ACP_TRANSCRIPT_KINDS = frozenset({"request", "reply", "synthesis"})
+_ACP_TRANSCRIPT_AUTHORITY_PRODUCERS = frozenset({"authority-message"})
 _ACP_TRANSCRIPT_MAX_MESSAGES = 32
 _ACP_TRANSCRIPT_MAX_BODY_BYTES = 256 * 1024
 _ACP_TRANSCRIPT_MAX_RESPONSE_BYTES = 512 * 1024
+_ACP_TRANSCRIPT_SQLITE_TIMEOUT_S = 0.5
+_ACP_TRANSCRIPT_MAX_CONCURRENCY = 4
+_ACP_TRANSCRIPT_JSON_REDACT_MAX_DEPTH = 4
+_ACP_TRANSCRIPT_JSON_REDACT_MAX_CONTAINER_DEPTH = 64
+# JSON whitespace (RFC 8259 section 2), not str.strip()'s Unicode whitespace.
+_ACP_JSON_WHITESPACE = " \t\n\r"
+_ACP_TRANSCRIPT_CONCURRENCY_LOCK = Lock()
+_ACP_TRANSCRIPT_ACTIVE_READS = 0
 _ACP_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _ACP_TRANSCRIPT_STATE_OK = "ok"
 _ACP_TRANSCRIPT_STATE_BODY_EXPIRED = "body_expired"
+_ACP_TRANSCRIPT_STATE_WITHHELD = "withheld"
 _ACP_TRANSCRIPT_STATE_MISSING_OR_CORRUPT = "missing_or_corrupt"
 _ACP_TRANSCRIPT_STATE_BACKEND_UNAVAILABLE = "backend_unavailable"
 _ACP_TRANSCRIPT_STATE_OVERSIZED_OR_PARTIAL = "oversized_or_partial"
 _ACP_TRANSCRIPT_STATE_LABELS: dict[str, str] = {
     _ACP_TRANSCRIPT_STATE_OK: "ok",
     _ACP_TRANSCRIPT_STATE_BODY_EXPIRED: "body expired",
+    _ACP_TRANSCRIPT_STATE_WITHHELD: "withheld",
     _ACP_TRANSCRIPT_STATE_MISSING_OR_CORRUPT: "missing or corrupt",
     _ACP_TRANSCRIPT_STATE_BACKEND_UNAVAILABLE: "backend unavailable",
     _ACP_TRANSCRIPT_STATE_OVERSIZED_OR_PARTIAL: "oversized or partial",
@@ -1499,8 +1513,8 @@ def _bound_acp_listener(request: Request) -> tuple[str, str] | None:
     return authority, f"http://{authority}"
 
 
-def _acp_transcript_access_refusal(request: Request) -> str | None:
-    """Return a typed refusal reason when the request violates the local-listener boundary.
+def local_body_read_access_refusal(request: Request) -> str | None:
+    """Shared guard for all body-bearing Monitor routes; returns a typed refusal reason or ``None``.
 
     Returns ``None`` only when:
     - the bound ASGI listener in ``scope["server"]`` is a valid loopback HTTP listener,
@@ -1551,6 +1565,221 @@ def _acp_transcript_access_refusal(request: Request) -> str | None:
     if len(fetch_sites) > 1 or (len(fetch_sites) == 1 and fetch_sites[0] not in _ACP_TRANSCRIPT_ALLOWED_FETCH_SITES):
         return "cross_site_request"
     return None
+
+
+def local_body_read_refusal_response(request: Request) -> JSONResponse | None:
+    """Return a ``no-store`` HTTP 403 refusal response from the shared body-read guard, or ``None``."""
+    refusal = local_body_read_access_refusal(request)
+    if refusal is None:
+        return None
+    return JSONResponse(
+        status_code=403,
+        content={"detail": "Forbidden", "reason": refusal},
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+# Backward-compatible alias for tests and callers; never duplicate the guard implementation.
+_acp_transcript_access_refusal = local_body_read_access_refusal
+
+
+def _try_acquire_acp_transcript_slot() -> bool:
+    """Acquire one transcript concurrency semaphore slot without blocking."""
+    global _ACP_TRANSCRIPT_ACTIVE_READS
+    with _ACP_TRANSCRIPT_CONCURRENCY_LOCK:
+        limit = int(_ACP_TRANSCRIPT_MAX_CONCURRENCY)
+        active = _ACP_TRANSCRIPT_ACTIVE_READS
+        if limit <= 0 or active >= limit:
+            return False
+        _ACP_TRANSCRIPT_ACTIVE_READS = active + 1
+        return True
+
+
+def _release_acp_transcript_slot() -> None:
+    """Release one previously acquired transcript concurrency semaphore slot."""
+    global _ACP_TRANSCRIPT_ACTIVE_READS
+    with _ACP_TRANSCRIPT_CONCURRENCY_LOCK:
+        if _ACP_TRANSCRIPT_ACTIVE_READS > 0:
+            _ACP_TRANSCRIPT_ACTIVE_READS -= 1
+
+
+def _is_sqlite_busy_error(exc: sqlite3.Error) -> bool:
+    message = str(exc).lower()
+    return "locked" in message or "busy" in message
+
+
+def _acp_allowed_producers(allowed_lanes: frozenset[str]) -> frozenset[str]:
+    """Return the exact slice-1 producer allowlist: ``acpx-discuss:<lane>`` and ``authority-message``."""
+    return frozenset({*(f"acpx-discuss:{lane}" for lane in allowed_lanes), *_ACP_TRANSCRIPT_AUTHORITY_PRODUCERS})
+
+
+class _AcpRedactionDepthExceeded(Exception):
+    """Structured body exceeded redaction container or nested-JSON depth bounds."""
+
+
+class _AcpBodyEncodingError(Exception):
+    """Structured body could not be safely re-serialized or UTF-8 encoded after redaction."""
+
+
+_ACP_JSON_FLOAT_RE = re.compile(
+    r"^-?(?:0|[1-9][0-9]*)(?:\.[0-9]+(?:[eE][+-]?[0-9]+)?|[eE][+-]?[0-9]+)$"
+)
+
+
+def _redact_and_sanitize_plain_text(value: str) -> str:
+    """Run server-side ``redact_text`` then ``sanitize_text`` on plain text (IDs, labels, prose)."""
+    redacted = redact_text(value)
+    return sanitize_text("" if redacted is None else redacted)
+
+
+def _is_redacted_json_key(key: str) -> bool:
+    """Return True iff ``secret_redactor.redact_value`` classifies ``key`` as a secret key."""
+    return bool(redact_value({key: None}).get(key) == REDACTION)
+
+
+class _AcpJsonObject(list):
+    """Every member of one decoded JSON object as ``(key, value)`` pairs, in order, duplicates kept.
+
+    Redaction validates every member, including one that a secret key or a later duplicate key
+    discards, before it builds the served object.
+    """
+
+
+def _acp_json_too_deep(value: Any, max_depth: int) -> bool:
+    """True when objects and arrays in ``value`` nest past ``max_depth``, counting every member."""
+    pending: list[tuple[Any, int]] = [(value, 1)]
+    while pending:
+        item, level = pending.pop()
+        if isinstance(item, _AcpJsonObject):
+            children = [member for _, member in item]
+        elif isinstance(item, list):
+            children = item
+        else:
+            continue
+        if level > max_depth:
+            return True
+        pending.extend((child, level + 1) for child in children)
+    return False
+
+
+def _redact_and_sanitize_json_value(value: Any, *, depth: int) -> Any:
+    """Recursively redact and path-sanitize JSON containers and leaves, including nested JSON strings."""
+    if isinstance(value, str):
+        return _redact_and_sanitize_text(value, _depth=depth + 1)
+    if isinstance(value, _AcpJsonObject):
+        cleaned: dict[str, Any] = {}
+        served_keys: dict[str, str] = {}
+        next_suffix: dict[str, int] = {}
+        for raw_key, item in value:
+            cleaned_key = _redact_and_sanitize_text(raw_key, _depth=depth + 1)
+            # Validate every member before a secret key or a later duplicate key discards it.
+            cleaned_item = _redact_and_sanitize_json_value(item, depth=depth)
+            if _is_redacted_json_key(raw_key) or _is_redacted_json_key(cleaned_key):
+                cleaned_item = REDACTION
+            served_key = served_keys.get(raw_key)
+            if served_key is None:
+                # Distinct keys that redact to the same text keep distinct members: "#2", "#3", ...
+                # Each cleaned key resumes from its next free suffix, so collisions cost linear time.
+                served_key, suffix = cleaned_key, next_suffix.get(cleaned_key, 2)
+                while served_key in cleaned:
+                    served_key, suffix = f"{cleaned_key}#{suffix}", suffix + 1
+                next_suffix[cleaned_key] = suffix
+                served_keys[raw_key] = served_key
+            cleaned[served_key] = cleaned_item  # a repeated raw key keeps JSON's last-member value
+        return cleaned
+    if isinstance(value, list):
+        return [_redact_and_sanitize_json_value(item, depth=depth) for item in value]
+    return value
+
+
+def _redact_and_sanitize_text(value: str, *, _depth: int = 0) -> str:
+    """Run server-side ``redact_text`` then ``sanitize_text`` (secrets and filesystem paths only).
+
+    Classification: only text that is one complete JSON object, array or string (after JSON
+    whitespace) takes the structured path; every other text, whatever it starts with, takes the
+    plain-text path. A standalone JSON number or constant is the one exception: a non-finite one
+    (``NaN``, ``Infinity``, ``1e309``) raises ``_AcpBodyEncodingError``, and a finite one, including
+    an integer of any length, stays plain text.
+
+    The structured path decodes objects, arrays and JSON-string wrappers recursively across string
+    leaves and object keys up to ``_ACP_TRANSCRIPT_JSON_REDACT_MAX_DEPTH``, redacts them
+    structurally (``secret_redactor`` key/text rules and ``opsec_sanitize``), and re-serializes them
+    so JSON delimiters are preserved and JSON escapes cannot conceal secrets or paths. The parser's
+    number hooks never raise, so a syntax error always reaches ``JSONDecodeError`` and the plain-text
+    path. A parsed document fails closed: container depth above 64 or nested-JSON depth above the cap
+    raises ``_AcpRedactionDepthExceeded``; a non-finite number or an integer too long to convert,
+    anywhere in it (including under redacted or overwritten duplicate keys), and a decoded lone
+    surrogate raise ``_AcpBodyEncodingError``. Text nested more than ``json_depth.MAX_DEPTH_CEILING``
+    levels before its first syntax error cannot be classified by the bounded parser and raises
+    ``_AcpRedactionDepthExceeded``. Every member of a parsed object is validated, including one a
+    secret key or a later duplicate key discards, and distinct keys that redact to the same text
+    are served as distinct members. Any text containing a lone surrogate, at any level, raises
+    ``_AcpBodyEncodingError``.
+    """
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        raise _AcpBodyEncodingError() from None
+    stripped = value.strip(_ACP_JSON_WHITESPACE)
+    if stripped in {"NaN", "Infinity", "-Infinity"} or (
+        stripped and _ACP_JSON_FLOAT_RE.fullmatch(stripped) is not None
+    ):
+        if not math.isfinite(float(stripped)):
+            raise _AcpBodyEncodingError()
+        return _redact_and_sanitize_plain_text(value)
+    if stripped and stripped[0] in '{["':
+        saw_unconvertible_number = False
+
+        def _parse_json_float(raw: str) -> float:
+            nonlocal saw_unconvertible_number
+            number = float(raw)
+            if not math.isfinite(number):
+                saw_unconvertible_number = True
+            return number
+
+        def _parse_json_int(raw: str) -> int:
+            nonlocal saw_unconvertible_number
+            try:
+                return int(raw)
+            except ValueError:  # longer than sys.get_int_max_str_digits()
+                saw_unconvertible_number = True
+                return 0
+
+        def _parse_json_constant(_raw: str) -> float:
+            nonlocal saw_unconvertible_number
+            saw_unconvertible_number = True
+            return 0.0
+
+        try:
+            parsed = json_depth.loads(
+                stripped,
+                max_depth=json_depth.MAX_DEPTH_CEILING,
+                parse_float=_parse_json_float,
+                parse_int=_parse_json_int,
+                parse_constant=_parse_json_constant,
+                object_pairs_hook=_AcpJsonObject,
+            )
+        except RecursionError:
+            raise _AcpRedactionDepthExceeded() from None
+        except json.JSONDecodeError:
+            return _redact_and_sanitize_plain_text(value)
+        except (TypeError, ValueError):
+            raise _AcpBodyEncodingError() from None
+        if _acp_json_too_deep(parsed, _ACP_TRANSCRIPT_JSON_REDACT_MAX_CONTAINER_DEPTH):
+            raise _AcpRedactionDepthExceeded()
+        if saw_unconvertible_number:
+            raise _AcpBodyEncodingError()
+        if _depth >= _ACP_TRANSCRIPT_JSON_REDACT_MAX_DEPTH:
+            raise _AcpRedactionDepthExceeded()
+        try:
+            cleaned = sanitize_document(_redact_and_sanitize_json_value(parsed, depth=_depth))
+            serialized = json.dumps(cleaned, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
+        except RecursionError:
+            raise _AcpRedactionDepthExceeded() from None
+        except (TypeError, ValueError):
+            raise _AcpBodyEncodingError() from None
+        return serialized
+    return _redact_and_sanitize_plain_text(value)
 
 
 class _AcpBackendUnavailable(Exception):
@@ -1607,10 +1836,15 @@ def _open_acp_transcript_store(ctx: MonitorContext) -> tuple[Path, SQLiteConnect
     try:
         if not db_path.is_file():
             raise _AcpBackendUnavailable("store_unavailable")
-        connection = cast(SQLiteConnection, open_readonly(db_path))
+        connection = cast(
+            SQLiteConnection,
+            open_readonly(db_path, timeout=_ACP_TRANSCRIPT_SQLITE_TIMEOUT_S),
+        )
     except _AcpBackendUnavailable:
         raise
-    except (OSError, sqlite3.Error, RuntimeError, ValueError):
+    except sqlite3.Error as exc:
+        raise _AcpBackendUnavailable("store_busy" if _is_sqlite_busy_error(exc) else "store_unavailable") from None
+    except (OSError, RuntimeError, ValueError):
         raise _AcpBackendUnavailable("store_unavailable") from None
     connection.row_factory = sqlite3.Row
     try:
@@ -1624,9 +1858,9 @@ def _open_acp_transcript_store(ctx: MonitorContext) -> tuple[Path, SQLiteConnect
                 "message_artifacts",
             )
         )
-    except sqlite3.Error:
+    except sqlite3.Error as exc:
         connection.close()
-        raise _AcpBackendUnavailable("store_unavailable") from None
+        raise _AcpBackendUnavailable("store_busy" if _is_sqlite_busy_error(exc) else "store_unavailable") from None
     if not has_tables:
         connection.close()
         raise _AcpBackendUnavailable("schema_unavailable")
@@ -1723,28 +1957,17 @@ def _acp_digest_is_expired(connection: SQLiteConnection, sha256_lower: str) -> b
     )
 
 
-def _acp_transcript_inline_body(
-    value: Any,
-    *,
-    content_sha256: Any,
-) -> tuple[str, str | None, str | None, str | None]:
-    """Validate a legacy inline-only ACP body and return ``(state, reason, body, sha256)``."""
+def _acp_inline_body_digest(value: Any) -> str | None:
+    """Compute SHA-256 of an inline string solely for expired-digest detection; never serves inline text."""
     if not isinstance(value, str):
-        return _ACP_TRANSCRIPT_STATE_MISSING_OR_CORRUPT, "body_missing", None, None
+        return None
     try:
         encoded = value.encode("utf-8")
-        _acp_json_bytes(value)
-    except (UnicodeError, ValueError):
-        return _ACP_TRANSCRIPT_STATE_MISSING_OR_CORRUPT, "body_not_utf8", None, None
-    computed_sha256 = hashlib.sha256(encoded).hexdigest()
-    if content_sha256 is not None:
-        if not isinstance(content_sha256, str) or not _ACP_SHA256_RE.fullmatch(content_sha256.lower()):
-            return _ACP_TRANSCRIPT_STATE_MISSING_OR_CORRUPT, "content_digest_mismatch", None, None
-        if computed_sha256 != content_sha256.lower():
-            return _ACP_TRANSCRIPT_STATE_MISSING_OR_CORRUPT, "content_digest_mismatch", None, None
+    except UnicodeError:
+        return None
     if len(encoded) > _ACP_TRANSCRIPT_MAX_BODY_BYTES:
-        return _ACP_TRANSCRIPT_STATE_OVERSIZED_OR_PARTIAL, "body_too_large", None, computed_sha256
-    return _ACP_TRANSCRIPT_STATE_OK, None, value, computed_sha256
+        return None
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def _read_acp_artifact_body(
@@ -1753,10 +1976,11 @@ def _read_acp_artifact_body(
     artifact_id: str,
     *,
     content_sha256: Any,
+    allowed_producers: frozenset[str],
 ) -> tuple[str, str | None, str | None, str | None]:
-    """Read an integrity-checked CAS body, withholding expired blobs and handling the mark/unlink race."""
+    """Read an allowlisted, integrity-checked, redacted CAS body, withholding off-list or expired blobs."""
     artifact_row = connection.execute(
-        "SELECT sha256, bytes, retention_class FROM artifacts WHERE artifact_id = ?",
+        "SELECT sha256, bytes, producer, retention_class FROM artifacts WHERE artifact_id = ?",
         (artifact_id,),
     ).fetchone()
     if artifact_row is None:
@@ -1765,6 +1989,13 @@ def _read_acp_artifact_body(
     retention_class = artifact_row["retention_class"]
     if not isinstance(retention_class, str):
         return _ACP_TRANSCRIPT_STATE_MISSING_OR_CORRUPT, "artifact_metadata_corrupt", None, None
+
+    producer = artifact_row["producer"]
+    if not isinstance(producer, str):
+        return _ACP_TRANSCRIPT_STATE_MISSING_OR_CORRUPT, "artifact_metadata_corrupt", None, None
+    if producer not in allowed_producers:
+        return _ACP_TRANSCRIPT_STATE_WITHHELD, "producer_not_allowlisted", None, None
+
     if retention_class.startswith(RETENTION_EXPIRED_PREFIX):
         return _ACP_TRANSCRIPT_STATE_BODY_EXPIRED, "body_expired", None, None
 
@@ -1825,7 +2056,17 @@ def _read_acp_artifact_body(
         _acp_json_bytes(text)
     except (UnicodeError, ValueError):
         return _ACP_TRANSCRIPT_STATE_MISSING_OR_CORRUPT, "body_not_utf8", None, sha256
-    return _ACP_TRANSCRIPT_STATE_OK, None, text, sha256
+    try:
+        redacted_text = _redact_and_sanitize_text(text)
+        redacted_bytes = redacted_text.encode("utf-8")
+        _acp_json_bytes(redacted_text)
+    except _AcpRedactionDepthExceeded:
+        return _ACP_TRANSCRIPT_STATE_WITHHELD, "redaction_depth_exceeded", None, sha256
+    except (_AcpBodyEncodingError, TypeError, ValueError, UnicodeError):
+        return _ACP_TRANSCRIPT_STATE_MISSING_OR_CORRUPT, "body_redaction_failed", None, sha256
+    if len(redacted_bytes) > _ACP_TRANSCRIPT_MAX_BODY_BYTES:
+        return _ACP_TRANSCRIPT_STATE_OVERSIZED_OR_PARTIAL, "body_too_large", None, sha256
+    return _ACP_TRANSCRIPT_STATE_OK, None, redacted_text, sha256
 
 
 def _acp_transcript_payload(
@@ -1837,9 +2078,9 @@ def _acp_transcript_payload(
     """Assemble one HTTP 200 ACP transcript payload with its derived top-level state."""
     transcript_state, transcript_reason = _acp_transcript_summary_state(entries, truncated=truncated)
     return {
-        "conversation_id": conversation_id,
+        "conversation_id": _redact_and_sanitize_plain_text(conversation_id),
         "state": transcript_state,
-        "label": _ACP_TRANSCRIPT_STATE_LABELS[transcript_state],
+        "label": _redact_and_sanitize_plain_text(_ACP_TRANSCRIPT_STATE_LABELS[transcript_state]),
         "reason": transcript_reason,
         "truncated": truncated,
         "messages": entries,
@@ -1852,8 +2093,17 @@ def _acp_transcript_entries(
     conversation_id: str,
     participants: tuple[str, ...],
 ) -> tuple[list[dict[str, Any]], bool]:
-    """Read a bounded, allowlisted ACP transcript with an explicit state for every turn.
+    """Read a bounded, allowlisted, redacted ACP transcript with an explicit state for every turn.
 
+    Turns: every ``comms_messages`` row of the conversation in insertion order, whether or not an
+    event links it, then each event-linked message id with no row in the conversation (served as
+    ``message_row_missing``); events supply the round where they link a turn.
+    Row-count cap (``_ACP_TRANSCRIPT_MAX_MESSAGES``, 32): checked in SQL before joining or
+    materializing message rows, with ``LIMIT`` enforced inside the ``page`` CTE.
+    Producer/kind allowlist: only ``acpx-discuss:<lane>`` and ``authority-message`` artifacts
+    with exact kind in ``{request, reply, synthesis}`` are served; off-list turns are withheld
+    with a typed reason. Every allowed body and label passes through ``redact_text`` then
+    ``sanitize_text`` before post-redaction body/response caps and serialization.
     Response-cap contract (``_ACP_TRANSCRIPT_MAX_RESPONSE_BYTES``, 512 KiB): after finalizing
     retention over all candidate turns in one snapshot, if the all-``ok`` serialized HTTP
     response exceeds the cap, reserve for every not-yet-decided surviving turn the size of its
@@ -1864,55 +2114,118 @@ def _acp_transcript_entries(
     otherwise mark it ``oversized_or_partial`` (``reason="response_budget_exceeded"``,
     ``body=None``). No turn is dropped and the serialized response stays within the cap.
     """
-    rows = connection.execute(
-        """
-        SELECT messages.message_id, messages.kind, messages.sender, messages.recipient,
-               messages.body_inline, messages.body_artifact_id, messages.content_sha256,
-               messages.created_at, event_round.round, event_round.round_invalid,
-               event_round.non_synthesis_events
-        FROM (
-            SELECT message_id, MIN(sequence) AS message_sequence,
-                   CASE
-                       WHEN COUNT(round) = 0 THEN NULL
-                       WHEN COUNT(round) = COUNT(*)
-                            AND SUM(CASE WHEN typeof(round) != 'integer' OR round < 1 THEN 1 ELSE 0 END) = 0
-                            AND MIN(round) = MAX(round)
-                       THEN MIN(round)
-                   END AS round,
-                   CASE
-                       WHEN COUNT(round) = 0 THEN 0
-                       WHEN COUNT(round) = COUNT(*)
-                            AND SUM(CASE WHEN typeof(round) != 'integer' OR round < 1 THEN 1 ELSE 0 END) = 0
-                            AND MIN(round) = MAX(round)
-                       THEN 0
-                       ELSE 1
-                   END AS round_invalid,
-                   SUM(
-                       CASE
-                           WHEN typeof(event_type) = 'text'
-                                AND LOWER(REPLACE(TRIM(event_type), '-', '_'))
-                                    IN ('synthesis', 'synthesis_complete', 'synthesis_terminal')
-                           THEN 0
-                           ELSE 1
-                       END
-                   ) AS non_synthesis_events
-            FROM acp_conversation_events
-            WHERE conversation_id = ? AND message_id IS NOT NULL
-            GROUP BY message_id
-        ) AS event_round
-        LEFT JOIN comms_messages AS messages
-               ON messages.message_id = event_round.message_id
-              AND messages.conversation_id = ?
-        ORDER BY event_round.message_sequence ASC
-        LIMIT ?
-        """,
-        (conversation_id, conversation_id, _ACP_TRANSCRIPT_MAX_MESSAGES + 1),
-    ).fetchall()
+    max_messages = max(0, int(_ACP_TRANSCRIPT_MAX_MESSAGES))
+    connection.execute("BEGIN DEFERRED")
+    try:
+        # Turns are every comms_messages row of the conversation, in insertion order (rows are
+        # immutable, so rowid order is persistence order), then every event-linked message id with
+        # no row in this conversation, in event order, served as message_row_missing. Events add
+        # the round where a turn is linked; an unlinked turn has no round.
+        count_row = connection.execute(
+            """
+            SELECT COUNT(*) AS message_count
+            FROM (
+                SELECT message_id FROM comms_messages WHERE conversation_id = ?
+                UNION
+                SELECT message_id FROM acp_conversation_events
+                WHERE conversation_id = ? AND message_id IS NOT NULL
+                LIMIT ?
+            )
+            """,
+            (conversation_id, conversation_id, max_messages + 1),
+        ).fetchone()
+        observed_messages = int(count_row["message_count"]) if count_row is not None else 0
+        truncated = observed_messages > max_messages
 
-    truncated = len(rows) > _ACP_TRANSCRIPT_MAX_MESSAGES
-    rows = rows[:_ACP_TRANSCRIPT_MAX_MESSAGES]
+        rows = (
+            connection.execute(
+                """
+                WITH page AS (
+                    SELECT message_id, orphan, position
+                    FROM (
+                        SELECT message_id, 0 AS orphan, rowid AS position
+                        FROM comms_messages
+                        WHERE conversation_id = ?
+                        UNION ALL
+                        SELECT message_id, 1 AS orphan, MIN(sequence) AS position
+                        FROM acp_conversation_events AS orphan_events
+                        WHERE conversation_id = ? AND message_id IS NOT NULL
+                          AND NOT EXISTS (
+                              SELECT 1 FROM comms_messages AS linked
+                              WHERE linked.message_id = orphan_events.message_id
+                                AND linked.conversation_id = ?
+                          )
+                        GROUP BY message_id
+                    )
+                    ORDER BY orphan ASC, position ASC
+                    LIMIT ?
+                )
+                SELECT messages.message_id, messages.kind, messages.sender, messages.recipient,
+                       CASE
+                           WHEN messages.body_artifact_id IS NULL
+                                AND messages.content_sha256 IS NULL
+                                AND LENGTH(CAST(messages.body_inline AS BLOB)) <= ?
+                           THEN messages.body_inline
+                       END AS body_inline,
+                       messages.body_artifact_id, messages.content_sha256,
+                       messages.created_at, event_round.round, event_round.round_invalid,
+                       event_round.non_synthesis_events,
+                       event_round.message_id IS NOT NULL AS linked
+                FROM page
+                LEFT JOIN comms_messages AS messages
+                       ON messages.message_id = page.message_id
+                      AND messages.conversation_id = ?
+                LEFT JOIN (
+                    SELECT message_id,
+                           CASE
+                               WHEN COUNT(round) = 0 THEN NULL
+                               WHEN COUNT(round) = COUNT(*)
+                                    AND SUM(CASE WHEN typeof(round) != 'integer' OR round < 1 THEN 1 ELSE 0 END) = 0
+                                    AND MIN(round) = MAX(round)
+                               THEN MIN(round)
+                           END AS round,
+                           CASE
+                               WHEN COUNT(round) = 0 THEN 0
+                               WHEN COUNT(round) = COUNT(*)
+                                    AND SUM(CASE WHEN typeof(round) != 'integer' OR round < 1 THEN 1 ELSE 0 END) = 0
+                                    AND MIN(round) = MAX(round)
+                               THEN 0
+                               ELSE 1
+                           END AS round_invalid,
+                           SUM(
+                               CASE
+                                   WHEN typeof(event_type) = 'text'
+                                        AND LOWER(REPLACE(TRIM(event_type), '-', '_'))
+                                            IN ('synthesis', 'synthesis_complete', 'synthesis_terminal')
+                                   THEN 0
+                                   ELSE 1
+                               END
+                           ) AS non_synthesis_events
+                    FROM acp_conversation_events
+                    WHERE conversation_id = ? AND message_id IN (SELECT message_id FROM page)
+                    GROUP BY message_id
+                ) AS event_round
+                       ON event_round.message_id = page.message_id
+                ORDER BY page.orphan ASC, page.position ASC
+                """,
+                (
+                    conversation_id,
+                    conversation_id,
+                    conversation_id,
+                    max_messages,
+                    _ACP_TRANSCRIPT_MAX_BODY_BYTES,
+                    conversation_id,
+                    conversation_id,
+                ),
+            ).fetchall()
+            if max_messages > 0
+            else []
+        )
+    finally:
+        connection.rollback()
 
     allowed_lanes = frozenset({"root", "codex", *participants})
+    allowed_producers = _acp_allowed_producers(allowed_lanes)
 
     entries: list[dict[str, Any]] = []
     candidates: list[tuple[int, str, str | None, str | None]] = []
@@ -1931,15 +2244,38 @@ def _acp_transcript_entries(
             reason: str | None = "message_row_missing"
             body: str | None = None
         else:
-            kind = _acp_text(row["kind"], allowed=_ACP_TRANSCRIPT_KINDS)
-            sender = _acp_text(row["sender"], allowed=allowed_lanes)
-            recipient = _acp_text(row["recipient"], allowed=allowed_lanes)
+            raw_kind = row["kind"]
+            kind_malformed = not isinstance(raw_kind, str) or not raw_kind
+            kind_off_allowlist = not kind_malformed and raw_kind not in _ACP_TRANSCRIPT_KINDS
+            kind = None if (kind_malformed or kind_off_allowlist) else _redact_and_sanitize_plain_text(raw_kind)
+
+            raw_sender = row["sender"]
+            sender = (
+                _redact_and_sanitize_plain_text(raw_sender)
+                if isinstance(raw_sender, str) and raw_sender in allowed_lanes
+                else None
+            )
+            raw_recipient = row["recipient"]
+            recipient = (
+                _redact_and_sanitize_plain_text(raw_recipient)
+                if isinstance(raw_recipient, str) and raw_recipient in allowed_lanes
+                else None
+            )
             created_at = _acp_timestamp(row["created_at"])
-            if round_number is None and (non_synthesis_events > 0 or kind != "synthesis"):
+            if (
+                row["linked"]
+                and round_number is None
+                and not kind_off_allowlist
+                and (non_synthesis_events > 0 or kind != "synthesis")
+            ):
                 round_invalid = True
-            if round_invalid or None in (kind, sender, recipient, created_at):
+            if round_invalid or kind_malformed or None in (sender, recipient, created_at):
                 state = _ACP_TRANSCRIPT_STATE_MISSING_OR_CORRUPT
                 reason = "malformed_turn_metadata"
+                body = None
+            elif kind_off_allowlist:
+                state = _ACP_TRANSCRIPT_STATE_WITHHELD
+                reason = "kind_not_allowlisted"
                 body = None
             else:
                 raw_artifact_id = row["body_artifact_id"]
@@ -1979,29 +2315,28 @@ def _acp_transcript_entries(
                         plane_root,
                         artifact_id,
                         content_sha256=row["content_sha256"],
+                        allowed_producers=allowed_producers,
                     )
                     if artifact_sha256 is not None:
                         digest_lower = artifact_sha256
-                elif digest_lower is not None and _acp_digest_is_expired(connection, digest_lower):
-                    state = _ACP_TRANSCRIPT_STATE_BODY_EXPIRED
-                    reason = "body_expired"
-                    body = None
                 else:
-                    state, reason, body, inline_sha256 = _acp_transcript_inline_body(
-                        row["body_inline"],
-                        content_sha256=row["content_sha256"],
-                    )
-                    if inline_sha256 is not None:
-                        digest_lower = inline_sha256
-                        if _acp_digest_is_expired(connection, inline_sha256):
-                            state = _ACP_TRANSCRIPT_STATE_BODY_EXPIRED
-                            reason = "body_expired"
-                            body = None
+                    # Inline-only rows without an artifact have no verified producer: detect
+                    # expired shared digests first, otherwise withhold with a typed reason.
+                    if digest_lower is None:
+                        digest_lower = _acp_inline_body_digest(row["body_inline"])
+                    if digest_lower is not None and _acp_digest_is_expired(connection, digest_lower):
+                        state = _ACP_TRANSCRIPT_STATE_BODY_EXPIRED
+                        reason = "body_expired"
+                        body = None
+                    else:
+                        state = _ACP_TRANSCRIPT_STATE_WITHHELD
+                        reason = "producer_not_allowlisted"
+                        body = None
 
         entry: dict[str, Any] = {
             "ordinal": index,
             "state": state,
-            "label": _ACP_TRANSCRIPT_STATE_LABELS[state],
+            "label": _redact_and_sanitize_plain_text(_ACP_TRANSCRIPT_STATE_LABELS[state]),
             "reason": reason,
             "kind": kind,
             "sender": sender,
@@ -2015,9 +2350,8 @@ def _acp_transcript_entries(
         if state == _ACP_TRANSCRIPT_STATE_OK and body is not None:
             candidates.append((len(entries) - 1, body, artifact_id, digest_lower))
 
-    # Recheck retention for ALL candidate turns (both CAS artifact IDs and inline digests,
-    # including legacy inline rows whose digest was derived from validated UTF-8 bytes) in ONE
-    # single SQLite SELECT snapshot after the last blob read finishes, BEFORE response budgeting.
+    # Recheck retention for ALL candidate turns in ONE single SQLite SELECT snapshot after the
+    # last blob read finishes, BEFORE response budgeting.
     surviving: list[tuple[int, str]] = []
     if candidates:
         art_ids = sorted({art_id for _, _, art_id, _ in candidates if art_id is not None})
@@ -2048,7 +2382,9 @@ def _acp_transcript_entries(
                 digest_lower is not None and digest_lower in expired_digests
             ):
                 entries[entry_idx]["state"] = _ACP_TRANSCRIPT_STATE_BODY_EXPIRED
-                entries[entry_idx]["label"] = _ACP_TRANSCRIPT_STATE_LABELS[_ACP_TRANSCRIPT_STATE_BODY_EXPIRED]
+                entries[entry_idx]["label"] = _redact_and_sanitize_plain_text(
+                    _ACP_TRANSCRIPT_STATE_LABELS[_ACP_TRANSCRIPT_STATE_BODY_EXPIRED]
+                )
                 entries[entry_idx]["reason"] = "body_expired"
                 entries[entry_idx]["body"] = None
             else:
@@ -2060,16 +2396,20 @@ def _acp_transcript_entries(
     if surviving and len(
         _acp_json_bytes(_acp_transcript_payload(conversation_id, entries, truncated=truncated))
     ) > _ACP_TRANSCRIPT_MAX_RESPONSE_BYTES:
+        oversized_label = _redact_and_sanitize_plain_text(
+            _ACP_TRANSCRIPT_STATE_LABELS[_ACP_TRANSCRIPT_STATE_OVERSIZED_OR_PARTIAL]
+        )
+        ok_label = _redact_and_sanitize_plain_text(_ACP_TRANSCRIPT_STATE_LABELS[_ACP_TRANSCRIPT_STATE_OK])
         for entry_idx, text in surviving:
             entry = entries[entry_idx]
             ok_size = len(_acp_json_bytes(entry))
             entry["state"] = _ACP_TRANSCRIPT_STATE_OVERSIZED_OR_PARTIAL
-            entry["label"] = _ACP_TRANSCRIPT_STATE_LABELS[_ACP_TRANSCRIPT_STATE_OVERSIZED_OR_PARTIAL]
+            entry["label"] = oversized_label
             entry["reason"] = "response_budget_exceeded"
             entry["body"] = None
             if ok_size <= len(_acp_json_bytes(entry)):
                 entry["state"] = _ACP_TRANSCRIPT_STATE_OK
-                entry["label"] = _ACP_TRANSCRIPT_STATE_LABELS[_ACP_TRANSCRIPT_STATE_OK]
+                entry["label"] = ok_label
                 entry["reason"] = None
                 entry["body"] = text
         for entry_idx, text in surviving:
@@ -2077,7 +2417,7 @@ def _acp_transcript_entries(
             if entry["state"] == _ACP_TRANSCRIPT_STATE_OK:
                 continue
             entry["state"] = _ACP_TRANSCRIPT_STATE_OK
-            entry["label"] = _ACP_TRANSCRIPT_STATE_LABELS[_ACP_TRANSCRIPT_STATE_OK]
+            entry["label"] = ok_label
             entry["reason"] = None
             entry["body"] = text
             if (
@@ -2085,9 +2425,7 @@ def _acp_transcript_entries(
                 > _ACP_TRANSCRIPT_MAX_RESPONSE_BYTES
             ):
                 entry["state"] = _ACP_TRANSCRIPT_STATE_OVERSIZED_OR_PARTIAL
-                entry["label"] = _ACP_TRANSCRIPT_STATE_LABELS[
-                    _ACP_TRANSCRIPT_STATE_OVERSIZED_OR_PARTIAL
-                ]
+                entry["label"] = oversized_label
                 entry["reason"] = "response_budget_exceeded"
                 entry["body"] = None
 
@@ -2109,6 +2447,9 @@ def _acp_transcript_summary_state(
         if entry["state"] == _ACP_TRANSCRIPT_STATE_OVERSIZED_OR_PARTIAL:
             return _ACP_TRANSCRIPT_STATE_OVERSIZED_OR_PARTIAL, cast(str, entry["reason"])
     for entry in entries:
+        if entry["state"] == _ACP_TRANSCRIPT_STATE_WITHHELD:
+            return _ACP_TRANSCRIPT_STATE_WITHHELD, cast(str, entry["reason"])
+    for entry in entries:
         if entry["state"] == _ACP_TRANSCRIPT_STATE_BODY_EXPIRED:
             return _ACP_TRANSCRIPT_STATE_BODY_EXPIRED, "body_expired"
     return _ACP_TRANSCRIPT_STATE_OK, None
@@ -2118,9 +2459,11 @@ def _acp_backend_unavailable_response(conversation_id: str | None, reason: str) 
     return (
         503,
         {
-            "conversation_id": conversation_id,
+            "conversation_id": _redact_and_sanitize_plain_text(conversation_id) if conversation_id is not None else None,
             "state": _ACP_TRANSCRIPT_STATE_BACKEND_UNAVAILABLE,
-            "label": _ACP_TRANSCRIPT_STATE_LABELS[_ACP_TRANSCRIPT_STATE_BACKEND_UNAVAILABLE],
+            "label": _redact_and_sanitize_plain_text(
+                _ACP_TRANSCRIPT_STATE_LABELS[_ACP_TRANSCRIPT_STATE_BACKEND_UNAVAILABLE]
+            ),
             "reason": reason,
             "detail": "ACP transcript store unavailable",
         },
@@ -2138,7 +2481,8 @@ def get_acp_conversation_transcript(
         return _acp_backend_unavailable_response(safe_id, exc.reason)
     try:
         if safe_id is None:
-            return 404, {"detail": "Conversation not found", "reason": "invalid_conversation_id"}
+            # 404 is reserved for a valid id that a completed lookup did not find.
+            return 400, {"detail": "Invalid conversation id", "reason": "invalid_conversation_id"}
         conversation = connection.execute(
             "SELECT participants_json FROM acp_conversations WHERE conversation_id = ?", (safe_id,)
         ).fetchone()
@@ -2149,9 +2493,11 @@ def get_acp_conversation_transcript(
             return (
                 200,
                 {
-                    "conversation_id": safe_id,
+                    "conversation_id": _redact_and_sanitize_plain_text(safe_id),
                     "state": _ACP_TRANSCRIPT_STATE_MISSING_OR_CORRUPT,
-                    "label": _ACP_TRANSCRIPT_STATE_LABELS[_ACP_TRANSCRIPT_STATE_MISSING_OR_CORRUPT],
+                    "label": _redact_and_sanitize_plain_text(
+                        _ACP_TRANSCRIPT_STATE_LABELS[_ACP_TRANSCRIPT_STATE_MISSING_OR_CORRUPT]
+                    ),
                     "reason": participant_error or "malformed_participants",
                     "truncated": False,
                     "messages": [],
@@ -2160,8 +2506,10 @@ def get_acp_conversation_transcript(
         entries, truncated = _acp_transcript_entries(connection, plane_root, safe_id, participants)
     except _AcpBackendUnavailable as exc:
         return _acp_backend_unavailable_response(safe_id, exc.reason)
-    except sqlite3.Error:
-        return _acp_backend_unavailable_response(safe_id, "store_query_failed")
+    except sqlite3.Error as exc:
+        return _acp_backend_unavailable_response(
+            safe_id, "store_busy" if _is_sqlite_busy_error(exc) else "store_query_failed"
+        )
     finally:
         connection.close()
 
@@ -2206,16 +2554,24 @@ async def runtime_acp_conversation_transcript(
 ):
     """Read ACP transcript content for the local UI with explicit states; never mutate storage."""
     no_store = {"Cache-Control": "no-store"}
-    refusal = _acp_transcript_access_refusal(request)
-    if refusal is not None:
-        return JSONResponse(
-            status_code=403,
-            content={"detail": "Forbidden", "reason": refusal},
-            headers=no_store,
+    refusal_response = local_body_read_refusal_response(request)
+    if refusal_response is not None:
+        return refusal_response
+    if not _try_acquire_acp_transcript_slot():
+        status_code, payload = _acp_backend_unavailable_response(
+            _acp_identifier(conversation_id), "concurrency_limit_exceeded"
         )
-    status_code, payload = await asyncio.to_thread(
-        get_acp_conversation_transcript, conversation_id, ctx=ctx
-    )
+        return JSONResponse(
+            status_code=status_code,
+            content=payload,
+            headers={**no_store, "Retry-After": "1"},
+        )
+    try:
+        status_code, payload = await asyncio.to_thread(
+            get_acp_conversation_transcript, conversation_id, ctx=ctx
+        )
+    finally:
+        _release_acp_transcript_slot()
     return JSONResponse(status_code=status_code, content=payload, headers=no_store)
 
 

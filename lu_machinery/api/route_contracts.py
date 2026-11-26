@@ -404,15 +404,52 @@ ROUTE_CONTRACTS: tuple[RouteContract, ...] = (
         "keep as the subscriptions view",
     ),
     RouteContract(
+        "/api/runtime/acp/conversations/{conversation_id}/transcript",
+        "exact",
+        "http",
+        "Loopback-only read-only ACP discussion transcript with explicit per-turn and transcript states "
+        "(ok, body_expired, withheld, missing_or_corrupt, oversized_or_partial, backend_unavailable). "
+        "Only allowlisted producers (acpx-discuss:<lane> turns and authority-message ACP turns) and kinds "
+        "(request, reply, synthesis) are served; anything off-allowlist is withheld with a typed reason. "
+        "Every allowed body and label passes through redact_text then sanitize_text server-side before caps "
+        "and serialization; redaction is best-effort for secrets and filesystem paths only (hostnames and "
+        "IP addresses are not redacted). "
+        "Redaction covers plain text and JSON (including JSON nested inside JSON strings up to the depth "
+        "cap); other encodings (base64, URL-encoding, HTML entities, compression) are out of scope. "
+        "Only a body (or nested string) that is one complete JSON object, array or string is redacted "
+        "structurally; any other text, whatever it starts with, is plain text and its JSON escapes are not "
+        "decoded. A standalone finite number stays plain text; a non-finite number, or an integer too long "
+        "to convert anywhere inside structured JSON, is missing_or_corrupt (body_redaction_failed). "
+        "Structured JSON deeper than 64 containers or 4 nested JSON strings, and text nested more than 512 "
+        "levels before its first syntax error, is withheld (redaction_depth_exceeded). "
+        "Turns are every stored message of the conversation in persistence order, whether or not an event "
+        "links it (round shown where an event links it), then any event-linked message id with no stored "
+        "row as missing_or_corrupt (message_row_missing). "
+        "A malformed conversation id is HTTP 400 (invalid_conversation_id); 404 means only a valid id "
+        "that a completed lookup did not find. "
+        "Bounded by raw-body bytes, whole serialized response bytes, SQL "
+        "row count checked before materialization, SQLite busy timeout, and a concurrency semaphore.",
+        "Fleet Comms SQLite store (read-only) and content-addressed body artifacts under blobs/sha256.",
+        "Read live per request; no route cache (Cache-Control: no-store); GET never mutates storage.",
+        ("fleet.html", "operators"),
+        "Uses the shared local body-read access guard (loopback listener, direct loopback peer, exact Host "
+        "and Origin, Sec-Fetch-Site in {same-origin, none}, no Forwarded or X-Forwarded-* headers). "
+        "Body-free timelines stay on /api/runtime/acp/conversations/{conversation_id}.",
+        "medium; redaction covers secrets and filesystem paths only, not hostnames or IP addresses",
+        "keep as the loopback-only ACP transcript reader contract",
+        locality="cluster_authoritative",
+        mutates=False,
+    ),
+    RouteContract(
         "/api/runtime",
         "prefix",
         "http",
         "Agent runtime inventory, usage, ACPX shadow evidence, ACP conversation observability, default-model quota headroom, recent calls, auth mode, and cached transport health.",
         "Runtime config, usage JSONL, the fleet-comms ACP SQLite store, sanitized probe receipt, environment presence booleans, and OAuth credential presence.",
-        "Logins uses one request-triggered background snapshot, a 600-second refresh interval and a 900-second display bound allowing probe and page timing. The ACP conversation list is served stale-while-revalidate (state_helpers.swr_route): the last value at once with its true age in X-Snapshot-Age-S, per limit, refreshed after 15 s. Other routes read live files/env/SQLite. ACPX is aggregate evidence only and never launches a probe; ACP transcripts require a direct loopback peer and host and are no-store; transport health carries receipt expiry; auth reports booleans/source names only.",
-        ("index.html", "subscriptions.html", "agents"),
+        "Logins uses one request-triggered background snapshot, a 600-second refresh interval and a 900-second display bound allowing probe and page timing. The ACP conversation list is served stale-while-revalidate (state_helpers.swr_route): the last value at once with its true age in X-Snapshot-Age-S, per limit, refreshed after 15 s. Other routes read live files/env/SQLite. ACPX is aggregate evidence only and never launches a probe; ACP transcripts use the exact transcript contract (loopback-only, no-store, secrets-and-paths redaction only); transport health carries receipt expiry; auth reports booleans/source names only.",
+        ("index.html", "subscriptions.html", "fleet.html", "agents"),
         "Usage complements /api/state/routing-budget and cost endpoints.",
-        "medium; transcript bodies are restricted to the local conversation reader",
+        "medium; transcript bodies are restricted to the local conversation reader with secrets-and-paths redaction only",
         "keep",
         locality="mixed",
     ),
@@ -543,7 +580,7 @@ ROUTE_CONTRACTS: tuple[RouteContract, ...] = (
         "Read live per request with bounded timeout; no route cache (Cache-Control: no-store). Unavailable CLI, DB, or invalid CLI payload returns typed availability with entries [] and total null.",
         ("journal.html", "operators"),
         "Complements Fleet Comms deliveries and driver-state handoffs with an append-only plain-English project log.",
-        "low; loopback peer and loopback-or-absent Origin required, read-only, no-store",
+        "low; uses the shared local body-read guard (loopback listener and peer, exact Host/Origin, Sec-Fetch-Site in {same-origin, none}, no Forwarded/X-Forwarded-* headers), read-only, no-store",
         "keep as the local journal read contract",
         locality="cluster_authoritative",
         mutates=False,
@@ -812,14 +849,19 @@ PAGE_CONTRACTS: tuple[PageContract, ...] = (
     PageContract(
         "fleet.html",
         "/fleet",
-        "Fleet: live agent workers with optional open-PR status, recently finished dispatches and unfinished-record attention list, Fleet Comms store/queue/failure metrics, and a seven-day token summary.",
-        "GET /api/delegate/active, /api/delegate/recent, /api/comms/v1/metrics, "
-        "/api/fleet/model-stats?window=7d&view=tokens and optional /api/git/pull-requests.",
-        "HTTP reads every 30 seconds. Each panel paints independently and shows its source age and freshness bound. "
-        "The token line shares the Model Stats cache.",
+        "Fleet: live agent workers with optional open-PR status, recently finished dispatches and unfinished-record "
+        "attention list, Fleet Comms store/queue/failure metrics, seats and deliveries, a seven-day token summary, "
+        "and an on-demand Discussions panel for reading loopback-only ACP discussion transcripts with best-effort "
+        "secrets-and-paths redaction only.",
+        "GET /api/delegate/active, /api/delegate/recent, /api/comms/v1/metrics, /api/fleet/seats, "
+        "/api/fleet/deliveries, /api/fleet/model-stats?window=7d&view=tokens, optional /api/git/pull-requests, "
+        "and on-demand /api/fleet/acp/conversations plus /api/runtime/acp/conversations/{conversation_id}/transcript.",
+        "HTTP reads every 30 seconds for live panels. Discussions stays closed on load and polling makes zero "
+        "transcript requests; the conversation list loads when opened and one transcript loads on selection "
+        "(Cache-Control: no-store, textContent rendering).",
         ("humans", "operators"),
-        "Combines live agent dispatch activity and Fleet Comms metrics on one area page.",
-        "medium if a stale reading is read as current",
+        "Combines live agent dispatch activity, Fleet Comms metrics, and on-demand ACP transcript reading on one area page.",
+        "medium if a stale reading is read as current; transcript redaction covers secrets and filesystem paths only",
         "keep",
         label="Fleet & comms",
     ),
