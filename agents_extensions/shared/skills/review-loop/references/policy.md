@@ -67,9 +67,17 @@ Critical and high risk take Sol, Opus or Gemini 4 Neon High (NEON-SOLTIER-1120).
   findings. A factual language error in learner-facing Ukrainian is a real defect.
 - Tag each finding New or Pre-existing. A pre-existing defect outside the frozen obligation
   blocks only when the PR exposes or worsens it; otherwise it becomes an issue. An unresolved security finding always blocks.
-- Report one finding per root cause and violated invariant; never repeat a posted finding. One
-  representative case is sufficient unless another reachable case changes the impact or the
-  required fix. A sibling that proves the same reachable P0–P2 failure survived the fix stays on
+- Report one finding per root cause and violated invariant; never repeat a posted finding.
+- Before returning a round that reports a new finding or leaves a finding open, name the violated
+  invariant and the affected input or state family. In that round, sweep the review diff and the
+  relevant code it reaches, including unchanged callees, applicable callers, fallbacks and
+  affected tests. Record the search boundary and every evidenced member found, with its trigger,
+  location and impact. Use one stable finding ID per root cause and violated invariant. Keep
+  surviving siblings under the same ID and give distinct root causes their own IDs. Put the class
+  and its members in the existing finding body. In delta rounds, verify the reported members and
+  sweep analogous paths affected by the fix. Material uncertainty about a plausible P0–P2 path
+  still blocks pending evidence.
+- A sibling that proves the same reachable P0–P2 failure survived the fix stays on
   the original ID and blocks. A real sibling outside the frozen obligation that the PR neither
   introduces, exposes nor worsens, or an unrelated discovery with those same properties, is a P3
   `follow_up` with an owner. Demonstrated material regressions and unresolved security findings
@@ -77,7 +85,7 @@ Critical and high risk take Sol, Opus or Gemini 4 Neon High (NEON-SOLTIER-1120).
   acceptance criteria are met and only follow-ups remain, approve.
 - Every blocking finding is fixed, or dismissed with evidence the reviewer confirms.
 
-**Threat model.** Every code or infra brief identifies supported entry points and environments, input sources, who can influence each source or relevant write path directly or indirectly, and the controls that enforce any exclusion. The reviewer verifies those controls at the exact head. Low and Medium cover supported use, foreseeable operator error, and malformed or partial state, concurrency and recovery where applicable. High and security-sensitive reviews also assume hostile values, ordering and volume wherever an actor can influence them. Public product reviews include reachable user and contributor inputs. Machinery and private infra reviews include the actual PR, CI, artifact, operator and automation boundaries, including lower-trust inputs consumed by privileged steps. A one-shot run may use the bytes at its pinned SHA as the input ceiling when that is what it executes and no lower-trust actor can substitute those bytes before use. Reusable tools cover future reachable inputs. A size or shape exclusion requires evidence. Material uncertainty about a plausible P0–P2 path blocks pending evidence naming the actor, entry point, control in question and impact. The critical review floor and independent review of material threat-model changes still apply. Unresolved security findings always block.
+**Threat model.** Every code or infra brief identifies supported entry points and environments, input sources, who can influence each source or relevant write path directly or indirectly, and the controls that enforce any exclusion. The reviewer verifies those controls at the exact head. Low and Medium cover supported use, foreseeable operator error, and malformed or partial state, concurrency and recovery where applicable. High and security-sensitive reviews also assume hostile values, ordering and volume wherever an actor can influence them. Public product reviews include reachable user and contributor inputs. Machinery and private infra reviews include the actual PR, CI, artifact, operator and automation boundaries, including lower-trust inputs consumed by privileged steps. A one-shot run may use the bytes at its pinned SHA as the input ceiling when that is what it executes and no lower-trust actor can substitute those bytes before use. Reusable tools cover future reachable inputs. A size or shape exclusion requires evidence. Material uncertainty about a plausible P0–P2 path blocks pending evidence naming the actor, entry point, control in question and impact. The critical review floor and independent review of material threat-model changes still apply. Unresolved security findings always block. A reviewer may carry a confirmed defect as an owned P3 follow-up only after verifying on the exact head that it is outside the frozen obligation and that the PR neither introduces, exposes nor worsens it. For an input exclusion, cite the applicable contract and the control that rules out the actor-to-input path, with evidence from the reviewed head. A scope label, an owned-path limit or a brief assertion cannot establish exclusion. Demonstrated material regressions, reachable P0–P2 failures within the supported contract, unresolved security findings and material uncertainty about a plausible P0–P2 path still block. Material threat-model changes require independent review. APPROVE requires every acceptance criterion to be met, with only eligible follow-ups remaining.
 
 ## 4. Convergence
 
