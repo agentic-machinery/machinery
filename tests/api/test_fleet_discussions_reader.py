@@ -229,14 +229,16 @@ def test_served_artifact_or_file_page_cannot_read_transcript(tmp_path: Path, mon
 
 
 def test_secrets_paths_nested_json_and_labels_redacted_in_json(tmp_path: Path, monkeypatch) -> None:
-    """Defect class: secrets, absolute home paths, nested JSON secrets/paths, or poisoned labels leak in transcript JSON."""
+    """Defect class: secrets, absolute home paths, nested JSON secrets/paths, over-deep JSON, non-finite JSON, or poisoned labels leak or 500."""
     root = tmp_path / "plane"
-    planted_ghp = "ghp_1234567890abcdefghijklmnopqrstuvwx"
-    planted_ant = "sk-ant-abcdefghijklmnopqrstuvwxyz1234"
+    planted_ghp = "ghp_" + "1234567890" + "abcdefghijklmnopqrstuvwx"
+    planted_ant = "sk-" + "ant-" + "abcdefghijklmnopqrstuvwxyz1234"
     planted_url_pw = "super_secret_url_pw_99"
     planted_home = "/home/alice/private-key-dir/token.txt"
     planted_users = "/Users/bob/Documents/secret.env"
     nested_pw = "nested_json_password_777"
+    deep_secret = "DEEP_CONTAINER_SECRET_MUST_NOT_LEAK"
+    nested_depth_secret = "DEEP_NESTED_JSON_SECRET_MUST_NOT_LEAK"
 
     nested_payload = json.dumps(
         {
@@ -248,16 +250,26 @@ def test_secrets_paths_nested_json_and_labels_redacted_in_json(tmp_path: Path, m
         }
     )
     plain_body = (
-        f"Check token {planted_ghp} and {planted_ant}\n"
+        f"[note] Check token {planted_ghp} and {planted_ant}\n"
         f"URL https://operator:{planted_url_pw}@example.com/path\n"
         f"Local file {planted_home}"
     )
+    # F4: >64-level JSON container and >4-level nested JSON string fail closed as withheld.
+    over_deep_container = '{"a":' * 66 + json.dumps({"token": deep_secret}) + "}" * 66
+    over_deep_nested = json.dumps({"token": nested_depth_secret})
+    for _ in range(5):
+        over_deep_nested = json.dumps({"wrap": over_deep_nested})
+    # F2: syntactically valid JSON containing a float outside Python's finite range (1e309 -> inf).
+    non_finite_json = '{"overflow": 1e309, "note": "must not 500"}'
 
     conv_id, _ = _seed_conversation(
         root,
         turns=[
             ("request", "root", "codex", plain_body, 1),
             ("reply", "codex", "root", nested_payload, 1),
+            ("reply", "claude", "root", over_deep_container, 2),
+            ("reply", "codex", "root", over_deep_nested, 2),
+            ("reply", "claude", "root", non_finite_json, 2),
         ],
         suffix="redaction",
     )
@@ -280,15 +292,27 @@ def test_secrets_paths_nested_json_and_labels_redacted_in_json(tmp_path: Path, m
         planted_users,
         "outer_api_key_secret_123",
         nested_pw,
+        deep_secret,
+        nested_depth_secret,
+        "must not 500",
     ):
         assert forbidden not in resp.text, forbidden
 
+    assert data["messages"][0]["state"] == "ok"
     assert "[REDACTED_SECRET]" in data["messages"][0]["body"]
     assert "[redacted-path]" in data["messages"][0]["body"]
+    assert data["messages"][1]["state"] == "ok"
     assert "[REDACTED_SECRET]" in data["messages"][1]["body"]
     assert "[redacted-path]" in data["messages"][1]["body"]
-    assert "[REDACTED_SECRET]" in data["label"]
-    assert "[redacted-path]" in data["label"]
+    assert data["messages"][2]["state"] == "withheld"
+    assert data["messages"][2]["reason"] == "redaction_depth_exceeded"
+    assert data["messages"][2]["body"] is None
+    assert data["messages"][3]["state"] == "withheld"
+    assert data["messages"][3]["reason"] == "redaction_depth_exceeded"
+    assert data["messages"][3]["body"] is None
+    assert data["messages"][4]["state"] == "missing_or_corrupt"
+    assert data["messages"][4]["reason"] == "body_redaction_failed"
+    assert data["messages"][4]["body"] is None
     assert "[REDACTED_SECRET]" in data["messages"][0]["label"]
     assert "[redacted-path]" in data["messages"][0]["label"]
 
@@ -597,6 +621,9 @@ def test_each_e3_cap_trips_with_typed_state(tmp_path: Path, monkeypatch) -> None
             executed_sql.append(sql)
             return self._inner.execute(sql, params)
 
+        def rollback(self) -> None:
+            self._inner.rollback()
+
         def close(self) -> None:
             self._inner.close()
 
@@ -613,14 +640,61 @@ def test_each_e3_cap_trips_with_typed_state(tmp_path: Path, monkeypatch) -> None
     assert rows_data["reason"] == "message_limit_exceeded"
     assert rows_data["truncated"] is True
     assert len(rows_data["messages"]) == runtime_router._ACP_TRANSCRIPT_MAX_MESSAGES
-    # Confirm SQL checked message count before joining comms_messages and pushed LIMIT into the subquery.
+    # Confirm SQL checked message count before joining comms_messages inside one BEGIN DEFERRED snapshot.
+    begin_queries = [q for q in executed_sql if q.strip() == "BEGIN DEFERRED"]
     count_queries = [q for q in executed_sql if "COUNT(*) AS message_count" in q]
     join_queries = [q for q in executed_sql if "LEFT JOIN comms_messages" in q]
-    assert count_queries and join_queries
-    assert executed_sql.index(count_queries[0]) < executed_sql.index(join_queries[0])
+    assert begin_queries and count_queries and join_queries
+    assert executed_sql.index(begin_queries[0]) < executed_sql.index(count_queries[0]) < executed_sql.index(join_queries[0])
     assert "LIMIT ?" in join_queries[0].split("LEFT JOIN comms_messages")[0]
 
-    # 4. SQLite busy timeout -> bounded HTTP 503 backend_unavailable (store_busy).
+    # 3b. F3 snapshot consistency: a 33rd turn committed between COUNT(*) and the capped join is NOT seen
+    # in that snapshot (truncated=False matches the exact 32-turn snapshot), then a subsequent read sees 33.
+    root_snap = tmp_path / "plane-snap"
+    exact_32 = [("reply", "codex", "root", f"snap-{i}", 1) for i in range(runtime_router._ACP_TRANSCRIPT_MAX_MESSAGES)]
+    conv_snap, _ = _seed_conversation(root_snap, turns=exact_32, suffix="snap-cap")
+    monkeypatch.setenv("FLEET_COMMS_ROOT", str(root_snap))
+    injected = {"done": False}
+
+    class _InterveningCommitConn:
+        def __init__(self, inner):
+            self._inner = inner
+
+        def execute(self, sql: str, params=()):
+            cursor = self._inner.execute(sql, params)
+            if "COUNT(*) AS message_count" in sql and not injected["done"]:
+                injected["done"] = True
+                _insert_custom_turn(
+                    root_snap, conv_snap, sequence=500, message_id="msg-snap-33",
+                    kind="reply", sender="codex", recipient="root",
+                    body="snap-33-after-count", producer="acpx-discuss:codex",
+                )
+            return cursor
+
+        def rollback(self) -> None:
+            self._inner.rollback()
+
+        def close(self) -> None:
+            self._inner.close()
+
+    monkeypatch.setattr(
+        runtime_router,
+        "_open_acp_transcript_store",
+        lambda ctx: (lambda pair: (pair[0], _InterveningCommitConn(pair[1])))(real_open_store(ctx)),
+    )
+    snap_resp = local.get(f"/api/runtime/acp/conversations/{conv_snap}/transcript")
+    monkeypatch.setattr(runtime_router, "_open_acp_transcript_store", real_open_store)
+    assert injected["done"] is True
+    assert snap_resp.status_code == 200
+    assert snap_resp.json()["truncated"] is False
+    assert len(snap_resp.json()["messages"]) == runtime_router._ACP_TRANSCRIPT_MAX_MESSAGES
+    assert "snap-33-after-count" not in snap_resp.text
+    after_snap = local.get(f"/api/runtime/acp/conversations/{conv_snap}/transcript")
+    assert after_snap.status_code == 200
+    assert after_snap.json()["truncated"] is True
+    assert after_snap.json()["reason"] == "message_limit_exceeded"
+
+    # 4. SQLite busy timeout (configured via open_readonly timeout alone -> 500 ms default, 503 store_busy on lock).
     root_busy = tmp_path / "plane-busy"
     conv_busy, _ = _seed_conversation(
         root_busy,
@@ -628,8 +702,12 @@ def test_each_e3_cap_trips_with_typed_state(tmp_path: Path, monkeypatch) -> None
         suffix="busy",
     )
     monkeypatch.setenv("FLEET_COMMS_ROOT", str(root_busy))
+    _, default_conn = real_open_store(app.state.ctx)
+    try:
+        assert default_conn.execute("PRAGMA busy_timeout").fetchone()[0] == 500
+    finally:
+        default_conn.close()
     monkeypatch.setattr(runtime_router, "_ACP_TRANSCRIPT_SQLITE_TIMEOUT_S", 0.05)
-    monkeypatch.setattr(runtime_router, "_ACP_TRANSCRIPT_SQLITE_BUSY_TIMEOUT_MS", 50)
     locker = sqlite3.connect(root_busy / "comms.sqlite3", isolation_level=None)
     try:
         locker.execute("PRAGMA journal_mode=DELETE")

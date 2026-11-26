@@ -133,7 +133,6 @@ _ACP_TRANSCRIPT_MAX_MESSAGES = 32
 _ACP_TRANSCRIPT_MAX_BODY_BYTES = 256 * 1024
 _ACP_TRANSCRIPT_MAX_RESPONSE_BYTES = 512 * 1024
 _ACP_TRANSCRIPT_SQLITE_TIMEOUT_S = 0.5
-_ACP_TRANSCRIPT_SQLITE_BUSY_TIMEOUT_MS = 500
 _ACP_TRANSCRIPT_MAX_CONCURRENCY = 4
 _ACP_TRANSCRIPT_JSON_REDACT_MAX_DEPTH = 4
 _ACP_TRANSCRIPT_CONCURRENCY_LOCK = Lock()
@@ -1610,6 +1609,14 @@ def _acp_allowed_producers(allowed_lanes: frozenset[str]) -> frozenset[str]:
     return frozenset({*(f"acpx-discuss:{lane}" for lane in allowed_lanes), *_ACP_TRANSCRIPT_AUTHORITY_PRODUCERS})
 
 
+class _AcpRedactionDepthExceeded(Exception):
+    """Structured body exceeded redaction container or nested-JSON depth bounds."""
+
+
+class _AcpBodyEncodingError(Exception):
+    """Structured body could not be safely re-serialized or UTF-8 encoded after redaction."""
+
+
 def _redact_and_sanitize_json_value(value: Any, *, depth: int) -> Any:
     """Recursively redact and path-sanitize strings inside a JSON value, including nested JSON strings."""
     if isinstance(value, str):
@@ -1629,19 +1636,27 @@ def _redact_and_sanitize_text(value: str, *, _depth: int = 0) -> str:
 
     Structured JSON payloads (including nested JSON strings up to ``_ACP_TRANSCRIPT_JSON_REDACT_MAX_DEPTH``)
     also pass through ``redact_value`` and ``sanitize_document`` before final text redaction so
-    escaped quotes inside nested JSON strings cannot conceal secrets or paths.
+    escaped quotes inside nested JSON strings cannot conceal secrets or paths. Structured bodies
+    that exceed either container depth (64) or nested-JSON depth fail closed by raising
+    ``_AcpRedactionDepthExceeded`` rather than falling back to plain-text filters.
     """
-    if _depth < _ACP_TRANSCRIPT_JSON_REDACT_MAX_DEPTH:
-        stripped = value.strip()
-        if stripped and stripped[0] in "{[":
+    stripped = value.strip()
+    if stripped and stripped[0] in "{[":
+        try:
+            parsed = json_depth.loads(stripped, max_depth=64)
+        except RecursionError:
+            raise _AcpRedactionDepthExceeded() from None
+        except (TypeError, ValueError, json.JSONDecodeError):
+            parsed = None
+        if isinstance(parsed, (dict, list)):
+            if _depth >= _ACP_TRANSCRIPT_JSON_REDACT_MAX_DEPTH:
+                raise _AcpRedactionDepthExceeded()
+            cleaned = sanitize_document(_redact_and_sanitize_json_value(redact_value(parsed), depth=_depth))
             try:
-                parsed = json_depth.loads(stripped, max_depth=64)
-            except (TypeError, ValueError, json.JSONDecodeError, RecursionError):
-                parsed = None
-            if isinstance(parsed, (dict, list)):
-                cleaned = sanitize_document(_redact_and_sanitize_json_value(redact_value(parsed), depth=_depth))
                 serialized = json.dumps(cleaned, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
-                return sanitize_text(redact_text(serialized) or "")
+            except (TypeError, ValueError):
+                raise _AcpBodyEncodingError() from None
+            return sanitize_text(redact_text(serialized) or "")
     redacted = redact_text(value)
     return sanitize_text("" if redacted is None else redacted)
 
@@ -1712,8 +1727,6 @@ def _open_acp_transcript_store(ctx: MonitorContext) -> tuple[Path, SQLiteConnect
         raise _AcpBackendUnavailable("store_unavailable") from None
     connection.row_factory = sqlite3.Row
     try:
-        busy_ms = max(0, int(_ACP_TRANSCRIPT_SQLITE_BUSY_TIMEOUT_MS))
-        connection.execute(f"PRAGMA busy_timeout = {busy_ms}")
         has_tables = all(
             _acp_table_exists(connection, table)
             for table in (
@@ -1922,8 +1935,15 @@ def _read_acp_artifact_body(
         _acp_json_bytes(text)
     except (UnicodeError, ValueError):
         return _ACP_TRANSCRIPT_STATE_MISSING_OR_CORRUPT, "body_not_utf8", None, sha256
-    redacted_text = _redact_and_sanitize_text(text)
-    if len(redacted_text.encode("utf-8")) > _ACP_TRANSCRIPT_MAX_BODY_BYTES:
+    try:
+        redacted_text = _redact_and_sanitize_text(text)
+        redacted_bytes = redacted_text.encode("utf-8")
+        _acp_json_bytes(redacted_text)
+    except _AcpRedactionDepthExceeded:
+        return _ACP_TRANSCRIPT_STATE_WITHHELD, "redaction_depth_exceeded", None, sha256
+    except (_AcpBodyEncodingError, TypeError, ValueError, UnicodeError):
+        return _ACP_TRANSCRIPT_STATE_MISSING_OR_CORRUPT, "body_redaction_failed", None, sha256
+    if len(redacted_bytes) > _ACP_TRANSCRIPT_MAX_BODY_BYTES:
         return _ACP_TRANSCRIPT_STATE_OVERSIZED_OR_PARTIAL, "body_too_large", None, sha256
     return _ACP_TRANSCRIPT_STATE_OK, None, redacted_text, sha256
 
@@ -1971,77 +1991,81 @@ def _acp_transcript_entries(
     ``body=None``). No turn is dropped and the serialized response stays within the cap.
     """
     max_messages = max(0, int(_ACP_TRANSCRIPT_MAX_MESSAGES))
-    count_row = connection.execute(
-        """
-        SELECT COUNT(*) AS message_count
-        FROM (
-            SELECT 1
-            FROM acp_conversation_events
-            WHERE conversation_id = ? AND message_id IS NOT NULL
-            GROUP BY message_id
-            LIMIT ?
-        )
-        """,
-        (conversation_id, max_messages + 1),
-    ).fetchone()
-    observed_messages = int(count_row["message_count"]) if count_row is not None else 0
-    truncated = observed_messages > max_messages
-
-    rows = (
-        connection.execute(
+    connection.execute("BEGIN DEFERRED")
+    try:
+        count_row = connection.execute(
             """
-            SELECT messages.message_id, messages.kind, messages.sender, messages.recipient,
-                   CASE
-                       WHEN messages.body_artifact_id IS NULL
-                            AND messages.content_sha256 IS NULL
-                            AND LENGTH(CAST(messages.body_inline AS BLOB)) <= ?
-                       THEN messages.body_inline
-                   END AS body_inline,
-                   messages.body_artifact_id, messages.content_sha256,
-                   messages.created_at, event_round.round, event_round.round_invalid,
-                   event_round.non_synthesis_events
+            SELECT COUNT(*) AS message_count
             FROM (
-                SELECT message_id, MIN(sequence) AS message_sequence,
-                       CASE
-                           WHEN COUNT(round) = 0 THEN NULL
-                           WHEN COUNT(round) = COUNT(*)
-                                AND SUM(CASE WHEN typeof(round) != 'integer' OR round < 1 THEN 1 ELSE 0 END) = 0
-                                AND MIN(round) = MAX(round)
-                           THEN MIN(round)
-                       END AS round,
-                       CASE
-                           WHEN COUNT(round) = 0 THEN 0
-                           WHEN COUNT(round) = COUNT(*)
-                                AND SUM(CASE WHEN typeof(round) != 'integer' OR round < 1 THEN 1 ELSE 0 END) = 0
-                                AND MIN(round) = MAX(round)
-                           THEN 0
-                           ELSE 1
-                       END AS round_invalid,
-                       SUM(
-                           CASE
-                               WHEN typeof(event_type) = 'text'
-                                    AND LOWER(REPLACE(TRIM(event_type), '-', '_'))
-                                        IN ('synthesis', 'synthesis_complete', 'synthesis_terminal')
-                               THEN 0
-                               ELSE 1
-                           END
-                       ) AS non_synthesis_events
+                SELECT 1
                 FROM acp_conversation_events
                 WHERE conversation_id = ? AND message_id IS NOT NULL
                 GROUP BY message_id
-                ORDER BY message_sequence ASC
                 LIMIT ?
-            ) AS event_round
-            LEFT JOIN comms_messages AS messages
-                   ON messages.message_id = event_round.message_id
-                  AND messages.conversation_id = ?
-            ORDER BY event_round.message_sequence ASC
+            )
             """,
-            (_ACP_TRANSCRIPT_MAX_BODY_BYTES, conversation_id, max_messages, conversation_id),
-        ).fetchall()
-        if max_messages > 0
-        else []
-    )
+            (conversation_id, max_messages + 1),
+        ).fetchone()
+        observed_messages = int(count_row["message_count"]) if count_row is not None else 0
+        truncated = observed_messages > max_messages
+
+        rows = (
+            connection.execute(
+                """
+                SELECT messages.message_id, messages.kind, messages.sender, messages.recipient,
+                       CASE
+                           WHEN messages.body_artifact_id IS NULL
+                                AND messages.content_sha256 IS NULL
+                                AND LENGTH(CAST(messages.body_inline AS BLOB)) <= ?
+                           THEN messages.body_inline
+                       END AS body_inline,
+                       messages.body_artifact_id, messages.content_sha256,
+                       messages.created_at, event_round.round, event_round.round_invalid,
+                       event_round.non_synthesis_events
+                FROM (
+                    SELECT message_id, MIN(sequence) AS message_sequence,
+                           CASE
+                               WHEN COUNT(round) = 0 THEN NULL
+                               WHEN COUNT(round) = COUNT(*)
+                                    AND SUM(CASE WHEN typeof(round) != 'integer' OR round < 1 THEN 1 ELSE 0 END) = 0
+                                    AND MIN(round) = MAX(round)
+                               THEN MIN(round)
+                           END AS round,
+                           CASE
+                               WHEN COUNT(round) = 0 THEN 0
+                               WHEN COUNT(round) = COUNT(*)
+                                    AND SUM(CASE WHEN typeof(round) != 'integer' OR round < 1 THEN 1 ELSE 0 END) = 0
+                                    AND MIN(round) = MAX(round)
+                               THEN 0
+                               ELSE 1
+                           END AS round_invalid,
+                           SUM(
+                               CASE
+                                   WHEN typeof(event_type) = 'text'
+                                        AND LOWER(REPLACE(TRIM(event_type), '-', '_'))
+                                            IN ('synthesis', 'synthesis_complete', 'synthesis_terminal')
+                                   THEN 0
+                                   ELSE 1
+                               END
+                           ) AS non_synthesis_events
+                    FROM acp_conversation_events
+                    WHERE conversation_id = ? AND message_id IS NOT NULL
+                    GROUP BY message_id
+                    ORDER BY message_sequence ASC
+                    LIMIT ?
+                ) AS event_round
+                LEFT JOIN comms_messages AS messages
+                       ON messages.message_id = event_round.message_id
+                      AND messages.conversation_id = ?
+                ORDER BY event_round.message_sequence ASC
+                """,
+                (_ACP_TRANSCRIPT_MAX_BODY_BYTES, conversation_id, max_messages, conversation_id),
+            ).fetchall()
+            if max_messages > 0
+            else []
+        )
+    finally:
+        connection.rollback()
 
     allowed_lanes = frozenset({"root", "codex", *participants})
     allowed_producers = _acp_allowed_producers(allowed_lanes)

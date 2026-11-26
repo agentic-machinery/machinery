@@ -566,7 +566,7 @@ ROUTE_CONTRACTS: tuple[RouteContract, ...] = (
         "Read live per request with bounded timeout; no route cache (Cache-Control: no-store). Unavailable CLI, DB, or invalid CLI payload returns typed availability with entries [] and total null.",
         ("journal.html", "operators"),
         "Complements Fleet Comms deliveries and driver-state handoffs with an append-only plain-English project log.",
-        "low; loopback peer and loopback-or-absent Origin required, read-only, no-store",
+        "low; uses the shared local body-read guard (loopback listener and peer, exact Host/Origin, Sec-Fetch-Site in {same-origin, none}, no Forwarded/X-Forwarded-* headers), read-only, no-store",
         "keep as the local journal read contract",
         locality="cluster_authoritative",
         mutates=False,
