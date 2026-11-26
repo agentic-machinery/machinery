@@ -38,7 +38,8 @@ A CTO started from its non-Git workspace uses the released template
 `lu_machinery/lib/lu-start-cto.workspace.sh`. The host renders it by replacing
 each `@`-delimited name with one quoted literal. Admission pins its normalized
 statements; `SELECTOR_PROFILE` is a per-host policy value, like `REPO` and
-`CFG`, and must be absolute. The template sources that deployed profile for
+`CFG`, and must be absolute. No policy value may contain `~`, which Bash
+expands after a colon in an assignment. The template sources that deployed profile for
 `LU_FLEET_REPO_SELECTOR_FILE`. It then holds `CFG/start.lock` from before the
 process, session and bounded `claude auth status` checks through launch. A
 `--here` run keeps the lock for its life in a `flock -o` parent, so
@@ -49,7 +50,10 @@ ancestors, the scope waiter and any flock still holding the lock, do not count
 as another running CTO. Any other CTO process still refuses it. A new tmux
 session gets the selector, root and interpreter settings from the caller and
 clears any the caller left unset, so a reused tmux server's stale values never
-reach the pane. Only the pane reads the role text.
+reach the pane. Only the pane reads the role text. The pane takes
+`start.lock` with a bounded wait after the detached start releases it, and holds
+it for its launcher's life. No other start passes the process check before the
+pane's launcher is visible to it.
 
 The inbox watcher receives the launcher's entrypoint and helper metadata through
 its inherited environment. Exact captured Claude CTO arguments travel as raw

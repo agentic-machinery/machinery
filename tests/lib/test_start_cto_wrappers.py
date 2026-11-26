@@ -1165,6 +1165,7 @@ def test_cto_successor_signature_binds_the_launch_mode(tmp_path: Path, monkeypat
         (template(f"{live}/{package_wrapper.name}"), workspace, package_wrapper),  # not the canonical path
         (template(package_wrapper), workspace, live / package_wrapper.name),
         (template(package_wrapper, selector="selector-profile.sh"), workspace, package_wrapper),  # wrapper refuses it
+        (template(package_wrapper, selector=f"{tmp_path}:~/profile.sh"), workspace, package_wrapper),  # Bash expands ~
     ):
         with pytest.raises(SupervisorError, match="cto-wrapper-unsupported"):
             cto_wrapper_signature(wrapper, root, entry, args)
@@ -1228,16 +1229,20 @@ def test_cto_workspace_start_gives_the_pane_the_callers_selector_and_roots(tmp_p
     """Defect class: a pane started from a reused tmux server running with that server's stale
     selector, state root, product root or interpreter instead of the configured ones. The new
     session takes the deployed profile's selector and the caller's roots, an unset caller root is
-    cleared rather than inherited, and the role text stays out of the tmux client argv."""
-    record = tmp_path / "launch"
+    cleared rather than inherited, the role text stays out of the tmux client argv, and the pane's
+    launcher runs under start.lock."""
+    record, lock = tmp_path / "launch", tmp_path / "cto config/start.lock"
     wrapper, env, _config = _workspace_start_host(
         tmp_path, f'{{ printf "%s\\0" "$PWD" "$@"; }} > {shlex.quote(str(record))}.argv\n'
+                  f'{{ flock -n {shlex.quote(str(lock))} true && echo free || echo held; cat "/proc/$PPID/comm"; }}'
+                  f' > {shlex.quote(str(record))}.lock\n'
                   f'env -0 > {shlex.quote(str(record))}.env')
     tmux_argv = tmp_path / "tmux-argv"
     stale = ["LU_FLEET_REPO_SELECTOR_FILE=/stale/tmux/selector.yaml", "LU_STATE_ROOT=/stale/state",
              "LU_PRODUCT_ROOT=/stale/product", "LEARN_UKRAINIAN_PYTHON=/stale/python",
              "LC_WORKSPACE_ROOT=/stale/workspace", f"PATH={env['PATH']}", f"HOME={env['HOME']}"]
-    # A reused server: the pane starts from the server's environment, overlaid by each -e.
+    # A reused server: the pane starts from the server's environment, overlaid by each -e, and
+    # runs after new-session returns. Its inherited output pipes make the run below wait for it.
     (tmp_path / "bin/tmux").write_text(
         "#!/bin/bash\n"
         f'printf "%s\\0" "$@" >> {shlex.quote(str(tmux_argv))}\n'
@@ -1245,7 +1250,7 @@ def test_cto_workspace_start_gives_the_pane_the_callers_selector_and_roots(tmp_p
         f"server=({' '.join(shlex.quote(item) for item in stale)})\n"
         'while [ $# -gt 0 ]; do case "$1" in -d) shift ;; -s) shift 2 ;; -e) server+=("$2"); shift 2 ;; *) break ;; esac; done\n'
         r'pane=(); for a in "$@"; do [[ $a == *"\;" ]] && a="${a%\\;};"; pane+=("$a"); done' "\n"
-        'cd / && exec env -i "${server[@]}" "${pane[@]}" </dev/null\n')
+        '(cd / && exec env -i "${server[@]}" "${pane[@]}" </dev/null) &\n')
     (tmp_path / "bin/tmux").chmod(0o755)
     caller = {**env, "LU_FLEET_REPO_SELECTOR_FILE": "/stale/caller/selector.yaml", "LU_STATE_ROOT": "/configured/state",
               "LEARN_UKRAINIAN_PYTHON": "/configured/python"}
@@ -1264,6 +1269,8 @@ def test_cto_workspace_start_gives_the_pane_the_callers_selector_and_roots(tmp_p
     assert "LU_PRODUCT_ROOT" not in pane and "LU_PYTHON" not in pane
     assert pane["CLAUDE_CONFIG_DIR"] == str(tmp_path / "account a")
     assert b"operator role text" not in tmux_argv.read_bytes()
+    # The pane's launcher runs under start.lock, so no start slips in before it is visible.
+    assert record.with_suffix(".lock").read_text().split() == ["held", "flock"]
 
     # In place, the profile's selector also replaces a stale one the caller carries.
     (tmp_path / "bin/tmux").write_text("#!/bin/bash\nexit 1\n")

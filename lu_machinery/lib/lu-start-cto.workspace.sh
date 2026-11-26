@@ -87,12 +87,13 @@ unset LU_FLEET_REPO_SELECTOR_FILE
 export LU_FLEET_REPO_SELECTOR_FILE
 
 ANCESTORS=" "
+STAT_END=") "
 if [ "$SUCCESSOR" = 1 ]; then
   PID=$PPID
   while [[ "$PID" =~ ^[0-9]+$ ]] && [ "$PID" -gt 1 ]; do
     ANCESTORS+="$PID "
     { STAT=$(< "/proc/$PID/stat"); } 2>/dev/null || break
-    STAT=${STAT##*") "}
+    STAT=${STAT##*"$STAT_END"}
     STAT=${STAT#* }
     PID=${STAT%% *}
   done
@@ -150,11 +151,14 @@ for var in "${PANE_ENV_VARS[@]}"; do
 done
 # Only the pane reads the role text: a new tmux server can retain this client's argv, which
 # must not look like a running CTO to the process check. The pane enters REPO itself, so a
-# tmux config cwd cannot override it, and clears the settings this caller left unset.
+# tmux config cwd cannot override it, and clears the settings this caller left unset. This
+# start holds start.lock until tmux returns; the pane then takes it (bounded wait) and keeps
+# it for its launcher's life, as a --here start does, so no start passes the process check
+# before this pane's launcher is visible to it. Whichever start takes the lock first runs.
 # shellcheck disable=SC2016
 TMUX_ARGS+=(
-  bash -c 'repo=$1 role_file=$2 count=$3; shift 3; for v in "${@:1:count}"; do [ -n "${!v:-}" ] || unset "$v"; done; shift "$count"; unset LC_WORKSPACE_ROOT; if role=$(cat "$role_file") && cd -- "$repo"; then LC_WORKSPACE_ROOT="$repo" "$@" --append-system-prompt "$role"; fi; exec bash'
-  lu-start-cto "$REPO" "$ROLE" "${#PANE_ENV_VARS[@]}" "${PANE_ENV_VARS[@]}" "${LAUNCH[@]}"
+  bash -c 'repo=$1 role_file=$2 lock=$3 count=$4; shift 4; for v in "${@:1:count}"; do [ -n "${!v:-}" ] || unset "$v"; done; shift "$count"; unset LC_WORKSPACE_ROOT; if role=$(cat "$role_file") && cd -- "$repo"; then LC_WORKSPACE_ROOT="$repo" flock -w 30 -E 75 -o "$lock" "$@" --append-system-prompt "$role" || [ "$?" != 75 ] || echo "refused: start.lock stayed held; this pane did not start the CTO" >&2; fi; exec bash'
+  lu-start-cto "$REPO" "$ROLE" "$LOCK" "${#PANE_ENV_VARS[@]}" "${PANE_ENV_VARS[@]}" "${LAUNCH[@]}"
 )
 # tmux reads an argument's trailing semicolon as a command separator.
 for index in "${!TMUX_ARGS[@]}"; do

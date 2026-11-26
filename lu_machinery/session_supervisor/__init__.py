@@ -68,7 +68,7 @@ class SupervisorError(ValueError):
 # start.lock with in-place successor re-entry, bounded auth check) and gave its tmux pane
 # the caller's selector instead of a reused server's stale one.
 _CTO_CHECKOUT_TEMPLATE = "44dedafd91b354e31b9fcd8a4948518b57dc9f41cce9f34fd02e5cae36157280"
-_CTO_WORKSPACE_TEMPLATE = "b103a47a15f4e695b846757b483369091235fdd691511d1b47d42198743f6a59"
+_CTO_WORKSPACE_TEMPLATE = "63241e9962f604c83f648935d1a19f722099a80a07027f5e3e8085c6285f2cf1"
 _CTO_PACKAGE_WRAPPER = Path(__file__).resolve().parents[1] / "start-claude-cto.sh"
 
 
@@ -102,6 +102,8 @@ def cto_wrapper_signature(wrapper: Path, root: Path, entrypoint: Path, args: lis
             raise ValueError("unsupported wrapper separator or control")
         normalized: list[str] = []
         policy: dict[str, str] = {}
+        # A policy value is one literal: Bash expands an unquoted ~ after = or after any
+        # : in an assignment, where shlex keeps it, so no ~ is admitted anywhere.
         for line in text.split("\n"):
             line = line.strip(" \t")
             if not line or line.startswith("#"):
@@ -113,7 +115,7 @@ def cto_wrapper_signature(wrapper: Path, root: Path, entrypoint: Path, args: lis
                 lexer.whitespace_split = True
                 lexer.commenters = ""
                 tokens = list(lexer)
-                if key in policy or len(tokens) != 1 or value.startswith("~") or any(c in value for c in "$`\\\n\0"):
+                if key in policy or len(tokens) != 1 or any(c in value for c in "~$`\\\n\0"):
                     raise ValueError("nonliteral policy")
                 policy[key] = tokens[0]
                 line = key + "=<source-policy>"
@@ -125,7 +127,7 @@ def cto_wrapper_signature(wrapper: Path, root: Path, entrypoint: Path, args: lis
                     lexer = shlex.shlex(value, posix=True, punctuation_chars=";&|<>()")
                     lexer.whitespace_split = True
                     lexer.commenters = ""
-                    if len(list(lexer)) != 1 or value.startswith("~") or any(c in value for c in "$`\\\n\0"):
+                    if len(list(lexer)) != 1 or any(c in value for c in "~$`\\\n\0"):
                         raise ValueError("nonliteral selection policy")
                 line = re.sub(r"DIR=[^;]+", "DIR=<source-policy>", line)
             normalized.append(line)
