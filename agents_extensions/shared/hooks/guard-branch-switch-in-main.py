@@ -59,7 +59,7 @@ try:
         strip_skippable_heredoc_bodies,
     )
 except Exception as exc:
-    print(f"guard dependency unavailable: shell_shlex ({exc})", file=sys.stderr)
+    print(f"guard dependency unavailable: shell_shlex ({type(exc).__name__})", file=sys.stderr)
     raise SystemExit(2) from exc
 
 try:
@@ -71,7 +71,7 @@ try:
         unknown_repository_segments,
     )
 except Exception as exc:
-    print(f"guard dependency unavailable: shell_redirects ({exc})", file=sys.stderr)
+    print(f"guard dependency unavailable: shell_redirects ({type(exc).__name__})", file=sys.stderr)
     raise SystemExit(2) from exc
 
 # Words that, when seen as the FIRST token after `git`, indicate a branch
@@ -139,8 +139,49 @@ def _configured_primary_root() -> Path | None:
         raise RootsConfigurationError(str(exc)) from exc
 
 
-# Protect the configured product primary and any explicitly configured state
-# primary. The private infrastructure checkout retains its existing protection.
+def _dispatch_infra_root(public: Path) -> Path:
+    """The ``infra-private`` checkout exactly as dispatch resolves it."""
+    from lu_machinery.dispatcher.git import resolve_repo
+
+    return resolve_repo("infra-private")[0]
+
+
+def _sibling_infra_root(public: Path) -> Path:
+    """The ``infra-private`` checkout as the fleet sibling resolver derives it from *public*."""
+    from lu_machinery.orchestration.fleet_repos import resolve_fleet_repo
+
+    return resolve_fleet_repo("infra-private", primary_root=public, require_checkout=False)[1]
+
+
+def _infra_primary_roots(public: Path) -> list[Path]:
+    """The fleet registry's ``infra-private`` checkout as each tool resolves it.
+
+    Dispatch (``resolve_repo``: ``LU_REPOS_ROOT``, else the configured primary's parent, plus
+    the registry value) and the sibling resolver (``resolve_fleet_repo``: ``LU_REPOS_ROOT``,
+    else *public*'s parent, plus the loaded registry value) can name different directories;
+    both are protected. Each candidate is imported, resolved and normalized inside its own
+    handler, so a failure leaves only that candidate unprotected. Failures are reported on
+    stderr by exception class only (their text can carry private paths) and never block a
+    command, so the public primary keeps its protection either way.
+    """
+    roots: list[Path] = []
+    failures: list[str] = []
+    for resolve in (_dispatch_infra_root, _sibling_infra_root):
+        try:
+            roots.append(Path(resolve(public)).resolve())
+        except Exception as exc:
+            failures.append(type(exc).__name__)
+    if failures:
+        print(
+            "guard-branch-switch-in-main: infra-private primary not protected under every base; "
+            f"fleet registry or repositories root unresolved ({', '.join(failures)})",
+            file=sys.stderr,
+        )
+    return roots
+
+
+# Protect the configured product primary, any explicitly configured state
+# primary and the registry's private infrastructure checkout.
 # Resolve on first use because ordinary commands never reach a branch verb.
 PROTECTED_ROOTS: list[Path] | None = None
 
@@ -148,11 +189,12 @@ PROTECTED_ROOTS: list[Path] | None = None
 def _protected_roots() -> set[Path]:
     global PROTECTED_ROOTS
     if PROTECTED_ROOTS is None:
+        public = _public_primary_root()
         configured = _configured_primary_root()
         PROTECTED_ROOTS = [
-            _public_primary_root(),
+            public,
             *([] if configured is None else [configured]),
-            Path("~/projects/learn-ukrainian-infra-private").expanduser().resolve(),
+            *_infra_primary_roots(public),
         ]
     return {root.resolve() for root in PROTECTED_ROOTS}
 
@@ -178,22 +220,8 @@ def _in_main_worktree(project_root: Path) -> bool:
     worktree we're in. So they match iff we're in the main worktree.
     """
     try:
-        gd = subprocess.run(
-            ["git", "rev-parse", "--git-dir"],
-            cwd=project_root,
-            capture_output=True,
-            text=True,
-            check=True,
-            env=_git_probe_env(),
-        ).stdout.strip()
-        cd = subprocess.run(
-            ["git", "rev-parse", "--git-common-dir"],
-            cwd=project_root,
-            capture_output=True,
-            text=True,
-            check=True,
-            env=_git_probe_env(),
-        ).stdout.strip()
+        gd = _git_path_output(["rev-parse", "--git-dir"], project_root)
+        cd = _git_path_output(["rev-parse", "--git-common-dir"], project_root)
     except (subprocess.CalledProcessError, FileNotFoundError):
         # Not a git repo or git missing → nothing to enforce.
         return False
@@ -425,17 +453,23 @@ def _git_invocation(seg: list[str], effective_cwd: Path | None) -> tuple[str, li
     return seg[i], seg[i + 1 :], git_cwd
 
 
+def _git_path_output(args: list[str], cwd: Path) -> str:
+    """One path Git prints, byte for byte: only its final line feed is dropped.
+
+    Text mode would decode with the locale and translate carriage returns, and stripping
+    would drop whitespace a checkout name may end in, so a path dispatch accepts could read
+    as a different one (#1496 F1). ``os.fsdecode`` matches how ``Path`` spells the name.
+    """
+    out = subprocess.run(
+        ["git", *args], cwd=cwd, capture_output=True, check=True, env=_git_probe_env()
+    ).stdout
+    return os.fsdecode(out.removesuffix(b"\n"))
+
+
 def _git_repo_root(git_cwd: Path) -> Path | None:
     """Resolve the root of the repo a git invocation actually targets."""
     try:
-        root = subprocess.run(
-            ["git", "rev-parse", "--path-format=absolute", "--show-toplevel"],
-            cwd=git_cwd,
-            capture_output=True,
-            text=True,
-            check=True,
-            env=_git_probe_env(),
-        ).stdout.strip()
+        root = _git_path_output(["rev-parse", "--path-format=absolute", "--show-toplevel"], git_cwd)
     except (subprocess.CalledProcessError, FileNotFoundError):
         return None
     return Path(root).resolve()
@@ -726,7 +760,7 @@ def main() -> int:
     try:
         reason = _command_danger_reason(command)
     except RootsConfigurationError as exc:
-        reason = f"machinery roots configuration unusable ({exc})"
+        reason = f"machinery roots configuration unusable ({type(exc.__cause__ or exc).__name__})"
     except Exception:
         reason = "nested shell command could not be parsed safely"
     if reason:

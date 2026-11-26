@@ -158,7 +158,9 @@ def test_remove_refuses_helper_tree_with_live_borrower(tmp_path, capsys):
 def _fleet(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, Path]:
     """Public primary and its ``infra-private`` sibling checkout beside it (#8624)."""
     public = _primary(tmp_path)
-    sibling = tmp_path / "learn-ukrainian-infra-private"
+    from lu_machinery.orchestration.fleet_repos import load_fleet_repos
+
+    sibling = tmp_path / load_fleet_repos()["infra-private"].local_name
     sibling.mkdir()
     _git(sibling, "init", "-b", "main")
     _git(sibling, "config", "user.email", "claims@example.invalid")
@@ -193,11 +195,11 @@ def _malformed_catalog(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_control_plane_root_raises_control_plane_error_on_malformed_catalog_yaml(tmp_path, monkeypatch):
-    _fleet(tmp_path, monkeypatch)
+    _public, sibling = _fleet(tmp_path, monkeypatch)
     _malformed_catalog(tmp_path, monkeypatch)
 
     with pytest.raises(worktree_claims.ControlPlaneError, match="catalog unreadable"):
-        worktree_claims.control_plane_root(tmp_path / "learn-ukrainian-infra-private")
+        worktree_claims.control_plane_root(sibling)
 
 
 def test_remove_unclaimed_worktree_never_raises_on_malformed_catalog_yaml(tmp_path, monkeypatch):
