@@ -344,9 +344,12 @@ def launcher(spec, invocation, task_file: Path, draft_fd: int | None = None) -> 
     ]
     for path in declared_outputs(spec, invocation):
         argv += ["--output", str(path)]
-    if spec.mode == "read-only" and spec.agent in {"claude", "codex"}:
+    savant = spec.agent == "opencode" and spec.provider == SAVANT_PROVIDER
+    if spec.mode == "read-only" and not savant:
+        # Every native read-only route (Claude, Codex, Cursor, OpenCode) gets its own task artifacts and final
+        # Fleet delivery. Savant has no host broker, which the grant needs.
         argv.append("--task-artifacts")
-    if not (spec.agent == "opencode" and spec.provider == SAVANT_PROVIDER):
+    if not savant:
         for path in credential_files(spec.agent, invocation.env):
             argv += ["--credential", str(path)]
     if spec.agent == "claude":
@@ -357,7 +360,6 @@ def launcher(spec, invocation, task_file: Path, draft_fd: int | None = None) -> 
         # The selected account's login: the only thing the task-local CODEX_HOME takes from the real one.
         home = Path(invocation.env.get("HOME") or Path.home())
         argv += ["--codex-auth", str(Path(invocation.env.get("CODEX_HOME") or home / ".codex") / "auth.json")]
-    savant = spec.agent == "opencode" and spec.provider == SAVANT_PROVIDER
     if spec.mode == "read-only" and not savant and spec.agent in _SOURCES_MCP_ROUTES:
         argv += ["--sources-mcp", spec.agent]
     if spec.options.get("pr"):
@@ -1066,8 +1068,8 @@ def grant_task_artifacts(task_id: str, record: dict, receipt_path: Path, receipt
                          protected: tuple[Path, ...]) -> tuple[Path, str]:
     """This read-only run's own ``<task_id>.artifacts`` directory, created if absent, and the run's nonce.
 
-    The one grant every read-only boundary uses (this one for Claude and Codex, ``agy_sandbox`` for AGY); the
-    caller binds only the returned directory writable. It needs the task's active read-only record, lies beside
+    The one grant every read-only boundary uses (this one for Claude, Codex, Cursor and OpenCode, ``agy_sandbox``
+    for AGY); the caller binds only the returned directory writable. It needs the task's active read-only record, lies beside
     that record in the task store, overlaps neither ``protected`` nor the Fleet store, and is a private directory
     owned by the dispatcher. An existing one is reused only by a relaunch whose earlier receipt at
     ``receipt_path`` names the same run and inode.
@@ -1385,8 +1387,8 @@ class _Broker:
                 "present, takes precedence over dispatch --initiator); ask the dispatcher to correct the parent "
                 "task ID or, for a top-level dispatch, to pass a valid --initiator seat such as claude-cto, "
                 "and relaunch" if self.boundary.args.task_artifacts else
-                "it was launched without task artifacts; ask the dispatcher to relaunch it through a read-only "
-                "Claude or Codex route, which grants them"))
+                "it was launched without task artifacts; ask the dispatcher to relaunch it through a native "
+                "read-only route (Claude, Codex, Cursor or OpenCode, not Savant), which grants them"))
         if self.final_publish_attempted:
             raise _BrokerRefusal("the final Fleet publication has already been attempted")
         if set(payload) != {"channel", "body", "sender", "recipient"}:
