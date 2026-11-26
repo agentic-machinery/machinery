@@ -430,6 +430,43 @@ def test_read_only_agy_cannot_read_sibling_task_records(tmp_path, monkeypatch, c
     assert run.stdout == "own packet\nreviewed\n"
 
 
+def test_read_only_agy_writes_only_its_own_task_artifacts(tmp_path, monkeypatch, configured_roots):  # noqa: F811
+    """Defect class: a read-only AGY report is lost with the scratch because its own ``.artifacts`` is read-only,
+    or the grant reaches further: another task's artifacts, the task store or the checkout become writable."""
+    if not _bwrap_usable():
+        pytest.skip("needs a usable unprivileged bubblewrap")
+    _, worktree = _linked_worktree(tmp_path)
+    tasks = tmp_path / "tasks"
+    tasks.mkdir()
+    monkeypatch.setenv("LU_TASKS_DIR", str(tasks))
+    task_id = "agy-art"
+    (tasks / f"{task_id}.json").write_text(json.dumps(
+        {"task_id": task_id, "mode": "read-only", "status": "running", "run_nonce": "2" * 32}))
+    other = tasks / "sibling.artifacts"
+    other.mkdir()
+    (other / "kept.txt").write_text("sibling\n")
+    own = tasks / f"{task_id}.artifacts"
+    script = (
+        "set -u; "
+        f'printf report > {shlex.quote(str(own / "report.md"))} || exit 3; '
+        f'printf x > {shlex.quote(str(other / "kept.txt"))} && exit 4; '
+        f'mkdir {shlex.quote(str(tasks / "sibling2.artifacts"))} && exit 5; '
+        "printf x >> README.md && exit 6; "
+        "exit 0"
+    )
+    argv, env = _launch(tmp_path, worktree, task_id, ["/bin/sh", "-c", script], [])
+    argv.insert(argv.index("--"), "--task-artifacts")
+    run = subprocess.run(argv, env=env, cwd=worktree, capture_output=True, text=True, timeout=90, check=False)
+    receipt = json.loads(agy_sandbox.receipt_file(tmp_path / f"{task_id}.result").read_text())
+    assert (run.returncode, receipt["status"]) == (0, "ran"), (receipt.get("reason"), run.stderr[-800:])
+    assert receipt["canary"]["passed"] is True
+    assert (own / "report.md").read_text() == "report"  # after the launcher removed its scratch
+    assert not (tmp_path / f"scratch-{task_id}").exists()
+    assert receipt["task_artifacts"]["inode"] == own.stat().st_ino and own.stat().st_mode & 0o777 == 0o700
+    assert (other / "kept.txt").read_text() == "sibling\n" and not (tasks / "sibling2.artifacts").exists()
+    assert (worktree / "README.md").read_text() == "reviewed\n"
+
+
 def test_refuses_when_digest_changes_before_start(tmp_path, monkeypatch):
     """Defect class: a swapped file is still mounted."""
     repo, worktree = _linked_worktree(tmp_path)

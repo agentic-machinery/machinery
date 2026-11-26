@@ -1062,6 +1062,49 @@ def _overlaps(path: Path, other: Path) -> bool:
     return path == other or path.is_relative_to(other) or other.is_relative_to(path)
 
 
+def grant_task_artifacts(task_id: str, record: dict, receipt_path: Path, receipt: dict,
+                         protected: tuple[Path, ...]) -> tuple[Path, str]:
+    """This read-only run's own ``<task_id>.artifacts`` directory, created if absent, and the run's nonce.
+
+    The one grant every read-only boundary uses (this one for Claude and Codex, ``agy_sandbox`` for AGY); the
+    caller binds only the returned directory writable. It needs the task's active read-only record, lies beside
+    that record in the task store, overlaps neither ``protected`` nor the Fleet store, and is a private directory
+    owned by the dispatcher. An existing one is reused only by a relaunch whose earlier receipt at
+    ``receipt_path`` names the same run and inode.
+    """
+    from lu_machinery.dispatcher import store as task_store
+
+    nonce = record.get("run_nonce")
+    if (record.get("task_id") != task_id or record.get("mode") != "read-only"
+            or record.get("status") not in ("spawning", "running")
+            or not isinstance(nonce, str) or not _REQUEST_ID.fullmatch(nonce)):
+        raise Refused("task artifacts require this read-only run's active task record")
+    record_path = task_store.record_path(task_id)
+    path = record_path.parent.resolve(strict=True) / record_path.with_suffix(".artifacts").name
+    if any(_overlaps(path, other) for other in (*protected, _fleet_plane())):
+        raise Refused("task artifacts overlap Git metadata, the worktree or the Fleet store")
+    try:
+        path.mkdir(mode=0o700)
+    except FileExistsError:
+        created = False
+    else:
+        created = True
+    info = path.lstat()
+    if not (stat.S_ISDIR(info.st_mode) and info.st_uid == os.geteuid() and stat.S_IMODE(info.st_mode) == 0o700):
+        raise Refused("task artifacts are not a private directory owned by the dispatcher")
+    identity = {"run_nonce": nonce, "device": info.st_dev, "inode": info.st_ino}
+    if not created:
+        # A format-correction launch reuses the first launch's artifacts. The receipt is outside its view.
+        try:
+            previous = json_depth.loads(receipt_path.read_text(), max_depth=512)
+        except (OSError, ValueError):
+            previous = None
+        if not isinstance(previous, dict) or previous.get("task_artifacts") != identity:
+            raise Refused("task artifacts already exist without this run's boundary receipt")
+    receipt["task_artifacts"] = identity
+    return path, nonce
+
+
 class _BrokerRefusal(Exception):
     pass
 
@@ -1480,28 +1523,6 @@ class _Boundary:
         # And the start commit's paths below the read paths that the view left out, sorted.
         self.left_out: list[str] = []
 
-    def _artifacts(self, path: Path, nonce: str) -> Path:
-        try:
-            path.mkdir(mode=0o700)
-        except FileExistsError:
-            created = False
-        else:
-            created = True
-        info = path.lstat()
-        if not (stat.S_ISDIR(info.st_mode) and info.st_uid == os.geteuid() and stat.S_IMODE(info.st_mode) == 0o700):
-            raise Refused("task artifacts are not a private directory owned by the dispatcher")
-        identity = {"run_nonce": nonce, "device": info.st_dev, "inode": info.st_ino}
-        if not created:
-            # A format-correction launch reuses the first launch's artifacts. The receipt is outside its view.
-            try:
-                previous = json_depth.loads(Path(self.args.receipt).read_text(), max_depth=512)
-            except (OSError, ValueError):
-                previous = None
-            if not isinstance(previous, dict) or previous.get("task_artifacts") != identity:
-                raise Refused("task artifacts already exist without this run's boundary receipt")
-        self.receipt["task_artifacts"] = identity
-        return path
-
     def run(self) -> int:
         from lu_machinery.agent_runtime.attempt_network import AttemptEgress
 
@@ -1595,18 +1616,10 @@ class _Boundary:
             raise Refused("sources_mcp_required: Ukrainian review needs a Sources MCP projection and relay")
         final_delivery = None
         if self.args.task_artifacts:
-            task_id = self.args.task_id
-            nonce = record.get("run_nonce")
-            if (record.get("task_id") != task_id or record.get("mode") != "read-only"
-                    or record.get("status") not in ("spawning", "running")
-                    or not isinstance(nonce, str) or not _REQUEST_ID.fullmatch(nonce)):
-                raise Refused("task artifacts require this read-only run's active task record")
-            record_path = task_store.record_path(task_id)
-            artifacts = record_path.parent.resolve(strict=True) / record_path.with_suffix(".artifacts").name
-            if any(_overlaps(artifacts, protected) for protected in (common, self.worktree, _fleet_plane())):
-                raise Refused("task artifacts overlap Git metadata, the worktree or the Fleet store")
-            outputs.append(self._artifacts(artifacts, nonce))
-            final_delivery = _final_delivery(record, task_id, nonce)
+            artifacts, nonce = grant_task_artifacts(self.args.task_id, record, Path(self.args.receipt), self.receipt,
+                                                    (common, self.worktree))
+            outputs.append(artifacts)
+            final_delivery = _final_delivery(record, self.args.task_id, nonce)
         credentials = []
         for raw in self.args.credential or []:
             path = Path(raw)
