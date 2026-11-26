@@ -40,6 +40,8 @@ Each row is also served as one selection: `/api/rules?scope=task:<name>` with
 names `repo-change`, `cli`, `curriculum`, `fresh-build`, `routing`, `driver`,
 `fleet-comms`, `review`, `task-family`, `rollover`, `ukrainian` (in row order).
 `_load-via-api.md` lists the same files for offline reads.
+The `ukrainian` selection was ordered by claude-cto on 2026-11-26.
+The loader path grant is approval_ref claude-cto 2026-11-26T11:00:40Z.
 
 The complete Monitor `/api/rules?scope=full&format=markdown` response is available for full
 policy audits, ambiguous cross-cutting tasks, and clients needing the complete
