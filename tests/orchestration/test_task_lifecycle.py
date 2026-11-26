@@ -3745,6 +3745,15 @@ def test_write_lifecycle_and_lock_refuse_direct_task_store_and_load_reads_existi
     too_long = f"{orig_path.parent}{'/' * 5000}{orig_path.name}"
     assert task_closeout.main(["bind-pr", "--state-file", too_long, "--pr", "77", "--now", NOW]) == 2
     assert orig_path.read_bytes() == before
+    # A mutating --state-file is checked as given: a quoted leading "~" is refused, not expanded first
+    # (expansion could shorten a spelling past the length check, PR1484 R1 F4).
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / "closeout.json").write_bytes(before)
+    monkeypatch.setenv("HOME", str(home))
+    assert task_closeout.main(["bind-pr", "--state-file", "~/closeout.json", "--pr", "77", "--now", NOW]) == 2
+    assert (home / "closeout.json").read_bytes() == before
+    assert [path.name for path in home.iterdir()] == ["closeout.json"]
 
     # A dangling symlink outside the store and a directory at the target are refused before any lock or write.
     dangling_outside = tmp_path / "dangling-ledger.json"

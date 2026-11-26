@@ -1007,11 +1007,14 @@ def _state_file(
     args: argparse.Namespace, identity: Mapping[str, Any] | None = None, *, writable: bool = True,
 ) -> Path:
     if args.state_file is not None:
-        # os.path.expanduser leaves an unknown ~user as given (Path.expanduser raises RuntimeError) and the
-        # write-path check refuses it; the string keeps a trailing "/", "/." or "/.." for that check too.
-        raw = os.path.expanduser(args.state_file)
+        raw = args.state_file
         if writable:
+            # Checked exactly as given, as closeout_cli and verify_review check theirs: no "~" expansion or
+            # normalisation first, so a leading "~", a trailing "/" and the length limit apply to the argument.
             task_lifecycle._validate_lifecycle_write_path(raw, label="lifecycle ledger")
+        else:
+            # os.path.expanduser leaves an unknown ~user as given (Path.expanduser raises RuntimeError).
+            raw = os.path.expanduser(raw)
         return Path(os.path.realpath(raw))
     if identity is None:
         raise task_lifecycle.LifecycleError("--state-file is required for this command")
