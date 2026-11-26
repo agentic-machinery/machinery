@@ -9,6 +9,24 @@ this file.
 
 ## [Unreleased]
 
+<a id="v0.1.82"></a>
+## [0.1.82] - 2026-11-26
+
+### Added
+
+- Add loopback ACP discussions reader with JSON-classified redaction and caps ([#1512](https://github.com/agentic-machinery/machinery/pull/1512))
+- Read selected messages and their threads ([#1515](https://github.com/agentic-machinery/machinery/pull/1515))
+
+### Changed
+
+- Fix repository discovery for push and public publication ([#1517](https://github.com/agentic-machinery/machinery/pull/1517))
+
+### Fixed
+
+- Route Ukrainian seats to the shared verify-ukrainian skill ([#1514](https://github.com/agentic-machinery/machinery/pull/1514))
+- Set and verify Latest on promotion ([#1516](https://github.com/agentic-machinery/machinery/pull/1516))
+- Preserve detached canary roots ([#1519](https://github.com/agentic-machinery/machinery/pull/1519))
+
 <a id="v0.1.81"></a>
 ## [0.1.81] - 2026-11-26 [YANKED]
 
@@ -1844,7 +1862,8 @@ First release: the machinery extracted from learn-ukrainian as the installable `
 - Rollover confirms replacement bindings without a self-answered quiz. ([#65](https://github.com/learn-ukrainian/machinery/pull/65))
 - Deploy derives release identity from packaged bytes. ([#145](https://github.com/learn-ukrainian/machinery/pull/145))
 
-[Unreleased]: https://github.com/agentic-machinery/machinery/compare/v0.1.81...HEAD
+[Unreleased]: https://github.com/agentic-machinery/machinery/compare/v0.1.82...HEAD
+[0.1.82]: https://github.com/agentic-machinery/machinery/compare/v0.1.79...v0.1.82
 [0.1.81]: https://github.com/agentic-machinery/machinery/compare/v0.1.79...v0.1.81
 [0.1.80]: https://github.com/agentic-machinery/machinery/compare/v0.1.79...v0.1.80
 [0.1.79]: https://github.com/agentic-machinery/machinery/compare/v0.1.78...v0.1.79
