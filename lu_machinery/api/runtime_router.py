@@ -1630,7 +1630,35 @@ def _open_acp_transcript_store(ctx: MonitorContext) -> tuple[Path, SQLiteConnect
     if not has_tables:
         connection.close()
         raise _AcpBackendUnavailable("schema_unavailable")
+    try:
+        cas_fd = _open_acp_cas_sha256_dir(plane_root)
+    except _AcpBackendUnavailable:
+        connection.close()
+        raise
+    os.close(cas_fd)
     return plane_root, connection
+
+
+def _open_acp_cas_sha256_dir(plane_root: Path) -> int:
+    """Open ``plane_root/blobs/sha256`` without following symlinks, raising typed 503 on failure."""
+    cloexec = getattr(os, "O_CLOEXEC", 0)
+    dir_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | cloexec
+    try:
+        parent_fd = os.open(plane_root, os.O_RDONLY | os.O_DIRECTORY | cloexec)
+    except OSError:
+        raise _AcpBackendUnavailable("blob_store_unavailable") from None
+    try:
+        for part in ("blobs", "sha256"):
+            try:
+                next_fd = os.open(part, dir_flags, dir_fd=parent_fd)
+            except OSError:
+                raise _AcpBackendUnavailable("blob_store_unavailable") from None
+            os.close(parent_fd)
+            parent_fd = next_fd
+        return parent_fd
+    except BaseException:
+        os.close(parent_fd)
+        raise
 
 
 def _open_acp_blob_no_follow(plane_root: Path, sha256: str) -> int:
@@ -1644,18 +1672,8 @@ def _open_acp_blob_no_follow(plane_root: Path, sha256: str) -> int:
     cloexec = getattr(os, "O_CLOEXEC", 0)
     dir_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | cloexec
     file_flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | cloexec
+    parent_fd = _open_acp_cas_sha256_dir(plane_root)
     try:
-        parent_fd = os.open(plane_root, os.O_RDONLY | os.O_DIRECTORY | cloexec)
-    except OSError:
-        raise _AcpBackendUnavailable("blob_store_unavailable") from None
-    try:
-        for part in ("blobs", "sha256"):
-            try:
-                next_fd = os.open(part, dir_flags, dir_fd=parent_fd)
-            except OSError:
-                raise _AcpBackendUnavailable("blob_store_unavailable") from None
-            os.close(parent_fd)
-            parent_fd = next_fd
         try:
             shard_fd = os.open(sha256[:2], dir_flags, dir_fd=parent_fd)
         except FileNotFoundError:
@@ -1838,7 +1856,8 @@ def _acp_transcript_entries(
         """
         SELECT messages.message_id, messages.kind, messages.sender, messages.recipient,
                messages.body_inline, messages.body_artifact_id, messages.content_sha256,
-               messages.created_at, event_round.round, event_round.round_invalid
+               messages.created_at, event_round.round, event_round.round_invalid,
+               event_round.non_synthesis_events
         FROM (
             SELECT message_id, MIN(sequence) AS message_sequence,
                    CASE
@@ -1855,7 +1874,16 @@ def _acp_transcript_entries(
                             AND MIN(round) = MAX(round)
                        THEN 0
                        ELSE 1
-                   END AS round_invalid
+                   END AS round_invalid,
+                   SUM(
+                       CASE
+                           WHEN typeof(event_type) = 'text'
+                                AND LOWER(REPLACE(TRIM(event_type), '-', '_'))
+                                    IN ('synthesis', 'synthesis_complete', 'synthesis_terminal')
+                           THEN 0
+                           ELSE 1
+                       END
+                   ) AS non_synthesis_events
             FROM acp_conversation_events
             WHERE conversation_id = ? AND message_id IS NOT NULL
             GROUP BY message_id
@@ -1879,6 +1907,7 @@ def _acp_transcript_entries(
 
     for index, row in enumerate(rows, start=1):
         round_invalid = bool(row["round_invalid"])
+        non_synthesis_events = int(row["non_synthesis_events"] or 0)
         round_number = None if round_invalid else _acp_int(row["round"], minimum=1)
         if not round_invalid and row["round"] is not None and round_number is None:
             round_invalid = True
@@ -1894,6 +1923,8 @@ def _acp_transcript_entries(
             sender = _acp_text(row["sender"], allowed=allowed_lanes)
             recipient = _acp_text(row["recipient"], allowed=allowed_lanes)
             created_at = _acp_timestamp(row["created_at"])
+            if round_number is None and (non_synthesis_events > 0 or kind != "synthesis"):
+                round_invalid = True
             if round_invalid or None in (kind, sender, recipient, created_at):
                 state = _ACP_TRANSCRIPT_STATE_MISSING_OR_CORRUPT
                 reason = "malformed_turn_metadata"
