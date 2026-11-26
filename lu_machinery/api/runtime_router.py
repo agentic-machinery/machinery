@@ -1370,36 +1370,161 @@ def get_acp_conversation(conversation_id: str, *, ctx: MonitorContext) -> dict[s
         connection.close()
 
 
-def _acp_transcript_client_is_loopback(request: Request) -> bool:
-    """Accept only direct loopback peers addressed through a loopback host.
+_ACP_TRANSCRIPT_ALLOWED_FETCH_SITES = frozenset({"same-origin", "none"})
 
-    ``request.client`` is supplied by the accepted connection, rather than a
-    forwarding header. Requiring a loopback URL host as well closes the usual
-    DNS-rebinding path from a non-local browser origin.
+
+def _is_loopback_ip(address: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    mapped = getattr(address, "ipv4_mapped", None)
+    # ipaddress.{IPv4,IPv6}Address.is_loopback is a boolean property, not a method.
+    return address.is_loopback or bool(mapped and mapped.is_loopback)  # nosemgrep: python.lang.maintainability.is-function-without-parentheses
+
+
+def _whatwg_ipv6_serialize(address: ipaddress.IPv6Address) -> str:
+    """Serialize an IPv6 address using the WHATWG URL Standard IPv6 serializer.
+
+    Browsers serialize IPv4-mapped IPv6 addresses as hex hextets
+    (``::ffff:7f00:1``) rather than Python's dotted-quad form
+    (``::ffff:127.0.0.1``).
     """
+    value = int(address)
+    pieces = [(value >> (16 * (7 - index))) & 0xFFFF for index in range(8)]
+    best_start = -1
+    best_len = 1
+    cur_start = -1
+    cur_len = 0
+    for index, piece in enumerate(pieces):
+        if piece == 0:
+            if cur_start == -1:
+                cur_start = index
+                cur_len = 1
+            else:
+                cur_len += 1
+            if cur_len > best_len:
+                best_start = cur_start
+                best_len = cur_len
+        else:
+            cur_start = -1
+            cur_len = 0
+    compress = best_start if best_len > 1 else None
+    out: list[str] = []
+    ignore0 = False
+    for index, piece in enumerate(pieces):
+        if ignore0 and piece == 0:
+            continue
+        if ignore0:
+            ignore0 = False
+        if compress == index:
+            out.append("::" if index == 0 else ":")
+            ignore0 = True
+            continue
+        out.append(f"{piece:x}")
+        if index != 7:
+            out.append(":")
+    return "".join(out)
+
+
+def _bound_acp_listener(request: Request) -> tuple[str, str] | None:
+    """Return ``(expected_host, exact_origin)`` for the local loopback HTTP listener.
+
+    Reads the accepted connection's local interface and effective port from ASGI
+    ``scope["server"]`` (which Uvicorn populates from ``socket.getsockname()``,
+    independent of HTTP headers), so alternate loopback ports (such as
+    ``launchd_supervisor start --port``) and IPv6 / IPv4-mapped loopback listeners
+    authorize their own exact authority without extra launcher plumbing. Fails
+    closed (returns ``None``) if ``scope["server"]`` is absent, malformed, or
+    non-loopback.
+    """
+    server = request.scope.get("server")
+    if not isinstance(server, (tuple, list)) or len(server) != 2:
+        return None
+    raw_host, raw_port = server
+    if (
+        not isinstance(raw_host, str)
+        or not isinstance(raw_port, int)
+        or isinstance(raw_port, bool)
+        or not (1 <= raw_port <= 65535)
+    ):
+        return None
+    if not raw_host or any(ord(ch) <= 0x20 or ord(ch) >= 0x7F or ch in "/?#@\\%" for ch in raw_host):
+        return None
+    if raw_host.startswith("[") or raw_host.endswith("]"):
+        if not (raw_host.startswith("[") and raw_host.endswith("]")):
+            return None
+        try:
+            address: ipaddress.IPv4Address | ipaddress.IPv6Address = ipaddress.IPv6Address(raw_host[1:-1])
+        except ValueError:
+            return None
+    else:
+        try:
+            address = ipaddress.ip_address(raw_host)
+        except ValueError:
+            return None
+    if isinstance(address, ipaddress.IPv6Address) and address.scope_id is not None:
+        return None
+    if not _is_loopback_ip(address):
+        return None
+    if isinstance(address, ipaddress.IPv6Address):
+        authority_host = f"[{_whatwg_ipv6_serialize(address)}]"
+    else:
+        authority_host = address.compressed
+    if raw_port == 80:
+        return authority_host, f"http://{authority_host}"
+    authority = f"{authority_host}:{raw_port}"
+    return authority, f"http://{authority}"
+
+
+def _acp_transcript_access_refusal(request: Request) -> str | None:
+    """Return a typed refusal reason when the request violates the local-listener boundary.
+
+    Returns ``None`` only when:
+    - the bound ASGI listener in ``scope["server"]`` is a valid loopback HTTP listener,
+    - no ``Forwarded`` or ``X-Forwarded-*`` header is present,
+    - ``request.client`` is a direct loopback IP,
+    - the request scheme is ``http`` and exactly one raw ``Host`` matches the bound listener,
+    - any ``Origin`` header is singular and equals that exact origin (scheme, host, port), and
+    - any ``Sec-Fetch-Site`` header is singular and in ``{"same-origin", "none"}``.
+    """
+    listener = _bound_acp_listener(request)
+    if listener is None:
+        return "invalid_listener"
+    expected_host, expected_origin = listener
+
+    hosts: list[str] = []
+    origins: list[str] = []
+    fetch_sites: list[str] = []
+    for raw_name, raw_value in request.headers.raw:
+        name = raw_name.decode("latin-1").strip().lower()
+        if name == "forwarded" or name.startswith("x-forwarded-"):
+            return "forwarding_header_present"
+        if name == "host":
+            hosts.append(raw_value.decode("latin-1"))
+        elif name == "origin":
+            origins.append(raw_value.decode("latin-1"))
+        elif name == "sec-fetch-site":
+            fetch_sites.append(raw_value.decode("latin-1"))
+
     client = request.client
     client_host = client.host if client else None
     if not isinstance(client_host, str):
-        return False
+        return "non_loopback_peer"
     try:
         client_address = ipaddress.ip_address(client_host)
     except ValueError:
-        return False
-    client_mapped = getattr(client_address, "ipv4_mapped", None)
-    if not client_address.is_loopback and not (client_mapped and client_mapped.is_loopback):
-        return False
+        return "non_loopback_peer"
+    if isinstance(client_address, ipaddress.IPv6Address) and client_address.scope_id is not None:
+        return "non_loopback_peer"
+    if not _is_loopback_ip(client_address):
+        return "non_loopback_peer"
 
-    url_host = request.url.hostname
-    if url_host == "localhost":
-        return True
-    if not isinstance(url_host, str):
-        return False
-    try:
-        url_address = ipaddress.ip_address(url_host)
-    except ValueError:
-        return False
-    url_mapped = getattr(url_address, "ipv4_mapped", None)
-    return url_address.is_loopback or bool(url_mapped and url_mapped.is_loopback)
+    if request.scope.get("scheme") != "http":
+        return "invalid_scheme"
+    if len(hosts) != 1 or hosts[0] != expected_host:
+        return "invalid_host"
+    if len(origins) > 1 or (len(origins) == 1 and origins[0] != expected_origin):
+        return "invalid_origin"
+    if len(fetch_sites) > 1 or (len(fetch_sites) == 1 and fetch_sites[0] not in _ACP_TRANSCRIPT_ALLOWED_FETCH_SITES):
+        return "cross_site_request"
+    return None
 
 
 def _acp_transcript_body(value: Any, *, remaining_bytes: int) -> str | None:
@@ -1544,8 +1669,13 @@ async def runtime_acp_conversation_transcript(
 ):
     """Read body-inline ACP content for the local UI only; never mutate storage."""
     no_store = {"Cache-Control": "no-store"}
-    if not _acp_transcript_client_is_loopback(request):
-        return JSONResponse(status_code=403, content={"detail": "Forbidden"}, headers=no_store)
+    refusal = _acp_transcript_access_refusal(request)
+    if refusal is not None:
+        return JSONResponse(
+            status_code=403,
+            content={"detail": "Forbidden", "reason": refusal},
+            headers=no_store,
+        )
     transcript = await asyncio.to_thread(get_acp_conversation_transcript, conversation_id, ctx=ctx)
     if transcript is None:
         return JSONResponse(
