@@ -28,6 +28,7 @@ _QUOTED_VALUES = {
 }
 _SINGLE_QUOTED_EQUALS_VALUE = re.compile(r"'(?:\\[\s\S]|''|[^'\\])*'")
 _LINE_END = re.compile(r"[\r\n]")
+_PORT_DIGITS = re.compile(r"[0-9]+")
 
 # A private-key block runs from a BEGIN header to the first END footer after
 # it. Header and footer are searched separately: one lazy regex rescans to the
@@ -315,11 +316,13 @@ def _redact_assignments(text: str) -> str:
             continue
         while match.start() >= authority[1]:
             authority = next(authorities, (len(text), len(text)))
+        # Test the rest of the authority in place: copying it for every
+        # assignment inside one authority is quadratic.
         if (match.group("separator") == ":"
-                and authority[0] <= match.start() < match.end() < authority[1]):
-            tail = text[match.end():authority[1]]
-            if (tail.isascii() and tail.isdecimal()) or tail.startswith(REDACTION + "@"):
-                continue
+                and authority[0] <= match.start() < match.end() < authority[1]
+                and (_PORT_DIGITS.fullmatch(text, match.end(), authority[1])
+                     or text.startswith(REDACTION + "@", match.end(), authority[1]))):
+            continue
         start = match.end()
         if start == len(text):
             continue
