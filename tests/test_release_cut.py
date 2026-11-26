@@ -838,6 +838,7 @@ def test_only_a_bump_since_a_full_release_still_skips(tmp_path, monkeypatch):
 def test_consumer_collection_names_the_candidate_interpreter(monkeypatch, tmp_path):
     """Defect class: collection inherits the caller's LEARN_UKRAINIAN_PYTHON; unset, 43 product modules fail to import."""
     monkeypatch.delenv("LEARN_UKRAINIAN_PYTHON", raising=False)
+    monkeypatch.setenv("LU_PYTHON", str(tmp_path / "host-python"))
     site, product, candidate = tmp_path / "site", tmp_path / "product", tmp_path / "accept/bin/python"
     site.mkdir()
     cut = Cut(work=tmp_path, dry_run=True, machinery_remote="", product_remote="", machinery_repo="learn-ukrainian/machinery",
@@ -858,6 +859,7 @@ def test_consumer_collection_names_the_candidate_interpreter(monkeypatch, tmp_pa
     cut.run = run
     assert cut.consumer_collection(candidate, product) == "44149 tests collected"
     assert [(env["LEARN_UKRAINIAN_PYTHON"], env["LU_PRODUCT_ROOT"]) for env in collected] == [(str(candidate), str(product))]
+    assert "LU_PYTHON" not in collected[0]
 
 
 @pytest.fixture
@@ -1335,6 +1337,15 @@ def test_publisher_uses_release_interpreter_not_stale_host_python(tmp_path, monk
     fleet.mkdir()
     primary = fleet / "learn-ukrainian"
     _init_repo(primary)
+    state = tmp_path / "state"
+    state.mkdir()
+    monkeypatch.delenv("LU_FLEET_REPO_SELECTOR_FILE", raising=False)
+    monkeypatch.delenv("LEARN_UKRAINIAN_PRIMARY_REPO_ROOT", raising=False)
+    monkeypatch.delenv("LU_TASKS_DIR", raising=False)
+    monkeypatch.setenv("LU_PRIMARY_REPO_ROOT", f"{primary}/")
+    monkeypatch.setenv("LU_STATE_ROOT", str(state))
+    monkeypatch.setenv("LU_PRODUCT_ROOT", str(product_seed))
+    monkeypatch.setenv("LU_GITHUB_SLUG", "learn-ukrainian/learn-ukrainian.github.io")
     sibling_machinery = fleet / "machinery"
     _init_repo(sibling_machinery)
     host_log = tmp_path / "host-publish.log"
@@ -1369,7 +1380,7 @@ def test_publisher_uses_release_interpreter_not_stale_host_python(tmp_path, monk
         '[ "${1:-}" = "-I" ] || { printf "missing -I: %s\\n" "$*" >&2; exit 11; }\n'
         '[ "${2:-}" = "-m" ] && [ "${3:-}" = "lu_machinery.publish" ] || { printf "bad module: %s\\n" "$*" >&2; exit 12; }\n'
         f'[ "${{LEARN_UKRAINIAN_PRIMARY_REPO_ROOT:-}}" = {shlex.quote(str(primary))} ] || {{ printf "bad primary=%s\\n" "${{LEARN_UKRAINIAN_PRIMARY_REPO_ROOT:-}}" >&2; exit 14; }}\n'
-        f'[ "${{LU_PRODUCT_ROOT:-}}" = {shlex.quote(str(primary))} ] || {{ printf "bad product=%s\\n" "${{LU_PRODUCT_ROOT:-}}" >&2; exit 15; }}\n'
+        f'[ "${{LU_PRODUCT_ROOT:-}}" = {shlex.quote(str(product_seed))} ] || {{ printf "bad product=%s\\n" "${{LU_PRODUCT_ROOT:-}}" >&2; exit 15; }}\n'
         'if [ -e "$venv_root/lib/python3.14/site-packages/zz-release-cut-consumer.pth" ]; then\n'
         '  printf "contaminated publisher venv: overlay present\\n" >&2; exit 16\n'
         "fi\n"
@@ -1459,6 +1470,7 @@ def test_publisher_uses_release_interpreter_not_stale_host_python(tmp_path, monk
     pub_argv, pub_env = cut.publisher_invocation("pr-create", "--milestone", "v0.11.0")
     assert pub_argv == [installed, "-I", "-m", "lu_machinery.publish", "pr-create", "--milestone", "v0.11.0"]
     assert "PYTHONPATH" not in pub_env
+    assert repo_root.primary_root(env=pub_env) == primary
     cut.publish(files, "notes\n")
     _stub_adopt_input_refresh(cut, monkeypatch)
     cut.open_adopt_pr(product)
@@ -1477,6 +1489,8 @@ def test_publisher_uses_release_interpreter_not_stale_host_python(tmp_path, monk
     monkeypatch.setattr(cut, "remote_state", lambda: (True, "released", [1275]))
     custom_resume_msg = cut.clean_up("post-release PR")
     quoted_root = shlex.quote(str(primary.absolute()))
+    quoted_product = shlex.quote(str(product_seed))
+    quoted_state = shlex.quote(str(state))
     quoted_host_py = shlex.quote(str(host_python.absolute()))
     assert "--no-alert --machinery-remote <original-machinery-remote>" in custom_resume_msg
     assert str(tmp_path / "machinery.git") not in custom_resume_msg
@@ -1487,16 +1501,14 @@ def test_publisher_uses_release_interpreter_not_stale_host_python(tmp_path, monk
         resume_msg = cut.clean_up("post-release PR")
         default_remote_ctx.setattr(cut, "alert", True)
         alert_on_msg = cut.clean_up("post-release PR")
-    expected_resume = (
-        f"LEARN_UKRAINIAN_PRIMARY_REPO_ROOT={quoted_root} LU_PRODUCT_ROOT={quoted_root} "
-        f"LU_PYTHON={quoted_host_py} "
+    resume_command = resume_msg.partition("then run ")[2]
+    assert resume_command.endswith(
         f"{shlex.quote(str(installed))} -I -m lu_machinery.release_cut post-release "
-        f"--x-agent claude/claude-opus-5-5 --no-alert"
+        "--x-agent claude/claude-opus-5-5 --no-alert"
     )
-    assert expected_resume in resume_msg
     assert "--machinery-remote" not in resume_msg
     assert "--no-alert" not in alert_on_msg
-    # Execute the emitted env-prefixed command in a fresh shell with no root/interpreter env vars inherited and
+    # Execute the emitted command in a shell with stale root/interpreter aliases and
     # no <primary>/.venv/bin/python, exercising real main -> _locked_run -> _run (project_interpreter, resolve_repo,
     # milestone parsing, git identity, lock acquisition) and stubbing only the live open_post_release call.
     assert not (primary / ".venv/bin/python").exists()
@@ -1510,9 +1522,12 @@ def test_publisher_uses_release_interpreter_not_stale_host_python(tmp_path, monk
         f"sys.path.insert(0, {str(pkg_parent)!r})\n"
         "from pathlib import Path\n"
         "from lu_machinery import release_cut\n"
+        "from lu_machinery.common.repo_root import configured_github_slug, state_root\n"
         "def stub_open_post_release(probe_cut):\n"
         f"    assert probe_cut.primary.resolve() == Path({str(primary)!r}).resolve()\n"
         f"    assert probe_cut.host_python == Path({str(host_python.absolute())!r})\n"
+        f"    assert state_root() == Path({str(state)!r})\n"
+        "    assert configured_github_slug() == 'learn-ukrainian/learn-ukrainian.github.io'\n"
         "    assert probe_cut.x_agent == 'claude/claude-opus-5-5'\n"
         "    assert probe_cut.alert is False\n"
         "    print('RUN_OK', probe_cut.host_python, probe_cut.x_agent, probe_cut.alert)\n"
@@ -1527,16 +1542,15 @@ def test_publisher_uses_release_interpreter_not_stale_host_python(tmp_path, monk
         encoding="utf-8",
     )
     probe_runner.chmod(0o755)
-    emitted_for_probe = expected_resume.replace(shlex.quote(str(installed)), shlex.quote(str(probe_runner)), 1)
-    clean_shell_env = {
-        key: value for key, value in os.environ.items()
-        if key not in {
-            "LEARN_UKRAINIAN_PRIMARY_REPO_ROOT", "LU_PRIMARY_REPO_ROOT", "LU_PRODUCT_ROOT",
-            "LU_PYTHON", "LEARN_UKRAINIAN_PYTHON", "LU_TASKS_DIR",
-            "LU_STATE_ROOT", "LEARN_UKRAINIAN_STATE_ROOT", "LEARN_UKRAINIAN_DISPATCH_TASK_ID",
-        }
-    }
-    clean_shell_env["HOME"] = str(probe_home)
+    emitted_for_probe = resume_command.replace(shlex.quote(str(installed)), shlex.quote(str(probe_runner)), 1)
+    clean_shell_env = dict(os.environ)
+    clean_shell_env.pop("LEARN_UKRAINIAN_DISPATCH_TASK_ID", None)
+    clean_shell_env.update(
+        HOME=str(probe_home), LU_PRIMARY_REPO_ROOT=str(sibling_machinery),
+        LEARN_UKRAINIAN_PYTHON=str(tmp_path / "old-python"),
+        LEARN_UKRAINIAN_STATE_ROOT=str(primary),
+        LEARN_UKRAINIAN_GITHUB_SLUG="example/old-product",
+    )
     probe_result = subprocess.run(
         ["/bin/sh", "-c", emitted_for_probe], cwd=tmp_path, env=clean_shell_env,
         capture_output=True, text=True, check=False, timeout=30,
@@ -1596,8 +1610,9 @@ def test_publisher_uses_release_interpreter_not_stale_host_python(tmp_path, monk
         manual_line = err_text.splitlines()[-1].strip()
         assert manual_line in out_text
         assert f"LEARN_UKRAINIAN_PRIMARY_REPO_ROOT={quoted_root}" in manual_line
-        assert f"LU_PRODUCT_ROOT={quoted_root}" in manual_line
+        assert f"LU_PRODUCT_ROOT={quoted_product}" in manual_line
         assert f"LU_PYTHON={quoted_host_py}" in manual_line
+        assert f"LU_STATE_ROOT={quoted_state}" in manual_line
         assert f"--body-file {shlex.quote(str((work / 'post-release-body.md').absolute()))}" in manual_line
         assert (work / "post-release-body.md").is_file()
     manual_result = subprocess.run(
