@@ -377,7 +377,7 @@ def test_single_family_branch_agrees_across_selector_and_recorder(repo, tasks, m
     }
     monkeypatch.setattr(recorder, "load_fleet_repos", lambda: catalog)
     monkeypatch.setattr(target_resolution, "load_fleet_repos", lambda: catalog)
-    monkeypatch.setattr(fleet_repos, "load_fleet_repos", lambda: catalog)
+    monkeypatch.setattr(fleet_repos, "load_fleet_repos", lambda path=None: catalog)
     posted = []
     # The CLI reads canonical provenance while Git history and citations use the target.
     assert record_verdict(
