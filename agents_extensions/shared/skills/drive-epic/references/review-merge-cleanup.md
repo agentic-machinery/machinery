@@ -126,10 +126,11 @@ read-only dispatch (#8703; [accepted wording](../../review-loop/references/brief
      neither introduces, exposes nor worsens (a pre-existing defect, a real sibling or an
      unrelated discovery);
    - `stop_and_escalate` — material contract ambiguity, or a fix that would trip a breaker.
-5. **Reviewer duties** — apply the
-   [policy's section 3](../../review-loop/references/policy.md#3-findings) in full: its finding
-   IDs, its class sweep before returning a round that reports a new finding or leaves one open,
-   and its threat-model rules for follow-ups and exclusions. Every P0–P2 finding cites
+5. **Reviewer duties** — one finding per root cause and violated invariant, as the
+   [policy's section 3](../../review-loop/references/policy.md#3-findings) sets out. In a code
+   or infra review, its class sweep before returning a round that reports a new finding or
+   leaves one open, and its threat-model rules for follow-ups and exclusions, apply too; a
+   Ukrainian review follows the Ukrainian content variant below. Every P0–P2 finding cites
    `sources` that show its trigger is reachable under the input contract; a reviewer who cannot
    establish reachability says so. Each blocker states the demonstrated failure, its impact and
    the required corrected behaviour; a code fix is a suggestion. Demonstrated material
