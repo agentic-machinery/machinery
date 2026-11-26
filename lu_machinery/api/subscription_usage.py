@@ -712,7 +712,7 @@ def _window_from_used_pct(used_pct: float, *, window_minutes: int, resets_at: st
 
 def _probe_claude_native(*, timeout_s: float, account: str = "a", include_stale: bool = False) -> dict[str, Any]:
     """Project one account's measured sample; never make another provider request."""
-    from lu_machinery.api.claude_account_usage import claude_accounts_snapshot  # noqa: PLC0415  # lazy-ok: import cycle
+    from lu_machinery.api.claude_account_usage import claude_accounts_snapshot  # noqa: PLC0415, I001  # lazy-ok: import cycle
 
     row = claude_accounts_snapshot(include_provider_usage=True)[f"claude:{account}"]
     if row["status"] != "ok" and not (include_stale and row["status"] == "stale"):
@@ -2169,7 +2169,7 @@ SUBSCRIPTION_REFRESH_KEYS: tuple[str, ...] = tuple(
 def _refresh_claude_accounts_live() -> None:
     """The sole machinery reader for all Claude subscription accounts."""
     # The per-account module reads this module's CodexBar helpers, so a top-level import is a cycle.
-    from lu_machinery.api.claude_account_usage import refresh_claude_account_usage  # noqa: PLC0415  # lazy-ok: import cycle
+    from lu_machinery.api.claude_account_usage import refresh_claude_account_usage  # noqa: PLC0415, I001  # lazy-ok: import cycle
 
     refresh_claude_account_usage()
 
