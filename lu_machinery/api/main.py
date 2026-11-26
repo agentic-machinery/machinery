@@ -13,7 +13,6 @@ import importlib.metadata
 import logging
 import mimetypes
 import os
-import posixpath
 import re
 import socket
 import stat
@@ -2053,12 +2052,13 @@ _ACP_TRANSCRIPT_PATH_REGEX = compile_path("/api/runtime/acp/conversations/{conve
 
 
 def _is_acp_transcript_path(scope: Scope) -> bool:
-    """Return True when ``scope`` targets the mounted ACP transcript route.
+    """Return True when ``scope`` targets or slash-redirects to the mounted ACP transcript route.
 
-    Uses Starlette's ``get_route_path`` and ``compile_path`` regex so single-segment
-    matching, trailing-slash redirection, dot-segments, and regex end-of-string
-    semantics (including decoded trailing newlines) stay aligned with FastAPI routing
-    without stripping CORS from unrelated routes.
+    Uses Starlette's ``get_route_path`` and ``compile_path`` regex on the decoded
+    path (plus trailing-slash stripping for ``redirect_slashes``) so single-segment
+    matching, ``root_path``, and regex end-of-string semantics (including decoded
+    trailing newlines) stay aligned with FastAPI routing without collapsing distinct
+    contributed routes.
     """
     raw_path = scope.get("path")
     if not isinstance(raw_path, str) or not raw_path:
@@ -2066,13 +2066,11 @@ def _is_acp_transcript_path(scope: Scope) -> bool:
     route_path = get_route_path(scope)
     if not route_path:
         return False
-    candidates = {route_path}
-    if route_path.startswith("/"):
-        candidates.add(posixpath.normpath("/" + route_path.lstrip("/")))
-    for candidate in list(candidates):
-        if candidate.endswith("/") and candidate != "/":
-            candidates.add(candidate.rstrip("/"))
-    return any(_ACP_TRANSCRIPT_PATH_REGEX.match(candidate) is not None for candidate in candidates)
+    if _ACP_TRANSCRIPT_PATH_REGEX.match(route_path) is not None:
+        return True
+    if route_path.endswith("/") and route_path != "/":
+        return _ACP_TRANSCRIPT_PATH_REGEX.match(route_path.rstrip("/")) is not None
+    return False
 
 
 class _ScopedCORSMiddleware(CORSMiddleware):

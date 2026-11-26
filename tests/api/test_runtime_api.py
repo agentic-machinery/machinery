@@ -505,12 +505,13 @@ def test_acp_transcript_refuses_foreign_origin_and_omits_cors(tmp_path, monkeypa
     )
     assert runtime_router._acp_transcript_access_refusal(dup_fetch_site) == "cross_site_request"
 
-    # Cover canonical path, trailing slash, dot-segment, and decoded terminal newline (%0a) routed by FastAPI.
+    # Cover canonical path, trailing slash, decoded terminal newline (%0a), slash-redirected %0a/, and percent-encoding.
     for preflight_path in (
         url,
         f"{url}/",
         f"{url}%0a",
-        "/api/runtime/acp/conversations/conv-guarded/./transcript",
+        f"{url}%0a/",
+        "/api/runtime/acp/conversations/%63onv-guarded/%74ranscript",
     ):
         preflight = local.options(
             preflight_path,
@@ -529,7 +530,8 @@ def test_acp_transcript_refuses_foreign_origin_and_omits_cors(tmp_path, monkeypa
     assert "access-control-allow-origin" not in newline_get.headers
     assert "access-control-allow-credentials" not in newline_get.headers
 
-    # Other Monitor routes (body-free ACP routes, ID named "transcript", and extra-segment routes) keep existing CORS.
+    # Other Monitor routes (body-free ACP routes, ID named "transcript", and extra-segment routes including dot-segments)
+    # keep existing CORS.
     for other_path in ("/api/runtime/acp/conversations", "/api/runtime/acp/conversations/transcript"):
         other = local.get(other_path, headers={"Origin": "https://viewer.example"})
         assert other.headers.get("access-control-allow-origin") == "https://viewer.example"
@@ -548,13 +550,23 @@ def test_acp_transcript_refuses_foreign_origin_and_omits_cors(tmp_path, monkeypa
     extra_client = TestClient(
         extra_app, raise_server_exceptions=False, client=("127.0.0.1", 50000), base_url=_LISTENER_ORIGIN
     )
-    extra_resp = extra_client.get(
-        "/api/runtime/acp/conversations/team/item-1/transcript",
-        headers={"Origin": "https://viewer.example"},
-    )
-    assert extra_resp.status_code == 200
-    assert extra_resp.headers.get("access-control-allow-origin") == "https://viewer.example"
-    assert extra_resp.headers.get("access-control-allow-credentials") == "true"
+    for contributed_path, expected_item in (
+        ("/api/runtime/acp/conversations/team/item-1/transcript", "item-1"),
+        ("/api/runtime/acp/conversations/team/.%2ftranscript", "."),
+        ("/api/runtime/acp/conversations/team/..%2ftranscript", ".."),
+    ):
+        extra_resp = extra_client.get(contributed_path, headers={"Origin": "https://viewer.example"})
+        assert extra_resp.status_code == 200, contributed_path
+        assert extra_resp.json() == {"group": "team", "item": expected_item}
+        assert extra_resp.headers.get("access-control-allow-origin") == "https://viewer.example"
+        assert extra_resp.headers.get("access-control-allow-credentials") == "true"
+        extra_preflight = extra_client.options(
+            contributed_path,
+            headers={"Origin": "https://viewer.example", "Access-Control-Request-Method": "GET"},
+        )
+        assert extra_preflight.status_code == 200, contributed_path
+        assert extra_preflight.headers.get("access-control-allow-origin") == "https://viewer.example"
+        assert extra_preflight.headers.get("access-control-allow-credentials") == "true"
 
 
 def test_acp_transcript_refuses_mismatched_missing_or_duplicate_host(tmp_path, monkeypatch):
