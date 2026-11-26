@@ -105,6 +105,7 @@ def _write_acp_db(
             """
         )
         if include_artifact_tables:
+            (root / "blobs" / "sha256").mkdir(parents=True, exist_ok=True)
             connection.executescript(
                 """
                 CREATE TABLE artifacts (
@@ -1279,6 +1280,7 @@ def test_acp_transcript_state_missing_or_corrupt_covers_blobs_turns_and_particip
             ("reply", "codex", "root", "poisoned metadata body", 1),
             ("reply", "claude", "root", "overflow timestamp body", 1),
             ("reply", "codex", "root", "broken round body", 1),
+            ("reply", "claude", "root", "null round call body", 1),
             ("synthesis", "codex", "root", "valid synthesis without round", None),
         ],
     )
@@ -1320,10 +1322,14 @@ def test_acp_transcript_state_missing_or_corrupt_covers_blobs_turns_and_particip
             "UPDATE comms_messages SET created_at = '0001-01-01T00:00:00+00:01' WHERE message_id = ?",
             (records[6][0],),
         )
-        # 5c. Non-integer event round on turn 8 (PR1498-F4).
+        # 5c. Non-integer event round on turn 8 and NULL round on round-bound CALL_TERMINAL turn 9 (PR1498-F4).
         conn.execute(
             "UPDATE acp_conversation_events SET round = 'broken-round' WHERE message_id = ?",
             (records[7][0],),
+        )
+        conn.execute(
+            "UPDATE acp_conversation_events SET round = NULL WHERE message_id = ?",
+            (records[8][0],),
         )
         # 6. Dangling event referencing a missing comms_messages row.
         conn.execute(
@@ -1348,12 +1354,12 @@ def test_acp_transcript_state_missing_or_corrupt_covers_blobs_turns_and_particip
     data = resp.json()
     assert data["state"] == "missing_or_corrupt"
     assert data["label"] == "missing or corrupt"
-    assert len(data["messages"]) == 10
+    assert len(data["messages"]) == 11
     assert data["messages"][0]["state"] == "ok"
     assert data["messages"][0]["body"] == "healthy turn"
-    assert data["messages"][8]["state"] == "ok"
-    assert data["messages"][8]["body"] == "valid synthesis without round"
-    assert "round" not in data["messages"][8]
+    assert data["messages"][9]["state"] == "ok"
+    assert data["messages"][9]["body"] == "valid synthesis without round"
+    assert "round" not in data["messages"][9]
     expected_reasons = [
         (1, "blob_missing"),
         (2, "blob_digest_mismatch"),
@@ -1362,7 +1368,8 @@ def test_acp_transcript_state_missing_or_corrupt_covers_blobs_turns_and_particip
         (5, "malformed_turn_metadata"),
         (6, "malformed_turn_metadata"),
         (7, "malformed_turn_metadata"),
-        (9, "message_row_missing"),
+        (8, "malformed_turn_metadata"),
+        (10, "message_row_missing"),
     ]
     for idx, expected_reason in expected_reasons:
         turn = data["messages"][idx]
@@ -1371,6 +1378,7 @@ def test_acp_transcript_state_missing_or_corrupt_covers_blobs_turns_and_particip
         assert turn["reason"] == expected_reason, (idx, turn)
         assert turn["body"] is None, (idx, turn)
     assert "round" not in data["messages"][7]
+    assert "round" not in data["messages"][8]
     for forbidden in (
         unlinked_secret,
         tampered_secret,
@@ -1378,6 +1386,7 @@ def test_acp_transcript_state_missing_or_corrupt_covers_blobs_turns_and_particip
         "poisoned metadata body",
         "overflow timestamp body",
         "broken round body",
+        "null round call body",
     ):
         assert forbidden not in resp.text
 
@@ -1534,32 +1543,35 @@ def test_acp_transcript_state_backend_unavailable_returns_503_and_reserves_404(t
     )
     import shutil
 
-    # 5a. Missing blobs/sha256 directory -> 503.
+    # 5a. Missing blobs/sha256 directory -> 503 for BOTH existing and unknown conversation IDs.
     (bad_blobs_root / "blobs" / "sha256").rename(bad_blobs_root / "blobs" / "sha256-moved")
     monkeypatch.setenv("FLEET_COMMS_ROOT", str(bad_blobs_root))
-    missing_sha_dir_resp = local.get(f"/api/runtime/acp/conversations/{conv_bad_dir}/transcript")
-    assert missing_sha_dir_resp.status_code == 503
-    assert missing_sha_dir_resp.headers["cache-control"] == "no-store"
-    assert missing_sha_dir_resp.json()["state"] == "backend_unavailable"
-    assert missing_sha_dir_resp.json()["reason"] == "blob_store_unavailable"
+    for target_id in (conv_bad_dir, "unknown-id"):
+        missing_sha_dir_resp = local.get(f"/api/runtime/acp/conversations/{target_id}/transcript")
+        assert missing_sha_dir_resp.status_code == 503
+        assert missing_sha_dir_resp.headers["cache-control"] == "no-store"
+        assert missing_sha_dir_resp.json()["state"] == "backend_unavailable"
+        assert missing_sha_dir_resp.json()["reason"] == "blob_store_unavailable"
 
-    # 5b. Missing blobs directory (renamed aside) -> 503.
+    # 5b. Missing blobs directory (renamed aside) -> 503 for BOTH existing and unknown IDs.
     (bad_blobs_root / "blobs").rename(bad_blobs_root / "blobs-moved")
-    missing_blobs_resp = local.get(f"/api/runtime/acp/conversations/{conv_bad_dir}/transcript")
-    assert missing_blobs_resp.status_code == 503
-    assert missing_blobs_resp.headers["cache-control"] == "no-store"
-    assert missing_blobs_resp.json()["state"] == "backend_unavailable"
-    assert missing_blobs_resp.json()["reason"] == "blob_store_unavailable"
+    for target_id in (conv_bad_dir, "unknown-id"):
+        missing_blobs_resp = local.get(f"/api/runtime/acp/conversations/{target_id}/transcript")
+        assert missing_blobs_resp.status_code == 503
+        assert missing_blobs_resp.headers["cache-control"] == "no-store"
+        assert missing_blobs_resp.json()["state"] == "backend_unavailable"
+        assert missing_blobs_resp.json()["reason"] == "blob_store_unavailable"
 
-    # 5c. Regular file in place of blobs directory (ENOTDIR) -> 503.
+    # 5c. Regular file in place of blobs directory (ENOTDIR) -> 503 for BOTH existing and unknown IDs.
     shutil.rmtree(bad_blobs_root / "blobs-moved")
     (bad_blobs_root / "blobs").write_text("not a directory", encoding="utf-8")
-    bad_dir_resp = local.get(f"/api/runtime/acp/conversations/{conv_bad_dir}/transcript")
-    assert bad_dir_resp.status_code == 503
-    assert bad_dir_resp.headers["cache-control"] == "no-store"
-    assert bad_dir_resp.json()["state"] == "backend_unavailable"
-    assert bad_dir_resp.json()["reason"] == "blob_store_unavailable"
-    assert "cannot open blobs dir" not in bad_dir_resp.text
+    for target_id in (conv_bad_dir, "unknown-id"):
+        bad_dir_resp = local.get(f"/api/runtime/acp/conversations/{target_id}/transcript")
+        assert bad_dir_resp.status_code == 503
+        assert bad_dir_resp.headers["cache-control"] == "no-store"
+        assert bad_dir_resp.json()["state"] == "backend_unavailable"
+        assert bad_dir_resp.json()["reason"] == "blob_store_unavailable"
+        assert "cannot open blobs dir" not in bad_dir_resp.text
 
     # 6. Blob backend OSError (not FileNotFoundError) -> 503 blob_store_unavailable.
     monkeypatch.setenv("FLEET_COMMS_ROOT", str(good_root))
