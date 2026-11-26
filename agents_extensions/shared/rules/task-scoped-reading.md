@@ -28,7 +28,7 @@ retain relevant context across phases and reload when its contents change.
 | Code/infra review and closeout | `local-code-review` skill; exact-head cross-family review and required CI remain merge gates |
 | Task archive, rename, or resource cleanup | `task-family-manager` skill; load only the requested operation reference |
 | Rollover preparation or resumption | `thread-rollover` skill; load the current rollover phase |
-| Any seat writing, repairing, or reviewing Ukrainian | Load the `verify-ukrainian` skill from the installed machinery release before any language verdict, and check its SHA-256 against the pin in the calling skill. |
+| Any seat writing, repairing, or reviewing Ukrainian | Load the `verify-ukrainian` skill from the installed machinery release before any language verdict. |
 
 Skill sources live under `agents_extensions/shared/skills/<name>/SKILL.md`.
 For standalone module completion use `track-completion`; for manifest-order
@@ -40,8 +40,6 @@ Each row is also served as one selection: `/api/rules?scope=task:<name>` with
 names `repo-change`, `cli`, `curriculum`, `fresh-build`, `routing`, `driver`,
 `fleet-comms`, `review`, `task-family`, `rollover`, `ukrainian` (in row order).
 `_load-via-api.md` lists the same files for offline reads.
-The `ukrainian` selection was ordered by claude-cto on 2026-11-26.
-The loader path grant is approval_ref claude-cto 2026-11-26T11:00:40Z.
 
 The complete Monitor `/api/rules?scope=full&format=markdown` response is available for full
 policy audits, ambiguous cross-cutting tasks, and clients needing the complete
