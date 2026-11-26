@@ -76,10 +76,6 @@ def build_effective_roots(project_root: Path) -> dict[str, Path]:
     return effective
 
 
-_ALLOWED_EXT = {
-    ".html", ".md", ".txt", ".json", ".png", ".jpg", ".jpeg", ".svg", ".webp", ".pdf",
-    ".css", ".js", ".gif", ".woff", ".woff2"
-}
 _MIME_TYPES = {
     ".html": "text/html",
     ".md": "text/markdown",
@@ -92,7 +88,9 @@ _MIME_TYPES = {
     ".webp": "image/webp",
     ".pdf": "application/pdf",
     ".css": "text/css",
-    ".js": "application/javascript",
+    # A script subresource executes in the embedding page's origin. Serve
+    # stored scripts as text so nosniff blocks that use.
+    ".js": "text/plain",
     ".gif": "image/gif",
     ".woff": "font/woff",
     ".woff2": "font/woff2",
@@ -558,7 +556,8 @@ def serve_artifact(
         return _directory_listing(path, root_key, root_path, remainder)
 
     # File serving
-    if full_path.suffix.lower() not in _ALLOWED_EXT:
+    media_type = _MIME_TYPES.get(full_path.suffix.lower())
+    if media_type is None:
         raise HTTPException(
             status_code=403,
             detail=f"File extension {full_path.suffix} not allowed for documentation artifacts",
@@ -567,6 +566,10 @@ def serve_artifact(
     # codeql[py/path-injection] -- full_path validated via safe_join + _assert_under_root + extension allowlist above. See #1860.
     return FileResponse(
         full_path,
-        media_type=_MIME_TYPES.get(full_path.suffix.lower(), "application/octet-stream"),
-        headers={"Cache-Control": "max-age=300, must-revalidate"},
+        media_type=media_type,
+        headers={
+            "Cache-Control": "max-age=300, must-revalidate",
+            "Content-Security-Policy": "sandbox",
+            "X-Content-Type-Options": "nosniff",
+        },
     )
