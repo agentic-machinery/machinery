@@ -29,12 +29,11 @@ _QUOTED_VALUES = {
 _SINGLE_QUOTED_EQUALS_VALUE = re.compile(r"'(?:\\[\s\S]|''|[^'\\])*'")
 _LINE_END = re.compile(r"[\r\n]")
 
-_BLOCK_PATTERNS = (
-    re.compile(
-        r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*?-----END [A-Z0-9 ]*PRIVATE KEY-----",
-        re.DOTALL,
-    ),
-)
+# A private-key block runs from a BEGIN header to the first END footer after
+# it. Header and footer are searched separately: one lazy regex rescans to the
+# end of the text from every unterminated header, which is quadratic.
+_BLOCK_BEGIN = re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----")
+_BLOCK_END = re.compile(r"-----END [A-Z0-9 ]*PRIVATE KEY-----")
 
 _TOKEN_PATTERNS = (
     re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}\b"),
@@ -45,10 +44,13 @@ _TOKEN_PATTERNS = (
     re.compile(r"\bAIza[0-9A-Za-z_-]{20,}\b"),
     re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
     re.compile(r"\bASIA[0-9A-Z]{16}\b"),
-    re.compile(
-        r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b"
-    ),
 )
+# A JWT's first segment ends at the first character outside its class, so every
+# "eyJ" start inside one run shares that run's outcome. One regex retries each
+# start and rescans the run, which is quadratic; _redact_jwts skips the run.
+_JWT_START = re.compile(r"\beyJ")
+_JWT_REST = re.compile(r"[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b")
+_JWT_SEGMENT_END = re.compile(r"[^A-Za-z0-9_-]")
 
 # A non-vendor secret can appear inside an OAuth/provider error message without
 # a secret-named key. Restrict the generic detector to long ASCII token runs so
@@ -67,34 +69,64 @@ _OPAQUE_TOKEN_PUNCTUATION = frozenset("_+./~-")
 
 _URL_SCHEME = r"\b[A-Za-z][A-Za-z0-9+.-]*://"
 # First bound the whole token; URL boundaries within it depend on userinfo.
+# Only anchored matches use it: a search retries every word boundary in a long
+# scheme-character run and is quadratic, so _find_scheme locates schemes.
 URL_PATTERN = re.compile(rf"{_URL_SCHEME}[^\s<>\"`]*")
-_URL_BOUNDARY_PATTERN = re.compile(rf"[,;]?(?P<scheme>{_URL_SCHEME})")
+_URL_TOKEN_END = re.compile(r"[\s<>\"`]")
+_SCHEME_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+.-"
+_SCHEME_START = re.compile(r"\b[A-Za-z]")
+_AUTHORITY_END = re.compile(r"[/?#]")
 # RFC 3986 unreserved, sub-delims and pct-encoded, excluding the password colon.
 _URL_USERNAME_PATTERN = re.compile(r"(?:[A-Za-z0-9._~!$&'()*+,;=-]|%[0-9A-Fa-f]{2})*")
 
 
-def _url_authority_bounds(raw: str) -> tuple[int, int]:
-    """Resolve authority, including the guarded malformed-userinfo fallback."""
-    start = raw.index("://") + 3
-    end = min(
-        (index for delimiter in "/?#" if (index := raw.find(delimiter, start)) >= 0),
-        default=len(raw),
-    )
-    if "@" not in raw[start:end]:
-        username, colon, password_prefix = raw[start:end].partition(":")
+def _find_scheme(text: str, pos: int, endpos: int) -> tuple[int, int] | None:
+    """Return ``(start, end)`` of ``re.search(_URL_SCHEME, text[:endpos], pos)``.
+
+    The scan is linear in the searched span. A scheme run cannot contain ":",
+    so the run ending at each "://" is the only place a scheme for it starts,
+    and runs before successive separators are disjoint.
+    """
+    floor = pos
+    while (separator := text.find("://", floor, endpos)) >= 0:
+        run_start = floor + len(text[floor:separator].rstrip(_SCHEME_CHARS))
+        start = _SCHEME_START.search(text, run_start, separator)
+        if start is not None:
+            return start.start(), separator + 3
+        floor = separator + 3
+    return None
+
+
+def _first_index(pattern: re.Pattern[str], text: str, start: int, stop: int) -> int:
+    found = pattern.search(text, start, stop)
+    return found.start() if found else stop
+
+
+def _authority_span(text: str, cursor: int, stop: int, at_stop: int) -> tuple[int, int]:
+    """Absolute authority bounds of the URL ``text[cursor:stop]``.
+
+    ``at_stop`` bounds the fallback "@" search; any value past the last "@"
+    before ``stop`` gives the result for ``stop``.
+    """
+    start = text.index("://", cursor, stop) + 3
+    end = _first_index(_AUTHORITY_END, text, start, stop)
+    if text.find("@", start, end) < 0:
+        username, colon, password_prefix = text[start:end].partition(":")
         if (
             colon
             and _URL_USERNAME_PATTERN.fullmatch(username)
             and password_prefix
             and not password_prefix.isdigit()
         ):
-            userinfo_end = raw.find("@", end)
+            userinfo_end = text.find("@", end, at_stop)
             if userinfo_end >= 0:
-                end = min(
-                    (index for delimiter in "/?#" if (index := raw.find(delimiter, userinfo_end + 1)) >= 0),
-                    default=len(raw),
-                )
+                end = _first_index(_AUTHORITY_END, text, userinfo_end + 1, stop)
     return start, end
+
+
+def _url_authority_bounds(raw: str) -> tuple[int, int]:
+    """Resolve authority, including the guarded malformed-userinfo fallback."""
+    return _authority_span(raw, 0, len(raw), len(raw))
 
 
 def iter_url_matches(text: str) -> Iterator[re.Match[str]]:
@@ -102,19 +134,27 @@ def iter_url_matches(text: str) -> Iterator[re.Match[str]]:
 
     A scheme inside a password cannot become a new URL. Comma/semicolon
     joiners after resolved userinfo remain outside matches, as in round b.
+    Each step scans forward from the previous one, so the pass is linear.
     """
-    for token in URL_PATTERN.finditer(text):
-        cursor = token.start()
-        while cursor < token.end():
-            raw = text[cursor:token.end()]
-            start, end = _url_authority_bounds(raw)
-            userinfo_end = raw.rfind("@", start, end)
-            boundary = _URL_BOUNDARY_PATTERN.search(text, cursor + max(start, userinfo_end + 1), token.end())
-            limit = boundary.start() if boundary else token.end()
+    position = 0
+    while (scheme := _find_scheme(text, position, len(text))) is not None:
+        cursor = scheme[0]
+        token_end = _first_index(_URL_TOKEN_END, text, scheme[1], len(text))
+        # One reverse scan per token keeps every fallback "@" search bounded.
+        at_stop = text.rfind("@", cursor, token_end) + 1
+        while True:
+            start, end = _authority_span(text, cursor, token_end, at_stop)
+            boundary_floor = max(start, text.rfind("@", start, end) + 1)
+            scheme = _find_scheme(text, boundary_floor, token_end)
+            limit = token_end
+            if scheme is not None:
+                joined = scheme[0] > boundary_floor and text[scheme[0] - 1] in ",;"
+                limit = scheme[0] - 1 if joined else scheme[0]
             yield URL_PATTERN.match(text, cursor, limit)
-            if boundary is None:
+            if scheme is None:
                 break
-            cursor = boundary.start("scheme")
+            cursor = scheme[0]
+        position = token_end
 
 
 def redact_url_authority(raw: str) -> tuple[str, str, str]:
@@ -160,12 +200,11 @@ def redact_text(value: str | None) -> str | None:
         parts.extend(redact_url_authority(match.group()))
         cursor = match.end()
     parts.append(text[cursor:])
-    text = "".join(parts)
-    for pattern in _BLOCK_PATTERNS:
-        text = pattern.sub(REDACTION, text)
+    text = _redact_blocks("".join(parts))
     text = _redact_assignments(text)
     for pattern in _TOKEN_PATTERNS:
         text = pattern.sub(REDACTION, text)
+    text = _redact_jwts(text)
     text = _OPAQUE_TOKEN_PATTERN.sub(_redact_opaque_token_match, text)
     return text
 
@@ -229,6 +268,37 @@ def _looks_like_opaque_secret(value: str) -> bool:
 def _redact_opaque_token_match(match: re.Match[str]) -> str:
     """Redact only generic candidates that satisfy the entropy detector."""
     return REDACTION if _looks_like_opaque_secret(match.group("value")) else match.group(0)
+
+
+def _redact_blocks(text: str) -> str:
+    """Replace each BEGIN...END private-key block, leftmost first.
+
+    Once a header has no footer after it, no later header can have one.
+    """
+    parts = []
+    cursor = 0
+    while (begin := _BLOCK_BEGIN.search(text, cursor)) and (end := _BLOCK_END.search(text, begin.end())):
+        parts.append(text[cursor:begin.start()])
+        parts.append(REDACTION)
+        cursor = end.end()
+    parts.append(text[cursor:])
+    return "".join(parts)
+
+
+def _redact_jwts(text: str) -> str:
+    """Replace each JWT-shaped token, leftmost first."""
+    parts = []
+    cursor = position = 0
+    while start := _JWT_START.search(text, position):
+        rest = _JWT_REST.match(text, start.end())
+        if rest is None:
+            position = _first_index(_JWT_SEGMENT_END, text, start.end(), len(text))
+            continue
+        parts.append(text[cursor:start.start()])
+        parts.append(REDACTION)
+        cursor = position = rest.end()
+    parts.append(text[cursor:])
+    return "".join(parts)
 
 
 def _redact_assignments(text: str) -> str:
