@@ -456,10 +456,10 @@ does these steps in order:
      At cut time, the candidate gate validates the models and catalog that this
      release installs together. A failing route or an incomplete run
      blocks the release. PR merge does not require these receipts.
-9. **Promote.** `release-edit --no-prerelease` replaces the notes with the
-   final Acceptance section: the per-route canary table, the Node and npm
-   versions, the prefix and the collection summary. The command then marks the
-   adopt PR ready for review.
+9. **Promote.** `release-edit --no-prerelease --latest` writes the final
+   Acceptance notes and sets the full release as Latest. The cut marks the
+   adopt PR ready for review only after GitHub's `releases/latest` returns
+   the new tag.
 10. **Post-release PR.** One machinery PR, titled
     `chore(release): record $V and start <next>`, records the changelog
     section and moves the version files to the next patch version. It refreshes

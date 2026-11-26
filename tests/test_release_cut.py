@@ -17,6 +17,7 @@ from lu_machinery.agent_runtime.adapters.acpx import _check_node_artifact
 from lu_machinery.ci import check_agent_attribution as attribution
 from lu_machinery.common import repo_root
 from lu_machinery.dispatcher import git as git_module
+from lu_machinery.publish import github as publisher
 from lu_machinery.release_cut import Cut, CutError, main, preflight, record_changelog, release_notes
 
 HEAD = "a" * 40
@@ -1259,6 +1260,43 @@ def test_execute_skips_and_refuses_before_live_milestone_lookup(tmp_path, monkey
     assert called == []
 
 
+def test_release_cut_leaves_an_older_release_as_latest(tmp_path, monkeypatch):
+    """A release cut that leaves an older release as Latest must stop before adoption."""
+    cut = Cut(
+        work=tmp_path, dry_run=False, machinery_remote="fixture", product_remote="fixture",
+        machinery_repo="fixture/machinery", product_repo="fixture/product",
+        host_python=tmp_path / "python", primary=tmp_path, alert=False, x_agent="codex/fixture",
+        version="0.1.80", adopt_pr=42,
+    )
+    published = []
+    monkeypatch.setattr(publisher.gate, "check_texts", lambda *args, **kwargs: None)
+
+    def publish(argv, **kwargs):
+        published.append(argv)
+        notes = Path(argv[argv.index("--notes-file") + 1])
+        assert notes.read_text(encoding="utf-8") == "final notes\n"
+        return subprocess.CompletedProcess(argv, 0)
+
+    def publish_from_cut(*argv):
+        assert publisher.main(argv, runner=publish) == 0
+
+    monkeypatch.setattr(cut, "publisher", publish_from_cut)
+
+    def run(argv, **kwargs):
+        assert argv == ["gh", "api", "repos/fixture/machinery/releases/latest", "--jq", ".tag_name"]
+        return subprocess.CompletedProcess(argv, 0, "v0.1.22\n", "")
+
+    monkeypatch.setattr(cut, "run", run)
+    with pytest.raises(CutError, match=r"expected v0\.1\.80.*v0\.1\.22"):
+        cut.promote("final notes\n")
+    [edit] = published
+    assert edit[:6] == ["gh", "release", "edit", "--repo", "fixture/machinery", "--notes-file"]
+    assert edit[7:] == ["--prerelease=false", "--latest=true", "--", "v0.1.80"]
+    monkeypatch.setattr(cut, "remote_state", lambda: (True, "released", [42]))
+    assert "before continuing adoption" in cut.clean_up(cut.step)
+    assert len(published) == 1
+
+
 def test_publisher_uses_release_interpreter_not_stale_host_python(tmp_path, monkeypatch, capsys):
     """Defect class: release_cut invokes the consumer's stale host_python publisher instead of the release's own
     publisher, failing with OPSEC: invalid publisher arguments when the release passes a new flag (0.1.62 skew)."""
@@ -1402,6 +1440,9 @@ def test_publisher_uses_release_interpreter_not_stale_host_python(tmp_path, monk
         command = [str(part) for part in argv]
         if command[:2] == ["git", "-C"] and "push" in command:
             return subprocess.CompletedProcess(command, 0, "", "")
+        if command[:2] == ["gh", "api"]:
+            assert command[2:] == [f"repos/{REPO}/releases/latest", "--jq", ".tag_name"]
+            return subprocess.CompletedProcess(command, 0, "v0.1.62\n", "")
         if command[:2] == ["gh", "release"]:
             published = Path(command[command.index("-D") + 1])
             published.mkdir()
@@ -1429,6 +1470,7 @@ def test_publisher_uses_release_interpreter_not_stale_host_python(tmp_path, monk
     assert verbs == ["release-create", "pr-create", "release-edit", "pr-ready", "pr-create"]
     lines = accept_log.read_text(encoding="utf-8").splitlines()
     assert "--milestone" in lines[1] and "--milestone" in lines[4]
+    assert lines[2].endswith("--no-prerelease --latest")
 
     # Cleanup after full release emits a complete resume command with required roots, LU_PYTHON, --x-agent,
     # --no-alert when alert=False, and a non-leaking --machinery-remote placeholder when a custom remote was used.
