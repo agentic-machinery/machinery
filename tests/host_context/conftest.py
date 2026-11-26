@@ -69,6 +69,7 @@ def host_layout(tmp_path):
         checkout.mkdir(parents=True)
         git(checkout, "init", "--template=")
         git(checkout, "remote", "add", "origin", f"https://github.com/{slug}.git")
+        git(checkout, "config", "extensions.worktreeConfig", "true")
         repos[key] = str(checkout)
 
     tool = tmp_path / "tool.py"

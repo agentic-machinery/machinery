@@ -33,10 +33,13 @@ REGISTRY_PATH = Path(__file__).with_name("config") / "fleet_repos.yaml"
 _MAX_BYTES = 64 * 1024
 _KEY = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9_-]*")
 _DIGEST = re.compile(r"[a-fA-F0-9]{64}")
-_CONFIG_KEYS = (
-    r"^(remote\.origin\.url|remote\..+\.(pushurl|vcs|uploadpack|receivepack|proxy)|"
-    r"remote\.pushdefault|branch\..+\.(pushremote|remote)|include\..*|includeif\..*|url\..*|"
-    r"core\.(worktree|sshcommand|gitproxy)|http\.(.+\.)?(proxy|sslverify)|extensions\.worktreeconfig)$"
+_SAFE_REPO_CONFIG = re.compile(
+    rb"core\.(bare|filemode|ignorecase|logallrefupdates|precomposeunicode|repositoryformatversion|"
+    rb"sparsecheckout|sparsecheckoutcone|symlinks)|"
+    rb"extensions\.(objectformat|refstorage|worktreeconfig)|"
+    rb"remote\.origin\.(fetch|partialclonefilter|promisor)|branch\..+\.merge|user\.(email|name)|"
+    rb"gc\.auto|maintenance\.(auto|strategy)|pack\.(deltacachesize|threads|windowmemory)|"
+    rb"lfs\.(repositoryformatversion|https://github\.com/[\w.-]+/[\w.-]+/info/lfs\.access)"
 )
 _REMOTE_SELECTION_KEYS = re.compile(rb"(remote\.pushdefault|branch\..+\.(pushremote|remote))")
 
@@ -324,14 +327,16 @@ def _check_repo(path: Path, origins: tuple[str, ...]) -> None:
     if not primary:
         raise HostContextError("repo_not_primary", "repo must be a primary checkout with its own Git directory")
     _outside_git(path.parent, code="repo_not_primary", label="checkout parent")
-    config = _git(path, "config", "--file", str(git_dir / "config"), "--no-includes", "--null", "--get-regexp", _CONFIG_KEYS)
+    # The isolated Git environment excludes system, global and injected config.
+    # Listing includes primary worktree config when Git's extension enables it.
+    config = _git(path, "config", "--no-includes", "--null", "--list")
     urls = []
     for entry in config.removesuffix(b"\0").split(b"\0"):
         key, _, value = entry.partition(b"\n")
         if key == b"remote.origin.url":
             urls.append(value)
-        elif not (_REMOTE_SELECTION_KEYS.fullmatch(key) and value == b"origin"):
-            raise HostContextError("repo_origin_mismatch", "checkout config can override the registered origin")
+        elif not (_SAFE_REPO_CONFIG.fullmatch(key) or (_REMOTE_SELECTION_KEYS.fullmatch(key) and value == b"origin")):
+            raise HostContextError("repo_origin_mismatch", "checkout contains unsupported Git config")
     if len(urls) != 1:
         raise HostContextError("repo_origin_mismatch", "checkout must declare exactly one unambiguous origin")
     if urls[0].lower() not in {value.encode("ascii").lower() for value in origins}:
