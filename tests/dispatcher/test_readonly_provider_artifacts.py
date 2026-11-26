@@ -23,6 +23,22 @@ _TASK = "wb-art"
 _WRITE_BINDS = ("--bind", "--bind-try", "--dev-bind", "--dev-bind-try")
 
 
+@pytest.fixture(autouse=True)
+def _test_owned_home_and_git(tmp_path, monkeypatch):
+    """A test-owned HOME and no global or system Git configuration, before any fixture runs Git.
+
+    Autouse, so it runs before ``primary``, whose first ``git commit`` precedes its own HOME: a developer's signing
+    or hook configuration must not decide these tests, and credential discovery must not read the real home.
+    """
+    home = tmp_path / "test-home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", os.devnull)
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    for name in ("XDG_CONFIG_HOME", "CLAUDE_CONFIG_DIR", "CODEX_HOME"):
+        monkeypatch.delenv(name, raising=False)
+
+
 def _spec(worktree: Path, agent: str, provider: str | None, mode: str = "read-only") -> TaskSpec:
     return TaskSpec(_TASK, agent, "probe-model", "high", mode, worktree, worktree.parent / "prompt",
                     worktree.parent / "final", provider=provider)
@@ -30,7 +46,8 @@ def _spec(worktree: Path, agent: str, provider: str | None, mode: str = "read-on
 
 def _boundary_args(spec: TaskSpec, command: list[str], task_file: Path) -> list[str]:
     """The launcher's own arguments for ``write_boundary.main``, without the host context it applies to itself."""
-    argv = write_boundary.launcher(spec, Invocation(command, None, {"PATH": os.environ["PATH"]}, None), task_file)
+    env = {"PATH": os.environ["PATH"], "HOME": os.environ["HOME"]}  # the test's own HOME (autouse fixture)
+    argv = write_boundary.launcher(spec, Invocation(command, None, env, None), task_file)
     args, index = [], 5  # past the interpreter, -I, -c, the bootstrap and the package root
     while index < len(argv):
         if argv[index] == "--host-env" and index < argv.index("--"):
