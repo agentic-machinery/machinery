@@ -9,6 +9,15 @@ this file.
 
 ## [Unreleased]
 
+<a id="v0.1.79"></a>
+## [0.1.79] - 2026-11-26
+
+### Fixed
+
+- Scope generated path ownership to the target repository ([#1507](https://github.com/agentic-machinery/machinery/pull/1507))
+- Sweep a finding's whole class in the round that reports it ([#1511](https://github.com/agentic-machinery/machinery/pull/1511))
+- Release the workspace lu-start-cto template with the host safeguards ([#1510](https://github.com/agentic-machinery/machinery/pull/1510))
+
 <a id="v0.1.78"></a>
 ## [0.1.78] - 2026-11-26
 
@@ -1796,7 +1805,8 @@ First release: the machinery extracted from learn-ukrainian as the installable `
 - Rollover confirms replacement bindings without a self-answered quiz. ([#65](https://github.com/learn-ukrainian/machinery/pull/65))
 - Deploy derives release identity from packaged bytes. ([#145](https://github.com/learn-ukrainian/machinery/pull/145))
 
-[Unreleased]: https://github.com/agentic-machinery/machinery/compare/v0.1.78...HEAD
+[Unreleased]: https://github.com/agentic-machinery/machinery/compare/v0.1.79...HEAD
+[0.1.79]: https://github.com/agentic-machinery/machinery/compare/v0.1.78...v0.1.79
 [0.1.78]: https://github.com/agentic-machinery/machinery/compare/v0.1.77...v0.1.78
 [0.1.77]: https://github.com/agentic-machinery/machinery/compare/v0.1.76...v0.1.77
 [0.1.76]: https://github.com/agentic-machinery/machinery/compare/v0.1.75...v0.1.76
