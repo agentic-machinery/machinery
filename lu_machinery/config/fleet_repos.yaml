@@ -103,7 +103,7 @@ repos:
     transfer_complete: true
     repository_id: 1282510453
     visibility: private
-    local_name: learn-ukrainian-infra-private
+    local_name: machinery-infra
     transport: https
     role: private-infra
     verdict_recorder: true
