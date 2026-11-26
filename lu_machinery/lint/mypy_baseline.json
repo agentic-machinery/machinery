@@ -3220,11 +3220,6 @@
     {
       "path": "lu_machinery/dispatcher/store.py",
       "code": "arg-type",
-      "message": "Argument 1 to \"_grant_worktree\" has incompatible type \"None | dict[Any, Any]\"; expected \"dict[Any, Any]\""
-    },
-    {
-      "path": "lu_machinery/dispatcher/store.py",
-      "code": "arg-type",
       "message": "Argument 1 to \"effective_scope\" has incompatible type \"None | dict[Any, Any]\"; expected \"dict[Any, Any]\""
     },
     {

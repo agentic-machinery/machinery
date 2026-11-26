@@ -389,7 +389,18 @@ def test_owning_a_lexicon_path_also_owns_the_fingerprint_its_gate_regenerates(sa
 def test_owning_a_site_component_also_owns_the_lesson_schema_its_gate_regenerates():
     """A component owner is not blocked by the unowned schema the lesson-schema-drift hook rewrites (#12169)."""
     owned = ["site/src/components/LexiconPractice.tsx"]
-    assert scope.with_generated_outputs(owned) == ([*owned, "docs/lesson-schema.yaml"], ["docs/lesson-schema.yaml"])
+    assert scope.with_generated_outputs(owned, "public") == ([*owned, "docs/lesson-schema.yaml"], ["docs/lesson-schema.yaml"])
+
+
+@pytest.mark.parametrize(("repo_key", "added"), [
+    ("public", ["docs/lesson-schema.yaml"]),
+    ("machinery", []),
+    ("unknown", []),
+])
+def test_generated_output_ownership_depends_on_repository_gate(repo_key, added):
+    """Defect class: generated output granted in a repository without its gate."""
+    owned = ["site/src/components/LexiconPractice.tsx"]
+    assert scope.with_generated_outputs(owned, repo_key) == (owned + added, added)
 
 
 @pytest.mark.usefixtures('configured_roots')

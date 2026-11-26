@@ -1,20 +1,20 @@
 """The files a dispatch owns because a commit gate regenerates them from what it owns (#12169).
 
 A gate that rewrites a generated file whenever its input changes blocks a worker that owns the
-input but not the file. The dispatcher adds the file to the owned paths once, before anything reads
-them, and the task record carries the result, so hooks and settlement need no rule of their own.
+input but not the file. The dispatcher adds the file only for tasks targeting the gate's repository.
+The task record carries the expanded paths, so hooks and settlement need no rule of their own.
 """
 
+from collections.abc import Iterable
 from pathlib import PurePosixPath
 
-# One entry per gate, matching its hook in .pre-commit-config.yaml: the input tree it watches and the
-# file it regenerates. Add an entry only once that producer, input and output are established.
-# The hooks live in the product repository, but every entry applies to whichever repository a task
-# targets, so a task elsewhere may own an output its repository has no gate for. That over-grant is
-# accepted until each repository declares its own generated outputs (follow-up, PR #1494 review).
+# Within each fleet repository key, map the input tree a commit gate watches to the file it
+# regenerates. Repositories without a matching key receive no generated paths.
 GENERATED_OUTPUTS = {
-    "scripts/lexicon": "site/src/data/lexicon-manifest.fingerprint.json",  # atlas-lexicon-fingerprint-drift
-    "site/src/components": "docs/lesson-schema.yaml",  # lesson-schema-drift
+    "public": {
+        "scripts/lexicon": "site/src/data/lexicon-manifest.fingerprint.json",  # atlas-lexicon-fingerprint-drift
+        "site/src/components": "docs/lesson-schema.yaml",  # lesson-schema-drift
+    },
 }
 
 
@@ -31,17 +31,18 @@ def _literal_root(raw: str) -> str | None:
     return "/".join(literal) or None
 
 
-def with_generated_outputs(owned_paths) -> tuple[list[str], list[str]]:
-    """The owned paths with every generated file a gate needs from them, and the files added.
+def with_generated_outputs(owned_paths: Iterable[str], repo_key: str | None) -> tuple[list[str], list[str]]:
+    """Return the expanded owned paths and the files added for the target repository's gates.
 
     An owned path needs a file when its literal part is the gate's input tree, inside it or above it.
-    A file the owned paths already cover is not added again.
+    Unknown repository keys add nothing. A file the owned paths already cover is not added again.
     """
     from lu_machinery.guardrails.delegate_ownership import path_is_owned
 
     owned = list(owned_paths)
     roots = [root for root in map(_literal_root, owned) if root]
-    added = [output for prefix, output in GENERATED_OUTPUTS.items()
+    gates = GENERATED_OUTPUTS.get(repo_key, {}) if isinstance(repo_key, str) else {}
+    added = [output for prefix, output in gates.items()
              if not path_is_owned(output, owned)
              and any(root == prefix or root.startswith(prefix + "/") or prefix.startswith(root + "/") for root in roots)]
     return owned + added, added
