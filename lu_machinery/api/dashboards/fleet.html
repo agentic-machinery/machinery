@@ -83,12 +83,24 @@
     <p id="comms-status" class="visually-hidden" aria-live="polite" aria-atomic="true"></p>
     <div id="comms-content">Loading…</div>
   </section>
+  <section class="wide" id="discussions">
+    <details id="discussions-disclosure">
+      <summary>Discussions (ACP transcripts)</summary>
+      <p class="muted" id="discussions-redaction-notice">Loopback-only transcript reader. Redaction is best-effort for secrets and paths only (hostnames and IP addresses are not redacted).</p>
+      <div class="journal-actions">
+        <button type="button" class="retry" id="discussions-refresh">Refresh discussions</button>
+      </div>
+      <p id="discussions-status" class="muted" role="status"></p>
+      <div id="discussions-list"></div>
+      <div id="discussions-transcript"></div>
+    </details>
+  </section>
 </main>
 <script src="/machinery.js"></script>
 <script>
 "use strict";
 const {
-  escapeHtml, fetchJson, span, relative, table, td, text, unknown, chip,
+  escapeHtml, fetchJson, span, utc, relative, table, td, text, unknown, chip,
   ciLabel, prLink, prSnapshotFresh, createPanelRunner,
 } = Machinery;
 
@@ -639,7 +651,318 @@ function bindMessageFilters() {
   });
 }
 
+const DISCUSSIONS_LIST_URL = "/api/fleet/acp/conversations";
+const ACP_TRANSCRIPT_PREFIX = "/api/runtime/acp/conversations";
+const DISCUSSION_STATE_TONE = {
+  ok: "ok",
+  body_expired: "warn",
+  withheld: "warn",
+  oversized_or_partial: "warn",
+  missing_or_corrupt: "bad",
+  backend_unavailable: "bad",
+};
+const DISCUSSION_STATE_LABEL = {
+  ok: "ok",
+  body_expired: "Body expired",
+  withheld: "Withheld",
+  oversized_or_partial: "Oversized or partial",
+  missing_or_corrupt: "Missing or corrupt",
+  backend_unavailable: "Backend unavailable",
+};
+
+let discussionsListSeq = 0;
+let transcriptRequestSeq = 0;
+let selectedConversationId = null;
+let activeTranscriptController = null;
+
+function discussionEl(tag, className = "", textValue = null) {
+  const node = document.createElement(tag);
+  if (className) node.className = className;
+  if (textValue !== null && textValue !== undefined) node.textContent = String(textValue);
+  return node;
+}
+
+function discussionStatus(message) {
+  const status = typeof document === "object" && document && typeof document.getElementById === "function"
+    ? document.getElementById("discussions-status") : null;
+  if (status) status.textContent = message;
+}
+
+function setNodeChildren(container, nodes) {
+  if (!container) return;
+  if (typeof container.replaceChildren === "function") {
+    container.replaceChildren(...nodes);
+    return;
+  }
+  while (container.firstChild) container.removeChild(container.firstChild);
+  for (const node of nodes) container.appendChild(node);
+}
+
+function discussionTranscriptUrl(conversationId) {
+  return `${ACP_TRANSCRIPT_PREFIX}/${encodeURIComponent(conversationId)}/transcript`;
+}
+
+function renderDiscussionsListDom(payload) {
+  const container = document.getElementById("discussions-list");
+  if (!container) return;
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+    setNodeChildren(container, [discussionEl("p", "error", "Discussions list unavailable.")]);
+    return;
+  }
+  if (payload.availability !== "available" && payload.availability !== "empty") {
+    setNodeChildren(container, [discussionEl("p", "error", "Discussions list unavailable.")]);
+    return;
+  }
+  const rows = Array.isArray(payload.conversations) ? payload.conversations : [];
+  if (!rows.length) {
+    setNodeChildren(container, [discussionEl("p", "muted", "No ACP discussions recorded.")]);
+    return;
+  }
+  const tbl = discussionEl("table");
+  const thead = discussionEl("thead");
+  const headRow = discussionEl("tr");
+  for (const label of ["Discussion", "Participants", "State", "Rounds", "Updated"]) {
+    headRow.appendChild(discussionEl("th", "", label));
+  }
+  thead.appendChild(headRow);
+  tbl.appendChild(thead);
+
+  const tbody = discussionEl("tbody");
+  for (const row of rows) {
+    if (!row || typeof row !== "object" || typeof row.conversation_id !== "string" || !row.conversation_id) continue;
+    const tr = discussionEl("tr");
+
+    const idTd = discussionEl("td");
+    const openBtn = discussionEl("button", "retry", row.conversation_id);
+    openBtn.type = "button";
+    openBtn.dataset.discussionId = row.conversation_id;
+    openBtn.setAttribute("aria-label", `Open transcript ${row.conversation_id}`);
+    idTd.appendChild(openBtn);
+    tr.appendChild(idTd);
+
+    const participants = Array.isArray(row.participants)
+      ? row.participants.filter(item => typeof item === "string" && item).join(", ") : "";
+    tr.appendChild(discussionEl("td", "", participants || "—"));
+
+    const stateText = typeof row.current_state === "string" && row.current_state
+      ? row.current_state : (typeof row.classification === "string" ? row.classification : "unknown");
+    tr.appendChild(discussionEl("td", "", stateText));
+
+    const completed = typeof row.rounds_completed === "number" ? row.rounds_completed : "?";
+    const requested = typeof row.rounds_requested === "number" ? row.rounds_requested : "?";
+    tr.appendChild(discussionEl("td", "num", `${completed}/${requested}`));
+
+    const updated = typeof row.updated_at === "string" && row.updated_at ? utc(row.updated_at) : "—";
+    tr.appendChild(discussionEl("td", "num", updated));
+
+    tbody.appendChild(tr);
+  }
+  tbl.appendChild(tbody);
+  setNodeChildren(container, [tbl]);
+}
+
+function formatStateSummary(state, label, reason) {
+  const base = DISCUSSION_STATE_LABEL[state] || (typeof label === "string" && label ? label : String(state || "unknown"));
+  if (typeof reason === "string" && reason && reason !== state) {
+    return `${base} (${reason.replaceAll("_", " ")})`;
+  }
+  return base;
+}
+
+function renderTranscriptDom(conversationId, payload, httpStatus = 200) {
+  const container = document.getElementById("discussions-transcript");
+  if (!container) return;
+  const nodes = [];
+
+  const heading = discussionEl("h3", "", `Transcript: ${conversationId}`);
+  nodes.push(heading);
+
+  if (httpStatus === 403) {
+    const reason = typeof payload?.reason === "string" ? payload.reason : "forbidden";
+    nodes.push(discussionEl("p", "error", `Transcript access refused (${reason.replaceAll("_", " ")}).`));
+    setNodeChildren(container, nodes);
+    return;
+  }
+  if (httpStatus === 404) {
+    nodes.push(discussionEl("p", "muted", "Discussion not found."));
+    setNodeChildren(container, nodes);
+    return;
+  }
+  if (httpStatus === 503 || payload?.state === "backend_unavailable") {
+    const reason = typeof payload?.reason === "string" ? payload.reason : "store_unavailable";
+    nodes.push(discussionEl("p", "error", formatStateSummary("backend_unavailable", payload?.label, reason)));
+    setNodeChildren(container, nodes);
+    return;
+  }
+  if (!payload || typeof payload !== "object" || !Array.isArray(payload.messages)) {
+    nodes.push(discussionEl("p", "error", "Transcript response could not be read."));
+    setNodeChildren(container, nodes);
+    return;
+  }
+
+  const topState = typeof payload.state === "string" ? payload.state : "unknown";
+  const summaryTone = DISCUSSION_STATE_TONE[topState] || "muted";
+  const summaryBar = discussionEl("div", "journal-meta");
+  summaryBar.appendChild(
+    discussionEl("span", `journal-tag ${summaryTone}`, formatStateSummary(topState, payload.label, payload.reason))
+  );
+  if (payload.truncated === true) {
+    summaryBar.appendChild(discussionEl("span", "journal-tag warn", "Truncated at row limit"));
+  }
+  nodes.push(summaryBar);
+
+  if (!payload.messages.length) {
+    nodes.push(discussionEl("p", "muted", "No transcript turns available."));
+    setNodeChildren(container, nodes);
+    return;
+  }
+
+  const list = discussionEl("div", "journal-list");
+  for (const turn of payload.messages) {
+    if (!turn || typeof turn !== "object") continue;
+    const article = discussionEl("article", "journal-entry");
+    const meta = discussionEl("div", "journal-meta");
+
+    const ordinal = typeof turn.ordinal === "number" ? `#${turn.ordinal}` : "#?";
+    meta.appendChild(discussionEl("span", "journal-tag muted", ordinal));
+
+    const sender = typeof turn.sender === "string" && turn.sender ? turn.sender : "unknown";
+    const recipient = typeof turn.recipient === "string" && turn.recipient ? turn.recipient : "unknown";
+    meta.appendChild(discussionEl("span", "journal-author", `${sender} → ${recipient}`));
+
+    if (typeof turn.kind === "string" && turn.kind) {
+      meta.appendChild(discussionEl("span", "journal-tag", turn.kind));
+    }
+    if (typeof turn.round === "number" && Number.isInteger(turn.round)) {
+      meta.appendChild(discussionEl("span", "journal-tag muted", `round ${turn.round}`));
+    }
+    if (typeof turn.created_at === "string" && turn.created_at) {
+      meta.appendChild(discussionEl("time", "journal-time", utc(turn.created_at)));
+    }
+
+    const turnState = typeof turn.state === "string" ? turn.state : "unknown";
+    const turnTone = DISCUSSION_STATE_TONE[turnState] || "muted";
+    meta.appendChild(
+      discussionEl("span", `journal-tag ${turnTone}`, formatStateSummary(turnState, turn.label, turn.reason))
+    );
+    article.appendChild(meta);
+
+    if (turnState === "ok" && typeof turn.body === "string") {
+      article.appendChild(discussionEl("p", "journal-body", turn.body));
+    } else {
+      article.appendChild(
+        discussionEl("p", "muted", `${formatStateSummary(turnState, turn.label, turn.reason)} — body omitted.`)
+      );
+    }
+    list.appendChild(article);
+  }
+  nodes.push(list);
+  setNodeChildren(container, nodes);
+}
+
+async function loadDiscussionsList() {
+  const seq = ++discussionsListSeq;
+  discussionStatus("Loading discussions…");
+  const container = document.getElementById("discussions-list");
+  try {
+    const response = await fetch(DISCUSSIONS_LIST_URL, {
+      cache: "no-store",
+      headers: {Accept: "application/json"},
+    });
+    if (seq !== discussionsListSeq) return;
+    if (!response.ok) {
+      discussionStatus(`Discussions unavailable (HTTP ${response.status}).`);
+      setNodeChildren(container, [discussionEl("p", "error", `Discussions unavailable (HTTP ${response.status}).`)]);
+      return;
+    }
+    let payload;
+    try { payload = JSON.parse(await response.text()); } catch { payload = null; }
+    if (seq !== discussionsListSeq) return;
+    renderDiscussionsListDom(payload);
+    const count = Array.isArray(payload?.conversations) ? payload.conversations.length : 0;
+    discussionStatus(`Loaded ${count} discussion${count === 1 ? "" : "s"}.`);
+  } catch {
+    if (seq !== discussionsListSeq) return;
+    discussionStatus("Discussions could not load.");
+    setNodeChildren(container, [discussionEl("p", "error", "Discussions could not load.")]);
+  }
+}
+
+async function openDiscussion(conversationId) {
+  if (typeof conversationId !== "string" || !conversationId) return;
+  selectedConversationId = conversationId;
+  const seq = ++transcriptRequestSeq;
+  if (activeTranscriptController && typeof activeTranscriptController.abort === "function") {
+    activeTranscriptController.abort();
+  }
+  const controller = typeof AbortController === "function" ? new AbortController() : null;
+  activeTranscriptController = controller;
+
+  const container = document.getElementById("discussions-transcript");
+  setNodeChildren(container, [
+    discussionEl("h3", "", `Transcript: ${conversationId}`),
+    discussionEl("p", "muted", "Loading transcript…"),
+  ]);
+  discussionStatus(`Loading transcript ${conversationId}…`);
+
+  try {
+    const options = {cache: "no-store", headers: {Accept: "application/json"}};
+    if (controller) options.signal = controller.signal;
+    const response = await fetch(discussionTranscriptUrl(conversationId), options);
+    if (seq !== transcriptRequestSeq || conversationId !== selectedConversationId) return;
+    let payload = null;
+    try { payload = JSON.parse(await response.text()); } catch { payload = null; }
+    if (seq !== transcriptRequestSeq || conversationId !== selectedConversationId) return;
+    renderTranscriptDom(conversationId, payload, response.status);
+    discussionStatus(`Transcript ${conversationId} loaded.`);
+  } catch (error) {
+    if (error && error.name === "AbortError") return;
+    if (seq !== transcriptRequestSeq || conversationId !== selectedConversationId) return;
+    setNodeChildren(container, [
+      discussionEl("h3", "", `Transcript: ${conversationId}`),
+      discussionEl("p", "error", "Transcript could not load."),
+    ]);
+    discussionStatus(`Transcript ${conversationId} could not load.`);
+  } finally {
+    if (activeTranscriptController === controller) activeTranscriptController = null;
+  }
+}
+
+function bindDiscussionsPanel() {
+  if (typeof document !== "object" || !document || typeof document.getElementById !== "function"
+    || typeof document.createElement !== "function") return;
+  const disclosure = document.getElementById("discussions-disclosure");
+  if (!disclosure || !disclosure.dataset || typeof disclosure.addEventListener !== "function"
+    || disclosure.dataset.bound) return;
+  disclosure.dataset.bound = "1";
+  let loadedOnce = false;
+  disclosure.addEventListener("toggle", () => {
+    if (disclosure.open && !loadedOnce) {
+      loadedOnce = true;
+      loadDiscussionsList();
+    }
+  });
+  const refreshBtn = document.getElementById("discussions-refresh");
+  if (refreshBtn && typeof refreshBtn.addEventListener === "function") {
+    refreshBtn.addEventListener("click", () => {
+      loadedOnce = true;
+      loadDiscussionsList();
+    });
+  }
+  const listBox = document.getElementById("discussions-list");
+  if (listBox && typeof listBox.addEventListener === "function") {
+    listBox.addEventListener("click", event => {
+      const target = event.target;
+      const button = typeof target?.closest === "function" ? target.closest("button[data-discussion-id]") : null;
+      if (button && button.dataset && button.dataset.discussionId) {
+        openDiscussion(button.dataset.discussionId);
+      }
+    });
+  }
+}
+
 bindMessageFilters();
+bindDiscussionsPanel();
 runner.start();
 </script>
 </body>

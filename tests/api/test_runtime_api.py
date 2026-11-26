@@ -487,13 +487,25 @@ def _seed_transcript_db(root: Path) -> None:
         ),
     ]
     _write_acp_db(root, [conversation], events)
+    raw = b"guarded transcript body"
+    digest = hashlib.sha256(raw).hexdigest()
+    blob_path = root / "blobs" / "sha256" / digest[:2] / digest
+    blob_path.parent.mkdir(parents=True, exist_ok=True)
+    blob_path.write_bytes(raw)
     connection = sqlite3.connect(root / "comms.sqlite3")
     try:
         connection.execute(
-            """INSERT INTO comms_messages(
-                message_id, conversation_id, kind, sender, recipient, body_inline, metadata_json, created_at
+            """INSERT INTO artifacts(
+                artifact_id, sha256, bytes, mime_type, logical_filename, producer, retention_class, created_at
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-            ("message-1", "conv-guarded", "reply", "codex", "root", "guarded transcript body", "{}", _iso(now)),
+            ("art-guarded-1", digest, len(raw), "text/plain; charset=utf-8", "msg.txt", "acpx-discuss:codex", "acpx-discussion", _iso(now)),
+        )
+        connection.execute(
+            """INSERT INTO comms_messages(
+                message_id, conversation_id, kind, sender, recipient, body_inline,
+                body_artifact_id, content_sha256, metadata_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            ("message-1", "conv-guarded", "reply", "codex", "root", "guarded transcript body", "art-guarded-1", digest, "{}", _iso(now)),
         )
         connection.commit()
     finally:
@@ -879,15 +891,27 @@ def test_acp_transcript_hides_unavailable_malformed_and_body_free_routes(tmp_pat
         "conv-malformed", "secret", "secret", "secret", 1, '["codex", "claude"]', _iso(now), None, 1, 1,
     )
     _write_acp_db(root, [conversation], [])
+    raw_private = b"body only in transcript"
+    digest_private = hashlib.sha256(raw_private).hexdigest()
+    blob_private = root / "blobs" / "sha256" / digest_private[:2] / digest_private
+    blob_private.parent.mkdir(parents=True, exist_ok=True)
+    blob_private.write_bytes(raw_private)
     connection = sqlite3.connect(root / "comms.sqlite3")
     try:
+        connection.execute(
+            """INSERT INTO artifacts(
+                artifact_id, sha256, bytes, mime_type, logical_filename, producer, retention_class, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            ("art-private", digest_private, len(raw_private), "text/plain; charset=utf-8", "msg.txt", "acpx-discuss:codex", "acpx-discussion", _iso(now)),
+        )
         connection.executemany(
             """INSERT INTO comms_messages(
-                message_id, conversation_id, kind, sender, recipient, body_inline, metadata_json, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                message_id, conversation_id, kind, sender, recipient, body_inline,
+                body_artifact_id, content_sha256, metadata_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             [
-                ("message-private", "conv-malformed", "reply", "codex", "root", "body only in transcript", '{"path":"secret"}', _iso(now)),
-                ("message-unlinked", "conv-malformed", "reply", "codex", "root", "must not appear", '{}', _iso(now)),
+                ("message-private", "conv-malformed", "reply", "codex", "root", "body only in transcript", "art-private", digest_private, '{"path":"secret"}', _iso(now)),
+                ("message-unlinked", "conv-malformed", "reply", "codex", "root", "must not appear", None, None, '{}', _iso(now)),
             ],
         )
         connection.execute(
