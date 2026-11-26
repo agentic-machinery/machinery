@@ -84,19 +84,7 @@ def internal_environment(source: Mapping[str, str] | None = None) -> dict[str, s
     return {key: value for key, value in (os.environ if source is None else source).items() if key != OVERRIDE}
 
 
-def primary_root(cwd: Path | None = None) -> Path:
-    """The primary checkout of ``cwd``'s repository; without ``cwd``, of the state anchor's."""
-    if cwd is None:
-        try:
-            # Imported here: minimal workflow checkouts omit common/.
-            from lu_machinery.common.repo_root import state_root
-
-            cwd = state_root()
-        except (ImportError, ValueError):
-            raise PublishBlocked(
-                "OPSEC: repository context unavailable; set LEARN_UKRAINIAN_PRIMARY_REPO_ROOT "
-                "or use an explicit repository."
-            ) from None
+def _git_primary(cwd: Path | None) -> Path | None:
     result = subprocess.run(
         ["git", "rev-parse", "--path-format=absolute", "--git-common-dir"],
         cwd=cwd,
@@ -106,9 +94,40 @@ def primary_root(cwd: Path | None = None) -> Path:
         check=False,
         timeout=5,
     )
-    if result.returncode:
-        raise PublishBlocked("OPSEC: repository context unavailable; use an explicit repository.")
-    return Path(result.stdout.strip()).parent
+    common_dir = Path(result.stdout.removesuffix("\n"))
+    return common_dir.parent if result.returncode == 0 and common_dir.is_absolute() else None
+
+
+def primary_root(cwd: Path | None = None) -> Path:
+    """Resolve an explicit checkout, or use the current checkout then the configured primary."""
+    try:
+        primary = _git_primary(cwd)
+        if primary is not None:
+            return primary
+        if cwd is None:
+            # Imported here: minimal workflow checkouts omit common/.
+            from lu_machinery.common.repo_root import configured_primary_root
+
+            configured = configured_primary_root()
+            if configured is not None:
+                primary = _git_primary(configured)
+                if primary is not None:
+                    return primary
+    except (ImportError, OSError, ValueError, subprocess.SubprocessError):
+        pass
+    raise PublishBlocked(
+        "OPSEC: repository context unavailable; set LU_PRIMARY_REPO_ROOT or use an explicit repository."
+    ) from None
+
+
+def _policy_checkout() -> Path:
+    """Keep executable policy anchored to the configured primary or the in-tree scanner."""
+    try:
+        from lu_machinery.common.repo_root import primary_root as configured_or_source_primary
+
+        return configured_or_source_primary()
+    except (ImportError, OSError, ValueError):
+        raise PublishBlocked("OPSEC: policy checkout unavailable; set LU_PRIMARY_REPO_ROOT.") from None
 
 
 # Modules that minimal workflow sparse checkouts omit from ``common/``.
@@ -265,7 +284,7 @@ def is_private(destination: str) -> bool:
 
 
 def private_tooling() -> Path:
-    return primary_root().parent / _packaged_catalog()["infra-private"]["local_name"] / "tools/public_opsec_scan"
+    return _policy_checkout().parent / _packaged_catalog()["infra-private"]["local_name"] / "tools/public_opsec_scan"
 
 
 CREDENTIAL_TOKEN_PATTERN = re.compile(
@@ -518,7 +537,7 @@ def _override_admitted(
 ) -> bool:
     """Whether the private authority admits these policy hits; its refusal becomes PublishBlocked.
 
-    The audit path is under the state anchor's primary checkout, shared by every
+    The audit path is under the policy checkout, shared by every
     worktree and publisher, unless the caller names one. Only a literal True admits;
     any other failure, resolving that path included, admits nothing.
     """
@@ -526,7 +545,7 @@ def _override_admitted(
     import io
 
     try:
-        target = log_path or primary_root() / "batch_state/opsec/overrides.jsonl"
+        target = log_path or _policy_checkout() / "batch_state/opsec/overrides.jsonl"
         with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
             admitted = authority.authorize(destination, list(blocks), reason, target)
     except authority.OverrideBlocked as exc:

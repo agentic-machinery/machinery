@@ -54,7 +54,7 @@ def gate():
 
     prepublish.catalog = lambda: config["catalog"]
     prepublish.private_tooling = lambda: Path(config["tooling"])
-    prepublish.primary_root = lambda cwd=None: Path(config["sandbox_root"])
+    prepublish._policy_checkout = lambda: Path(config["sandbox_root"])
     return prepublish
 
 
@@ -390,7 +390,7 @@ def test_git_lookups_and_the_callers_hooks_receive_no_override(sandbox, subject)
 def test_merge_readiness_reads_and_the_merge_receive_no_override(synthetic_opsec, monkeypatch, tmp_path):
     """pr-merge: gh reads before the scan, and the write after the override is claimed."""
     monkeypatch.setattr(gate, "catalog", lambda: CATALOG)
-    monkeypatch.setattr(gate, "primary_root", lambda cwd=None: tmp_path)
+    monkeypatch.setattr(gate, "_policy_checkout", lambda: tmp_path)
     monkeypatch.delenv("AGENT_NO_MERGE", raising=False)
     head = "a" * 40
     calls = []

@@ -187,7 +187,7 @@ def test_missing_matcher_fails_closed_for_default_text(tmp_path, monkeypatch):
 
 
 def test_override_is_logged_and_single_use(synthetic_opsec, tmp_path, monkeypatch):
-    monkeypatch.setattr(gate, "primary_root", lambda cwd=None: tmp_path)
+    monkeypatch.setattr(gate, "_policy_checkout", lambda: tmp_path)
     calls = []
     env = {"LU_OPSEC_OVERRIDE": "synthetic false positive"}
     pub.publish(
@@ -255,7 +255,7 @@ def test_transfer_without_a_product_root_is_refused_before_any_receipt(synthetic
 @pytest.mark.parametrize("field", ["subject", "body"])
 def test_override_for_a_supplied_field_is_offered_once(synthetic_opsec, tmp_path, monkeypatch, field):
     """Defect class: the early supplied-field scan consuming or auditing the override a second time."""
-    monkeypatch.setattr(gate, "primary_root", lambda cwd=None: tmp_path)
+    monkeypatch.setattr(gate, "_policy_checkout", lambda: tmp_path)
     calls = []
     pub.publish(
         "pr-merge", repo="unit/public", number=1, env={"LU_OPSEC_OVERRIDE": "synthetic false positive"},

@@ -36,7 +36,7 @@ from lu_machinery.agent_runtime.codex_accounts import (
 )
 from lu_machinery.api.state_helpers import cache_get_with_age, cache_invalidate, cache_set
 from lu_machinery.common import json_depth
-from lu_machinery.common.repo_root import state_root
+from lu_machinery.common.repo_root import primary_root, state_root
 from lu_machinery.fleet.credit_lane import SUBSCRIPTION_NEAR_CAP_USED_PCT
 
 # Public diagnostic marker. Provider messages belong only in server logs.
@@ -413,10 +413,7 @@ def _private_usage() -> ModuleType | None:
 def _load_private_usage() -> ModuleType | None:
     name = "_lu_private_fleet_usage"
     try:
-        from lu_machinery.opsec.prepublish import (  # noqa: PLC0415  # lazy-ok: private binding lookup
-            catalog,
-            primary_root,
-        )
+        from lu_machinery.opsec.prepublish import catalog  # noqa: PLC0415  # lazy-ok: private binding lookup
 
         path = primary_root().parent / catalog()["infra-private"]["local_name"] / "tools/fleet_usage/usage.py"
         spec = importlib.util.spec_from_file_location(name, path)
@@ -2172,7 +2169,7 @@ SUBSCRIPTION_REFRESH_KEYS: tuple[str, ...] = tuple(
 def _refresh_claude_accounts_live() -> None:
     """The sole machinery reader for all Claude subscription accounts."""
     # The per-account module reads this module's CodexBar helpers, so a top-level import is a cycle.
-    from lu_machinery.api.claude_account_usage import refresh_claude_account_usage  # noqa: PLC0415, I001  # lazy-ok: import cycle
+    from lu_machinery.api.claude_account_usage import refresh_claude_account_usage  # noqa: PLC0415  # lazy-ok: import cycle
 
     refresh_claude_account_usage()
 

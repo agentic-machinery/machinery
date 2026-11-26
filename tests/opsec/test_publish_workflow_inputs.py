@@ -2,22 +2,29 @@
 
 
 
-from lu_machinery.common.repo_root import machinery_path
-import json
-import subprocess
-import pytest
-from lu_machinery.opsec import prepublish as gate
-from lu_machinery.publish import github as pub
-from tests.helpers.product_tree import configured_roots as configured_roots
 import importlib.util
+import json
 import os
 import re
 import statistics
+import subprocess
 import sys
 import time
 from pathlib import Path
+
+import pytest
+
+from lu_machinery.common.repo_root import machinery_path
+from lu_machinery.opsec import prepublish as gate
+from lu_machinery.publish import github as pub
 from tests.helpers import machinery_package as machinery_package
-from tests.opsec_fixtures import CATALOG as CATALOG, ROOT as ROOT, TOKEN as TOKEN, install_override as install_override, synthetic_rules as synthetic_rules
+from tests.helpers.product_tree import configured_roots as configured_roots
+from tests.opsec_fixtures import CATALOG as CATALOG
+from tests.opsec_fixtures import ROOT as ROOT
+from tests.opsec_fixtures import TOKEN as TOKEN
+from tests.opsec_fixtures import install_override as install_override
+from tests.opsec_fixtures import make_tooling
+from tests.opsec_fixtures import synthetic_rules as synthetic_rules
 
 SHA = "0123456789abcdefABCDEF0123456789abcdef01"
 
@@ -429,10 +436,10 @@ def test_an_override_authority_failure_never_admits(synthetic_opsec, tmp_path, m
     # Without a log path, a failure to resolve the primary checkout's audit root is the same refusal.
     for failure in (OSError("synthetic root failure"), gate.PublishBlocked("synthetic root refusal")):
 
-        def unavailable(cwd=None, failure=failure):
+        def unavailable(failure=failure):
             raise failure
 
-        monkeypatch.setattr(gate, "primary_root", unavailable)
+        monkeypatch.setattr(gate, "_policy_checkout", unavailable)
         with pytest.raises(gate.PublishBlocked, match=r"OPSEC blocked: .*override was not admitted") as error:
             gate.check_texts("github.com/unit/public", [TOKEN], environment={gate.OVERRIDE: "reason"})
         assert error.value.indices == {0}
@@ -453,7 +460,7 @@ def authorize(destination, blocks, reason, log_path):
 @pytest.mark.usefixtures('configured_roots', 'fake_catalog')
 @pytest.mark.usefixtures('github_command_boundary')
 def test_a_valid_private_override_module_is_used_through_the_binding(synthetic_opsec, tmp_path, monkeypatch, capfd):
-    monkeypatch.setattr(gate, "primary_root", lambda cwd=None: tmp_path / "primary")
+    monkeypatch.setattr(gate, "_policy_checkout", lambda: tmp_path / "primary")
     install_override(gate.private_tooling(), RECORDING_OVERRIDE)
     env = {gate.OVERRIDE: "synthetic false positive"}
     gate.check_texts("github.com/unit/public", ["clean", TOKEN], environment=env)
@@ -524,8 +531,7 @@ def test_an_override_refusal_becomes_publish_blocked(synthetic_opsec, tmp_path):
 @pytest.mark.usefixtures('configured_roots', 'fake_catalog')
 @pytest.mark.usefixtures('github_command_boundary')
 def test_direct_review_publisher_blocks_before_send(synthetic_opsec):
-    from lu_machinery.fleet_comms.review_publisher import post_commit_status
-    from lu_machinery.fleet_comms.review_publisher import post_pr_comment
+    from lu_machinery.fleet_comms.review_publisher import post_commit_status, post_pr_comment
 
     for call in [
         lambda: post_pr_comment(repository="unit/public", pr_number=1, body=TOKEN, runner=send),
@@ -653,6 +659,41 @@ def test_clean_publish_with_override_needs_no_log(synthetic_opsec, tmp_path):
     gate.check_texts(
         "github.com/unit/public", ["clean"], environment={"LU_OPSEC_OVERRIDE": "reason"}, log_path=target / "log"
     )
+
+
+@pytest.mark.usefixtures("fake_catalog")
+def test_state_root_is_not_repository_context(configured_roots, monkeypatch, tmp_path):
+    state = tmp_path / "state"
+    state.mkdir()
+    pushing = tmp_path / "pushing"
+    subprocess.run(["git", "init", "-q", str(pushing)], check=True, capture_output=True, timeout=30)
+    monkeypatch.setenv("LU_PRIMARY_REPO_ROOT", str(configured_roots.primary))
+    monkeypatch.setenv("LU_STATE_ROOT", str(state))
+    make_tooling(configured_roots.primary.parent / "private-fixture/tools/public_opsec_scan")
+
+    monkeypatch.chdir(state)
+    assert gate.primary_root() == configured_roots.primary
+    assert gate.primary_root(pushing) == pushing
+    gate.check_texts("github.com/unit/public", ["ordinary public text"], environment={})
+
+    monkeypatch.chdir(pushing)
+    assert gate.primary_root() == pushing
+    gate.check_texts("github.com/unit/public", ["ordinary public text"], environment={})
+    subprocess.run(
+        [sys.executable, str(ROOT / ".githooks/pre_push_gate.py"), "--push-messages", "origin",
+         "https://github.com/unit/public.git"],
+        input=b"", check=True, capture_output=True, timeout=30,
+    )
+
+
+def test_unresolvable_repository_context_fails_closed(monkeypatch, tmp_path):
+    monkeypatch.setenv("LU_STATE_ROOT", str(tmp_path))
+    monkeypatch.delenv("LU_PRIMARY_REPO_ROOT", raising=False)
+    monkeypatch.delenv("LEARN_UKRAINIAN_PRIMARY_REPO_ROOT", raising=False)
+    monkeypatch.chdir(tmp_path)
+
+    with pytest.raises(gate.PublishBlocked, match="repository context unavailable"):
+        gate.primary_root()
 
 
 @pytest.mark.usefixtures('configured_roots', 'fake_catalog')
