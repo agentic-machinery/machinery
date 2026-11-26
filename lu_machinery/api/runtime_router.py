@@ -10,6 +10,7 @@ import importlib.util
 import inspect
 import ipaddress
 import json
+import math
 import os
 import re
 import sqlite3
@@ -1647,14 +1648,22 @@ def _redact_and_sanitize_text(value: str, *, _depth: int = 0) -> str:
     Structured JSON payloads — objects, arrays, and JSON-string wrappers, recursively across
     string leaves and object keys up to ``_ACP_TRANSCRIPT_JSON_REDACT_MAX_DEPTH`` — are decoded,
     redacted structurally (using ``secret_redactor`` key/text rules and ``opsec_sanitize``), and
-    re-serialized before final text redaction so JSON escapes cannot conceal secrets or paths.
-    Structured bodies that exceed either container depth (64) or nested-JSON depth fail closed by
-    raising ``_AcpRedactionDepthExceeded`` rather than falling back to plain-text filters; parser
-    conversion failures and unencodable outputs (non-finite floats, lone surrogates) raise
-    ``_AcpBodyEncodingError``.
+    re-serialized directly so valid JSON delimiters are preserved and JSON escapes cannot conceal
+    secrets or paths. Structured bodies that exceed either container depth (64) or nested-JSON
+    depth fail closed by raising ``_AcpRedactionDepthExceeded`` rather than falling back to
+    plain-text filters; parser conversion errors, non-finite JSON scalars/floats, and decoded lone
+    surrogates raise ``_AcpBodyEncodingError``.
     """
     stripped = value.strip()
-    if stripped and stripped[0] in '{["':
+    is_json_candidate = bool(
+        stripped
+        and (
+            stripped[0] in '{["'
+            or stripped in {"NaN", "Infinity", "-Infinity"}
+            or (stripped[0] in "-0123456789" and any(ch in stripped for ch in ".eE"))
+        )
+    )
+    if is_json_candidate:
         try:
             parsed = json_depth.loads(stripped, max_depth=64)
         except RecursionError:
@@ -1663,6 +1672,8 @@ def _redact_and_sanitize_text(value: str, *, _depth: int = 0) -> str:
             parsed = None
         except (TypeError, ValueError):
             raise _AcpBodyEncodingError() from None
+        if isinstance(parsed, float) and not math.isfinite(parsed):
+            raise _AcpBodyEncodingError()
         if isinstance(parsed, (dict, list, str)):
             if _depth >= _ACP_TRANSCRIPT_JSON_REDACT_MAX_DEPTH:
                 raise _AcpRedactionDepthExceeded()
@@ -1674,7 +1685,7 @@ def _redact_and_sanitize_text(value: str, *, _depth: int = 0) -> str:
                 raise _AcpRedactionDepthExceeded() from None
             except (TypeError, ValueError, UnicodeError):
                 raise _AcpBodyEncodingError() from None
-            return sanitize_text(redact_text(serialized) or "")
+            return serialized
     redacted = redact_text(value)
     return sanitize_text("" if redacted is None else redacted)
 

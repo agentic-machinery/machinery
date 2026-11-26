@@ -1097,6 +1097,38 @@ globalThis.fetch = async (url) => {
             (),
         ),
         (
+            "json-assignment-leaf-preserves-sibling",
+            json.dumps({"note": "password=leaf_assign_secret_13", "keep": "sibling_intact"}),
+            "ok",
+            None,
+            ("leaf_assign_secret_13",),
+            ("[REDACTED_SECRET]", "sibling_intact"),
+        ),
+        (
+            "standalone-non-finite-scalar",
+            "1e309",
+            "missing_or_corrupt",
+            "body_redaction_failed",
+            ("1e309",),
+            (),
+        ),
+        (
+            "wrapped-non-finite-scalar",
+            json.dumps("1e309"),
+            "missing_or_corrupt",
+            "body_redaction_failed",
+            ("1e309",),
+            (),
+        ),
+        (
+            "standalone-infinity-constant",
+            "Infinity",
+            "missing_or_corrupt",
+            "body_redaction_failed",
+            ("Infinity",),
+            (),
+        ),
+        (
             "plain-prose-quoted-not-json",
             '"quoted prose" followed by password="plain_quoted_secret_12" and /home/alice/prose.txt',
             "ok",
@@ -1136,5 +1168,8 @@ def test_wrapped_json_redaction_class_and_depth_bounds(
         assert isinstance(turn["body"], str)
         for token in expected_tokens:
             assert token in turn["body"], (case_id, token, turn["body"])
+        if case_id == "json-assignment-leaf-preserves-sibling":
+            reparsed = json.loads(turn["body"])
+            assert reparsed == {"note": "password=[REDACTED_SECRET]", "keep": "sibling_intact"}
     else:
         assert turn["body"] is None, (case_id, turn)
