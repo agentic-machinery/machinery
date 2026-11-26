@@ -178,7 +178,9 @@ def patch_gh(
 def _fleet_layout(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, Path]:
     """Public primary plus its ``infra-private`` sibling checkout, laid out as layout A does (#8624)."""
     public = init_repo(tmp_path, "learn-ukrainian")
-    sibling = init_repo(tmp_path, "learn-ukrainian-infra-private")
+    from lu_machinery.orchestration.fleet_repos import load_fleet_repos
+
+    sibling = init_repo(tmp_path, load_fleet_repos()["infra-private"].local_name)
     monkeypatch.setattr(worktree_claims, "public_primary_root", lambda: public)
     return public, sibling
 
