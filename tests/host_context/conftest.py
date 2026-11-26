@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytest
 
-from lu_machinery.host_context import CONTEXT_ENV, SCHEMA
+from lu_machinery import host_context
 
 _VERSION = "99.1.0"
 
@@ -44,13 +44,13 @@ def git(checkout, *args):
 
 @pytest.fixture
 def host_layout(tmp_path):
-    # The package comes from this checkout. Version metadata belongs to this
-    # fixture and allows the subprocess to exercise the isolated import check.
+    # Use the package under test, including the installed-wheel CI layout.
+    # Fixture metadata lets the subprocess exercise the isolated import check.
     runtime = tmp_path / "runtime"
     venv.EnvBuilder(symlinks=True).create(runtime)
     python = runtime / "bin" / "python"
     site = runtime / "lib" / f"python{sys.version_info.major}.{sys.version_info.minor}" / "site-packages"
-    source = Path(__file__).resolve().parents[2] / "lu_machinery"
+    source = Path(host_context.__file__).resolve().parent
     (site / "lu_machinery").symlink_to(source, target_is_directory=True)
     (site / "fixture-deps.pth").write_text(sysconfig.get_path("purelib") + "\n", encoding="utf-8")
     metadata = site / f"lu_machinery-{_VERSION}.dist-info"
@@ -84,7 +84,7 @@ def host_layout(tmp_path):
     layout = HostLayout(
         file=file,
         data={
-            "schema": SCHEMA,
+            "schema": host_context.SCHEMA,
             "state_root": str(state),
             "runtime": {"python": str(python), "lu_machinery": _VERSION, "wheel_sha256": "a" * 64},
             "repos": repos,
@@ -96,7 +96,7 @@ def host_layout(tmp_path):
             "monitor_url": "http://127.0.0.1:8765",
         },
         python=python,
-        env={CONTEXT_ENV: str(file)},
+        env={host_context.CONTEXT_ENV: str(file)},
     )
     layout.write()
     return layout
