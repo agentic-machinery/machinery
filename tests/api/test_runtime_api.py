@@ -1535,43 +1535,102 @@ def test_acp_transcript_state_backend_unavailable_returns_503_and_reserves_404(t
     assert not_found.headers["cache-control"] == "no-store"
     assert not_found.json() == {"detail": "Conversation not found", "reason": "conversation_not_found"}
 
-    # 5. Shared CAS directory missing or replaced with a regular file -> 503 blob_store_unavailable (PR1493-F2).
+    # 5. Shared CAS directory usability class (PR1493-F2): unusable modes, symlinks, files,
+    # missing directories, and OSErrors must map to 503 blob_store_unavailable (never 404);
+    # read-only searchable mode 0500 remains usable (200 existing, 404 absent).
     bad_blobs_root = tmp_path / "bad-blobs-dir"
     conv_bad_dir, _ = _create_controller_conversation(
         bad_blobs_root,
         turns=[("request", "root", "codex", "cannot open blobs dir", 1)],
     )
+    import errno as _errno
     import shutil
 
-    # 5a. Missing blobs/sha256 directory -> 503 for BOTH existing and unknown conversation IDs.
-    (bad_blobs_root / "blobs" / "sha256").rename(bad_blobs_root / "blobs" / "sha256-moved")
     monkeypatch.setenv("FLEET_COMMS_ROOT", str(bad_blobs_root))
-    for target_id in (conv_bad_dir, "unknown-id"):
-        missing_sha_dir_resp = local.get(f"/api/runtime/acp/conversations/{target_id}/transcript")
-        assert missing_sha_dir_resp.status_code == 503
-        assert missing_sha_dir_resp.headers["cache-control"] == "no-store"
-        assert missing_sha_dir_resp.json()["state"] == "backend_unavailable"
-        assert missing_sha_dir_resp.json()["reason"] == "blob_store_unavailable"
 
-    # 5b. Missing blobs directory (renamed aside) -> 503 for BOTH existing and unknown IDs.
-    (bad_blobs_root / "blobs").rename(bad_blobs_root / "blobs-moved")
-    for target_id in (conv_bad_dir, "unknown-id"):
-        missing_blobs_resp = local.get(f"/api/runtime/acp/conversations/{target_id}/transcript")
-        assert missing_blobs_resp.status_code == 503
-        assert missing_blobs_resp.headers["cache-control"] == "no-store"
-        assert missing_blobs_resp.json()["state"] == "backend_unavailable"
-        assert missing_blobs_resp.json()["reason"] == "blob_store_unavailable"
+    # 5a. Parametrized mode variants on both blobs/sha256 and blobs (0000/0100/0200/0400 -> 503; 0500 -> usable).
+    mode_cases = [
+        (bad_blobs_root / "blobs" / "sha256", 0o000, False),
+        (bad_blobs_root / "blobs" / "sha256", 0o100, False),
+        (bad_blobs_root / "blobs" / "sha256", 0o200, False),
+        (bad_blobs_root / "blobs" / "sha256", 0o400, False),
+        (bad_blobs_root / "blobs" / "sha256", 0o500, True),
+        (bad_blobs_root / "blobs", 0o000, False),
+        (bad_blobs_root / "blobs", 0o100, False),
+        (bad_blobs_root / "blobs", 0o200, False),
+        (bad_blobs_root / "blobs", 0o400, False),
+        (bad_blobs_root / "blobs", 0o500, True),
+    ]
+    for target_dir, mode, usable in mode_cases:
+        os.chmod(target_dir, mode)
+        try:
+            existing_resp = local.get(f"/api/runtime/acp/conversations/{conv_bad_dir}/transcript")
+            absent_resp = local.get("/api/runtime/acp/conversations/unknown-id/transcript")
+        finally:
+            os.chmod(target_dir, 0o700)
+        if usable:
+            assert existing_resp.status_code == 200, f"mode={oct(mode)} dir={target_dir.name}"
+            assert existing_resp.json()["state"] == "ok"
+            assert absent_resp.status_code == 404, f"mode={oct(mode)} dir={target_dir.name}"
+            assert absent_resp.json() == {"detail": "Conversation not found", "reason": "conversation_not_found"}
+        else:
+            for resp in (existing_resp, absent_resp):
+                assert resp.status_code == 503, f"mode={oct(mode)} dir={target_dir.name}"
+                assert resp.headers["cache-control"] == "no-store"
+                assert resp.json()["state"] == "backend_unavailable"
+                assert resp.json()["reason"] == "blob_store_unavailable"
+                assert "PermissionError" not in resp.text
+                assert "Errno" not in resp.text
+                assert str(tmp_path) not in resp.text
+                assert "cannot open blobs dir" not in resp.text
 
-    # 5c. Regular file in place of blobs directory (ENOTDIR) -> 503 for BOTH existing and unknown IDs.
-    shutil.rmtree(bad_blobs_root / "blobs-moved")
-    (bad_blobs_root / "blobs").write_text("not a directory", encoding="utf-8")
-    for target_id in (conv_bad_dir, "unknown-id"):
-        bad_dir_resp = local.get(f"/api/runtime/acp/conversations/{target_id}/transcript")
-        assert bad_dir_resp.status_code == 503
-        assert bad_dir_resp.headers["cache-control"] == "no-store"
-        assert bad_dir_resp.json()["state"] == "backend_unavailable"
-        assert bad_dir_resp.json()["reason"] == "blob_store_unavailable"
-        assert "cannot open blobs dir" not in bad_dir_resp.text
+    # 5b. OSError variants (EPERM, EIO) while proving searchability -> 503 with no exception text.
+    real_stat = os.stat
+    for err_no in (_errno.EPERM, _errno.EIO):
+        def _fail_dir_stat(path, *args, _err=err_no, **kwargs):
+            if path == "." and kwargs.get("dir_fd") is not None:
+                raise OSError(_err, f"secret host fault {_err}")
+            return real_stat(path, *args, **kwargs)
+
+        monkeypatch.setattr(runtime_router.os, "stat", _fail_dir_stat)
+        for target_id in (conv_bad_dir, "unknown-id"):
+            err_resp = local.get(f"/api/runtime/acp/conversations/{target_id}/transcript")
+            assert err_resp.status_code == 503
+            assert err_resp.headers["cache-control"] == "no-store"
+            assert err_resp.json()["state"] == "backend_unavailable"
+            assert err_resp.json()["reason"] == "blob_store_unavailable"
+            assert "secret host fault" not in err_resp.text
+            assert "OSError" not in err_resp.text
+    monkeypatch.setattr(runtime_router.os, "stat", real_stat)
+
+    # 5c. Symlink, regular file (ENOTDIR), and missing (ENOENT) in place of blobs/sha256 and blobs -> 503.
+    decoy_dir = tmp_path / "decoy-cas-dir"
+    decoy_dir.mkdir()
+    for rel_path in (("blobs", "sha256"), ("blobs",)):
+        target_path = bad_blobs_root.joinpath(*rel_path)
+        backup_path = target_path.parent / f"{target_path.name}-backup"
+        target_path.rename(backup_path)
+        try:
+            for kind in ("missing", "file", "symlink"):
+                if kind == "file":
+                    target_path.write_text("not a directory", encoding="utf-8")
+                elif kind == "symlink":
+                    target_path.symlink_to(decoy_dir)
+                try:
+                    for target_id in (conv_bad_dir, "unknown-id"):
+                        resp = local.get(f"/api/runtime/acp/conversations/{target_id}/transcript")
+                        assert resp.status_code == 503, f"path={rel_path} kind={kind} id={target_id}"
+                        assert resp.headers["cache-control"] == "no-store"
+                        assert resp.json()["state"] == "backend_unavailable"
+                        assert resp.json()["reason"] == "blob_store_unavailable"
+                        assert str(tmp_path) not in resp.text
+                        assert "cannot open blobs dir" not in resp.text
+                finally:
+                    if target_path.is_symlink() or target_path.is_file():
+                        target_path.unlink()
+        finally:
+            backup_path.rename(target_path)
+    shutil.rmtree(decoy_dir)
 
     # 6. Blob backend OSError (not FileNotFoundError) -> 503 blob_store_unavailable.
     monkeypatch.setenv("FLEET_COMMS_ROOT", str(good_root))

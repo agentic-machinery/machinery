@@ -1640,7 +1640,15 @@ def _open_acp_transcript_store(ctx: MonitorContext) -> tuple[Path, SQLiteConnect
 
 
 def _open_acp_cas_sha256_dir(plane_root: Path) -> int:
-    """Open ``plane_root/blobs/sha256`` without following symlinks, raising typed 503 on failure."""
+    """Open and verify ``plane_root/blobs/sha256`` without following symlinks, raising typed 503 on failure.
+
+    A request returns 404 only after a lookup that proves the store directory is usable
+    (opened, searchable, readable) and the id is absent; any ``OSError`` while proving
+    usability (``EACCES``, ``EPERM``, ``ENOTDIR``, ``ELOOP``, ``EIO``, ``ENOENT`` of the
+    directory itself, and unusable mode ``0000``/``0100``/``0200``/``0400`` variants, while
+    read-only searchable ``0500`` remains usable) maps to 503 ``blob_store_unavailable`` with
+    no exception text.
+    """
     cloexec = getattr(os, "O_CLOEXEC", 0)
     dir_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | cloexec
     try:
@@ -1655,6 +1663,10 @@ def _open_acp_cas_sha256_dir(plane_root: Path) -> int:
                 raise _AcpBackendUnavailable("blob_store_unavailable") from None
             os.close(parent_fd)
             parent_fd = next_fd
+        try:
+            os.stat(".", dir_fd=parent_fd)
+        except OSError:
+            raise _AcpBackendUnavailable("blob_store_unavailable") from None
         return parent_fd
     except BaseException:
         os.close(parent_fd)
