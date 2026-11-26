@@ -18,7 +18,7 @@ One dictionary procedure for every seat that writes or reviews Ukrainian. It cov
 
 - Word tools take one word form: `verify_words` (one form per list entry), `check_russian_shadow`, `verify_stress`. Split a phrase into its word forms for them and keep the phrase as context. A phrase sent whole returns misleading output (no VESUM match, or a false Russian-shadow match). Judge the phrase itself only with the phrase sources in step 5.
 - Headword tools take the lemma: `query_cefr_level`, `query_sum20`, `query_ulif`, `verify_lemma`, `search_heritage`, `search_esum`, `search_slovnyk_me`, and `query_r2u` (which takes a Russian lemma). Query them with the context-supported VESUM lemma from step 2. When VESUM has no match for the form (the step 2 escalation, step 5), query them with the written form or with a candidate headword taken from tool output (for example a headword a `query_ulif` miss lists). Never invent a lookup key. Keep the original item in the row and record the exact key you sent as `checked_form`.
-- Lookup keys are bare. For every tool except `verify_stress`, remove stress marks (U+0301, U+0300) from the key, including from a headword copied out of tool output, write an in-word hyphen (U+2010, U+2011) as the ASCII hyphen-minus, and lowercase a word that is capitalized only because it starts a sentence or heading. Keep proper nouns as written. A hyphenated compound is one word form: send it whole. VESUM misses a stress-marked, typographic-hyphen or sentence-capitalized form that it attests in this bare form, so a miss on an unnormalized key is no evidence. Send `verify_stress` the form as written and keep the original item for the stress row.
+- Lookup keys are bare. For every tool, `verify_stress` included, write an in-word hyphen (U+2010, U+2011) as the ASCII hyphen-minus; a hyphenated compound is one word form, sent whole. For every tool except `verify_stress`, also remove stress marks (U+0301, U+0300) from the key, including from a headword copied out of tool output, and lowercase a word that is capitalized only because it starts a sentence or heading. Keep proper nouns as written. VESUM misses a stress-marked, typographic-hyphen or sentence-capitalized form that it attests in this bare form, and `verify_stress` refuses a typographic hyphen, so a miss or refusal on an unnormalized key is no evidence. `verify_stress` keeps the written stress marks and capitals. Keep the original item in `item` and record the key you sent in `checked_form`.
 
 ## Reading a Sources result
 
@@ -29,7 +29,7 @@ One dictionary procedure for every seat that writes or reviews Ukrainian. It cov
   - `verify_stress` `disposition` `ambiguous`, `pending` or `invalid_input`, even under `status: error` (step 7 says how to read each);
   - plain text, such as a `query_sum20` article or a `search_heritage` attestation (hits), or a `query_ulif` or `search_heritage` no-entry reply (misses);
   - the plain object `check_russian_shadow` returns (`matches_russian`, `russian_lemma`, `ukrainian_alternative`, `confidence`).
-- An input sent to the wrong kind of tool (a phrase to a word tool, or an inflected form to a headword tool when VESUM supplied the lemma) is the caller's error. Correct the input as above and call again. Only a corrected call that still fails is `unavailable`.
+- An input sent to the wrong kind of tool (a phrase to a word tool, or an inflected form to a headword tool when VESUM supplied the lemma) is the caller's error. Correct the input as above and call again. Only a corrected call that still returns no lookup answer is `unavailable`.
 
 ## Procedure
 
@@ -49,7 +49,7 @@ One dictionary procedure for every seat that writes or reviews Ukrainian. It cov
 | Facet | Tool |
 | --- | --- |
 | spelling | `query_pravopys` (Правопис 2019, cite the §) |
-| stress | `verify_stress` with the word form, then the СУМ-20 headword (`query_sum20`). VESUM has no stress. `ambiguous`: call again with the lemma, POS and tags of the context reading from step 2; still `ambiguous` is `unresolved`. `pending`: use the СУМ-20 headword, else `unresolved`. `invalid_input` for a single-syllable word: there is no stress to mark, so give no stress row. |
+| stress | `verify_stress` with the word form, then the СУМ-20 headword (`query_sum20`). VESUM has no stress. `ambiguous`: call again with the lemma, POS and tags of the context reading from step 2; still `ambiguous` is `unresolved`. `pending`: use the СУМ-20 headword, else `unresolved`. `invalid_input` for a single-syllable word: there is no stress to mark, so give no stress row. Any other `invalid_input`: correct the key as in "What each tool takes" and call again; a corrected key it still refuses is `unresolved`. |
 | meaning | `query_sum20`, then ULIF (`query_ulif`) and `search_slovnyk_me`. Label СУМ-20 mirror rows as mirrors; they are not official verification. Грінченко is a witness only. |
 | etymology | `search_esum` |
 
