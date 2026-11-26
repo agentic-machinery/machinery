@@ -13,7 +13,7 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from lu_machinery.api import journal_router
+from lu_machinery.api import journal_router, runtime_router
 from lu_machinery.api.route_contracts import contract_for_page, contract_for_route
 from lu_machinery.orchestration.fleet_repos import FleetRepo
 
@@ -156,7 +156,7 @@ def test_journal_available_with_entries_and_ordering_and_paging_passthrough(
                 "limit": "2",
                 "offset": "1",
             },
-            headers={"Origin": "http://localhost:8765"},
+            headers={"Origin": "http://127.0.0.1:8765", "Sec-Fetch-Site": "same-origin"},
         )
 
     assert response.status_code == 200
@@ -469,28 +469,63 @@ def test_journal_missing_or_duplicate_host_or_origin_headers_return_403() -> Non
             }
         )
 
-    assert not journal_router._request_is_allowed(make_request([]))
-    assert not journal_router._request_is_allowed(
-        make_request([(b"host", b"127.0.0.1:8765"), (b"host", b"127.0.0.1:8765")])
-    )
-    assert not journal_router._request_is_allowed(
-        make_request(
-            [
-                (b"host", b"127.0.0.1:8765"),
-                (b"origin", b"http://127.0.0.1:8765"),
-                (b"origin", b"https://evil.example"),
-            ]
+    assert journal_router.local_body_read_refusal_response is runtime_router.local_body_read_refusal_response
+    assert runtime_router.local_body_read_access_refusal(make_request([])) == "invalid_host"
+    assert (
+        runtime_router.local_body_read_access_refusal(
+            make_request([(b"host", b"127.0.0.1:8765"), (b"host", b"127.0.0.1:8765")])
         )
+        == "invalid_host"
     )
-    assert journal_router._request_is_allowed(
-        make_request([(b"host", b"127.0.0.1:8765"), (b"origin", b"http://localhost:8765")])
+    assert (
+        runtime_router.local_body_read_access_refusal(
+            make_request(
+                [
+                    (b"host", b"127.0.0.1:8765"),
+                    (b"origin", b"http://127.0.0.1:8765"),
+                    (b"origin", b"https://evil.example"),
+                ]
+            )
+        )
+        == "invalid_origin"
+    )
+    # Shared A2 guard enforces exact bound listener origin, Fetch Metadata, and no forwarding headers.
+    assert (
+        runtime_router.local_body_read_access_refusal(
+            make_request([(b"host", b"127.0.0.1:8765"), (b"origin", b"http://localhost:8765")])
+        )
+        == "invalid_origin"
+    )
+    assert (
+        runtime_router.local_body_read_access_refusal(
+            make_request([(b"host", b"127.0.0.1:8765"), (b"sec-fetch-site", b"cross-site")])
+        )
+        == "cross_site_request"
+    )
+    assert (
+        runtime_router.local_body_read_access_refusal(
+            make_request([(b"host", b"127.0.0.1:8765"), (b"x-forwarded-for", b"127.0.0.1")])
+        )
+        == "forwarding_header_present"
+    )
+    assert (
+        runtime_router.local_body_read_access_refusal(
+            make_request(
+                [
+                    (b"host", b"127.0.0.1:8765"),
+                    (b"origin", b"http://127.0.0.1:8765"),
+                    (b"sec-fetch-site", b"same-origin"),
+                ]
+            )
+        )
+        is None
     )
 
 
 def test_journal_loopback_ipv6_and_loopback_origins_allowed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Defect class: valid loopback IPv6 peer or loopback Origin falsely refused."""
+    """Defect class: valid loopback IPv6 peer or exact listener Origin falsely refused, or mismatched loopback Origin allowed."""
     monkeypatch.setattr(journal_router, "load_fleet_repos", lambda: _FIXTURE_REPOS)
     cli = _make_fake_cli(
         tmp_path,
@@ -499,10 +534,29 @@ def test_journal_loopback_ipv6_and_loopback_origins_allowed(
     monkeypatch.setenv("LU_DRIVER_STATE_CLI", str(cli))
 
     with _build_client(client=("::1", 50000), base_url="http://[::1]:8765") as client:
-        for origin in ("http://[::1]:8765", "http://127.0.0.1:8765", "http://localhost:8765"):
-            response = client.get("/api/journal", headers={"Origin": origin})
-            assert response.status_code == 200, origin
+        for headers in (
+            {"Origin": "http://[::1]:8765", "Sec-Fetch-Site": "same-origin"},
+            {"Sec-Fetch-Site": "none"},
+            {},
+        ):
+            response = client.get("/api/journal", headers=headers)
+            assert response.status_code == 200, headers
             assert response.headers["cache-control"] == "no-store"
+
+        for mismatched_origin in ("http://127.0.0.1:8765", "http://localhost:8765"):
+            refused = client.get("/api/journal", headers={"Origin": mismatched_origin})
+            assert refused.status_code == 403, mismatched_origin
+            assert refused.headers["cache-control"] == "no-store"
+            assert refused.json() == {"detail": "Forbidden", "reason": "invalid_origin"}
+
+        for extra_headers, expected_reason in (
+            ({"Sec-Fetch-Site": "cross-site"}, "cross_site_request"),
+            ({"Forwarded": "for=127.0.0.1"}, "forwarding_header_present"),
+        ):
+            refused = client.get("/api/journal", headers=extra_headers)
+            assert refused.status_code == 403, extra_headers
+            assert refused.headers["cache-control"] == "no-store"
+            assert refused.json() == {"detail": "Forbidden", "reason": expected_reason}
 
 
 def test_journal_page_renders_plain_text_markers_and_unavailable_states() -> None:
