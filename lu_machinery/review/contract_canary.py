@@ -31,7 +31,6 @@ from pathlib import Path
 from typing import Any, cast
 
 from lu_machinery.common import github_client, json_depth
-from lu_machinery.common.git_credentials import SELECTOR_ENV
 from lu_machinery.common.repo_root import MACHINERY_ENV_VARS, STATE_ROOT_ENV
 
 # The machinery package's directory name, which a change lists its files under, from this module's
@@ -369,6 +368,8 @@ def _run_steps(
     history), and ``run`` removes it once the image is built. With a wheelhouse, the consumer
     venv also finds wheels there; the lock's hashes still decide which bytes install.
     """
+    from lu_machinery.common.git_credentials import SELECTOR_ENV
+
     clone, mount = work / "source", work / "mount"
     python = str(work / "consumer/bin/python")
     url = f"https://github.com/{repo}.git"

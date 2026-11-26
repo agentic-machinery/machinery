@@ -38,7 +38,6 @@ from typing import Literal
 
 from lu_machinery.common import json_depth
 from lu_machinery.common.git_context import sanitized_git_env
-from lu_machinery.common.git_credentials import SELECTOR_ENV
 from lu_machinery.common.repo_root import ENV_ALIASES, MACHINERY_ENV_VARS, PRIMARY_ROOT_ENV, PRODUCT_ROOT_ENV
 
 # The post-release PR's title. A range holding only these PRs is unchanged.
@@ -1433,6 +1432,8 @@ class Cut:
         return tagged, release, adopt
 
     def _recovery_env_prefix(self) -> str:
+        from lu_machinery.common.git_credentials import SELECTOR_ENV
+
         env = self.env(LU_PYTHON=str(self.host_python.absolute()))
         context = (PRODUCT_ROOT_ENV, SELECTOR_ENV, "LU_TASKS_DIR", *MACHINERY_ENV_VARS)
         argv = ["env"]
