@@ -422,6 +422,11 @@ ROUTE_CONTRACTS: tuple[RouteContract, ...] = (
         "to convert anywhere inside structured JSON, is missing_or_corrupt (body_redaction_failed). "
         "Structured JSON deeper than 64 containers or 4 nested JSON strings, and text nested more than 512 "
         "levels before its first syntax error, is withheld (redaction_depth_exceeded). "
+        "Turns are every stored message of the conversation in persistence order, whether or not an event "
+        "links it (round shown where an event links it), then any event-linked message id with no stored "
+        "row as missing_or_corrupt (message_row_missing). "
+        "A malformed conversation id is HTTP 400 (invalid_conversation_id); 404 means only a valid id "
+        "that a completed lookup did not find. "
         "Bounded by raw-body bytes, whole serialized response bytes, SQL "
         "row count checked before materialization, SQLite busy timeout, and a concurrency semaphore.",
         "Fleet Comms SQLite store (read-only) and content-addressed body artifacts under blobs/sha256.",

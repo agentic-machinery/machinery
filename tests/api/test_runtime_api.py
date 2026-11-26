@@ -358,14 +358,14 @@ def test_acp_transcript_is_loopback_only_ordered_allowlisted_and_no_store(tmp_pa
                 message_id, conversation_id, kind, sender, recipient, body_inline,
                 body_artifact_id, content_sha256, metadata_json, created_at
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            [
-                (
-                    "message-later", "conv-transcript", "reply", "codex", "root", "second body",
-                    "artifact-secret-later", digests["artifact-secret-later"], '{"credential":"secret"}', _iso(now + timedelta(seconds=2)),
-                ),
+            [  # turns follow persistence (insertion) order
                 (
                     "message-early", "conv-transcript", "request", "root", "codex", "first body",
                     "artifact-secret-early", digests["artifact-secret-early"], '{"command":"secret"}', _iso(now + timedelta(seconds=1)),
+                ),
+                (
+                    "message-later", "conv-transcript", "reply", "codex", "root", "second body",
+                    "artifact-secret-later", digests["artifact-secret-later"], '{"credential":"secret"}', _iso(now + timedelta(seconds=2)),
                 ),
                 (
                     "message-synthesis", "conv-transcript", "synthesis", "codex", "root", "final synthesis",
@@ -939,7 +939,8 @@ def test_acp_transcript_hides_unavailable_malformed_and_body_free_routes(tmp_pat
     assert transcript.status_code == 200
     assert transcript.json()["messages"][0]["body"] == "body only in transcript"
     assert "must not appear" not in transcript.text
-    assert malformed.status_code == 404
+    assert malformed.status_code == 400
+    assert malformed.json() == {"detail": "Invalid conversation id", "reason": "invalid_conversation_id"}
     assert missing.status_code == 404
     assert malformed.headers["cache-control"] == "no-store"
     assert missing.headers["cache-control"] == "no-store"

@@ -1637,19 +1637,52 @@ def _is_redacted_json_key(key: str) -> bool:
     return bool(redact_value({key: None}).get(key) == REDACTION)
 
 
+class _AcpJsonObject(list):
+    """Every member of one decoded JSON object as ``(key, value)`` pairs, in order, duplicates kept.
+
+    Redaction validates every member, including one that a secret key or a later duplicate key
+    discards, before it builds the served object.
+    """
+
+
+def _acp_json_too_deep(value: Any, max_depth: int) -> bool:
+    """True when objects and arrays in ``value`` nest past ``max_depth``, counting every member."""
+    pending: list[tuple[Any, int]] = [(value, 1)]
+    while pending:
+        item, level = pending.pop()
+        if isinstance(item, _AcpJsonObject):
+            children = [member for _, member in item]
+        elif isinstance(item, list):
+            children = item
+        else:
+            continue
+        if level > max_depth:
+            return True
+        pending.extend((child, level + 1) for child in children)
+    return False
+
+
 def _redact_and_sanitize_json_value(value: Any, *, depth: int) -> Any:
     """Recursively redact and path-sanitize JSON containers and leaves, including nested JSON strings."""
     if isinstance(value, str):
         return _redact_and_sanitize_text(value, _depth=depth + 1)
-    if isinstance(value, Mapping):
+    if isinstance(value, _AcpJsonObject):
         cleaned: dict[str, Any] = {}
-        for raw_key, item in value.items():
-            key_text = str(raw_key)
-            cleaned_key = _redact_and_sanitize_text(key_text, _depth=depth + 1)
-            if _is_redacted_json_key(key_text) or _is_redacted_json_key(cleaned_key):
-                cleaned[cleaned_key] = REDACTION
-            else:
-                cleaned[cleaned_key] = _redact_and_sanitize_json_value(item, depth=depth)
+        served_keys: dict[str, str] = {}
+        for raw_key, item in value:
+            cleaned_key = _redact_and_sanitize_text(raw_key, _depth=depth + 1)
+            # Validate every member before a secret key or a later duplicate key discards it.
+            cleaned_item = _redact_and_sanitize_json_value(item, depth=depth)
+            if _is_redacted_json_key(raw_key) or _is_redacted_json_key(cleaned_key):
+                cleaned_item = REDACTION
+            served_key = served_keys.get(raw_key)
+            if served_key is None:
+                # Distinct keys that redact to the same text keep distinct members: "#2", "#3", ...
+                served_key, suffix = cleaned_key, 2
+                while served_key in cleaned:
+                    served_key, suffix = f"{cleaned_key}#{suffix}", suffix + 1
+                served_keys[raw_key] = served_key
+            cleaned[served_key] = cleaned_item  # a repeated raw key keeps JSON's last-member value
         return cleaned
     if isinstance(value, list):
         return [_redact_and_sanitize_json_value(item, depth=depth) for item in value]
@@ -1675,8 +1708,15 @@ def _redact_and_sanitize_text(value: str, *, _depth: int = 0) -> str:
     anywhere in it (including under redacted or overwritten duplicate keys), and a decoded lone
     surrogate raise ``_AcpBodyEncodingError``. Text nested more than ``json_depth.MAX_DEPTH_CEILING``
     levels before its first syntax error cannot be classified by the bounded parser and raises
-    ``_AcpRedactionDepthExceeded``.
+    ``_AcpRedactionDepthExceeded``. Every member of a parsed object is validated, including one a
+    secret key or a later duplicate key discards, and distinct keys that redact to the same text
+    are served as distinct members. Any text containing a lone surrogate, at any level, raises
+    ``_AcpBodyEncodingError``.
     """
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        raise _AcpBodyEncodingError() from None
     stripped = value.strip(_ACP_JSON_WHITESPACE)
     if stripped in {"NaN", "Infinity", "-Infinity"} or (
         stripped and _ACP_JSON_FLOAT_RE.fullmatch(stripped) is not None
@@ -1714,6 +1754,7 @@ def _redact_and_sanitize_text(value: str, *, _depth: int = 0) -> str:
                 parse_float=_parse_json_float,
                 parse_int=_parse_json_int,
                 parse_constant=_parse_json_constant,
+                object_pairs_hook=_AcpJsonObject,
             )
         except RecursionError:
             raise _AcpRedactionDepthExceeded() from None
@@ -1721,10 +1762,8 @@ def _redact_and_sanitize_text(value: str, *, _depth: int = 0) -> str:
             return _redact_and_sanitize_plain_text(value)
         except (TypeError, ValueError):
             raise _AcpBodyEncodingError() from None
-        try:
-            json_depth.check_depth(parsed, max_depth=_ACP_TRANSCRIPT_JSON_REDACT_MAX_CONTAINER_DEPTH)
-        except RecursionError:
-            raise _AcpRedactionDepthExceeded() from None
+        if _acp_json_too_deep(parsed, _ACP_TRANSCRIPT_JSON_REDACT_MAX_CONTAINER_DEPTH):
+            raise _AcpRedactionDepthExceeded()
         if saw_unconvertible_number:
             raise _AcpBodyEncodingError()
         if _depth >= _ACP_TRANSCRIPT_JSON_REDACT_MAX_DEPTH:
@@ -1732,10 +1771,9 @@ def _redact_and_sanitize_text(value: str, *, _depth: int = 0) -> str:
         try:
             cleaned = sanitize_document(_redact_and_sanitize_json_value(parsed, depth=_depth))
             serialized = json.dumps(cleaned, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
-            serialized.encode("utf-8")
         except RecursionError:
             raise _AcpRedactionDepthExceeded() from None
-        except (TypeError, ValueError, UnicodeError):
+        except (TypeError, ValueError):
             raise _AcpBodyEncodingError() from None
         return serialized
     return _redact_and_sanitize_plain_text(value)
@@ -2054,8 +2092,11 @@ def _acp_transcript_entries(
 ) -> tuple[list[dict[str, Any]], bool]:
     """Read a bounded, allowlisted, redacted ACP transcript with an explicit state for every turn.
 
+    Turns: every ``comms_messages`` row of the conversation in insertion order, whether or not an
+    event links it, then each event-linked message id with no row in the conversation (served as
+    ``message_row_missing``); events supply the round where they link a turn.
     Row-count cap (``_ACP_TRANSCRIPT_MAX_MESSAGES``, 32): checked in SQL before joining or
-    materializing message rows, with ``LIMIT`` enforced inside the grouped event subquery.
+    materializing message rows, with ``LIMIT`` enforced inside the ``page`` CTE.
     Producer/kind allowlist: only ``acpx-discuss:<lane>`` and ``authority-message`` artifacts
     with exact kind in ``{request, reply, synthesis}`` are served; off-list turns are withheld
     with a typed reason. Every allowed body and label passes through ``redact_text`` then
@@ -2073,18 +2114,22 @@ def _acp_transcript_entries(
     max_messages = max(0, int(_ACP_TRANSCRIPT_MAX_MESSAGES))
     connection.execute("BEGIN DEFERRED")
     try:
+        # Turns are every comms_messages row of the conversation, in insertion order (rows are
+        # immutable, so rowid order is persistence order), then every event-linked message id with
+        # no row in this conversation, in event order, served as message_row_missing. Events add
+        # the round where a turn is linked; an unlinked turn has no round.
         count_row = connection.execute(
             """
             SELECT COUNT(*) AS message_count
             FROM (
-                SELECT 1
-                FROM acp_conversation_events
+                SELECT message_id FROM comms_messages WHERE conversation_id = ?
+                UNION
+                SELECT message_id FROM acp_conversation_events
                 WHERE conversation_id = ? AND message_id IS NOT NULL
-                GROUP BY message_id
                 LIMIT ?
             )
             """,
-            (conversation_id, max_messages + 1),
+            (conversation_id, conversation_id, max_messages + 1),
         ).fetchone()
         observed_messages = int(count_row["message_count"]) if count_row is not None else 0
         truncated = observed_messages > max_messages
@@ -2092,6 +2137,26 @@ def _acp_transcript_entries(
         rows = (
             connection.execute(
                 """
+                WITH page AS (
+                    SELECT message_id, orphan, position
+                    FROM (
+                        SELECT message_id, 0 AS orphan, rowid AS position
+                        FROM comms_messages
+                        WHERE conversation_id = ?
+                        UNION ALL
+                        SELECT message_id, 1 AS orphan, MIN(sequence) AS position
+                        FROM acp_conversation_events AS orphan_events
+                        WHERE conversation_id = ? AND message_id IS NOT NULL
+                          AND NOT EXISTS (
+                              SELECT 1 FROM comms_messages AS linked
+                              WHERE linked.message_id = orphan_events.message_id
+                                AND linked.conversation_id = ?
+                          )
+                        GROUP BY message_id
+                    )
+                    ORDER BY orphan ASC, position ASC
+                    LIMIT ?
+                )
                 SELECT messages.message_id, messages.kind, messages.sender, messages.recipient,
                        CASE
                            WHEN messages.body_artifact_id IS NULL
@@ -2101,9 +2166,14 @@ def _acp_transcript_entries(
                        END AS body_inline,
                        messages.body_artifact_id, messages.content_sha256,
                        messages.created_at, event_round.round, event_round.round_invalid,
-                       event_round.non_synthesis_events
-                FROM (
-                    SELECT message_id, MIN(sequence) AS message_sequence,
+                       event_round.non_synthesis_events,
+                       event_round.message_id IS NOT NULL AS linked
+                FROM page
+                LEFT JOIN comms_messages AS messages
+                       ON messages.message_id = page.message_id
+                      AND messages.conversation_id = ?
+                LEFT JOIN (
+                    SELECT message_id,
                            CASE
                                WHEN COUNT(round) = 0 THEN NULL
                                WHEN COUNT(round) = COUNT(*)
@@ -2129,17 +2199,21 @@ def _acp_transcript_entries(
                                END
                            ) AS non_synthesis_events
                     FROM acp_conversation_events
-                    WHERE conversation_id = ? AND message_id IS NOT NULL
+                    WHERE conversation_id = ? AND message_id IN (SELECT message_id FROM page)
                     GROUP BY message_id
-                    ORDER BY message_sequence ASC
-                    LIMIT ?
                 ) AS event_round
-                LEFT JOIN comms_messages AS messages
-                       ON messages.message_id = event_round.message_id
-                      AND messages.conversation_id = ?
-                ORDER BY event_round.message_sequence ASC
+                       ON event_round.message_id = page.message_id
+                ORDER BY page.orphan ASC, page.position ASC
                 """,
-                (_ACP_TRANSCRIPT_MAX_BODY_BYTES, conversation_id, max_messages, conversation_id),
+                (
+                    conversation_id,
+                    conversation_id,
+                    conversation_id,
+                    max_messages,
+                    _ACP_TRANSCRIPT_MAX_BODY_BYTES,
+                    conversation_id,
+                    conversation_id,
+                ),
             ).fetchall()
             if max_messages > 0
             else []
@@ -2185,7 +2259,12 @@ def _acp_transcript_entries(
                 else None
             )
             created_at = _acp_timestamp(row["created_at"])
-            if round_number is None and not kind_off_allowlist and (non_synthesis_events > 0 or kind != "synthesis"):
+            if (
+                row["linked"]
+                and round_number is None
+                and not kind_off_allowlist
+                and (non_synthesis_events > 0 or kind != "synthesis")
+            ):
                 round_invalid = True
             if round_invalid or kind_malformed or None in (sender, recipient, created_at):
                 state = _ACP_TRANSCRIPT_STATE_MISSING_OR_CORRUPT
@@ -2399,7 +2478,8 @@ def get_acp_conversation_transcript(
         return _acp_backend_unavailable_response(safe_id, exc.reason)
     try:
         if safe_id is None:
-            return 404, {"detail": "Conversation not found", "reason": "invalid_conversation_id"}
+            # 404 is reserved for a valid id that a completed lookup did not find.
+            return 400, {"detail": "Invalid conversation id", "reason": "invalid_conversation_id"}
         conversation = connection.execute(
             "SELECT participants_json FROM acp_conversations WHERE conversation_id = ?", (safe_id,)
         ).fetchone()

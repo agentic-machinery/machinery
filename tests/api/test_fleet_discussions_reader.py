@@ -20,7 +20,9 @@ from fastapi.testclient import TestClient
 
 import lu_machinery.api.config as api_config
 import lu_machinery.api.runtime_router as runtime_router
+from lu_machinery.agent_runtime import acpx_discuss
 from lu_machinery.agent_runtime.acpx_discuss import AcpxDiscussionController
+from lu_machinery.agent_runtime.result import Result
 from lu_machinery.api.main import app, create_app
 from lu_machinery.api.monitor_context import fixture_context
 from lu_machinery.api.product_contribution import EMPTY
@@ -454,7 +456,7 @@ def test_no_turn_lost_or_reordered_across_mixed_states(tmp_path: Path, monkeypat
         turns=[("request", "root", "claude", "turn-1-ok", 1)],
         suffix="ordering",
     )
-    # Insert out-of-order by SQLite insertion order, with explicit monotonic event sequences 20..70.
+    # Event sequences (20..70) disagree with insertion order; turns follow insertion (persistence) order.
     _insert_custom_turn(
         root, conv_id, sequence=70, message_id="msg-seq-70",
         kind="synthesis", sender="codex", recipient="root",
@@ -494,16 +496,63 @@ def test_no_turn_lost_or_reordered_across_mixed_states(tmp_path: Path, monkeypat
     assert [m["ordinal"] for m in messages] == [1, 2, 3, 4, 5, 6]
     assert [m["state"] for m in messages] == [
         "ok",
-        "body_expired",
-        "withheld",
-        "missing_or_corrupt",
-        "oversized_or_partial",
         "ok",
+        "withheld",
+        "body_expired",
+        "oversized_or_partial",
+        "missing_or_corrupt",
     ]
-    assert [m["sender"] for m in messages] == ["root", "claude", "agy", "claude", "codex", "codex"]
+    assert [m["sender"] for m in messages] == ["root", "codex", "agy", "claude", "codex", "claude"]
     assert messages[0]["body"] == "turn-1-ok"
-    assert messages[5]["body"] == "turn-6-synthesis-ok"
-    assert "round" not in messages[5]
+    assert messages[1]["body"] == "turn-6-synthesis-ok"
+    assert "round" not in messages[1]
+
+
+def test_every_persisted_turn_of_a_three_participant_discussion_is_served(tmp_path: Path, monkeypatch) -> None:
+    """Defect class (PR #1509 F1): persisted turns that no event links (earlier peer deliveries and
+    the synthesis request) are silently left out of a transcript reported ok and not truncated."""
+    monkeypatch.setenv("LU_ACPX_TRANSPORT", "active")
+    monkeypatch.setattr(acpx_discuss, "classify_repo_path", lambda *_a, **_k: "dispatch_worktree")
+
+    def _reply(agent: str, response: str) -> Result:
+        return Result(
+            ok=True, agent=agent, model="fixture", mode="read-only", response=response,
+            stderr_excerpt=None, duration_s=0.01, session_id=None, rate_limited=False,
+            stalled=False, returncode=0, usage_record={"outcome": "ok", "tokens": 5},
+        )
+
+    root = tmp_path / "plane"
+    controller = AcpxDiscussionController(
+        root=root,
+        participant_call=lambda agent, _prompt, **_kwargs: _reply(agent, f"{agent} evidence"),
+        synthesis_call=lambda agent, _prompt, **_kwargs: _reply(agent, "synthesis"),
+    )
+    try:
+        result = controller.run(
+            prompt="Compare the three bounded options.",
+            cwd=Path.cwd(),
+            task_id="task-f1-three",
+            correlation_id="corr-f1-three",
+            idempotency_key="idem-f1-three",
+            rounds=2,
+            participants=("claude", "cursor", "codex"),
+        )
+        stored = controller.conn.execute(
+            "SELECT kind, sender, recipient FROM comms_messages WHERE conversation_id = ? ORDER BY rowid",
+            (result["conversation_id"],),
+        ).fetchall()
+    finally:
+        controller.close()
+    # 3 requests + 3 replies, 6 peer deliveries + 3 replies, synthesis request + synthesis.
+    assert len(stored) == 17
+
+    monkeypatch.setenv("FLEET_COMMS_ROOT", str(root))
+    resp = _loopback_client().get(f"/api/runtime/acp/conversations/{result['conversation_id']}/transcript")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert (data["state"], data["truncated"]) == ("ok", False)
+    assert [(m["kind"], m["sender"], m["recipient"]) for m in data["messages"]] == [tuple(row) for row in stored]
+    assert all(m["state"] == "ok" and isinstance(m["body"], str) for m in data["messages"])
 
 
 def test_get_transcript_never_writes_store_bytes_unchanged(tmp_path: Path, monkeypatch) -> None:
@@ -667,13 +716,12 @@ def test_each_e3_cap_trips_with_typed_state(tmp_path: Path, monkeypatch) -> None
     assert executed_sql.index(begin_queries[0]) < executed_sql.index(count_queries[0]) < executed_sql.index(join_queries[0])
     assert "LIMIT ?" in join_queries[0].split("LEFT JOIN comms_messages")[0]
 
-    # 3b. F3/F6 snapshot consistency: insert a 33rd turn at sequence=0 (inside the capped 32-row window,
-    # before existing message sequences 2..33 while leaving CONVERSATION_CREATED at sequence=1 intact)
-    # right after COUNT(*) sees 32. Without one read transaction, the capped join would observe
-    # sequence=0 and displace snap-31 while truncated stayed False.
+    # 3b. F3/F6 snapshot consistency: right after COUNT(*) sees 32 turns, commit a 33rd turn and a
+    # second event giving snap-0 a conflicting round. Without one read transaction, the capped join
+    # would observe that event and serve snap-0 as malformed while truncated stayed False.
     root_snap = tmp_path / "plane-snap"
     exact_32 = [("reply", "codex", "root", f"snap-{i}", 1) for i in range(runtime_router._ACP_TRANSCRIPT_MAX_MESSAGES)]
-    conv_snap, _ = _seed_conversation(root_snap, turns=exact_32, suffix="snap-cap")
+    conv_snap, snap_records = _seed_conversation(root_snap, turns=exact_32, suffix="snap-cap")
     monkeypatch.setenv("FLEET_COMMS_ROOT", str(root_snap))
     injected = {"done": False}
 
@@ -690,6 +738,21 @@ def test_each_e3_cap_trips_with_typed_state(tmp_path: Path, monkeypatch) -> None
                     kind="reply", sender="codex", recipient="root",
                     body="snap-inserted-seq-0", producer="acpx-discuss:codex",
                 )
+                conflict = sqlite3.connect(root_snap / "comms.sqlite3")
+                try:
+                    conflict.execute(
+                        """INSERT INTO acp_conversation_events(
+                            event_id, conversation_id, sequence, event_type, state, sender, recipient,
+                            round, outcome, message_id, metadata_json, created_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (
+                            "evt-snap-conflict", conv_snap, 1000, "CALL_TERMINAL", "COMPLETE", "codex", "root",
+                            2, "succeeded", snap_records[0][0], "{}", "2026-01-01T00:00:00Z",
+                        ),
+                    )
+                    conflict.commit()
+                finally:
+                    conflict.close()
             return cursor
 
         def rollback(self) -> None:
@@ -710,6 +773,7 @@ def test_each_e3_cap_trips_with_typed_state(tmp_path: Path, monkeypatch) -> None
     snap_data = snap_resp.json()
     assert snap_data["truncated"] is False
     assert len(snap_data["messages"]) == runtime_router._ACP_TRANSCRIPT_MAX_MESSAGES
+    assert snap_data["messages"][0]["state"] == "ok"
     assert snap_data["messages"][0]["body"] == "snap-0"
     assert snap_data["messages"][-1]["body"] == f"snap-{runtime_router._ACP_TRANSCRIPT_MAX_MESSAGES - 1}"
     assert "snap-inserted-seq-0" not in snap_resp.text
@@ -717,8 +781,9 @@ def test_each_e3_cap_trips_with_typed_state(tmp_path: Path, monkeypatch) -> None
     assert after_snap.status_code == 200
     after_data = after_snap.json()
     assert after_data["truncated"] is True
-    assert after_data["reason"] == "message_limit_exceeded"
-    assert after_data["messages"][0]["body"] == "snap-inserted-seq-0"
+    assert after_data["state"] == "missing_or_corrupt"  # the conflicting round now shows
+    assert after_data["messages"][0]["reason"] == "malformed_turn_metadata"
+    assert "snap-inserted-seq-0" not in after_snap.text  # inserted last: past the 32-turn window
 
     # 4. SQLite busy timeout (configured via open_readonly timeout alone -> 500 ms default, 503 store_busy on lock).
     root_busy = tmp_path / "plane-busy"
@@ -1328,7 +1393,7 @@ def _gen_value(rng, planted: _GenPlanted, *, depth: int, nest: int, allow_bad_nu
             else:
                 key = rng.choice(_GEN_WORDS)
             obj.append((key, _gen_value(rng, planted, depth=depth + 1, nest=nest, allow_bad_numbers=allow_bad_numbers)))
-        if obj and rng.random() < 0.1:
+        if obj and isinstance(obj[0][0], str) and rng.random() < 0.1:
             obj.append((obj[0][0], 1))  # a later duplicate overwrites the first member
         return obj
     if nest > 0 and pick < 0.56:
@@ -1434,10 +1499,16 @@ def _gen_outcome(text: str) -> tuple[str, str | None]:
         return "encoding_error", None
 
 
-def _gen_oracle(text: str) -> tuple[str, bool, bool, int]:
-    """Classify ``text`` by the contract: (kind, non_finite, oversized_int, container_depth).
+class _GenOracleObject(list):
+    """The oracle's view of one JSON object: every (key, value) member, duplicates included."""
 
-    kind is ``invalid`` (not complete valid JSON), ``scalar`` or ``structured``.
+
+def _gen_oracle(text: str) -> dict:
+    """Classify ``text`` by the contract, with Python's json decoder as the only judge of validity.
+
+    ``kind`` is ``invalid`` (not complete valid JSON), ``scalar`` or ``structured``; ``depth``
+    counts objects and arrays over every member; ``surrogate`` is a lone surrogate in the text or
+    in any decoded key or value; ``tree`` keeps every member for the member-preservation check.
     """
     flags = {"non_finite": False, "oversized": False}
 
@@ -1457,18 +1528,50 @@ def _gen_oracle(text: str) -> tuple[str, bool, bool, int]:
         flags["non_finite"] = True
         return 0.0
 
+    def _has_surrogate(value: str) -> bool:
+        return any(0xD800 <= ord(ch) <= 0xDFFF for ch in value)
+
+    result = {"kind": "invalid", "depth": 0, "surrogate": _has_surrogate(text), "tree": None, **flags}
     try:
-        parsed = json.loads(text, parse_int=_int, parse_float=_float, parse_constant=_constant)
+        parsed = json.loads(
+            text, parse_int=_int, parse_float=_float, parse_constant=_constant, object_pairs_hook=_GenOracleObject
+        )
     except json.JSONDecodeError:
-        return "invalid", False, False, 0
+        return result
     depth, pending = 0, [(parsed, 0)]
     while pending:
         item, level = pending.pop()
-        if isinstance(item, (dict, list)):
+        if isinstance(item, _GenOracleObject):
             depth = max(depth, level + 1)
-            pending.extend((child, level + 1) for child in (item.values() if isinstance(item, dict) else item))
-    kind = "structured" if isinstance(parsed, (dict, list, str)) else "scalar"
-    return kind, flags["non_finite"], flags["oversized"], depth
+            for key, child in item:
+                result["surrogate"] = result["surrogate"] or _has_surrogate(key)
+                pending.append((child, level + 1))
+        elif isinstance(item, list):
+            depth = max(depth, level + 1)
+            pending.extend((child, level + 1) for child in item)
+        elif isinstance(item, str):
+            result["surrogate"] = result["surrogate"] or _has_surrogate(item)
+    result.update(flags)
+    result.update(kind="structured" if isinstance(parsed, (list, str)) else "scalar", depth=depth, tree=parsed)
+    return result
+
+
+def _gen_members_kept(inp: object, out: object) -> bool:
+    """Every distinct member of every object, and every array item, survives redaction.
+
+    Distinct keys can redact to the same text; neither member may be lost. A repeated key keeps
+    JSON's semantics (first position, last value). A value under a secret key is the marker.
+    """
+    if isinstance(inp, _GenOracleObject):
+        last: dict[str, object] = {}
+        for key, value in inp:
+            last[key] = value
+        if not isinstance(out, dict) or len(out) != len(last):
+            return False
+        return all(o == runtime_router.REDACTION or _gen_members_kept(i, o) for i, o in zip(last.values(), out.values(), strict=True))
+    if isinstance(inp, list):
+        return isinstance(out, list) and len(inp) == len(out) and all(map(_gen_members_kept, inp, out, strict=True))
+    return True
 
 
 def _gen_word_bounded(text: str, value: str) -> bool:
@@ -1495,20 +1598,26 @@ def _gen_check(
         outcome, output = _gen_outcome(text)
     except Exception as exc:  # any untyped exception is the defect this test exists for
         pytest.fail(f"{label}: untyped {type(exc).__name__} for input {text[:120]!r}")
-    kind, non_finite, oversized, depth = _gen_oracle(text)
+    oracle = _gen_oracle(text)
+    kind, depth = oracle["kind"], oracle["depth"]
     plain = runtime_router._redact_and_sanitize_plain_text(text)
-    if kind == "invalid":
+    if any(0xD800 <= ord(ch) <= 0xDFFF for ch in text):
+        assert (outcome, output) == ("encoding_error", None), (label, "lone surrogate in the text", text[:120])
+    elif kind == "invalid":
         assert (outcome, output) == ("text", plain), (label, "invalid JSON must take the plain-text path", text[:120])
     elif kind == "scalar":
-        expected = ("encoding_error", None) if non_finite else ("text", plain)
+        expected = ("encoding_error", None) if oracle["non_finite"] else ("text", plain)
         assert (outcome, output) == expected, (label, "standalone scalar", text[:120])
     else:
         if depth > 64:
             assert outcome == "depth_exceeded", (label, depth, text[:120])
-        elif non_finite or oversized:
+        elif oracle["non_finite"] or oracle["oversized"]:
             assert outcome == "encoding_error", (label, "unconvertible number at any position", text[:120])
+        elif oracle["surrogate"]:
+            assert outcome != "text", (label, "decoded lone surrogate served", text[:120])
         if outcome == "text":
-            json.loads(output)  # structured output stays valid JSON
+            served = json.loads(output)  # structured output stays valid JSON
+            assert _gen_members_kept(oracle["tree"], served), (label, "a member was lost", text[:120], output[:120])
     if output is not None:
         for value in planted.always + (planted.structured if context_intact and kind != "invalid" else []):
             if _gen_word_bounded(text, value):
@@ -1522,10 +1631,12 @@ def test_redaction_parser_generator_never_raises_leaks_or_misclassifies() -> Non
     Seeded generator (stdlib random, fixed seed) over ``_redact_and_sanitize_text``: arbitrary
     text, truncated and malformed JSON, oversized and non-finite numbers at any position, lone
     surrogates, JSON nested in JSON strings up to and over the depth cap, \\u-escaped planted
-    secrets and home paths. Invariants: only typed refusals are raised; text that is not complete
-    valid JSON takes the plain-text path whatever it starts with; an unconvertible number gives
-    the same typed state wherever it sits; no planted secret or path survives in text output;
-    valid JSON and the same JSON with different whitespace and escapes give the same outcome.
+    secrets and home paths, secret-keyed and duplicate members, keys that redact to the same text.
+    Invariants: only typed refusals are raised; text that is not complete valid JSON takes the
+    plain-text path whatever it starts with; an unconvertible number or a lone surrogate gives the
+    same typed state wherever it sits, including in members a secret or duplicate key discards; no
+    planted secret or path survives in text output; no object member or array item is lost; valid
+    JSON and the same JSON with different whitespace and escapes give the same outcome.
     """
     rng = random.Random(_GEN_SEED)
     seen: Counter[str] = Counter()
@@ -1536,11 +1647,14 @@ def test_redaction_parser_generator_never_raises_leaks_or_misclassifies() -> Non
         if family == "arbitrary":
             outcome, _ = _gen_check(_gen_arbitrary(rng, planted), planted, label, context_intact=False)
         elif family == "placement":
-            # Same typed state wherever an unconvertible number sits: top level, nested, under a
-            # secret key, overwritten by a duplicate key, or inside a nested JSON string.
+            # Same typed state wherever an unconvertible number or a lone surrogate sits: top level,
+            # nested, under a secret key, overwritten by a duplicate key, inside a nested JSON
+            # string, and inside a nested JSON string that a secret or duplicate key discards.
             doc = _GenObject([("k", _gen_value(rng, planted, depth=0, nest=2, allow_bad_numbers=False))])
-            bad = _GenNumber(rng.choice((_GEN_OVERSIZED_INT, *_GEN_NON_FINITE)))
-            spot = rng.randrange(5)
+            bad: object = rng.choice(
+                (_GenNumber(_GEN_OVERSIZED_INT), *map(_GenNumber, _GEN_NON_FINITE), "lone \ud800", "\udfff")
+            )
+            spot = rng.randrange(8)
             if spot == 0:
                 doc.append(("n", bad))
             elif spot == 1:
@@ -1549,8 +1663,14 @@ def test_redaction_parser_generator_never_raises_leaks_or_misclassifies() -> Non
                 doc.append((rng.choice(_GEN_SECRET_KEYS), bad))
             elif spot == 3:
                 doc.extend([("dup", bad), ("dup", 1)])
-            else:
+            elif spot == 4:
                 doc.append(("n", _GenNested(_GenNested([bad]))))
+            elif spot == 5:
+                doc.append((rng.choice(_GEN_SECRET_KEYS), _GenNested([bad])))
+            elif spot == 6:
+                doc.extend([("dup", _GenNested(_GenObject([("x", bad)]))), ("dup", 1)])
+            else:
+                doc.append((rng.choice(_GEN_SECRET_KEYS), _GenNested(_GenNested(_GenObject([("y", bad)])))))
             outcome, _ = _gen_check(_gen_dump(rng, doc, escape=0.1), planted, label)
             assert outcome == "encoding_error", (label, spot)
         else:
@@ -1565,7 +1685,7 @@ def test_redaction_parser_generator_never_raises_leaks_or_misclassifies() -> Non
             else:
                 outcome, output = _gen_check(first, planted, label)
                 other = _gen_check(_gen_dump(rng, doc, escape=0.3), planted, label + " variant")
-                assert other == (outcome, output) or (_gen_oracle(first)[0] == "scalar" and other[0] == outcome), (
+                assert other == (outcome, output) or (_gen_oracle(first)["kind"] == "scalar" and other[0] == outcome), (
                     label,
                     "whitespace or escapes changed the outcome",
                     first[:120],
