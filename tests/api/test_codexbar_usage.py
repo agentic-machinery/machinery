@@ -2378,7 +2378,13 @@ def test_expired_codex_token_marks_only_that_account_unavailable(two_codex_accou
 def private_binding(tmp_path, monkeypatch):
     from lu_machinery.opsec import prepublish
 
-    monkeypatch.setattr(prepublish, "primary_root", lambda: tmp_path / "public")
+    checkout = tmp_path / "public"
+    checkout.mkdir()
+    aliases = tmp_path / "aliases"
+    aliases.mkdir()
+    alias = aliases / "public"
+    alias.symlink_to(checkout, target_is_directory=True)
+    monkeypatch.setattr(subscription_usage_mod, "primary_root", lambda: alias)
     monkeypatch.setattr(prepublish, "catalog", lambda: {"infra-private": {"local_name": "private"}})
     directory = tmp_path / "private" / "tools" / "fleet_usage"
     directory.mkdir(parents=True)

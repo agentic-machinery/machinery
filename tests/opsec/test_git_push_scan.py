@@ -747,7 +747,7 @@ def run_hook(sandbox, monkeypatch, client, *updates, stdin=None, url=None, remot
     """git_push.main in process on hand-written pre-push input; returns (status, caller hook calls)."""
     monkeypatch.setattr(gate, "catalog", lambda: catalog or CATALOG)
     monkeypatch.setattr(gate, "private_tooling", lambda: sandbox.tooling)
-    monkeypatch.setattr(gate, "primary_root", lambda cwd=None: sandbox.root)
+    monkeypatch.setattr(gate, "_policy_checkout", lambda: sandbox.root)
     monkeypatch.chdir(sandbox.work)
     monkeypatch.setattr(os, "environ", _env(**extra))
     if stdin is None:
