@@ -68,6 +68,8 @@ _RUNTIME_ATTRIBUTION_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:/-]{0,99}$")
 _RUNTIME_ATTRIBUTION_SOURCES = frozenset({"explicit", "session_env", "unknown"})
 _RUNTIME_FAILURE_CODES = RUNTIME_FAILURE_CODES
 _ACP_LEGACY_PARTICIPANTS = ("codex", "grok")
+_ACP_MIN_PARTICIPANTS = 2
+_ACP_MAX_PARTICIPANTS = 4
 _ACP_ENABLED_PARTICIPANTS = frozenset(ACPX_SUPPORTED_PARTICIPANTS)
 _ACP_STATES = frozenset({
     "CREATED",
@@ -140,6 +142,9 @@ _ACP_TRANSCRIPT_STATE_LABELS: dict[str, str] = {
     _ACP_TRANSCRIPT_STATE_BACKEND_UNAVAILABLE: "backend unavailable",
     _ACP_TRANSCRIPT_STATE_OVERSIZED_OR_PARTIAL: "oversized or partial",
 }
+_ACP_TRANSCRIPT_WORST_STATE = _ACP_TRANSCRIPT_STATE_OVERSIZED_OR_PARTIAL
+_ACP_TRANSCRIPT_WORST_LABEL = _ACP_TRANSCRIPT_STATE_LABELS[_ACP_TRANSCRIPT_WORST_STATE]
+_ACP_TRANSCRIPT_WORST_REASON = "malformed_artifact_reference"
 _ACP_EVENT_TYPE_ALIASES = {
     "created": "CONVERSATION_CREATED",
     "conversation_created": "CONVERSATION_CREATED",
@@ -259,11 +264,11 @@ def _parse_iso_datetime(value: str | None) -> datetime | None:
         return None
     try:
         parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
-    except ValueError:
+        if parsed.tzinfo is None:
+            return parsed.replace(tzinfo=UTC)
+        return parsed.astimezone(UTC)
+    except (ValueError, OverflowError):
         return None
-    if parsed.tzinfo is None:
-        return parsed.replace(tzinfo=UTC)
-    return parsed.astimezone(UTC)
 
 
 def _isoformat_z(value: datetime) -> str:
@@ -1034,13 +1039,10 @@ def _open_acp_db_readonly(ctx: MonitorContext) -> SQLiteConnection | None:
     """Open fleet-comms storage read-only, returning ``None`` when unavailable."""
     try:
         db_path = _acp_db_path(ctx)
-    except (PlaneRootAnchorError, OSError, RuntimeError, ValueError):
-        return None
-    if not db_path.is_file():
-        return None
-    try:
+        if not db_path.is_file():
+            return None
         connection = open_readonly(db_path.resolve())
-    except (OSError, sqlite3.Error, ValueError):
+    except (PlaneRootAnchorError, OSError, sqlite3.Error, RuntimeError, ValueError):
         return None
     connection.row_factory = sqlite3.Row
     return connection
@@ -1101,7 +1103,7 @@ def _acp_identifier(value: Any) -> str | None:
 
 
 def _acp_discussion_participants(value: Any) -> tuple[str, ...]:
-    """Return a privacy-safe enabled participant tuple, tolerating legacy stored shapes."""
+    """Return a privacy-safe enabled participant tuple (2-4 seats), tolerating legacy stored shapes."""
     try:
         decoded = json_depth.loads(value, max_depth=512) if isinstance(value, str) else value
     except (TypeError, ValueError, json.JSONDecodeError):
@@ -1111,7 +1113,7 @@ def _acp_discussion_participants(value: Any) -> tuple[str, ...]:
         for item in decoded:
             if isinstance(item, str) and item in _ACP_ENABLED_PARTICIPANTS and item not in enabled:
                 enabled.append(item)
-    if len(enabled) >= 2:
+    if _ACP_MIN_PARTICIPANTS <= len(enabled) <= _ACP_MAX_PARTICIPANTS:
         return tuple(enabled)
     return _ACP_LEGACY_PARTICIPANTS
 
@@ -1120,7 +1122,12 @@ def _acp_timestamp(value: Any) -> str | None:
     if not isinstance(value, str):
         return None
     parsed = _parse_iso_datetime(value)
-    return _isoformat_z(parsed) if parsed else None
+    if parsed is None:
+        return None
+    try:
+        return _isoformat_z(parsed)
+    except (ValueError, OverflowError):
+        return None
 
 
 def _acp_classification(state: str | None) -> str:
@@ -1557,8 +1564,18 @@ class _AcpBackendUnavailable(Exception):
         self.reason = reason
 
 
+def _acp_json_bytes(value: Any) -> bytes:
+    """Serialize identically to Starlette's ``JSONResponse.render()``."""
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+
 def _acp_transcript_participants(value: Any) -> tuple[tuple[str, ...] | None, str | None]:
-    """Validate stored ACP participants strictly for transcript membership checks."""
+    """Validate stored ACP participants strictly (2-4 unique enabled seats) for transcript reads."""
     if not isinstance(value, str):
         return None, "malformed_participants"
     try:
@@ -1574,7 +1591,7 @@ def _acp_transcript_participants(value: Any) -> tuple[tuple[str, ...] | None, st
         if not isinstance(item, str) or item not in _ACP_ENABLED_PARTICIPANTS or item in enabled:
             return None, "malformed_participants"
         enabled.append(item)
-    if len(enabled) < 2:
+    if not (_ACP_MIN_PARTICIPANTS <= len(enabled) <= _ACP_MAX_PARTICIPANTS):
         return None, "malformed_participants"
     return tuple(enabled), None
 
@@ -1592,10 +1609,12 @@ def _open_acp_transcript_store(ctx: MonitorContext) -> tuple[Path, SQLiteConnect
     except (PlaneRootAnchorError, OSError, RuntimeError, ValueError):
         raise _AcpBackendUnavailable("store_root_unavailable") from None
     db_path = plane_root / "comms.sqlite3"
-    if not db_path.is_file():
-        raise _AcpBackendUnavailable("store_unavailable")
     try:
+        if not db_path.is_file():
+            raise _AcpBackendUnavailable("store_unavailable")
         connection = cast(SQLiteConnection, open_readonly(db_path))
+    except _AcpBackendUnavailable:
+        raise
     except (OSError, sqlite3.Error, ValueError):
         raise _AcpBackendUnavailable("store_unavailable") from None
     connection.row_factory = sqlite3.Row
@@ -1614,14 +1633,26 @@ def _open_acp_transcript_store(ctx: MonitorContext) -> tuple[Path, SQLiteConnect
 
 
 def _open_acp_blob_no_follow(plane_root: Path, sha256: str) -> int:
-    """Open a CAS blob file under ``plane_root/blobs/sha256/<aa>/<sha256>`` without following symlinks."""
+    """Open a CAS blob file under ``plane_root/blobs/sha256/<aa>/<sha256>`` without following symlinks.
+
+    Non-missing errors on shared CAS directories raise ``_AcpBackendUnavailable``; missing
+    directory or leaf components raise ``FileNotFoundError``; leaf-file ``OSError`` propagates.
+    """
     cloexec = getattr(os, "O_CLOEXEC", 0)
     dir_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | cloexec
     file_flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | cloexec
-    parent_fd = os.open(plane_root, os.O_RDONLY | os.O_DIRECTORY | cloexec)
+    try:
+        parent_fd = os.open(plane_root, os.O_RDONLY | os.O_DIRECTORY | cloexec)
+    except OSError:
+        raise _AcpBackendUnavailable("blob_store_unavailable") from None
     try:
         for part in ("blobs", "sha256", sha256[:2]):
-            next_fd = os.open(part, dir_flags, dir_fd=parent_fd)
+            try:
+                next_fd = os.open(part, dir_flags, dir_fd=parent_fd)
+            except FileNotFoundError:
+                raise
+            except OSError:
+                raise _AcpBackendUnavailable("blob_store_unavailable") from None
             os.close(parent_fd)
             parent_fd = next_fd
         return os.open(sha256, file_flags, dir_fd=parent_fd)
@@ -1641,30 +1672,39 @@ def _acp_artifact_is_expired(connection: SQLiteConnection, artifact_id: str) -> 
     return isinstance(retention_class, str) and retention_class.startswith(RETENTION_EXPIRED_PREFIX)
 
 
+def _acp_digest_is_expired(connection: SQLiteConnection, sha256_lower: str) -> bool:
+    """Check whether an ``artifacts`` row matching ``sha256_lower`` carries the retention expiry marker."""
+    row = connection.execute(
+        "SELECT retention_class FROM artifacts WHERE sha256 = ?",
+        (sha256_lower,),
+    ).fetchone()
+    if row is None:
+        return False
+    retention_class = row["retention_class"]
+    return isinstance(retention_class, str) and retention_class.startswith(RETENTION_EXPIRED_PREFIX)
+
+
 def _acp_transcript_inline_body(
     value: Any,
     *,
     content_sha256: Any,
-    remaining_bytes: int,
-) -> tuple[str, str | None, str | None, int]:
-    """Validate a legacy inline-only ACP body and return ``(state, reason, body, serialized_bytes)``."""
+) -> tuple[str, str | None, str | None]:
+    """Validate a legacy inline-only ACP body and return ``(state, reason, body)``."""
     if not isinstance(value, str):
-        return _ACP_TRANSCRIPT_STATE_MISSING_OR_CORRUPT, "body_missing", None, 0
+        return _ACP_TRANSCRIPT_STATE_MISSING_OR_CORRUPT, "body_missing", None
     try:
         encoded = value.encode("utf-8")
-        serialized = json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-    except UnicodeError:
-        return _ACP_TRANSCRIPT_STATE_MISSING_OR_CORRUPT, "body_not_utf8", None, 0
+        _acp_json_bytes(value)
+    except (UnicodeError, ValueError):
+        return _ACP_TRANSCRIPT_STATE_MISSING_OR_CORRUPT, "body_not_utf8", None
     if content_sha256 is not None:
         if not isinstance(content_sha256, str) or not _ACP_SHA256_RE.fullmatch(content_sha256.lower()):
-            return _ACP_TRANSCRIPT_STATE_MISSING_OR_CORRUPT, "content_digest_mismatch", None, 0
+            return _ACP_TRANSCRIPT_STATE_MISSING_OR_CORRUPT, "content_digest_mismatch", None
         if hashlib.sha256(encoded).hexdigest() != content_sha256.lower():
-            return _ACP_TRANSCRIPT_STATE_MISSING_OR_CORRUPT, "content_digest_mismatch", None, 0
+            return _ACP_TRANSCRIPT_STATE_MISSING_OR_CORRUPT, "content_digest_mismatch", None
     if len(encoded) > _ACP_TRANSCRIPT_MAX_BODY_BYTES:
-        return _ACP_TRANSCRIPT_STATE_OVERSIZED_OR_PARTIAL, "body_too_large", None, 0
-    if len(serialized) > remaining_bytes:
-        return _ACP_TRANSCRIPT_STATE_OVERSIZED_OR_PARTIAL, "response_budget_exceeded", None, 0
-    return _ACP_TRANSCRIPT_STATE_OK, None, value, len(serialized)
+        return _ACP_TRANSCRIPT_STATE_OVERSIZED_OR_PARTIAL, "body_too_large", None
+    return _ACP_TRANSCRIPT_STATE_OK, None, value
 
 
 def _read_acp_artifact_body(
@@ -1673,43 +1713,44 @@ def _read_acp_artifact_body(
     artifact_id: str,
     *,
     content_sha256: Any,
-    remaining_bytes: int,
-) -> tuple[str, str | None, str | None, int]:
+) -> tuple[str, str | None, str | None]:
     """Read an integrity-checked CAS body, withholding expired blobs and handling the mark/unlink race."""
     artifact_row = connection.execute(
         "SELECT sha256, bytes, retention_class FROM artifacts WHERE artifact_id = ?",
         (artifact_id,),
     ).fetchone()
     if artifact_row is None:
-        return _ACP_TRANSCRIPT_STATE_MISSING_OR_CORRUPT, "artifact_row_missing", None, 0
+        return _ACP_TRANSCRIPT_STATE_MISSING_OR_CORRUPT, "artifact_row_missing", None
 
     retention_class = artifact_row["retention_class"]
     if not isinstance(retention_class, str):
-        return _ACP_TRANSCRIPT_STATE_MISSING_OR_CORRUPT, "artifact_metadata_corrupt", None, 0
+        return _ACP_TRANSCRIPT_STATE_MISSING_OR_CORRUPT, "artifact_metadata_corrupt", None
     if retention_class.startswith(RETENTION_EXPIRED_PREFIX):
-        return _ACP_TRANSCRIPT_STATE_BODY_EXPIRED, "body_expired", None, 0
+        return _ACP_TRANSCRIPT_STATE_BODY_EXPIRED, "body_expired", None
 
     raw_sha = artifact_row["sha256"]
     if not isinstance(raw_sha, str) or not _ACP_SHA256_RE.fullmatch(raw_sha.lower()):
-        return _ACP_TRANSCRIPT_STATE_MISSING_OR_CORRUPT, "artifact_metadata_corrupt", None, 0
+        return _ACP_TRANSCRIPT_STATE_MISSING_OR_CORRUPT, "artifact_metadata_corrupt", None
     sha256 = raw_sha.lower()
 
     if content_sha256 is not None and (not isinstance(content_sha256, str) or content_sha256.lower() != sha256):
-        return _ACP_TRANSCRIPT_STATE_MISSING_OR_CORRUPT, "content_digest_mismatch", None, 0
+        return _ACP_TRANSCRIPT_STATE_MISSING_OR_CORRUPT, "content_digest_mismatch", None
 
     declared_bytes = artifact_row["bytes"]
     if isinstance(declared_bytes, bool) or not isinstance(declared_bytes, int) or declared_bytes < 0:
-        return _ACP_TRANSCRIPT_STATE_MISSING_OR_CORRUPT, "artifact_metadata_corrupt", None, 0
+        return _ACP_TRANSCRIPT_STATE_MISSING_OR_CORRUPT, "artifact_metadata_corrupt", None
 
     try:
         blob_fd = _open_acp_blob_no_follow(plane_root, sha256)
     except FileNotFoundError:
         if _acp_artifact_is_expired(connection, artifact_id):
-            return _ACP_TRANSCRIPT_STATE_BODY_EXPIRED, "body_expired", None, 0
-        return _ACP_TRANSCRIPT_STATE_MISSING_OR_CORRUPT, "blob_missing", None, 0
+            return _ACP_TRANSCRIPT_STATE_BODY_EXPIRED, "body_expired", None
+        return _ACP_TRANSCRIPT_STATE_MISSING_OR_CORRUPT, "blob_missing", None
+    except _AcpBackendUnavailable:
+        raise
     except OSError as exc:
         if exc.errno in (errno.ELOOP, errno.ENOTDIR, errno.EISDIR):
-            return _ACP_TRANSCRIPT_STATE_MISSING_OR_CORRUPT, "blob_not_regular_file", None, 0
+            return _ACP_TRANSCRIPT_STATE_MISSING_OR_CORRUPT, "blob_not_regular_file", None
         raise _AcpBackendUnavailable("blob_store_unavailable") from None
 
     try:
@@ -1718,13 +1759,13 @@ def _read_acp_artifact_body(
         except OSError:
             raise _AcpBackendUnavailable("blob_store_unavailable") from None
         if not stat.S_ISREG(st.st_mode):
-            return _ACP_TRANSCRIPT_STATE_MISSING_OR_CORRUPT, "blob_not_regular_file", None, 0
+            return _ACP_TRANSCRIPT_STATE_MISSING_OR_CORRUPT, "blob_not_regular_file", None
         if st.st_size != declared_bytes:
-            return _ACP_TRANSCRIPT_STATE_MISSING_OR_CORRUPT, "blob_digest_mismatch", None, 0
+            return _ACP_TRANSCRIPT_STATE_MISSING_OR_CORRUPT, "blob_digest_mismatch", None
         if declared_bytes > _ACP_TRANSCRIPT_MAX_BODY_BYTES:
             if _acp_artifact_is_expired(connection, artifact_id):
-                return _ACP_TRANSCRIPT_STATE_BODY_EXPIRED, "body_expired", None, 0
-            return _ACP_TRANSCRIPT_STATE_OVERSIZED_OR_PARTIAL, "body_too_large", None, 0
+                return _ACP_TRANSCRIPT_STATE_BODY_EXPIRED, "body_expired", None
+            return _ACP_TRANSCRIPT_STATE_OVERSIZED_OR_PARTIAL, "body_too_large", None
         try:
             with os.fdopen(blob_fd, "rb") as handle:
                 blob_fd = -1
@@ -1736,17 +1777,15 @@ def _read_acp_artifact_body(
             os.close(blob_fd)
 
     if _acp_artifact_is_expired(connection, artifact_id):
-        return _ACP_TRANSCRIPT_STATE_BODY_EXPIRED, "body_expired", None, 0
+        return _ACP_TRANSCRIPT_STATE_BODY_EXPIRED, "body_expired", None
     if len(raw) != declared_bytes or hashlib.sha256(raw).hexdigest() != sha256:
-        return _ACP_TRANSCRIPT_STATE_MISSING_OR_CORRUPT, "blob_digest_mismatch", None, 0
+        return _ACP_TRANSCRIPT_STATE_MISSING_OR_CORRUPT, "blob_digest_mismatch", None
     try:
         text = raw.decode("utf-8")
-        serialized_len = len(json.dumps(text, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
-    except UnicodeError:
-        return _ACP_TRANSCRIPT_STATE_MISSING_OR_CORRUPT, "body_not_utf8", None, 0
-    if serialized_len > remaining_bytes:
-        return _ACP_TRANSCRIPT_STATE_OVERSIZED_OR_PARTIAL, "response_budget_exceeded", None, 0
-    return _ACP_TRANSCRIPT_STATE_OK, None, text, serialized_len
+        _acp_json_bytes(text)
+    except (UnicodeError, ValueError):
+        return _ACP_TRANSCRIPT_STATE_MISSING_OR_CORRUPT, "body_not_utf8", None
+    return _ACP_TRANSCRIPT_STATE_OK, None, text
 
 
 def _acp_transcript_entries(
@@ -1786,40 +1825,65 @@ def _acp_transcript_entries(
     has_artifacts_table = _acp_table_exists(connection, "artifacts")
     has_message_artifacts_table = _acp_table_exists(connection, "message_artifacts")
     allowed_lanes = frozenset({"root", "codex", *participants})
-    entries: list[dict[str, Any]] = []
-    remaining_bytes = _ACP_TRANSCRIPT_MAX_RESPONSE_BYTES
 
+    # Pre-build every turn's worst-case metadata skeleton so the full serialized response
+    # (envelope + metadata + separators + admitted bodies) never exceeds _ACP_TRANSCRIPT_MAX_RESPONSE_BYTES.
+    prepared: list[tuple[sqlite3.Row, dict[str, Any], int, bool]] = []
+    skeleton_entries: list[dict[str, Any]] = []
     for index, row in enumerate(rows, start=1):
         round_number = _acp_int(row["round"], minimum=1)
         if row["message_id"] is None:
-            entry: dict[str, Any] = {
-                "ordinal": index,
-                "state": _ACP_TRANSCRIPT_STATE_MISSING_OR_CORRUPT,
-                "label": _ACP_TRANSCRIPT_STATE_LABELS[_ACP_TRANSCRIPT_STATE_MISSING_OR_CORRUPT],
-                "reason": "message_row_missing",
-                "kind": None,
-                "sender": None,
-                "recipient": None,
-                "created_at": None,
-                "body": None,
-            }
-            if round_number is not None:
-                entry["round"] = round_number
-            entries.append(entry)
-            continue
+            kind = sender = recipient = created_at = None
+            metadata_valid = False
+        else:
+            kind = _acp_text(row["kind"], allowed=_ACP_TRANSCRIPT_KINDS)
+            sender = _acp_text(row["sender"], allowed=allowed_lanes)
+            recipient = _acp_text(row["recipient"], allowed=allowed_lanes)
+            created_at = _acp_timestamp(row["created_at"])
+            metadata_valid = None not in (kind, sender, recipient, created_at)
+        skeleton: dict[str, Any] = {
+            "ordinal": index,
+            "state": _ACP_TRANSCRIPT_WORST_STATE,
+            "label": _ACP_TRANSCRIPT_WORST_LABEL,
+            "reason": _ACP_TRANSCRIPT_WORST_REASON,
+            "kind": kind,
+            "sender": sender,
+            "recipient": recipient,
+            "created_at": created_at,
+            "body": None,
+        }
+        if round_number is not None:
+            skeleton["round"] = round_number
+        skeleton_entries.append(skeleton)
+        prepared.append((row, skeleton, len(_acp_json_bytes(skeleton)), metadata_valid))
 
-        kind = _acp_text(row["kind"], allowed=_ACP_TRANSCRIPT_KINDS)
-        sender = _acp_text(row["sender"], allowed=allowed_lanes)
-        recipient = _acp_text(row["recipient"], allowed=allowed_lanes)
-        created_at = _acp_timestamp(row["created_at"])
+    # Reserve worst-case envelope + all skeleton turns (use truncated=False since "false" is 1 byte longer than "true").
+    baseline_envelope = {
+        "conversation_id": conversation_id,
+        "state": _ACP_TRANSCRIPT_WORST_STATE,
+        "label": _ACP_TRANSCRIPT_WORST_LABEL,
+        "reason": _ACP_TRANSCRIPT_WORST_REASON,
+        "truncated": False,
+        "messages": skeleton_entries,
+    }
+    remaining_bytes = max(0, _ACP_TRANSCRIPT_MAX_RESPONSE_BYTES - len(_acp_json_bytes(baseline_envelope)))
 
-        if None in (kind, sender, recipient, created_at):
+    entries: list[dict[str, Any]] = []
+    recheck_targets: list[tuple[dict[str, Any], str | None, str | None]] = []
+
+    for row, skeleton, skeleton_len, metadata_valid in prepared:
+        artifact_id: str | None = None
+        inline_digest_lower: str | None = None
+        if row["message_id"] is None:
             state = _ACP_TRANSCRIPT_STATE_MISSING_OR_CORRUPT
-            reason: str | None = "malformed_turn_metadata"
+            reason: str | None = "message_row_missing"
             body: str | None = None
+        elif not metadata_valid:
+            state = _ACP_TRANSCRIPT_STATE_MISSING_OR_CORRUPT
+            reason = "malformed_turn_metadata"
+            body = None
         else:
             raw_artifact_id = row["body_artifact_id"]
-            artifact_id: str | None = None
             artifact_ref_error: str | None = None
             if raw_artifact_id is not None:
                 if isinstance(raw_artifact_id, str) and raw_artifact_id.strip():
@@ -1849,58 +1913,83 @@ def _acp_transcript_entries(
             elif artifact_id is not None:
                 if not has_artifacts_table:
                     raise _AcpBackendUnavailable("schema_unavailable")
-                state, reason, body, consumed = _read_acp_artifact_body(
+                state, reason, body = _read_acp_artifact_body(
                     connection,
                     plane_root,
                     artifact_id,
                     content_sha256=row["content_sha256"],
-                    remaining_bytes=remaining_bytes,
                 )
-                remaining_bytes -= consumed
             else:
-                # Legacy inline-only row: still withhold if content_sha256 matches an expired artifact.
-                expired_by_digest = False
                 raw_digest = row["content_sha256"]
                 if (
                     has_artifacts_table
                     and isinstance(raw_digest, str)
                     and _ACP_SHA256_RE.fullmatch(raw_digest.lower())
                 ):
-                    digest_row = connection.execute(
-                        "SELECT retention_class FROM artifacts WHERE sha256 = ?",
-                        (raw_digest.lower(),),
-                    ).fetchone()
-                    if digest_row is not None:
-                        digest_class = digest_row["retention_class"]
-                        expired_by_digest = isinstance(digest_class, str) and digest_class.startswith(
-                            RETENTION_EXPIRED_PREFIX
-                        )
-                if expired_by_digest:
+                    inline_digest_lower = raw_digest.lower()
+                if inline_digest_lower is not None and _acp_digest_is_expired(connection, inline_digest_lower):
                     state = _ACP_TRANSCRIPT_STATE_BODY_EXPIRED
                     reason = "body_expired"
                     body = None
                 else:
-                    state, reason, body, consumed = _acp_transcript_inline_body(
+                    state, reason, body = _acp_transcript_inline_body(
                         row["body_inline"],
                         content_sha256=row["content_sha256"],
-                        remaining_bytes=remaining_bytes,
                     )
-                    remaining_bytes -= consumed
 
-        entry = {
-            "ordinal": index,
-            "state": state,
-            "label": _ACP_TRANSCRIPT_STATE_LABELS[state],
-            "reason": reason,
-            "kind": kind,
-            "sender": sender,
-            "recipient": recipient,
-            "created_at": created_at,
-            "body": body,
-        }
-        if round_number is not None:
-            entry["round"] = round_number
+        entry = dict(skeleton)
+        entry["state"] = state
+        entry["label"] = _ACP_TRANSCRIPT_STATE_LABELS[state]
+        entry["reason"] = reason
+        entry["body"] = body
+
+        if state == _ACP_TRANSCRIPT_STATE_OK:
+            delta_bytes = max(0, len(_acp_json_bytes(entry)) - skeleton_len)
+            if delta_bytes > remaining_bytes:
+                entry["state"] = _ACP_TRANSCRIPT_STATE_OVERSIZED_OR_PARTIAL
+                entry["label"] = _ACP_TRANSCRIPT_STATE_LABELS[_ACP_TRANSCRIPT_STATE_OVERSIZED_OR_PARTIAL]
+                entry["reason"] = "response_budget_exceeded"
+                entry["body"] = None
+            else:
+                remaining_bytes -= delta_bytes
+                recheck_targets.append((entry, artifact_id, inline_digest_lower))
+
         entries.append(entry)
+
+    # Recheck retention in one consistent snapshot after the last blob read finishes so any
+    # turn expired while later turns were being read is cleared before building the response.
+    if recheck_targets and has_artifacts_table:
+        art_ids = sorted({art_id for _, art_id, _ in recheck_targets if art_id is not None})
+        expired_art_ids: set[str] = set()
+        if art_ids:
+            placeholders = ",".join("?" for _ in art_ids)
+            for row in connection.execute(
+                f"SELECT artifact_id, retention_class FROM artifacts WHERE artifact_id IN ({placeholders})",
+                art_ids,
+            ).fetchall():
+                klass = row["retention_class"]
+                if isinstance(klass, str) and klass.startswith(RETENTION_EXPIRED_PREFIX):
+                    expired_art_ids.add(str(row["artifact_id"]))
+        digests = sorted({digest for _, art_id, digest in recheck_targets if art_id is None and digest is not None})
+        expired_digests: set[str] = set()
+        if digests:
+            placeholders = ",".join("?" for _ in digests)
+            for row in connection.execute(
+                f"SELECT sha256, retention_class FROM artifacts WHERE sha256 IN ({placeholders})",
+                digests,
+            ).fetchall():
+                klass = row["retention_class"]
+                if isinstance(klass, str) and klass.startswith(RETENTION_EXPIRED_PREFIX):
+                    expired_digests.add(str(row["sha256"]).lower())
+        for entry, art_id, digest_lower in recheck_targets:
+            if (art_id is not None and art_id in expired_art_ids) or (
+                art_id is None and digest_lower is not None and digest_lower in expired_digests
+            ):
+                entry["state"] = _ACP_TRANSCRIPT_STATE_BODY_EXPIRED
+                entry["label"] = _ACP_TRANSCRIPT_STATE_LABELS[_ACP_TRANSCRIPT_STATE_BODY_EXPIRED]
+                entry["reason"] = "body_expired"
+                entry["body"] = None
+
     return entries, truncated
 
 

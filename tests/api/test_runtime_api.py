@@ -1110,6 +1110,58 @@ def test_acp_transcript_state_body_expired_withholds_inline_and_handles_race(tmp
     for leaked in (expired_secret, phase1_secret, race_secret):
         assert leaked not in resp.text
 
+    # Cross-turn retention race (F1): turn 1 is expired and unlinked while opening turn 2 -> turn 1 is cleared.
+    cross_root = tmp_path / "plane-cross-turn"
+    turn1_secret = "CROSS_TURN_EXPIRED_TURN1_SECRET"
+    conv_cross, cross_records = _create_controller_conversation(
+        cross_root,
+        deadline_at="2020-01-01T00:00:00Z",
+        turns=[
+            ("request", "root", "codex", turn1_secret, 1),
+            ("reply", "codex", "root", "turn 2 stays live", 1),
+        ],
+    )
+    cross_store = ArtifactStore(root=cross_root)
+    try:
+        cross_store.connection.execute(
+            "UPDATE comms_messages SET created_at = ? WHERE message_id = ?",
+            (old_ts, cross_records[0][0]),
+        )
+        cross_store.connection.execute(
+            "UPDATE artifacts SET created_at = ? WHERE artifact_id = ?",
+            (old_ts, cross_records[0][1]),
+        )
+        cross_store.connection.commit()
+        os.utime(cross_store.blob_path_for(cross_records[0][2]), (1_577_836_800, 1_577_836_800))
+    finally:
+        cross_store.close()
+
+    turn2_sha = cross_records[1][2]
+
+    def _expire_turn1_on_turn2_open(plane_root: Path, sha256: str) -> int:
+        if sha256 == turn2_sha:
+            s = ArtifactStore(root=cross_root)
+            try:
+                rep = s.expire_message_blobs(older_than_days=30, grace_seconds=60, apply=True)
+                assert rep.removed == 1
+            finally:
+                s.close()
+        return real_open(plane_root, sha256)
+
+    monkeypatch.setattr(runtime_router, "_open_acp_blob_no_follow", _expire_turn1_on_turn2_open)
+    monkeypatch.setenv("FLEET_COMMS_ROOT", str(cross_root))
+    cross_resp = _loopback_transcript_client().get(f"/api/runtime/acp/conversations/{conv_cross}/transcript")
+    assert cross_resp.status_code == 200
+    assert cross_resp.headers["cache-control"] == "no-store"
+    cross_data = cross_resp.json()
+    assert cross_data["state"] == "body_expired"
+    assert cross_data["messages"][0]["state"] == "body_expired"
+    assert cross_data["messages"][0]["label"] == "body expired"
+    assert cross_data["messages"][0]["body"] is None
+    assert cross_data["messages"][1]["state"] == "ok"
+    assert cross_data["messages"][1]["body"] == "turn 2 stays live"
+    assert turn1_secret not in cross_resp.text
+
 
 def test_acp_transcript_state_missing_or_corrupt_covers_blobs_turns_and_participants(tmp_path, monkeypatch):
     """Defect class: corrupt blobs, missing rows, or malformed/unhashable participants drop turns or raise TypeError."""
@@ -1125,6 +1177,7 @@ def test_acp_transcript_state_missing_or_corrupt_covers_blobs_turns_and_particip
             ("reply", "codex", "root", "non-utf8 body", 1),
             ("reply", "claude", "root", "missing artifact row", 1),
             ("reply", "codex", "root", "poisoned metadata body", 1),
+            ("reply", "claude", "root", "overflow timestamp body", 1),
         ],
     )
     # 1. Missing blob WITHOUT expired marker.
@@ -1160,6 +1213,11 @@ def test_acp_transcript_state_missing_or_corrupt_covers_blobs_turns_and_particip
             "UPDATE comms_messages SET sender = 'intruder-seat' WHERE message_id = ?",
             (records[5][0],),
         )
+        # 5b. Timestamp that overflows UTC conversion on turn 7 (F4).
+        conn.execute(
+            "UPDATE comms_messages SET created_at = '0001-01-01T00:00:00+00:01' WHERE message_id = ?",
+            (records[6][0],),
+        )
         # 6. Dangling event referencing a missing comms_messages row.
         conn.execute(
             """INSERT INTO acp_conversation_events(
@@ -1183,7 +1241,7 @@ def test_acp_transcript_state_missing_or_corrupt_covers_blobs_turns_and_particip
     data = resp.json()
     assert data["state"] == "missing_or_corrupt"
     assert data["label"] == "missing or corrupt"
-    assert len(data["messages"]) == 7
+    assert len(data["messages"]) == 8
     assert data["messages"][0]["state"] == "ok"
     assert data["messages"][0]["body"] == "healthy turn"
     expected_reasons = [
@@ -1192,7 +1250,8 @@ def test_acp_transcript_state_missing_or_corrupt_covers_blobs_turns_and_particip
         (3, "body_not_utf8"),
         (4, "artifact_row_missing"),
         (5, "malformed_turn_metadata"),
-        (6, "message_row_missing"),
+        (6, "malformed_turn_metadata"),
+        (7, "message_row_missing"),
     ]
     for idx, expected_reason in expected_reasons:
         turn = data["messages"][idx]
@@ -1200,16 +1259,17 @@ def test_acp_transcript_state_missing_or_corrupt_covers_blobs_turns_and_particip
         assert turn["label"] == "missing or corrupt", (idx, turn)
         assert turn["reason"] == expected_reason, (idx, turn)
         assert turn["body"] is None, (idx, turn)
-    for forbidden in (unlinked_secret, tampered_secret, "intruder-seat", "poisoned metadata body"):
+    for forbidden in (unlinked_secret, tampered_secret, "intruder-seat", "poisoned metadata body", "overflow timestamp body"):
         assert forbidden not in resp.text
 
-    # Malformed participant items (including unhashable dicts/lists) are refused with typed reason, never TypeError.
+    # Malformed participant items (unhashable dicts/lists, >4 seats, <2 seats, unknown seats) refused with typed reason.
     for bad_participants in (
         '[{"nested": 1}]',
         '[["codex"]]',
         '[123, "codex"]',
         '["codex", "evil"]',
         '["codex"]',
+        '["codex", "claude", "agy", "grok", "cursor"]',
         'not-json',
         '{}',
     ):
@@ -1237,18 +1297,21 @@ def test_acp_transcript_state_missing_or_corrupt_covers_blobs_turns_and_particip
         assert "unhashable" not in bad_resp.text
         assert "healthy turn" not in bad_resp.text
 
-    # Body-free routes also tolerate unhashable participant items without raising TypeError.
-    conn = sqlite3.connect(root / "comms.sqlite3")
-    try:
-        conn.execute(
-            "UPDATE acp_conversations SET participants_json = ? WHERE conversation_id = ?",
-            ('[{"nested": 1}]', conv_id),
-        )
-        conn.commit()
-    finally:
-        conn.close()
-    assert client.get(f"/api/runtime/acp/conversations/{conv_id}").status_code == 200
-    assert client.get("/api/runtime/acp/conversations").status_code == 200
+    # Body-free routes also tolerate unhashable or >4 participant items without raising TypeError.
+    for body_free_participants in ('[{"nested": 1}]', '["codex", "claude", "agy", "grok", "cursor"]'):
+        conn = sqlite3.connect(root / "comms.sqlite3")
+        try:
+            conn.execute(
+                "UPDATE acp_conversations SET participants_json = ? WHERE conversation_id = ?",
+                (body_free_participants, conv_id),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        detail_resp = client.get(f"/api/runtime/acp/conversations/{conv_id}")
+        assert detail_resp.status_code == 200
+        assert detail_resp.json()["participants"] == ["codex", "grok"]
+        assert client.get("/api/runtime/acp/conversations").status_code == 200
 
 
 def test_acp_transcript_state_backend_unavailable_returns_503_and_reserves_404(tmp_path, monkeypatch):
@@ -1314,7 +1377,26 @@ def test_acp_transcript_state_backend_unavailable_returns_503_and_reserves_404(t
     assert not_found.headers["cache-control"] == "no-store"
     assert not_found.json() == {"detail": "Conversation not found", "reason": "conversation_not_found"}
 
-    # 5. Blob backend OSError (not FileNotFoundError) -> 503 blob_store_unavailable.
+    # 5. Shared CAS directory replaced with a regular file (ENOTDIR) -> 503 blob_store_unavailable (F2).
+    bad_blobs_root = tmp_path / "bad-blobs-dir"
+    conv_bad_dir, _ = _create_controller_conversation(
+        bad_blobs_root,
+        turns=[("request", "root", "codex", "cannot open blobs dir", 1)],
+    )
+    import shutil
+
+    shutil.rmtree(bad_blobs_root / "blobs")
+    (bad_blobs_root / "blobs").write_text("not a directory", encoding="utf-8")
+    monkeypatch.setenv("FLEET_COMMS_ROOT", str(bad_blobs_root))
+    bad_dir_resp = local.get(f"/api/runtime/acp/conversations/{conv_bad_dir}/transcript")
+    assert bad_dir_resp.status_code == 503
+    assert bad_dir_resp.headers["cache-control"] == "no-store"
+    assert bad_dir_resp.json()["state"] == "backend_unavailable"
+    assert bad_dir_resp.json()["reason"] == "blob_store_unavailable"
+    assert "cannot open blobs dir" not in bad_dir_resp.text
+
+    # 6. Blob backend OSError (not FileNotFoundError) -> 503 blob_store_unavailable.
+    monkeypatch.setenv("FLEET_COMMS_ROOT", str(good_root))
     def _fail_blob_open(_plane_root: Path, _sha256: str) -> int:
         raise PermissionError("secret host path /private/blob")
 
@@ -1327,7 +1409,7 @@ def test_acp_transcript_state_backend_unavailable_returns_503_and_reserves_404(t
     assert "PermissionError" not in io_err.text
     assert "/private/blob" not in io_err.text
 
-    # 6. Unsupported PG authority -> 503 authority_unsupported_component.
+    # 7. Unsupported PG authority -> 503 authority_unsupported_component.
     monkeypatch.setattr(runtime_router, "resolve_authority", lambda _store_id: Authority.PG)
     pg_resp = local.get(f"/api/runtime/acp/conversations/{conv_id}/transcript")
     assert pg_resp.status_code == 503
@@ -1366,27 +1448,27 @@ def test_acp_transcript_state_oversized_or_partial_preserves_turns_without_404(t
     assert data_big["messages"][1]["reason"] == "body_too_large"
     assert data_big["messages"][1]["body"] is None
 
-    # 2. Total response byte budget (>512 KiB across turns): third 200 KiB turn hits response_budget_exceeded.
+    # 2. Total response byte budget (<=512 KiB including JSON envelope and turn metadata, F5).
     root_budget = tmp_path / "plane-budget"
-    chunk = "C" * (200 * 1024)
+    near_half = "C" * (runtime_router._ACP_TRANSCRIPT_MAX_BODY_BYTES - 2)
     conv_budget, _ = _create_controller_conversation(
         root_budget,
         turns=[
-            ("request", "root", "codex", chunk, 1),
-            ("reply", "codex", "root", chunk, 1),
-            ("synthesis", "codex", "root", chunk, None),
+            ("request", "root", "codex", near_half, 1),
+            ("reply", "codex", "root", near_half, 1),
         ],
     )
     monkeypatch.setenv("FLEET_COMMS_ROOT", str(root_budget))
     resp_budget = local.get(f"/api/runtime/acp/conversations/{conv_budget}/transcript")
     assert resp_budget.status_code == 200
+    assert len(resp_budget.content) <= runtime_router._ACP_TRANSCRIPT_MAX_RESPONSE_BYTES
     data_budget = resp_budget.json()
     assert data_budget["state"] == "oversized_or_partial"
     assert data_budget["reason"] == "response_budget_exceeded"
     assert data_budget["truncated"] is False
-    assert [m["state"] for m in data_budget["messages"]] == ["ok", "ok", "oversized_or_partial"]
-    assert data_budget["messages"][2]["reason"] == "response_budget_exceeded"
-    assert data_budget["messages"][2]["body"] is None
+    assert [m["state"] for m in data_budget["messages"]] == ["ok", "oversized_or_partial"]
+    assert data_budget["messages"][1]["reason"] == "response_budget_exceeded"
+    assert data_budget["messages"][1]["body"] is None
 
     # 3. Message count limit (>32 turns) returns HTTP 200 (not 404) with first 32 turns and truncated=True.
     root_many = tmp_path / "plane-many"
