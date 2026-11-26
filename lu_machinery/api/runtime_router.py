@@ -1646,8 +1646,10 @@ def _redact_and_sanitize_text(value: str, *, _depth: int = 0) -> str:
             parsed = json_depth.loads(stripped, max_depth=64)
         except RecursionError:
             raise _AcpRedactionDepthExceeded() from None
-        except (TypeError, ValueError, json.JSONDecodeError):
+        except json.JSONDecodeError:
             parsed = None
+        except (TypeError, ValueError):
+            raise _AcpBodyEncodingError() from None
         if isinstance(parsed, (dict, list)):
             if _depth >= _ACP_TRANSCRIPT_JSON_REDACT_MAX_DEPTH:
                 raise _AcpRedactionDepthExceeded()
