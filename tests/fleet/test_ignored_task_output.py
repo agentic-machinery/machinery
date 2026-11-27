@@ -113,6 +113,16 @@ def test_worktree_inventory_follows_an_archive_move_without_restarting(tmp_path,
         return read_bytes(path)
 
     monkeypatch.setattr(Path, "read_bytes", archive_before_read)
+    from lu_machinery.orchestration import task_record_store
+
+    read_regular = task_record_store.read_regular_bytes
+
+    def archive_before_regular_read(path):
+        if path == hot and hot.exists():
+            hot.rename(archived)
+        return read_regular(path)
+
+    monkeypatch.setattr(task_record_store, "read_regular_bytes", archive_before_regular_read)
 
     assert output.matching_worktree_records(tree, tasks, repo_root=tmp_path, publish_cache=False) == [(archived, state)]
     assert "retrying complete inventory" not in capsys.readouterr().err

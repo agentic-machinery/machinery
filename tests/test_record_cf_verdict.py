@@ -125,6 +125,16 @@ def test_historical_admission_read_survives_a_listed_record_moving(tmp_path, mon
         return read_bytes(path)
 
     monkeypatch.setattr(Path, "read_bytes", archive_before_read)
+    from lu_machinery.orchestration import task_record_store
+
+    read_regular = task_record_store.read_regular_bytes
+
+    def archive_before_regular_read(path):
+        if path == hot and hot.exists():
+            hot.rename(archived)
+        return read_regular(path)
+
+    monkeypatch.setattr(task_record_store, "read_regular_bytes", archive_before_regular_read)
 
     assert recorder.admitted_unknown_history(
         repository="org/repo", branch="codex/topic", head_sha=SHA, task_root=tmp_path, repo_root=tmp_path,
@@ -149,6 +159,16 @@ def test_in_flight_guard_survives_a_listed_terminal_review_moving(tmp_path, monk
         return read_bytes(path)
 
     monkeypatch.setattr(Path, "read_bytes", archive_before_read)
+    from lu_machinery.orchestration import task_record_store
+
+    read_regular = task_record_store.read_regular_bytes
+
+    def archive_before_regular_read(path):
+        if path == hot and hot.exists():
+            hot.rename(archived)
+        return read_regular(path)
+
+    monkeypatch.setattr(task_record_store, "read_regular_bytes", archive_before_regular_read)
 
     recorder.require_no_outside_review_in_flight(tmp_path, "org/repo", SHA)
     assert archived.is_file()
@@ -557,8 +577,18 @@ def test_owner_unreadable_record_of_another_task_refuses_and_names_its_mode(tmp_
                 hidden.rename(archived)
             return read_bytes(path, *args, **kwargs)
 
+        from lu_machinery.orchestration import task_record_store
+
+        read_regular = task_record_store.read_regular_bytes
+
+        def archive_first_regular(path, *args, **kwargs):
+            if path == hidden and hidden.exists():
+                hidden.rename(archived)
+            return read_regular(path, *args, **kwargs)
+
         with monkeypatch.context() as patch:
             patch.setattr(Path, "read_bytes", archive_first)
+            patch.setattr(task_record_store, "read_regular_bytes", archive_first_regular)
             with pytest.raises(LineageRefused, match=r"b4-hidden\.json unreadable: Permission denied \(mode 000:"):
                 review_records(tasks, repository="owner/repo")
         archived.rename(hidden)
