@@ -2,9 +2,9 @@
 
 Run in order before any dispatch, from the CTO workspace (or, before the workspace cutover,
 the read-only primary checkout); scratch goes in the session scratchpad (`<scratch>`).
-Commands below never rely on the working directory: `$LEARN_UKRAINIAN_PYTHON` is the
-project interpreter the launcher exported, and the task store is `LU_TASKS_DIR`, else
-`<state root>/batch_state/tasks`, where the state root is `LU_STATE_ROOT`, else the primary
+Commands below never rely on the working directory: `$LU_PYTHON` (alias
+`$LEARN_UKRAINIAN_PYTHON`) is the installed machinery interpreter the launcher exported,
+and the task store is `LU_TASKS_DIR`, else `<state root>/batch_state/tasks`, where the state root is `LU_STATE_ROOT`, else the primary
 checkout (`LEARN_UKRAINIAN_PRIMARY_REPO_ROOT`). The CTO workspace is not a Git checkout: a bare
 repository path below (`docs/runbooks/…`, `lu_machinery/config/…`) is in the machinery primary
 checkout, `$LU_PRIMARY_REPO_ROOT`; run Git there with `git -C` and `gh` with `-R <owner/name>`.
@@ -55,7 +55,7 @@ when you claim and acknowledge, never as a recipient and never to workers as an 
 The default drain covers `cto`, `epics` and `claude-cto`.
 `claude-epics` (`lu_machinery/config/area_assignments.yaml` `epics.slots`) carries the launcher's
 supervisory deliveries. Inspect that slot first with
-`"$LEARN_UKRAINIAN_PYTHON" -I -m lu_machinery.fleet_comms backlog`. Leave claims on that slot to
+`"$LU_PYTHON" -I -m lu_machinery.fleet_comms backlog`. Leave claims on that slot to
 the launcher because the claim command cannot select a delivery by ID or kind.
 The Fleet authority service admits every exact recipient, even where a convenience CLI
 lists fewer. For each message run the authority-delivery procedure in
@@ -65,7 +65,7 @@ a supervisory request: it belongs to the launcher and its watcher
 (`docs/runbooks/session-supervisor.md`).
 
 Deliveries queued before this rule sit at old `claude-cto-<id>` names and stay claimable.
-Once per session, list them with `"$LEARN_UKRAINIAN_PYTHON" -I -m lu_machinery.fleet_comms backlog` and drain
+Once per session, list them with `"$LU_PYTHON" -I -m lu_machinery.fleet_comms backlog` and drain
 each such name the same way (claim with `--recipient <old name>`, your own `--worker-id`).
 Do not publish to an old name and do not tell a worker to.
 
@@ -74,11 +74,11 @@ Do not publish to an old name and do not tell a worker to.
 Before re-arming, and before the first dispatch of the session, list every task
 record whose id starts with the predecessor session's prefix (for example
 `ls "<task store>" | grep '^cto-<prefix>-'`, then
-`"$LEARN_UKRAINIAN_PYTHON" -I -m lu_machinery.dispatch status <id>` for each). Reconcile that
+`"$LU_PYTHON" -I -m lu_machinery.dispatch status <id>` for each). Reconcile that
 list against the handoff note, and read the latest notes on the top operator order. The
 handoff list is a snapshot; the task records in the task store are the source of truth.
 
-Re-arm in the background `"$LEARN_UKRAINIAN_PYTHON" -I -m lu_machinery.dispatch wait <task-id>
+Re-arm in the background `"$LU_PYTHON" -I -m lu_machinery.dispatch wait <task-id>
 --run-nonce <nonce>` for every live worker and any PR watcher the handoff names, then run the
 first [cycle](cycle.md).
 

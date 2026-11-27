@@ -27,7 +27,7 @@ publish_order() {
   local body="$1" recipient="$2" idempotency_key="$3"
   shift 3
   sed "s/@UTC@/$(date -u +%Y-%m-%dT%H:%M:%SZ)/g" "$body" |
-    "$LEARN_UKRAINIAN_PYTHON" -I -m lu_machinery.fleet_comms channel publish cto - \
+    "$LU_PYTHON" -I -m lu_machinery.fleet_comms channel publish cto - \
       --sender "$LU_INBOX_WORKER" --source cto --recipient "$recipient" \
       --idempotency-key "$idempotency_key" "$@"
 }
@@ -125,9 +125,9 @@ owner and done condition. Attach its task ID with `link <id> task <task-id>` and
 FULL run nonce with `note <id> <text>` so the tracker handoff can re-arm its wait.
 
 Run every dispatch through the scratch table helper. It builds each
-`"$LEARN_UKRAINIAN_PYTHON" -I -m lu_machinery.dispatch dispatch` argv from a table and logs stdout and stderr per task; grep the log
+`"$LU_PYTHON" -I -m lu_machinery.dispatch dispatch` argv from a table and logs stdout and stderr per task; grep the log
 for `run_nonce=`, `SUBSTITUTE` and `queued behind`. Record the actual substituted identity.
-Run Claude-account dispatches from the seat as `env -u CLAUDE_CONFIG_DIR "$LEARN_UKRAINIAN_PYTHON" -I
+Run Claude-account dispatches from the seat as `env -u CLAUDE_CONFIG_DIR "$LU_PYTHON" -I
 -m lu_machinery.dispatch dispatch ... --claude-account <label>`: the launcher exports
 `CLAUDE_CONFIG_DIR` into the seat's shells, and the dispatcher refuses an explicit account
 while that ambient value is set (`claude_account_ambient_conflict`).
@@ -164,7 +164,7 @@ A product brief whose change adds or renames tracked files under `registry/` or 
 `docs/knowledge/catalogue.yaml` and `docs/README.md`, because the docs catalogue check
 requires every tracked file under those roots to be covered by a family glob and, when that
 catalogue changes, the generated family table in `docs/README.md` regenerated
-(`"$LEARN_UKRAINIAN_PYTHON" -I -m lu_machinery.docs.catalogue readme`).
+(`"$LU_PYTHON" -I -m lu_machinery.docs.catalogue readme`).
 Retained evidence, evaluation material and anything a later session needs goes under
 `<durable-state-root>/<topic>/` (mode 0700 when private), never a session scratchpad, and the
 brief names that path.
@@ -182,7 +182,7 @@ only limit (`model-assignment.md`, Claude headless advisor).
 Briefs state expected eligible PR lines and files; require a one-line size justification
 above the `workflow.md` small-batch threshold, including data files.
 A brief or acceptance criterion never orders a worker to regenerate or deploy gitignored copies
-(for example `lu_machinery.agent_deploy`, or the product's `npm run agents:deploy`) inside its worktree. Before writing an acceptance criterion
+(for example `lu_machinery.agent_deploy --project-root <worktree>`, or the product's `npm run agents:deploy`) inside its worktree. Before writing an acceptance criterion
 about generated files, check `.gitignore` and whether those files belong in the PR: a worker that
 deployed agent copies in its worktree hit the pre-push refusal of untracked inputs, deleted the
 copies, broke its own hooks and could not finish.

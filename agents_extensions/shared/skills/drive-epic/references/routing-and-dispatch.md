@@ -96,7 +96,7 @@ that settlement cannot verify (including a commit SHA) or that equals `--branch`
 dispatch; read-only dispatches still accept a SHA base. If frozen inputs require a tree before
 dispatch, create it with `create_worktree` from `lu_machinery.dispatcher.git` (it writes the
 creator receipt; tasks launched with `--cwd` borrow it) and remove it afterwards as the helper cleanup runbook
-(`docs/runbooks/worktree-cleanup.md`, "Remove helper-created trees") says: `"$LU_PYTHON" -I -m lu_machinery.orchestration.worktree_claims remove PATH`, preceded for
+(`docs/runbooks/worktree-cleanup.md`, "Remove helper-created trees") describes: `"$LU_PYTHON" -I -m lu_machinery.orchestration.worktree_claims remove PATH`, preceded for
 trees that predate receipts by
 `"$LU_PYTHON" -I -m lu_machinery.orchestration.worktree_claims attribute-helper PATH --actor ACTOR --reason REASON`.
 

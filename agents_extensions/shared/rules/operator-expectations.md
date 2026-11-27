@@ -164,7 +164,7 @@ are the tie-breakers.
     already ordered or cleared). Agent-system PRs (agent definitions, skills, rules, hooks,
     launchers, settings sources) land like every other PR: independent cross-family review
     at the exact head, CI Gate green on that head, then the driver enqueues, runs
-    `merge_closeout`, and deploys with `"$LU_PYTHON" -I -m lu_machinery.agent_deploy`. Never ask the operator to
+    `merge_closeout`, and deploys with `"$LU_PYTHON" -I -m lu_machinery.agent_deploy --project-root <checkout>`. Never ask the operator to
     approve, merge, or deploy them. Routine host maintenance is driver work, done then
     reported, including with sudo where the host requires it: pull merged `main`, restart
     an updated or broken service after checking no active dispatch depends on it, install
