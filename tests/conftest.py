@@ -2060,6 +2060,24 @@ def _retarget_api_batch_state(monkeypatch: pytest.MonkeyPatch, batch_state: Path
         monkeypatch.setattr(app.state, "ctx", context.with_roots(batch_state_dir=batch_state))
 
 
+@pytest.fixture(autouse=True)
+def _isolate_host_binding(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Give each test its own default host binding path, never created.
+
+    ``pytest_configure`` already keeps the process off the live binding; this
+    per-test path means a test that writes a file at ``host_context.DEFAULT_PATH``
+    cannot leak it to the next test. A test's ``monkeypatch.undo()`` falls back to
+    the ``pytest_configure`` path, never the live file. Nothing is created under
+    ``tmp_path`` (see ``_isolate_runtime_scratch_root``). A test that needs a
+    binding writes its own scratch file and sets ``LU_HOST_CONTEXT``
+    (``tests/host_context/conftest.py:build_host_layout``) or patches
+    ``DEFAULT_PATH`` itself; both run after this fixture, so they win.
+    """
+    from lu_machinery import host_context
+
+    monkeypatch.setattr(host_context, "DEFAULT_PATH", tmp_path / "absent-host-binding" / "host.v1.json")
+
+
 # Per-process, not per-test: ``mktemp`` scans the base directory for the next
 # number, and that scan grows with every directory already created (#8654 review).
 _DISPATCH_STORE_SEQ = itertools.count()
@@ -3015,6 +3033,19 @@ def pytest_configure(config: pytest.Config) -> None:
     config._fleet_comms_primary = primary
     fleet_env = pytest.MonkeyPatch()
     config.add_cleanup(fleet_env.undo)
+    # The host binding file (host_context.DEFAULT_PATH) exists only on bound
+    # hosts, where it must agree with the LU_STATE_ROOT set below or every
+    # loader refuses with legacy_conflict; CI has no such file. Point the
+    # default at a path that is never created, for collection, session
+    # fixtures and tests alike, so the loader reports missing_context as on CI.
+    # This MonkeyPatch is not the per-test one, so a test's monkeypatch.undo()
+    # cannot restore the live path. Child processes still read the live file.
+    from lu_machinery import host_context
+
+    host_binding_dir = tempfile.TemporaryDirectory(prefix="host-binding-")
+    config.add_cleanup(host_binding_dir.cleanup)
+    fleet_env.delenv(host_context.CONTEXT_ENV, raising=False)
+    fleet_env.setattr(host_context, "DEFAULT_PATH", Path(host_binding_dir.name) / "host.v1.json")
     fleet_env.setenv("FLEET_COMMS_ROOT", str(config._fleet_comms_root))
     fleet_env.setenv("LEARN_UKRAINIAN_PRIMARY_REPO_ROOT", str(primary))
     fleet_env.setenv("LU_STATE_ROOT", str(primary))
