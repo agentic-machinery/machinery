@@ -220,6 +220,40 @@ _TASK_TERMINAL_STATUSES = frozenset({
 _LOG = logging.getLogger(__name__)
 
 
+def _roster_sources() -> tuple[Path | None, Path | None]:
+    """The assignments and driver-lane files the roster reads; ``None`` for a source whose setting is unusable."""
+    from lu_machinery import agent_identity
+    from lu_machinery.common.repo_root import MachineryConfigError
+    from lu_machinery.ops import driver_lanes
+
+    try:
+        assignments: Path | None = Path(agent_identity.default_assignments_path())
+    except MachineryConfigError:
+        assignments = None
+    try:
+        lane_data: Path | None = Path(driver_lanes.default_data_path())
+    except MachineryConfigError:
+        lane_data = None
+    return assignments, lane_data
+
+
+def _roster_identity(sources: tuple[Path | None, Path | None]) -> tuple[object, ...]:
+    """Each roster file's (path, device, inode, ctime, mtime, size), or ``None`` fields when it cannot be stated.
+
+    Any write, replacement or permission change moves ctime, so equal identities taken
+    before and after a read prove the read saw one version.
+    """
+    key: list[object] = []
+    for path in sources:
+        fields: tuple[int, ...] | None = None
+        if path is not None:
+            with contextlib.suppress(OSError):
+                stat = path.stat()
+                fields = (stat.st_dev, stat.st_ino, stat.st_ctime_ns, stat.st_mtime_ns, stat.st_size)
+        key.append((str(path), fields))
+    return tuple(key)
+
+
 def _load_roster() -> tuple[frozenset[str], bool]:
     """The durable CTO, registered slots, external recipients and driver lanes, and whether both sources loaded.
 
@@ -237,30 +271,12 @@ def _load_roster() -> tuple[frozenset[str], bool]:
     identity changed while it was read gives an incomplete, uncached roster.
     """
     from lu_machinery import agent_identity
-    from lu_machinery.common.repo_root import MachineryConfigError
     from lu_machinery.ops import driver_lanes
 
     # An unusable profile entry or root setting leaves that roster source unavailable, so the roster is incomplete.
-    try:
-        assignments: Path | None = Path(agent_identity.default_assignments_path())
-    except MachineryConfigError:
-        assignments = None
-    try:
-        lane_data: Path | None = Path(driver_lanes.default_data_path())
-    except MachineryConfigError:
-        lane_data = None
-    def identity() -> tuple[object, ...]:
-        key: list[object] = []
-        for path in (assignments, lane_data):
-            fields: tuple[int, ...] | None = None
-            if path is not None:
-                with contextlib.suppress(OSError):
-                    stat = path.stat()
-                    fields = (stat.st_dev, stat.st_ino, stat.st_ctime_ns, stat.st_mtime_ns, stat.st_size)
-            key.append((str(path), fields))
-        return tuple(key)
-
-    key = identity()
+    sources = _roster_sources()
+    assignments, lane_data = sources
+    key = _roster_identity(sources)
     cached = _ROSTER_CACHE.get(key)
     if cached is not None:
         return cached
@@ -280,7 +296,7 @@ def _load_roster() -> tuple[frozenset[str], bool]:
         with contextlib.suppress(Exception):
             lanes = tuple(lane.sender for lane in driver_lanes.load_registry(lane_data).lanes)
     complete = bool(slots) and bool(lanes) and external_availability == "available"
-    changed = identity() != key  # a replacement between the reads mixes two versions
+    changed = _roster_identity(sources) != key  # a replacement between the reads mixes two versions
     complete = complete and not changed
     if not complete:
         _LOG.warning(
@@ -578,12 +594,14 @@ def pending_delivery_snapshot(recipient: str, *, root: Path | None = None, limit
         # A historical alias names no roster seat; only a canonical name has a standing to check.
         # An alias that cannot be told from a canonical name (roster unreadable, or changed while the
         # alias was read) is unverified, never refused.
+        sources = _roster_sources()
+        before = _roster_identity(sources)
         roster = _load_roster()
         try:
             canonical = resolve_recipient_alias(recipient, strict=True) == recipient
         except Exception:
             return {**unknown, "reason": "recipient_standing_unverified"}
-        if _load_roster() != roster:
+        if _roster_identity(sources) != before:  # the roster file changed (even and back) during the reads
             return {**unknown, "reason": "recipient_standing_unverified"}
         if canonical:
             standing = _recipient_standing(recipient, *roster)
@@ -1912,8 +1930,8 @@ class AuthorityService:
         nothing is expired or ended, and ``roster_complete`` reports false.
         """
         now_value = self._now_string(now)
-        roster = _load_roster()  # one roster version for every decision and the reported flag
         with self._write_transaction():
+            roster = _load_roster()  # read under the write lock: one version for every decision and the flag
             ended = len(self._unreadable_subscriptions_tx(roster, settled_only=False))
             expired: dict[str, list[str]] = {RECIPIENT_NOT_REGISTERED_REASON: [], RECIPIENT_SETTLED_REASON: []}
             for row, reason in self._unreadable_deliveries_tx(roster, settled_only=False):
