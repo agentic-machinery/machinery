@@ -13,9 +13,13 @@ the observed Codex account. Claude retains its existing account cap protection.
 The model inventory, candidate routes, and risk ladders are loaded from the
 versioned ``scripts/config/model_catalog.yaml`` catalog at import time
 (``REVIEW_CANDIDATES`` / ``REVIEW_LADDERS`` via ``_catalog_candidate`` /
-``_catalog_ladder``). Policy changes belong in YAML: critical admits Sol / Opus / Grok;
-Fable holds no review role (#9583); native and runtime-attested Cursor Grok are
-regular code/infra reviewers at every risk (operator decision 2026-10-05, #9769).
+``_catalog_ladder``). Policy changes belong in YAML. At low, medium and high risk,
+Sol, Opus, Neon and runtime-attested Cursor Grok (``grok-4.7-high``) are one equal
+code/infra group; critical, including security paths raised to critical, holds
+Sol, Opus and Neon only (REVIEW-ROTATION-GROK-1127). At every risk the resolver
+picks, among the best-fitting eligible seats, the one with the fewest recent
+reviews of record (``read_recent_review_counts``), breaking ties by catalog
+order. Fable holds no review role (#9583).
 A formal review at high or critical risk is performed only by the models
 ``review_scheduler.risk_reviewer_models`` lists; that is an
 eligibility gate, so it binds explicit pins and custom ladders too.

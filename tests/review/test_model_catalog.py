@@ -1144,7 +1144,7 @@ def assert_frozen_surfaces(actual, *, surfaces):
                 ("models", "claude-opus-5-5", "notes"):
                     "1990f56acf404aeef4bd1de031d3cc81fb2c285a202e0480e793aaf03d851844",
                 ("models", "gemini-4-neon", "notes"):
-                    "9e2c5a21ddb16105c35d55ed6f98b148ba4acf5031d290cfd76a1efb9f5e941a",
+                    "c4f4ea30a6bd729b7a6004256c4231f0d55502d1ff6482990ac774553a3870ab",
                 ("models", "gemini-4-argon", "notes"):
                     "2660fee9b21105e8171f20addcf97a9fb558775e50cbd95565901405df99a8f6",
                 ("models", "gemini-3.7-flash-high", "notes"):

@@ -839,8 +839,8 @@ models:
       dispatch for supplemental work. NEON-SOLTIER-1120 (operator 2026-11-20):
       native formal review admits Neon High for code and infra at every risk
       tier, including critical and security paths, as a peer of Opus 5.5 and
-      Sol 6.2 (after Sol and Opus on critical, alongside the Opus seats on high,
-      unchanged on medium and low). Neon is also a peer of Opus 5.5 and Sol 6.2
+      Sol 6.2, in the least-used review rotation at every risk tier
+      (REVIEW-ROTATION-GROK-1127). Neon is also a peer of Opus 5.5 and Sol 6.2
       for hard coding, security-sensitive code authoring and stream driving;
       designated approval stays Opus 5.5 and Sol 6.2. Neon High writes fresh-build
       lessons (UK-WRITER-NEON-1121) and reviews Ukrainian with the Sources MCP
