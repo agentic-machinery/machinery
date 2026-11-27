@@ -4,13 +4,15 @@ Use the nightly systemd timer after installation, or run a no-report subset to
 check the host. The tests run in a fresh code-only checkout of ``origin/main``;
 the logical stores and the host data they read stay where they are and are
 mounted read-only into the test process (bubblewrap), never snapshotted or
-copied. The audited selection and known failures come from that checkout. This
-module never edits the primary checkout or its data.
+copied. The audited selection is the set of test definitions that exist in
+that checkout, and the known failures come from that checkout. This module
+never edits the primary checkout or its data.
 """
 
 from __future__ import annotations
 
 import argparse
+import ast
 import contextlib
 import datetime as dt
 import hashlib
@@ -75,6 +77,9 @@ EXPOSED_DATA = (
 )
 ABSOLUTE_PATH = re.compile(r"(?<![A-Za-z0-9])/(?!/)[^\s\]\[),:;]+")
 NETWORK_ADDRESS = re.compile(r"https?://[^\s\]\[),:;]+|(?<!\d)(?:\d{1,3}\.){3}\d{1,3}(?!\d)")
+# owner/name, read from the product checkout's origin. Never a baked slug.
+_REPOSITORY = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+_GITHUB_REMOTE = re.compile(r"(?ai:github\.com)[:/]([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(?:\.git)?/?$")
 
 
 class DataTierError(RuntimeError):
@@ -155,29 +160,80 @@ def _product_json(checkout: Path, relative: PurePosixPath) -> tuple[dict, str]:
     return value, hashlib.sha256(raw).hexdigest()
 
 
+def _test_path(relative: str) -> PurePosixPath | None:
+    """A repository-relative test file, or None when the path can leave the checkout."""
+    if not isinstance(relative, str) or not relative.startswith("tests/") or not relative.endswith(".py"):
+        return None
+    path = PurePosixPath(relative)
+    if path.is_absolute() or ".." in path.parts:
+        return None
+    return path
+
+
+def _defined_tests(checkout: Path, relative: str) -> set[str]:
+    """Module-level test functions and one-level class methods defined in one file."""
+    candidate = checkout.joinpath(*PurePosixPath(relative).parts)
+    try:
+        tree = ast.parse(candidate.read_text(encoding="utf-8"))
+    except (OSError, SyntaxError, UnicodeError) as error:
+        raise DataTierError(f"{relative} in the tested checkout is not readable Python") from error
+    found: set[str] = set()
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            found.add(node.name)
+        elif isinstance(node, ast.ClassDef):
+            for item in node.body:
+                if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    found.add(f"{node.name}::{item.name}")
+    return found
+
+
 def load_selection(checkout: Path, expected_sha256: str | None = None) -> tuple[dict, str]:
     """The audited selection from the tested checkout and its digest.
 
-    The pytest child passes the digest the parent validated, so both use the same bytes.
+    The expected set is the test definitions that exist in the checkout. A stored
+    ``class_c_merge_group`` count is historical and is not the audit. The pytest
+    child passes the digest the parent validated, so both use the same bytes.
     """
     selection, digest = _product_json(checkout, SELECTION)
     if expected_sha256 is not None and digest != expected_sha256:
         raise DataTierError(f"{SELECTION} changed after the runner validated it")
     try:
         ids, files = selection["nodeids"], selection["files"]
-        compatible = (
-            selection["schema"] == 1
-            and isinstance(ids, list)
-            and isinstance(files, list)
-            and len(ids) == selection["class_c_merge_group"]
-            and len(ids) == len(set(ids))
-        )
+        compatible = selection["schema"] == 1 and isinstance(ids, list) and isinstance(files, list)
     except (KeyError, TypeError) as error:
         raise DataTierError(f"{SELECTION} lacks a schema-1 field: {error}") from error
-    if not compatible:
+    if not compatible or not all(isinstance(nodeid, str) for nodeid in ids) or len(ids) != len(set(ids)):
         raise DataTierError("data-tier selection count or uniqueness differs from the audited class C")
-    if not all(isinstance(path, str) and path.startswith("tests/") and path.endswith(".py") for path in files):
+    if any(_test_path(path) is None for path in files):
         raise DataTierError("data-tier selection contains an invalid test file")
+    listed = set(files)
+    missing: list[str] = []
+    definitions: dict[str, set[str]] = {}
+    for nodeid in ids:
+        base = nodeid.split("[", 1)[0]
+        relative, separator, qualname = base.partition("::")
+        if not separator or not qualname or _test_path(relative) is None or relative not in listed:
+            missing.append(nodeid)
+            continue
+        if relative not in definitions:
+            if not checkout.joinpath(*PurePosixPath(relative).parts).is_file():
+                missing.append(nodeid)
+                continue
+            definitions[relative] = _defined_tests(checkout, relative)
+        if qualname not in definitions[relative]:
+            missing.append(nodeid)
+    absent_files = [relative for relative in files if not checkout.joinpath(*PurePosixPath(relative).parts).is_file()]
+    if absent_files:
+        shown = ", ".join(absent_files[:20])
+        extra = f" (+{len(absent_files) - 20} more)" if len(absent_files) > 20 else ""
+        raise DataTierError(f"data-tier selection file is absent from the product tree: {shown}{extra}")
+    if missing:
+        shown = ", ".join(missing[:20])
+        extra = f" (+{len(missing) - 20} more)" if len(missing) > 20 else ""
+        raise DataTierError(
+            f"data-tier selection names {len(missing)} test(s) absent from the product tree: {shown}{extra}"
+        )
     return selection, digest
 
 
@@ -749,8 +805,35 @@ def run_failed(summary: dict) -> bool:
     )
 
 
-def _gh(args: list[str], *, input_text: str | None = None) -> str:
-    result = github_client.run(["gh", *args], input=input_text, capture_output=True, text=True, check=False, timeout=90)
+def github_repository(checkout: Path) -> str:
+    """Owner/name from the product checkout's origin.
+
+    The service working directory is not a Git checkout, so reporting cannot ask
+    ``gh`` to discover the repository there.
+    """
+    url = command(["git", "remote", "get-url", "origin"], cwd=checkout).stdout.strip()
+    match = _GITHUB_REMOTE.search(url)
+    if match is None:
+        raise DataTierError("product origin is not a GitHub owner/name")
+    owner, name = match.group(1), match.group(2)
+    repository = f"{owner}/{name}"
+    if owner in {".", ".."} or name in {".", ".."} or _REPOSITORY.fullmatch(repository) is None:
+        raise DataTierError("product origin is not a GitHub owner/name")
+    return repository
+
+
+def _gh(args: list[str], *, repository: str, input_text: str | None = None) -> str:
+    """Run one gh command with the repository named, independent of the working directory."""
+    if len(args) < 2 or _REPOSITORY.fullmatch(repository) is None:
+        raise DataTierError("product origin is not a GitHub owner/name")
+    result = github_client.run(
+        ["gh", args[0], args[1], "--repo", repository, *args[2:]],
+        input=input_text,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=90,
+    )
     observation = getattr(result, "github_result", None)
     if observation is not None and (observation.stale or observation.error == "github_rate_limited"):
         raise github_client.GitHubRateLimited(observation.reset_at)
@@ -759,7 +842,8 @@ def _gh(args: list[str], *, input_text: str | None = None) -> str:
     return result.stdout
 
 
-def report(summary: dict, baseline: dict[str, int]) -> str:
+def report(summary: dict, baseline: dict[str, int], checkout: Path) -> str:
+    repository = github_repository(checkout)
     issues = json_depth.loads(
         _gh(
             [
@@ -773,8 +857,10 @@ def report(summary: dict, baseline: dict[str, int]) -> str:
                 "100",
                 "--json",
                 "number,title,state",
-            ]
-        ), max_depth=512
+            ],
+            repository=repository,
+        ),
+        max_depth=512,
     )
     matching = [issue for issue in issues if issue["title"] == ISSUE_TITLE]
     if len(matching) > 1:
@@ -784,15 +870,19 @@ def report(summary: dict, baseline: dict[str, int]) -> str:
         body = issue_body(summary, baseline)
         if issue:
             if issue["state"] != "OPEN":
-                _gh(["issue", "reopen", str(issue["number"])])
-            _gh(["issue", "edit", str(issue["number"]), "--body-file", "-"], input_text=body)
+                _gh(["issue", "reopen", str(issue["number"])], repository=repository)
+            _gh(["issue", "edit", str(issue["number"]), "--body-file", "-"], repository=repository, input_text=body)
             return f"updated issue #{issue['number']}"
         created = _gh(
-            ["issue", "create", "--title", ISSUE_TITLE, "--label", "infra", "--body-file", "-"], input_text=body
+            ["issue", "create", "--title", ISSUE_TITLE, "--label", "infra", "--body-file", "-"],
+            repository=repository,
+            input_text=body,
         )
         return f"created {created.strip()}"
     if issue and issue["state"] == "OPEN":
-        comments = json_depth.loads(_gh(["issue", "view", str(issue["number"]), "--json", "comments"]), max_depth=512)["comments"]
+        comments = json_depth.loads(
+            _gh(["issue", "view", str(issue["number"]), "--json", "comments"], repository=repository), max_depth=512
+        )["comments"]
         marker = f"Data-tier clean run `{summary['run_key']}`"
         if not any(marker in comment["body"] for comment in comments):
             _gh(
@@ -802,9 +892,10 @@ def report(summary: dict, baseline: dict[str, int]) -> str:
                     str(issue["number"]),
                     "--body",
                     marker + f": {summary['passed']} passed, {summary['skipped']} skipped.",
-                ]
+                ],
+                repository=repository,
             )
-        _gh(["issue", "close", str(issue["number"])])
+        _gh(["issue", "close", str(issue["number"])], repository=repository)
         return f"closed issue #{issue['number']} after clean run"
     return "no issue change"
 
@@ -933,7 +1024,7 @@ def run(args: argparse.Namespace) -> int:
             {
                 "run_key": run_key,
                 "pytest_exit": pytest_exit,
-                "selection_cases": selection["class_c_merge_group"],
+                "selection_cases": len(selection["nodeids"]),
                 "collected": len(json_depth.loads(collected_data, max_depth=512)) if collected_data is not None else 0,
             }
         )
@@ -988,7 +1079,9 @@ def run(args: argparse.Namespace) -> int:
     persist()
     if not args.no_report:
         try:
-            print(report(summary, baseline))
+            if primary is None:
+                raise DataTierError("product checkout is unavailable")
+            print(report(summary, baseline, primary))
         except github_client.GitHubRateLimited:
             # The timer records the reset. Persist the test result first,
             # and never repeat a partially successful publishing sequence.
