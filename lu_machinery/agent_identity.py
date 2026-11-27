@@ -186,15 +186,28 @@ def _read_assignments(path: Path, *, strict: bool) -> dict[Any, Any]:
 
     Lenient (the default): an empty mapping on a missing file, parse error or
     missing PyYAML, and a malformed area is left for the caller to skip.
-    ``strict``: the file must pass the one assignments contract
-    (``validate_fleet_taxonomy.load_validated_assignments``: schema, unique
-    keys, non-blank slots); any doubt raises, so a caller that decides from
-    the roster sees the failure instead of a partial answer.
+    ``strict``: the file is read as a regular file under the one fleet-config
+    YAML rule (``validate_fleet_taxonomy.load_yaml_mapping_bytes``: unique and
+    string keys, no cyclic anchor), and every area must be a mapping whose
+    ``slots`` is a list of non-blank names; any doubt raises ``ValueError``, so
+    a caller that decides from the roster sees the failure instead of a
+    partial answer. Fields the roster does not read are not judged here.
     """
     if strict:
-        from lu_machinery.orchestration.validate_fleet_taxonomy import load_validated_assignments
+        from lu_machinery.orchestration.validate_fleet_taxonomy import (
+            load_yaml_mapping_bytes,
+            read_regular_file_bytes,
+        )
 
-        return dict(load_validated_assignments(path)["assignments"])
+        _, content = read_regular_file_bytes(path)
+        strict_assignments = load_yaml_mapping_bytes(content, path).get("assignments")
+        if not isinstance(strict_assignments, dict):
+            raise ValueError(f"{path.name}: assignments is not a mapping")
+        for name, area_data in strict_assignments.items():
+            area_slots = area_data.get("slots") if isinstance(area_data, dict) else None
+            if not isinstance(area_slots, list) or not all(isinstance(s, str) and s.strip() for s in area_slots):
+                raise ValueError(f"{path.name}: area {name!r} has no list of non-blank slot names")
+        return dict(strict_assignments)
     try:
         if not path.is_file():  # never block on a FIFO
             return {}

@@ -12,6 +12,7 @@ import uuid
 from contextlib import nullcontext
 from datetime import UTC, datetime, timedelta
 from pathlib import Path, PureWindowsPath
+from stat import S_ISREG
 from typing import Any
 
 from lu_machinery.common import json_depth
@@ -24,7 +25,7 @@ from lu_machinery.orchestration.task_record_store import (
     archived_task_record_path,
     is_identical_copy,
     iter_task_records,
-    locate_task_record,
+    locate_task_record,  # noqa: F401 - re-exported: dispatcher.checks reads store.locate_task_record
     misnamed_record_refusal,
     parse_task_record,
     read_task_record_bytes,
@@ -448,32 +449,38 @@ def _worktree_may_exist(path: str | None) -> bool:
     return True
 
 
-def _require_absent(tasks_root: Path, task_id: str) -> None:
-    """Prove that neither the hot nor the archived record exists; anything else is ``TASK_RECORD_UNREADABLE``.
+def _locate_record(tasks_root: Path, task_id: str) -> Path | None:
+    """The hot record, else the archived one; ``None`` only when both are proven absent.
 
-    ``locate_task_record`` answers "no record" for a name it cannot stat too (an
-    access failure on 3.14 ``is_file``), so absence is proven only by
-    ``FileNotFoundError`` or ``NotADirectoryError`` on both locations.
+    The archive is consulted only after the hot name is proven absent, so an
+    unusable hot entry never lets an older archived copy answer. Absence is a
+    ``FileNotFoundError`` on the name with no directory entry left (a dangling
+    link is an entry); an access failure, a non-regular entry or any other
+    error is ``TASK_RECORD_UNREADABLE``. (``locate_task_record`` uses
+    ``is_file()``, which on 3.14 answers False on an access failure.)
     """
     for candidate in (task_record_path(tasks_root, task_id), archived_task_record_path(tasks_root, task_id)):
         try:
-            os.stat(candidate)
-        except (FileNotFoundError, NotADirectoryError):
-            continue
+            if S_ISREG(os.stat(candidate).st_mode):
+                return candidate
+        except FileNotFoundError:
+            try:
+                os.lstat(candidate)
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                raise TaskRecordError("TASK_RECORD_UNREADABLE") from exc
         except OSError as exc:
             raise TaskRecordError("TASK_RECORD_UNREADABLE") from exc
-        raise TaskRecordError("TASK_RECORD_UNREADABLE")  # a non-file entry, or one written since the lookup
+        raise TaskRecordError("TASK_RECORD_UNREADABLE")  # a dangling link or a non-regular entry
+    return None
 
 
 def read(task_id: str, nonce: str | None = None, *, missing_ok=False, tasks_root: Path | None = None) -> dict | None:
     """The task's record, hot or archived; ``None`` with ``missing_ok`` only when no record is proven to exist."""
-    root = record_path(task_id).parent if tasks_root is None else tasks_root
-    try:
-        path = locate_task_record(root, task_id)
-    except OSError as exc:  # a pathlib whose is_file() raises on an access failure instead of answering False
-        raise TaskRecordError("TASK_RECORD_UNREADABLE") from exc
+    default = record_path(task_id)  # validates the id, whichever store is read
+    path = _locate_record(default.parent if tasks_root is None else tasks_root, task_id)
     if path is None:
-        _require_absent(root, task_id)
         if missing_ok:
             return None
         raise ValueError("task not found")

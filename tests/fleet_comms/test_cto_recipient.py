@@ -179,10 +179,9 @@ def test_declared_external_recipients_are_admitted_and_unknown_names_still_refus
     assert sorted(tuple(row) for row in backlog(plane)) == sorted((name, "queued") for name in external)
 
     # Admission comes from the declared list, not a name in code: without it, the same name is refused.
-    data = yaml.safe_load(agent_identity.ASSIGNMENTS_PATH.read_text(encoding="utf-8"))
-    data["external_recipients"] = []
+    text = agent_identity.ASSIGNMENTS_PATH.read_text(encoding="utf-8")
     stripped = tmp_path / "area_assignments.yaml"
-    stripped.write_text(yaml.safe_dump(data), encoding="utf-8")
+    stripped.write_text(text.replace("external_recipients:", "unused_external_recipients:"), encoding="utf-8")
     monkeypatch.setattr(agent_identity, "ASSIGNMENTS_PATH", stripped)
     with AuthorityService(root=plane) as service:
         for name in external:
@@ -330,11 +329,11 @@ def test_incomplete_roster_proves_no_name_unregistered_and_removes_nothing(
     ])
 
 
-@pytest.mark.parametrize("doubt", ["malformed_area", "task_store_unreadable"])
+@pytest.mark.parametrize("doubt", ["malformed_area", "task_store_unreadable", "hot_entry_not_a_file", "dangling_record_link"])
 def test_partly_unreadable_roster_or_task_store_keeps_mail_queued_through_expire_stale_apply(
     plane, tasks, monkeypatch, tmp_path, capsys, doubt,
 ):
-    """Defect class: a reader that cannot read part of its input answers as if it had, so expire-stale --apply dead-letters live mail (#1567)."""
+    """Defect class: a reader that cannot read part of its input answers as if it had, so live mail is refused or dead-lettered (#1567)."""
     from lu_machinery import agent_identity
     from lu_machinery.dispatcher import store
     from lu_machinery.fleet_comms import authority
@@ -350,13 +349,25 @@ def test_partly_unreadable_roster_or_task_store_keeps_mail_queued_through_expire
     with AuthorityService(root=plane) as service:
         service.publish_message(sender="claude-cto", body="b", recipients=(victim,))
     tasks_dir = tmp_path / "tasks"
+    hot = tasks_dir / f"{worker}.json"
     try:
         if doubt == "malformed_area":
+            tasks(victim, "done")  # a settled task may share the slot's name
             data["assignments"]["doubt-probe"]["slots"] = victim  # a scalar, not a list
             roster.write_text(yaml.safe_dump(data), encoding="utf-8")
             assert authority._roster_complete() is False
+            with AuthorityService(root=plane) as service:
+                service.publish_message(sender="claude-cto", body="b", recipients=(victim,))  # admitted
         else:
-            tasks_dir.chmod(0o600)  # no search permission: every record stat fails with EACCES
+            if doubt == "task_store_unreadable":
+                tasks_dir.chmod(0o600)  # no search permission: every record stat fails with EACCES
+            else:
+                # An older terminal copy in the archive must not answer for an unusable hot entry.
+                archived = json.loads(hot.read_text()) | {"status": "done"}
+                (tasks_dir / "archive").mkdir()
+                (tasks_dir / "archive" / hot.name).write_text(json.dumps(archived))
+                hot.unlink()
+                hot.mkdir() if doubt == "hot_entry_not_a_file" else hot.symlink_to(tmp_path / "gone.json")
             with pytest.raises(store.TaskRecordError, match="TASK_RECORD_UNREADABLE"):
                 store.read(worker, missing_ok=True)
             assert authority._task_standing(worker) == "unknown"
@@ -366,8 +377,11 @@ def test_partly_unreadable_roster_or_task_store_keeps_mail_queued_through_expire
     assert applied["unreadable_expired"]["deliveries"] == 0
     with AuthorityService(root=plane) as service:
         assert dead_letter_reasons(service) == []
-    assert [tuple(row) for row in backlog(plane)] == [(victim, "queued")]
+    assert {tuple(row) for row in backlog(plane)} == {(victim, "queued")}
     assert store.read("cto-0-i0-absent", missing_ok=True) is None  # proven absence still reads as no record
+    tasks("a_b", "running")
+    with pytest.raises(ValueError, match="task id must contain only"):
+        store.read("a/b", missing_ok=True, tasks_root=tasks_dir)  # an explicit store still validates the id
 
 
 def test_unreadable_alias_roster_leaves_an_alias_unverified_never_refused(plane, monkeypatch, tmp_path):
@@ -381,8 +395,9 @@ def test_unreadable_alias_roster_leaves_an_alias_unverified_never_refused(plane,
     monkeypatch.setattr(agent_identity, "ASSIGNMENTS_PATH", roster)
     assert agent_identity.resolve_recipient_alias("cursor-monitor", strict=True) == "cursor"
     assert authority._roster_complete() is True  # read and cached before the alias read fails
-    roster.chmod(0)
+    roster.chmod(0)  # mtime and size unchanged
     try:
+        assert authority._roster_complete() is False  # the cached read is not reused for an unreadable file
         with pytest.raises(ValueError, match="Cannot read"):
             agent_identity.resolve_recipient_alias("cursor-monitor", strict=True)
         # A name no roster can make an alias needs no read.
