@@ -19,6 +19,7 @@ import pytest
 
 from lu_machinery.agent_deploy import plan
 from lu_machinery.agent_deploy.__main__ import main
+from tests.host_context.conftest import host_layout as host_layout
 
 CORE = b"# Fleet core\n"
 SKILL = b"---\nname: fleet\ndescription: Fleet example\n---\nRun the fleet example.\n"
@@ -36,7 +37,6 @@ EXPECTED = {
     ".codex/settings.json", ".codex/hooks.json",
     ".claude/memory/MEMORY.md", ".codex/memory/MEMORY.md", ".agent/memory/MEMORY.md",
 }
-
 
 def snapshot(root):
     return {str(p.relative_to(root)): (p.read_bytes(), p.stat().st_mode & 0o777, p.stat().st_mtime_ns)
@@ -480,7 +480,7 @@ def test_every_discovery_name_refuses_unowned_content(tmp_path, root, names, kin
             if kind == "file":
                 path.write_text("planted\n")
                 if (root, name) == (".codex", "skills"):
-                    with pytest.raises(plan.Invalid, match="non-directory deployment path: .codex/skills"):
+                    with pytest.raises(plan.Invalid, match=r"non-directory deployment path: \.codex/skills"):
                         plan.preflight(tree, empty_plan, {"files": {}}, False)
                 else:
                     assert plan.preflight(tree, empty_plan, {"files": {}}, False) == [
@@ -531,9 +531,8 @@ def test_future_planned_output_refuses_runtime_collision(consumer, tmp_path, mon
             os.mkfifo(target)
     write(consumer, "agents_extensions/shared/sessions/active", "planned bytes\n")
     before = snapshot(consumer)
-    with plan.selected_tree(str(consumer), check=check) as tree:
-        with pytest.raises(plan.Invalid):
-            plan.deploy(tree, check=check)
+    with plan.selected_tree(str(consumer), check=check) as tree, pytest.raises(plan.Invalid):
+        plan.deploy(tree, check=check)
     assert invoke(monkeypatch, consumer, check=check) == 2
     error = capsys.readouterr().err
     if kind == "nested-file":
@@ -905,13 +904,13 @@ def release_inventory():
 def test_release_requires_each_claude_python_guard_as_its_native_command():
     """Defect class: a mandatory Claude Python delegator run by the interpreter PATH selects,
     or release bytes drifting from the installed native hook command they must equal."""
-    from lu_machinery.agent_runtime.agy_hook_config import CLAUDE_GUARD_MODES, native_hook_command
+    from lu_machinery.agent_runtime.agy_hook_config import CLAUDE_GUARD_MODES, NATIVE_HOOK_DECLARATION
 
     commands = [hook["command"] for requirement in release_inventory()["required_hooks"]["claude"][".claude/settings.json"]
                 for hook in requirement["hooks"]]
     assert [command for command in commands if command.endswith(".py")] == []
-    natives = {native_hook_command(mode) for mode in (*CLAUDE_GUARD_MODES, "claude-audit-hook")}
-    assert {command for command in commands if command.startswith("/bin/bash ")} == natives
+    declarations = {f"{NATIVE_HOOK_DECLARATION} {mode}" for mode in (*CLAUDE_GUARD_MODES, "claude-audit-hook")}
+    assert {command for command in commands if command.startswith(NATIVE_HOOK_DECLARATION)} == declarations
 
 
 def test_claude_hook_commands_run_from_a_project_path_with_a_space(tmp_path):
@@ -939,7 +938,16 @@ def test_claude_hook_commands_run_from_a_project_path_with_a_space(tmp_path):
 
 
 @pytest.fixture
-def deployed(tmp_path):
+def deployed(tmp_path, host_layout, monkeypatch):
+    for name, value in host_layout.env.items():
+        monkeypatch.setenv(name, value)
+    for name in (
+        "LU_PRODUCT_ROOT", "LU_PRIMARY_REPO_ROOT", "LEARN_UKRAINIAN_PRIMARY_REPO_ROOT",
+        "LU_PYTHON", "LEARN_UKRAINIAN_PYTHON", "LU_STATE_ROOT", "LEARN_UKRAINIAN_STATE_ROOT", "LU_TASKS_DIR",
+        "LU_GITHUB_CACHE_DIR", "LU_REPOS_ROOT", "LU_FLEET_REPO_SELECTOR_FILE",
+        "LEARN_UKRAINIAN_BATCH_STATE_DIR", "LEARN_UKRAINIAN_OWNERSHIP_LEDGER", "FLEET_COMMS_ROOT",
+    ):
+        monkeypatch.delenv(name, raising=False)
     root = tmp_path / "gate-consumer"
     root.mkdir()
     subprocess.run(["git", "init", "-q", str(root)], check=True, env=git_environment())
@@ -1148,5 +1156,5 @@ def test_inputs_commit_reads_ignore_worker_git_settings(deployed, redirect):
         assert set(inputs.inventory("agents_extensions/claude")) == {"settings.json", "hooks/product.py"}
         # A path below a non-directory entry is refused as the checkout refuses it, never read as absent.
         for reader in (inputs, tree):
-            with pytest.raises(plan.Invalid, match="^non-directory deployment path: agents_extensions/claude/settings"):
+            with pytest.raises(plan.Invalid, match=r"^non-directory deployment path: agents_extensions/claude/settings"):
                 reader.read("agents_extensions/claude/settings.json/source")

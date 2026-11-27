@@ -16,6 +16,7 @@ import pytest
 
 from lu_machinery.common.repo_root import machinery_path
 from tests.helpers.wheel import release_wheel
+from tests.host_context.conftest import build_host_layout
 
 REPO = Path(__file__).resolve().parents[2]
 SHARED = "agents_extensions/shared/"
@@ -282,7 +283,7 @@ def test_deployed_skill_stale_bytes(release):
     """Catalog bytes and every deployed copy of each advertised skill carry the wheel's recorded digest."""
     _, wheel, _, _ = release
     advertised = _catalog(release)
-    consumer, _, deployed = _deploy_consumer(release, "parity-consumer", list(HARNESSES))
+    consumer, _, deployed, _ = _deploy_consumer(release, "parity-consumer", list(HARNESSES))
     assert deployed.returncode == 0, deployed.stdout + deployed.stderr
     digests = _wheel_digests(wheel)
     with zipfile.ZipFile(wheel) as archive:
@@ -329,14 +330,19 @@ def _deploy_consumer(release, name, providers):
             path = source / "settings.json" if provider == "claude" else consumer / "agents_extensions/codex/hooks.json"
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(json.dumps(data))
+    host = build_host_layout(scratch / f"{name}-binding")
+    host.data["runtime"]["python"] = str(executable)
+    host.write()
+    bound_env = {name: env[name] for name in ("PATH", "HOME", "TMPDIR", "LANG") if name in env}
+    bound_env.update(host.env)
     command = [str(executable), "-I", "-m", "lu_machinery.agent_deploy", "--project-root", str(consumer)]
-    return consumer, command, _run(command, cwd=scratch, env=env)
+    return consumer, command, _run(command, cwd=scratch, env=bound_env), bound_env
 
 
 def test_wheel_only_deployer_isolation_idempotency_and_false_green(release):
     """A real installed wheel deploys a non-curriculum consumer and detects tampering."""
-    scratch, _, executable, env = release
-    consumer, command, first = _deploy_consumer(release, "agent-consumer", ["claude", "codex", "agy"])
+    scratch, _, executable, _ = release
+    consumer, command, first, env = _deploy_consumer(release, "agent-consumer", ["claude", "codex", "agy"])
     assert first.returncode == 0, first.stdout + first.stderr
     assert (consumer / ".agents/skills/consumer/SKILL.md").read_text() == "---\nname: consumer\ndescription: Consumer example\n---\nRead this example.\n"
     assert not (consumer / ".claude/rules/core.md").exists()

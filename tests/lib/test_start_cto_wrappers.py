@@ -7,25 +7,30 @@ import json
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 from pathlib import Path
+
 import pytest
 import yaml
+
 from lu_machinery.common.repo_root import machinery_path
 from lu_machinery.session_streams.db import SessionStreamDatabase
 from lu_machinery.session_streams.model import LeaseHolder
 from lu_machinery.session_streams.store import NotFoundError, SessionStreamStore
-from tests.epics_monitor_stub import isolated_monitor_state as isolated_monitor_state
 from tests.epics_monitor_stub import epics_monitor_stub as epics_monitor_stub
+from tests.epics_monitor_stub import isolated_monitor_state as isolated_monitor_state
+from tests.helpers import current_sol
 from tests.helpers.product_tree import configured_roots as configured_roots
+from tests.host_context.conftest import host_layout as host_layout
 from tests.launcher_sandbox import copy_launcher_sources, launcher_environment
 from tests.lib.test_claude_cap_guard import launch_with_usage as _usage_fixture
-from tests.lib.test_launcher_contract import REPO as REPO, _core_canary_failure_fixture as _core_canary_failure_fixture, run_launcher as run_launcher
+from tests.lib.test_launcher_contract import REPO as REPO
+from tests.lib.test_launcher_contract import _core_canary_failure_fixture as _core_canary_failure_fixture
+from tests.lib.test_launcher_contract import run_launcher as run_launcher
 from tests.lib.test_launcher_driver_scope import scope_sandbox as scope_sandbox
 from tests.rules_core_view import _build_view as _build_view
-import shutil
-from tests.helpers import current_sol
 
 CURRENT_SOL = current_sol()
 
@@ -880,8 +885,7 @@ def test_fresh_infra_stream_capsule_is_registered(tmp_path: Path, monkeypatch) -
     from lu_machinery.session_streams.model import LeaseHolder
     from lu_machinery.session_streams.receipts import register_manifest_inventory
     from lu_machinery.session_streams.store import SessionStreamStore
-    from lu_machinery.session_supervisor import LaunchRole
-    from lu_machinery.session_supervisor import SessionSupervisor
+    from lu_machinery.session_supervisor import LaunchRole, SessionSupervisor
 
     fresh_epic = 888001
     stream_id = f"epic:{fresh_epic}"
@@ -951,7 +955,7 @@ def _render_workspace_template(path: Path, **values: str) -> Path:
 
 def _workspace_roots(tmp_path: Path) -> tuple[Path, Path, Path]:
     """A non-Git workspace, a non-Git state root and a real primary checkout, all outside each other."""
-    workspace, state, primary = tmp_path / "cto-workspace", tmp_path / "state", tmp_path / "primary"
+    workspace, state, primary = tmp_path / "cto-workspace", tmp_path / "workspace-state", tmp_path / "primary"
     workspace.mkdir()
     state.mkdir()
     subprocess.run(["git", "init", "-q", "-b", "main", str(primary)], check=True, timeout=30,
@@ -1062,7 +1066,7 @@ def test_cto_workspace_launch_supervisor_and_driver_state_from_a_non_git_directo
     assert "PINNED DRIVER STATE" in json.loads(ran.stdout)["hookSpecificOutput"]["additionalContext"]
 
 
-def test_cto_launch_refuses_drift(tmp_path: Path) -> None:
+def test_cto_launch_refuses_drift(tmp_path: Path, host_layout) -> None:
     """The installed-layout CLI must reach Claude on a clean explicit deploy and refuse persistent drift."""
     workspace, state, primary = _workspace_roots(tmp_path)
     installed = tmp_path / "installed"
@@ -1076,6 +1080,16 @@ def test_cto_launch_refuses_drift(tmp_path: Path) -> None:
                                LU_PRIMARY_REPO_ROOT=str(primary), LU_STATE_ROOT=str(state),
                                LEARN_UKRAINIAN_PYTHON=sys.executable, LC_DRIVER_LEASE_ENABLED="0",
                                LU_CLAUDE_CAP_OVERRIDE="1")
+    state.chmod(0o700)
+    host_layout.data["state_root"] = str(state)
+    host_layout.data["repos"] = {"machinery": str(primary)}
+    host_layout.data["products"]["public"]["repo"] = "machinery"
+    host_layout.data["runtime"]["python"] = sys.executable
+    host_layout.data["monitor_url"] = env["LU_MONITOR_LOOPBACK"]
+    host_layout.write()
+    env.update(host_layout.env)
+    for name in ("FLEET_COMMS_ROOT", "LU_TASKS_DIR", "LU_GITHUB_CACHE_DIR"):
+        env.pop(name, None)
     inventory = json.loads(machinery_path("agent_deploy/release.v1.json").read_text())
     hooks: dict = {}
     for requirement in inventory["required_hooks"]["claude"][".claude/settings.json"]:

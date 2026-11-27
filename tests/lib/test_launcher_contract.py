@@ -24,9 +24,11 @@ from lu_machinery.session_streams.db import SessionStreamDatabase
 from lu_machinery.session_streams.model import LeaseHolder, utc_now
 from lu_machinery.session_streams.store import SessionStreamStore
 from lu_machinery.session_supervisor import LaunchRole, SessionSupervisor
-from tests.epics_monitor_stub import isolated_monitor_state as isolated_monitor_state
 from tests.epics_monitor_stub import epics_monitor_stub
+from tests.epics_monitor_stub import isolated_monitor_state as isolated_monitor_state
+from tests.helpers import current_sol
 from tests.helpers.product_tree import configured_roots as configured_roots
+from tests.host_context.conftest import host_layout as host_layout
 from tests.launcher_sandbox import (
     copy_interactive_launcher_checkout,
     copy_launcher_sources,
@@ -40,7 +42,6 @@ from tests.rules_core_view import (
     install_loader_bypass,
     rules_core_absent_when_marked,  # noqa: F401  (autouse: serves @rules_core_absent)
 )
-from tests.helpers import current_sol
 
 CURRENT_SOL = current_sol()
 
@@ -125,7 +126,7 @@ def run_launcher(
     return result
 
 
-def test_real_launcher_deploy_is_confined_to_temporary_checkout(tmp_path: Path) -> None:
+def test_real_launcher_deploy_is_confined_to_temporary_checkout(tmp_path: Path, host_layout) -> None:
     """Keep the real startup deploy and assert its actual output, not a stub."""
     checkout = tmp_path / "checkout with spaces"
     copy_interactive_launcher_checkout(checkout)
@@ -172,11 +173,21 @@ def test_real_launcher_deploy_is_confined_to_temporary_checkout(tmp_path: Path) 
             encoding="utf-8",
         )
         wrapper.chmod(0o755)
+    host_layout.data["repos"] = {"machinery": str(checkout)}
+    host_layout.data["products"]["public"]["repo"] = "machinery"
+    host_layout.data["runtime"]["python"] = str(checkout / ".venv/bin/python")
+    host_layout.data["monitor_url"] = launcher_environment()["LU_MONITOR_LOOPBACK"]
+    host_layout.write()
     result = run_launcher(
         "start-claude.sh",
         dry_run=False,
         root=checkout,
         env={
+            **host_layout.env,
+            "LU_STATE_ROOT": host_layout.data["state_root"],
+            "FLEET_COMMS_ROOT": str(Path(host_layout.data["state_root"]) / "batch_state/fleet-comms/v1"),
+            "LU_TASKS_DIR": str(Path(host_layout.data["state_root"]) / "batch_state/tasks"),
+            "LU_GITHUB_CACHE_DIR": str(Path(host_layout.data["state_root"]) / "batch_state/github-client"),
             "PATH": f"{binary.parent}{os.pathsep}{launcher_toolchain_path()}",
             "HOME": str(tmp_path / "home"),
             "LU_SKIP_PLANE_TUNNEL_CHECK": "1",

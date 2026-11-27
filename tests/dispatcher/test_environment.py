@@ -97,6 +97,23 @@ def test_child_env_carries_sense_proof_dir_and_strips_logins(tmp_path, monkeypat
 
 
 @pytest.mark.parametrize(("agent", "provider"), PROVIDERS)
+def test_every_read_only_provider_receives_machinery_interpreter(tmp_path, monkeypatch, agent, provider):
+    """Defect class: per-provider env forwarding drift in the no-shims path."""
+    monkeypatch.setattr(environment, "npm_shim_dir", lambda: None)
+    monkeypatch.setenv("LU_PYTHON", sys.executable)
+    monkeypatch.setenv("LEARN_UKRAINIAN_PYTHON", sys.executable)
+    product = str(tmp_path / "product")
+    monkeypatch.setenv("LU_PRODUCT_ROOT", product)
+    spec = TaskSpec("fixture", agent, "stub", None, "read-only", tmp_path, tmp_path / "p", tmp_path / "f",
+                    provider=provider)
+
+    child = worker._provider_env(spec)
+
+    assert child["LU_PYTHON"] == child["LEARN_UKRAINIAN_PYTHON"] == sys.executable
+    assert child["LU_PRODUCT_ROOT"] == product
+
+
+@pytest.mark.parametrize(("agent", "provider"), PROVIDERS)
 def test_child_env_forwards_fleet_repo_selector_when_set_and_omits_when_absent(tmp_path, monkeypatch, agent, provider):
     """Defect class: dropped LU_FLEET_REPO_SELECTOR_FILE breaks active-slug resolution in dispatched workers."""
     monkeypatch.setenv("LU_TASKS_DIR", str(tmp_path / "tasks"))

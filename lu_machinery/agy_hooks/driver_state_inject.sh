@@ -32,8 +32,17 @@ bootstrap_failed() {
 code=$(cd "$(dirname "$0")/../.." 2>/dev/null && pwd) || bootstrap_failed root
 # shellcheck disable=SC1091
 source "$code/lu_machinery/lib/project_interpreter.sh" || bootstrap_failed machinery
-project_hook_context_resolve 2>/dev/null || bootstrap_failed
-py="$LEARN_UKRAINIAN_PYTHON"
+# The rendered Claude entry opts into the host binding explicitly. Existing
+# registrations still use the legacy bootstrap when their caller exports LU_PYTHON.
+case "$mode:${2:-}" in
+  claude-*:--host-context)
+    project_host_context || bootstrap_failed context
+    py="$LU_PYTHON" ;;
+  *:)
+    project_hook_context_resolve 2>/dev/null || bootstrap_failed
+    py="$LEARN_UKRAINIAN_PYTHON" ;;
+  *) bootstrap_failed context ;;
+esac
 # Ordinary sessions have no driver gate and need no temporary files.
 if [ -z "${LU_DRIVER_STATE_FILE:-}" ] || [ -z "${SESSION_HANDOFF_AGENT:-}" ]; then
   cat >/dev/null

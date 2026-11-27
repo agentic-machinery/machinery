@@ -3320,6 +3320,12 @@ def bash_git_write_intents(
 
 
 def _block_git_mediated(summary: str, main_root: Path, reason: str) -> int:
+    if reason == _UnresolvedWrite.reason or reason.startswith("undecidable_"):
+        sys.stderr.write(
+            f"BLOCKED by guard-primary-checkout-write: cannot resolve the Git write target "
+            f"[{reason}] (issue #5396). Use a literal target and a known working directory.\n"
+        )
+        return 2
     sys.stderr.write(
         f"BLOCKED by guard-primary-checkout-write: git-mediated write "
         f"'{summary}' would mutate the protected primary checkout "
@@ -3791,6 +3797,13 @@ def _main(payload: dict | None) -> int:
 
     for raw, decision in decisions:
         if not decision.allowed:
+            if isinstance(decision, (_UnresolvedWrite, _UndecidableWrite)):
+                sys.stderr.write(
+                    f"BLOCKED by guard-primary-checkout-write: cannot resolve the write target "
+                    f"'{_label(raw)}' for {tool_name} [{decision.reason}].\n\n"
+                    f"{decision.message}\n"
+                )
+                return 2
             sys.stderr.write(
                 f"BLOCKED by guard-primary-checkout-write: {tool_name} would write "
                 f"'{_label(raw)}' inside a protected primary checkout "

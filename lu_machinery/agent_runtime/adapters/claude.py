@@ -254,7 +254,7 @@ from functools import cache
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from lu_machinery.agent_runtime.agy_hook_config import CLAUDE_GUARD_MODES, native_hook_command
+from lu_machinery.agent_runtime.agy_hook_config import CLAUDE_GUARD_MODES, AgyHookConfigError, hook_mode_for_source
 from lu_machinery.common import json_depth
 from lu_machinery.common.repo_root import machinery_path, product_root
 
@@ -734,19 +734,7 @@ _FLEET_GUARD_MARKERS = (".claude/hooks/", _PROJECT_PYTHON_HOOK_WRAPPER, *sorted(
 _WORKER_UNPAIRED_HOOKS = frozenset({_DEPLOYED_HOOKS_PREFIX + "audit-primary-checkout-dirt.py"})
 
 
-@cache
-def _worker_unpaired_hooks() -> frozenset[str]:
-    """The unpaired observers above, in the deployed path form and the native command form."""
-    return _WORKER_UNPAIRED_HOOKS | {native_hook_command("claude-audit-hook")}
-
-
-@cache
-def _native_guard_files() -> dict[str, str]:
-    """Each native Claude guard command, by its exact bytes, to the guard file it runs."""
-    return {native_hook_command(mode): mode.removeprefix("claude-") + ".py" for mode in CLAUDE_GUARD_MODES}
-
-
-def _worker_guard_invocation(command: str) -> str | None:
+def _worker_guard_invocation(command: str, mode: str | None) -> str | None:
     """Translate one deployed hook command into a tracked-source invocation.
 
     The command is split into shell words first, so quoting and escaping never
@@ -757,7 +745,7 @@ def _worker_guard_invocation(command: str) -> str | None:
     $CLAUDE_PROJECT_DIR/.claude/hooks/run-project-python-hook.sh <guard>``
     become ``<this interpreter> -I <guard>``, for the guards in
     ``PROJECT_PYTHON_GUARDS`` only. A native Claude guard command (exactly
-    ``native_hook_command("claude-<guard>")``) becomes ``<this interpreter> -I
+    ``lu-machinery-hook-v2 claude-<guard>`` or a published legacy command) becomes ``<this interpreter> -I
     <guard>.py`` too. The tracked guard path is always the last
     shell word, which the Grok hook bridge relies on. Any other command naming
     the hooks directory, the wrapper or one of those guards raises, so a guard
@@ -765,9 +753,8 @@ def _worker_guard_invocation(command: str) -> str | None:
     return ``None``.
     """
     hooks_dir = machinery_path("agents_extensions/shared/hooks")
-    native = _native_guard_files().get(command)
-    if native is not None:
-        tracked = hooks_dir / native
+    if mode in CLAUDE_GUARD_MODES:
+        tracked = hooks_dir / (mode.removeprefix("claude-") + ".py")
         if not tracked.is_file():
             raise RuntimeError(f"Claude worker guard unavailable: {tracked}")
         return shlex.join([sys.executable, "-I", str(tracked)])
@@ -814,9 +801,14 @@ def _worker_guard_settings(*, publish_guard: bool = False) -> str:
     for group in source["hooks"]["PreToolUse"]:
         hooks = []
         for hook in group["hooks"]:
-            if hook.get("command") in _worker_unpaired_hooks():
+            command = hook.get("command", "")
+            try:
+                mode = hook_mode_for_source(command)
+            except AgyHookConfigError as exc:
+                raise RuntimeError(f"Claude worker native hook has an unsupported form: {exc.reason}") from None
+            if command in _WORKER_UNPAIRED_HOOKS or mode == "claude-audit-hook":
                 continue
-            invocation = _worker_guard_invocation(hook.get("command", ""))
+            invocation = _worker_guard_invocation(command, mode)
             if invocation is not None:
                 hooks.append({**hook, "command": invocation})
             elif hook.get("onFailure") == "block":

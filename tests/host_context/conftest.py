@@ -42,8 +42,7 @@ def git(checkout, *args):
     )
 
 
-@pytest.fixture
-def host_layout(tmp_path):
+def build_host_layout(tmp_path: Path) -> HostLayout:
     # Use the package under test, including the installed-wheel CI layout.
     # Fixture metadata lets the subprocess exercise the isolated import check.
     runtime = tmp_path / "runtime"
@@ -52,6 +51,7 @@ def host_layout(tmp_path):
     site = runtime / "lib" / f"python{sys.version_info.major}.{sys.version_info.minor}" / "site-packages"
     source = Path(host_context.__file__).resolve().parent
     (site / "lu_machinery").symlink_to(source, target_is_directory=True)
+    (site / "agents_extensions").symlink_to(source.parent / "agents_extensions", target_is_directory=True)
     (site / "fixture-deps.pth").write_text(sysconfig.get_path("purelib") + "\n", encoding="utf-8")
     metadata = site / f"lu_machinery-{_VERSION}.dist-info"
     metadata.mkdir()
@@ -100,3 +100,8 @@ def host_layout(tmp_path):
     )
     layout.write()
     return layout
+
+
+@pytest.fixture
+def host_layout(tmp_path: Path) -> HostLayout:
+    return build_host_layout(tmp_path)

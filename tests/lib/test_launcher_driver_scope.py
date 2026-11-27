@@ -295,6 +295,8 @@ def install_scope_sandbox(root: Path) -> None:
             # A caller's own contact record (run_launcher) takes precedence.
             else f'export {key}="${{{key}:-{value}}}"'
             if key == "LU_TEST_REAL_MANAGER_CONTACT"
+            else f'if [ -z "${{LU_HOST_CONTEXT:-}}" ]; then export {key}={shlex.quote(value)}; fi'
+            if key == "FLEET_COMMS_ROOT"
             else f"export {key}={shlex.quote(value)}"
             for key, value in env.items()
         )

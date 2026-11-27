@@ -17,7 +17,9 @@ from pathlib import Path
 
 import pytest
 
+from lu_machinery.agent_runtime.agy_hook_config import native_hook_command
 from lu_machinery.common.repo_root import machinery_root
+from tests.host_context.conftest import host_layout as host_layout
 
 SOURCE = machinery_root().parent
 HOOKS = SOURCE / "agents_extensions" / "shared" / "hooks"
@@ -31,6 +33,55 @@ GUARDS = {
     "guard-pr-merge.py": ("gh pr merge 1", 2),
     "guard-public-github-text.py": ("gh pr view 1", 0),
 }
+
+
+def test_hook_bootstrap_resolves_from_host_context_on_detached_layout(host_layout) -> None:
+    target = Path(host_layout.data["repos"]["public"]) / "new-source.md"
+    payload = {"tool_name": "Write", "cwd": str(target.parent), "tool_input": {"file_path": str(target)}}
+    command = native_hook_command("claude-guard-primary-checkout-write", python=host_layout.python)
+    result = subprocess.run(
+        ["/bin/sh", "-c", command],
+        cwd="/", env=host_layout.env, input=json.dumps(payload), capture_output=True, text=True,
+        check=False, timeout=30,
+    )
+    assert result.returncode == 2
+    assert "inside a protected primary checkout" in result.stderr
+    assert "[untracked_primary_checkout]" in result.stderr
+
+
+def test_hook_bootstrap_refuses_invalid_context_before_running_guard(host_layout) -> None:
+    target = Path(host_layout.data["repos"]["public"]) / "new-source.md"
+    payload = {"tool_name": "Write", "cwd": str(target.parent), "tool_input": {"file_path": str(target)}}
+    command = native_hook_command("claude-guard-primary-checkout-write", python=host_layout.python)
+    invocation = host_layout.file.parent / "invalid-invocation"
+    invocation.mkdir()
+    (invocation / ".git").write_text("not a Git worktree\n", encoding="utf-8")
+    result = subprocess.run(
+        ["/bin/sh", "-c", command],
+        cwd=invocation, env={**host_layout.env, "LU_STATE_ROOT": str(target.parent)}, input=json.dumps(payload),
+        capture_output=True, text=True, check=False, timeout=30,
+    )
+    assert result.returncode == 2
+    assert result.stderr.strip() == "HOOK-BOOTSTRAP-FAILED: [legacy_conflict] LU_STATE_ROOT disagrees with host context"
+
+
+def test_guard_denial_names_unresolved_variable_not_protected_checkout(host_layout) -> None:
+    state = host_layout.data["state_root"]
+    payload = {
+        "tool_name": "Bash",
+        "cwd": host_layout.data["repos"]["public"],
+        "tool_input": {"command": 'echo x > "$DETACHED_STATE/task.log"'},
+    }
+    command = native_hook_command("claude-guard-primary-checkout-write", python=host_layout.python)
+    result = subprocess.run(
+        ["/bin/sh", "-c", command],
+        cwd="/", env={**host_layout.env, "DETACHED_STATE": state}, input=json.dumps(payload),
+        capture_output=True, text=True, check=False, timeout=30,
+    )
+    assert result.returncode == 2
+    assert "cannot resolve the write target" in result.stderr
+    assert "[unresolved_shell_variable]" in result.stderr
+    assert "inside a protected primary checkout" not in result.stderr
 
 
 def _executable(path: Path, body: str) -> Path:
@@ -331,6 +382,7 @@ def test_deployed_guards_do_not_import_a_planted_stdlib_module(tmp_path: Path) -
         subprocess.run(["git", "-C", str(product), *args], check=True, capture_output=True, env=env)
     release = tmp_path / "site-packages"
     shutil.copytree(machinery_root(), release / "lu_machinery", ignore=shutil.ignore_patterns("__pycache__"))
+    shutil.copytree(HOOKS, release / "agents_extensions/shared/hooks", ignore=shutil.ignore_patterns("__pycache__"))
     subprocess.run([sys.executable, "-I", "-m", "venv", "--without-pip", str(product / ".venv")], check=True)
     purelib = subprocess.run(
         [str(product / ".venv" / "bin" / "python"), "-I", "-c", "import sysconfig; print(sysconfig.get_path('purelib'))"],

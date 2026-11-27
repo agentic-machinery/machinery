@@ -14,8 +14,10 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import stat
 import subprocess
+import sys
 import tempfile
 import unicodedata
 from collections.abc import Mapping
@@ -405,6 +407,54 @@ def _check_private_tool(tool: PrivateTool) -> None:
         raise HostContextError("private_tool_digest_mismatch", "private tool digest differs from its binding")
 
 
+def _load_binding(
+    raw: Any, env: Mapping[str, str], *, running_python: Path | None = None,
+) -> tuple[HostContext, Mapping[str, dict[str, Any]]]:
+    context = _parse(raw)
+    from lu_machinery.common.git_credentials import repository_registry
+
+    try:
+        registry = repository_registry(REGISTRY_PATH)
+    except (OSError, ValueError):
+        raise HostContextError("invalid_registry", "packaged fleet registry cannot be loaded") from None
+    if not context.repos.keys() <= registry.keys():
+        raise HostContextError("unknown_repo", "repos must use packaged fleet registry keys")
+    _assert_legacy(context, env, registry)
+    if running_python is not None and running_python != context.runtime.python:
+        raise HostContextError("interpreter_binding_mismatch", "entry must use the bound machinery interpreter")
+    return context, registry
+
+
+def _validate_binding(
+    context: HostContext, registry: Mapping[str, dict[str, Any]], *,
+    role: str, invocation_repo: str | None = None,
+) -> None:
+    from lu_machinery.common.git_credentials import canonical_origins
+
+    required_repos = (
+        ("machinery", context.products[context.default_product].repo) if role == "hook" else context.repos
+    )
+    if invocation_repo is not None:
+        required_repos = (*required_repos, invocation_repo)
+    for key in dict.fromkeys(required_repos):
+        try:
+            # R1 verifies the packaged identity. Credential use still requires
+            # the selector and its existing independent trust checks.
+            row = registry[key]
+            origins = canonical_origins({"github": row["github"], "transport": row.get("transport", "ssh")})
+        except (OSError, ValueError):
+            raise HostContextError("invalid_repo_binding", "cannot select the registered repository origin") from None
+        _check_repo(context.repos[key], origins)
+
+    if role == "hook":
+        return
+    interpreters = dict.fromkeys((context.runtime.python, *(product.python for product in context.products.values())))
+    for interpreter in interpreters:
+        _check_python(interpreter, context.runtime.lu_machinery)
+    for tool in context.private_tools.values():
+        _check_private_tool(tool)
+
+
 def load_host_context(
     *, role: str = "all", env: Mapping[str, str] | None = None,
 ) -> HostContext | SandboxStateContext:
@@ -423,36 +473,19 @@ def load_host_context(
         _check_assertions(_state_assertions(root), env)
         _check_state(root)
         return SandboxStateContext(root, source)
-    context = _parse(raw)
-    from lu_machinery.common.git_credentials import canonical_origins, repository_registry
-
-    try:
-        registry = repository_registry(REGISTRY_PATH)
-    except (OSError, ValueError):
-        raise HostContextError("invalid_registry", "packaged fleet registry cannot be loaded") from None
-    if not context.repos.keys() <= registry.keys():
-        raise HostContextError("unknown_repo", "repos must use packaged fleet registry keys")
-    _assert_legacy(context, env, registry)
+    context, registry = _load_binding(raw, env)
     _check_state(context.state_root)
-    if role == "state":
-        return context
-
-    for key, path in context.repos.items():
-        try:
-            # R1 verifies the packaged identity. Credential use still requires
-            # the selector and its existing independent trust checks.
-            row = registry[key]
-            origins = canonical_origins({"github": row["github"], "transport": row.get("transport", "ssh")})
-        except (OSError, ValueError):
-            raise HostContextError("invalid_repo_binding", "cannot select the registered repository origin") from None
-        _check_repo(path, origins)
-
-    interpreters = dict.fromkeys((context.runtime.python, *(product.python for product in context.products.values())))
-    for interpreter in interpreters:
-        _check_python(interpreter, context.runtime.lu_machinery)
-    for tool in context.private_tools.values():
-        _check_private_tool(tool)
+    if role == "all":
+        _validate_binding(context, registry, role=role)
     return context
+
+
+def hook_interpreter() -> Path:
+    """Return the interpreter from the full host binding for hook registration."""
+    context = load_host_context(role="state")
+    if isinstance(context, SandboxStateContext):
+        raise HostContextError("invalid_role", "hook registration requires a full host binding")
+    return context.runtime.python
 
 
 def project_sandbox_state(
@@ -476,6 +509,89 @@ def project_sandbox_state(
     return SandboxStateContext(context.state_root, Path(binding.name))
 
 
+def invocation_checkout(directory: Path) -> tuple[Path, Path] | None:
+    """Return the nearest checkout and its primary without running Git."""
+    from lu_machinery.guardrails.worktree_containment import (
+        NotAGitRepositoryError,
+        resolve_main_root_without_git,
+    )
+
+    try:
+        physical = directory.resolve(strict=True)
+        _path(os.fspath(physical), "invocation directory")
+        if not physical.is_dir():
+            raise NotADirectoryError
+        for checkout in (physical, *physical.parents):
+            try:
+                (checkout / ".git").lstat()
+            except FileNotFoundError:
+                continue
+            primary = resolve_main_root_without_git(checkout)
+            _path(os.fspath(primary), "invocation primary")
+            if os.path.lexists(primary / ".git" / "commondir"):
+                raise NotAGitRepositoryError
+            return checkout, primary
+    except (OSError, RuntimeError, ValueError):
+        raise HostContextError("invalid_invocation_git", "invocation directory or its Git metadata is invalid") from None
+    return None
+
+
+def load_hook_context(
+    directory: Path, *, require_checkout: bool = False, outside_checkout: bool = False,
+) -> tuple[HostContext, tuple[Path, Path] | None]:
+    """Validate the binding and check invocation metadata without deriving authority from it."""
+    env = os.environ
+    override = CONTEXT_ENV in env
+    source = _path(env[CONTEXT_ENV], CONTEXT_ENV) if override else DEFAULT_PATH
+    raw = _read(source, override=override)
+    context, registry = _load_binding(raw, env, running_python=Path(sys.executable))
+    _check_state(context.state_root)
+    _check_python(context.runtime.python, context.runtime.lu_machinery)
+    checkout = invocation_checkout(directory)
+    if outside_checkout and checkout is not None:
+        raise HostContextError("invocation_inside_checkout", "workspace must be outside every Git checkout")
+    invocation_repo = None
+    if require_checkout:
+        if checkout is None:
+            raise HostContextError("invocation_git_missing", "Git hook requires an invocation checkout")
+        invocation_repo = next((key for key, path in context.repos.items() if path == checkout[1]), None)
+        if invocation_repo is None:
+            raise HostContextError("invocation_repo_unbound", "Git hook checkout is outside the host repository bindings")
+    _validate_binding(context, registry, role="hook", invocation_repo=invocation_repo)
+    return context, checkout
+
+
+def hook_environment(context: HostContext) -> dict[str, str]:
+    """Project the validated binding into the existing hook and launcher interfaces."""
+    return {
+        "LU_STATE_ROOT": os.fspath(context.state_root),
+        "LU_PRIMARY_REPO_ROOT": os.fspath(context.repos["machinery"]),
+        "LU_PRODUCT_ROOT": os.fspath(context.repos[context.products[context.default_product].repo]),
+        "LU_PYTHON": os.fspath(context.runtime.python),
+    }
+
+
+def _shell_context(directory: Path, *, require_checkout: bool, outside_checkout: bool) -> int:
+    """Emit shell assignments only after all required inputs have validated."""
+    try:
+        context, checkout = load_hook_context(
+            directory, require_checkout=require_checkout, outside_checkout=outside_checkout,
+        )
+    except HostContextError as exc:
+        print(f"HOOK-BOOTSTRAP-FAILED: [{exc.code}] {exc}", file=sys.stderr)
+        return 2
+
+    environment = hook_environment(context)
+    environment["LU_MACHINERY_CODE_ROOT"] = os.fspath(Path(__file__).resolve().parent.parent)
+    for name, value in environment.items():
+        print(f"export {name}={shlex.quote(value)}")
+    if checkout is not None:
+        target, primary = map(os.fspath, checkout)
+        print(f"worktree_root={shlex.quote(target)}")
+        print(f"main_root={shlex.quote(primary)}")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description=(
@@ -492,10 +608,18 @@ def main(argv: list[str] | None = None) -> int:
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("command", choices=["check"], help="check the binding and print a receipt")
+    parser.add_argument("command", choices=["check", "shell"], help="check the binding or print shell assignments")
     parser.add_argument("--role", default="all", help="validation scope: all (default), or state")
     parser.add_argument("--json", action="store_true", help="emit a JSON receipt; defaults to a text result")
+    parser.add_argument("--directory", type=Path, default=Path("."), help="invocation directory for shell")
+    checkout_mode = parser.add_mutually_exclusive_group()
+    checkout_mode.add_argument("--require-checkout", action="store_true", help="require a bound invocation checkout for shell")
+    checkout_mode.add_argument("--outside-checkout", action="store_true", help="require a non-Git invocation directory for shell")
     args = parser.parse_args(argv)
+    if args.command == "shell":
+        return _shell_context(
+            args.directory, require_checkout=args.require_checkout, outside_checkout=args.outside_checkout,
+        )
     receipt: dict[str, Any] = {"schema": SCHEMA, "ok": True}
     try:
         load_host_context(role=args.role)

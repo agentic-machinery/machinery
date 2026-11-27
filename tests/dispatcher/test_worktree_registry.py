@@ -1,15 +1,15 @@
 """A repository that declares a worktree registry gets every dispatched worktree registered and archived (#12540)."""
 
 import json
+from copy import deepcopy
 from pathlib import Path
-import yaml
-from tests.dispatcher.conftest import run_git
+
 import pytest
-from tests.helpers.product_tree import configured_roots  # noqa: F401
+import yaml
 
-
-
-
+from tests.dispatcher.conftest import run_git
+from tests.helpers.product_tree import configured_roots as configured_roots
+from tests.host_context.conftest import host_layout as host_layout
 
 REGISTRY = ".agent/workspace-hygiene.json"
 
@@ -329,9 +329,36 @@ def enroll(primary, *, ignored="/.claude/\n/.deploy-state/\n", descriptor=None, 
     return run_git(primary, "rev-parse", "HEAD"), settings
 
 
+def deployment_binding(host_layout, sandbox, python):
+    """Bind the fixture dispatcher and its deployer to the same runtime and detached state."""
+    state = Path(host_layout.data["state_root"])
+    batch = state / "batch_state"
+    host_layout.data["repos"] = {"machinery": str(sandbox.repo)}
+    host_layout.data["default_product"] = "public"
+    host_layout.data["runtime"]["python"] = python
+    host_layout.data["products"] = {"public": {"repo": "machinery", "python": python}}
+    host_layout.data["monitor_url"] = sandbox.env["LU_MONITOR_LOOPBACK"]
+    host_layout.write()
+    return {
+        **host_layout.env,
+        "LU_STATE_ROOT": str(state),
+        "LEARN_UKRAINIAN_STATE_ROOT": str(state),
+        "LEARN_UKRAINIAN_BATCH_STATE_DIR": str(batch),
+        "LEARN_UKRAINIAN_OWNERSHIP_LEDGER": str(batch / "tasks/write-ownership.sqlite3"),
+        "LU_PRIMARY_REPO_ROOT": str(sandbox.repo),
+        "LEARN_UKRAINIAN_PRIMARY_REPO_ROOT": str(sandbox.repo),
+        "LU_PRODUCT_ROOT": str(sandbox.repo),
+        "LU_PYTHON": python,
+        "LEARN_UKRAINIAN_PYTHON": python,
+        "LU_TASKS_DIR": str(batch / "tasks"),
+        "LU_GITHUB_CACHE_DIR": str(batch / "github-client"),
+        "FLEET_COMMS_ROOT": str(batch / "fleet-comms/v1"),
+    }
+
+
 @pytest.mark.parametrize("deploy_agents", [True, False])
 def test_an_enrolled_write_worktree_gets_its_product_guards_and_no_other_worktree_does(
-        sandbox, monkeypatch, deploy_agents):
+        sandbox, monkeypatch, host_layout, deploy_agents):
     """Defect classes: a write worker of an enrolled checkout launched without the product's guards, because
     Claude Code loads project settings only from the worktree it runs in and the checkout tracks none of them,
     or because the sparse checkout hid a source the descriptor declares; a worker's edit to a source, even one
@@ -344,8 +371,9 @@ def test_an_enrolled_write_worktree_gets_its_product_guards_and_no_other_worktre
 
     from lu_machinery.dispatcher import git
 
-    monkeypatch.setenv("LEARN_UKRAINIAN_PYTHON", sys.executable)
     primary, _, _ = declared_repo(sandbox)
+    for name, value in deployment_binding(host_layout, sandbox, sys.executable).items():
+        monkeypatch.setenv(name, value)
     # A tree that is not enrolled is left as it is, and a write task may still borrow it.
     plain = primary / ".worktrees/dispatch/codex/plain"
     run_git(primary, "worktree", "add", "--detach", str(plain), "HEAD")
@@ -364,7 +392,15 @@ def test_an_enrolled_write_worktree_gets_its_product_guards_and_no_other_worktre
     if not deploy_agents:
         assert not (tree / ".claude").exists() and not (tree / ".deploy-state").exists()
         return
-    assert json.loads(deployed.read_text())["hooks"]["PreToolUse"] == settings["hooks"]["PreToolUse"]
+    from lu_machinery.agent_runtime.agy_hook_config import hook_mode_for_source, native_hook_command
+
+    expected = deepcopy(settings["hooks"]["PreToolUse"])
+    for group in expected:
+        for hook in group["hooks"]:
+            mode = hook_mode_for_source(hook["command"])
+            if mode is not None:
+                hook["command"] = native_hook_command(mode, python=Path(sys.executable))
+    assert json.loads(deployed.read_text())["hooks"]["PreToolUse"] == expected
     assert run_git(tree, "status", "--porcelain", "--untracked-files=all") == ""
     # Guards come from the commit: a worker's edit to a source never reaches them, even one status hides.
     before = {name: (tree / name).read_bytes() for name in (".claude/settings.json", ".claude/README.md",
@@ -400,14 +436,16 @@ def test_an_enrolled_write_worktree_gets_its_product_guards_and_no_other_worktre
      "agent_deploy_failed: exit 2: invalid deployment: prompt lint: PERSONA_IN_RESEARCH"),
 ])
 def test_a_deployment_that_cannot_be_applied_refuses_the_launch_with_its_reason(
-        sandbox, tmp_path, broken, global_excludes, reason):
+        sandbox, tmp_path, host_layout, broken, global_excludes, reason):
     """Defect class: a write worker launched unguarded, or with generated outputs it could commit, after its
     checkout's agent deployment failed: a broken or dangling descriptor skipped, or outputs only the
     dispatcher's own user-level excludes file hides, which the worker does not share, or a validation the
     commit selects but the sparse checkout hid from the apply; or a write task borrowing (--cwd) an enrolled
     tree launched, or deployed into. A read-only task of the same checkout is never deployed, so the same
     breakage cannot refuse it."""
-    sandbox.env["LEARN_UKRAINIAN_PYTHON"] = sandbox.python
+    bound = deployment_binding(host_layout, sandbox, sandbox.python)
+    sandbox.env.update(bound)
+    sandbox.tasks = Path(bound["LU_TASKS_DIR"])
     if global_excludes:
         (tmp_path / "excludes").write_text("/.claude/\n")
         (tmp_path / "gitconfig").write_text(f"[core]\n\texcludesFile = {tmp_path / 'excludes'}\n")

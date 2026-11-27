@@ -21,15 +21,22 @@ import sys
 import tomllib
 import unicodedata
 from collections.abc import Callable, Iterator
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path, PurePosixPath
 from typing import Any
 
 import yaml
 
+from lu_machinery.agent_runtime.agy_hook_config import (
+    NATIVE_HOOK_DECLARATION,
+    AgyHookConfigError,
+    hook_mode_for_source,
+    native_hook_command,
+)
 from lu_machinery.common import json_depth
 from lu_machinery.common.repo_root import state_root
 from lu_machinery.common.safe_open import UnsafeEntryError, safe_open_below
+from lu_machinery.host_context import HostContextError, hook_interpreter
 from lu_machinery.lint.lint_agent_skills import _parse_frontmatter, metadata_errors
 
 DESCRIPTOR = "agents_extensions/deployment.v1.json"
@@ -594,6 +601,21 @@ def _validate_workspace_frontmatter(path: str, blob: bytes) -> None:
             raise Invalid(f"workspace frontmatter cannot declare {key}: {path}")
 
 
+def _native_hook_entries(settings: Any) -> Iterator[tuple[dict[str, Any], str]]:
+    """Find the exact managed commands in provider hook settings."""
+    if isinstance(settings, list):
+        for entry in settings:
+            yield from _native_hook_entries(entry)
+    elif isinstance(settings, dict):
+        command = settings.get("command")
+        if settings.get("type") == "command" and isinstance(command, str):
+            mode = hook_mode_for_source(command)
+            if mode is not None:
+                yield settings, mode
+        for value in settings.values():
+            yield from _native_hook_entries(value)
+
+
 def _validate_workspace_claude_settings(settings: dict[str, Any], requirements: list[dict[str, Any]]) -> None:
     """Enforce the strict release-bound policy on a non-Git workspace's ``.claude/settings.json``."""
     unknown = sorted(set(settings) - WORKSPACE_CLAUDE_SETTINGS_KEYS)
@@ -797,18 +819,28 @@ def build(tree: Tree, inputs: Tree | CommitInputs | None = None, *, workspace: b
         for path, blob in agy_parts(shared["rules/core.md"].blob).items():
             add(".agent", path, Output(blob, 0o644, "fleet", "generated:core"))
         add(".agent", "rules.json", Output(encoded({"exclude": ["core.md", "model-assignment.md", "workflow.md"]}), 0o644, "fleet", "generated:agy-excludes"))
+    hook_python = None
+    native_configs = {"claude": ".claude/settings.json"}
     for provider in providers:
-        for config, requirements in inventory["required_hooks"].get(provider, {}).items():
+        required_configs = inventory["required_hooks"].get(provider, {})
+        hook_configs = dict(required_configs)
+        native_config = native_configs.get(provider)
+        if native_config is not None and native_config in outputs:
+            hook_configs.setdefault(native_config, [])
+        for config, requirements in hook_configs.items():
             output = outputs.get(config)
             if output is None:
                 raise Invalid("missing provider settings: " + config)
             try:
                 settings = decode(output.blob)
+                entries = list(_native_hook_entries(settings)) if config == native_config else []
+                for hook_entry, hook_mode in entries:
+                    hook_entry["command"] = f"{NATIVE_HOOK_DECLARATION} {hook_mode}"
                 if workspace and config == ".claude/settings.json":
                     if not isinstance(settings, dict):
                         raise Invalid("expected a settings object")
                     _validate_workspace_claude_settings(settings, requirements)
-            except Invalid as exc:
+            except (Invalid, AgyHookConfigError) as exc:
                 raise Invalid(f"{config}: {exc}") from exc
             for requirement in requirements:
                 groups_for_event = settings
@@ -822,11 +854,22 @@ def build(tree: Tree, inputs: Tree | CommitInputs | None = None, *, workspace: b
                     if not any(isinstance(group, dict)
                                and {k: v for k, v in group.items() if k != "hooks"} == requirement["group"]
                                and group.get("enabled", True) is True and group.get("disabled", False) is False
+                               and isinstance(group.get("hooks"), list)
                                and any(isinstance(candidate, dict)
                                        and {k: v for k, v in candidate.items() if k != "statusMessage"}
                                        == {k: v for k, v in hook.items() if k != "statusMessage"}
                                        for candidate in group.get("hooks", [])) for group in groups_for_event):
                         raise Invalid("missing mandatory hook delegator: " + config)
+
+            if entries:
+                try:
+                    if hook_python is None:
+                        hook_python = hook_interpreter()
+                    for hook_entry, hook_mode in entries:
+                        hook_entry["command"] = native_hook_command(hook_mode, python=hook_python)
+                except (AgyHookConfigError, HostContextError) as exc:
+                    raise Invalid(f"{config}: {exc}") from exc
+                outputs[config] = replace(output, blob=encoded(settings))
 
     # Local project settings can override mandatory hooks even when the file
     # is preserved. Only recognized control files are read; runtime scratch
