@@ -21,13 +21,14 @@ TERMINAL_EXIT_GRACE_S = 30
 
 
 class DeadlineExpired(subprocess.TimeoutExpired):
-    def __init__(self, argv, kind, seconds):
+    def __init__(self, argv, kind, seconds, *, activity_sources=None):
         super().__init__(argv, seconds)
         self.kind = kind
         if kind == "initial_response_timeout":
+            sources = activity_sources or "stdout, stderr, liveness file, or process-tree work"
             self.diagnostic = (
                 f"initial_response_timeout fired after {seconds:g}s with no first observable startup activity "
-                "(stdout, stderr, liveness file, or process-tree work) "
+                f"({sources}) "
                 f"— raise it with --initial-response-timeout (current default {DEFAULT_INITIAL_RESPONSE_TIMEOUT_S}s)"
             )
         elif kind == "stdout_silence_timeout":
@@ -51,6 +52,9 @@ def deadlines(options):
 
 
 def liveness_paths(spec, invocation):
+    if spec.agent == "agy":
+        # AGY's diagnostic log is shared with its language server. The watchdog uses native activity below.
+        return None
     if spec.agent in {"claude", "codex"}:
         from lu_machinery.agent_runtime.adapters.base import InvocationPlan
         from lu_machinery.agent_runtime.adapters.claude import ClaudeAdapter
@@ -61,8 +65,6 @@ def liveness_paths(spec, invocation):
                               output_file=invocation.final_file, env_overrides=invocation.env)
         return lambda: adapter.liveness_signal_paths(plan)
     paths = (invocation.final_file,) if invocation.final_file else ()
-    if spec.agent == "agy" and "--log-file" in invocation.argv:
-        paths += (Path(invocation.argv[invocation.argv.index("--log-file") + 1]),)
     return lambda: paths
 
 
@@ -79,11 +81,19 @@ def communicate(child, invocation, stdout_path, stderr_path, hard_timeout, silen
     paths = (stdout_path, stderr_path)
     sizes = dict(zip(paths, output_sizes, strict=True))
     mtimes, primed, cpu, io = {}, set(), {}, {}
-    for path in tuple(liveness())[:_MAX_LIVENESS_PATHS]:
-        try:
-            mtimes[Path(path)] = Path(path).stat().st_mtime_ns
-        except OSError:
-            mtimes[Path(path)] = 0
+    agy_activity = None
+    if liveness is None:
+        from lu_machinery.dispatcher.providers import agy
+
+        # In stream-json mode, stdout carries the conversation. Stderr and tree work also carry maintenance.
+        paths = (stdout_path,)
+        agy_activity = agy.model_request_observer(invocation.argv)
+    else:
+        for path in tuple(liveness())[:_MAX_LIVENESS_PATHS]:
+            try:
+                mtimes[Path(path)] = Path(path).stat().st_mtime_ns
+            except OSError:
+                mtimes[Path(path)] = 0
     next_activity_poll = started
     terminal_at = None
     while True:
@@ -122,7 +132,9 @@ def communicate(child, invocation, stdout_path, stderr_path, hard_timeout, silen
                 sizes[path] = size
         # A terminal envelope ends provider work. Housekeeping cannot extend its exit deadline;
         # normal exit and parsing still decide success, otherwise the configured timeout settles it.
-        if terminal_at is None and now >= next_activity_poll:
+        if terminal_at is None and agy_activity is not None and agy_activity():
+            state.last_activity, state.observed_io = now, True
+        if terminal_at is None and liveness is not None and now >= next_activity_poll:
             if _process_tree_has_activity(child, primed, cpu, io):
                 state.last_activity, state.observed_io = now, True
             for path in tuple(liveness())[:_MAX_LIVENESS_PATHS]:
@@ -142,4 +154,7 @@ def communicate(child, invocation, stdout_path, stderr_path, hard_timeout, silen
         )):
             seconds = {"hard_timeout": hard_timeout, "stdout_silence_timeout": silence_timeout,
                        "initial_response_timeout": initial_response_timeout}[reason]
-            raise DeadlineExpired(invocation.argv, reason, seconds)
+            raise DeadlineExpired(
+                invocation.argv, reason, seconds,
+                activity_sources="AGY conversation stream or model request" if liveness is None else None,
+            )

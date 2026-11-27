@@ -2003,8 +2003,17 @@ def _execute_invocation_once(
     agy_identity_launch = agent_name == "agy" and pinned_model in AgyAdapter.claude_model_slugs
     cli_sha256 = None
     invocation_id = ""
+    track_activity = bool(
+        (stdout_silence_timeout is not None and stdout_silence_timeout > 0)
+        or (initial_response_timeout is not None and initial_response_timeout > 0)
+    )
+    agy_log_activity = None
     if agent_name == "agy":
         _AGY_OBSERVED_IDENTITY.set(None)
+        if track_activity:
+            from lu_machinery.dispatcher.providers.agy import model_request_observer
+
+            agy_log_activity = model_request_observer(plan.cmd)
     if agy_identity_launch:
         import hashlib
         import uuid
@@ -2140,15 +2149,16 @@ def _execute_invocation_once(
         stdout_line_transform = _bounded_acpx_progress_filter() if output_limit is not None else None
         watchdog_state, watchdog_threads = start_watchdog(
             proc,
-            list(liveness_paths),
+            list(liveness_paths) if agy_log_activity is None else [],
             stdout_master_fd=stdout_master_fd,
             stderr_master_fd=stderr_master_fd,
-            track_process_activity=bool(
-                (stdout_silence_timeout is not None and stdout_silence_timeout > 0)
-                or (initial_response_timeout is not None and initial_response_timeout > 0)
-            ),
+            track_process_activity=track_activity and agy_log_activity is None,
             stdout_line_transform=stdout_line_transform,
         )
+        deadline_state = watchdog_state
+        if agy_log_activity is not None:
+            # Keep draining stderr for diagnostics. AGY's deadlines use stdout and model requests.
+            deadline_state = WatchdogState(watchdog_state.start_time, watchdog_state.start_time)
         mcp_observer = _McpRuntimeObserver.from_tool_config(
             agent_name=agent_name,
             task_id=task_id,
@@ -2202,8 +2212,13 @@ def _execute_invocation_once(
                 except Exception:
                     pass
 
+            if agy_log_activity is not None:
+                if agy_log_activity():
+                    deadline_state.last_activity = time.monotonic()
+                deadline_state.last_activity = max(deadline_state.last_activity, watchdog_state.last_stdout_activity)
+                deadline_state.observed_io = deadline_state.last_activity > deadline_state.start_time
             kill_reason = should_kill(
-                watchdog_state,
+                deadline_state,
                 stall_timeout,
                 hard_timeout,
                 stdout_silence_timeout=stdout_silence_timeout,
