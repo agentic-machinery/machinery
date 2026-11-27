@@ -111,9 +111,10 @@ interpreter does not select the primary checkout's Python modules.
    exactly. Do not add `--require-review-verdict` to these bound attempts.
 
    ```bash
+   # FLEET_REPO_KEY is the target's key in fleet_repos.yaml.
    "$PY" -m lu_machinery.dispatch dispatch \
      --agent "$REVIEW_AGENT" --model "$REVIEW_MODEL" --effort high \
-     --mode read-only --worktree --task-id "$REVIEW_TASK" \
+     --mode read-only --worktree --repo "$FLEET_REPO_KEY" --task-id "$REVIEW_TASK" \
      --prompt-file "$REVIEW_BRIEF" --branch "$BRANCH" --pinned-head "$HEAD_SHA" --pr "$PR" \
      --review-profile "$REVIEW_PROFILE" --review-author-model "$AUTHOR_MODEL" --risk "$RISK" \
      --review-mode cross_family --require-review-verdict

@@ -95,7 +95,7 @@ def test_review_metadata_loss_round_trip_enforces_risk_and_subjects(dispatch, mo
     read_files = Mock(return_value=[])
     monkeypatch.setattr(cf, "_pr", load_pr)
     monkeypatch.setattr(cf.GitHubAdapter, "pr_file_rows", read_files)
-    record = dispatch("--risk", "high", "--review-profile", "code", "--review-mode", "cross_family",
+    record = dispatch("--repo", "machinery", "--risk", "high", "--review-profile", "code", "--review-mode", "cross_family",
                       "--review-author-model", "claude-opus-5-5", "--language-lane", "", "--pr", "42",
                       "--subject-seat", "GROK_build", "--subject-seat", "claude-infra",
                       "--subject-seat", "grok", "--subject-family", " XAI ", "--require-review-verdict")
@@ -335,7 +335,7 @@ def test_fourth_default_tier_review_dispatch_is_refused_without_any_recorded_ver
     heads = iter(f"{index}" * 40 for index in range(1, 5))
     monkeypatch.setattr(git, "review_branch_start", lambda *a, **k: next(heads))
     monkeypatch.setattr(git, "worktree_plan", lambda *a, **k: (Path("/nonexistent"), "codex/review", a[3]))
-    review = ("--mode", "read-only", "--branch", "codex/fix", "--pr", "42", "--risk", "medium",
+    review = ("--mode", "read-only", "--repo", "public", "--branch", "codex/fix", "--pr", "42", "--risk", "medium",
               "--require-review-verdict", "--prompt", "Review this change")
     # GitHub knows the Medium-tier diff, with no recorded verdicts at the third or fourth head.
     current_head = "1" * 40
@@ -358,6 +358,50 @@ def test_fourth_default_tier_review_dispatch_is_refused_without_any_recorded_ver
     assert "review dispatch refused: REVIEW_BUDGET_EXHAUSTED: PR #42 already has verdicts at 3 heads (3 dispatched " \
            "with no recorded verdict" in capsys.readouterr().err
     assert store.read("round-4", missing_ok=True) is None
+
+
+def test_review_dispatch_without_repo_refuses_before_github(dispatch, monkeypatch, tmp_path, capsys):
+    """A repository-local PR number must not trigger a lookup against the default repository."""
+    registry = tmp_path / "fleet_repos.yaml"
+    registry.write_text(json.dumps({"repos": {
+        "public": {"default": True, "github": "example/public", "role": "public-monorepo"},
+        "review-target": {"local_name": "review-target", "github": "example/target"},
+    }}), encoding="utf-8")
+    monkeypatch.setattr(git, "_fleet_repos_path", lambda: registry)
+    read_task_card = Mock()
+    read_pr = Mock(side_effect=cf.RecordError("unexpected PR lookup"))
+    monkeypatch.setattr(checks, "check_task_card", read_task_card)
+    monkeypatch.setattr(cf, "_run_json", read_pr)
+
+    dispatch("--mode", "read-only", "--pr", "42", "--task-card", "#10", expected=2, refusal="review_setup_refusal")
+
+    read_task_card.assert_not_called()
+    read_pr.assert_not_called()
+    detail = "review_repo_required: --pr requires --repo. Pass a fleet repository key (public, review-target)."
+    assert capsys.readouterr().err == f"dispatcher: {detail}\n"
+    [record] = store.list_tasks()
+    assert record["error"] == f"review_setup_refusal: {detail}"
+
+
+def test_review_admission_error_names_queried_repository(dispatch, monkeypatch, tmp_path, capsys):
+    """A lookup failure must identify the selected GitHub slug even when it differs from the fleet key."""
+    repository = {"key": "review-target", "github": "example/old", "alternate_github": "example/active"}
+    monkeypatch.setattr(git, "resolve_repo", lambda _: (tmp_path, repository))
+    monkeypatch.setattr(
+        git_credentials, "load_selector",
+        lambda **_kwargs: git_credentials.SelectorState({"review-target": "example/active"}, "d" * 64),
+    )
+    read = Mock(side_effect=cf.RecordError("GraphQL: Could not resolve to a PullRequest with the number of 42"))
+    monkeypatch.setattr(cf, "_run_json", read)
+
+    dispatch("--mode", "read-only", "--pr", "42", "--repo", "review-target", expected=2, refusal="review_setup_refusal")
+
+    read.assert_called_once()
+    assert read.call_args.args[0][:6] == ["gh", "pr", "view", "42", "--repo", "example/active"]
+    detail = "review admission for example/active#42: GraphQL: Could not resolve to a PullRequest with the number of 42"
+    assert capsys.readouterr().err == f"dispatcher: {detail}\n"
+    [record] = store.list_tasks()
+    assert (record["repo"], record["error"]) == ("review-target", f"review_setup_refusal: {detail}")
 
 
 pytestmark = pytest.mark.usefixtures("configured_roots")
@@ -422,7 +466,8 @@ def test_mislabelled_review_dispatch_cannot_avoid_the_critical_floor(dispatch, m
     ))
     monkeypatch.setattr(cf.GitHubAdapter, "pr_file_rows", lambda *_a: [{"filename": path, "status": "added"}])
     branch = () if flags == ("--pr", "42") or "--cwd" in flags else ("--branch", "review/target")
-    review = ("--mode", "read-only", "--risk", "low", *branch, *flags)
+    repository = ("--repo", "public") if "--pr" in flags else ()
+    review = ("--mode", "read-only", "--risk", "low", *repository, *branch, *flags)
     if refusal is None:
         record = dispatch(*review, agent=agent, model=model)
         assert (record["model"], record["review_branch"], record["pinned_head"]) == (model, "review/target", head)
