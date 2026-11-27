@@ -633,10 +633,13 @@ def _unreadable_recipient_cause(recipient: str) -> tuple[str, str] | None:
     """``(name, cause)`` when no drain reads this recipient, else ``None``; reads no store.
 
     Mirrors ``deliveries pending``: a historical alias is not checked, and the
-    standing comes from one roster read. Only a proven standing refuses. An
-    unknown standing (incomplete roster, damaged task record), or any failure to
-    classify (an unreadable profile or assignments source), is admitted, so doubt
-    never hides mail; the claim path then answers as it did before this check.
+    standing comes from one roster read. Only a proven standing refuses; an
+    unknown one (incomplete roster, damaged task record) is admitted, so doubt
+    never hides mail, and the claim path then answers as it did before this check.
+
+    Each evidence source fails on its own. An unreadable alias or roster source
+    proves nothing about the name's registration, so ``not_registered`` is not
+    refused then; a readable terminal task record still proves ``settled_task``.
     """
     from lu_machinery.agent_identity import resolve_recipient_alias
     from lu_machinery.fleet_comms.authority import (
@@ -647,10 +650,19 @@ def _unreadable_recipient_cause(recipient: str) -> tuple[str, str] | None:
     )
 
     name = _nonempty(recipient, field="recipient")
+    registration_known = True
     try:
         if resolve_recipient_alias(name) != name:
             return None
-        standing = _recipient_standing(name, *_load_roster())
+    except Exception:
+        registration_known = False
+    try:
+        roster = _load_roster()
+    except Exception:
+        registration_known = False
+        roster = (frozenset(), False)
+    try:
+        standing = _recipient_standing(name, roster[0], roster[1] and registration_known)
     except Exception:
         return None
     if standing not in {"not_registered", "settled_task"}:

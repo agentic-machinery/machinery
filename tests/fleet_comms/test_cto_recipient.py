@@ -347,6 +347,33 @@ def test_claim_and_receive_admit_a_recipient_of_unknown_standing(plane, tasks, c
     assert received["delivery"]["recipient"] == name
 
 
+@pytest.mark.parametrize("unreadable", ["alias_source", "roster_source"])
+@pytest.mark.parametrize("operation", ["receive", "claim"])
+def test_a_settled_task_is_refused_when_a_roster_source_is_unreadable(
+    plane, tasks, capsys, monkeypatch, unreadable, operation,
+):
+    """Defect class: a failure in one evidence source (alias or roster read) discards the task record's proof of
+    settlement, so mail queued to a settled task is leased instead of refused."""
+    from lu_machinery import agent_identity
+    from lu_machinery.common.profile import ProfileError
+    from lu_machinery.fleet_comms import authority
+
+    worker = tasks("cto-10-i10-worker", "running")
+    with AuthorityService(root=plane) as service:
+        service.publish_message(sender="claude-cto", body="apply option B", recipients=(worker,))
+    tasks(worker, "done")
+    before = delivery_snapshot(plane)
+
+    def fail():
+        raise ProfileError("area_assignments entry names a missing file")
+
+    target = (agent_identity, "default_assignments_path") if unreadable == "alias_source" else (authority, "_load_roster")
+    monkeypatch.setattr(*target, fail)
+    refused = run(capsys, "deliveries", operation, "--recipient", worker, "--worker-id", worker, expected=EXIT_ERROR)
+    assert (refused["error"], refused["queued"], refused["running"]) == ("recipient_settled", 1, 0)
+    assert delivery_snapshot(plane) == before
+
+
 def test_dead_subscription_still_receiving_broadcasts_ends_when_its_task_settles(plane, tasks):
     """Defect class: a settled task stays subscribed, so every broadcast still fans out to it (#594)."""
     worker = tasks("cto-4-i4-worker", "running")
