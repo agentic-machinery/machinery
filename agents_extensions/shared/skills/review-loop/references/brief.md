@@ -133,7 +133,7 @@ Freeze sections 2 to 4 of the template from round 1; do not edit them. Section 1
 - the acceptance-criterion IDs the fix diff affects;
 - the ledger: every finding id with its disposition and proof, that is its fix evidence, the
   author's decline with file:line or test evidence, or the author's `not_applicable` claim
-  with its proof, and the outcome label recorded for each P0-P1 finding with its evidence;
+  with its proof, and the outcome label recorded for each P0-P2 finding with its evidence;
 - targeted same-head output or the relevant CI excerpts, and the checks still pending;
 - the budget state (`round 2 of 3`, or of the budget the repository declares).
 

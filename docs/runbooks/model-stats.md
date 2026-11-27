@@ -405,19 +405,19 @@ On 2026-11-19 over 30 days (backfilled copy): GPT-6.1 Sol 0.949 (237 settled fin
 (91, 28 open), GPT-6.2 Sol 1.0 (3, 35 open, low sample), Grok 4.7 1.0 (7, low sample).
 
 **Outcome labels** (`reviewer_accuracy.findings[].labels`). After it records a `CHANGES_REQUESTED` verdict,
-the author labels each P0-P1 finding of that review with
+the author labels each P0-P2 finding of that review (every finding that can block it) with
 `record_cf_verdict finding-outcome --task-id <review> --pr <N> --finding <id> --label <label> [--evidence '<line>']`:
 `fixed` (a real error, changed), `wrong` (the code was already correct), `invented` (it cites a file, line,
 symbol or behaviour that does not exist), `out_of_scope` or `duplicate`. Every label except `fixed` needs one line
-of evidence. The verb refuses a finding that is not a P0-P1 finding of the review's structured reply and a review
+of evidence. The verb refuses a finding that is not a P0-P2 finding of the review's structured reply and a review
 with no published `CHANGES_REQUESTED` verdict on that PR in the publication ledger. One label per finding: the
 same label again is a no-op, and another one is refused. The next review of the PR may contest a label with a line
 `CONTEST <finding-id>: <reason>` in its reply's `overall.explanation`. When `record` publishes that review, it
-stores each contested id that is a P0-P1 finding of the PR's previous blocking review of record (the newest other
+stores each contested id that is a P0-P2 finding of the PR's previous blocking review of record (the newest other
 `CHANGES_REQUESTED` publication; of two at one GitHub time, the later ledger line) and reports
 `outcome_contests` (`stored against <review>: <ids>; unmatched: <ids>`); a reply that contests nothing adds no
-field. A contested label counts as `contested`, not as its label. `unlabelled` is the review's P0-P1 count minus
-its labels. `real_precision` is `fixed / (fixed + wrong + invented)` with its Wilson interval; a label is the
+field. A contested label counts as `contested`, not as its label. `unlabelled` is the review's P0-P2 count minus
+its labels (the file-inferred figures above cover P0-P1 only). `real_precision` is `fixed / (fixed + wrong + invented)` with its Wilson interval; a label is the
 author's word unless a later review contested it.
 
 Both line kinds go to `batch_state/model-stats/finding-outcomes.jsonl` (schema `review-finding-outcome.v1`)
