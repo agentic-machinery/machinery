@@ -2060,6 +2060,47 @@ def _retarget_api_batch_state(monkeypatch: pytest.MonkeyPatch, batch_state: Path
         monkeypatch.setattr(app.state, "ctx", context.with_roots(batch_state_dir=batch_state))
 
 
+@pytest.fixture(scope="session", autouse=True)
+def _no_session_host_binding(tmp_path_factory: pytest.TempPathFactory) -> Generator[None, None, None]:
+    """Keep the whole session, session fixtures included, off the live host binding.
+
+    ``host_context.DEFAULT_PATH`` names a root-owned host file that only some
+    hosts have. A test that sets its own ``LU_STATE_ROOT`` then fails there with
+    ``legacy_conflict`` while CI, which has no such file, passes. The default
+    path here is never created, so the loader reports ``missing_context`` and
+    callers use the legacy settings. An inherited ``LU_HOST_CONTEXT`` is removed
+    for the same reason.
+
+    This uses its own ``MonkeyPatch``: a test that calls ``monkeypatch.undo()``
+    reverts every patch on the shared per-test instance, and must fall back to
+    this absent path, not the live file. Child processes import ``host_context``
+    afresh and do not see either patch.
+    """
+    from lu_machinery import host_context
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.delenv(host_context.CONTEXT_ENV, raising=False)
+        absent = tmp_path_factory.getbasetemp() / "absent-host-binding" / "host.v1.json"
+        patch.setattr(host_context, "DEFAULT_PATH", absent)
+        yield
+
+
+@pytest.fixture(autouse=True)
+def _isolate_host_binding(_no_session_host_binding: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Give each test its own default host binding path, never created.
+
+    A test that writes a file at ``host_context.DEFAULT_PATH`` cannot leak it to
+    the next test. Nothing is created under ``tmp_path`` (see
+    ``_isolate_runtime_scratch_root``). A test that needs a binding writes its own
+    scratch file and sets ``LU_HOST_CONTEXT``
+    (``tests/host_context/conftest.py:build_host_layout``) or patches
+    ``DEFAULT_PATH`` itself; both run after this fixture, so they win.
+    """
+    from lu_machinery import host_context
+
+    monkeypatch.setattr(host_context, "DEFAULT_PATH", tmp_path / "absent-host-binding" / "host.v1.json")
+
+
 # Per-process, not per-test: ``mktemp`` scans the base directory for the next
 # number, and that scan grows with every directory already created (#8654 review).
 _DISPATCH_STORE_SEQ = itertools.count()
