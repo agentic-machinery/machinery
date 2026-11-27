@@ -219,9 +219,9 @@ launcher_adapter_exec() {
     fi
   else
     cmd=(claude --model "$LC_MODEL")
-    if [ -n "${LC_RULES_CORE:-}" ]; then
-      cmd+=(--append-system-prompt "$LC_RULES_CORE")
-    fi
+    # One system-prompt addition: the core, then any caller additions.
+    launcher_claude_system_prompt merge
+    cmd+=(${LC_CLAUDE_SYSTEM_PROMPT_ARGS[@]+"${LC_CLAUDE_SYSTEM_PROMPT_ARGS[@]}"})
   fi
   cmd+=("${LC_FORWARD_ARGS[@]}")
   if [ "$LC_DRY_RUN" = 1 ]; then printf 'LAUNCHER_DRY_RUN=1: credential_source=%s\nwould exec ' "$LC_AUTH_SOURCE"; launcher_print_argv "${cmd[@]}"; printf '\n'; return 0; fi

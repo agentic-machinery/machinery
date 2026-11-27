@@ -1261,6 +1261,39 @@ def test_cto_wrapper_start_builds_cto_prompt_not_lane_driver_prompt(tmp_path: Pa
     assert "Load .claude/skills/drive-epic/SKILL.md from the workspace root" in lane_prompt
 
 
+def test_launcher_passes_single_system_prompt_with_core_then_role(tmp_path: Path) -> None:
+    """#1589 defect class: a second --append-system-prompt silently drops the rules core, since
+    Claude Code keeps only the last addition. Native Claude, the CTO wrapper's role and Codex on
+    Claude Code each pass one inline addition: the core, then the caller's additions in order,
+    whatever form the caller used (inline, =, file, file=). A one-value option's value is kept."""
+    role = "You are the operator-appointed CTO AND cross-epic lead."
+    role_file = tmp_path / "role.txt"
+    role_file.write_text("File role.\n", encoding="utf-8")
+    argv_file = tmp_path / "argv"
+    cases = (
+        (("start-claude-cto.sh", "--epic", "epics", "--model", "claude-opus-5-5", "KICK", "--",
+          "--dangerously-skip-permissions", "--append-system-prompt", role), [role]),
+        (("start-claude.sh", "--", "--append-system-prompt=One.", "--name", "--append-system-prompt",
+          "--append-system-prompt-file", str(role_file), f"--append-system-prompt-file={role_file}"),
+         ["One.", "File role.\n", "File role.\n"]),
+        (("start-codex.sh", "--harness", "claude-code", "--", "--append-system-prompt", role), [role]),
+    )
+    for args, additions in cases:
+        result = run_launcher(*args, env={"LAUNCHER_DRY_RUN_ARGV_FILE": str(argv_file)})
+        assert result.returncode == 0, result.stdout + result.stderr
+        core_bytes = int(re.search(r"launcher: rules core seat=\S+ bytes=(\d+)", result.stdout).group(1))
+        argv = argv_file.read_bytes().removesuffix(b"\0").split(b"\0")
+        assert argv[0] == b"claude", args
+        values = [argv[i + 1] for i, arg in enumerate(argv) if arg == b"--append-system-prompt" and argv[i - 1] != b"--name"]
+        assert len(values) == 1, (args, values)
+        assert not [arg for arg in argv if arg.startswith((b"--append-system-prompt=", b"--append-system-prompt-file"))]
+        core, rest = values[0][:core_bytes], values[0][core_bytes:]
+        assert core.startswith(b"<rules-core ") and core.rstrip().endswith(b"</rules-core>"), args
+        assert rest == "".join(f"\n\n{addition}" for addition in additions).encode(), args
+        if "--name" in args:
+            assert argv[argv.index(b"--name") + 1] == b"--append-system-prompt"
+
+
 def test_fleet_cold_clause_keeps_lane_drivers_on_drive_epic(tmp_path: Path) -> None:
     """#12496: only the CTO seat names another skill; the lane-driver clause is unchanged."""
     script = (

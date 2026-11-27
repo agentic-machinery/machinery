@@ -289,6 +289,93 @@ launcher_print_argv() {
   fi
 }
 
+# launcher_claude_system_prompt inline|merge — Claude Code keeps only the last
+# system-prompt addition it is given (#1589), so a caller's addition after the
+# launcher's silently drops the rules core. Both modes scan LC_FORWARD_ARGS for
+# --append-system-prompt and --append-system-prompt-file, each with a separate
+# or =-joined value, as Claude parses them: a literal -- ends options, and the
+# value of a one-value option is never read as an option.
+#   inline  Before any side effect: replace each file addition in place with the
+#           inline form of its content (argument positions unchanged). A missing
+#           value, or a file that is unreadable or holds a NUL byte, refuses.
+#   merge   At exec: remove every addition and set LC_CLAUDE_SYSTEM_PROMPT_ARGS to
+#           one inline addition, the core, then each caller addition in order,
+#           separated by a blank line.
+launcher_claude_system_prompt() {
+  local mode="$1"
+  local -a kept=() parts=() chunks=()
+  local arg flag value path index=0 count="${#LC_FORWARD_ARGS[@]}" joined part size
+  LC_CLAUDE_SYSTEM_PROMPT_ARGS=()
+  if [ -n "${LC_RULES_CORE:-}" ]; then parts+=("$LC_RULES_CORE"); fi
+  while [ "$index" -lt "$count" ]; do
+    arg="${LC_FORWARD_ARGS[index]}"
+    index=$((index + 1))
+    case "$arg" in
+      --)
+        kept+=("${LC_FORWARD_ARGS[@]:index-1}")
+        break
+        ;;
+      --append-system-prompt|--append-system-prompt-file)
+        if [ "$index" -ge "$count" ]; then
+          launcher_error "refusing to launch: $arg requires a value."
+          exit 2
+        fi
+        flag="$arg"
+        value="${LC_FORWARD_ARGS[index]}"
+        index=$((index + 1))
+        ;;
+      --append-system-prompt=*|--append-system-prompt-file=*)
+        flag="${arg%%=*}"
+        value="${arg#*=}"
+        ;;
+      -*)
+        kept+=("$arg")
+        if [[ "$arg" != *=* ]] && launcher_provider_option_arity "$arg" \
+            && [ "$LC_OPTION_ARITY" = one ] && [ "$index" -lt "$count" ]; then
+          kept+=("${LC_FORWARD_ARGS[index]}")
+          index=$((index + 1))
+        fi
+        continue
+        ;;
+      *)
+        kept+=("$arg")
+        continue
+        ;;
+    esac
+    if [ "$flag" = --append-system-prompt-file ]; then
+      # Read the file whole, trailing newlines included, as Claude would.
+      path="$value"
+      if ! [ -f "$path" ] || ! [ -r "$path" ] || ! size="$(wc -c < "$path")" \
+          || ! mapfile -d '' -t chunks < "$path"; then
+        launcher_error "refusing to launch: --append-system-prompt-file '$path' is not a readable file."
+        exit 2
+      fi
+      value="${chunks[0]-}"
+      if [ "${#chunks[@]}" -gt 1 ] || [ "$(printf '%s' "$value" | wc -c)" -ne "$size" ]; then
+        launcher_error "refusing to launch: --append-system-prompt-file '$path' holds a NUL byte."
+        exit 2
+      fi
+    fi
+    if [ "$mode" = inline ]; then
+      if [[ "$arg" == *=* ]]; then
+        kept+=("--append-system-prompt=$value")
+      else
+        kept+=(--append-system-prompt "$value")
+      fi
+    elif [ -n "$value" ]; then
+      parts+=("$value")
+    fi
+  done
+  LC_FORWARD_ARGS=(${kept[@]+"${kept[@]}"})
+  [ "$mode" = merge ] && [ "${#parts[@]}" -gt 0 ] || return 0
+  joined="${parts[0]}"
+  for part in "${parts[@]:1}"; do
+    joined+=$'\n\n'"$part"
+  done
+  # shellcheck disable=SC2034  # read by the Claude adapters (launchers/claude.sh, codex.sh)
+  LC_CLAUDE_SYSTEM_PROMPT_ARGS=(--append-system-prompt "$joined")
+}
+
 # Every seat starts with the rules core (scripts/lib/rules_core.sh). A driver on
 # a curriculum lane is a content seat and also gets the curriculum addendum. An
 # absent or unreadable core refuses the launch (exit 1), naming the path.
@@ -1616,6 +1703,11 @@ launcher_main() {
   # canary or seed can leave side effects behind a failed launch.
   if [ "$LC_MODE" = "driver" ] && [ "$LC_GOVERNOR" = "0" ]; then
     launcher_validate_provider_option_arity || exit 2
+  fi
+  # Read caller system-prompt files now, so the exec-time merge into the one
+  # addition cannot refuse after a lease or canary.
+  if [ "$LC_HARNESS" = claude-code ]; then
+    launcher_claude_system_prompt inline
   fi
   launcher_adapter_preflight
 

@@ -2,7 +2,8 @@
 # Rules core for launchers. Reads the core from this release through the
 # sibling rules_core.py (offline; never the Monitor API) and hands provider
 # adapters the text in the form their harness accepts:
-#   claude-code  --append-system-prompt "$LC_RULES_CORE"
+#   claude-code  one --append-system-prompt: the core, then any caller additions
+#                (launcher_claude_system_prompt; Claude keeps only the last one)
 #   codex        -c developer_instructions=<rules_core_toml>
 #   grok         --rules "$LC_RULES_CORE"
 #   agy, cursor-agent, opencode: the core leads the initial prompt
