@@ -149,20 +149,23 @@ Check the diff against `agents_extensions/shared/rules/design-charter.md`, read 
 Pull a fresh routing snapshot, then resolve:
 
 ```bash
-SNAPSHOT_FILE="$(mktemp)"
-curl -s 'http://localhost:8765/api/state/routing-budget?fresh_codexbar=true' \
-  | "$LU_PYTHON" -I -c 'import json,sys; d=json.load(sys.stdin); print(json.dumps(d.get("lane_health", d)))' \
-  > "$SNAPSHOT_FILE"
+(
+  set -eo pipefail
+  SNAPSHOT_FILE="$(mktemp)"
+  trap 'rm -f -- "$SNAPSHOT_FILE"' EXIT
+  curl -s 'http://localhost:8765/api/state/routing-budget?fresh_codexbar=true' \
+    | "$LU_PYTHON" -I -c 'import json,sys; d=json.load(sys.stdin); print(json.dumps(d.get("lane_health", d)))' \
+    > "$SNAPSHOT_FILE"
 
-"$LU_PYTHON" -I -m lu_machinery.review.closeout_cli --state-file "$STATE_FILE" resolve-reviewer \
-  --author-model "<the author's actual model/seat, e.g. claude-opus-5-5, gpt-6.2-sol, grok-4.7>" \
-  --review-profile "<same profile as Step 2>" \
-  --risk "<same risk as Step 2>" \
-  --domain "<code|infra>" \
-  --data-egress-policy "<omit unless this run is genuinely local-interactive>" \
-  --routing-snapshot-file "$SNAPSHOT_FILE" \
-  --owned-path "<each changed per-seat adapter or reviewer hook; repeat the flag>"
-rm -f -- "$SNAPSHOT_FILE"
+  "$LU_PYTHON" -I -m lu_machinery.review.closeout_cli --state-file "$STATE_FILE" resolve-reviewer \
+    --author-model "<the author's actual model/seat, e.g. claude-opus-5-5, gpt-6.2-sol, grok-4.7>" \
+    --review-profile "<same profile as Step 2>" \
+    --risk "<same risk as Step 2>" \
+    --domain "<code|infra>" \
+    --data-egress-policy "<omit unless this run is genuinely local-interactive>" \
+    --routing-snapshot-file "$SNAPSHOT_FILE" \
+    --owned-path "<each changed per-seat adapter or reviewer hook; repeat the flag>"
+)
 ```
 
 When the frozen diff governs a seat — its adapter `<seat>*.py` under
