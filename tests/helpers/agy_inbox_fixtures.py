@@ -31,7 +31,11 @@ def roster(tmp_path, monkeypatch):
     from lu_machinery import agent_identity
 
     path = tmp_path / "assignments.yaml"
-    path.write_text("assignments:\n  infra:\n    slots: [gemini-infra, codex-core]\n  monitor:\n    slots: []\n")
+    path.write_text(
+        "schema_version: 1\nassignments:\n"
+        "  infra:\n    driver_agent_type: gemini\n    slots: [gemini-infra, codex-core]\n"
+        "  monitor:\n    driver_agent_type: claude\n    slots: []\n"
+    )
     monkeypatch.setattr(agent_identity, "ASSIGNMENTS_PATH", path)
     monkeypatch.setenv("TEST_INBOX_ROSTER", str(path))
     interpreter = tmp_path / "roster-interpreter"

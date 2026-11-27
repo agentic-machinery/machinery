@@ -12,7 +12,7 @@ import uuid
 from contextlib import nullcontext
 from datetime import UTC, datetime, timedelta
 from pathlib import Path, PureWindowsPath
-from stat import S_ISREG
+from stat import S_ISDIR, S_ISREG
 from typing import Any
 
 from lu_machinery.common import json_depth
@@ -449,30 +449,53 @@ def _worktree_may_exist(path: str | None) -> bool:
     return True
 
 
+def _proven_absent(path: Path) -> bool:
+    """True when ``path`` has no directory entry and its nearest existing ancestor is a reachable directory.
+
+    A dangling link anywhere on the way (the record name, the archive or the
+    tasks directory itself) or an ancestor that cannot be stated proves
+    nothing, so it is ``TASK_RECORD_UNREADABLE``; a tasks directory that does
+    not exist yet below a real directory is an empty store.
+    """
+    probe = path
+    while True:
+        try:
+            os.lstat(probe)
+        except FileNotFoundError:
+            if probe.parent == probe:
+                return True
+            probe = probe.parent
+            continue
+        except OSError as exc:
+            raise TaskRecordError("TASK_RECORD_UNREADABLE") from exc
+        break
+    if probe == path:
+        return False  # an entry exists: a dangling link or one written since the stat
+    try:
+        return S_ISDIR(os.stat(probe).st_mode)
+    except OSError as exc:
+        raise TaskRecordError("TASK_RECORD_UNREADABLE") from exc
+
+
 def _locate_record(tasks_root: Path, task_id: str) -> Path | None:
     """The hot record, else the archived one; ``None`` only when both are proven absent.
 
     The archive is consulted only after the hot name is proven absent, so an
-    unusable hot entry never lets an older archived copy answer. Absence is a
-    ``FileNotFoundError`` on the name with no directory entry left (a dangling
-    link is an entry); an access failure, a non-regular entry or any other
-    error is ``TASK_RECORD_UNREADABLE``. (``locate_task_record`` uses
-    ``is_file()``, which on 3.14 answers False on an access failure.)
+    unusable hot entry never lets an older archived copy answer. Absence needs
+    ``_proven_absent``; an access failure, a non-regular entry, a dangling link
+    or any other error is ``TASK_RECORD_UNREADABLE``. (``locate_task_record``
+    uses ``is_file()``, which on 3.14 answers False on an access failure.)
     """
     for candidate in (task_record_path(tasks_root, task_id), archived_task_record_path(tasks_root, task_id)):
         try:
             if S_ISREG(os.stat(candidate).st_mode):
                 return candidate
         except FileNotFoundError:
-            try:
-                os.lstat(candidate)
-            except FileNotFoundError:
+            if _proven_absent(candidate):
                 continue
-            except OSError as exc:
-                raise TaskRecordError("TASK_RECORD_UNREADABLE") from exc
         except OSError as exc:
             raise TaskRecordError("TASK_RECORD_UNREADABLE") from exc
-        raise TaskRecordError("TASK_RECORD_UNREADABLE")  # a dangling link or a non-regular entry
+        raise TaskRecordError("TASK_RECORD_UNREADABLE")  # a dangling link, a non-regular entry or no reachable directory
     return None
 
 

@@ -179,9 +179,10 @@ def test_declared_external_recipients_are_admitted_and_unknown_names_still_refus
     assert sorted(tuple(row) for row in backlog(plane)) == sorted((name, "queued") for name in external)
 
     # Admission comes from the declared list, not a name in code: without it, the same name is refused.
-    text = agent_identity.ASSIGNMENTS_PATH.read_text(encoding="utf-8")
+    data = yaml.safe_load(agent_identity.ASSIGNMENTS_PATH.read_text(encoding="utf-8"))
+    data["external_recipients"] = []
     stripped = tmp_path / "area_assignments.yaml"
-    stripped.write_text(text.replace("external_recipients:", "unused_external_recipients:"), encoding="utf-8")
+    stripped.write_text(yaml.safe_dump(data), encoding="utf-8")
     monkeypatch.setattr(agent_identity, "ASSIGNMENTS_PATH", stripped)
     with AuthorityService(root=plane) as service:
         for name in external:
@@ -329,7 +330,10 @@ def test_incomplete_roster_proves_no_name_unregistered_and_removes_nothing(
     ])
 
 
-@pytest.mark.parametrize("doubt", ["malformed_area", "task_store_unreadable", "hot_entry_not_a_file", "dangling_record_link"])
+@pytest.mark.parametrize("doubt", [
+    "malformed_area", "unknown_roster_key", "task_store_unreadable", "hot_entry_not_a_file", "dangling_record_link",
+    "dangling_tasks_dir_link",
+])
 def test_partly_unreadable_roster_or_task_store_keeps_mail_queued_through_expire_stale_apply(
     plane, tasks, monkeypatch, tmp_path, capsys, doubt,
 ):
@@ -345,11 +349,12 @@ def test_partly_unreadable_roster_or_task_store_keeps_mail_queued_through_expire
     roster.write_text(yaml.safe_dump(data), encoding="utf-8")
     monkeypatch.setattr(agent_identity, "ASSIGNMENTS_PATH", roster)
     worker = tasks("cto-7-i7-worker", "running")
-    victim = "codex-doubt-probe" if doubt == "malformed_area" else worker
+    victim = {"malformed_area": "codex-doubt-probe", "unknown_roster_key": "eggbot"}.get(doubt, worker)
     with AuthorityService(root=plane) as service:
         service.publish_message(sender="claude-cto", body="b", recipients=(victim,))
     tasks_dir = tmp_path / "tasks"
     hot = tasks_dir / f"{worker}.json"
+    moved = tmp_path / "tasks-moved"
     try:
         if doubt == "malformed_area":
             tasks(victim, "done")  # a settled task may share the slot's name
@@ -358,9 +363,16 @@ def test_partly_unreadable_roster_or_task_store_keeps_mail_queued_through_expire
             assert authority._roster_complete() is False
             with AuthorityService(root=plane) as service:
                 service.publish_message(sender="claude-cto", body="b", recipients=(victim,))  # admitted
+        elif doubt == "unknown_roster_key":
+            data["external_recipient"] = data.pop("external_recipients")  # a misspelt key the contract refuses
+            roster.write_text(yaml.safe_dump(data), encoding="utf-8")
+            assert authority._roster_complete() is False
         else:
             if doubt == "task_store_unreadable":
                 tasks_dir.chmod(0o600)  # no search permission: every record stat fails with EACCES
+            elif doubt == "dangling_tasks_dir_link":
+                tasks_dir.rename(moved)
+                tasks_dir.symlink_to(tmp_path / "unmounted")
             else:
                 # An older terminal copy in the archive must not answer for an unusable hot entry.
                 archived = json.loads(hot.read_text()) | {"status": "done"}
@@ -373,6 +385,9 @@ def test_partly_unreadable_roster_or_task_store_keeps_mail_queued_through_expire
             assert authority._task_standing(worker) == "unknown"
         applied = run(capsys, "deliveries", "expire-stale", "--root", str(plane), "--apply")
     finally:
+        if moved.exists():
+            tasks_dir.unlink()
+            moved.rename(tasks_dir)
         tasks_dir.chmod(0o700)
     assert applied["unreadable_expired"]["deliveries"] == 0
     with AuthorityService(root=plane) as service:
