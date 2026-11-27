@@ -155,7 +155,8 @@ Pull a fresh routing snapshot, then resolve:
   LU_PYTHON="${LU_PYTHON:-${LEARN_UKRAINIAN_PYTHON:?neither LU_PYTHON nor LEARN_UKRAINIAN_PYTHON is set}}" || exit "$?"
   SNAPSHOT_FILE="$(mktemp)" || exit "$?"
   trap 'rm -f -- "$SNAPSHOT_FILE"' EXIT
-  curl -fsS 'http://localhost:8765/api/state/routing-budget?fresh_codexbar=true' \
+  SNAPSHOT_RAW="$(curl -fsS 'http://localhost:8765/api/state/routing-budget?fresh_codexbar=true')" || exit "$?"
+  printf '%s' "$SNAPSHOT_RAW" \
     | "$LU_PYTHON" -I -c 'import json,sys; d=json.load(sys.stdin); print(json.dumps(d.get("lane_health", d)))' \
     > "$SNAPSHOT_FILE" || exit "$?"
 
