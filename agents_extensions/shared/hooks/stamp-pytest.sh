@@ -12,7 +12,7 @@ context_machinery_bootstrap "${LU_PRODUCT_ROOT:-${CLAUDE_PROJECT_DIR:-}}" || exi
 # The helper is the configured primary's (the validated shared-state anchor), never
 # the product checkout's: a worktree's tracked copy is the worker's to rewrite, and
 # this hook runs outside any provider sandbox. It stamps the payload's checkout.
-HELPER="$LEARN_UKRAINIAN_PRIMARY_REPO_ROOT/.githooks/pytest_stamp.py"
+HELPER="$LU_PRIMARY_REPO_ROOT/.githooks/pytest_stamp.py"
 [ -f "$HELPER" ] || exit 0
 
 exec "$CONTEXT_PROJECT_PYTHON" "$HELPER"

@@ -63,8 +63,9 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from lu_machinery import host_context
 from lu_machinery.common import json_depth
-from lu_machinery.common.repo_root import machinery_path, main_checkout_root, product_root
+from lu_machinery.common.repo_root import configured_interpreter, machinery_path, main_checkout_root, product_root
 from lu_machinery.common.scratch import ensure_scratch_root
 
 if TYPE_CHECKING:
@@ -217,8 +218,9 @@ def _tool_results_from_receipt(receipt: Path) -> Path:
 
 def launcher(spec, agy_argv: list[str]) -> list[str]:
     """The argv of every read-only AGY launch: this boundary, which runs ``agy_argv`` inside it."""
+    interpreter = configured_interpreter() or Path(sys.executable)
     argv = [
-        sys.executable, "-I", "-c", _BOOTSTRAP, str(machinery_path("dispatcher/agy_sandbox.py").parent.parent.parent),
+        str(interpreter), "-I", "-c", _BOOTSTRAP, str(machinery_path("dispatcher/agy_sandbox.py").parent.parent.parent),
         "--task-id", spec.task_id, "--worktree", str(spec.worktree), "--scratch", str(scratch(spec.task_id)),
         "--receipt", str(receipt_file(spec.final_file)), "--task-artifacts",
     ]
@@ -285,6 +287,11 @@ def _under_credential(path: Path, home: Path) -> bool:
     return False
 
 
+def _full_host_bindings() -> set[Path]:
+    configured = Path(os.environ.get(host_context.CONTEXT_ENV, str(host_context.DEFAULT_PATH)))
+    return {configured.resolve(), host_context.DEFAULT_PATH.resolve()}
+
+
 def _bind_one(index: int, raw: str, root: Path, home: Path) -> dict:
     candidate = Path(raw).expanduser()
     if not candidate.is_absolute():
@@ -310,6 +317,8 @@ def _bind_one(index: int, raw: str, root: Path, home: Path) -> dict:
             raise ValueError("agy_input_refused: not a readable regular file") from exc
         if resolved != candidate:
             raise ValueError("agy_input_refused: symlink")
+        if resolved in _full_host_bindings():
+            raise ValueError("agy_input_refused: host binding is private")
         if info.st_size > MAX_INPUT_BYTES:
             raise ValueError(f"agy_input_refused: larger than {MAX_INPUT_BYTES} bytes")
         if _under_credential(resolved, home):
@@ -1493,12 +1502,36 @@ class _Boundary:
                                     refused_networks=github_networks())
         env_keep = {name: os.environ[name] for name in ("PATH", "HOME", "LANG", "TMPDIR") if name in os.environ}
         self.relay = SourcesRelay(boundary / "sources.sock", frozenset(readers), env_keep)
+        host_file = Path(os.environ.get(host_context.CONTEXT_ENV, str(host_context.DEFAULT_PATH)))
+        hook_reads: list[Path] = []
+        if host_file.is_file():
+            # An editable test install and a wheel both need the release's two packages.
+            hook_reads = [
+                Path(__file__).resolve().parents[1],
+                machinery_path("agents_extensions/shared/hooks/guard-secret-print.py").parents[2],
+            ]
         sandbox = prepare_host_sandbox(
             engine="agy", snapshot_root=self.worktree, write_root=runtime, reject_root=repository,
-            runtime_reads=[*runtime_files(agy), *_venv_reads(), *node_reads, *reads,
+            runtime_reads=[*runtime_files(agy), *_venv_reads(), *hook_reads, *node_reads, *reads,
                            *(target for _, target in databases), *sidecars, shared, boundary],
             network_allowed=False,
         )
+        hook_env: dict[str, str] = {}
+        if sandbox.state_context is not None:
+            mounts = [*map(Path, sandbox.read_roots), runtime, *own]
+            if artifacts is not None:
+                mounts.append(artifacts)
+            if any(binding.is_file() and binding.is_relative_to(mount)
+                   for binding in _full_host_bindings() for mount in mounts):
+                raise Refused("agy_host_binding_would_be_visible_in_sandbox")
+            configured_python = configured_interpreter()
+            if configured_python != Path(sys.executable):
+                raise Refused("agy_hook_interpreter_binding_mismatch")
+            hook_env = {
+                "LU_PYTHON": str(configured_python),
+                "LEARN_UKRAINIAN_PYTHON": str(configured_python),
+                "LU_PRODUCT_ROOT": str(product_root()),
+            }
         self.receipt["bwrap"] = str(sandbox.binary)
         report_read, report_write = os.pipe()
         go_read, go_write = os.pipe()
@@ -1545,6 +1578,7 @@ class _Boundary:
             sandbox_path.append(str(node_bin))
         sandbox_path.extend(["/usr/bin", "/bin", str(agy.parent)])
         env = {
+            **hook_env,
             "HOME": str(home), "TMPDIR": str(tmp), "PATH": os.pathsep.join(dict.fromkeys(sandbox_path)),
             "LANG": os.environ.get("LANG", "C.UTF-8"), "USER": "review", "LOGNAME": "review", "SHELL": "/bin/bash",
             "LU_TASKS_DIR": str(tasks),

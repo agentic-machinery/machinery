@@ -16,6 +16,28 @@ from lu_machinery.agent_runtime import agy_hook_config as config
 from lu_machinery.agent_runtime.adapters import claude
 from tests.agent_runtime.product_roots import agent_runtime_roots as agent_runtime_roots
 from tests.helpers.product_tree import configured_roots as configured_roots
+from tests.host_context.conftest import host_layout as host_layout
+
+
+@pytest.fixture(autouse=True)
+def bind_registration_runtime(host_layout, monkeypatch):
+    """Registration tests render a fixture runtime, independent of launcher test roots."""
+    monkeypatch.setattr(config, "hook_interpreter", lambda: host_layout.python)
+
+
+
+@pytest.fixture
+def valid_hook_context(host_layout, monkeypatch):
+    def validate(directory):
+        result = subprocess.run(
+            [str(host_layout.python), "-I", "-B", "-m", "lu_machinery.host_context", "shell",
+             "--directory", str(directory)],
+            env=host_layout.env, check=False, capture_output=True, text=True, timeout=30,
+        )
+        if result.returncode:
+            raise ValueError(result.stderr)
+
+    monkeypatch.setattr(config, "configure_native_hook_roots", validate)
 
 
 def test_product_tree_cannot_supply_fleet_guard_executables(tmp_path, monkeypatch):
@@ -268,6 +290,7 @@ def test_invalid_candidate_cannot_hide_behind_valid_peer(tmp_path, candidate, fa
 
 
 @pytest.mark.usefixtures('configured_roots')
+@pytest.mark.usefixtures('valid_hook_context')
 def test_worker_provisions_absent_workspace_without_home_file(tmp_path):
     cwd = dispatch_tree(tmp_path)
     home = tmp_path / "home"
@@ -279,6 +302,7 @@ def test_worker_provisions_absent_workspace_without_home_file(tmp_path):
 @pytest.mark.usefixtures('configured_roots')
 @pytest.mark.parametrize("candidate", ["workspace", "home"])
 @pytest.mark.parametrize("duplicate", ["guard", "enabled", "command"])
+@pytest.mark.usefixtures('valid_hook_context')
 def test_duplicate_members_cannot_hide_disabled_or_wrong_guard(tmp_path, candidate, duplicate):
     paths = config.hook_locations(tmp_path / "cwd", tmp_path / "home")
     for path in paths:
@@ -358,15 +382,15 @@ def test_scratch_provision_refuses_traversal_without_writing(tmp_path):
 
 
 @pytest.mark.usefixtures('configured_roots')
-def test_empty_worktree_installs_primary_interpreter(tmp_path):
+def test_empty_worktree_installs_bound_interpreter(tmp_path, host_layout):
     cwd = dispatch_tree(tmp_path)
     assert not (cwd / ".agents").exists()
     config.install_worktree_guard(cwd)
     path = cwd / ".agents/hooks.json"
-    args = shlex.split(json.loads(path.read_text())[config.GUARD_NAME]["PreToolUse"][0]["hooks"][0]["command"])
-    assert args[0] == "/bin/bash"
-    assert args[-1] == "agy-secret-print"
-    assert json.loads(path.read_text())[config.GUARD_NAME]["PreToolUse"][0]["hooks"][0]["command"] == config.native_hook_command("agy-secret-print")
+    command = json.loads(path.read_text())[config.GUARD_NAME]["PreToolUse"][0]["hooks"][0]["command"]
+    assert command.startswith(f"(exec {shlex.quote(str(host_layout.python))} -I -B -m "
+                              "lu_machinery.agent_runtime.agy_hook_config --run-hook agy-secret-print)")
+    assert "hook_exec_failed" in command
     assert config.check_hook_config((path,)).passed
 
 
@@ -492,6 +516,7 @@ def test_install_atomic_publication_preserves_unrelated_bytes(tmp_path, monkeypa
 
 
 @pytest.mark.usefixtures('configured_roots')
+@pytest.mark.usefixtures('valid_hook_context')
 def test_gate_and_cli(tmp_path, capsys):
     (tmp_path / "cwd").mkdir()
     paths = config.hook_locations(tmp_path / "cwd", tmp_path / "home")
@@ -508,6 +533,7 @@ def test_gate_and_cli(tmp_path, capsys):
 
 
 @pytest.mark.usefixtures('configured_roots')
+@pytest.mark.usefixtures('valid_hook_context')
 def test_scoped_home_must_be_absolute(tmp_path):
     with pytest.raises(config.AgyHookConfigError, match="relative_scoped_home"):
         config.require_hook_config(tmp_path, tmp_path / "home", Path("relative-home"))

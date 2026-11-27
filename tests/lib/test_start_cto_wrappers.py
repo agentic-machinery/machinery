@@ -23,8 +23,9 @@ from tests.epics_monitor_stub import epics_monitor_stub as epics_monitor_stub
 from tests.epics_monitor_stub import isolated_monitor_state as isolated_monitor_state
 from tests.helpers import current_sol
 from tests.helpers.product_tree import configured_roots as configured_roots
-from tests.host_context.conftest import host_layout as host_layout
-from tests.launcher_sandbox import copy_launcher_sources, launcher_environment
+from tests.host_context.conftest import HostLayout, build_host_layout
+from tests.host_context.conftest import git as fixture_git
+from tests.launcher_sandbox import bind_launcher_environment, copy_launcher_sources, launcher_environment
 from tests.lib.test_claude_cap_guard import launch_with_usage as _usage_fixture
 from tests.lib.test_launcher_contract import REPO as REPO
 from tests.lib.test_launcher_contract import _core_canary_failure_fixture as _core_canary_failure_fixture
@@ -533,7 +534,7 @@ session_supervisor_exec_successor
 """
     scratch_root = tmp_path / "runtime scratch"
     for capture_tmpdir in (None, tmp_path / "ambient temp"):
-        launcher_env = launcher_environment()
+        launcher_env = bind_launcher_environment(root, launcher_environment())
         launcher_env["LU_SCRATCH_ROOT"] = str(scratch_root)
         if capture_tmpdir is None:
             launcher_env.pop("TMPDIR", None)
@@ -955,12 +956,25 @@ def _render_workspace_template(path: Path, **values: str) -> Path:
 
 def _workspace_roots(tmp_path: Path) -> tuple[Path, Path, Path]:
     """A non-Git workspace, a non-Git state root and a real primary checkout, all outside each other."""
-    workspace, state, primary = tmp_path / "cto-workspace", tmp_path / "workspace-state", tmp_path / "primary"
+    workspace, state, primary = tmp_path / "cto-workspace", tmp_path / "state", tmp_path / "primary"
     workspace.mkdir()
-    state.mkdir()
+    state.mkdir(mode=0o700)
     subprocess.run(["git", "init", "-q", "-b", "main", str(primary)], check=True, timeout=30,
                    env={"PATH": os.defpath, "HOME": str(tmp_path), "GIT_CONFIG_NOSYSTEM": "1"})
     return workspace, state, primary
+
+
+def _workspace_binding(tmp_path: Path, state: Path, primary: Path, env: dict[str, str]) -> HostLayout:
+    fixture_git(primary, "remote", "add", "origin", "https://github.com/agentic-machinery/machinery.git")
+    layout = build_host_layout(tmp_path / "host-binding")
+    layout.data["state_root"] = str(state)
+    layout.data["repos"]["machinery"] = str(primary)
+    layout.data["monitor_url"] = env["LU_MONITOR_LOOPBACK"]
+    layout.write()
+    for key in ("FLEET_COMMS_ROOT", "LU_TASKS_DIR", "LU_GITHUB_CACHE_DIR"):
+        env.pop(key, None)
+    env.update(layout.env, LU_PYTHON=str(layout.python))
+    return layout
 
 
 def test_cto_workspace_launch_supervisor_and_driver_state_from_a_non_git_directory(tmp_path: Path) -> None:
@@ -976,8 +990,9 @@ def test_cto_workspace_launch_supervisor_and_driver_state_from_a_non_git_directo
     base = launcher_environment(tmp_path=tmp_path)
     for name in ("LU_PRODUCT_ROOT", "LEARN_UKRAINIAN_PRIMARY_REPO_ROOT", "LEARN_UKRAINIAN_STATE_ROOT", "LU_PYTHON"):
         base.pop(name, None)
+    layout = _workspace_binding(tmp_path, state, primary, base)
     env = {**base, "LC_WORKSPACE_ROOT": str(workspace), "LU_PRIMARY_REPO_ROOT": str(primary),
-           "LU_STATE_ROOT": str(state), "LEARN_UKRAINIAN_PYTHON": sys.executable, "LAUNCHER_DRY_RUN": "1",
+           "LU_STATE_ROOT": str(state), "LAUNCHER_DRY_RUN": "1",
            "LAUNCHER_DRY_RUN_ARGV_FILE": str(argv_file), "LU_CLAUDE_CAP_OVERRIDE": "1"}
 
     def launch(entry: Path = wrapper, cwd: Path = workspace, args: tuple[str, ...] = ("--epic", "epics", "kick"),
@@ -993,7 +1008,7 @@ def test_cto_workspace_launch_supervisor_and_driver_state_from_a_non_git_directo
     argv = argv_file.read_bytes().split(b"\0")[:-1]
     assert argv[0] == b"claude" and argv[argv.index(b"--agent") + 1] == b"cto"
     assert f"would verify agent extensions (workspace {workspace})" in result.stdout
-    assert f"LEARN_UKRAINIAN_PRIMARY_REPO_ROOT={primary}" in result.stdout
+    assert f"workspace {workspace}" in result.stdout
     assert "would bind cto after lease" in result.stdout
     assert not list(workspace.iterdir()) and not list(state.iterdir())
 
@@ -1017,17 +1032,17 @@ def test_cto_workspace_launch_supervisor_and_driver_state_from_a_non_git_directo
     second_nested_link.symlink_to(second_nested, target_is_directory=True)
     for state_root in (workspace, tmp_path / "absent-state", stray, second, second_nested, primary_nested, second_nested_link):
         refused = launch(LU_STATE_ROOT=str(state_root))
-        assert refused.returncode == 3 and "state root does not validate" in refused.stderr, (state_root, refused.stderr)
+        assert refused.returncode == 3 and "[legacy_conflict] LU_STATE_ROOT" in refused.stderr, (state_root, refused.stderr)
     refused = launch(args=("--epic", "infra"))
     assert refused.returncode == 2 and "fixes the lane 'epics'" in refused.stderr, refused.stderr
     for changes, cwd, message in (
-        ({"LU_PRIMARY_REPO_ROOT": None}, workspace, "needs LU_PRIMARY_REPO_ROOT"),
+        ({"LU_PYTHON": None}, workspace, "[missing_interpreter_binding]"),
         ({}, state, "LC_WORKSPACE_ROOT_CWD"),
         ({"LC_WORKSPACE_ROOT": str(nested)}, nested, "outside every Git checkout"),
-        ({"LC_WORKSPACE_ROOT": str(unsafe_name)}, unsafe_name, "control/format characters in path"),
-        ({"LEARN_UKRAINIAN_STATE_ROOT": str(state)}, workspace, "not LEARN_UKRAINIAN_STATE_ROOT"),
-        ({"LU_PRODUCT_ROOT": str(workspace)}, workspace, "cannot be the CTO workspace"),
-        ({"LU_PRIMARY_REPO_ROOT": str(primary_alias)}, workspace, "by its physical path"),
+        ({"LC_WORKSPACE_ROOT": str(unsafe_name)}, unsafe_name, "[invalid_invocation_git]"),
+        ({"LEARN_UKRAINIAN_STATE_ROOT": str(workspace)}, workspace, "[legacy_conflict] LEARN_UKRAINIAN_STATE_ROOT"),
+        ({"LU_PRODUCT_ROOT": str(workspace)}, workspace, "[legacy_conflict] LU_PRODUCT_ROOT"),
+        ({"LU_PRIMARY_REPO_ROOT": str(primary_alias)}, workspace, "[legacy_conflict] LU_PRIMARY_REPO_ROOT"),
         ({"LC_WORKSPACE_ROOT": None}, workspace, "LC_WORKSPACE_ROOT_REQUIRED"),
     ):
         refused = launch(cwd=cwd, **changes)
@@ -1039,7 +1054,7 @@ def test_cto_workspace_launch_supervisor_and_driver_state_from_a_non_git_directo
     assert refused.returncode == 3 and "absolute physical path" in refused.stderr, refused.stderr
 
     # Supervisor start: the capsule lands under the state root, the lease receipt in the workspace.
-    project, _capture = _build_fake_project(tmp_path)
+    project, _capture = _build_fake_project(tmp_path, state=state)
     claim = subprocess.run(
         ["bash", "-c", 'set -euo pipefail; source "$1/lu_machinery/lib/session_supervisor.sh"; '
          'claim_session_supervisor_env epic:10453 claude claude-code cto-task claude-1 "$2" start-claude-cto.sh epics; '
@@ -1055,18 +1070,18 @@ def test_cto_workspace_launch_supervisor_and_driver_state_from_a_non_git_directo
 
     # Driver state: the pinned pointer in the workspace is injected for this project directory.
     hook_env = {**base, "CLAUDE_PROJECT_DIR": str(workspace), "LU_STATE_ROOT": str(state),
-                "LEARN_UKRAINIAN_PRIMARY_REPO_ROOT": str(primary), "SESSION_EPIC": "epics",
+                "SESSION_EPIC": "epics",
                 "SESSION_HANDOFF_AGENT": "claude-epics",
                 "LU_DRIVER_STATE_FILE": str(workspace / ".claude/epics-epic/DRIVER-STATE.md")}
     for command, stdin in ((["init", "--epic", "epics"], ""), (["claude-hook"], json.dumps(
             {"hook_event_name": "UserPromptSubmit", "session_id": "s", "cwd": str(workspace)}))):
-        ran = subprocess.run([sys.executable, "-I", "-m", "lu_machinery.driver_state", *command], cwd=workspace,
+        ran = subprocess.run([str(layout.python), "-I", "-m", "lu_machinery.driver_state", *command], cwd=workspace,
                              input=stdin, env=hook_env, capture_output=True, text=True, check=False, timeout=60)
         assert ran.returncode == 0, ran.stdout + ran.stderr
     assert "PINNED DRIVER STATE" in json.loads(ran.stdout)["hookSpecificOutput"]["additionalContext"]
 
 
-def test_cto_launch_refuses_drift(tmp_path: Path, host_layout) -> None:
+def test_cto_launch_refuses_drift(tmp_path: Path) -> None:
     """The installed-layout CLI must reach Claude on a clean explicit deploy and refuse persistent drift."""
     workspace, state, primary = _workspace_roots(tmp_path)
     installed = tmp_path / "installed"
@@ -1078,18 +1093,8 @@ def test_cto_launch_refuses_drift(tmp_path: Path, host_layout) -> None:
     fake_claude.chmod(0o755)
     env = launcher_environment(scope, tmp_path=tmp_path, LC_WORKSPACE_ROOT=str(workspace),
                                LU_PRIMARY_REPO_ROOT=str(primary), LU_STATE_ROOT=str(state),
-                               LEARN_UKRAINIAN_PYTHON=sys.executable, LC_DRIVER_LEASE_ENABLED="0",
-                               LU_CLAUDE_CAP_OVERRIDE="1")
-    state.chmod(0o700)
-    host_layout.data["state_root"] = str(state)
-    host_layout.data["repos"] = {"machinery": str(primary)}
-    host_layout.data["products"]["public"]["repo"] = "machinery"
-    host_layout.data["runtime"]["python"] = sys.executable
-    host_layout.data["monitor_url"] = env["LU_MONITOR_LOOPBACK"]
-    host_layout.write()
-    env.update(host_layout.env)
-    for name in ("FLEET_COMMS_ROOT", "LU_TASKS_DIR", "LU_GITHUB_CACHE_DIR"):
-        env.pop(name, None)
+                               LC_DRIVER_LEASE_ENABLED="0", LU_CLAUDE_CAP_OVERRIDE="1")
+    layout = _workspace_binding(tmp_path, state, primary, env)
     inventory = json.loads(machinery_path("agent_deploy/release.v1.json").read_text())
     hooks: dict = {}
     for requirement in inventory["required_hooks"]["claude"][".claude/settings.json"]:
@@ -1109,7 +1114,7 @@ def test_cto_launch_refuses_drift(tmp_path: Path, host_layout) -> None:
     result = launch()
     assert result.returncode == 1 and "missing workspace digest record" in result.stderr, result.stderr
     assert not (workspace / ".claude").exists()
-    subprocess.run([sys.executable, "-I", "-m", "lu_machinery.agent_deploy", "--workspace",
+    subprocess.run([str(layout.python), "-I", "-m", "lu_machinery.agent_deploy", "--workspace",
                     "--project-root", str(workspace)], cwd=workspace, env=env, check=True, capture_output=True, timeout=60)
     result = launch()
     assert result.returncode == 0, result.stdout + result.stderr

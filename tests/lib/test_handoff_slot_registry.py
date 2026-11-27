@@ -21,12 +21,12 @@ import yaml
 
 from lu_machinery import agent_identity
 from lu_machinery.agent_runtime.lane_probe import resolve_handoff_agent
-from lu_machinery.common.repo_root import PRODUCT_ROOT_ENV, machinery_path
+from lu_machinery.common.repo_root import machinery_path
 from lu_machinery.orchestration import handoff_slot_registry as registry
 from lu_machinery.orchestration.slot_routing import resolve_slot_holder
 from lu_machinery.session_streams.inventory import stream_anchor_id, stream_map
 from tests.helpers.product_tree import configured_roots as configured_roots
-from tests.launcher_sandbox import launcher_environment
+from tests.launcher_sandbox import bind_launcher_environment, launcher_environment
 from tests.rules_core_view import launch_checkout
 
 REPO = Path(__file__).resolve().parents[2]
@@ -182,7 +182,7 @@ def _launcher(
     return subprocess.run(
         [str(root / "start-claude-driver.sh"), *args],
         cwd=root,
-        env=launch_env,
+        env=bind_launcher_environment(root, launch_env, overrides=env),
         capture_output=True,
         text=True,
         timeout=60,
@@ -360,7 +360,7 @@ def test_kube_dojo_wrapper_dry_run_binds_its_claude_lane(launch_root: Path) -> N
     result = subprocess.run(
         [str(launch_root / MACHINERY.name / "start-kube-dojo-driver.sh")],
         cwd=launch_root,
-        env={**launcher_environment(), "LAUNCHER_DRY_RUN": "1", "LU_PRODUCT_ROOT": str(launch_root)},
+        env=bind_launcher_environment(launch_root, launcher_environment(LAUNCHER_DRY_RUN="1")),
         capture_output=True,
         text=True,
         timeout=60,
@@ -391,7 +391,7 @@ def test_practice_launcher_dry_run_uses_the_dedicated_stream(provider: str, laun
     result = subprocess.run(
         [str(launch_root / f"start-{provider}-driver.sh"), "--epic", "practice"],
         cwd=launch_root,
-        env={**launcher_environment(), "LAUNCHER_DRY_RUN": "1"},
+        env=bind_launcher_environment(launch_root, launcher_environment(LAUNCHER_DRY_RUN="1")),
         capture_output=True,
         text=True,
         timeout=60,
@@ -496,7 +496,7 @@ def test_curriculum_upgrade_is_accepted_on_the_core_slot(
     provider: str, curriculum_upgrade_stream: str, launch_root: Path
 ) -> None:
     """curriculum-upgrade mints <provider>-core and its registry anchor stream, and keeps its handoff directory."""
-    launch_env = launcher_environment({PRODUCT_ROOT_ENV: str(launch_root)}, LAUNCHER_DRY_RUN="1")
+    launch_env = bind_launcher_environment(launch_root, launcher_environment(LAUNCHER_DRY_RUN="1"))
     lanes, gate = _gate_matrix()
     assert lanes["curriculum-upgrade"] == "core"
     if provider == "muse":
@@ -602,7 +602,7 @@ def test_kube_dojo_wrapper_refuses_a_caller_lane(caller_epic: tuple[str, ...], l
     result = subprocess.run(
         [str(launch_root / MACHINERY.name / "start-kube-dojo-driver.sh"), *caller_epic],
         cwd=launch_root,
-        env={**launcher_environment(), "LAUNCHER_DRY_RUN": "1", "LU_PRODUCT_ROOT": str(launch_root)},
+        env=bind_launcher_environment(launch_root, launcher_environment(LAUNCHER_DRY_RUN="1")),
         capture_output=True,
         text=True,
         timeout=60,

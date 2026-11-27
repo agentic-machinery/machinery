@@ -31,11 +31,11 @@ INBOX_PYTHON="$CONTEXT_PROJECT_PYTHON"
 
 # This command reads only Fleet delivery counts and IDs. It never creates a
 # database, claims mail or reads a message body. A missing store is unknown.
-INBOX_OUTPUT=$(cd "$LEARN_UKRAINIAN_PRIMARY_REPO_ROOT" && "$INBOX_PYTHON" -I -m lu_machinery.fleet_comms deliveries pending --recipient "$RECIPIENT")
+INBOX_OUTPUT=$(cd "$LU_PRIMARY_REPO_ROOT" && "$INBOX_PYTHON" -I -m lu_machinery.fleet_comms deliveries pending --recipient "$RECIPIENT")
 INBOX_STATUS=$?
 if [ "$INBOX_STATUS" -ne 0 ] || ! printf '%s' "$INBOX_OUTPUT" | jq -e '.probe == "ok" and (.count | type == "number")' >/dev/null 2>&1; then
   CONTEXT="${RECIPIENT_LABEL} INBOX: unknown. Fleet delivery state could not be read.
-cd $(printf '%q' "$LEARN_UKRAINIAN_PRIMARY_REPO_ROOT") && $(printf '%q' "$INBOX_PYTHON") -I -m lu_machinery.fleet_comms deliveries receive --recipient $(printf '%q' "$RECIPIENT") --worker-id $(printf '%q' "$RECIPIENT")"
+cd $(printf '%q' "$LU_PRIMARY_REPO_ROOT") && $(printf '%q' "$INBOX_PYTHON") -I -m lu_machinery.fleet_comms deliveries receive --recipient $(printf '%q' "$RECIPIENT") --worker-id $(printf '%q' "$RECIPIENT")"
   jq -n --arg msg "$CONTEXT" \
     '{"hookSpecificOutput":{"hookEventName":"UserPromptSubmit","additionalContext":$msg}}'
   exit 0
@@ -79,7 +79,7 @@ CONTEXT="${RECIPIENT_LABEL} INBOX: ${COUNT} unread message(s) waiting.
 Message IDs:
 ${PENDING_IDS}
 ---
-cd $(printf '%q' "$LEARN_UKRAINIAN_PRIMARY_REPO_ROOT") && $(printf '%q' "$INBOX_PYTHON") -I -m lu_machinery.fleet_comms deliveries receive --recipient $(printf '%q' "$RECIPIENT") --worker-id $(printf '%q' "$RECIPIENT")"
+cd $(printf '%q' "$LU_PRIMARY_REPO_ROOT") && $(printf '%q' "$INBOX_PYTHON") -I -m lu_machinery.fleet_comms deliveries receive --recipient $(printf '%q' "$RECIPIENT") --worker-id $(printf '%q' "$RECIPIENT")"
 
 jq -n --arg msg "$CONTEXT" \
   '{"hookSpecificOutput":{"hookEventName":"UserPromptSubmit","additionalContext":$msg}}'

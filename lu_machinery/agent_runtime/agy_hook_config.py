@@ -9,6 +9,7 @@ import os
 import re
 import runpy
 import shlex
+import subprocess
 import sys
 import uuid
 from contextlib import suppress
@@ -19,14 +20,18 @@ from pathlib import Path
 from lu_machinery.common import json_depth
 from lu_machinery.common.repo_root import (
     configure_native_hook_roots,
+    configured_interpreter,
     machinery_path,
     main_checkout_root,
 )
 from lu_machinery.common.safe_open import safe_open_below
 from lu_machinery.host_context import (
     HostContextError,
+    SandboxStateContext,
     hook_environment,
+    hook_interpreter,
     load_hook_context,
+    load_host_context,
 )
 
 GUARD_NAME = "shell-secret-print-guard"
@@ -47,6 +52,12 @@ CLAUDE_GUARD_MODES = (
     "claude-guard-primary-checkout-write",
     "claude-guard-public-github-text",
 )
+_CODEX_SHELL_HOOKS = {
+    "codex-session-setup": "session-setup.sh",
+    "codex-post-compact": "post-compact.sh",
+    "codex-goal-driver-stop": "goal-driver-stop.sh",
+    "codex-release-thread-lease": "release-thread-lease.sh",
+}
 # Every mode a product hook manifest may name, across the standard, audit and guard tails.
 NATIVE_HOOK_MODES = (
     GUARD_MODE,
@@ -62,113 +73,19 @@ NATIVE_HOOK_MODES = (
     "codex-post-tool-use",
     "codex-user-prompt-submit",
     *CLAUDE_GUARD_MODES,
-)
-# $0 of the generated command, so the contract version shows in process listings.
-NATIVE_HOOK_NAME = "lu-machinery-hook-v1"
-_RESOLVERS_FILE = "lib/project_interpreter.sh"
-_RESOLVERS_BEGIN = "# LU_HOOK_RESOLVERS_BEGIN"
-_RESOLVERS_END = "# LU_HOOK_RESOLVERS_END"
-# Runs after the resolver block, with the mode as $1. A bootstrap failure answers
-# in the mode's native shape: AGY Stop continues, other AGY entries deny, Claude
-# Stop blocks, Claude SessionStart/UserPromptSubmit stops, Codex exits 2. Once
-# the context resolves, the installed entry replaces this shell, so its own
-# output and exit status are the hook's.
-_HOOK_TAIL = r"""_lu_hook_fail() {
-    cat >/dev/null 2>&1
-    printf '%s %s\n' 'HOOK-BOOTSTRAP-FAILED: product root, shared state, interpreter or machinery unavailable.' "${2:-machinery}" >&2
-    case "$1" in
-        agy-stop-hook) printf '%s\n' '{"decision":"continue","reason":"HOOK-BOOTSTRAP-FAILED: hook context unavailable."}' ;;
-        agy-*) printf '%s\n' '{"decision":"deny","reason":"HOOK-BOOTSTRAP-FAILED: hook context unavailable."}' ;;
-        claude-stop-hook) printf '%s\n' '{"decision":"block","reason":"HOOK-BOOTSTRAP-FAILED: hook context unavailable."}' ;;
-        claude-hook) printf '%s\n' '{"continue":false,"stopReason":"HOOK-BOOTSTRAP-FAILED: hook context unavailable."}' ;;
-        *) exit 2 ;;
-    esac
-    exit 0
-}
-_lu_hook_mode="$1"
-project_hook_context_resolve 2>/dev/null || _lu_hook_fail "$_lu_hook_mode" "${PROJECT_HOOK_BOOTSTRAP_STEP:-machinery}"
-case "$_lu_hook_mode" in
-    agy-primary-write)
-        _lu_hook_guard="$("$LEARN_UKRAINIAN_PYTHON" -I -c 'from lu_machinery.common.repo_root import machinery_path
-print(machinery_path("agents_extensions/shared/hooks/guard-primary-checkout-write.py"))' </dev/null 2>/dev/null)" || _lu_hook_fail "$_lu_hook_mode"
-        "$LEARN_UKRAINIAN_PYTHON" -I "$_lu_hook_guard" || _lu_hook_fail "$_lu_hook_mode"
-        exit 0 ;;
-    agy-secret-print)
-        "$LEARN_UKRAINIAN_PYTHON" -I -m lu_machinery.agent_runtime.secret_print_hook --harness agy \
-            || _lu_hook_fail "$_lu_hook_mode"
-        exit 0 ;;
-    agy-pending-orders) _lu_hook_entry=agy_hooks/pending_orders_inject.sh; set -- ;;
-    agy-hook|agy-stop-hook|agy-pretool-hook|claude-hook|claude-stop-hook)
-        _lu_hook_entry=agy_hooks/driver_state_inject.sh; set -- "$_lu_hook_mode" ;;
-    codex-pre-tool-use|codex-post-tool-use|codex-user-prompt-submit)
-        _lu_hook_entry=agent_runtime/codex_hook_entry.sh; set -- "${_lu_hook_mode#codex-}" ;;
-    *) _lu_hook_fail "$_lu_hook_mode" ;;
-esac
-_lu_hook_entry="$("$LEARN_UKRAINIAN_PYTHON" -I -c 'import sys
-from lu_machinery.common.repo_root import machinery_path
-print(machinery_path(sys.argv[1]))' "$_lu_hook_entry" </dev/null 2>/dev/null)" || _lu_hook_fail "$_lu_hook_mode"
-[ -f "$_lu_hook_entry" ] || _lu_hook_fail "$_lu_hook_mode"
-shopt -s execfail
-exec /bin/bash "$_lu_hook_entry" "$@"
-_lu_hook_fail "$_lu_hook_mode"
-"""
-
-# The existing Claude audit mode preserves its policy exit status. Standard
-# modes retain their command bytes when a mode is added.
-_AUDIT_HOOK_TAIL = r"""project_hook_context_resolve 2>/dev/null || {
-    cat >/dev/null 2>&1
-    printf '%s %s\n' 'HOOK-BOOTSTRAP-FAILED: product root, shared state, interpreter or machinery unavailable.' "${PROJECT_HOOK_BOOTSTRAP_STEP:-machinery}" >&2
-    exit 2
-}
-exec "$LEARN_UKRAINIAN_PYTHON" -I -m agents_extensions.shared.hooks.audit-primary-checkout-dirt
-"""
-
-# Claude's guard delegators, in their own tail so the other modes keep their bytes.
-# Each runs the installed guard module under the interpreter the shell rule
-# resolves (never one found on PATH) and keeps the guard's own output and exit
-# status. An unknown mode, a bootstrap failure, an interpreter that cannot find
-# the installed guard module, or a failed exec exits 2, which Claude reads as a
-# refusal of the tool call.
-_GUARD_HOOK_TAIL = r"""case "$1" in
-    @MODES@) ;;
-    *) cat >/dev/null 2>&1
-       printf '%s\n' 'HOOK-BOOTSTRAP-FAILED: unknown guard mode.' >&2
-       exit 2 ;;
-esac
-project_hook_context_resolve 2>/dev/null || {
-    cat >/dev/null 2>&1
-    printf '%s %s\n' 'HOOK-BOOTSTRAP-FAILED: product root, shared state, interpreter or machinery unavailable.' "${PROJECT_HOOK_BOOTSTRAP_STEP:-machinery}" >&2
-    exit 2
-}
-_lu_hook_guard="agents_extensions.shared.hooks.${1#claude-}"
-"$LEARN_UKRAINIAN_PYTHON" -I -c 'import importlib.util, sys
-raise SystemExit(0 if importlib.util.find_spec(sys.argv[1]) is not None else 1)' "$_lu_hook_guard" </dev/null >/dev/null 2>&1 || {
-    cat >/dev/null 2>&1
-    printf '%s\n' 'HOOK-BOOTSTRAP-FAILED: the project interpreter cannot load the installed guard.' >&2
-    exit 2
-}
-shopt -s execfail
-exec "$LEARN_UKRAINIAN_PYTHON" -I -m "$_lu_hook_guard"
-printf '%s\n' 'HOOK-BOOTSTRAP-FAILED: guard interpreter did not start.' >&2
-exit 2
-""".replace("@MODES@", "|".join(CLAUDE_GUARD_MODES))
-
-
-_CLAUDE_NATIVE_MODES = (
-    "claude-hook",
-    "claude-stop-hook",
-    "claude-audit-hook",
-    *CLAUDE_GUARD_MODES,
+    *_CODEX_SHELL_HOOKS,
 )
 
 _HOOK_REFUSALS: dict[str, tuple[str, str | bool, str]] = {
+    "agy-stop-hook": ("decision", "continue", "reason"),
     "claude-stop-hook": ("decision", "block", "reason"),
     "claude-hook": ("continue", False, "stopReason"),
 }
 
 
 def _hook_refusal(mode: str, diagnostic: str) -> dict[str, str | bool] | None:
-    refusal = _HOOK_REFUSALS.get(mode)
+    default = ("decision", "deny", "reason") if mode.startswith("agy-") else None
+    refusal = _HOOK_REFUSALS.get(mode, default)
     if refusal is None:
         return None
     key, value, reason = refusal
@@ -185,46 +102,108 @@ def _refuse_hook(mode: str, code: str, message: str) -> int:
     return 0
 
 
+def _run_projected_secret_guard(context: SandboxStateContext) -> int:
+    """Check shell text in the read-only sandbox without accepting a checkout binding."""
+    from lu_machinery.agent_runtime.secret_print_hook import (
+        MAX_STDIN_BYTES,
+        emit_decision,
+        extract_command,
+        run_guard,
+    )
+
+    if not os.statvfs(context.path).f_flag & os.ST_RDONLY:
+        return _refuse_hook(GUARD_MODE, "writable_projection", "sandbox state binding must be mounted read-only")
+    if configured_interpreter() != Path(sys.executable):
+        return _refuse_hook(GUARD_MODE, "interpreter_binding_mismatch", "guard requires the configured interpreter")
+    product = os.environ.get("LU_PRODUCT_ROOT", "")
+    if not Path(product).is_absolute() or Path(product).as_posix() != product or ".." in Path(product).parts:
+        return _refuse_hook(GUARD_MODE, "invalid_product_binding", "guard requires the configured product path")
+    raw = sys.stdin.read(MAX_STDIN_BYTES + 1)
+    if len(raw.encode("utf-8")) > MAX_STDIN_BYTES:
+        return _refuse_hook(GUARD_MODE, "invalid_hook_event", "native hook event exceeds its size limit")
+    try:
+        command = extract_command("agy", json_depth.loads(raw, max_depth=512))
+    except ValueError:
+        return _refuse_hook(GUARD_MODE, "invalid_hook_event", "native hook event has no valid tool input")
+    # The guard analyses text. The OS boundary enforces write permissions.
+    allowed, message = (True, "") if command is None else run_guard(command, harness="agy")
+    return emit_decision("agy", allowed, message)
+
+
 def run_native_hook(mode: str) -> int:
-    """Validate the host binding before starting a registered Claude hook."""
-    if mode not in _CLAUDE_NATIVE_MODES:
+    """Validate the host binding before starting a registered hook."""
+    if mode not in NATIVE_HOOK_MODES:
         return _refuse_hook("", "unsupported_hook_mode", "hook mode is not registered")
     try:
+        if mode == GUARD_MODE:
+            state = load_host_context(role="state")
+            if isinstance(state, SandboxStateContext):
+                return _run_projected_secret_guard(state)
         context, _ = load_hook_context(Path.cwd())
     except HostContextError as exc:
         return _refuse_hook(mode, exc.code, str(exc))
     except OSError:
-        return _refuse_hook(mode, "invalid_invocation_git", "invocation directory is unavailable")
+        return _refuse_hook(mode, "invalid_invocation_git", "invocation directory or sandbox projection is unavailable")
+    except ValueError:
+        return _refuse_hook(mode, "invalid_hook_binding", "hook environment conflicts with the binding")
 
     env = {**os.environ, **hook_environment(context)}
+    python = os.fspath(context.runtime.python)
+    if mode in CLAUDE_GUARD_MODES:
+        argv = [python, "-I", "-m", f"agents_extensions.shared.hooks.{mode.removeprefix('claude-')}"]
+    elif mode == "claude-audit-hook":
+        argv = [python, "-I", "-m", "agents_extensions.shared.hooks.audit-primary-checkout-dirt"]
+    elif mode == "agy-primary-write":
+        argv = [python, "-I", os.fspath(machinery_path(PRIMARY_GUARD_ENTRY))]
+    elif mode == GUARD_MODE:
+        argv = [python, "-I", "-m", "lu_machinery.agent_runtime.secret_print_hook", "--harness", "agy"]
+    elif mode in _CODEX_SHELL_HOOKS:
+        argv = ["/bin/bash", os.fspath(machinery_path(f"agents_extensions/shared/hooks/{_CODEX_SHELL_HOOKS[mode]}"))]
+        if mode == "codex-post-compact":
+            env["CODEX_COMPACT_SESSION_START"] = "1"
+    elif mode.startswith("codex-"):
+        argv = ["/bin/bash", os.fspath(machinery_path("agent_runtime/codex_hook_entry.sh")), mode.removeprefix("codex-")]
+    elif mode == "agy-pending-orders":
+        argv = ["/bin/bash", os.fspath(machinery_path("agy_hooks/pending_orders_inject.sh"))]
+    else:
+        argv = ["/bin/bash", os.fspath(machinery_path("agy_hooks/driver_state_inject.sh")), mode]
     try:
-        if mode in CLAUDE_GUARD_MODES or mode == "claude-audit-hook":
-            entry = "audit-primary-checkout-dirt" if mode == "claude-audit-hook" else mode.removeprefix("claude-")
-            module = f"agents_extensions.shared.hooks.{entry}"
-            if importlib.util.find_spec(module) is None:
-                return _refuse_hook(mode, "hook_unavailable", "installed hook module is missing")
-            # The native entry is already running under the validated isolated
-            # interpreter. Run the release-owned module in the same process.
-            os.environ.update(hook_environment(context))
-            sys.argv[:] = [module]
-            runpy.run_module(module, run_name="__main__", alter_sys=True)
+        if argv[0] == python and argv[2] == "-m" and importlib.util.find_spec(argv[3]) is None:
+            return _refuse_hook(mode, "hook_unavailable", "installed hook module is missing")
+        if mode in {GUARD_MODE, "agy-primary-write"}:
+            result = subprocess.run(argv, env=env, check=False)  # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit
+            if result.returncode:
+                return _refuse_hook(mode, "hook_exec_failed", "installed guard could not complete")
             return 0
-        else:
-            script = machinery_path("agy_hooks/driver_state_inject.sh")
-            if not script.is_file():
-                return _refuse_hook(mode, "hook_unavailable", "installed hook script is missing")
-            os.execve("/bin/bash", ["/bin/bash", os.fspath(script), mode, "--host-context"], env)
+        if argv[0] == python:
+            # The native entry already runs under the validated isolated interpreter.
+            os.environ.update(hook_environment(context))
+            sys.argv[:] = [argv[3]]
+            runpy.run_module(argv[3], run_name="__main__", alter_sys=True)
+            return 0
+        if not Path(argv[1]).is_file():
+            return _refuse_hook(mode, "hook_unavailable", "installed hook script is missing")
+        os.execve("/bin/bash", argv, env)
     except (ImportError, OSError):
         return _refuse_hook(mode, "hook_exec_failed", "installed hook could not be started")
 
 
 NATIVE_HOOK_DECLARATION = "lu-machinery-hook-v2"
 # Fingerprints of the published commands let product sources migrate at deploy
-# time without changing AGY and Codex registrations during the rollout.
+# time. The old executable shell body is never rendered or run.
 _LEGACY_HOOK_MODE = {
+    "fc9ee7e141149783e3d2e02285522f0975922c295c27a4798fe862d2ba6e1f9a": "agy-secret-print",
+    "d722a89eca07d83932020f7483d25a619a81b3b1241ff6376d4e02bf0a5186ea": "agy-primary-write",
+    "57f030774516561030dd028c336b518ff69d6a9eca96e5d5afb393677590d252": "agy-pending-orders",
+    "da2451ebe93f2fedd5f46a74f0543f9c6979d7c6839d8a8ed1f9d1b40dbba3f6": "agy-hook",
+    "2c3ffdc110be4081e2e755c33a0072c19767e2152f59c8b9f49be788de52f3ac": "agy-stop-hook",
+    "8f64c884b485c6fba3cb0423e4d8a41de22c0dcd754849559ba34a597031af64": "agy-pretool-hook",
     "9c07093232c7b899a129972fc53f27aecd400e833964e2a23b46bf7e22776d55": "claude-hook",
     "79defbb55ba4156729e2683a7230fba44e592939e0359479b653a583275fce8a": "claude-stop-hook",
     "cc04c744b0f94a1798a535eaf4476bbe39fcd61f5686bc366cb9675d7a4e0339": "claude-audit-hook",
+    "4b9f92f31bfbaf76b7a6d7ce82c3ace0c610c109b3d4d31bdeb2d99c88eb7fd8": "codex-pre-tool-use",
+    "cd8bb4732b0dc9088b515e1f0d9c055e2501d3e65040caff3fcd81dbe89f91c8": "codex-post-tool-use",
+    "a9539431c1b5de8c17bee747e6402bbdcad7b1491210fcc9a2f0ee18541d56f0": "codex-user-prompt-submit",
     "a31855c82de580929ba8b9d5941a1aec4068e689d13d4e25097a8a68a4a87e97": "claude-heal-core-bare",
     "bfa38242e7dd49626bb8722c89b2f3de3a0d5aecef9bde5d186f72f93cf080cd": "claude-guard-branch-switch-in-main",
     "c517cc9348e7c7b20909113d635489ce1c95077dc398fbafc2918cfab2230e0a": "claude-guard-admin-merge",
@@ -232,13 +211,18 @@ _LEGACY_HOOK_MODE = {
     "480d96c562fb568238340a849214c757082debbcc267fd96fbbadd6d6e0feda5": "claude-guard-secret-print",
     "2976e241d25f41d7c89d4cfcd6e5f06e635cc683cc7400c2579ea47f910dbf7f": "claude-guard-primary-checkout-write",
     "1a71485aefc055285e289067d727605774e02491c8318c2a58f418a44b91601a": "claude-guard-public-github-text",
+    "a944eb852608f56a7ed1a587dcca604079908a33e1137dcf2c396b94349b7651": "codex-pre-tool-use",
+    "6fb815eaaefe91f6f268a422bfe5e808d7350e8064accd96f246219951d45583": "codex-session-setup",
+    "8665a604706b839c040f95a9e3464c440e7fd0664866bddae7f063f8ac367f8e": "codex-post-compact",
+    "858e80b79302e1722e37baa4ae6ee6a5ed47e989087efea6e3d8117e5a53a004": "codex-goal-driver-stop",
+    "53ba19034820bb6de1001ad44414eee497953c493c111146fda707dc235e14aa": "codex-release-thread-lease",
 }
 
 
 def hook_mode_for_source(command: str) -> str | None:
     """Identify an exact native hook declaration or a published legacy command."""
     if command.startswith(NATIVE_HOOK_DECLARATION):
-        for mode in _CLAUDE_NATIVE_MODES:
+        for mode in NATIVE_HOOK_MODES:
             if command == f"{NATIVE_HOOK_DECLARATION} {mode}":
                 return mode
         raise AgyHookConfigError("unsupported_hook_mode")
@@ -296,44 +280,15 @@ def _read_config(path: Path) -> dict:
     return data
 
 
-def _hook_resolvers() -> str:
-    """The marked resolver block of the packaged shell library, read as data."""
-    try:
-        lines = machinery_path(_RESOLVERS_FILE).read_text(encoding="utf-8").splitlines(keepends=True)
-    except (OSError, UnicodeError):
-        raise AgyHookConfigError("hook_resolvers_unavailable") from None
-    begins = [index for index, line in enumerate(lines) if line.rstrip("\n") == _RESOLVERS_BEGIN]
-    ends = [index for index, line in enumerate(lines) if line.rstrip("\n") == _RESOLVERS_END]
-    if len(begins) != 1 or len(ends) != 1 or ends[0] < begins[0]:
-        raise AgyHookConfigError("hook_resolvers_unmarked")
-    return "".join(lines[begins[0] + 1 : ends[0]])
-
-
-def _legacy_hook_command(mode: str) -> str:
-    """The one native hook command for ``mode``; every product manifest uses these bytes.
-
-    ``/bin/bash -c <body> lu-machinery-hook-v1 <mode>``, serialized with ``shlex.join``.
-    The body is ``set -u``, the packaged resolver block and a fixed tail. It holds no
-    host path: it resolves the product, shared-state anchor and interpreter by the
-    shell rule before any Python starts, then runs the installed entry for ``mode``
-    under ``-I``. Validators compare these exact bytes, never an equivalent argv.
-    """
+def native_hook_command(mode: str, *, python: Path | None = None) -> str:
+    """Render a native hook with the machinery interpreter selected by deployment."""
     if mode not in NATIVE_HOOK_MODES:
         raise AgyHookConfigError("unsupported_hook_mode")
-    if mode == "claude-audit-hook":
-        tail = _AUDIT_HOOK_TAIL
-    elif mode in CLAUDE_GUARD_MODES:
-        tail = _GUARD_HOOK_TAIL
-    else:
-        tail = _HOOK_TAIL
-    body = "set -u\n" + _hook_resolvers() + tail
-    return shlex.join(["/bin/bash", "-c", body, NATIVE_HOOK_NAME, mode])
-
-
-def native_hook_command(mode: str, *, python: Path | None = None) -> str:
-    """Render a bound Claude command or retain the published legacy registration."""
-    if python is None or mode not in _CLAUDE_NATIVE_MODES:
-        return _legacy_hook_command(mode)
+    if python is None:
+        try:
+            python = hook_interpreter()
+        except HostContextError as exc:
+            raise AgyHookConfigError(exc.code) from None
     command = "exec " + shlex.join([
         os.fspath(python), "-I", "-B", "-m", "lu_machinery.agent_runtime.agy_hook_config", "--run-hook", mode,
     ])
@@ -539,10 +494,8 @@ def require_hook_config(cwd: Path, home: Path, agy_home: Path | None = None, *, 
 
     Every existing candidate must validate, and at least one must contain the
     guard. Never repair an existing invalid candidate or write ordinary HOME.
-    ``cwd`` is the invocation boundary: missing product and shared-state roots are
-    configured from it by the shared shell rule before anything is provisioned, so
-    the provider and its hooks inherit them. Configured roots are kept; invalid
-    ones refuse.
+    Validate the host binding and the invocation checkout before provisioning.
+    The provider and its hooks inherit the validated product and state roots.
     """
     try:
         configure_native_hook_roots(cwd)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -12,7 +13,9 @@ import pytest
 from lu_machinery.common.repo_root import machinery_path
 from tests.helpers import current_sol
 from tests.helpers.product_tree import configured_roots as configured_roots
+from tests.host_context.conftest import host_layout as host_layout
 from tests.launcher_sandbox import (
+    bind_driver_protocol_fixture,
     copy_launcher_sources,
     copy_slot_registry,
     launcher_environment,
@@ -144,6 +147,8 @@ fi
 exec {os.fspath(_PROJECT_PYTHON)!r} "$@"
 """,
     )
+
+    bind_driver_protocol_fixture(primary, venv_bin / "python")
 
     init_command = ["git", "init", "-b", "main"]
     if separate_git_dir:
@@ -530,7 +535,7 @@ def test_ambiguous_or_resumed_rollover_fails_before_lease_and_codex(tmp_path: Pa
     ("checkout_kind", "configured"),
     [(kind, configured) for kind in ("primary", "forged", "linked") for configured in ("", "./relative-python", "absolute")],
 )
-def test_documented_wrapper_refuses_worktree_or_relative_interpreter(tmp_path: Path, checkout_kind: str, configured: str) -> None:
+def test_documented_wrapper_refuses_worktree_or_relative_interpreter(tmp_path: Path, checkout_kind: str, configured: str, host_layout) -> None:
     """Defect class: the installed-release lookup executing a checkout-local interpreter (#100).
 
     No local check tells a real primary from a checkout whose Git metadata was rewritten
@@ -554,24 +559,22 @@ def test_documented_wrapper_refuses_worktree_or_relative_interpreter(tmp_path: P
     _write_executable(root / ".venv/bin/python", planted)
     _write_executable(root / "relative-python", planted)
     _write_executable(tmp_path / "planted-package/lib/launcher_core.sh", 'printf "planted-release-loaded\\n"\n')
-    package = tmp_path / "installed-package"
-    _write_executable(package / "lib/launcher_core.sh", 'printf "trusted-release-loaded\\n"\n')
-    trusted = tmp_path / "trusted-python"
-    _write_executable(trusted, f'#!/bin/sh\nprintf "%s\\n" "{package}"\n')
-    header = machinery_path("lib/launcher_core.sh").read_text().split("# Fixed arguments", 1)[0]
-    recipe = "\n".join(line[2:] for line in header.splitlines() if line.startswith("#   "))
+    library = machinery_path("lib/project_interpreter.sh")
     wrapper = root / "start-codex.sh"
-    _write_executable(wrapper, "#!/bin/bash\nset -e\n" + recipe + "\n")
-    env = launcher_environment()
-    env.pop("LEARN_UKRAINIAN_PYTHON", None)
+    _write_executable(
+        wrapper,
+        f"#!/bin/bash\nset -e\nsource {shlex.quote(str(library))}\nproject_host_context\nprintf 'trusted-release-loaded\\n'\n",
+    )
+    env = {**host_layout.env, "PATH": os.defpath}
     if configured:
-        env["LEARN_UKRAINIAN_PYTHON"] = str(trusted) if configured == "absolute" else configured
+        env["LU_PYTHON"] = str(host_layout.python) if configured == "absolute" else configured
     result = _run([str(wrapper), "--help"], root, env=env)
     assert not marker.exists()
-    if configured == "absolute":
+    if configured == "absolute" and checkout_kind != "linked":
         assert result.returncode == 0, result.stderr
         assert result.stdout == "trusted-release-loaded\n"
     else:
         assert result.returncode == 2
-        assert "absolute trusted interpreter" in result.stderr
-        assert "release-loaded" not in result.stdout
+        reason = "invalid_invocation_git" if configured == "absolute" else "missing_interpreter_binding"
+        assert f"[{reason}]" in result.stderr
+        assert result.stdout == ""

@@ -25,6 +25,8 @@ import pytest
 
 from lu_machinery.common.repo_root import machinery_path, machinery_root
 from tests.helpers.product_tree import configured_roots as configured_roots
+from tests.host_context.conftest import HostLayout
+from tests.host_context.conftest import host_layout as host_layout
 from tests.launcher_sandbox import launcher_environment, sandbox_wrapper_text
 
 REPO = Path(__file__).resolve().parents[2]
@@ -124,6 +126,13 @@ class Layout:
     worktree: Path
     attacker: Path
     log: Path
+    binding: HostLayout
+
+    def environment(self, **extra: str) -> dict[str, str]:
+        env = _clean_env()
+        for name in ("FLEET_COMMS_ROOT", "LU_TASKS_DIR", "LU_GITHUB_CACHE_DIR"):
+            env.pop(name, None)
+        return {**env, **self.binding.env, "LU_PYTHON": str(self.binding.python), **extra}
 
     def lines(self) -> list[str]:
         return self.log.read_text(encoding="utf-8").splitlines() if self.log.exists() else []
@@ -133,7 +142,7 @@ class Layout:
 
 
 @pytest.fixture()
-def layout(tmp_path: Path) -> Layout:
+def layout(tmp_path: Path, host_layout: HostLayout) -> Layout:
     tmp = tmp_path.resolve()
     log = tmp / "executions.log"
     primary = tmp / "primary"
@@ -144,9 +153,16 @@ def layout(tmp_path: Path) -> Layout:
         shutil.copy2(_tracked_source(relative), destination)
         if relative.startswith("start-"):
             destination.write_text(sandbox_wrapper_text(destination.read_text()))
+    wrapper = primary / "start-claude-driver.sh"
+    wrapper.write_text(wrapper.read_text().replace('export LU_PRODUCT_ROOT="$ROOT"\n', ""))
     _place_helper_scripts(primary)
     (primary / ".gitignore").write_text(".venv/\n", encoding="utf-8")
     _git(primary, "init", "-q", "-b", "main")
+    _git(primary, "remote", "add", "origin", "https://github.com/agentic-machinery/machinery.git")
+    host_layout.data["repos"] = {"machinery": str(primary)}
+    host_layout.data["products"]["public"]["repo"] = "machinery"
+    host_layout.data["monitor_url"] = _clean_env()["LU_MONITOR_LOOPBACK"]
+    host_layout.write()
     _git(primary, "add", ".")
     _git(primary, "commit", "-q", "-m", "init")
     worktree = tmp / "worktree"
@@ -160,7 +176,7 @@ def layout(tmp_path: Path) -> Layout:
     _git(attacker, "add", ".")
     _git(attacker, "commit", "-q", "-m", "attacker")
     _stub_python(attacker, "EVIL", log)
-    return Layout(tmp, primary, worktree, attacker, log)
+    return Layout(tmp, primary, worktree, attacker, log, host_layout)
 
 
 def _hostile_env(layout: Layout) -> dict[str, str]:
@@ -176,8 +192,17 @@ LC_ROOT="$1"
 source "$LC_ROOT/lu_machinery/lib/launcher_core.sh"
 launcher_resolve_roots
 printf 'resolved=%s\n' "$LC_DURABLE_HELPER_ROOT"
-printf 'hook_primary=%s\n' "${LEARN_UKRAINIAN_PRIMARY_REPO_ROOT:-}"
+printf 'hook_primary=%s\n' "$LU_PRIMARY_REPO_ROOT"
+printf 'bound_python=%s\n' "$(launcher_project_python)"
 source "$LC_ROOT/lu_machinery/lib/handoff_identity.sh"
+# Only the helper calls below are observed through the fixture recorder. The
+# root loader and interpreter selection above ran against the real binding.
+project_python_run() {
+  [ "$1" = "$LU_PYTHON" ] || return 97
+  shift
+  project_python_command "$FIXTURE_HELPER_RECORDER" || return
+  "${PROJECT_PYTHON_COMMAND[@]}" "$@"
+}
 site() { printf 'SITE %s\n' "$1" >> "$SITE_LOG"; }
 
 site renew_heartbeat
@@ -194,9 +219,19 @@ site lease_close
 site driver_agent_type
 ( LC_PROVIDER=claude LC_EPIC=devops LC_DRY_RUN=0 LC_FORWARD_ARGS=(); launcher_inject_driver_agent ) >/dev/null 2>&1
 site slot_registry
-( launcher_require_registered_slot claude devops ) >/dev/null 2>&1
+(
+  [ "$(launcher_project_python)" = "$LU_PYTHON" ] || exit 97
+  launcher_project_python() { printf '%s\n' "$FIXTURE_HELPER_RECORDER"; }
+  _handoff_slot_registry --slot claude-devops
+) >/dev/null 2>&1
 site claude_profile
-( LC_MODEL=claude-opus-5-5 source "$LC_ROOT/lu_machinery/launchers/claude.sh"; launcher_adapter_preflight ) >/dev/null 2>&1
+(
+  [ "$(launcher_project_python)" = "$LU_PYTHON" ] || exit 97
+  launcher_project_python() { printf '%s\n' "$FIXTURE_HELPER_RECORDER"; }
+  LC_MODEL=claude-opus-5-5
+  source "$LC_ROOT/lu_machinery/launchers/claude.sh"
+  launcher_adapter_preflight
+) >/dev/null 2>&1
 exit 0
 """
 
@@ -205,7 +240,10 @@ def _run_sites(layout: Layout, root: Path | None = None, **env: str) -> subproce
     return subprocess.run(
         ["bash", "-c", _SITE_HARNESS, "bash", str(root or layout.worktree)],
         cwd=layout.tmp,
-        env=_clean_env(HOME=str(layout.tmp / "home"), SITE_LOG=str(layout.log), **env),
+        env=layout.environment(
+            HOME=str(layout.tmp / "home"), SITE_LOG=str(layout.log),
+            FIXTURE_HELPER_RECORDER=str(layout.primary / ".venv/bin/python"), **env,
+        ),
         capture_output=True,
         text=True,
         check=False,
@@ -231,11 +269,8 @@ def _assert_every_site_ran_the_primary(
     assert result.returncode == 0, result.stderr
     assert f"resolved={layout.primary}" in result.stdout
     executions = _site_executions(layout)
-    # Before any site, launcher_resolve_roots asks shared-state admission once, on the
-    # validated primary's interpreter, whether the helper root may be the state anchor.
-    resolving = executions.pop("", [])
-    assert len(resolving) == 1, resolving
-    assert resolving[0].startswith("HONEST -c ") and "configured_primary_root()" in resolving[0], resolving
+    assert f"bound_python={layout.binding.python}" in result.stdout
+    assert "" not in executions, executions
     assert list(executions) == list(_SITES), executions
     for name in sites:
         ran = executions[name]
@@ -248,12 +283,15 @@ def _assert_every_site_ran_the_primary(
     # The validated primary interpreter invokes the installed module (#161).
     raw = Path(str(layout.log) + ".raw").read_bytes().decode().split("\0")
     roots = [raw[index + 3:index + 5] for index, arg in enumerate(raw) if arg == "-I" and raw[index + 1] == "-c" and "module bootstrap:" in raw[index + 2]]
-    assert roots and all(pair == [str(result.args[-1]), "lu_machinery"] for pair in roots), roots
+    assert roots and all(
+        Path(root).resolve() in {Path(result.args[-1]).resolve(), layout.primary} and package == "lu_machinery"
+        for root, package in roots
+    ), roots
 
 
 def _assert_refused_before_any_site(layout: Layout, result: subprocess.CompletedProcess[str]) -> None:
     assert result.returncode == 3, (result.stdout, result.stderr)
-    assert "git metadata does not validate" in result.stderr
+    assert "[invalid_invocation_git]" in result.stderr
     assert "resolved=" not in result.stdout
     assert layout.lines() == [], layout.lines()
 
@@ -271,7 +309,7 @@ def test_worktree_reached_through_a_symlinked_path_still_resolves(layout: Layout
     _assert_every_site_ran_the_primary(layout, _run_sites(layout, root=alias))
 
 
-def test_relative_back_pointer_is_accepted(layout: Layout) -> None:
+def test_relative_back_pointer_cannot_change_bound_repo_config(layout: Layout) -> None:
     """Git's ``worktree.useRelativePaths`` writes both pointers relative."""
     relative = layout.tmp / "relative"
     _git(layout.primary, "-c", "worktree.useRelativePaths=true", "worktree", "add", "-q", "-b", "rel", str(relative))
@@ -279,7 +317,10 @@ def test_relative_back_pointer_is_accepted(layout: Layout) -> None:
     assert not (layout.primary / ".git" / "worktrees" / "relative" / "gitdir").read_text(
         encoding="utf-8"
     ).startswith("/")
-    _assert_every_site_ran_the_primary(layout, _run_sites(layout, root=relative))
+    result = _run_sites(layout, root=relative)
+    assert result.returncode == 3, result.stderr
+    assert "[repo_origin_mismatch]" in result.stderr
+    assert layout.lines() == []
 
 
 # --- environment redirection --------------------------------------------------
@@ -289,25 +330,18 @@ def test_ambient_git_dir_does_not_redirect_any_site(layout: Layout) -> None:
     _assert_every_site_ran_the_primary(layout, _run_sites(layout, **_hostile_env(layout)))
 
 
-def test_claude_launch_replaces_an_inherited_anchor_and_refuses_an_invalid_one(layout: Layout) -> None:
-    """Defect class: Claude hooks that trust a caller's inherited anchor, or start without a valid one.
-
-    A Claude launch exports its own validated helper root as the hook trust anchor, replacing an
-    inherited LEARN_UKRAINIAN_PRIMARY_REPO_ROOT, and refuses before any site when the hook boundary
-    rejects that root (here a conflicting LEARN_UKRAINIAN_STATE_ROOT). Ported from the product's
-    launcher-primary-root-export patch.
-    """
-    result = _run_sites(
-        layout, LC_PROVIDER="claude", LEARN_UKRAINIAN_PRIMARY_REPO_ROOT=str(layout.attacker), **_hostile_env(layout)
-    )
-    _assert_every_site_ran_the_primary(layout, result)
-    assert f"hook_primary={layout.primary}" in result.stdout
-    layout.log.write_text("")
-    refused = _run_sites(layout, LC_PROVIDER="claude", LEARN_UKRAINIAN_STATE_ROOT=str(layout.attacker))
-    assert refused.returncode == 3, (refused.stdout, refused.stderr)
-    assert "refusing to start Claude" in refused.stderr
-    assert "resolved=" not in refused.stdout
-    assert not [line for line in layout.lines() if line.startswith("SITE ")], layout.lines()
+def test_claude_launch_checks_both_legacy_root_assertions(layout: Layout) -> None:
+    """A legacy assertion can neither redirect the host binding nor silently disagree."""
+    agreed = _run_sites(layout, LC_PROVIDER="claude", LEARN_UKRAINIAN_PRIMARY_REPO_ROOT=str(layout.primary))
+    _assert_every_site_ran_the_primary(layout, agreed)
+    assert f"hook_primary={layout.primary}" in agreed.stdout
+    for setting in ("LEARN_UKRAINIAN_PRIMARY_REPO_ROOT", "LEARN_UKRAINIAN_STATE_ROOT"):
+        layout.log.write_text("")
+        refused = _run_sites(layout, LC_PROVIDER="claude", **{setting: str(layout.attacker)})
+        assert refused.returncode == 3
+        assert f"[legacy_conflict] {setting}" in refused.stderr
+        assert "resolved=" not in refused.stdout
+        assert layout.lines() == []
 
 
 def test_worktree_local_venv_never_runs(layout: Layout) -> None:
@@ -325,7 +359,7 @@ def test_resolution_clears_git_local_environment(layout: Layout) -> None:
     )
     result = subprocess.run(
         ["bash", "-c", script, "bash", str(layout.worktree)],
-        env=_clean_env(**_hostile_env(layout), GIT_INDEX_FILE="/x", GIT_OBJECT_DIRECTORY="/x",
+        env=layout.environment(**_hostile_env(layout), GIT_INDEX_FILE="/x", GIT_OBJECT_DIRECTORY="/x",
                        GIT_CONFIG_PARAMETERS="'core.fsmonitor=/x'"),
         capture_output=True, text=True, check=False, timeout=30,
     )
@@ -354,15 +388,14 @@ def test_gitfile_borrowing_another_repositorys_worktree_entry_is_refused(layout:
     (layout.worktree / ".git").write_text(f"gitdir: {layout.attacker}/.git/worktrees/decoy\n", encoding="utf-8")
     result = _run_sites(layout)
     _assert_refused_before_any_site(layout, result)
-    assert "does not point back" in result.stderr
 
 
-def test_commondir_tampered_inside_the_real_admin_dir_is_ignored(layout: Layout) -> None:
-    """The resolver never reads ``commondir``, even under a validated admin dir."""
+def test_commondir_tampered_inside_the_real_admin_dir_is_refused(layout: Layout) -> None:
+    """Git invocation metadata must agree with its primary."""
     (layout.primary / ".git" / "worktrees" / "worktree" / "commondir").write_text(
         f"{layout.attacker}/.git\n", encoding="utf-8"
     )
-    _assert_every_site_ran_the_primary(layout, _run_sites(layout))
+    _assert_refused_before_any_site(layout, _run_sites(layout))
 
 
 def test_codex_refuses_a_canonical_checkout_git_found_through_commondir(layout: Layout) -> None:
@@ -377,10 +410,10 @@ printf 'canonical=%s\n' "$LC_CODEX_CANONICAL_ROOT"
 """
     result = subprocess.run(
         ["bash", "-c", script, "bash", str(layout.worktree)],
-        env=_clean_env(HOME=str(layout.tmp / "home")), capture_output=True, text=True, check=False, timeout=30,
+        env=layout.environment(HOME=str(layout.tmp / "home")), capture_output=True, text=True, check=False, timeout=30,
     )
-    assert result.returncode == 1, (result.stdout, result.stderr)
-    assert f"canonical checkout {layout.attacker} does not belong to the validated primary" in result.stderr
+    assert result.returncode == 3, (result.stdout, result.stderr)
+    assert "[invalid_invocation_git]" in result.stderr
     assert "canonical=" not in result.stdout
 
 
@@ -393,7 +426,7 @@ printf 'canonical=%s\n' "$LC_CODEX_CANONICAL_ROOT"
 """
     result = subprocess.run(
         ["bash", "-c", script, "bash", str(layout.worktree)],
-        env=_clean_env(HOME=str(layout.tmp / "home")), capture_output=True, text=True, check=False, timeout=30,
+        env=layout.environment(HOME=str(layout.tmp / "home")), capture_output=True, text=True, check=False, timeout=30,
     )
     assert result.returncode == 0, result.stderr
     assert f"canonical={layout.primary}" in result.stdout
@@ -447,7 +480,6 @@ def test_fake_primary_without_a_back_pointer_is_refused(layout: Layout) -> None:
     (layout.worktree / ".git").write_text(f"gitdir: {fake}/.git/worktrees/worktree\n", encoding="utf-8")
     result = _run_sites(layout)
     _assert_refused_before_any_site(layout, result)
-    assert "does not point back" in result.stderr
 
 
 def test_fake_primary_pointing_back_at_another_worktree_is_refused(layout: Layout) -> None:
@@ -484,29 +516,15 @@ def test_residual_fully_forged_primary_is_locally_indistinguishable(layout: Layo
 
 
 @pytest.mark.parametrize("via", ["direct", "symlinked-path"])
-def test_snapshot_resolves_only_to_the_launcher_root(layout: Layout, via: str) -> None:
-    """Bounds the #9121 snapshot branch (see project_interpreter.sh).
-
-    A worktree whose gitfile was removed resolves as a release snapshot. That
-    resolution is ``LC_ROOT`` itself, the directory whose launcher code is
-    already running, and never the primary, the attacker or any other directory,
-    even with a hostile ambient ``GIT_DIR``.
-    """
+def test_snapshot_uses_the_host_runtime_without_trusting_its_local_venv(layout: Layout, via: str) -> None:
+    """A code snapshot without Git metadata cannot select the runtime or product."""
     _stub_python(layout.worktree, "SELF", layout.log)
     (layout.worktree / ".git").unlink()
     root = layout.worktree
     if via == "symlinked-path":
         root = layout.tmp / "alias"
         root.symlink_to(layout.worktree)
-
-    result = _run_sites(layout, root=root, **_hostile_env(layout))
-    assert result.returncode == 0, result.stderr
-    assert f"resolved={layout.worktree}\n" in result.stdout
-    ran = [line for line in layout.lines() if not line.startswith("SITE ")]
-    assert ran, layout.lines()
-    assert all(line.startswith("SELF ") for line in ran), ran
-    assert str(layout.primary) not in "\n".join(ran)
-    assert str(layout.attacker) not in "\n".join(ran)
+    _assert_every_site_ran_the_primary(layout, _run_sites(layout, root=root, **_hostile_env(layout)))
 
 
 @pytest.mark.parametrize("shape", ["state-anchor", "no-anchor", "empty-dotgit"])
@@ -528,13 +546,11 @@ def test_product_root_without_git_never_exports_its_own_venv(layout: Layout, sha
         (sub / ".git").mkdir()
     script = (
         'LC_ROOT="$1"; source "$2/lu_machinery/lib/launcher_core.sh"; launcher_resolve_roots; '
-        'printf "resolved=%s\\npython=%s\\n" "$LC_DURABLE_HELPER_ROOT" "${LEARN_UKRAINIAN_PYTHON:-}"'
+        'printf "resolved=%s\\npython=%s\\n" "$LC_DURABLE_HELPER_ROOT" "${LU_PYTHON:-}"'
     )
-    env = _clean_env(HOME=str(layout.tmp / "home"))
-    env.pop("LEARN_UKRAINIAN_PYTHON", None)
-    env.pop("LEARN_UKRAINIAN_PRIMARY_REPO_ROOT", None)
-    if shape != "no-anchor":
-        env["LEARN_UKRAINIAN_PRIMARY_REPO_ROOT"] = str(layout.primary)
+    env = layout.environment(HOME=str(layout.tmp / "home"))
+    if shape == "no-anchor":
+        env.pop("LU_HOST_CONTEXT")
     result = subprocess.run(
         ["bash", "-c", script, "bash", str(sub), str(layout.worktree)],
         cwd=layout.tmp, env=env, capture_output=True, text=True, check=False, timeout=60,
@@ -544,13 +560,13 @@ def test_product_root_without_git_never_exports_its_own_venv(layout: Layout, sha
     if shape == "state-anchor":
         assert result.returncode == 0, result.stderr
         assert f"resolved={layout.primary}\n" in result.stdout
-        assert f"python={layout.primary}/.venv/bin/python\n" in result.stdout
+        assert f"python={layout.binding.python}\n" in result.stdout
     elif shape == "no-anchor":
         assert result.returncode == 3, result.stderr
-        assert "needs LEARN_UKRAINIAN_PRIMARY_REPO_ROOT" in result.stderr
+        assert "[missing_context]" in result.stderr
     else:
         assert result.returncode == 3, result.stderr
-        assert "is not a Git repository" in result.stderr
+        assert "[invalid_invocation_git]" in result.stderr
 
 
 # --- operator-set CODEX_CANONICAL_REPO_ROOT override --------------------------
@@ -574,7 +590,7 @@ def _separate_git_dir_layout(layout: Layout) -> Layout:
     worktree = layout.tmp / "sgd-worktree"
     _git(primary, "worktree", "add", "-q", "-b", "feature", str(worktree))
     _stub_python(primary, "HONEST", layout.log)
-    return Layout(layout.tmp, primary, worktree, layout.attacker, layout.log)
+    return Layout(layout.tmp, primary, worktree, layout.attacker, layout.log, layout.binding)
 
 
 def _run_codex_sites(layout: Layout, override: Path | None, root: Path | None = None, **env: str):
@@ -590,21 +606,16 @@ def _assert_override_refused(layout: Layout, result: subprocess.CompletedProcess
     assert layout.lines() == [], layout.lines()
 
 
-# Every surviving helper site participates in the canonical-root check.
-_CODEX_REACHABLE_SITES = _SITES
-
-
 def test_override_names_a_separate_git_dir_primary(layout: Layout) -> None:
     sgd = _separate_git_dir_layout(layout)
     refused = _run_codex_sites(sgd, None)
     _assert_refused_before_any_site(sgd, refused)
 
-    _assert_every_site_ran_the_primary(sgd, _run_codex_sites(sgd, sgd.primary), _CODEX_REACHABLE_SITES)
+    _assert_refused_before_any_site(sgd, _run_codex_sites(sgd, sgd.primary))
 
 
 def test_codex_adapter_uses_the_validated_override(layout: Layout) -> None:
     """Canonical checkout, driver transport probe and canary all use the named primary."""
-    sgd = _separate_git_dir_layout(layout)
     script = r"""
 LC_ROOT="$1"; LC_PROVIDER=codex; source "$LC_ROOT/lu_machinery/lib/launcher_core.sh"; launcher_resolve_roots
 LC_DRY_RUN=0; source "$LC_ROOT/lu_machinery/launchers/codex.sh"
@@ -614,14 +625,14 @@ printf 'python=%s\n' "$(launcher_project_python)"
 LC_DRY_RUN=1 LC_MODEL=gpt-6.1-sol launcher_codex_transport_probe
 """
     result = subprocess.run(
-        ["bash", "-c", script, "bash", str(sgd.worktree)],
-        env=_clean_env(HOME=str(layout.tmp / "home"), CODEX_CANONICAL_REPO_ROOT=str(sgd.primary)),
+        ["bash", "-c", script, "bash", str(layout.worktree)],
+        env=layout.environment(HOME=str(layout.tmp / "home"), CODEX_CANONICAL_REPO_ROOT=str(layout.primary)),
         capture_output=True, text=True, check=False, timeout=30,
     )
     assert result.returncode == 0, result.stderr
-    assert f"canonical={sgd.primary}" in result.stdout
-    assert f"python={sgd.primary}/.venv/bin/python" in result.stdout
-    assert f"would probe {sgd.primary}/.venv/bin/python -m lu_machinery.orchestration.codex_transport_health" in (
+    assert f"canonical={layout.primary}" in result.stdout
+    assert f"python={layout.binding.python}" in result.stdout
+    assert f"would probe {layout.binding.python} -m lu_machinery.orchestration.codex_transport_health" in (
         result.stdout
     )
 
@@ -631,9 +642,7 @@ def test_override_to_the_real_primary_does_not_pass_a_hostile_gitfile(layout: La
     shutil.copytree(layout.primary / ".git" / "worktrees" / "worktree", admin)
     (admin / "commondir").write_text(f"{layout.attacker}/.git\n", encoding="utf-8")
     (layout.worktree / ".git").write_text(f"gitdir: {admin}\n", encoding="utf-8")
-    _assert_override_refused(
-        layout, _run_codex_sites(layout, layout.primary), "is not a checkout of this Git common directory"
-    )
+    _assert_refused_before_any_site(layout, _run_codex_sites(layout, layout.primary))
 
 
 def test_override_refuses_a_forged_primary_gitfile(layout: Layout) -> None:
@@ -644,9 +653,7 @@ def test_override_refuses_a_forged_primary_gitfile(layout: Layout) -> None:
     (admin / "gitdir").write_text(f"{layout.worktree}/.git\n", encoding="utf-8")
     _stub_python(fake, "EVIL", layout.log)
     (layout.worktree / ".git").write_text(f"gitdir: {admin}\n", encoding="utf-8")
-    _assert_override_refused(
-        layout, _run_codex_sites(layout, layout.primary), "is not a checkout of this Git common directory"
-    )
+    _assert_refused_before_any_site(layout, _run_codex_sites(layout, layout.primary))
 
 
 def test_override_naming_an_unrelated_repository_is_refused(layout: Layout) -> None:
@@ -681,12 +688,7 @@ def test_override_naming_a_lookalike_of_the_primary_is_refused(layout: Layout, b
 
 
 def test_override_copied_separate_git_dir_gitfile_residual(layout: Layout) -> None:
-    """Documented #9121 residual (see launcher_canonical_override_root).
-
-    Git keeps no back-pointer to a ``--separate-git-dir`` primary, so a copy of
-    its gitfile is accepted when the operator names the copy; once the common
-    directory records ``core.worktree`` (the real primary), the copy is refused.
-    """
+    """A separate Git directory and a copy of its pointer are both outside the binding."""
     sgd = _separate_git_dir_layout(layout)
     copy = layout.tmp / "sgd-copy"
     copy.mkdir()
@@ -694,16 +696,9 @@ def test_override_copied_separate_git_dir_gitfile_residual(layout: Layout) -> No
     _place_helper_scripts(copy)
     _stub_python(copy, "COPY", layout.log)
 
-    accepted = _run_codex_sites(sgd, copy)
-    assert accepted.returncode == 0, accepted.stderr
-    assert f"resolved={copy}" in accepted.stdout
-    layout.log.unlink()
-
+    _assert_refused_before_any_site(sgd, _run_codex_sites(sgd, copy))
     _git(sgd.primary, "config", "core.worktree", str(sgd.primary))
-    _assert_override_refused(
-        sgd, _run_codex_sites(sgd, copy), f"is not the core.worktree Git records ({sgd.primary}): {copy}"
-    )
-    _assert_every_site_ran_the_primary(sgd, _run_codex_sites(sgd, sgd.primary), _CODEX_REACHABLE_SITES)
+    _assert_refused_before_any_site(sgd, _run_codex_sites(sgd, copy))
 
 
 def test_override_is_read_only_on_codex_launches(layout: Layout) -> None:
@@ -719,7 +714,7 @@ def _run_driver(layout: Layout, **env: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         [str(layout.worktree / "start-claude-driver.sh"), "--epic", "devops"],
         cwd=layout.worktree,
-        env=_clean_env(HOME=str(layout.tmp / "home"), LAUNCHER_DRY_RUN="1", **env),
+        env=layout.environment(HOME=str(layout.tmp / "home"), LAUNCHER_DRY_RUN="1", **env),
         capture_output=True,
         text=True,
         check=False,
@@ -732,27 +727,27 @@ def test_real_driver_launcher_refuses_a_hostile_gitfile(layout: Layout) -> None:
     (layout.worktree / ".git").write_text(f"gitdir: {layout.attacker}/.git/worktrees/decoy\n", encoding="utf-8")
     result = _run_driver(layout)
     assert result.returncode == 3, (result.stdout, result.stderr)
-    assert "git metadata does not validate" in result.stderr
+    assert "[invalid_invocation_git]" in result.stderr
     assert layout.lines() == []
 
 
 def test_session_supervisor_state_root_ignores_git_redirection(layout: Layout) -> None:
-    script = 'source "$1/lu_machinery/lib/session_supervisor.sh"; _canonical_state_root "$1"'
+    script = 'source "$1/lu_machinery/lib/session_supervisor.sh"; project_host_context --directory "$1" && printf "%s\\n" "$LU_STATE_ROOT"'
     ambient = subprocess.run(
         ["bash", "-c", script, "bash", str(layout.worktree)],
-        env=_clean_env(**_hostile_env(layout)), capture_output=True, text=True, check=False, timeout=30,
+        env=layout.environment(**_hostile_env(layout)), capture_output=True, text=True, check=False, timeout=30,
     )
     assert ambient.returncode == 0, ambient.stderr
-    assert ambient.stdout.strip() == str(layout.primary)
+    assert ambient.stdout.strip() == layout.binding.data["state_root"]
 
     _git(layout.attacker, "worktree", "add", "-q", "-b", "decoy", str(layout.tmp / "decoy"))
     (layout.worktree / ".git").write_text(f"gitdir: {layout.attacker}/.git/worktrees/decoy\n", encoding="utf-8")
     hostile = subprocess.run(
         ["bash", "-c", script, "bash", str(layout.worktree)],
-        env=_clean_env(), capture_output=True, text=True, check=False, timeout=30,
+        env=layout.environment(), capture_output=True, text=True, check=False, timeout=30,
     )
-    assert hostile.returncode == 1
-    assert "cannot resolve canonical state root" in hostile.stderr
+    assert hostile.returncode == 2
+    assert "[invalid_invocation_git]" in hostile.stderr
     assert hostile.stdout == ""
 
 
@@ -794,16 +789,12 @@ def test_machinery_dir_is_the_physical_package_when_reached_through_a_symlink(tm
 
 # --- the product root (LC_ROOT) of an installed core -------------------------
 
-# Sources one launcher core, then stops launcher_main at LC_ROOT's first consumer
-# (launcher_resolve_roots): no interpreter, lease, deploy, scope or provider runs.
+# Observe the real root resolution before a lease or provider runs.
 _PRODUCT_ROOT_PROBE = r"""
 source "$1"
-launcher_resolve_roots() {
-  printf 'product-root=%s\n' "$LC_ROOT"
-  printf 'exported=%s\n' "$(printenv LU_PRODUCT_ROOT || true)"
-  exit 0
-}
-launcher_main claude driver --epic devops
+launcher_resolve_roots
+printf 'product-root=%s\n' "$LC_ROOT"
+printf 'exported=%s\n' "$LU_PRODUCT_ROOT"
 """
 
 
@@ -814,11 +805,22 @@ def _primary_checkout(path: Path) -> Path:
     return path
 
 
+def _bind_product(binding: HostLayout, product: Path) -> dict[str, str]:
+    _git(product, "remote", "add", "origin", "https://github.com/learn-ukrainian/learn-ukrainian.github.io.git")
+    binding.data["repos"]["public"] = str(product)
+    binding.data["monitor_url"] = _clean_env()["LU_MONITOR_LOOPBACK"]
+    binding.write()
+    return {**binding.env, "LU_PYTHON": str(binding.python)}
+
+
 def _probe_product_root(tmp: Path, core: Path, **env: str) -> subprocess.CompletedProcess[str]:
+    clean = _clean_env(HOME=str(tmp), **env)
+    for name in ("FLEET_COMMS_ROOT", "LU_TASKS_DIR", "LU_GITHUB_CACHE_DIR"):
+        clean.pop(name, None)
     return subprocess.run(
         ["bash", "-c", _PRODUCT_ROOT_PROBE, "bash", str(core)],
         cwd=tmp,
-        env=_clean_env(HOME=str(tmp), **env),
+        env=clean,
         capture_output=True,
         text=True,
         check=False,
@@ -827,53 +829,42 @@ def _probe_product_root(tmp: Path, core: Path, **env: str) -> subprocess.Complet
 
 
 @pytest.mark.parametrize("product", ["checkout", "unset", "relative"])
-def test_installed_core_takes_the_product_root_from_lu_product_root(tmp_path: Path, product: str) -> None:
-    """Defect class: an installed launcher core serving site-packages as the product checkout.
-
-    The lu_machinery package is copied to a site-packages directory, with no
-    ``<product>/lu_machinery`` link. Its core must take the product from the wrapper's
-    LU_PRODUCT_ROOT, and refuse with a named reason when that is unset or relative (never
-    resolved against the working directory), instead of deriving a product from its own
-    location.
-    """
+def test_installed_core_takes_the_product_root_from_lu_product_root(tmp_path: Path, host_layout: HostLayout, product: str) -> None:
+    """The installed core obtains its product from the binding and checks legacy assertions."""
     tmp = tmp_path.resolve()
     site = tmp / "venv" / "lib" / "python3" / "site-packages"
     shutil.copytree(machinery_root(), site / "lu_machinery", ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
     checkout = _primary_checkout(tmp / "product")
-    env: dict[str, str] = {}
+    env = _bind_product(host_layout, checkout)
     if product == "checkout":
         env["LU_PRODUCT_ROOT"] = str(checkout)
     elif product == "relative":
-        # The probe runs in tmp, where "product" names the checkout.
         env["LU_PRODUCT_ROOT"] = "product"
 
     result = _probe_product_root(tmp, site / "lu_machinery/lib/launcher_core.sh", **env)
 
-    if product == "checkout":
+    if product != "relative":
         assert result.returncode == 0, result.stderr
         assert result.stdout.splitlines() == [f"product-root={checkout}", f"exported={checkout}"]
         return
     assert result.returncode == 3, (result.stdout, result.stderr)
-    reason = "LU_PRODUCT_ROOT_REQUIRED" if product == "unset" else "LU_PRODUCT_ROOT_INVALID"
-    assert reason in result.stderr
+    assert "LU_PRODUCT_ROOT" in result.stderr
     assert "product-root=" not in result.stdout
 
 
-def test_in_tree_core_keeps_its_own_checkout_as_the_product_root(tmp_path: Path) -> None:
-    """Defect class: the in-tree source copy taking a configured product instead of its checkout.
-
-    A package directory named other than lu_machinery inside a product checkout keeps the
-    default it always had, the checkout holding it, even with LU_PRODUCT_ROOT naming
-    another primary checkout. It exports that checkout as LU_PRODUCT_ROOT, so Python
-    helpers and hooks, which read LU_PRODUCT_ROOT first, serve the same product.
-    """
+def test_in_tree_core_keeps_its_own_checkout_as_the_product_root(tmp_path: Path, host_layout: HostLayout) -> None:
+    """An in-tree installation refuses a conflicting product assertion."""
     tmp = tmp_path.resolve()
     checkout = _primary_checkout(tmp / "product")
     shutil.copytree(machinery_root(), checkout / "scripts", ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
     other = _primary_checkout(tmp / "other")
+    env = _bind_product(host_layout, checkout)
 
-    result = _probe_product_root(tmp, checkout / "scripts/lib/launcher_core.sh", LU_PRODUCT_ROOT=str(other))
+    refused = _probe_product_root(tmp, checkout / "scripts/lib/launcher_core.sh", **env, LU_PRODUCT_ROOT=str(other))
+    assert refused.returncode == 3, refused.stderr
+    assert "[legacy_conflict] LU_PRODUCT_ROOT" in refused.stderr
 
+    result = _probe_product_root(tmp, checkout / "scripts/lib/launcher_core.sh", **env)
     assert result.returncode == 0, result.stderr
     assert result.stdout.splitlines() == [f"product-root={checkout}", f"exported={checkout}"]
 
@@ -932,7 +923,7 @@ def _stub_tool(tmp: Path, name: str) -> Path:
         "inadmissible-state-anchor",
     ],
 )
-def test_installed_release_consumers_serve_only_lu_product_root(tmp_path: Path, consumer: str) -> None:
+def test_installed_release_consumers_serve_only_lu_product_root(tmp_path: Path, host_layout: HostLayout, consumer: str) -> None:
     """Defect class: an installed release's consumers deriving roots from site-packages (PR 301 F1-F4).
 
     A product that sets LU_PRODUCT_ROOT must get a working launch: the agent
@@ -951,10 +942,12 @@ def test_installed_release_consumers_serve_only_lu_product_root(tmp_path: Path, 
     env = _clean_env(
         HOME=str(tmp),
         LU_PRODUCT_ROOT=str(product),
+        **_bind_product(host_layout, product),
         AGENT_REAL_NPM=str(_stub_tool(tmp, "npm")),
         AGENT_REAL_GH=str(_stub_tool(tmp, "gh")),
     )
-    for name in ("LEARN_UKRAINIAN_PYTHON", "LEARN_UKRAINIAN_PRIMARY_REPO_ROOT", "LEARN_UKRAINIAN_STATE_ROOT"):
+    for name in ("LEARN_UKRAINIAN_PYTHON", "LEARN_UKRAINIAN_PRIMARY_REPO_ROOT", "LEARN_UKRAINIAN_STATE_ROOT",
+                 "FLEET_COMMS_ROOT", "LU_TASKS_DIR", "LU_GITHUB_CACHE_DIR"):
         env.pop(name, None)
 
     def run(*argv: str, **extra: str) -> subprocess.CompletedProcess[str]:
@@ -963,10 +956,7 @@ def test_installed_release_consumers_serve_only_lu_product_root(tmp_path: Path, 
         )
 
     if consumer in _INSTALLED_CONSUMERS:
-        state_binding = {"LU_STATE_ROOT": str(tmp)} if consumer == "inbox-watcher" else {}
-        result = run(
-            "bash", "-c", _INSTALLED_CONSUMER_PROBE, "bash", str(core), _INSTALLED_CONSUMERS[consumer], **state_binding,
-        )
+        result = run("bash", "-c", _INSTALLED_CONSUMER_PROBE, "bash", str(core), _INSTALLED_CONSUMERS[consumer])
         assert result.returncode == 0, (result.stdout, result.stderr)
         expected = {
             "npm-shim": "real-npm --version",
@@ -1015,44 +1005,25 @@ session_supervisor_exec_successor
         assert result.stdout.startswith("Usage: "), result.stdout
         return
     if consumer == "inadmissible-state-anchor":
-        # The anchor is exported only when shared-state admission accepts it: a primary
-        # checkout gets it; a --separate-git-dir primary, admitted as the Codex canonical
-        # root but refused by configured_primary_root, keeps no anchor, as before.
-        roots = 'printf "python=%s anchor=%s\\n" "${LEARN_UKRAINIAN_PYTHON:+set}" "${LEARN_UKRAINIAN_PRIMARY_REPO_ROOT-unset}"'
+        roots = 'printf "python=%s anchor=%s\\n" "${LU_PYTHON:+set}" "$LU_STATE_ROOT"'
         result = run("bash", "-c", _INSTALLED_CONSUMER_PROBE, "bash", str(core), roots)
         assert result.returncode == 0, result.stderr
-        assert result.stdout.splitlines() == [f"python=set anchor={product}"]
-        separate = tmp / "separate"
-        separate.mkdir()
-        _git(separate, "init", "-q", "-b", "main", "--separate-git-dir", str(tmp / "separate-git"))
-        _git(separate, "commit", "-q", "--allow-empty", "-m", "init")
-        (separate / ".venv").symlink_to(Path(sys.prefix))
-        result = run(
-            "bash", "-c", _INSTALLED_CONSUMER_PROBE, "bash", str(core), roots,
-            LU_PRODUCT_ROOT=str(separate), CODEX_CANONICAL_REPO_ROOT=str(separate),
-        )
-        assert result.returncode == 0, result.stderr
-        assert result.stdout.splitlines() == ["python=set anchor=unset"]
+        assert result.stdout.splitlines() == [f"python=set anchor={host_layout.data['state_root']}"]
+        refused = run("bash", "-c", _INSTALLED_CONSUMER_PROBE, "bash", str(core), roots, LU_STATE_ROOT=str(product))
+        assert refused.returncode == 3, refused.stderr
+        assert "[legacy_conflict] LU_STATE_ROOT" in refused.stderr
         return
     if consumer == "in-tree-export":
         shutil.copytree(machinery_root(), product / "scripts", ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
         other = _primary_checkout(tmp / "other")
-        python_root = r"""
-source "$1"
-launcher_resolve_product_root || exit 3
-project_python_run "$2" -c 'from scripts.common.repo_root import product_root; print(product_root())'
-"""
-        result = run(
-            "bash", "-c", python_root, "bash", str(product / "scripts/lib/launcher_core.sh"), sys.executable,
-            LU_PRODUCT_ROOT=str(other),
-        )
+        roots = """project_python_run "$LU_PYTHON" -c 'from scripts.common.repo_root import product_root; print(product_root())'"""
+        core = product / "scripts/lib/launcher_core.sh"
+        refused = run("bash", "-c", _INSTALLED_CONSUMER_PROBE, "bash", str(core), roots, LU_PRODUCT_ROOT=str(other))
+        assert refused.returncode == 3, refused.stderr
+        assert "[legacy_conflict] LU_PRODUCT_ROOT" in refused.stderr
+        result = run("bash", "-c", _INSTALLED_CONSUMER_PROBE, "bash", str(core), roots)
         assert result.returncode == 0, result.stderr
         assert result.stdout.splitlines() == [str(product)]
-        # The in-tree copy exports the shared-state anchor as well: its hooks refuse without it (#100).
-        roots = 'printf "pkg=%s anchor=%s\\n" "$LC_MACHINERY_PACKAGE" "${LEARN_UKRAINIAN_PRIMARY_REPO_ROOT-unset}"'
-        result = run("bash", "-c", _INSTALLED_CONSUMER_PROBE, "bash", str(product / "scripts/lib/launcher_core.sh"), roots)
-        assert result.returncode == 0, result.stderr
-        assert result.stdout.splitlines() == [f"pkg=scripts anchor={product}"]
         return
     # The launcher child keeps every root the launcher exports, and so does a dispatched
     # agent's environment for the product root.

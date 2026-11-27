@@ -6,8 +6,10 @@ import json
 import os
 import shlex
 import shutil
+import sqlite3
 import subprocess
 import sys
+from contextlib import closing
 from pathlib import Path
 
 import pytest
@@ -17,6 +19,7 @@ from lu_machinery.agent_runtime.agy_hook_config import (
     native_hook_command,
 )
 from lu_machinery.common.repo_root import machinery_root
+from tests.host_context.conftest import host_layout as host_layout
 
 SOURCE = Path(__file__).resolve().parents[2]
 HOOKS = Path("agents_extensions/shared/hooks")
@@ -84,6 +87,29 @@ def product(tmp_path):
     return root
 
 
+@pytest.fixture
+def binding(host_layout, product, release):
+    """Bind the release runtime and the fixture product to distinct host roots."""
+    python = release.parent / "venv/bin/python"
+    version = host_layout.data["runtime"]["lu_machinery"]
+    metadata = release / f"lu_machinery-{version}.dist-info"
+    metadata.mkdir(exist_ok=True)
+    (metadata / "METADATA").write_text(f"Name: lu-machinery\nVersion: {version}\n")
+    subprocess.run(
+        ["git", "-C", str(product), "remote", "add", "origin",
+         "https://github.com/learn-ukrainian/learn-ukrainian.github.io.git"],
+        check=True, capture_output=True, env=_git_env(), timeout=10,
+    )
+    host_layout.python = python
+    host_layout.data["runtime"]["python"] = str(python)
+    host_layout.data["products"]["public"]["python"] = str(python)
+    host_layout.data["repos"]["public"] = str(product)
+    host_layout.data["monitor_url"] = "http://127.0.0.1:9"
+    host_layout.env["LU_PYTHON"] = str(python)
+    host_layout.write()
+    return host_layout
+
+
 def run_hook(
     release,
     product,
@@ -94,6 +120,7 @@ def run_hook(
     event="PreToolUse",
     tool_id="call",
     cwd=None,
+    binding=None,
 ):
     env = {
         k: v
@@ -104,6 +131,9 @@ def run_hook(
         LU_PRODUCT_ROOT=str(product / "absent" if missing else product),
         XDG_STATE_HOME=str(product.parent / "state"),
     )
+    if binding is not None:
+        # Direct hook tests use an isolated subprocess with only explicit fixture assertions.
+        env = {**binding.env, "LU_PRODUCT_ROOT": env["LU_PRODUCT_ROOT"], "XDG_STATE_HOME": env["XDG_STATE_HOME"]}
     payload = {
         "tool_name": "Bash",
         "tool_input": {"command": command},
@@ -171,16 +201,12 @@ def test_write_guard_does_not_anchor_git_mutations_to_release(release, product):
 
 
 @pytest.mark.parametrize("entry", ["direct", "native"])
-def test_dirt_audit_does_not_select_release_as_default_product(release, product, entry):
+def test_dirt_audit_does_not_select_release_as_default_product(release, product, entry, binding):
     name = "audit-primary-checkout-dirt.py"
     if entry == "native":
         # Port product PR 13005's registered audit control through the installed writer.
-        command = shlex.split(native_hook_command("claude-audit-hook"))
-        env = {"PATH": "/usr/bin:/bin", "HOME": str(product.parent),
-               "LU_PRODUCT_ROOT": str(product),
-               "LU_STATE_ROOT": str(product.parent),
-               "LEARN_UKRAINIAN_PRIMARY_REPO_ROOT": str(product),
-               "LEARN_UKRAINIAN_PYTHON": str(release.parent / "venv/bin/python"),
+        command = ["/bin/sh", "-c", native_hook_command("claude-audit-hook", python=binding.python)]
+        env = {**binding.env, "PATH": os.defpath, "HOME": str(product.parent),
                "XDG_STATE_HOME": str(product.parent / "state")}
         payload = {"tool_name": "Bash", "tool_input": {"command": "echo safe"},
                    "cwd": str(product), "hook_event_name": "PreToolUse",
@@ -198,12 +224,12 @@ def test_dirt_audit_does_not_select_release_as_default_product(release, product,
                                  cwd=product, env=env, timeout=30)
         assert refused.returncode == 2 and "HOOK-BOOTSTRAP-FAILED" in refused.stderr
         return
-    assert run_hook(release, product, name, "echo safe").returncode == 0
+    assert run_hook(release, product, name, "echo safe", binding=binding).returncode == 0
     (product / "new-dirt").write_text("fixture")
-    result = run_hook(release, product, name, "echo safe", event="PostToolUse")
+    result = run_hook(release, product, name, "echo safe", event="PostToolUse", binding=binding)
     assert result.returncode == 2 and "new-dirt" in result.stderr
     result = run_hook(
-        release, product, name, "echo safe", missing=True, tool_id="missing"
+        release, product, name, "echo safe", missing=True, tool_id="missing", binding=binding
     )
     assert result.returncode == 2 and "product root unavailable" in result.stderr
 
@@ -220,15 +246,10 @@ def test_dirt_audit_does_not_select_release_as_default_product(release, product,
 
 
 @pytest.mark.parametrize("mode", CLAUDE_GUARD_MODES)
-def test_native_claude_guard_takes_its_interpreter_from_the_primary_not_path(release, product, tmp_path, mode):
-    """Defect class: a Claude guard delegator run by the ``python3`` PATH selects, which cannot
-    import the release, refused every tool call. With no venv on PATH the native guard command
-    runs under the configured primary's interpreter, still refuses what its guard refuses, and
-    refuses when that interpreter is unavailable."""
-    shutil.copytree(release.parent / "venv", product / ".venv", symlinks=True)
-    argv = shlex.split(native_hook_command(mode))
-    env = {"PATH": "/usr/bin:/bin", "HOME": str(tmp_path), "CLAUDE_PROJECT_DIR": str(product),
-           "LEARN_UKRAINIAN_PRIMARY_REPO_ROOT": str(product), "XDG_STATE_HOME": str(tmp_path / "state")}
+def test_native_claude_guard_takes_the_bound_interpreter(release, product, tmp_path, mode, binding):
+    """A native command runs the installed guard even with only system tools on PATH."""
+    argv = ["/bin/sh", "-c", native_hook_command(mode, python=binding.python)]
+    env = {**binding.env, "PATH": os.defpath, "HOME": str(tmp_path), "XDG_STATE_HOME": str(tmp_path / "xdg")}
 
     def run(command, **extra):
         payload = {"tool_name": "Bash", "tool_input": {"command": command}, "cwd": str(product),
@@ -250,7 +271,7 @@ def test_native_claude_guard_takes_its_interpreter_from_the_primary_not_path(rel
         check=True, env=_without_caller_roots(),
     )
     unloadable = run("git status", LEARN_UKRAINIAN_PYTHON=str(bare / "bin/python"))
-    assert unloadable.returncode == 2 and "cannot load the installed guard" in unloadable.stderr, unloadable.stderr
+    assert unloadable.returncode == 2 and "[legacy_conflict]" in unloadable.stderr, unloadable.stderr
 
 
 def test_bare_healer_does_not_heal_release_instead_of_product(release, product):
@@ -326,8 +347,8 @@ def run_shell(path, *args, env=None, cwd):
 
 @pytest.mark.parametrize("name", SHELL_HOOKS)
 @pytest.mark.parametrize("layout", ["primary", "no-git", "empty-git", "hook-location", "empty-git-planted", "relative-root"])
-@pytest.mark.parametrize("interpreter", ["configured", "primary-venv"])
-def test_shell_hook_refuses_location_derived_project(release, product, tmp_path, name, layout, interpreter):
+@pytest.mark.parametrize("interpreter", ["configured", "unbound"])
+def test_shell_hook_refuses_location_derived_project(release, product, tmp_path, name, layout, interpreter, binding):
     """Premature root refusal must yield to the rule, without trusting hook location."""
     cwd = product / "nested" if layout == "primary" else tmp_path / layout
     cwd.mkdir()
@@ -359,8 +380,9 @@ def test_shell_hook_refuses_location_derived_project(release, product, tmp_path,
     }
     if layout == "relative-root":
         env["LU_PRODUCT_ROOT"] = "relative"
+    env.pop("LEARN_UKRAINIAN_PRIMARY_REPO_ROOT")
     if interpreter == "configured":
-        env["LEARN_UKRAINIAN_PYTHON"] = str(release.parent / "venv/bin/python")
+        env.update(binding.env)
     result = subprocess.run(
         ["bash", "-x", str(hooks / name)],
         check=False, input=json.dumps({"session_id": "release-root", "hook_event_name": "Stop",
@@ -368,7 +390,7 @@ def test_shell_hook_refuses_location_derived_project(release, product, tmp_path,
         text=True, capture_output=True, cwd=cwd, env=env, timeout=30,
     )
     assert not marker.exists(), result.stderr
-    if layout == "primary":
+    if interpreter == "configured" and layout in {"primary", "no-git", "hook-location"}:
         assert result.returncode == 0, result.stderr
         assert f"export LU_PRODUCT_ROOT={product}\n" in result.stderr
     else:
@@ -376,21 +398,13 @@ def test_shell_hook_refuses_location_derived_project(release, product, tmp_path,
         assert "export LU_PRODUCT_ROOT=" not in result.stderr
 
 
-def test_shell_hook_runs_the_configured_product(release, product):
+def test_shell_hook_runs_the_configured_product(release, product, binding):
     """Location-derived project root: the configured product's helper must be the one run."""
+    primary = Path(binding.data["repos"]["machinery"])
     marker = product / "stamped"
-    (product / ".githooks").mkdir()
-    (product / ".githooks/pytest_stamp.py").write_text(
-        f"open({str(marker)!r}, 'w').write('ok')\n"
-    )
-    (product / ".venv/bin").mkdir(parents=True)
-    (product / ".venv/bin/python").symlink_to(sys.executable)
-    result = run_shell(
-        release / HOOKS / "stamp-pytest.sh",
-        env={"LU_PRODUCT_ROOT": str(product), "LEARN_UKRAINIAN_PRIMARY_REPO_ROOT": str(product),
-             "LEARN_UKRAINIAN_PYTHON": str(release.parent / "venv/bin/python")},
-        cwd=product.parent,
-    )
+    (primary / ".githooks").mkdir()
+    (primary / ".githooks/pytest_stamp.py").write_text(f"open({str(marker)!r}, 'w').write('ok')\n")
+    result = run_shell(release / HOOKS / "stamp-pytest.sh", env=binding.env, cwd=product.parent)
     assert result.returncode == 0, result.stderr
     assert marker.read_text() == "ok"
 
@@ -419,7 +433,7 @@ def test_adapter_requires_a_selected_consumer(release, product, name):
         assert f"{name}: spell the option --project-root in full" in result.stderr
 
 
-def test_deployed_session_setup_runs_installed_release_code(release, product):
+def test_deployed_session_setup_runs_installed_release_code(release, product, binding):
     """Code taken from the consumer checkout: a deployed hook found no lu_machinery (R62)."""
     hooks = product / ".claude/hooks"
     hooks.mkdir(parents=True)
@@ -443,11 +457,15 @@ def test_deployed_session_setup_runs_installed_release_code(release, product):
     ).stdout.strip()
     dependencies = "\n".join(path for path in sys.path if path.endswith("site-packages"))
     Path(purelib, "release.pth").write_text(f"{release}\n{dependencies}\n")
+    python = product / ".venv/bin/python"
+    binding.data["runtime"]["python"] = str(python)
+    binding.env["LU_PYTHON"] = str(python)
+    binding.write()
     env = {
+        **binding.env,
         "SESSION_START_BUDGET_SECONDS": "60",
         "LEARN_UKRAINIAN_CLAUDEX_RUN_ID": "release-root-run",
         "LEARN_UKRAINIAN_CLAUDEX_LAUNCH_GENERATION": "1",
-        "LEARN_UKRAINIAN_PRIMARY_REPO_ROOT": str(product),
     }
     result = run_shell(
         hooks / "session-setup.sh",
@@ -464,7 +482,7 @@ def test_deployed_session_setup_runs_installed_release_code(release, product):
         cwd=product,
     )
     assert result.returncode == 1
-    assert "no installed lu_machinery release" in result.stderr
+    assert "No module named 'lu_machinery'" in result.stderr
 
 
 # Hooks that run machinery code, with a stdin payload that reaches it (#100 R69).
@@ -565,7 +583,7 @@ def consumer_with_decoy(product, release):
 
 @pytest.mark.parametrize("name", CODE_HOOKS)
 def test_deployed_hook_runs_release_code_not_the_project_copy(
-    marked_release, product, tmp_path, name
+    marked_release, product, tmp_path, name, binding
 ):
     """Code taken from $PROJECT_DIR/lu_machinery: a deployed hook ran the consumer's copy (R69).
 
@@ -573,14 +591,22 @@ def test_deployed_hook_runs_release_code_not_the_project_copy(
     so a hook that took its code from beside itself sourced the decoy there (R51).
     """
     consumer_with_decoy(product, marked_release)
+    version = binding.data["runtime"]["lu_machinery"]
+    metadata = marked_release / f"lu_machinery-{version}.dist-info"
+    metadata.mkdir(exist_ok=True)
+    (metadata / "METADATA").write_text(f"Name: lu-machinery\nVersion: {version}\n")
+    python = product / ".venv/bin/python"
+    binding.data["runtime"]["python"] = str(python)
+    binding.env["LU_PYTHON"] = str(python)
+    binding.write()
     for hooks in (product / ".claude/hooks", product / HOOKS):
         hooks.mkdir(parents=True)
         for helper in (name, "context-rollover-lib.sh", "context-hook-state.py"):
             shutil.copy2(SOURCE / HOOKS / helper, hooks / helper)
-        _run_code_hook(hooks, product, tmp_path / hooks.parent.name, name)
+        _run_code_hook(hooks, product, tmp_path / hooks.parent.name, name, binding.env)
 
 
-def _run_code_hook(hooks, product, tmp_path, name):
+def _run_code_hook(hooks, product, tmp_path, name, binding_env):
     tmp_path.mkdir()
     transcript = tmp_path / "transcript.jsonl"
     transcript.write_text(
@@ -594,10 +620,10 @@ def _run_code_hook(hooks, product, tmp_path, name):
     decoy_log, release_log = tmp_path / "decoy.log", tmp_path / "release.log"
     closed = "http://127.0.0.1:9"
     env = {
+        **binding_env,
         "PATH": os.environ["PATH"],
         "HOME": str(tmp_path),
         "CLAUDE_PROJECT_DIR": str(product),
-        "LEARN_UKRAINIAN_PRIMARY_REPO_ROOT": str(product),
         "LU_TEST_DECOY_LOG": str(decoy_log),
         "LU_TEST_RELEASE_LOG": str(release_log),
         "LU_MONITOR_LOOPBACK": closed,
@@ -620,16 +646,17 @@ def _run_code_hook(hooks, product, tmp_path, name):
 
 
 @pytest.mark.parametrize("checkout", ["primary", "linked-worktree"])
-def test_codex_entry_hands_hooks_the_payload_project(release, product, checkout):
+def test_codex_entry_hands_hooks_the_payload_project(release, product, checkout, binding):
     """Location-derived project: the Codex entry gave PostToolUse hooks its own tree (R70).
 
     The stamp helper the hook runs is the configured primary's, never the product
     checkout's: a linked worktree's tracked copy is the worker's to rewrite, and the hook
     runs outside any provider sandbox (#100).
     """
+    primary = Path(binding.data["repos"]["machinery"])
     marker = product / "stamped"
-    (product / ".githooks").mkdir()
-    (product / ".githooks/pytest_stamp.py").write_text(
+    (primary / ".githooks").mkdir()
+    (primary / ".githooks/pytest_stamp.py").write_text(
         f"open({str(marker)!r}, 'w').write('ok')\n"
     )
     (product / ".venv/bin").mkdir(parents=True)
@@ -657,17 +684,14 @@ def test_codex_entry_hands_hooks_the_payload_project(release, product, checkout)
         text=True,
         capture_output=True,
         cwd=checkout_root,
-        env={"PATH": os.environ["PATH"], "HOME": str(product.parent),
-             "LU_PRODUCT_ROOT": str(checkout_root),
-             "LEARN_UKRAINIAN_PRIMARY_REPO_ROOT": str(product),
-             "LEARN_UKRAINIAN_PYTHON": str(release.parent / "venv/bin/python")},
+        env={**binding.env, "PATH": os.environ["PATH"], "HOME": str(product.parent)},
     )
     assert marker.read_text() == "ok", result.stderr
     assert not planted.exists(), result.stderr
     assert not (release / ".githooks").exists()
 
 
-def test_codex_entry_audit_child_keeps_the_tree_off_sys_path(product, tmp_path):
+def test_codex_entry_audit_child_keeps_the_tree_off_sys_path(product, tmp_path, binding):
     """Tree root on sys.path: the audit child imported a stdlib-named file from it (#161 F1)."""
     tree = tmp_path / "tree"
     shutil.copytree(
@@ -709,11 +733,10 @@ def test_codex_entry_audit_child_keeps_the_tree_off_sys_path(product, tmp_path):
         capture_output=True,
         cwd=product,
         env={
+            **binding.env,
             "PATH": os.environ["PATH"],
             "HOME": str(tmp_path),
             "LU_PRODUCT_ROOT": str(product),
-            "LU_STATE_ROOT": str(tmp_path),
-            "LEARN_UKRAINIAN_PRIMARY_REPO_ROOT": str(product),
         },
     )
     assert not marker.exists(), result.stderr
@@ -732,7 +755,7 @@ HOOK_BOOTSTRAP_ENTRIES = {
 
 @pytest.mark.parametrize("anchor", ["configured", "unset", "missing-interpreter"])
 @pytest.mark.parametrize("entry", sorted(HOOK_BOOTSTRAP_ENTRIES))
-def test_hook_bootstrap_takes_the_interpreter_only_from_the_configured_primary(release, product, tmp_path, entry, anchor):
+def test_hook_bootstrap_uses_the_bound_interpreter(release, product, tmp_path, entry, anchor, binding):
     """Defect class: a checkout whose own Git metadata claims to be a primary supplied the hook
     interpreter; every bootstrap entry must take it only from the configured primary (#100)."""
     shutil.copytree(release.parent / "venv", product / ".venv", symlinks=True)
@@ -752,13 +775,13 @@ def test_hook_bootstrap_takes_the_interpreter_only_from_the_configured_primary(r
     env = {"PATH": os.environ["PATH"], "HOME": str(tmp_path), "TMPDIR": str(tmp_path),
            "LU_PRODUCT_ROOT": str(worktree), "LU_DRIVER_STATE_FILE": str(tmp_path / "driver-state"),
            "SESSION_HANDOFF_AGENT": "worker"}
+    env["LU_PRODUCT_ROOT"] = str(product)
     if anchor != "unset":
-        env["LEARN_UKRAINIAN_PRIMARY_REPO_ROOT"] = str(product)
-        env["LU_STATE_ROOT"] = str(tmp_path)
+        env.update(binding.env)
     if anchor == "missing-interpreter":
-        env["LEARN_UKRAINIAN_PYTHON"] = str(tmp_path / "absent-python")
+        env["LU_PYTHON"] = str(tmp_path / "absent-python")
     if entry == "native-hook":
-        argv = shlex.split(native_hook_command("codex-pre-tool-use"))
+        argv = ["/bin/sh", "-c", native_hook_command("codex-pre-tool-use", python=binding.python)]
     elif entry == "git-hook-lib":
         (worktree / "lu_machinery").symlink_to(release / "lu_machinery", target_is_directory=True)
         argv = ["bash", "-c", 'source "$1" && run_project_python -I -c "print(1)"', "lib",
@@ -777,7 +800,14 @@ def test_hook_bootstrap_takes_the_interpreter_only_from_the_configured_primary(r
     # Without the anchor every entry refuses (a non-zero exit, or AGY's deny answer); with it,
     # each one runs. Marker absence alone would also pass a fail-open or always-refusing hook.
     refused = result.returncode != 0 or '"decision":"deny"' in result.stdout
-    if anchor == "configured":
+    if anchor == "configured" and entry == "git-hook-lib":
+        assert refused and "[invocation_repo_unbound]" in result.stderr, result.stderr
+        admitted = subprocess.run(
+            argv, check=False, input=json.dumps(payload), text=True, capture_output=True,
+            cwd=product, env=env, timeout=60,
+        )
+        assert admitted.returncode == 0 and admitted.stdout == "1\n", admitted.stderr
+    elif anchor == "configured":
         assert not refused and "HOOK-BOOTSTRAP-FAILED" not in result.stdout + result.stderr, (
             result.returncode, result.stdout, result.stderr)
         if entry == "codex-entry":
@@ -786,7 +816,7 @@ def test_hook_bootstrap_takes_the_interpreter_only_from_the_configured_primary(r
             denied = subprocess.run(argv, check=False, input=json.dumps(payload), text=True, capture_output=True,
                                     cwd=worktree, env=env, timeout=60)
             assert denied.returncode == 2, (denied.stdout, denied.stderr)
-            assert "enforce-venv" in denied.stderr or ".venv/bin/python" in denied.stderr, denied.stderr
+            assert f"Run this command instead:\n  {binding.python} -c 1" in denied.stderr, denied.stderr
             assert "CODEX-HOOK-POLICY-FAILED" not in denied.stderr, denied.stderr
 
             # Exercise real import failures and non-JSON output in a private release copy.
@@ -809,18 +839,14 @@ def test_hook_bootstrap_takes_the_interpreter_only_from_the_configured_primary(r
     else:
         assert refused, (result.returncode, result.stdout, result.stderr)
         if entry == "git-hook-lib":
-            assert "Git hook error: hook context unavailable" in result.stderr
-            step = "interpreter" if anchor == "missing-interpreter" else "state"
-            assert f"step={step}" in result.stderr
+            assert "[missing_interpreter_binding]" in result.stderr
 
 
-def test_hook_shell_ordinary_session_falls_back_without_temporary_files(release, product, tmp_path):
+def test_hook_shell_ordinary_session_falls_back_without_temporary_files(release, product, tmp_path, binding):
     """Port PR 13005 S3: an ordinary stop hook allows without driver scratch."""
-    env = {"PATH": "/usr/bin:/bin", "HOME": str(tmp_path),
-           "LU_PRODUCT_ROOT": str(product),
-           "LEARN_UKRAINIAN_PRIMARY_REPO_ROOT": str(product),
+    env = {**binding.env, "PATH": "/usr/bin:/bin", "HOME": str(tmp_path),
            "LEARN_UKRAINIAN_PYTHON": str(release.parent / "venv/bin/python")}
-    result = subprocess.run(shlex.split(native_hook_command("agy-stop-hook")),
+    result = subprocess.run(["/bin/sh", "-c", native_hook_command("agy-stop-hook", python=binding.python)],
                             check=False, input="{}", text=True, capture_output=True,
                             cwd=product, env=env, timeout=30)
     assert result.returncode == 0, result.stderr
@@ -828,16 +854,13 @@ def test_hook_shell_ordinary_session_falls_back_without_temporary_files(release,
     assert result.stderr == ""
 
 
-def test_hook_driver_without_tmpdir_uses_the_system_temporary_directory(release, product, tmp_path):
+def test_hook_driver_without_tmpdir_uses_the_system_temporary_directory(release, product, tmp_path, binding):
     """Defect class: an ordinary unset TMPDIR refused a driver hook before it ran."""
-    env = {"PATH": "/usr/bin:/bin", "HOME": str(tmp_path),
-           "LU_PRODUCT_ROOT": str(product),
-           "LU_STATE_ROOT": str(tmp_path),
-           "LEARN_UKRAINIAN_PRIMARY_REPO_ROOT": str(product),
+    env = {**binding.env, "PATH": "/usr/bin:/bin", "HOME": str(tmp_path),
            "LEARN_UKRAINIAN_PYTHON": str(release.parent / "venv/bin/python"),
            "LU_DRIVER_STATE_FILE": str(tmp_path / "driver-state"),
            "SESSION_HANDOFF_AGENT": "worker"}
-    result = subprocess.run(shlex.split(native_hook_command("agy-stop-hook")),
+    result = subprocess.run(["/bin/sh", "-c", native_hook_command("agy-stop-hook", python=binding.python)],
                             check=False, input="{}", text=True, capture_output=True,
                             cwd=product, env=env, timeout=30)
     assert result.returncode == 0, result.stderr
@@ -845,19 +868,16 @@ def test_hook_driver_without_tmpdir_uses_the_system_temporary_directory(release,
     assert result.stderr == ""
 
 
-def test_workspace_session_audits_the_configured_primary_and_names_its_interpreter(release, product, tmp_path):
+def test_workspace_session_audits_the_configured_primary_and_names_its_interpreter(release, product, tmp_path, binding):
     """Defect class: a guard silently skipping the protected checkouts a non-Git project directory
     (the CTO workspace) can reach, or failing before its diagnostic. With LU_PRODUCT_ROOT unset and a
     dedicated non-Git LU_STATE_ROOT, the native audit hook records dirt in the configured primary
     instead of blocking every call, and enforce-venv blocks bare python with the anchor's interpreter."""
-    workspace, state = tmp_path / "cto-workspace", tmp_path / "state"
-    workspace.mkdir()
-    state.mkdir()
+    workspace = Path(binding.data["cto"]["workspace"])
     python = str(release.parent / "venv/bin/python")
-    env = {"PATH": "/usr/bin:/bin", "HOME": str(tmp_path), "CLAUDE_PROJECT_DIR": str(workspace),
-           "LU_STATE_ROOT": str(state), "LEARN_UKRAINIAN_PRIMARY_REPO_ROOT": str(product),
+    env = {**binding.env, "PATH": "/usr/bin:/bin", "HOME": str(tmp_path), "CLAUDE_PROJECT_DIR": str(workspace),
            "LEARN_UKRAINIAN_PYTHON": python, "XDG_STATE_HOME": str(tmp_path / "xdg")}
-    audit = shlex.split(native_hook_command("claude-audit-hook"))
+    audit = ["/bin/sh", "-c", native_hook_command("claude-audit-hook", python=binding.python)]
     payload = {"tool_name": "Bash", "tool_input": {"command": "touch x"}, "cwd": str(workspace),
                "hook_event_name": "PreToolUse", "session_id": "workspace", "tool_use_id": "audit"}
     before = subprocess.run(audit, check=False, input=json.dumps(payload), text=True, capture_output=True,
@@ -902,15 +922,10 @@ def test_workspace_session_audits_the_configured_primary_and_names_its_interpret
         "audit-primary-checkout-dirt.py",
     ],
 )
-def test_git_checkout_hooks_use_configured_state_root(release, product, tmp_path, layout, setting, entry):
+def test_git_checkout_hooks_use_configured_state_root(release, product, tmp_path, layout, setting, entry, binding):
     """Defect class: native hook readers and writers taking runtime state from checkout identity."""
-    state = tmp_path / "runtime state"
-    state.mkdir()
-    primary = product
-    if setting == "LEARN_UKRAINIAN_STATE_ROOT":
-        # The native hook's compatibility alias can name the configured primary.
-        subprocess.run(["git", "-C", str(state), "init", "-q"], check=True, env=_git_env(), timeout=10)
-        primary = state
+    state = Path(binding.data["state_root"])
+    primary = Path(binding.data["repos"]["machinery"])
     project = product
     if layout == "worktree":
         project = product / ".worktrees/dispatch/worker/task"
@@ -928,9 +943,9 @@ def test_git_checkout_hooks_use_configured_state_root(release, product, tmp_path
     interpreter = str(release.parent / "venv/bin/python")
     sid = "root-probe"
     env = {
+        **binding.env,
         "PATH": "/usr/bin:/bin", "HOME": str(tmp_path), "TMPDIR": str(tmp_path),
         "CLAUDE_PROJECT_DIR": str(project), "CODEX_CANONICAL_REPO_ROOT": str(product),
-        "LEARN_UKRAINIAN_PRIMARY_REPO_ROOT": str(primary), "LEARN_UKRAINIAN_PYTHON": interpreter,
         setting: str(state), "SESSION_START_BUDGET_SECONDS": "30",
     }
     if layout == "subdirectory":
@@ -945,7 +960,7 @@ def test_git_checkout_hooks_use_configured_state_root(release, product, tmp_path
     if entry == "context-rollover-lib.sh":
         argv = [
             "bash", "-c",
-            'source "$1" && context_machinery_bootstrap "$CLAUDE_PROJECT_DIR" && context_canonical_root "$PROJECT_DIR"',
+            'source "$1" && context_machinery_bootstrap && printf "%s\\n" "$PROJECT_HOOK_STATE_ROOT"',
             entry, str(hook),
         ]
     elif entry in {"session-setup.sh", "enforce-venv.sh"}:
@@ -987,21 +1002,27 @@ def test_git_checkout_hooks_use_configured_state_root(release, product, tmp_path
         )
         env["SESSION_BOUNDED_RUNNER"] = str(runner)
     elif entry == "check-agent-inbox.sh":
-        # The inbox hook sees one pending delivery without touching a live store.
-        inbox_python = tmp_path / "inbox-python"
-        inbox_python.write_text(
-            "#!/bin/sh\n"
-            'if [ "$1" = -I ] && [ "$2" = -m ] && [ "$3" = lu_machinery.fleet_comms ]; then\n'
-            """  printf '%s\\n' '{"probe":"ok","count":1,"ids":["fixture-delivery"]}'\n"""
-            "  exit 0\n"
-            "fi\n"
-            f'exec {shlex.quote(interpreter)} "$@"\n'
-        )
-        inbox_python.chmod(0o755)
-        env["LEARN_UKRAINIAN_PYTHON"] = str(inbox_python)
+        # Seed one pending delivery in the fixture's read-only inbox database.
+        plane = state / "batch_state/fleet-comms/v1"
+        plane.mkdir(parents=True)
+        recipient = "codex-infra"
+        env["LEARN_UK_HOOK_RECIPIENT"] = recipient
+        with closing(sqlite3.connect(plane / "comms.sqlite3")) as connection:
+            connection.executescript("""
+                CREATE TABLE authority_deliveries
+                    (delivery_id TEXT, message_id TEXT, recipient TEXT, state TEXT, deadline_at TEXT);
+                CREATE TABLE comms_messages (message_id TEXT, kind TEXT);
+                CREATE TABLE authority_idempotency (namespace TEXT);
+                CREATE TABLE authority_wake_receipts (delivery_id TEXT, state TEXT);
+            """)
+            message_id = "message_" + "1" * 32
+            connection.execute("INSERT INTO comms_messages VALUES (?, 'request')", (message_id,))
+            connection.execute("INSERT INTO authority_deliveries VALUES (?, ?, ?, 'queued', NULL)",
+                               ("fixture-delivery", message_id, recipient))
+            connection.commit()
         payload["hook_event_name"] = "UserPromptSubmit"
     elif entry == "audit-primary-checkout-dirt.py":
-        argv = shlex.split(native_hook_command("claude-audit-hook"))
+        argv = ["/bin/sh", "-c", native_hook_command("claude-audit-hook", python=binding.python)]
         env["XDG_STATE_HOME"] = str(tmp_path / "xdg")
         payload.update(
             hook_event_name="PreToolUse", tool_name="Bash", tool_use_id="audit-call",
@@ -1035,7 +1056,7 @@ def test_git_checkout_hooks_use_configured_state_root(release, product, tmp_path
         assert f"Run this command instead:\n  {interpreter} -V" in result.stderr, output
     elif entry == "check-agent-inbox.sh":
         deduplication_file, = (state / ".agent/runtime").glob("inbox-*.ids")
-        assert deduplication_file.read_text() == "fixture-delivery\n", output
+        assert deduplication_file.read_text() == message_id + "\n", output
     elif entry == "audit-primary-checkout-dirt.py":
         snapshots = state / ".agent/primary-dirt-audit/snapshots"
         assert len(list(snapshots.glob("*.json"))) == 1, output

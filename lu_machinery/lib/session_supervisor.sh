@@ -53,70 +53,6 @@ stream_id_for_epic() {
   fi
 }
 
-# _canonical_state_root <repo-root>
-# Print the durable state root that owns shared .agent runtime state.
-# Honors an explicit LU_STATE_ROOT (or compatibility alias
-# LEARN_UKRAINIAN_STATE_ROOT), allowing a dedicated non-Git directory while
-# refusing alias conflicts, relative paths, missing directories, and broken or
-# linked-worktree .git entries. Otherwise honors an explicit
-# LU_PRIMARY_REPO_ROOT (or compatibility alias) or resolves <repo-root>'s
-# primary checkout via project_interpreter.sh (never by git, #9121).
-_canonical_state_root() {
-  local repo_root="${1:-$(pwd)}"
-  local primary configured_state new_state old_state new_primary old_primary configured_primary
-  # shellcheck source=scripts/lib/project_interpreter.sh
-  source "$(dirname "${BASH_SOURCE[0]}")/project_interpreter.sh" || return 1
-
-  new_state="${LU_STATE_ROOT:-}"
-  old_state="${LEARN_UKRAINIAN_STATE_ROOT:-}"
-  if [ -n "$new_state" ] && [ -n "$old_state" ] && [ "$new_state" != "$old_state" ]; then
-    echo "Error: LU_STATE_ROOT and LEARN_UKRAINIAN_STATE_ROOT are set to different values" >&2
-    return 1
-  fi
-  configured_state="${new_state:-$old_state}"
-
-  new_primary="${LU_PRIMARY_REPO_ROOT:-}"
-  old_primary="${LEARN_UKRAINIAN_PRIMARY_REPO_ROOT:-}"
-  if [ -n "$new_primary" ] && [ -n "$old_primary" ] && [ "$new_primary" != "$old_primary" ]; then
-    echo "Error: LU_PRIMARY_REPO_ROOT and LEARN_UKRAINIAN_PRIMARY_REPO_ROOT are set to different values" >&2
-    return 1
-  fi
-  configured_primary="${new_primary:-$old_primary}"
-
-  if [ -n "$configured_primary" ]; then
-    if [[ "$configured_primary" != /* ]] || ! primary="$(_project_physical_dir "$configured_primary")" || ! _project_hook_git_layout "$primary"; then
-      echo "Error: configured primary checkout is not a real primary Git directory: ${configured_primary}" >&2
-      return 1
-    fi
-  fi
-
-  if [ -n "$configured_state" ]; then
-    if [[ "$configured_state" != /* ]] || ! configured_state="$(_project_physical_dir "$configured_state")"; then
-      echo "Error: state root must be an absolute existing directory: ${configured_state}" >&2
-      return 1
-    fi
-    if [ -e "$configured_state/.git" ] || [ -L "$configured_state/.git" ]; then
-      if ! _project_hook_git_layout "$configured_state"; then
-        echo "Error: state root .git is not a real primary Git directory: ${configured_state}" >&2
-        return 1
-      fi
-    fi
-    printf '%s\n' "$configured_state"
-    return 0
-  fi
-
-  if [ -n "$configured_primary" ]; then
-    printf '%s\n' "$primary"
-    return 0
-  fi
-
-  if ! primary="$(project_primary_root_resolve "$repo_root")" || [ ! -d "$primary/.git" ]; then
-    echo "Error: cannot resolve canonical state root for ${repo_root}" >&2
-    return 1
-  fi
-  printf '%s\n' "$primary"
-}
-
 # _iso_timestamp
 # Print current UTC timestamp in ISO-8601 Z format.
 _iso_timestamp() {
@@ -155,27 +91,8 @@ claim_session_supervisor_env() {
   local launcher="$7"
   local epic="$8"
 
-  local state_root
-  state_root="$(_canonical_state_root "$project_dir")" || return 1
-  local python_bin configured_python configured_primary
-  if [ -n "${LU_PYTHON:-}" ] && [ -n "${LEARN_UKRAINIAN_PYTHON:-}" ] && [ "$LU_PYTHON" != "$LEARN_UKRAINIAN_PYTHON" ]; then
-    echo "Error: LU_PYTHON and LEARN_UKRAINIAN_PYTHON are set to different values" >&2
-    return 1
-  fi
-  configured_python="${LU_PYTHON:-${LEARN_UKRAINIAN_PYTHON:-}}"
-  if [ -n "$configured_python" ]; then
-    python_bin="$(LEARN_UKRAINIAN_PYTHON="$configured_python" project_interpreter_resolve "$state_root")" || return 1
-  elif [ -d "$state_root/.git" ]; then
-    python_bin="$(project_interpreter_resolve "$state_root")" || return 1
-  else
-    configured_primary="${LU_PRIMARY_REPO_ROOT:-${LEARN_UKRAINIAN_PRIMARY_REPO_ROOT:-}}"
-    if [ -n "$configured_primary" ]; then
-      python_bin="$(project_interpreter_resolve "$configured_primary")" || return 1
-    else
-      echo "Error: non-Git state root requires LU_PYTHON, LEARN_UKRAINIAN_PYTHON, or LU_PRIMARY_REPO_ROOT" >&2
-      return 1
-    fi
-  fi
+  project_host_context --directory "$project_dir" || return 1
+  local state_root="$LU_STATE_ROOT" python_bin="$LU_PYTHON"
 
   local supervisor_tmp release_tmp
   supervisor_tmp="$(mktemp)"

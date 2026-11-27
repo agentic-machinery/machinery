@@ -25,6 +25,7 @@ from lu_machinery.session_streams.inventory import (
 from tests.helpers.monitor import UNREACHABLE_MONITOR_URL
 from tests.helpers.product_tree import configured_roots as configured_roots
 from tests.launcher_sandbox import (
+    bind_launcher_environment,
     copy_interactive_launcher_checkout,
     launcher_environment,
 )
@@ -289,7 +290,7 @@ def test_hermetic_launcher_unknown_selector_fails_closed_contract(
     script_path = _REPO_ROOT / launcher
     assert script_path.is_file(), f"Launcher missing: {launcher}"
 
-    clean_env = launcher_environment()
+    clean_env = bind_launcher_environment(_REPO_ROOT, launcher_environment())
 
     result = subprocess.run(
         ["bash", str(script_path), unknown_arg],
@@ -394,9 +395,6 @@ def _run_session_setup_hook(tmp_path: Path, session_epic: str, driver_state: str
         "SESSION_EPIC": session_epic,
         "CLAUDE_PROFILE_RESOLVER_SH": str(machinery_path('lib/profile_resolver.sh')),
         "CLAUDE_PROFILE_RESOLVER_PY": str(machinery_path('lib/context_profiles.py')),
-        "LEARN_UKRAINIAN_PYTHON": sys.executable,
-        "LEARN_UKRAINIAN_PRIMARY_REPO_ROOT": str(project_dir),
-        "LEARN_UKRAINIAN_STATE_ROOT": str(project_dir),
         "LU_PRODUCT_ROOT": str(project_dir),
         "CLAUDE_SESSION_RECORD_SCRIPT": str(machinery_path('lib/session_record.py')),
         "CLAUDE_SESSION_RECORD_PYTHON": sys.executable,
@@ -410,7 +408,8 @@ def _run_session_setup_hook(tmp_path: Path, session_epic: str, driver_state: str
     try:
         result = subprocess.run(
             ["bash", str(hook_path)],
-            env=env,
+            env=bind_launcher_environment(project_dir, env),
+            cwd=project_dir,
             capture_output=True,
             text=True,
             timeout=15,
@@ -462,7 +461,7 @@ def test_session_setup_hook_names_the_db_note_as_handoff_authority(tmp_path: Pat
 @pytest.fixture
 def _configured_launcher_roots(configured_roots, monkeypatch):
     """Use the shared hermetic product and primary trees for launcher calls."""
-    root = configured_roots.primary / "launcher-checkout"
+    root = configured_roots.primary.with_name(configured_roots.primary.name + "-launcher")
     copy_interactive_launcher_checkout(root)
     monkeypatch.setattr(sys.modules[__name__], "_REPO_ROOT", root)
     return configured_roots

@@ -20,6 +20,7 @@ import functools
 import importlib.util
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -31,6 +32,8 @@ from lu_machinery.common.repo_root import machinery_path, machinery_root
 from lu_machinery.common.scratch import ensure_scratch_root
 from tests.helpers import machinery_module, machinery_package, product_checkout
 from tests.helpers.monitor import UNREACHABLE_MONITOR_URL, UNREACHABLE_TOOL_TIMING_URL
+from tests.host_context.conftest import build_host_layout
+from tests.host_context.conftest import git as fixture_git
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -238,6 +241,53 @@ def launcher_environment(
         env.update(values)
     env.update(extra)
     return env
+
+
+def bind_driver_protocol_fixture(root: Path, runtime: Path, *, state: Path | None = None) -> None:
+    """Run the lifecycle against its scripted supervisor, after supplying its test binding."""
+    if state is None:
+        state = root.parent / "driver-state"
+        state.mkdir(mode=0o700, exist_ok=True)
+    library = root / "lu_machinery/lib/project_interpreter.sh"
+    with library.open("a", encoding="utf-8") as output:
+        output.write(
+            "\nproject_host_context() {\n"
+            f"  export LU_STATE_ROOT={shlex.quote(str(state))}\n"
+            f"  export LU_PRIMARY_REPO_ROOT={shlex.quote(str(root))}\n"
+            f"  export LU_PRODUCT_ROOT={shlex.quote(str(root))}\n"
+            f"  export LU_PYTHON={shlex.quote(str(runtime))}\n"
+            '  worktree_root="$(pwd -P)"\n'
+            f"  main_root={shlex.quote(str(root))}\n"
+            "}\n"
+        )
+
+
+def bind_launcher_environment(
+    product: Path, env: dict[str, str], *, overrides: Mapping[str, str] | None = None,
+) -> dict[str, str]:
+    """Give a synthetic launcher checkout a full binding and detached state."""
+    if "LU_HOST_CONTEXT" in env:
+        return env
+    layout_dir = Path(tempfile.mkdtemp(prefix="host-binding-", dir=env.get("TMPDIR") or ensure_scratch_root()))
+    layout = build_host_layout(layout_dir)
+    origin = subprocess.run(
+        ["git", "-C", str(product), "config", "--get", "remote.origin.url"],
+        capture_output=True, check=False, timeout=10, env={"PATH": os.defpath},
+    )
+    if origin.returncode == 1:
+        fixture_git(product, "remote", "add", "origin", "https://github.com/learn-ukrainian/learn-ukrainian.github.io.git")
+    layout.data["repos"]["public"] = str(product)
+    state = Path(env.get("LU_STATE_ROOT", layout.data["state_root"]))
+    layout.data["state_root"] = str(state)
+    layout.data["monitor_url"] = env.get("LU_MONITOR_LOOPBACK", layout.data["monitor_url"])
+    layout.write()
+    bound = {**env, **layout.env}
+    for key in ("FLEET_COMMS_ROOT", "LU_TASKS_DIR", "LU_GITHUB_CACHE_DIR"):
+        if key not in (overrides or {}):
+            bound.pop(key, None)
+    if "LU_PYTHON" not in (overrides or {}):
+        bound["LU_PYTHON"] = str(layout.python)
+    return bound
 
 
 def copy_launcher_sources(root: Path) -> None:

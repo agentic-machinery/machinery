@@ -20,7 +20,7 @@ import pytest
 from lu_machinery.common.repo_root import machinery_path
 from tests.helpers import machinery_package
 from tests.helpers.product_tree import configured_roots as configured_roots
-from tests.launcher_sandbox import copy_launcher_sources, launcher_environment
+from tests.launcher_sandbox import bind_driver_protocol_fixture, copy_launcher_sources, launcher_environment
 from tests.wait_helpers import wait_until
 
 pytestmark = [pytest.mark.usefixtures("configured_roots"), pytest.mark.usefixtures("hermetic_monitor")]
@@ -109,7 +109,8 @@ sleep 300 & LC_DRIVER_RENEW_PID=$!
 trap 'launcher_forward_driver_signal {name} {expected}' {name}
 IFS= read -r _ < "$(printf 'armed\\n' > armed; IFS= read -r _ < "$TEST_SIGNALLED"; printf '%s' "$TEST_PARK")"
 """)
-    env = {**launcher_environment(), "TEST_GATE": str(gate), "TEST_PARK": str(park),
+    env = {**launcher_environment(LU_PYTHON=str(tmp_path / ".venv/bin/python")),
+           "TEST_GATE": str(gate), "TEST_PARK": str(park),
            "TEST_SIGNALLED": str(signalled), "TEST_ATTEMPTS": str(attempts),
            "TEST_CLOSED": str(closed), "TEST_CLIENT_PID": str(client_pid)}
     process = subprocess.Popen(["bash", str(launcher)], cwd=tmp_path, env=env, start_new_session=True,
@@ -312,6 +313,7 @@ def _launcher(tmp_path: Path, provider: str = "claude") -> tuple[Path, dict[str,
     shutil.copy2(machinery_path('lib/project_interpreter.sh'), core.with_name('project_interpreter.sh'))
     shutil.copy2(machinery_path('lib/git_identity.py'), root / "lu_machinery/lib/git_identity.py")
     env["TEST_PROJECT_PYTHON"] = sys.executable
+    env["LU_PYTHON"] = sys.executable
     # Only provider/lease/preparation seams are stubbed. The full main entry,
     # defaults, uncertified-Gemini refusal, scope setup, identity and limit validation stay real.
     core.write_text(
@@ -321,7 +323,7 @@ launcher_clear_foreign_route_state() { :; }
 launcher_parse() { LC_DRY_RUN=0; LC_GOVERNOR=${TEST_GOVERNOR:-0}; LC_EPIC=devops; }
 launcher_drop_force_from_successor_args() { :; }
 launcher_normalize_effort() { :; }
-launcher_resolve_roots() { :; }
+launcher_resolve_roots() { launcher_resolve_product_root; }
 launcher_project_python() { printf '%s\\n' "$TEST_PROJECT_PYTHON"; }
 launcher_publication_path() { :; }
 launcher_normalize_model() { :; }
@@ -715,6 +717,7 @@ def test_late_term_preserves_the_collected_provider_status(tmp_path: Path, provi
     )
 
     root, env = _checkout(tmp_path)
+    bind_driver_protocol_fixture(root, root / ".venv/bin/python")
     collected = tmp_path / "collected"
     release = tmp_path / "release"
     os.mkfifo(release)
@@ -976,6 +979,7 @@ def test_failed_scope_start_publishes_only_for_a_driver_successor(tmp_path: Path
     )
 
     root, env = _checkout(tmp_path)
+    bind_driver_protocol_fixture(root, root / ".venv/bin/python")
     result = _launch(root, env, "start-claude-driver.sh", "--epic", "devops", FAKE_SCOPE_FAIL="1", **_SUPERVISOR)
     assert result.returncode == 6, result.stdout + result.stderr
     assert "DRIVER_SCOPE_REFUSED reason=scope-start-failed;" in result.stderr
@@ -994,7 +998,7 @@ def test_failed_supervisory_successor_scope_publishes_and_preserves_exit(tmp_pat
     launcher, env = _launcher(tmp_path)
     env.update(_failure_publication_fixture(tmp_path, seed_channel=publish_ok))
     # The publisher uses the launcher's one interpreter (R66, #100 R74), here the recorder.
-    env["TEST_PROJECT_PYTHON"] = env["LEARN_UKRAINIAN_PYTHON"]
+    env["TEST_PROJECT_PYTHON"] = env["LU_PYTHON"]
     launcher.chmod(0o755)
     helper = launcher.parent / "lu_machinery/lib/session_supervisor.sh"
     shutil.copy2(machinery_path('lib/session_supervisor.sh'), helper)

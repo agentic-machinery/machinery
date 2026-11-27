@@ -156,7 +156,7 @@ INFO=()
 CANONICAL_ROOT=$(context_canonical_root "$PROJECT_DIR" git_common_dir) || exit 1
 PRIMARY_CHECKOUT=""
 if [ -n "$WORKSPACE_PROJECT" ]; then
-  PRIMARY_CHECKOUT="$LEARN_UKRAINIAN_PRIMARY_REPO_ROOT"
+  PRIMARY_CHECKOUT="$LU_PRIMARY_REPO_ROOT"
 elif [ -n "${PROJECT_HOOK_STATE_ROOT:-}" ]; then
   PRIMARY_CHECKOUT=$(context_checkout_root "$PROJECT_DIR" git_common_dir) || exit 1
 fi
@@ -396,7 +396,7 @@ else:
     ROOT_GUARD_MODULE=lu_machinery.hygiene.root_entry_guard
     ROOT_GUARD_DETAIL="Detail: .venv/bin/python -m $ROOT_GUARD_MODULE"
     if [ -n "$WORKSPACE_PROJECT" ]; then
-      ROOT_GUARD_DETAIL="Detail: \"\$LEARN_UKRAINIAN_PYTHON\" -I -m $ROOT_GUARD_MODULE --repo-root \"\$LEARN_UKRAINIAN_PRIMARY_REPO_ROOT\""
+      ROOT_GUARD_DETAIL="Detail: \"\$LU_PYTHON\" -I -m $ROOT_GUARD_MODULE --repo-root \"\$LU_PRIMARY_REPO_ROOT\""
     fi
     if [ "${CODEX_NORMAL_TASK:-0}" = "1" ]; then
       # Ordinary Codex context is contracted under 500 bytes (#10952): the
@@ -513,13 +513,13 @@ if [ "$IS_CODEX_SESSION" = "0" ] \
       DRIFT_COUNT=$((DRIFT_COUNT + 1))
     done
     if [ "${#DEPLOY_CHECK_MODE[@]}" -gt 0 ]; then
-      ISSUES+=("DEPLOY DRIFT: $DRIFT_COUNT file(s) differ in this workspace's deployment. Run: \"\$LEARN_UKRAINIAN_PYTHON\" -I -m lu_machinery.agent_deploy --workspace --project-root <workspace>")
+      ISSUES+=("DEPLOY DRIFT: $DRIFT_COUNT file(s) differ in this workspace's deployment. Run: \"\$LU_PYTHON\" -I -m lu_machinery.agent_deploy --workspace --project-root <workspace>")
     else
       ISSUES+=("DEPLOY DRIFT: $DRIFT_COUNT file(s) differ between agents_extensions/shared/ and .claude/. Run: npm run agents:deploy")
     fi
   elif [ "$DEPLOY_CHECK_RC" -ne 0 ]; then
     if [ -n "$WORKSPACE_PROJECT" ]; then
-      ISSUES+=("DEPLOY DRIFT CHECK COULD NOT RUN (rc=$DEPLOY_CHECK_RC): deployed agent extensions are unverified. Detail: \"\$LEARN_UKRAINIAN_PYTHON\" -I -m lu_machinery.agent_deploy --workspace --project-root <workspace> --check")
+      ISSUES+=("DEPLOY DRIFT CHECK COULD NOT RUN (rc=$DEPLOY_CHECK_RC): deployed agent extensions are unverified. Detail: \"\$LU_PYTHON\" -I -m lu_machinery.agent_deploy --workspace --project-root <workspace> --check")
     else
       ISSUES+=("DEPLOY DRIFT CHECK COULD NOT RUN (rc=$DEPLOY_CHECK_RC): deployed agent extensions are unverified. Detail: .venv/bin/python -I -m lu_machinery.agent_deploy --project-root <checkout root> --check")
     fi
@@ -656,7 +656,7 @@ build_handoff_fallback() {
   local warning_text="$1"
   local prefix="" interpreter=.venv/bin/python
   if [ -n "$WORKSPACE_PROJECT" ]; then
-    interpreter='"$LEARN_UKRAINIAN_PYTHON" -I'
+    interpreter='"$LU_PYTHON" -I'
   fi
 
   if [ -n "$warning_text" ]; then
@@ -799,7 +799,7 @@ Latest next action: ${fields[6]}"
 # these two args separate even though they usually coincide for Claude
 # sessions (CF review on #6414 finding 1).
 GATE_ARGS=(
-  --repo-root "$CANONICAL_ROOT" --project-dir "$PROJECT_DIR"
+  --repo-root "$CANONICAL_ROOT" --project-dir "$(pwd -P)"
   --agent "$HANDOFF_AGENT" --session-id "$CURRENT_THREAD_ID"
   --record-session-id "$SESSION_ID"
 )

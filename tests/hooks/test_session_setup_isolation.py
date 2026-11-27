@@ -19,6 +19,8 @@ from pathlib import Path
 import pytest
 
 from lu_machinery.common.repo_root import machinery_root
+from tests.host_context.conftest import HostLayout
+from tests.host_context.conftest import git as fixture_git
 from tests.host_context.conftest import host_layout as host_layout
 
 _REPO_ROOT = machinery_root().parent
@@ -69,6 +71,12 @@ def _tree_copy(tmp_path: Path) -> Path:
     return tree
 
 
+def _bind_product(layout: HostLayout, product: Path) -> None:
+    fixture_git(product, "remote", "add", "origin", "https://github.com/learn-ukrainian/learn-ukrainian.github.io.git")
+    layout.data["repos"]["public"] = str(product)
+    layout.write()
+
+
 def _run_hook(
     *,
     cwd: Path,
@@ -77,34 +85,36 @@ def _run_hook(
     pythonpath: str | None,
     plant_log: Path,
     hook: Path = _HOOK,
-    primary: Path | None = None,
-    binding_env: dict[str, str] | None = None,
+    binding: HostLayout,
+    product_assertion: Path | None = None,
 ) -> subprocess.CompletedProcess[str]:
     env = {
         "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
         "HOME": str(home),
         "PLANT_LOG": str(plant_log),
         "SESSION_START_BUDGET_SECONDS": "60",
-        "LEARN_UKRAINIAN_PYTHON": sys.executable,
+        **binding.env,
+        "LU_PYTHON": str(binding.python),
         "LEARN_UKRAINIAN_CLAUDEX_RUN_ID": "isolation-probe-run",
         "LEARN_UKRAINIAN_CLAUDEX_LAUNCH_GENERATION": "1",
         "CLAUDE_CODE_FILE_READ_MAX_OUTPUT_TOKENS": "1",
     }
     if project is not None:
         env["CLAUDE_PROJECT_DIR"] = str(project)
-    env["LEARN_UKRAINIAN_PRIMARY_REPO_ROOT"] = str(primary or project or cwd)
+    if product_assertion is not None:
+        env["LU_PRODUCT_ROOT"] = str(product_assertion)
     if pythonpath is not None:
         env["PYTHONPATH"] = pythonpath
-    env.update(binding_env or {})
     return subprocess.run(
         ["bash", str(hook)], cwd=cwd, env=env, input=_STDIN, capture_output=True, text=True, timeout=120, check=False
     )
 
 
 @pytest.mark.parametrize("project_dir_set", [True, False], ids=["CLAUDE_PROJECT_DIR", "no-CLAUDE_PROJECT_DIR"])
-def test_hook_tree_supplies_its_code_to_a_project_without_machinery(tmp_path: Path, project_dir_set: bool) -> None:
+def test_hook_tree_supplies_its_code_to_a_project_without_machinery(tmp_path: Path, project_dir_set: bool, host_layout) -> None:
     """Defect class: code paths taken from the project, so the installed hook found no resolver (R44)."""
     project = _scratch_project(tmp_path)
+    _bind_product(host_layout, project)
     home = tmp_path / "home"
     home.mkdir()
     result = _run_hook(
@@ -113,25 +123,24 @@ def test_hook_tree_supplies_its_code_to_a_project_without_machinery(tmp_path: Pa
         project=project if project_dir_set else None,
         pythonpath=None,
         plant_log=tmp_path / "log",
+        binding=host_layout,
     )
     assert result.returncode == 0, result.stderr
     assert "resolver not found" not in result.stderr.lower(), result.stderr
     context = json.loads(result.stdout)["hookSpecificOutput"]["additionalContext"]
     # The bind ran and the supervisor refused it; an unreachable bind reports "runtime helper is unavailable".
     assert "CLAUDEX SUPERVISOR BIND FAILED: SessionStart did not match the owned child generation." in context
-    # The project, never the hook's tree, holds the session state.
-    assert (project / ".agent" / "sessions" / "isolation-probe.json").is_file()
+    state = Path(host_layout.data["state_root"])
+    assert (state / ".agent" / "sessions" / "isolation-probe.json").is_file()
+    assert not (project / ".agent" / "sessions" / "isolation-probe.json").exists()
     assert not (_REPO_ROOT / ".agent" / "sessions" / "isolation-probe.json").exists()
 
 
-def _deploy_lines(
-    project: Path, tmp_path: Path, binding_env: dict[str, str], cwd: Path | None = None, primary: Path | None = None,
-) -> list[str]:
+def _deploy_lines(project: Path, tmp_path: Path, binding: HostLayout, cwd: Path | None = None) -> list[str]:
     home = tmp_path / "home"
     home.mkdir(exist_ok=True)
     result = _run_hook(
-        cwd=cwd or project, home=home, project=project, pythonpath=None, plant_log=tmp_path / "log",
-        primary=primary, binding_env=binding_env,
+        cwd=cwd or project, home=home, project=project, pythonpath=None, plant_log=tmp_path / "log", binding=binding
     )
     assert result.returncode == 0, result.stderr
     context = json.loads(result.stdout)["hookSpecificOutput"]["additionalContext"]
@@ -156,6 +165,7 @@ def test_session_start_drift_check_matches_the_installed_deployer(tmp_path: Path
     )
     inventory = json.loads(inventory_probe.stdout)
     project = _scratch_project(tmp_path)
+    _bind_product(host_layout, project)
     # No preserve entry: the session state and lease this hook writes, and a driver's state directory, are
     # runtime siblings the deployer leaves out of its check.
     descriptor = {"providers": ["claude", "codex", "agy"], "sources": {}, "preserve": []}
@@ -176,32 +186,30 @@ def test_session_start_drift_check_matches_the_installed_deployer(tmp_path: Path
     (project / "agents_extensions/shared/rules/core-curriculum.md").write_text("# Product addendum\n", encoding="utf-8")
     descriptor["sources"]["shared"] = {"path": "agents_extensions/shared", "required": True}
     (project / "agents_extensions/deployment.v1.json").write_text(json.dumps(descriptor), encoding="utf-8")
-    deploy = [sys.executable, "-I", "-m", "lu_machinery.agent_deploy", "--project-root", str(project)]
-    host_layout.data["runtime"]["python"] = sys.executable
-    host_layout.data["repos"] = {"machinery": str(project)}
-    host_layout.data["products"]["public"]["repo"] = "machinery"
-    host_layout.write()
-    binding_env = {**host_layout.env, "LU_PRODUCT_ROOT": str(project)}
-    applied = subprocess.run(deploy, env=binding_env, capture_output=True, text=True, check=False, timeout=120)
+    deploy = [str(host_layout.python), "-I", "-m", "lu_machinery.agent_deploy", "--project-root", str(project)]
+    applied = subprocess.run(deploy, env=host_layout.env, capture_output=True, text=True, check=False)
     assert applied.returncode == 0, applied.stderr
     (project / ".claude/atlas-epic").mkdir()
     (project / ".claude/atlas-epic/DRIVER-STATE.md").write_text("runtime\n", encoding="utf-8")
 
     # The second start also sees the session state and lease the first one wrote.
-    assert _deploy_lines(project, tmp_path, binding_env) == []
-    assert _deploy_lines(project, tmp_path, binding_env) == []
+    assert _deploy_lines(project, tmp_path, host_layout) == []
+    assert _deploy_lines(project, tmp_path, host_layout) == []
     link = tmp_path / "project-link"
     link.symlink_to(project)
-    assert _deploy_lines(Path(str(link) + "/"), tmp_path, binding_env, cwd=project) == []
+    assert _deploy_lines(Path(str(link) + "/"), tmp_path, host_layout, cwd=project) == []
     # A root whose name ends in a newline is unsafe input, so its clean namesake (the valid project
     # beside it) is never checked in its place: as the anchor it refuses before any interpreter
     # starts, and as the configured product it refuses at the hook bootstrap, even from a clean cwd.
     unsafe = tmp_path / "project\n"
     shutil.copytree(project, unsafe, symlinks=True)
-    for cwd, primary, refusal in ((unsafe, None, "is not a primary checkout"), (project, project, "HOOK-BOOTSTRAP-FAILED")):
-        refused = _run_hook(cwd=cwd, home=tmp_path / "home", project=unsafe, pythonpath=None, plant_log=tmp_path / "log",
-                            primary=primary)
+    for cwd, assertion, refusal in ((unsafe, None, "invalid_invocation_git"), (project, unsafe, "legacy_conflict")):
+        refused = _run_hook(
+            cwd=cwd, home=tmp_path / "home", project=unsafe, pythonpath=None, plant_log=tmp_path / "log",
+            binding=host_layout, product_assertion=assertion,
+        )
         assert refused.returncode != 0 and refusal in refused.stderr, (cwd, refused.stderr)
+
 
     for path in ("agents_extensions", "product-claude", "product-codex"):
         subprocess.run(["git", "-C", str(project), "add", path], check=True)
@@ -212,18 +220,18 @@ def test_session_start_drift_check_matches_the_installed_deployer(tmp_path: Path
     worktree = tmp_path / "worktree"
     subprocess.run(["git", "-C", str(project), "worktree", "add", "-q", str(worktree)], check=True)
     assert (worktree / "agents_extensions/deployment.v1.json").is_file()
-    assert _deploy_lines(worktree, tmp_path, binding_env, primary=project) == []
+    assert _deploy_lines(worktree, tmp_path, host_layout) == []
 
     deployed = next(path for path in sorted((project / ".claude/rules").iterdir()) if path.is_file())
     deployed.write_bytes(deployed.read_bytes() + b"edited\n")
-    assert _deploy_lines(project, tmp_path, binding_env) == [
+    assert _deploy_lines(project, tmp_path, host_layout) == [
         "- DEPLOY DRIFT: 1 file(s) differ between agents_extensions/shared/ and .claude/. Run: npm run agents:deploy"
     ]
 
 
 @pytest.mark.parametrize("pythonpath", [None, ".", ":"], ids=["unset", "dot", "colon"])
 def test_hook_python_children_never_import_from_the_cwd(
-    tmp_path: Path, pythonpath: str | None, fake_cursor_bin: Path
+    tmp_path: Path, pythonpath: str | None, fake_cursor_bin: Path, host_layout
 ) -> None:
     """Defect class: a hook child resolves an import from the cwd (R45).
 
@@ -233,6 +241,7 @@ def test_hook_python_children_never_import_from_the_cwd(
     for the provider binary, which is not a Python child of the hook, so its lines are not counted.
     """
     tree = _tree_copy(tmp_path)
+    _bind_product(host_layout, tree)
     for name in _PLANTED:
         (tree / f"{name}.py").write_text(_PLANT, encoding="utf-8")
     home = tmp_path / "home"
@@ -240,9 +249,9 @@ def test_hook_python_children_never_import_from_the_cwd(
     plant_log = tmp_path / "plant.log"
     plant_log.write_text("", encoding="utf-8")
     hook = tree / "agents_extensions" / "shared" / "hooks" / _HOOK.name
-    result = _run_hook(cwd=tree, home=home, project=tree, pythonpath=pythonpath, plant_log=plant_log, hook=hook)
+    result = _run_hook(cwd=tree, home=home, project=tree, pythonpath=pythonpath, plant_log=plant_log, hook=hook, binding=host_layout)
     assert result.returncode == 0, result.stderr
-    assert (tree / ".agent" / "sessions" / "isolation-probe.json").is_file(), "the session gate did not run"
+    assert (Path(host_layout.data["state_root"]) / ".agent/sessions/isolation-probe.json").is_file()
     planted = [
         line
         for line in plant_log.read_text(encoding="utf-8").splitlines()
@@ -323,7 +332,7 @@ def _launcher_lib_child(site: str, tree: Path) -> list[str]:
 
 
 @pytest.mark.parametrize("site", ["rules_core", *_LIB_SITES])
-def test_launcher_library_python_children_never_import_from_the_cwd(tmp_path: Path, site: str) -> None:
+def test_launcher_library_python_children_never_import_from_the_cwd(tmp_path: Path, site: str, host_layout) -> None:
     """Defect class: a launcher library's Python child resolves an import from the checkout (#100 R63-R65, R68).
 
     The cwd is the machinery tree and the project, and ``PYTHONPATH`` names it. Each launcher-library site that
@@ -362,9 +371,15 @@ def test_launcher_library_python_children_never_import_from_the_cwd(tmp_path: Pa
         "THREAD_ROLLOVER_COMMAND_RUNNER": str(tree / "lu_machinery" / "agent_runtime" / "bounded_command.py"),
         "THREAD_ROLLOVER_COMMAND_TIMEOUT_SECONDS": "60",
     }
-    result = subprocess.run(
-        _launcher_lib_child(site, tree), cwd=tree, env=env, capture_output=True, text=True, timeout=120, check=False
-    )
+    argv = _launcher_lib_child(site, tree)
+    env["LU_PYTHON"] = str(venv_bin / "python")
+    if site == "session_supervisor_claim":
+        env.update(host_layout.env)
+        env["LU_PYTHON"] = str(host_layout.python)
+        host_layout.data["monitor_url"] = closed
+        host_layout.write()
+        argv.insert(1, "-x")
+    result = subprocess.run(argv, cwd=tree, env=env, capture_output=True, text=True, timeout=120, check=False)
     if site == "thread_rollover_link":
         assert result.returncode == 0, result.stdout + result.stderr
         assert "no pending packet for codex-infra" in result.stdout, result.stdout + result.stderr
@@ -373,9 +388,12 @@ def test_launcher_library_python_children_never_import_from_the_cwd(tmp_path: Pa
     elif site == "rules_core":
         assert result.returncode == 0, result.stderr
         assert "root_on_sys_path False" in result.stdout, result.stdout + result.stderr
-    assert "module bootstrap:" not in result.stderr, result.stderr
+    assert not any(line.startswith("module bootstrap:") for line in result.stderr.splitlines()), result.stderr
     assert plant_log.read_text(encoding="utf-8") == ""
-    if site != "rules_core":
+    if site == "session_supervisor_claim":
+        assert f"{host_layout.python} -I -B -m lu_machinery.host_context shell" in result.stderr
+        assert "session_supervisor open" in result.stderr
+    elif site != "rules_core":
         children = child_log.read_text(encoding="utf-8").splitlines()
         assert children, f"the site started no Python child: {result.stdout}{result.stderr}"
         assert set(children) == {"-I"}, children
@@ -385,12 +403,13 @@ def test_workspace_session_reads_its_account_memory_and_writes_state_to_the_stat
     """Defect class: hooks reading another account's or another root's memory or state. From a
     non-Git project directory (the CTO workspace) the memory check reads the workspace's directory
     under CLAUDE_CONFIG_DIR, and session state goes to the configured state root, never the workspace."""
-    primary = _scratch_project(tmp_path)
+    primary = Path(host_layout.data["repos"]["machinery"])
+    fixture_git(primary, "symbolic-ref", "HEAD", "refs/heads/main")
     (primary / ".python-version").write_text(platform.python_version() + "\n")
-    workspace, state, home, account = (tmp_path / name for name in ("cto-workspace", "workspace-state", "home", "account-b"))
-    for path in (workspace, state, home):
-        path.mkdir()
-    state.chmod(0o700)
+    workspace = Path(host_layout.data["cto"]["workspace"])
+    state = Path(host_layout.data["state_root"])
+    home, account = tmp_path / "home", tmp_path / "account-b"
+    home.mkdir()
     key = re.sub(r"[^A-Za-z0-9-]", "-", str(workspace))
     memory = account / "projects" / key / "memory" / "MEMORY.md"
     memory.parent.mkdir(parents=True)
@@ -400,10 +419,10 @@ def test_workspace_session_reads_its_account_memory_and_writes_state_to_the_stat
     stray.write_text("note\n")
     env = {
         "PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": str(home), "CLAUDE_CONFIG_DIR": str(account),
-        "SESSION_START_BUDGET_SECONDS": "60", "LEARN_UKRAINIAN_PYTHON": sys.executable,
+        **host_layout.env, "SESSION_START_BUDGET_SECONDS": "60", "LU_PYTHON": str(host_layout.python),
         "LEARN_UKRAINIAN_CLAUDEX_RUN_ID": "isolation-probe-run", "LEARN_UKRAINIAN_CLAUDEX_LAUNCH_GENERATION": "1",
         "CLAUDE_CODE_FILE_READ_MAX_OUTPUT_TOKENS": "1", "CLAUDE_PROJECT_DIR": str(workspace),
-        "LEARN_UKRAINIAN_PRIMARY_REPO_ROOT": str(primary), "LU_STATE_ROOT": str(state),
+        "LU_STATE_ROOT": str(state),
     }
     result = subprocess.run(["bash", str(_HOOK)], cwd=workspace, env=env, input=_STDIN, capture_output=True,
                             text=True, timeout=120, check=False)
@@ -431,15 +450,9 @@ def test_workspace_session_reads_its_account_memory_and_writes_state_to_the_stat
     (source / "deployment.v1.json").write_text(json.dumps(
         {"providers": ["claude"], "sources": {"claude": {"path": "agents_extensions/claude", "required": True}},
          "preserve": []}))
-    host_layout.data["state_root"] = str(state)
-    host_layout.data["runtime"]["python"] = sys.executable
-    host_layout.data["repos"] = {"machinery": str(primary)}
-    host_layout.data["products"]["public"]["repo"] = "machinery"
-    host_layout.write()
-    env.update(host_layout.env)
-    subprocess.run([sys.executable, "-I", "-m", "lu_machinery.agent_deploy", "--workspace", "--project-root",
+    subprocess.run([str(host_layout.python), "-I", "-m", "lu_machinery.agent_deploy", "--workspace", "--project-root",
                     str(workspace)], env=env, check=True, capture_output=True, timeout=120)
-    drift_env = {**env, "LU_PRODUCT_ROOT": str(primary), "CODEX_CANONICAL_REPO_ROOT": str(primary)}
+    drift_env = {**env, "LU_PRODUCT_ROOT": host_layout.data["repos"]["public"], "CODEX_CANONICAL_REPO_ROOT": str(primary)}
     drift_payload = json.dumps({"session_id": "workspace-with-product", "source": "startup"})
 
     def deploy_issues() -> list[str]:
@@ -477,5 +490,5 @@ def test_workspace_session_reads_its_account_memory_and_writes_state_to_the_stat
     drift_env["GIT_DIR"] = str(primary / ".git")
     assert deploy_issues() == [
         "- DEPLOY DRIFT: 1 file(s) differ in this workspace's deployment. Run: "
-        '"$LEARN_UKRAINIAN_PYTHON" -I -m lu_machinery.agent_deploy --workspace --project-root <workspace>'
+        '"$LU_PYTHON" -I -m lu_machinery.agent_deploy --workspace --project-root <workspace>'
     ]

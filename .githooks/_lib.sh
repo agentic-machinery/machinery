@@ -4,33 +4,19 @@
 set -euo pipefail
 
 hook_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
-worktree_root="$(git rev-parse --show-toplevel)"
-# Validate hook context with the shared selector before accepting a primary
-# root or checking dispatched ownership.
-project_interpreter="$worktree_root/lu_machinery/lib/project_interpreter.sh"
-# A consumer without a source package uses its explicitly configured, absolute
-# interpreter only to locate the installed selector. Repository metadata never
-# selects that bootstrap interpreter.
-if [[ ! -f "$project_interpreter" && "${LEARN_UKRAINIAN_PYTHON:-}" = /* && -f "${LEARN_UKRAINIAN_PYTHON:-}" && -x "${LEARN_UKRAINIAN_PYTHON:-}" ]]; then
-  installed_lib="$("${LEARN_UKRAINIAN_PYTHON}" -P -c 'import lu_machinery, pathlib; print(pathlib.Path(lu_machinery.__file__).resolve().parent / "lib" / "project_interpreter.sh")' 2>/dev/null || true)"
-  case "$installed_lib" in
-    /*) [[ -f "$installed_lib" ]] && project_interpreter="$installed_lib" ;;
-  esac
-fi
-if [[ ! -f "$project_interpreter" ]]; then
-  echo "Git hook error: project interpreter selector not found at $project_interpreter" >&2
+if [[ "${LU_PYTHON:-}" != /* || ! -f "$LU_PYTHON" || ! -x "$LU_PYTHON" ]]; then
+  printf '%s\n' 'Git hook error [missing_interpreter_binding]: LU_PYTHON must name an absolute executable.' >&2
   exit 127
 fi
-# shellcheck source=lu_machinery/lib/project_interpreter.sh
-source "$project_interpreter"
-project_hook_context_resolve "$worktree_root" || {
-  echo "Git hook error: hook context unavailable (step=${PROJECT_HOOK_BOOTSTRAP_STEP:-unknown}); configure the primary-state anchor and interpreter." >&2
+# The isolated entry validates the binding before inspecting invocation metadata.
+hook_context="$("$LU_PYTHON" -I -B -m lu_machinery.host_context shell --require-checkout)" || exit 127
+worktree_root='' main_root=''
+eval "$hook_context"
+unset hook_context
+if [[ -z "$worktree_root" || -z "$main_root" ]]; then
+  printf '%s\n' 'Git hook error [missing_checkout_binding]: the hook entry returned no checkout.' >&2
   exit 127
-}
-main_root="$(project_primary_root_resolve "$worktree_root")" || {
-  echo "Git hook error: primary checkout unavailable." >&2
-  exit 127
-}
+fi
 
 source_root="$worktree_root"
 if [[ ! -f "$source_root/lu_machinery/lib/project_interpreter.sh" || ! -f "$source_root/.pre-commit-config.yaml" ]]; then
@@ -38,9 +24,7 @@ if [[ ! -f "$source_root/lu_machinery/lib/project_interpreter.sh" || ! -f "$sour
 fi
 
 run_project_python() {
-  local python
-  python="$(project_interpreter_resolve "$worktree_root")" || return 127
-  "$python" "$@"
+  "$LU_PYTHON" "$@"
 }
 
 run_pre_commit() {
@@ -66,13 +50,11 @@ check_owned_paths() {
     (cd "$source_root" && run_project_python -m lu_machinery.dispatcher.ownership --worktree "$worktree_root" "$@") || exit 1
     return 0
   fi
-  local python
-  python="$(project_interpreter_resolve "$worktree_root")" || exit 127
-  if ! "$python" -P -c 'import lu_machinery.dispatcher.ownership' >/dev/null 2>&1; then
+  if ! "$LU_PYTHON" -I -c 'import lu_machinery.dispatcher.ownership' >/dev/null 2>&1; then
     echo "Git hook error: owned-path checker is not installed; refusing to skip enforcement." >&2
     exit 1
   fi
-  "$python" -P -m lu_machinery.dispatcher.ownership --worktree "$worktree_root" "$@" || exit 1
+  "$LU_PYTHON" -I -m lu_machinery.dispatcher.ownership --worktree "$worktree_root" "$@" || exit 1
 }
 
 require_git_lfs() {

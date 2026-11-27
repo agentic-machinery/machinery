@@ -28,8 +28,9 @@ from tests.epics_monitor_stub import epics_monitor_stub
 from tests.epics_monitor_stub import isolated_monitor_state as isolated_monitor_state
 from tests.helpers import current_sol
 from tests.helpers.product_tree import configured_roots as configured_roots
-from tests.host_context.conftest import host_layout as host_layout
 from tests.launcher_sandbox import (
+    bind_driver_protocol_fixture,
+    bind_launcher_environment,
     copy_interactive_launcher_checkout,
     copy_launcher_sources,
     copy_slot_registry,
@@ -100,6 +101,8 @@ def run_launcher(
     launch_env["LAUNCHER_DRY_RUN"] = "1" if dry_run else "0"
     launch_env.update(env or {})
     with TemporaryDirectory(prefix="launcher-manager-guard-", dir=ensure_scratch_root()) as guard:
+        if launch_root != REPO:
+            launch_env = bind_launcher_environment(launch_root, launch_env, overrides=env)
         contact = Path(guard) / "real-manager-contact"
         if not dry_run:
             # After the directories a test put ahead of the inherited PATH (its
@@ -126,7 +129,7 @@ def run_launcher(
     return result
 
 
-def test_real_launcher_deploy_is_confined_to_temporary_checkout(tmp_path: Path, host_layout) -> None:
+def test_real_launcher_deploy_is_confined_to_temporary_checkout(tmp_path: Path) -> None:
     """Keep the real startup deploy and assert its actual output, not a stub."""
     checkout = tmp_path / "checkout with spaces"
     copy_interactive_launcher_checkout(checkout)
@@ -173,21 +176,11 @@ def test_real_launcher_deploy_is_confined_to_temporary_checkout(tmp_path: Path, 
             encoding="utf-8",
         )
         wrapper.chmod(0o755)
-    host_layout.data["repos"] = {"machinery": str(checkout)}
-    host_layout.data["products"]["public"]["repo"] = "machinery"
-    host_layout.data["runtime"]["python"] = str(checkout / ".venv/bin/python")
-    host_layout.data["monitor_url"] = launcher_environment()["LU_MONITOR_LOOPBACK"]
-    host_layout.write()
     result = run_launcher(
         "start-claude.sh",
         dry_run=False,
         root=checkout,
         env={
-            **host_layout.env,
-            "LU_STATE_ROOT": host_layout.data["state_root"],
-            "FLEET_COMMS_ROOT": str(Path(host_layout.data["state_root"]) / "batch_state/fleet-comms/v1"),
-            "LU_TASKS_DIR": str(Path(host_layout.data["state_root"]) / "batch_state/tasks"),
-            "LU_GITHUB_CACHE_DIR": str(Path(host_layout.data["state_root"]) / "batch_state/github-client"),
             "PATH": f"{binary.parent}{os.pathsep}{launcher_toolchain_path()}",
             "HOME": str(tmp_path / "home"),
             "LU_SKIP_PLANE_TUNNEL_CHECK": "1",
@@ -393,6 +386,7 @@ exec {sys.executable!r} "$@"
         encoding="utf-8",
     )
     python_stub.chmod(0o755)
+    bind_driver_protocol_fixture(root, python_stub)
 
     adapter = root / "lu_machinery" / "launchers" / "claude.sh"
     adapter.parent.mkdir(parents=True, exist_ok=True)
@@ -555,6 +549,7 @@ exec {sys.executable!r} "$@"
         encoding="utf-8",
     )
     python_stub.chmod(0o755)
+    bind_driver_protocol_fixture(root, python_stub)
 
     provider = root / "provider.sh"
     provider.write_text(
@@ -659,7 +654,7 @@ launcher_close_driver_lease() {{
 }}
 launcher_exec_command fixture-cli
 """
-    env = {**launcher_environment(), "HOME": str(home), "PATH": f"{cli.parent}{os.pathsep}{launcher_toolchain_path()}", "LEARN_UKRAINIAN_PYTHON": sys.executable}
+    env = {**launcher_environment(), "HOME": str(home), "PATH": f"{cli.parent}{os.pathsep}{launcher_toolchain_path()}", "LU_PYTHON": sys.executable}
     process = subprocess.Popen(
         ["/bin/bash", "-c", script],
         env=env,
@@ -781,7 +776,7 @@ launcher_exec_command fixture-cli
         "PATH": f"{cli.parent}{os.pathsep}{launcher_toolchain_path()}",
         "FLEET_COMMS_ROOT": str(plane),
         "LU_STATE_ROOT": str(tmp_path),
-        "LEARN_UKRAINIAN_PYTHON": sys.executable,
+        "LU_PYTHON": sys.executable,
         "LEARN_UKRAINIAN_PRIMARY_REPO_ROOT": os.environ["LEARN_UKRAINIAN_PRIMARY_REPO_ROOT"],
         "LU_PRODUCT_ROOT": os.environ["LU_PRODUCT_ROOT"],
     }
@@ -1130,11 +1125,12 @@ launcher_adapter_exec() {{ launcher_exec_command {os.fspath(provider)!r}; }}
     env["LEARN_UK_REPO_ROOT"] = os.fspath(root)
     store = SessionStreamStore(SessionStreamDatabase(root / ".agent/session-streams/v1/session-streams.sqlite3"))
     with epics_monitor_stub(store) as monitor_url:
-        env["LU_MONITOR_LOOPBACK"] = monitor_url
+        env["LU_MONITOR_LOOPBACK"] = env["DELEGATE_MONITOR_API"] = monitor_url
+        bound = bind_launcher_environment(root, env)
         result = subprocess.run(
             ["bash", os.fspath(root / "start-claude-driver.sh"), "--epic", "devops"],
             cwd=root,
-            env=env,
+            env=bound,
             capture_output=True,
             text=True,
             check=False,
@@ -1198,8 +1194,7 @@ launcher_adapter_exec() {{ launcher_exec_command {os.fspath(provider)!r}; }}
 
 
 def test_linked_worktree_helper_calls_use_durable_helper_python(tmp_path: Path) -> None:
-    """A linked worktree has no own .venv; lease close must
-    run the durable helper root's interpreter (#F2, prompt audit r3)."""
+    """Lease close uses the bound interpreter when the linked worktree has no .venv."""
     session_root = tmp_path / "worktree"
     session_root.mkdir()  # deliberately no session_root/.venv
     helper_root = tmp_path / "primary"
@@ -1223,7 +1218,7 @@ LC_DURABLE_HELPER_ROOT={helper_root}
 source {machinery_path('lib/launcher_core.sh')}
 launcher_close_driver_lease
 """
-    result = subprocess.run(["bash", "-c", script], text=True, capture_output=True, check=False, timeout=30, env=launcher_environment())
+    result = subprocess.run(["bash", "-c", script], text=True, capture_output=True, check=False, timeout=30, env=launcher_environment(LU_PYTHON=str(stub)))
     assert result.returncode == 0, result.stderr
     body = log.read_text(encoding="utf-8")
     assert "-m\nlu_machinery.session_supervisor\nclose\n--role\ndriver\n" in body
@@ -1358,7 +1353,7 @@ SECONDS=0
 sleep() {{ printf 'delay=%s\n' "$1"; SECONDS=$((SECONDS + $1)); }}
 launcher_close_driver_lease
 """
-    result = subprocess.run(["bash", "-c", script], cwd=REPO, capture_output=True, text=True, timeout=10, env=launcher_environment())
+    result = subprocess.run(["bash", "-c", script], cwd=REPO, capture_output=True, text=True, timeout=10, env=launcher_environment(LU_PYTHON=str(launcher.parent / ".venv/bin/python")))
     assert result.returncode == (0 if recover else 1), result.stderr
     delays = [int(line.split("=")[1]) for line in result.stdout.splitlines()]
     assert delays[:6] == [1, 2, 4, 8, 16, 30]
