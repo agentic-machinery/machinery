@@ -82,6 +82,13 @@ def claim(capsys, *, worker="seat-1", recipient="codex", expected=EXIT_OK):
     )
 
 
+@pytest.mark.parametrize("operation", ["receive", "claim"])
+def test_receive_and_claim_on_empty_inbox_exit_zero_with_null_delivery(plane, capsys, operation):
+    """Defect class: a normal empty answer exits non-zero, so every idle inbox check reads as a failed command."""
+    result = invoke(capsys, operation, "--recipient", "codex", "--worker-id", "seat-1")
+    assert result == {"delivery": None, "content_included": False}
+
+
 def fenced(operation, delivery, *, worker="seat-1", token=None):
     return [
         operation, delivery["delivery_id"], "--worker-id", worker,
@@ -105,16 +112,16 @@ def test_delivery_claim_status_ack_and_idempotent_ack(plane, capsys):
     assert first["state"] == "acknowledged"
     assert invoke(capsys, *fenced("ack", delivery)) == first
     assert invoke(capsys, "status", delivery["delivery_id"]) == first
-    assert claim(capsys, expected=EXIT_NOT_FOUND)["delivery"] is None
+    assert claim(capsys)["delivery"] is None
     assert not (plane.parent / "unused-legacy.db").exists()
 
 
 def test_delivery_recipient_and_worker_mismatch_fail_closed(plane, capsys):
     message = publish(plane)
-    assert claim(capsys, recipient="other", expected=EXIT_NOT_FOUND)["delivery"] is None
+    assert claim(capsys, recipient="other")["delivery"] is None
     assert invoke(capsys, "status", message.delivery_ids[0])["state"] == "queued"
     delivery = claim(capsys)
-    assert claim(capsys, worker="other", expected=EXIT_NOT_FOUND)["delivery"] is None
+    assert claim(capsys, worker="other")["delivery"] is None
     result = invoke(capsys, *fenced("ack", delivery, worker="other"), expected=EXIT_ERROR)
     assert result["error"] == "stale_delivery_lease"
     assert invoke(capsys, "status", delivery["delivery_id"])["state"] == "running"
@@ -374,10 +381,10 @@ def test_lost_claim_output_receive_recovers_same_lease_without_burning_attempts(
         assert delivery["attempt_count"] == 1
         assert delivery["lease_expires_at"] == claimed["lease_expires_at"]
         assert delivery["state"] == "running"
-    assert main(["deliveries", "receive", "--recipient", "worker-task", "--worker-id", "other"]) == EXIT_NOT_FOUND
+    assert main(["deliveries", "receive", "--recipient", "worker-task", "--worker-id", "other"]) == EXIT_OK
     assert json.loads(capsys.readouterr().out) == {"delivery": None, "content_included": False}
     assert invoke(capsys, *fenced("ack", delivery))["state"] == "acknowledged"
-    assert main(["deliveries", *args]) == EXIT_NOT_FOUND
+    assert main(["deliveries", *args]) == EXIT_OK
     assert json.loads(capsys.readouterr().out) == {"delivery": None, "content_included": False}
 
 

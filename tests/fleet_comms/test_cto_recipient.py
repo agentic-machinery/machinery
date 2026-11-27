@@ -8,7 +8,7 @@ import json
 import pytest
 
 from lu_machinery.fleet_comms.authority import AuthorityRecipientRefused, AuthorityService, AuthorityServiceError
-from lu_machinery.fleet_comms.cli import EXIT_ERROR, EXIT_NOT_FOUND, EXIT_OK, main
+from lu_machinery.fleet_comms.cli import EXIT_ERROR, EXIT_OK, main
 
 SESSION = "claude-cto-27b21508"
 MISSING = object()
@@ -82,8 +82,8 @@ def test_worker_escalation_lands_at_claude_cto_and_the_session_claims_it(plane, 
         "--worker-id", SESSION, "--fence-token", str(claimed["fence_token"]),
     )
     assert acked["state"] == "acknowledged"
-    run(capsys, "deliveries", "claim", "--recipient", "claude-cto", "--worker-id", SESSION,
-        expected=EXIT_NOT_FOUND)
+    empty = run(capsys, "deliveries", "claim", "--recipient", "claude-cto", "--worker-id", SESSION)
+    assert empty["delivery"] is None
 
 
 def test_publishing_to_a_session_specific_cto_name_is_refused_at_the_authority(plane, capsys):

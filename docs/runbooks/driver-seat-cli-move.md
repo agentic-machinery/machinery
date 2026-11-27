@@ -200,6 +200,10 @@ worker identity:
   --recipient "<new-registered-slot>" --worker-id "<successor-worker-id>"
 ```
 
+With nothing to claim, the command exits 0 and prints
+`{"delivery": null, "content_included": false}`. Check the output for `delivery_id`
+before the next step; exit 0 alone does not mean a delivery was claimed.
+
 Read the original body with the delivery ID and fence token returned by the claim.
 
 ```bash

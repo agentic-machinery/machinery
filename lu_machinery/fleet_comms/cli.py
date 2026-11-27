@@ -652,7 +652,7 @@ def cmd_deliveries(args: argparse.Namespace) -> int:
                 )
                 if lease is None:
                     sys.stdout.write(_json_dump({"delivery": None, "content_included": False}))
-                    return EXIT_NOT_FOUND
+                    return EXIT_OK
                 payload = asdict(lease.delivery)
                 payload.update(
                     body_artifact_id=lease.body_artifact_id,
@@ -737,10 +737,13 @@ def _add_deliveries_parser(sub: Any) -> None:
         f"  .venv/bin/python -m {_PACKAGE} deliveries read DELIVERY --worker-id seat-1 --fence-token 1\n"
         "Outputs: JSON on stdout; message bodies only from read and receive.\n"
         "  Receive claims and reads in one call: {delivery: {delivery_id, fence_token, sender, body, ...},\n"
-        "  content_included: true}. Empty receive returns {delivery: null, content_included: false}.\n"
+        "  content_included: true}.\n"
         "  It reuses your current lease after lost output. Apply the body, then ack delivery.delivery_id\n"
         "  with delivery.fence_token. It never extends a replayed lease or acknowledges automatically.\n"
-        "  Empty claim/receive: {delivery: null, content_included: false}. Claim success is flat metadata.\n"
+        "  Nothing to collect is a normal answer: claim and receive exit 0 with\n"
+        "  {delivery: null, content_included: false}. Claim success is flat metadata with delivery_id\n"
+        "  and no delivery key. Exit 0 alone does not mean a delivery was leased: read the JSON\n"
+        "  (claim: delivery_id is present; receive: delivery is not null).\n"
         "  Read prints the body of a delivery you hold a current lease on; it refuses a stale lease.\n"
         "  Claim leases one delivery and reclaims expired leases (defaults: 300 seconds, 3 attempts).\n"
         "  Consume records supervisory intent before any side effect. On replay/reconciliation,\n"
@@ -758,7 +761,8 @@ def _add_deliveries_parser(sub: Any) -> None:
         "  These commands open the authority store, initializing/migrating it if necessary.\n"
         "  Inside a write boundary only receive and ack run, through the launcher's broker, for the\n"
         "  task's own deliveries (recipient and worker id are the task id).\n"
-        "Exit codes: 0 = success, 1 = no claimable delivery or delivery not found,\n"
+        "Exit codes: 0 = success, including an empty claim or receive,\n"
+        "  1 = status, read, ack or consume named a delivery that does not exist,\n"
         "  2 = usage error, 3 = operation refused or storage error.\n"
         f"Related: {_PACKAGE}.authority.AuthorityService; channels publish; plane-status."
     )
