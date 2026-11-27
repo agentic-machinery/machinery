@@ -278,10 +278,10 @@ def test_the_installed_package_refuses_product_and_state_without_anchors(unconfi
         lambda: rr.primary_root(decoy),
         lambda: rr.state_root(REPO),
     ):
-        with pytest.raises(rr.StateRootError, match=rr.PRIMARY_ROOT_ENV):
+        with pytest.raises(rr.StateRootError):
             resolve()
     # Consumers that catch the resolver's ValueError keep refusing.
-    with pytest.raises(worktree_claims.ControlPlaneError, match=rr.PRIMARY_ROOT_ENV):
+    with pytest.raises(worktree_claims.ControlPlaneError, match=rr.LU_STATE_ROOT_ENV):
         worktree_claims.public_primary_root()
     # A state root alone satisfies state_root(), but does not stand in for the primary Git checkout anchor.
     primary_candidate = _primary_checkout(tmp_path / "primary")
@@ -300,10 +300,12 @@ def test_the_installed_package_resolves_its_configured_anchors(unconfigured, tmp
     monkeypatch.setenv(rr.PRIMARY_ROOT_ENV, str(primary))
     monkeypatch.setenv(rr.PRODUCT_ROOT_ENV, str(product))
     assert rr.product_root() == product
-    assert rr.state_root() == rr.primary_root() == primary
-    assert worktree_claims.public_primary_root() == primary
+    assert rr.primary_root() == primary
+    with pytest.raises(rr.StateRootError, match=rr.LU_STATE_ROOT_ENV):
+        rr.state_root()
     monkeypatch.setenv(rr.STATE_ROOT_ENV, str(primary))
     assert rr.state_root() == primary
+    assert worktree_claims.public_primary_root() == primary
     dedicated_state = tmp_path / "dedicated-state"
     dedicated_state.mkdir()
     monkeypatch.setenv(rr.STATE_ROOT_ENV, str(dedicated_state))
@@ -374,12 +376,14 @@ def test_the_mode_comes_from_the_package_directory_name_not_the_surroundings(unc
         installed.product_root()
     with pytest.raises(installed.StateRootError):
         installed.state_root()
-    # The in-tree copy keeps its established checkout defaults.
+    # The in-tree copy keeps its product and primary checkout defaults.
     product = _decoy_cwd(tmp_path / "product")
     in_tree = _load_copy(monkeypatch, product / "scripts")
     assert in_tree.in_tree_source() is True
     assert in_tree.product_root() == product
-    assert in_tree.state_root() == in_tree.primary_root() == product
+    assert in_tree.primary_root() == product
+    with pytest.raises(in_tree.StateRootError):
+        in_tree.state_root()
     # A package directory symlinked into the product keeps the in-tree name it is loaded under.
     linked = _decoy_cwd(tmp_path / "linked-product")
     (linked / "scripts").symlink_to(staged / rr.INSTALLED_PACKAGE_NAME, target_is_directory=True)
@@ -491,6 +495,7 @@ def test_a_configured_product_cannot_hide_a_bad_invocation_git(unconfigured, tmp
     product = tmp_path / "product"
     product.mkdir()
     monkeypatch.setenv(rr.PRIMARY_ROOT_ENV, str(primary))
+    monkeypatch.setenv(rr.LU_STATE_ROOT_ENV, str(primary))
     # Empty, not unset: the gate sets a missing product root, and this restores it.
     monkeypatch.setenv(rr.PRODUCT_ROOT_ENV, "")
     monkeypatch.setenv(configured, str(product))
@@ -667,7 +672,7 @@ def test_lu_and_legacy_root_names_resolve_alike_and_a_conflict_refuses(unconfigu
             rr.state_root(env={**anchored, name: str(missing_state)})
     for name in (rr.LU_PRIMARY_ROOT_ENV, rr.PRIMARY_ROOT_ENV):
         assert project_interpreter(env={name: str(primary)}) == venv_python
-    with pytest.raises(rr.StateRootError, match=rr.LU_PRIMARY_ROOT_ENV):
+    with pytest.raises(rr.StateRootError, match=rr.LU_STATE_ROOT_ENV):
         rr.state_root(env={})
     # A missing primary anchor never hides an invalid state setting from any resolver.
     for invalid in (
@@ -708,12 +713,12 @@ def test_an_absent_profile_keeps_the_compatibility_slug_and_refuses_consumer_con
     copy = _load_copy(monkeypatch, tmp_path / "copy-package")
     where = re.escape(str(owner / profile.PROFILE_REL))
     before = _tree(tmp_path)
-    for name in (rr.PRIMARY_ROOT_ENV, rr.LU_PRIMARY_ROOT_ENV):
+    for name in (rr.STATE_ROOT_ENV, rr.LU_STATE_ROOT_ENV):
         assert copy.github_slug({name: str(bare)}) == rr.DEFAULT_GITHUB_SLUG
         assert copy.github_slug({name: str(bare), rr.GITHUB_SLUG_ENV: "demo-org/x"}) == "demo-org/x"
         with pytest.raises(copy.MachineryConfigError, match="profile reader beside this resolver is unavailable"):
             copy.github_slug({name: str(owner)})
-    for env in ({rr.PRIMARY_ROOT_ENV: str(owner)}, {rr.LU_PRIMARY_ROOT_ENV: str(owner)}, {}):
+    for env in ({rr.STATE_ROOT_ENV: str(owner)}, {rr.LU_STATE_ROOT_ENV: str(owner)}, {}):
         assert profile.load_profile(env=env) is None
         assert rr.configured_github_slug(env) is None
         assert rr.github_slug(env) == rr.DEFAULT_GITHUB_SLUG
@@ -747,12 +752,12 @@ def test_a_profile_binds_slug_and_config_paths_to_the_plane_owner(unconfigured, 
     monkeypatch.chdir(tmp_path / "cwd")
     before = _tree(tmp_path)
     for env in (
-        {rr.LU_PRIMARY_ROOT_ENV: str(owner)},
-        {rr.PRIMARY_ROOT_ENV: str(owner)},
+        {rr.LU_STATE_ROOT_ENV: str(owner)},
+        {rr.STATE_ROOT_ENV: str(owner)},
         {rr.PRIMARY_ROOT_ENV: str(owner), rr.LU_STATE_ROOT_ENV: str(owner)},
         # A relative object-directory override names a place below the working directory (which
         # has no objects/ here), not a property of the plane owner: it never decides the answer.
-        {rr.PRIMARY_ROOT_ENV: str(owner), "GIT_OBJECT_DIRECTORY": "objects"},
+        {rr.STATE_ROOT_ENV: str(owner), "GIT_OBJECT_DIRECTORY": "objects"},
     ):
         loaded = profile.load_profile(env=env)
         assert loaded is not None
@@ -886,7 +891,7 @@ def test_an_invalid_profile_refuses_and_never_falls_back(unconfigured, tmp_path,
     else:
         change(owner)
     before = _tree(tmp_path)
-    for env in ({rr.PRIMARY_ROOT_ENV: str(owner)}, {rr.LU_PRIMARY_ROOT_ENV: str(owner)}):
+    for env in ({rr.STATE_ROOT_ENV: str(owner)}, {rr.LU_STATE_ROOT_ENV: str(owner)}):
         # An agreeing slug variable never stands in for an unusable profile.
         agreeing = {**env, rr.LU_GITHUB_SLUG_ENV: _PROFILE["github_slug"]}
         if kind == "profile":
@@ -1063,6 +1068,7 @@ def test_every_entry_point_converges_for_primary_and_non_git_state_root(
     try:
         if layout_kind == "today-primary":
             expected_state = primary.resolve()
+            monkeypatch.setenv(rr.LU_STATE_ROOT_ENV, str(expected_state))
             monkeypatch.setenv(rr.PRIMARY_ROOT_ENV, str(primary))
             monkeypatch.setenv(rr.PRODUCT_ROOT_ENV, str(primary))
             monkeypatch.setenv(rr.INTERPRETER_ENV, str(python))
@@ -1175,7 +1181,7 @@ def test_config_path_default_fallback_and_fail_closed(unconfigured, tmp_path):
 
     # Plane owner with no profile -> returns default.
     owner = _primary_checkout(tmp_path / "owner")
-    owner_env = {rr.LU_PRIMARY_ROOT_ENV: str(owner)}
+    owner_env = {rr.LU_STATE_ROOT_ENV: str(owner)}
     assert profile.config_path("fleet_repos", env=owner_env, default=packaged) == packaged
 
     # Valid profile: declared key resolves to profile file; omitted key returns default.

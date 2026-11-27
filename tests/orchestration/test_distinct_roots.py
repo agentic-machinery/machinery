@@ -164,7 +164,7 @@ def _configured(layout: dict[str, Path], repo: str) -> dict[str, str]:
     return {
         rr.PRIMARY_ROOT_ENV: str(layout["primary"]),
         rr.GITHUB_SLUG_ENV: CONFIGURED_SLUG,
-        rr.STATE_ROOT_ENV: str(layout["primary"]),
+        rr.LU_STATE_ROOT_ENV: str(layout["primary"]),
         rr.INTERPRETER_ENV: str(layout["python"]),
         rr.PRODUCT_ROOT_ENV: str(layout["product"]),
     }
@@ -445,7 +445,7 @@ def test_runtime_target_interpreter_policy_and_state_roots_are_distinct(monkeypa
 # --------------------------------------------------------------------------- AC-02: defaults are today's values
 
 
-def test_unset_configuration_keeps_todays_roots(clean_env, monkeypatch) -> None:
+def test_in_tree_layout_requires_an_explicit_state_root(clean_env, monkeypatch) -> None:
     assert rr.RUNTIME_ROOT == Path(rr.__file__).resolve().parents[2]
     # This case deliberately models the legacy in-tree copy, independently
     # of where pytest imported the installed resolver.
@@ -457,6 +457,9 @@ def test_unset_configuration_keeps_todays_roots(clean_env, monkeypatch) -> None:
     monkeypatch.setattr(rr, "project_interpreter", lambda *args, **kwargs: stand_in)
     runtime = REPO
     primary = rr.main_checkout_root(runtime)
+    with pytest.raises(rr.StateRootError, match=rr.LU_STATE_ROOT_ENV):
+        rr.machinery_roots()
+    monkeypatch.setenv(rr.LU_STATE_ROOT_ENV, str(primary))
     roots = rr.machinery_roots()
     assert roots.interpreter == stand_in
     assert roots.runtime == runtime == REPO
@@ -507,12 +510,15 @@ def test_a_linked_worktree_is_never_the_configured_primary_or_state_root(
         (tree / ".git").mkdir()
         (tree / ".git" / "commondir").write_text(f"{primary / '.git'}\n", encoding="utf-8")
     monkeypatch.setenv(rr.PRIMARY_ROOT_ENV, str(tree))
-    monkeypatch.setenv(rr.STATE_ROOT_ENV, str(tree))
-    for resolve in (rr.machinery_roots, rr.state_root, lambda: rr.resolve_repo_root(Path(rr.__file__), 2)):
-        with pytest.raises(rr.MachineryConfigError, match="not a linked worktree"):
-            resolve()
-    with pytest.raises(worktree_claims.ControlPlaneError):
-        worktree_claims.public_primary_root()
+    monkeypatch.setenv(rr.LU_STATE_ROOT_ENV, str(tree))
+    with pytest.raises(rr.MachineryConfigError, match="not a linked worktree"):
+        rr.machinery_roots()
+    if git_metadata != "absent":
+        for resolve in (rr.state_root, lambda: rr.resolve_repo_root(Path(rr.__file__), 2)):
+            with pytest.raises(rr.MachineryConfigError, match="not a linked worktree"):
+                resolve()
+        with pytest.raises(worktree_claims.ControlPlaneError):
+            worktree_claims.public_primary_root()
 
 
 def test_an_empty_git_directory_is_never_the_configured_primary(clean_env, monkeypatch, tmp_path: Path) -> None:
@@ -524,6 +530,7 @@ def test_an_empty_git_directory_is_never_the_configured_primary(clean_env, monke
     stray = tmp_path / "stray"
     (stray / ".git").mkdir(parents=True)
     monkeypatch.setenv(rr.PRIMARY_ROOT_ENV, str(stray))
+    monkeypatch.setenv(rr.LU_STATE_ROOT_ENV, str(stray))
     for resolve in (rr.configured_primary_root, rr.state_root, rr.machinery_roots):
         with pytest.raises(rr.MachineryConfigError, match="not a real Git directory"):
             resolve()
@@ -533,6 +540,7 @@ def test_an_empty_git_directory_is_never_the_configured_primary(clean_env, monke
     subprocess.run(["git", f"--git-dir={real / '.git'}", f"--work-tree={real}", "init", "-q"],
                    check=True, capture_output=True, timeout=30)
     monkeypatch.setenv(rr.PRIMARY_ROOT_ENV, str(real))
+    monkeypatch.setenv(rr.LU_STATE_ROOT_ENV, str(real))
     assert rr.configured_primary_root() == real
     assert rr.state_root() == real
     (real / ".git" / "HEAD").unlink()
@@ -664,7 +672,7 @@ def test_non_git_state_root_uses_lu_repos_root_for_siblings_and_worktree_locks(
     assert worktree_claims.repository_lock_dir(rr.state_root()) == expected_locks
 
     # Non-default keeper repos get distinct per-repo state/lock files under non-Git LU_STATE_ROOT,
-    # and keep <repo-root>/batch_state when LU_STATE_ROOT is a primary Git checkout.
+    # including when LU_STATE_ROOT is a primary Git checkout.
     default_state, default_lock = merge_queue_keeper.default_keeper_paths(public_checkout)
     mach_state, mach_lock = merge_queue_keeper.default_keeper_paths(machinery_checkout, "learn-ukrainian/machinery")
     assert default_state == state.resolve() / "batch_state/merge_queue_keeper.json"
@@ -701,10 +709,10 @@ def test_non_git_state_root_uses_lu_repos_root_for_siblings_and_worktree_locks(
     with pytest.raises(worktree_claims.ControlPlaneError):
         worktree_claims.control_plane_root(machinery_checkout)
 
-    # In today's layout with explicit LU_STATE_ROOT == primary, non-default keeper keeps <repo-root>.
+    # An explicit legacy Git state root also holds repository-specific state and locks.
     monkeypatch.setenv(rr.LU_STATE_ROOT_ENV, str(public_checkout))
     today_mach_state, today_mach_lock = merge_queue_keeper.default_keeper_paths(
         machinery_checkout, "learn-ukrainian/machinery"
     )
-    assert today_mach_state == machinery_checkout.resolve() / "batch_state/merge_queue_keeper.json"
-    assert today_mach_lock == machinery_checkout.resolve() / "batch_state/locks/merge_queue_keeper.lock"
+    assert today_mach_state == public_checkout.resolve() / "batch_state/merge_queue_keeper/learn-ukrainian__machinery.json"
+    assert today_mach_lock == public_checkout.resolve() / "batch_state/locks/merge_queue_keeper.learn-ukrainian__machinery.lock"

@@ -7,7 +7,7 @@ code in ``scripts.project_api.config`` (Monitor split, C-4687).
 import os
 from pathlib import Path
 
-from lu_machinery.common.repo_root import machinery_path, product_root, state_root
+from lu_machinery.common.repo_root import StateRootError, machinery_path, product_root, state_root
 
 
 def _live_repo_root() -> Path:
@@ -19,6 +19,15 @@ def _live_repo_root() -> Path:
     if not (candidate / ".git").exists():
         raise RuntimeError(f"LEARN_UK_REPO_ROOT is not a Git checkout: {candidate}")
     return candidate
+
+
+def batch_state_path(shared_root: Path) -> Path:
+    """Resolve the Monitor store and validate its legacy environment assertion."""
+    path = shared_root / "batch_state"
+    setting = "LEARN_UKRAINIAN_BATCH_STATE_DIR"
+    if setting in os.environ and os.environ[setting] != str(path):
+        raise StateRootError(f"{setting} disagrees with the durable state root")
+    return path
 
 
 def __getattr__(name: str) -> Path:
@@ -44,8 +53,7 @@ def __getattr__(name: str) -> Path:
         # The machinery pages ship in the release, never in the product checkout.
         selected = machinery_path("api/dashboards")
     elif name == "BATCH_STATE_DIR":
-        override = os.environ.get("LEARN_UKRAINIAN_BATCH_STATE_DIR")
-        selected = Path(override) if override is not None else state_root() / "batch_state"
+        return batch_state_path(state_root())
     else:
         raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
     globals()[name] = selected

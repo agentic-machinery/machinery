@@ -39,6 +39,19 @@ def test_valid_context_passes_check(host_layout, tmp_path):
     assert result.returncode == 0, (result.stdout, result.stderr)
     assert json.loads(result.stdout) == {"schema": "machinery.host.v1", "ok": True}
 
+    projected = host_context.project_sandbox_state(tmp_path, env=host_layout.env)
+    assert projected is not None
+    assert projected.state_root == state
+    assert json.loads(projected.path.read_text()) == {
+        "schema": "machinery.sandbox-state.v1", "state_root": str(state),
+    }
+    env = {host_context.CONTEXT_ENV: str(projected.path)}
+    result = host_layout.check("--role", "state", env=env)
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    assert_refused(host_layout.check(env=env), "invalid_role")
+    assert_refused(host_layout.check("--role", "state", env={**env, "LU_STATE_ROOT": str(tmp_path)}),
+                   "legacy_conflict")
+
 
 def test_missing_context_fails_closed_before_state_io(host_layout, monkeypatch):
     """An absent binding cannot trigger a fallback lookup or a Git probe."""

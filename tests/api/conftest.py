@@ -121,8 +121,9 @@ def _forget_session_roots() -> None:
 @pytest.hookimpl(wrapper=True)
 def pytest_make_collect_report(collector: pytest.Collector):
     """Collect each module below this directory with the session roots configured, then restore."""
-    previous = {name: os.environ.get(name) for name in _ROOT_VALUES}
-    os.environ.update(_ROOT_VALUES)
+    values = {**_ROOT_VALUES, "LU_STATE_ROOT": _ROOT_VALUES["LEARN_UKRAINIAN_PRIMARY_REPO_ROOT"]}
+    previous = {name: os.environ.get(name) for name in values}
+    os.environ.update(values)
     try:
         return (yield)
     finally:

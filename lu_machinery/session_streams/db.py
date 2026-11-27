@@ -5,7 +5,6 @@ from __future__ import annotations
 import hashlib
 import random
 import sqlite3
-import subprocess
 import time
 from contextlib import suppress
 from dataclasses import dataclass
@@ -14,9 +13,7 @@ from pathlib import Path
 
 from lu_machinery.common.repo_root import (
     MachineryConfigError,
-    is_configured_state_root,
     state_root,
-    state_root_for_checkout,
 )
 from lu_machinery.control_plane.storage import StoreId, assert_component_supported
 from lu_machinery.control_plane.storage import connect as cp_connect
@@ -49,47 +46,15 @@ class Migration:
 
 
 def canonical_state_root(repo_root: Path | None = None) -> Path:
-    """Resolve the canonical durable state root for session streams."""
-    if repo_root is None:
+    """Resolve durable session state independently of the repository being operated on."""
+    try:
         return state_root().resolve()
-    try:
-        configured = is_configured_state_root(repo_root)
-    except (MachineryConfigError, OSError, RuntimeError) as exc:
-        raise SessionStreamDatabaseError(f"cannot resolve canonical state root: {exc}") from exc
-    if configured is not None:
-        return configured
-    active_root = repo_root.resolve()
-    result = subprocess.run(
-        ["git", "rev-parse", "--path-format=absolute", "--git-common-dir"],
-        cwd=active_root,
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=10,
-    )
-    common_dir_text = result.stdout.strip()
-    if result.returncode != 0 or not common_dir_text:
-        detail = result.stderr.strip() or "git did not report a common directory"
-        raise SessionStreamDatabaseError(f"cannot resolve canonical state root: {detail}")
-    common_dir = Path(common_dir_text)
-    if not common_dir.is_absolute() or common_dir.name != ".git":
-        raise SessionStreamDatabaseError(
-            f"cannot derive primary checkout from Git common directory: {common_dir_text!r}"
-        )
-    checkout_primary = common_dir.parent.resolve()
-    try:
-        return state_root_for_checkout(checkout_primary)
     except (MachineryConfigError, OSError, RuntimeError) as exc:
         raise SessionStreamDatabaseError(f"cannot resolve canonical state root: {exc}") from exc
 
 
 def default_database_path(repo_root: Path | None = None) -> Path:
-    try:
-        return canonical_state_root(repo_root) / DEFAULT_RELATIVE_DATABASE
-    except SessionStreamDatabaseError:
-        if repo_root is not None:
-            return (repo_root / DEFAULT_RELATIVE_DATABASE).resolve()
-        raise
+    return canonical_state_root(repo_root) / DEFAULT_RELATIVE_DATABASE
 
 
 def load_migrations() -> tuple[Migration, ...]:

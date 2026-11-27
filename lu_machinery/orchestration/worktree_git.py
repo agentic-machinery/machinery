@@ -177,18 +177,8 @@ def primary_checkout_root(repo_root: Path) -> Path:
 
 
 def control_plane_root(repo_root: Path) -> Path:
-    """Return the checkout holding ``repo_root``'s task records, leases, and locks.
-
-    ``repo_root``'s own primary checkout, except a ``--repo`` sibling
-    repository, whose dispatch state lives on the public primary (#8624). It
-    falls back to the repository's own primary when the fleet catalog is
-    unreadable.
-    """
-    primary = primary_checkout_root(repo_root)
-    try:
-        return worktree_claims.control_plane_root(primary)
-    except worktree_claims.ControlPlaneError:
-        return primary
+    """Return the configured control plane for the checkout's worktrees."""
+    return worktree_claims.control_plane_root(primary_checkout_root(repo_root))
 
 
 def _format_failure(proc: subprocess.CompletedProcess[str]) -> str:
@@ -810,14 +800,12 @@ def _has_active_rollover_lease(repo_root: Path, info: WorktreeInfo) -> str | Non
 def _has_active_ownership_claim(repo_root: Path, task_id: str | None) -> str | None:
     if not task_id:
         return None
-    env_override = (os.environ.get("LEARN_UKRAINIAN_OWNERSHIP_LEDGER") or "").strip()
-    if env_override:
-        db_path = Path(env_override).expanduser().resolve()
-    else:
-        db_path = control_plane_root(repo_root) / "batch_state" / "tasks" / "write-ownership.sqlite3"
-        if not db_path.is_file():
-            return None
+    from lu_machinery.guardrails.delegate_ownership import default_ledger_path
+
     try:
+        db_path = default_ledger_path()
+        if not db_path.is_file() and not (os.environ.get("LEARN_UKRAINIAN_OWNERSHIP_LEDGER") or "").strip():
+            return None
         conn = cp_connect(StoreId.WRITE_OWNERSHIP, path=db_path, read_only=True)
         try:
             cur = conn.cursor()

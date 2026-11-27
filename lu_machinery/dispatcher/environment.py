@@ -22,6 +22,7 @@ from lu_machinery.common.repo_root import (
 from lu_machinery.common.task_store_paths import tasks_dir
 from lu_machinery.dispatcher import site_deps, store
 from lu_machinery.dispatcher.types import TaskSpec
+from lu_machinery.host_context import CONTEXT_ENV
 
 # A worker's scratch lives at /var/tmp/<task-id>, exported as LU_TASK_SCRATCH. A write worker's TMPDIR is that
 # scratch: the supervisor creates it before launch and settlement removes it once the provider is proven gone,
@@ -280,7 +281,9 @@ def child_env(spec: TaskSpec) -> dict[str, str]:
         env["GIT_ALLOW_PROTOCOL"] = "file"
     # Every worker's hooks and machinery tools converge on the configured roots (#100), so
     # explicit machinery root settings (including legacy aliases) reach every child, whatever its mode.
-    for name in (PRIMARY_ROOT_ENV, LU_PRIMARY_ROOT_ENV, LU_STATE_ROOT_ENV, STATE_ROOT_ENV, REPOS_ROOT_ENV, PROFILE_PATH_ENV):
+    for name in (
+        CONTEXT_ENV, PRIMARY_ROOT_ENV, LU_PRIMARY_ROOT_ENV, LU_STATE_ROOT_ENV, STATE_ROOT_ENV, REPOS_ROOT_ENV, PROFILE_PATH_ENV,
+    ):
         configured = os.environ.get(name, "")
         if configured:
             env[name] = configured

@@ -703,7 +703,7 @@ def settle_terminal_worktrees(repo_root: Path, *, apply: bool, github: GitHubRea
 
     try:
         root = tasks_dir()
-        if (repo_root / "batch_state" / "tasks").resolve() != root.resolve():
+        if repo_root.resolve() != state_root().resolve():
             return None
     except (OSError, RuntimeError):
         return None
@@ -1836,7 +1836,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         if args.repo_root:
-            repo_roots = state_roots = args.repo_root
+            repo_roots = args.repo_root
         else:
             public = default_public_repo()
             private = default_private_repo()
@@ -1844,7 +1844,7 @@ def main(argv: list[str] | None = None) -> int:
             repo_roots = [public, *([state] if state is not None else []), private]
             # batch_state/ and .agent/ live under the state root, which a detached plane keeps apart
             # from the product checkout.
-            state_roots = [state_root(), private]
+        state_roots = [state_root()]
     except (MachineryConfigError, FleetRepoError) as exc:
         parser.error(str(exc))
     receipt = build_receipt(repo_roots, apply=bool(args.apply), **({"git_maintenance": True} if args.git_maintenance else {}))

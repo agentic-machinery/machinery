@@ -39,6 +39,7 @@ def test_non_release_code_cannot_migrate_live_store(tmp_path: Path, monkeypatch)
         (primary / ".git" / part).mkdir(parents=True)
     (primary / ".git" / "HEAD").write_text("ref: refs/heads/main\n")
     monkeypatch.setenv("LEARN_UKRAINIAN_PRIMARY_REPO_ROOT", str(primary))
+    monkeypatch.setenv("LU_STATE_ROOT", str(primary))
     monkeypatch.delenv("LEARN_UKRAINIAN_STATE_ROOT", raising=False)
     monkeypatch.delenv("FLEET_COMMS_ROOT", raising=False)
     live = primary / paths.DEFAULT_ROOT_REL
@@ -82,11 +83,11 @@ def test_non_release_code_cannot_migrate_live_store(tmp_path: Path, monkeypatch)
         assert service.store.connection.execute(
             "SELECT MAX(version) FROM comms_schema_migrations"
         ).fetchone()[0] == max(m.version for m in migrations.MIGRATIONS)
-    monkeypatch.delenv("LEARN_UKRAINIAN_PRIMARY_REPO_ROOT")
+    monkeypatch.delenv("LU_STATE_ROOT")
     with pytest.raises(PlaneRootAnchorError, match="live_store_identity_unknown"):
         ArtifactStore(root=tmp_path / "unknown-plane")
     assert not (tmp_path / "unknown-plane").exists()
-    monkeypatch.setenv("LEARN_UKRAINIAN_PRIMARY_REPO_ROOT", str(primary))
+    monkeypatch.setenv("LU_STATE_ROOT", str(primary))
     loop = tmp_path / "identity-loop"
     loop.symlink_to(loop)
     with pytest.raises(PlaneRootAnchorError, match="live_store_identity_unknown"):
@@ -180,11 +181,13 @@ def test_artifact_store_uses_durable_sqlite_and_private_modes(
 
     loop = tmp_path / "loop"
     loop.symlink_to(loop)
-    default_root = primary / "batch_state" / "fleet-comms" / "v1"
+    state = tmp_path / "state"
+    default_root = state / "batch_state" / "fleet-comms" / "v1"
     default_root.parent.mkdir(parents=True)
     default_root.symlink_to(loop)
     before = sorted(tmp_path.rglob("*"))
     with monkeypatch.context() as guard:
+        guard.setenv("LU_STATE_ROOT", str(state))
         guard.setattr("lu_machinery.fleet_comms.artifacts.cp_connect", connect)
         guard.setattr(ArtifactStore, "_prepare_private_dir", prepare)
         for selection in ({"root": loop}, {}, {"repo_root": loop}, {"repo_root": primary}):
@@ -548,7 +551,7 @@ def test_non_git_live_store_enforces_installed_release_guard_including_aliases(
     primary_db = primary / paths.DEFAULT_ROOT_REL / "comms.sqlite3"
     primary_db.parent.mkdir(parents=True)
     primary_db.write_bytes(b"")
-    monkeypatch.delenv("LU_STATE_ROOT")
+    monkeypatch.setenv("LU_STATE_ROOT", str(primary))
     monkeypatch.setenv("LEARN_UKRAINIAN_PRIMARY_REPO_ROOT", str(primary))
     monkeypatch.setenv("LEARN_UKRAINIAN_PYTHON", str(py))
     with pytest.raises(PlaneRootAnchorError, match="live_store_requires_installed_release"):

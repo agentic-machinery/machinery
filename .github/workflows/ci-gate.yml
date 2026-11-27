@@ -1439,12 +1439,14 @@ jobs:
           work="$RUNNER_TEMP/installed-wheel"
           product="$GITHUB_WORKSPACE/product"
           candidate="$work/product-consumer/bin/python"
+          state="$(mktemp -d "$work/key-state.XXXXXX")"
           mapfile -t tests < "$work/key-tests.txt"
           cd "$product"
           # The collection environment: the candidate's venv now ends with the
           # product environment's site-packages.
           env -u PYTHONPATH LEARN_UKRAINIAN_PYTHON="$candidate" LU_PRODUCT_ROOT="$product" \
-            LEARN_UKRAINIAN_PRIMARY_REPO_ROOT="$product" "$candidate" -m pytest "${tests[@]}"
+            LU_STATE_ROOT="$state" LEARN_UKRAINIAN_PRIMARY_REPO_ROOT="$product" \
+            "$candidate" -m pytest "${tests[@]}"
           echo "Key consumer tests passed: ${tests[*]}" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Remove build files

@@ -68,6 +68,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from lu_machinery.common.task_store_paths import tasks_dir as default_tasks_dir
+
 # File-path and isolated callers use this release's helper, never an installed copy.
 _json_loads = runpy.run_path(str(Path(__file__).resolve().parents[1] / "common" / "json_depth.py"))["loads"]
 def _load_sibling(module_name: str, filename: str):
@@ -319,7 +321,7 @@ def main(argv: list[str] | None = None) -> int:
         help="interpreter to run the sentinel-import probe under (default: <main_root>/.venv/bin/python)",
     )
     parser.add_argument(
-        "--tasks-dir", type=Path, default=None, help="dispatch tasks dir for attribution (default: <root>/batch_state/tasks)"
+        "--tasks-dir", type=Path, default=None, help="dispatch tasks dir for attribution (default: configured dispatch task store)"
     )
     parser.add_argument(
         "--state-dir",
@@ -333,7 +335,7 @@ def main(argv: list[str] | None = None) -> int:
     tasks_dir = args.tasks_dir
     if tasks_dir is None:
         try:
-            tasks_dir = _resolve_main_root(repo) / "batch_state" / "tasks"
+            tasks_dir = default_tasks_dir()
         except Exception:
             tasks_dir = None
 

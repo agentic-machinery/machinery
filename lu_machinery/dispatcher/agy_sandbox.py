@@ -1510,7 +1510,6 @@ class _Boundary:
         forwarder = [str(interpreter), "-I", str(boundary / "forwarder.py"), str(boundary / "egress.sock")]
         inner = [str(interpreter), "-I", str(boundary / "canary.py"), str(boundary / "plan.json"), "--",
                  *forwarder, str(agy), *command[1:]]
-        argv = wrap_argv_with_sandbox(inner, sandbox)
         masks = [argument for path in hidden for argument in ("--tmpfs", str(path), "--remount-ro", str(path))]
         # Match the other read-only dispatchers: mask the store and restore only this task's inputs and context.
         masks += ["--tmpfs", str(tasks)]
@@ -1533,13 +1532,13 @@ class _Boundary:
             for item in self.confirmed_inputs:
                 input_mounts += ["--ro-bind", item["copy"], item["mount"]]
         cwd = self.worktree
-        argv[-len(inner):-len(inner)] = [
+        argv = wrap_argv_with_sandbox(inner, sandbox, bwrap_mounts=[
             *masks, *input_mounts, "--ro-bind", str(boundary / "passwd"), "/etc/passwd",
             "--ro-bind", str(boundary / "group"),
             "/etc/group", "--cap-drop", "ALL", "--proc", "/proc", "--chdir", str(cwd),
             # Last: the empty root becomes read-only, leaving the runtime bind as the only writable path.
             "--remount-ro", "/",
-        ]
+        ])
         self.receipt["argv_sha256"] = hashlib.sha256(json.dumps(argv).encode()).hexdigest()
         sandbox_path = [str(boundary / "bin")]
         if node_bin is not None:

@@ -12,10 +12,10 @@ directory or ``site-packages`` lookup takes part, so a decoy file cannot change 
   modes; never configured, and resource paths stay in the package or its shipped shared resource tree.
 - :func:`product_root`: an explicit argument, else ``LU_PRODUCT_ROOT``; with neither,
   lu_machinery refuses, and only the in-tree copy derives the checkout holding it.
-- :func:`state_root` and :func:`primary_root`: ``LU_PRIMARY_REPO_ROOT`` (alias
-  ``LEARN_UKRAINIAN_PRIMARY_REPO_ROOT``);
-  without it, lu_machinery refuses, and only the in-tree copy derives the primary of its
-  own checkout (unchanged).
+- :func:`state_root`: the host context's state directory or the explicit legacy
+  ``LU_STATE_ROOT`` setting. If neither is configured, it refuses.
+- :func:`primary_root`: ``LU_PRIMARY_REPO_ROOT`` (alias
+  ``LEARN_UKRAINIAN_PRIMARY_REPO_ROOT``); only the in-tree copy can derive its own checkout.
 
 Refusals raise :class:`ProductRootError` or :class:`StateRootError` (both
 :class:`MachineryConfigError`, a ``ValueError``) at the call, never at import, so
@@ -38,7 +38,7 @@ primary checkout          ``LU_PRIMARY_REPO_ROOT``              ``main_checkout_
 GitHub slug               the plane owner's consumer profile,   ``learn-ukrainian/learn-ukrainian.github.io``
                           ``LU_GITHUB_SLUG``                    when the plane owner has no profile
                           (``LEARN_UKRAINIAN_GITHUB_SLUG``)
-state root                ``LU_STATE_ROOT``                     the primary checkout (holds ``batch_state/``)
+state root                host context or ``LU_STATE_ROOT``     required (holds ``batch_state/``)
                           (``LEARN_UKRAINIAN_STATE_ROOT``)
 rules directory (policy)  none: installed release                ``agents_extensions/shared/rules`` beside the package
 interpreter               ``LU_PYTHON``                         :func:`project_interpreter`'s resolution order
@@ -56,12 +56,8 @@ The GitHub slug has one authority. The plane owner's consumer profile
 variable may both name it only when they agree; a conflict refuses. The default slug is the
 compatibility path for a plane owner without a profile (learn-ukrainian until it commits one).
 
-Path values must be absolute; a relative value raises :class:`MachineryConfigError`
-(a ``ValueError``) rather than resolving against the working directory. The state root
-must name the primary checkout: moving state to another store is the operator's state
-cutover (machinery move step 9), so any other value is refused, which also keeps
-modules that still anchor ``batch_state/`` on the primary from splitting from those
-that read the state root.
+Path settings must be absolute. The durable state root can live outside all checkouts.
+The host context validates any supplied legacy state setting against that binding.
 
 The runtime root is never configured. It is the code that is running, and a re-exec
 from a linked worktree (``scripts/dispatcher/primary.py``) still resolves that code's own
@@ -91,9 +87,8 @@ product files names the product checkout with ``LU_PRODUCT_ROOT`` (a systemd
 API selects it at startup (``scripts.api.config.PRODUCT_ROOT``): served from a release
 snapshot, that is the snapshot itself, never the live checkout.
 
-Shared runtime state is anchored on ``LU_PRIMARY_REPO_ROOT`` (or its alias), never on the
-selected product: kube-dojo's worktrees and the shared dispatch state live in different
-places. The installed package refuses state-dependent use without that anchor.
+Shared runtime state requires a valid host context or an explicit ``LU_STATE_ROOT``.
+Product selection and Git checkout selection are independent of state placement.
 """
 
 from __future__ import annotations
@@ -448,13 +443,29 @@ def github_slug(env: Mapping[str, str] | None = None) -> str:
     return configured_github_slug(env) or DEFAULT_GITHUB_SLUG
 
 
-def configured_state_root(env: Mapping[str, str] | None = None) -> Path | None:
-    """The explicitly configured durable state root (``LU_STATE_ROOT`` or its alias), else ``None``.
+def configured_host_state_root(env: Mapping[str, str] | None = None) -> Path | None:
+    """Return the validated host binding's state root when the binding exists."""
+    from lu_machinery import host_context
 
-    Accepts either a dedicated non-Git existing directory (for example ``/var/lib/machinery``)
-    or a real primary Git checkout. Refuses relative paths, alias conflicts, missing or
-    non-directory paths, symlink loops, linked worktrees, and stray/broken ``.git`` entries.
+    settings = _env(env)
+    try:
+        return host_context.load_host_context(role="state", env=settings).state_root
+    except host_context.HostContextError as exc:
+        if exc.code == "missing_context" and host_context.CONTEXT_ENV not in settings:
+            return None
+        raise StateRootError(str(exc)) from exc
+
+
+def configured_state_root(env: Mapping[str, str] | None = None) -> Path | None:
+    """The host context state root or explicit legacy state root, else ``None``.
+
+    A legacy setting may name a dedicated non-Git directory or a primary checkout.
+    Invalid settings raise ``MachineryConfigError``.
     """
+    host_state = configured_host_state_root(env)
+    if host_state is not None:
+        return host_state
+
     setting = _configured_path(LU_STATE_ROOT_ENV, env)
     if setting is None:
         return None
@@ -469,29 +480,16 @@ def configured_state_root(env: Mapping[str, str] | None = None) -> Path | None:
 
 
 def state_root(start: Path | None = None, env: Mapping[str, str] | None = None) -> Path:
-    """The durable state root holding ``batch_state/`` and ``.agent/``.
+    """Resolve durable state from the host binding or explicit legacy setting.
 
-    When ``LU_STATE_ROOT`` (or its alias ``LEARN_UKRAINIAN_STATE_ROOT``) is set, it names the
-    durable state root directly—either a dedicated non-Git directory or a primary checkout.
-    Any configured ``LU_PRIMARY_REPO_ROOT`` is still validated so an invalid primary setting
-    never slips past. When ``LU_STATE_ROOT`` is unset, today's layout stands: the primary
-    checkout (:func:`primary_root`).
+    The retained `start` argument has no effect on state placement.
     """
-    # Validate state setting first (alias conflict, relative path, non-dir, broken .git),
-    # then validate any configured primary checkout so neither invalid root is hidden.
     configured = configured_state_root(env)
-    primary = configured_primary_root(env)
-    if configured is not None:
-        return configured
-    if primary is not None:
-        return primary
-    _require_in_tree_default(
-        StateRootError,
-        "shared-state anchor",
-        f"set {LU_STATE_ROOT_ENV} or {LU_PRIMARY_ROOT_ENV} (or its alias {PRIMARY_ROOT_ENV}) "
-        "to the durable state directory or primary checkout that holds batch_state/",
-    )
-    return main_checkout_root(RUNTIME_ROOT if start is None else start)
+    if configured is None:
+        raise StateRootError(
+            f"no durable state root configured: provide a host context or set {LU_STATE_ROOT_ENV}"
+        )
+    return configured
 
 
 def configured_repos_root(env: Mapping[str, str] | None = None) -> Path | None:
@@ -545,30 +543,8 @@ def is_configured_state_root(path: Path, env: Mapping[str, str] | None = None) -
 
 
 def state_root_for_checkout(checkout_primary: Path, env: Mapping[str, str] | None = None) -> Path:
-    """Converge a fleet checkout's primary root onto the configured durable ``state_root``.
-
-    When ``LU_STATE_ROOT`` is configured separately from repository checkouts, any checkout
-    belonging to this control plane (the configured primary, configured product, or a direct
-    child of ``LU_REPOS_ROOT``) resolves to that single state root. Isolated checkouts
-    outside the configured plane keep ``checkout_primary`` unchanged.
-    """
-    configured = configured_state_root(env)
-    if configured is None:
-        return checkout_primary
-    resolved_state = resolve_path(configured)
-    resolved_checkout = resolve_path(checkout_primary)
-    if resolved_checkout == resolved_state:
-        return resolved_state
-    primary = configured_primary_root(env)
-    if primary is not None and resolve_path(primary) == resolved_checkout:
-        return resolved_state
-    product = configured_product_root(env)
-    if product is not None and resolve_path(main_checkout_root(product)) == resolved_checkout:
-        return resolved_state
-    repos = configured_repos_root(env)
-    if repos is not None and resolved_checkout.parent == resolve_path(repos):
-        return resolved_state
-    return checkout_primary
+    """Resolve the shared state for a caller operating on a checkout."""
+    return state_root(env=env)
 
 
 def rules_dir() -> Path:
@@ -898,13 +874,8 @@ def project_interpreter(root: Path | None = None, *, env: Mapping[str, str] | No
 
 
 def resolve_repo_root(script_path: Path, parents: int) -> Path:
-    """Compatibility spelling for the shared primary/state anchor.
-
-    The in-tree source copy may derive its own checkout from ``script_path``.
-    Installed machinery requires the configured primary and never treats the
-    supplied script's ancestor as a repository or state root.
-    """
-    return state_root(script_path.resolve().parents[parents] if in_tree_source() else None)
+    """Compatibility spelling for the configured durable state root."""
+    return state_root()
 
 
 # Hook-boundary bridge (machinery #100, E3a). Fixed texts every native hook entry

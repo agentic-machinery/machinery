@@ -13,6 +13,7 @@ from pathlib import Path
 
 import pytest
 
+from lu_machinery import host_context
 from lu_machinery.common.git_credentials import SELECTOR_ENV
 from lu_machinery.dispatcher import agy_sandbox, environment, git, scope, site_deps, store, worker, write_boundary
 from lu_machinery.dispatcher.types import Invocation, ParsedResult, TaskSpec
@@ -727,12 +728,12 @@ def test_agy_sandbox_exposes_pinned_node_toolchain_read_only_and_refuses_missing
 
 
 def test_child_env_forwards_non_git_state_repos_and_profile_roots(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    """Defect class: child_env dropping LU_STATE_ROOT, LU_REPOS_ROOT, or LU_PROFILE_PATH."""
+    """Defect class: child_env dropping an explicit host binding or legacy roots."""
     from lu_machinery.common import repo_root
 
     state = tmp_path / "state"
     repos = tmp_path / "repos"
-    state.mkdir()
+    state.mkdir(mode=0o700)
     repos.mkdir()
     host_profile = tmp_path / "profile.v1.json"
     host_profile.write_text("{}", encoding="utf-8")
@@ -765,6 +766,15 @@ def test_child_env_forwards_non_git_state_repos_and_profile_roots(tmp_path: Path
         assert ro_child["LEARN_UKRAINIAN_STATE_ROOT"] == str(state)
         assert ro_child["LEARN_UKRAINIAN_PRIMARY_REPO_ROOT"] == str(primary)
         assert repo_root.state_root(env=ro_child) == state
+
+    # The host launcher needs the source selector before it projects the state view.
+    context_path = tmp_path / "host.v1.json"
+    context_path.write_text(json.dumps({"schema": "machinery.sandbox-state.v1", "state_root": str(state)}))
+    monkeypatch.setenv("LU_HOST_CONTEXT", str(context_path))
+    for name, value in host_context._state_assertions(state).items():
+        monkeypatch.setenv(name, str(value))
+    for mode in ("workspace-write", "read-only"):
+        assert environment.child_env(replace(spec, mode=mode))["LU_HOST_CONTEXT"] == str(context_path)
 
 
 pytestmark = [pytest.mark.usefixtures('configured_roots')]

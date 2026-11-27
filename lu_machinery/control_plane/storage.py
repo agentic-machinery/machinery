@@ -31,8 +31,8 @@ Environment
 Existing path overrides (honored before connect):
 ``FLEET_COMMS_ROOT``, ``LEARN_UKRAINIAN_OWNERSHIP_LEDGER``.
 
-Tests may redirect the primary checkout via ``LEARN_UK_REPO_ROOT`` (same as the
-Monitor API) or the store-specific overrides above.
+SQLite paths default to durable machinery state. Callers can inject an
+explicit database path into ``connect`` for an isolated store.
 """
 
 from __future__ import annotations
@@ -43,7 +43,6 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
-from lu_machinery.common.repo_root import configured_state_root, main_checkout_root, state_root
 from lu_machinery.lib.readonly_sqlite import refuse_writable_corpus_database
 
 _ENV_AUTHORITY = "LEARN_UKRAINIAN_CP_AUTHORITY"
@@ -92,18 +91,6 @@ class ControlPlaneUnsupportedComponentError(ControlPlaneError):
     OPSEC-safe message (store id + component only) instead of an arbitrary
     driver error deep inside a sqlite-shaped helper.
     """
-
-
-def _repo_root(repo_root: Path | None) -> Path:
-    if repo_root is not None:
-        return repo_root
-    configured_state = configured_state_root()
-    if configured_state is not None:
-        return configured_state.resolve()
-    configured = (os.environ.get("LEARN_UK_REPO_ROOT") or "").strip()
-    if configured:
-        return Path(configured).expanduser().resolve()
-    return state_root().resolve()
 
 
 def _parse_authority(raw: str) -> Authority:
@@ -174,33 +161,18 @@ def assert_component_supported(store: StoreId, component: str) -> Authority:
 
 def sqlite_path(store: StoreId, *, repo_root: Path | None = None) -> Path:
     """Resolve the canonical sqlite file for ``store`` without opening it."""
-    use_default_state = (
-        repo_root is None
-        and (configured_state_root() is not None or not (os.environ.get("LEARN_UK_REPO_ROOT") or "").strip())
-    )
-    root = _repo_root(repo_root)
     if store is StoreId.FLEET_COMMS:
         from lu_machinery.fleet_comms.paths import default_plane_root
 
-        if use_default_state:
-            plane_root = default_plane_root()
-        else:
-            plane_root = default_plane_root(
-                repo_root=root,
-                allow_non_git=repo_root is not None or bool(os.environ.get("LEARN_UK_REPO_ROOT")),
-            )
-        return plane_root / "comms.sqlite3"
+        return default_plane_root() / "comms.sqlite3"
     if store is StoreId.SESSION_STREAMS:
         from lu_machinery.session_streams.db import default_database_path
 
-        if use_default_state:
-            return default_database_path()
-        return default_database_path(main_checkout_root(root).resolve())
+        return default_database_path()
     if store is StoreId.WRITE_OWNERSHIP:
-        override = (os.environ.get("LEARN_UKRAINIAN_OWNERSHIP_LEDGER") or "").strip()
-        if override:
-            return Path(override).expanduser().resolve()
-        return root / "batch_state" / "tasks" / "write-ownership.sqlite3"
+        from lu_machinery.guardrails.delegate_ownership import default_ledger_path
+
+        return default_ledger_path()
     if store is StoreId.TASK_INDEX:
         raise ControlPlaneStoreUnavailableError(
             "task_index has no sqlite backing in Phase 0; use a later slice"

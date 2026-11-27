@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any
 
 from lu_machinery.common import github_client, json_depth
+from lu_machinery.common.task_store_paths import tasks_dir as default_tasks_dir
 from lu_machinery.control_plane.storage import StoreId, assert_component_supported
 from lu_machinery.control_plane.storage import connect as cp_connect
 from lu_machinery.fleet_comms.efficiency_metrics import (
@@ -69,7 +70,6 @@ LOAD_BEARING_PROBES = frozenset(
         "backlog_and_dead_letters",
     }
 )
-SESSION_STREAMS_REL = Path(".agent/session-streams/v1/session-streams.sqlite3")
 
 # Probes protected from shedding before the last-resort oversized fallback:
 # the load-bearing set, capsule_session_env, and needle_search (an explicit
@@ -223,7 +223,7 @@ def _probe_bottleneck_slice(
     """Top streams' bottleneck spans; ``collector`` returning ``None`` means still warming."""
     plane_root = root if root is not None else default_plane_root(repo_root=repo_root)
     plane_db = plane_root / "comms.sqlite3"
-    tasks_dir = (repo_root or Path.cwd()) / "batch_state" / "tasks"
+    tasks_dir = default_tasks_dir()
 
     payload = (collector or collect_board_bottleneck_metrics)(tasks_dir, plane_db)
     if payload is None:
@@ -347,31 +347,10 @@ def _probe_issues_streams_membership(orient_result: ProbeResult) -> dict[str, An
 
 
 def _resolve_session_streams_db(repo_root: Path | None) -> Path:
-    """Resolve primary-checkout session-streams DB (not worktree-local Path.cwd())."""
-    if HAS_SESSION_STREAMS and default_database_path is not None:
-        try:
-            return default_database_path(repo_root)
-        except Exception:
-            pass
-
-    active = (repo_root or Path.cwd()).resolve()
-    try:
-        result = subprocess.run(
-            ["git", "rev-parse", "--path-format=absolute", "--git-common-dir"],
-            cwd=active,
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=2.0,
-        )
-        common_dir_text = result.stdout.strip()
-        if result.returncode == 0 and common_dir_text:
-            common_dir = Path(common_dir_text)
-            if common_dir.is_absolute() and common_dir.name == ".git":
-                return common_dir.parent.resolve() / SESSION_STREAMS_REL
-    except Exception:
-        pass
-    return active / SESSION_STREAMS_REL
+    """Resolve the shared session-streams database independently of Git."""
+    if default_database_path is None:
+        raise RuntimeError("session-streams module unavailable")
+    return default_database_path()
 
 
 def _probe_session_streams_and_handoff(
@@ -396,7 +375,15 @@ def _probe_session_streams_and_handoff(
             data={"stream_id": stream_id, "reason": "module_unavailable"},
         )
 
-    db_path = _resolve_session_streams_db(repo_root)
+    try:
+        db_path = _resolve_session_streams_db(repo_root)
+    except (OSError, ValueError, RuntimeError):
+        return ProbeResult(
+            status="degraded",
+            elapsed_ms=(time.perf_counter() - start) * 1000.0,
+            error="session_streams_state_unavailable",
+            data={"stream_id": stream_id, "store": session_streams_store(reachable=False)},
+        )
     if not db_path.is_file():
         elapsed = (time.perf_counter() - start) * 1000.0
         return ProbeResult(

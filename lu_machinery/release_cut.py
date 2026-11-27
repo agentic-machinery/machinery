@@ -36,6 +36,7 @@ from functools import partial
 from pathlib import Path
 from typing import Literal
 
+from lu_machinery import host_context
 from lu_machinery.common import json_depth
 from lu_machinery.common.git_context import sanitized_git_env
 from lu_machinery.common.repo_root import ENV_ALIASES, MACHINERY_ENV_VARS, PRIMARY_ROOT_ENV, PRODUCT_ROOT_ENV
@@ -716,6 +717,35 @@ class Cut:
         env.update(extra)
         return env
 
+    def _consumer_env(self, scratch: Path, python: Path, product: Path) -> dict[str, str]:
+        """Select a state-only context for candidate probes, even on a configured host."""
+        scratch = scratch.resolve(strict=True)
+        state = scratch / "state"
+        state.mkdir(mode=0o700)
+        binding = scratch / "host.v1.json"
+        binding.write_text(json.dumps({
+            "schema": host_context.SCHEMA,
+            "state_root": str(state),
+            # The probe uses only the state role. It verifies the wheel separately.
+            "runtime": {"python": str(python), "lu_machinery": self.built, "wheel_sha256": "0" * 64},
+            "repos": {"machinery": str(product)},
+            "products": {"consumer": {"repo": "machinery", "python": str(python)}},
+            "default_product": "consumer",
+            "private_tools": {},
+            "cto": {"workspace": str(scratch), "starter": str(scratch / "unused"), "config_dir": str(scratch)},
+            "selector_file": str(scratch / "unused-selector"),
+            "monitor_url": "http://127.0.0.1",
+        }), encoding="utf-8")
+        env = self.scratch_env(
+            LU_PRODUCT_ROOT=str(product),
+            LEARN_UKRAINIAN_PRIMARY_REPO_ROOT=str(product),
+            LEARN_UKRAINIAN_PYTHON=str(python),
+            LU_STATE_ROOT=str(state),
+            **{host_context.CONTEXT_ENV: str(binding)},
+        )
+        host_context.load_host_context(role="state", env=env)
+        return env
+
     def venv(self, path: Path) -> Path:
         """A venv with no group- or other-writable file; returns its interpreter.
 
@@ -1066,11 +1096,13 @@ class Cut:
         if self.publisher_python is None:
             raise CutError("ADOPTION_SNAPSHOT_WHEEL: the verified candidate environment is missing")
         python = self._consumer_interpreter(self.publisher_python, product)
-        rendered = self.run(
-            [python, "-I", "-B", "-c", _RUN_ADOPTION_SNAPSHOT, module], cwd=product, timeout=120,
-            env=self.scratch_env(LU_PRODUCT_ROOT=str(product), LEARN_UKRAINIAN_PRIMARY_REPO_ROOT=str(product),
-                                 LEARN_UKRAINIAN_PYTHON=str(python)),
-        ).stdout
+        with tempfile.TemporaryDirectory(prefix="consumer-state-", dir=self.work) as scratch:
+            rendered = self.run(
+                [python, "-I", "-B", "-c", _RUN_ADOPTION_SNAPSHOT, module],
+                cwd=product,
+                timeout=120,
+                env=self._consumer_env(Path(scratch), python, product),
+            ).stdout
         if self.git(product, "status", "--porcelain", "--untracked-files=all"):
             raise CutError("ADOPTION_SNAPSHOT_DIRTY: the snapshot module must write only to stdout")
         try:
@@ -1329,10 +1361,16 @@ class Cut:
         """Collect the product's tests with the candidate first and the product venv's packages after it (R5)."""
         self.step = "consumer test collection"
         python = self._consumer_interpreter(python, product)
-        # The product's project_interpreter() reads LEARN_UKRAINIAN_PYTHON; the candidate names itself rather
-        # than inheriting the caller's value or none.
-        result = self.run([python, "-m", "pytest", "--collect-only", "-q", "tests"], cwd=product, timeout=1800,
-                          env=self.env(LU_PRODUCT_ROOT=str(product), LEARN_UKRAINIAN_PYTHON=str(python)), check=False)
+        # Collection imports the candidate's Monitor. Give it a disposable state
+        # directory and select the candidate interpreter independently of the host.
+        with tempfile.TemporaryDirectory(prefix="consumer-state-", dir=self.work) as scratch:
+            result = self.run(
+                [python, "-m", "pytest", "--collect-only", "-q", "tests"],
+                cwd=product,
+                timeout=1800,
+                env=self._consumer_env(Path(scratch), python, product),
+                check=False,
+            )
         summary = (result.stdout.strip().splitlines() or ["no output"])[-1]
         if result.returncode:
             raise CutError(f"product test collection failed (exit {result.returncode}): {summary}")

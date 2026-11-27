@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytest
 
-from lu_machinery import release_cut
+from lu_machinery import host_context, release_cut
 from lu_machinery.agent_runtime.adapters.acpx import _check_node_artifact
 from lu_machinery.ci import check_agent_attribution as attribution
 from lu_machinery.common import repo_root
@@ -546,6 +546,10 @@ def test_adopt_pr_commits_candidate_snapshot(tmp_path, monkeypatch):
         "from lu_machinery import ROUTES\n"
         "assert 'GH_TOKEN' not in os.environ\n"
         "assert os.environ['LU_PRODUCT_ROOT'] == str(Path.cwd())\n"
+        "state = Path(os.environ['LU_STATE_ROOT'])\n"
+        "assert state.is_dir() and not state.is_relative_to(Path.cwd())\n"
+        "binding = Path(os.environ['LU_HOST_CONTEXT'])\n"
+        "assert json.loads(binding.read_text())['state_root'] == str(state)\n"
         "print(json.dumps({'routes': ROUTES}))\n",
         encoding="utf-8",
     )
@@ -850,7 +854,11 @@ def test_consumer_collection_names_the_candidate_interpreter(monkeypatch, tmp_pa
         command = [str(part) for part in argv]
         stdout = {release_cut._SITE_PATHS: f"{tmp_path / 'host-site'}\n", release_cut._SHOW_LU: f"0.1.24\n{site}/lu_machinery/__init__.py\n"}
         if "pytest" in command:
-            collected.append(kwargs["env"])
+            env = kwargs["env"]
+            state = Path(env["LU_STATE_ROOT"])
+            assert state.is_dir() and state.parent.parent == cut.work and state != product
+            assert host_context.load_host_context(role="state", env=env).state_root == state
+            collected.append(env)
             return subprocess.CompletedProcess(command, 0, "44149 tests collected\n", "")
         if "purelib" in command[-1]:
             return subprocess.CompletedProcess(command, 0, f"{site}\n", "")

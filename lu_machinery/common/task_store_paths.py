@@ -10,7 +10,7 @@ from collections import OrderedDict, deque
 from pathlib import Path
 from typing import Any
 
-from lu_machinery.common.repo_root import MachineryConfigError, state_root
+from lu_machinery.common.repo_root import MachineryConfigError, configured_host_state_root, state_root
 
 # Keep one version per path, including foreign-file classifications. Entry and
 # content caps bound retention; an evicted version is an ordinary cache miss.
@@ -119,9 +119,12 @@ def read_cached_task_record(
 
 
 def tasks_dir() -> Path:
-    """Use a test override or the primary checkout's dispatch task store."""
+    """Resolve the dispatch task store at call time."""
     override = os.environ.get("LU_TASKS_DIR")
     if override:
+        host_state = configured_host_state_root()
+        if host_state is not None:
+            return host_state / "batch_state" / "tasks"
         return Path(override)
     return state_root() / "batch_state" / "tasks"
 

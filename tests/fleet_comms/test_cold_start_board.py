@@ -353,32 +353,20 @@ def test_compute_board_status_load_bearing_only():
     assert compute_board_status(probes) == "degraded"
 
 
-def test_session_streams_db_uses_primary_checkout(tmp_path: Path):
+def test_session_streams_db_uses_configured_state_from_a_worktree(tmp_path: Path, monkeypatch):
     """Dispatch worktree cwd must not make session-streams look missing."""
     from lu_machinery.fleet_comms import cold_start_board as board_mod
 
-    primary = tmp_path / "primary"
+    state = tmp_path / "state"
     worktree = tmp_path / "worktree"
-    primary.mkdir()
+    state.mkdir()
     worktree.mkdir()
-    db = primary / ".agent" / "session-streams" / "v1" / "session-streams.sqlite3"
-    db.parent.mkdir(parents=True)
-    db.write_bytes(b"")
+    monkeypatch.setenv("LU_STATE_ROOT", str(state))
+    monkeypatch.chdir(worktree)
 
-    git_common = primary / ".git"
-    completed = MagicMock()
-    completed.returncode = 0
-    completed.stdout = str(git_common) + "\n"
-    completed.stderr = ""
-
-    with (
-        patch.object(board_mod, "HAS_SESSION_STREAMS", False),
-        patch.object(board_mod, "default_database_path", None),
-        patch("lu_machinery.fleet_comms.cold_start_board.subprocess.run", return_value=completed),
-    ):
-        resolved = board_mod._resolve_session_streams_db(worktree)
-    assert resolved == db
-    assert resolved.is_file()
+    assert board_mod._resolve_session_streams_db(worktree) == (
+        state / ".agent/session-streams/v1/session-streams.sqlite3"
+    )
 
 
 def test_cli_cold_start_board(capsys, tmp_path, monkeypatch):

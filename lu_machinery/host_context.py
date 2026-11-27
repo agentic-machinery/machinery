@@ -1,7 +1,7 @@
 """Load and validate the single machinery.host.v1 host binding.
 
 The default file is root-owned. LU_HOST_CONTEXT can select a trusted scratch
-file for tests and canaries. Roles share the full schema and assertion checks.
+file for tests and canaries, or a state-only projection from the sandbox launcher.
 The state role validates only the state directory and requires no Git or private
 mounts. The wheel digest records the intended artifact for the installer. The
 startup probe checks the installed distribution version and its import.
@@ -16,6 +16,7 @@ import os
 import re
 import stat
 import subprocess
+import tempfile
 import unicodedata
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -27,6 +28,7 @@ from urllib.parse import urlsplit
 from lu_machinery.common import json_depth
 
 SCHEMA = "machinery.host.v1"
+_SANDBOX_STATE_SCHEMA = "machinery.sandbox-state.v1"
 DEFAULT_PATH = Path("/etc/machinery/host.v1.json")
 CONTEXT_ENV = "LU_HOST_CONTEXT"
 REGISTRY_PATH = Path(__file__).with_name("config") / "fleet_repos.yaml"
@@ -90,6 +92,12 @@ class HostContext:
     selector_file: Path
     monitor_url: str
     host: str | None = None
+
+
+@dataclass(frozen=True)
+class SandboxStateContext:
+    state_root: Path
+    path: Path
 
 
 def _text(value: Any, field: str) -> str:
@@ -232,29 +240,41 @@ def _parse(raw: Any) -> HostContext:
     )
 
 
+def _state_assertions(root: Path) -> dict[str, Path]:
+    batch = root / "batch_state"
+    return {
+        "LU_STATE_ROOT": root,
+        "LEARN_UKRAINIAN_STATE_ROOT": root,
+        "LU_TASKS_DIR": batch / "tasks",
+        "LEARN_UKRAINIAN_BATCH_STATE_DIR": batch,
+        "FLEET_COMMS_ROOT": batch / "fleet-comms" / "v1",
+        "LEARN_UKRAINIAN_OWNERSHIP_LEDGER": batch / "tasks" / "write-ownership.sqlite3",
+        "LU_GITHUB_CACHE_DIR": batch / "github-client",
+    }
+
+
+def _check_assertions(assertions: Mapping[str, Path | str | None], env: Mapping[str, str]) -> None:
+    for name, expected in assertions.items():
+        if name in env and (expected is None or env[name] != str(expected)):
+            raise HostContextError("legacy_conflict", f"{name} disagrees with host context")
+
+
 def _assert_legacy(
     context: HostContext, env: Mapping[str, str], registry: Mapping[str, dict[str, Any]],
 ) -> None:
     # Compare normalized spellings before filesystem probes, even for the state role.
-    batch = context.state_root / "batch_state"
     primary = context.repos["machinery"]
     product = context.repos[context.products[context.default_product].repo]
     assertions: dict[str, Path | str | None] = {
+        **_state_assertions(context.state_root),
         "LU_GITHUB_SLUG": registry["machinery"]["github"],
         "LEARN_UKRAINIAN_GITHUB_SLUG": registry["machinery"]["github"],
-        "LU_STATE_ROOT": context.state_root,
-        "LEARN_UKRAINIAN_STATE_ROOT": context.state_root,
         "LU_PRIMARY_REPO_ROOT": primary,
         "LEARN_UKRAINIAN_PRIMARY_REPO_ROOT": primary,
         "LU_PRODUCT_ROOT": product,
         "LEARN_UK_REPO_ROOT": product,
         "LU_PYTHON": context.runtime.python,
         "LEARN_UKRAINIAN_PYTHON": context.runtime.python,
-        "LU_TASKS_DIR": batch / "tasks",
-        "LEARN_UKRAINIAN_BATCH_STATE_DIR": batch,
-        "FLEET_COMMS_ROOT": batch / "fleet-comms" / "v1",
-        "LEARN_UKRAINIAN_OWNERSHIP_LEDGER": batch / "tasks" / "write-ownership.sqlite3",
-        "LU_GITHUB_CACHE_DIR": batch / "github-client",
         "LEARN_UKRAINIAN_INFRA_PRIVATE_ROOT": context.repos.get("infra-private"),
         "LU_FLEET_REPO_SELECTOR_FILE": context.selector_file,
         "MONITOR_PROJECT_STATE_URL": context.monitor_url.rstrip("/") + "/api/fleet/projects/v1/report",
@@ -272,9 +292,7 @@ def _assert_legacy(
             path.name == registry[key]["local_name"] for key, path in context.repos.items()
         )
         assertions["LU_REPOS_ROOT"] = next(iter(parents)) if same_layout else None
-    for name, expected in assertions.items():
-        if name in env and (expected is None or env[name] != str(expected)):
-            raise HostContextError("legacy_conflict", f"{name} disagrees with host context")
+    _check_assertions(assertions, env)
 
 
 def _outside_git(path: Path, *, code: str, label: str) -> None:
@@ -387,14 +405,25 @@ def _check_private_tool(tool: PrivateTool) -> None:
         raise HostContextError("private_tool_digest_mismatch", "private tool digest differs from its binding")
 
 
-def load_host_context(*, role: str = "all", env: Mapping[str, str] | None = None) -> HostContext:
+def load_host_context(
+    *, role: str = "all", env: Mapping[str, str] | None = None,
+) -> HostContext | SandboxStateContext:
     """Read a fresh binding. A state caller may only use the validated state root."""
     if role not in {"all", "state"}:
         raise HostContextError("invalid_role", "role must be all or state")
     env = os.environ if env is None else env
     override = CONTEXT_ENV in env
     source = _path(env[CONTEXT_ENV], CONTEXT_ENV) if override else DEFAULT_PATH
-    context = _parse(_read(source, override=override))
+    raw = _read(source, override=override)
+    if isinstance(raw, dict) and raw.get("schema") == _SANDBOX_STATE_SCHEMA:
+        if not override or role != "state":
+            raise HostContextError("invalid_role", "a sandbox context requires an explicit state role binding")
+        row = _object(raw, "sandbox state context", "schema state_root")
+        root = _path(row["state_root"], "state_root")
+        _check_assertions(_state_assertions(root), env)
+        _check_state(root)
+        return SandboxStateContext(root, source)
+    context = _parse(raw)
     from lu_machinery.common.git_credentials import canonical_origins, repository_registry
 
     try:
@@ -424,6 +453,27 @@ def load_host_context(*, role: str = "all", env: Mapping[str, str] | None = None
     for tool in context.private_tools.values():
         _check_private_tool(tool)
     return context
+
+
+def project_sandbox_state(
+    directory: Path, *, env: Mapping[str, str] | None = None,
+) -> SandboxStateContext | None:
+    """Validate before entering the sandbox and write only its state binding.
+
+    The caller owns the private directory and mounts the resulting file read-only.
+    """
+    env = os.environ if env is None else env
+    try:
+        context = load_host_context(role="state", env=env)
+    except HostContextError as exc:
+        if exc.code == "missing_context" and CONTEXT_ENV not in env:
+            return None
+        raise
+    with tempfile.NamedTemporaryFile(
+        mode="w", encoding="utf-8", dir=directory, prefix=".host-state-", suffix=".json", delete=False,
+    ) as binding:
+        json.dump({"schema": _SANDBOX_STATE_SCHEMA, "state_root": str(context.state_root)}, binding)
+    return SandboxStateContext(context.state_root, Path(binding.name))
 
 
 def main(argv: list[str] | None = None) -> int:

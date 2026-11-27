@@ -101,8 +101,10 @@ def _cleanup_fixture(tmp_path: Path, monkeypatch) -> Path:
         repo / ".worktrees" / "dispatch" / "codex" / "1526-item2-anchor-parity",
         "codex/active-dispatch-merged",
     )
+    batch_state = tmp_path / "state" / "batch_state"
+    monkeypatch.setenv("LU_TASKS_DIR", str(batch_state / "tasks"))
     _write(
-        repo / "batch_state" / "tasks" / "1526-item2-anchor-parity.json",
+        batch_state / "tasks" / "1526-item2-anchor-parity.json",
         json.dumps({"task_id": "1526-item2-anchor-parity", "status": "running"}),
     )
 
@@ -115,7 +117,7 @@ def _cleanup_fixture(tmp_path: Path, monkeypatch) -> Path:
     monkeypatch.setattr(
         app.state,
         "ctx",
-        app.state.ctx.with_roots(live_repo_root=repo, project_root=repo),
+        app.state.ctx.with_roots(live_repo_root=repo, project_root=repo, batch_state_dir=batch_state),
     )
     return repo
 

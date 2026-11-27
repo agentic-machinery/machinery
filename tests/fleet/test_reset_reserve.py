@@ -32,6 +32,11 @@ def fresh_inventory(monkeypatch):
     monkeypatch.setattr(reset_reserve, "get_provider_usage_data", lambda _provider: _eligible_codex())
 
 
+@pytest.fixture(autouse=True)
+def _reserve_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("LU_STATE_ROOT", str(tmp_path))
+
+
 def _reserve() -> dict:
     return {"available": True, **{key: value for key, value in _assertion().items() if key != "schema_version"}}
 
@@ -120,14 +125,17 @@ def test_valid_assertion_is_sanitized_without_mutation(tmp_path):
     assert path.read_bytes() == original
 
 
-def test_assertion_is_shared_with_dispatch_worktree_and_expires_on_next_read(tmp_path):
+def test_assertion_is_shared_with_dispatch_worktree_and_expires_on_next_read(tmp_path, monkeypatch):
     primary = tmp_path / "primary"
     worktree = primary / ".worktrees" / "dispatch" / "codex" / "task"
     git_worktree_dir = primary / ".git" / "worktrees" / "task"
     git_worktree_dir.mkdir(parents=True)
     worktree.mkdir(parents=True)
     (worktree / ".git").write_text(f"gitdir: {git_worktree_dir}\n", encoding="utf-8")
-    _write_assertion(primary, _assertion())
+    state = tmp_path / "durable-state"
+    _write_assertion(state, _assertion())
+    monkeypatch.setenv("LU_STATE_ROOT", str(state))
+    monkeypatch.chdir(worktree)
 
     assert load_reset_reserve(worktree, now=datetime(2026, 9, 23, 12, tzinfo=UTC))["remaining_resets"] == 2
     assert load_reset_reserve(worktree, now=datetime(2026, 9, 24, 10, tzinfo=UTC)) == unavailable_reserve()

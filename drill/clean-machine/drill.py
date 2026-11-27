@@ -907,6 +907,7 @@ def build_world(workdir: Path, base_python: str) -> dict[str, Path]:
         shutil.rmtree(world)
     home = world / "home"
     product = world / "product"
+    state = world / "state"
     remote = world / "remotes" / "product.git"
     for path in (home, product, remote.parent, world / "fixtures"):
         path.mkdir(parents=True, exist_ok=True)
@@ -1001,7 +1002,7 @@ def build_world(workdir: Path, base_python: str) -> dict[str, Path]:
     (product / "scripts" / "ci" / "data_tier_known_failures.json").write_text(
         json.dumps({"known_failures": {nodeids[1]: 1}}, indent=1) + "\n"
     )
-    tasks = product / "batch_state" / "tasks"
+    tasks = state / "batch_state" / "tasks"
     tasks.mkdir(parents=True)
     old = datetime.now(UTC) - timedelta(days=30)
     extracts = json.loads((FIXTURES / "task-records.json").read_text())
@@ -1086,6 +1087,7 @@ def build_world(workdir: Path, base_python: str) -> dict[str, Path]:
         "world": world,
         "home": home,
         "product": product,
+        "state": state,
         "remote": remote,
         "stubs": stubs,
         "worktree": worktree,
@@ -1398,6 +1400,7 @@ def run_row(
         "XDG_CACHE_HOME": f"{local['home']}/.cache",
         "XDG_RUNTIME_DIR": str(scratch / "tmp"),
         "LU_PRODUCT_ROOT": local["product"],
+        "LU_STATE_ROOT": local["state"],
         "LEARN_UKRAINIAN_PRIMARY_REPO_ROOT": local["product"],
         "LEARN_UKRAINIAN_PYTHON": local["py"],
         "GH_TOKEN": "drill-fake-token",
@@ -1642,6 +1645,8 @@ def seed_world(names: dict[str, str]) -> None:
     env.update(
         {
             "LU_PRODUCT_ROOT": names["product"],
+            "LU_STATE_ROOT": names["state"],
+            "LU_PYTHON": names["py"],
             "LEARN_UKRAINIAN_PRIMARY_REPO_ROOT": names["product"],
         }
     )
