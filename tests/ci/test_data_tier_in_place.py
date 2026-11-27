@@ -518,6 +518,23 @@ def test_child_passes_only_selected_ids_to_two_workers(tmp_path: Path, monkeypat
     recorded = junit.read_text(encoding="utf-8")
     assert missing in recorded
     assert stale_hash in recorded
+    args.only = "tests/test_sample.py"
+    assert data_tier.pytest_child(args) == 1 and missing in junit.read_text(encoding="utf-8")
+    args.only = None
+    forbidden = "tests/test_sample.py::test_removed\x00"
+    monkeypatch.setattr(
+        data_tier,
+        "load_selection",
+        lambda *_args, **_kwargs: (
+            {"nodeids": [selected, forbidden], "files": ["tests/test_sample.py"], "bulk_nodeids": []},
+            "0" * 64,
+        ),
+    )
+    assert (
+        data_tier.pytest_child(args) == 1
+        and "\x00" not in junit.read_text(encoding="utf-8")
+        and data_tier.junit_summary(junit)["failed"] == 1
+    )
 
 
 @pytest.mark.usefixtures('configured_roots', '_no_live_pool')
@@ -537,6 +554,15 @@ def test_collection_time_data_skip_is_in_junit(tmp_path: Path, monkeypatch: pyte
     args = SimpleNamespace(read_only=[], selection_sha256="0" * 64, junit=str(junit), collected=str(tmp_path / "collected.json"), only=None, bulk_reason=None)
     assert data_tier.pytest_child(args) == 0
     assert data_tier.junit_summary(junit)["skip_reasons"] == {"sources.db absent": 1}
+    exact = f"{module}::test_published"
+    monkeypatch.setattr(
+        data_tier,
+        "load_selection",
+        lambda *_args, **_kwargs: ({"nodeids": [exact], "files": [module]}, "0" * 64),
+    )
+    assert data_tier.pytest_child(args) == 0 and data_tier.junit_summary(junit)["skip_reasons"] == {
+        "sources.db absent": 1
+    }
 
 
 @pytest.mark.usefixtures('configured_roots', '_no_live_pool')

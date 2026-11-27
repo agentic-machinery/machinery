@@ -89,6 +89,8 @@ _SCP_ORIGIN = re.compile(
 )
 # The same digest the collection plugin stores for a node id it cannot name up front.
 _SELECTOR_HASH = re.compile(r"sha256:[0-9a-f]{64}")
+# XML 1.0 Char, so a synthetic JUnit name still parses. ElementTree writes the rest.
+_XML_FORBIDDEN = re.compile("[^\t\n\r\u0020-\ud7ff\ue000-\ufffd\U00010000-\U0010ffff]")
 
 
 class DataTierError(RuntimeError):
@@ -595,6 +597,18 @@ def _key(nodeid: str) -> str:
     return "sha256:" + hashlib.sha256(nodeid.encode()).hexdigest()
 
 
+def _xml_text(value: str) -> str:
+    """Replace characters XML 1.0 forbids so a synthetic JUnit receipt still parses."""
+    return _XML_FORBIDDEN.sub(lambda match: f"\\u{ord(match.group()):04x}", value)
+
+
+def _requested_file_selector(selector: str, only: str) -> bool:
+    """A file or exact selector whose path is the file a subset run asked for."""
+    if _SELECTOR_HASH.fullmatch(selector):
+        return False
+    return selector.split("::", 1)[0] == only
+
+
 class SelectionPlugin:
     def __init__(self, selection: dict, only: str | None, bulk_reason: str | None, collected: Path) -> None:
         self.selection = selection
@@ -610,9 +624,24 @@ class SelectionPlugin:
     def pytest_collectreport(self, report: pytest.CollectReport) -> None:
         if report.failed:
             self.collection_errors.append((report.nodeid, safe_text(str(report.longrepr))))
-        if report.skipped and report.nodeid in self.selection["nodeids"]:
-            detail = report.longrepr[2] if isinstance(report.longrepr, tuple) else str(report.longrepr)
-            self.collection_skips.append((report.nodeid, safe_text(str(detail))))
+        if not report.skipped:
+            return
+        detail = report.longrepr[2] if isinstance(report.longrepr, tuple) else str(report.longrepr)
+        reason = safe_text(str(detail))
+        recorded = {nodeid for nodeid, _reason in self.collection_skips}
+        nodeid = report.nodeid
+        if nodeid in self.selection["nodeids"] and nodeid not in recorded:
+            self.collection_skips.append((nodeid, reason))
+            recorded.add(nodeid)
+        # An import-time skip is the module path. Exact ids in that file are the same skip.
+        if "::" in nodeid or _SELECTOR_HASH.fullmatch(nodeid):
+            return
+        for selector in self.selection["nodeids"]:
+            if selector in recorded or "::" not in selector:
+                continue
+            if selector.split("::", 1)[0] == nodeid:
+                self.collection_skips.append((selector, reason))
+                recorded.add(selector)
 
     def pytest_collection_modifyitems(self, items: list[pytest.Item], config: pytest.Config) -> None:
         wanted = set(self.selection["nodeids"])
@@ -666,11 +695,14 @@ def pytest_child(args: argparse.Namespace) -> int:
             continue
         if not selector.startswith("sha256:") and selector.split("::", 1)[0] in error_ids:
             plugin.accounted.add(selector)
-    unmatched = (
-        []
-        if args.only is not None
-        else [nodeid for nodeid in selection["nodeids"] if nodeid not in plugin.accounted]
+    # A subset still audits file and exact selectors of the requested file. A digest has no path.
+    only = args.only
+    audited = (
+        selection["nodeids"]
+        if only is None
+        else [nodeid for nodeid in selection["nodeids"] if _requested_file_selector(nodeid, only)]
     )
+    unmatched = [nodeid for nodeid in audited if nodeid not in plugin.accounted]
     if (
         not plugin.selected_nodeids
         and not plugin.bulk_skipped
@@ -710,16 +742,18 @@ def pytest_child(args: argparse.Namespace) -> int:
         tree = ET.parse(args.junit)
         suite = next(tree.iter("testsuite"))
         for nodeid in plugin.bulk_skipped:
-            case = ET.SubElement(suite, "testcase", classname="data_tier", name=safe_text(nodeid))
-            ET.SubElement(case, "skipped", message=f"bulk root unavailable: {safe_text(args.bulk_reason)}")
+            case = ET.SubElement(suite, "testcase", classname="data_tier", name=_xml_text(safe_text(nodeid)))
+            ET.SubElement(
+                case, "skipped", message=_xml_text(f"bulk root unavailable: {safe_text(args.bulk_reason)}")
+            )
         for nodeid, reason in plugin.collection_skips:
-            case = ET.SubElement(suite, "testcase", classname="data_tier", name=safe_text(nodeid))
-            ET.SubElement(case, "skipped", message=reason)
+            case = ET.SubElement(suite, "testcase", classname="data_tier", name=_xml_text(safe_text(nodeid)))
+            ET.SubElement(case, "skipped", message=_xml_text(reason))
         for nodeid, reason in plugin.collection_errors:
-            case = ET.SubElement(suite, "testcase", classname="data_tier", name=safe_text(nodeid))
-            ET.SubElement(case, "error", message=reason)
+            case = ET.SubElement(suite, "testcase", classname="data_tier", name=_xml_text(safe_text(nodeid)))
+            ET.SubElement(case, "error", message=_xml_text(reason))
         for nodeid in unmatched:
-            case = ET.SubElement(suite, "testcase", classname="data_tier", name=safe_text(nodeid))
+            case = ET.SubElement(suite, "testcase", classname="data_tier", name=_xml_text(safe_text(nodeid)))
             ET.SubElement(case, "error", message="selector matched no collected test")
         skipped = len(plugin.bulk_skipped) + len(plugin.collection_skips)
         added = skipped + len(plugin.collection_errors) + len(unmatched)
