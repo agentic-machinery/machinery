@@ -106,18 +106,47 @@ MAX_CONSECUTIVE_CONTINUES = 4
 MAX_COUNTER_BYTES = 4096
 COUNTER_STORAGE_ERRORS = (OSError, ValueError, InstallError)
 ESCALATION_MARKER = "CTO-ESCALATION:"
+CTO_EPIC = "epics"
+CTO_STATE_LANE = "cto"
 LIVE_WORKER_STATUSES = frozenset({"spawning", "running"})
 # AGY reports a normal end of turn as NO_TOOL_CALL (docs also show model_stop).
 SKIP_TERMINATION_REASONS = frozenset({"ERROR", "MAX_INVOCATIONS", "MAX_STEPS_EXCEEDED", "USER_CANCELED", "HALTED_STEP"})
 
 POLICY_TITLE = "Standing decision policy"
-POLICY = f"""## {POLICY_TITLE}
-- Decide reversible, rule-following choices yourself and execute them now. Pick the option that obeys the rules (cross-family review, then CI Gate, then merge queue) and do it.
-- Never ask for an admission or gate override; the answer is always no. Use the clean path (fresh recorded branch, rebase, new commit).
-- When you list an action for yourself, do it in the same turn; never end a turn on a plan.
-- Ask the CTO only about deleting data, spending money, security or secrets, rule changes, or a true conflict between two operator rules. Post it through Fleet Comms and start the final message with `{ESCALATION_MARKER}`.
-- End every turn with the privately configured worker target met and a wake-up armed (a background `{_DISPATCH} wait` or the `schedule` tool), never with a question.
-"""
+_WORKER_POLICY_LINE = (
+    "- End each turn with free worker slots filled with ready work and a wake-up armed "
+    f"(a background `{_DISPATCH} wait` or the `schedule` tool), never with a question."
+)
+
+
+def _escalation_policy_line(*, is_cto: bool) -> str:
+    if is_cto:
+        return (
+            "- Ask the operator only about deleting data, spending money, security or secrets, "
+            f"rule changes, or a true conflict between two operator rules. Start the final message with `{ESCALATION_MARKER}`."
+        )
+    return (
+        "- Ask the CTO only about deleting data, spending money, security or secrets, "
+        "rule changes, or a true conflict between two operator rules. "
+        f"Post it through Fleet Comms and start the final message with `{ESCALATION_MARKER}`."
+    )
+
+
+def render_policy(*, is_cto: bool = False) -> str:
+    """Render the standing decision policy for a lane driver or the CTO seat."""
+    return (
+        f"## {POLICY_TITLE}\n"
+        "- Decide reversible, rule-following choices yourself and execute them now. "
+        "Pick the option that obeys the rules (cross-family review, then CI Gate, then merge queue) and do it.\n"
+        "- Never ask for an admission or gate override; the answer is always no. "
+        "Use the clean path (fresh recorded branch, rebase, new commit).\n"
+        "- When you list an action for yourself, do it in the same turn; never end a turn on a plan.\n"
+        f"{_escalation_policy_line(is_cto=is_cto)}\n"
+        f"{_WORKER_POLICY_LINE}\n"
+    )
+
+
+POLICY = render_policy()
 # Keep the existing envelope limit after removing the retired posting protocol.
 MAX_ENVELOPE_CHARS = 9_381
 
@@ -128,10 +157,10 @@ TEMPLATE = """# Driver state: {epic}
 
 ## Epic
 - Stream: {epic}
-- Seat: driver (one per stream; the launcher owns the lease)
+- Seat: {seat}
 
 ## Database authority
-- First run `lu-driver-state render --lane {epic}`, then `lu-driver-state check --lane {epic}` on startup and after compaction or doubt.
+- First run `lu-driver-state render --lane {state_lane}`, then `lu-driver-state check --lane {state_lane}` on startup and after compaction or doubt.
 - Read the newest full-content DB `handoff_note` as authority for goals, tasks, decisions and handoff state.
 - For each handoff, write exactly one full-content DB `handoff_note` with rollover/lineage IDs, full live task IDs/run nonces, open order message IDs, PR heads and the next three actions. A temporary path or markdown content cannot substitute.
 - Keep only pinned provider/stream facts and render instructions here; record mutable state in the database.
@@ -142,6 +171,54 @@ TEMPLATE = """# Driver state: {epic}
 
 {policy}
 """
+
+
+def render_template(epic: str) -> str:
+    """Render the initial pinned pointer for ``epic`` with its seat's state lane and escalation target."""
+    validate_epic(epic)
+    is_cto = epic == CTO_EPIC
+    state_lane = CTO_STATE_LANE if is_cto else epic
+    seat = (
+        "cto (the launcher owns the epics lease)"
+        if is_cto
+        else "driver (one per stream; the launcher owns the lease)"
+    )
+    return TEMPLATE.format(epic=epic, seat=seat, state_lane=state_lane, policy=render_policy(is_cto=is_cto))
+
+
+def _epic_from_path(path: Path) -> str | None:
+    """Extract a validated epic selector from ``.../.claude/<epic>-epic/DRIVER-STATE.md``."""
+    try:
+        parent = path.parent.name or path.resolve().parent.name
+    except OSError:
+        return None
+    if not parent.endswith("-epic"):
+        return None
+    epic = parent.removesuffix("-epic")
+    try:
+        validate_epic(epic)
+    except ValueError:
+        return None
+    return epic
+
+
+def _seat_context(path: Path) -> tuple[bool, str | None]:
+    """Resolve ``(is_cto, state_lane)`` from ``path`` first, then the launcher session environment."""
+    epic = _epic_from_path(path)
+    if epic is not None:
+        is_cto = epic == CTO_EPIC
+        return is_cto, (CTO_STATE_LANE if is_cto else epic)
+    if os.environ.get("SESSION_SEAT", "").strip() == CTO_STATE_LANE:
+        return True, CTO_STATE_LANE
+    session_epic = os.environ.get("SESSION_EPIC", "").strip()
+    if session_epic:
+        try:
+            validate_epic(session_epic)
+        except ValueError:
+            return False, None
+        is_cto = session_epic == CTO_EPIC
+        return is_cto, (CTO_STATE_LANE if is_cto else session_epic)
+    return False, None
 
 
 def _repo_root(start: Path | None = None) -> Path:
@@ -198,8 +275,9 @@ def _section(text: str, title: str) -> list[str]:
 
 
 def render_injection(text: str, path: Path) -> str:
+    is_cto, state_lane = _seat_context(path)
     if POLICY_TITLE.lower() not in text.lower():
-        text = text.rstrip() + "\n\n" + POLICY
+        text = text.rstrip() + "\n\n" + render_policy(is_cto=is_cto)
     tokens = MarkdownIt().parse(text)
     # Match the parser's CR/LF line maps without splitting Unicode separators
     # or changing the original line endings in retained pinned state.
@@ -221,10 +299,11 @@ def render_injection(text: str, path: Path) -> str:
         end = headings[index + 1][0] if index + 1 < len(headings) else len(lines)
         del lines[start:end]
     text = "".join(lines)
+    lane = state_lane or "<lane>"
     message = (
         "PINNED DRIVER STATE (pinned facts only; re-injected every model call). "
         "Task state, goals, decisions and handoffs live in the driver-state database: "
-        "run `lu-driver-state render --lane <lane>` and `lu-driver-state check --lane <lane>` "
+        f"run `lu-driver-state render --lane {lane}` and `lu-driver-state check --lane {lane}` "
         "first and record every goal, decision and handoff there "
         "(`lu-driver-state add|note|status`), never in this file. Full file: "
         f"{path.name} under .claude/.\n\n" + text.strip()
@@ -759,6 +838,7 @@ def _stop_policy(
         with contextlib.suppress(*COUNTER_STORAGE_ERRORS):
             _reset_counter(path, conversation)
         return None
+    is_cto, _ = _seat_context(path)
     try:
         if _bump_counter(path, conversation) > MAX_CONSECUTIVE_CONTINUES:
             with contextlib.suppress(*COUNTER_STORAGE_ERRORS):
@@ -775,19 +855,21 @@ def _stop_policy(
             path,
             conversation,
             "continuation_counter_unavailable",
-            "DRIVER-GATE-FAILED: continuation counter unavailable. " + _continuation_reason(reasons),
+            "DRIVER-GATE-FAILED: continuation counter unavailable. " + _continuation_reason(reasons, is_cto=is_cto),
             hook=hook,
         )
-    return _continuation_reason(reasons)
+    return _continuation_reason(reasons, is_cto=is_cto)
 
 
-def _continuation_reason(reasons: list[str]) -> str:
-    return (
-        "DRIVER-STATE standing decision policy: "
-        + "; ".join(reasons)
-        + f". Ask the CTO only about deletes, money, security or rule changes, via Fleet Comms, "
+def _continuation_reason(reasons: list[str], *, is_cto: bool = False) -> str:
+    escalation = (
+        f"Ask the operator only about deletes, money, security or rule changes, "
+        f"with a final message starting `{ESCALATION_MARKER}`."
+        if is_cto
+        else f"Ask the CTO only about deletes, money, security or rule changes, via Fleet Comms, "
         f"with a final message starting `{ESCALATION_MARKER}`."
     )
+    return "DRIVER-STATE standing decision policy: " + "; ".join(reasons) + ". " + escalation
 
 
 def cmd_agy_pretool_hook(stdin_text: str) -> dict:
@@ -795,14 +877,22 @@ def cmd_agy_pretool_hook(stdin_text: str) -> dict:
     tool = (payload.get("toolCall") or {}).get("name")
     if tool != "ask_question":
         return {"decision": "allow"}
-    if _driver_session(payload) is None:
+    path = _driver_session(payload)
+    if path is None:
         return {"decision": "allow"}
+    is_cto, _ = _seat_context(path)
+    escalation = (
+        f"For deletes, money, security or rule changes, ask the operator "
+        f"and start your final message with `{ESCALATION_MARKER}`."
+        if is_cto
+        else "For deletes, money, security or rule changes, post to the CTO "
+        f"via Fleet Comms and start your final message with `{ESCALATION_MARKER}`."
+    )
     return {
         "decision": "deny",
         "reason": (
             "Driver sessions have no one at the prompt. Decide reversible, rule-following choices "
-            "yourself and execute them. For deletes, money, security or rule changes, post to the CTO "
-            f"via Fleet Comms and start your final message with `{ESCALATION_MARKER}`."
+            f"yourself and execute them. {escalation}"
         ),
     }
 
@@ -945,7 +1035,7 @@ Related: {_MACHINERY}/agy_hooks/driver_state_inject.sh; #10201, #10297.
             print(f"exists: {path} (use --force to overwrite)", file=sys.stderr)
             return 1
         path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        path.write_text(TEMPLATE.format(epic=args.epic, policy=POLICY), encoding="utf-8")
+        path.write_text(render_template(args.epic), encoding="utf-8")
         print(path)
         return 0
     return 2
