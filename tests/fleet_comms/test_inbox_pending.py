@@ -25,6 +25,8 @@ from tests.helpers.agy_inbox_fixtures import (
     add_authority as add_legacy_authority,
 )
 from tests.helpers.product_tree import configured_roots as configured_roots
+from tests.host_context.conftest import host_layout as host_layout
+from tests.host_context.conftest import installed_hook_env
 
 pytestmark = pytest.mark.usefixtures("configured_roots")
 
@@ -34,6 +36,18 @@ EXPECTED_UNKNOWN_NOTICE = (
     "PENDING ORDERS: unknown; "
     "authority: .venv/bin/python -m lu_machinery.fleet_comms deliveries --help"
 )
+
+
+@pytest.fixture
+def inbox_hook_binding(host_layout, configured_roots, stores, monkeypatch):
+    """Bind the native hook to fixture checkouts with the installed runtime."""
+    state = Path(host_layout.data["state_root"])
+    fleet = state / "batch_state/fleet-comms/v1"
+    fleet.mkdir(parents=True)
+    authority = stores[0].rename(fleet / stores[0].name)
+    for name, value in installed_hook_env(host_layout).items():
+        monkeypatch.setenv(name, value)
+    return (authority,)
 
 
 def add_authority(path, **kwargs):
@@ -75,7 +89,8 @@ def test_authority_delivery_states(stores, state, consumed, wake, expected):
     }
 
 
-def test_h26_wake_observation_is_not_supervisory_consumption(stores, roster):
+def test_h26_wake_observation_is_not_supervisory_consumption(inbox_hook_binding, roster):
+    stores = inbox_hook_binding
     recipient = "supervisor:epic:9999"
     with AuthorityService(root=stores[0].parent) as service:
         message = service.enqueue_supervisory_request(
@@ -316,7 +331,7 @@ def test_cli_bad_arguments_hide_error_data(capsys, hook_mode):
         assert result["probe"] == "unknown"
 
 
-def test_hook_cli_does_not_echo_stdin(stores, monkeypatch, capsys):
+def test_hook_cli_does_not_echo_stdin(inbox_hook_binding, monkeypatch, capsys):
     from io import StringIO
 
     monkeypatch.setattr(sys, "stdin", StringIO(BODY_MARKER))
@@ -336,7 +351,8 @@ def test_hook_cli_does_not_echo_stdin(stores, monkeypatch, capsys):
         ("missing-slot", None, True),
     ],
 )
-def test_unknown_cli_notice_guides_both_drains(stores, roster, tmp_path, monkeypatch, failure, store_index, pending):
+def test_unknown_cli_notice_guides_both_drains(inbox_hook_binding, roster, tmp_path, monkeypatch, failure, store_index, pending):
+    stores = inbox_hook_binding
     if pending:
         add_authority(stores[0], state="running")
     if failure == "missing-store":

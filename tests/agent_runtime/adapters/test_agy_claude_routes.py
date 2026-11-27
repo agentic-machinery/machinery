@@ -15,14 +15,16 @@ from lu_machinery.review.reviewer_resolver import (
     ResolverInputs,
     evaluate_candidate,
 )
+from tests.agent_runtime.agy_hook_helpers import bind_registration_runtime as bind_registration_runtime
 from tests.agent_runtime.agy_hook_helpers import register_agy_hooks
+from tests.agent_runtime.agy_hook_helpers import registration_host as registration_host
 from tests.agent_runtime.product_roots import (  # noqa: F401
     agent_runtime_roots,
     configured_roots,
 )
 from tests.claude_route_accounts import HOST_ACCOUNT
 
-pytestmark = pytest.mark.usefixtures("agent_runtime_roots")
+pytestmark = pytest.mark.usefixtures("agent_runtime_roots", "bind_registration_runtime")
 
 SLUGS = ("claude-sonnet-5-5-high", "claude-opus-5-5-high")
 LABELS = ("Claude Sonnet 5.5 (High)", "Claude Opus 5.5 (High)")

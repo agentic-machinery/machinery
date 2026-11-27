@@ -254,119 +254,60 @@ def _installed_layout(base: Path, log: Path, *, code: int = 0, args_path: Path |
     return venv, site
 
 
-def test_launcher_interpreter_matrix(tmp_path: Path) -> None:
-    """launcher_project_python follows the same rule and ignores a worktree venv."""
+def test_launcher_interpreter_matrix(tmp_path: Path, host_layout) -> None:
+    """A launcher reads the bound runtime and refuses a conflicting interpreter assertion."""
     primary, worktree, log = _layout(tmp_path, primary_venv=True, worktree_venv=True)
-    override = _wrapper(tmp_path / "override-python", log)
-    plain = tmp_path / "plain-file"
-    plain.write_text("", encoding="utf-8")
+    product = host_layout.data["repos"]["public"]
+    state = host_layout.data["state_root"]
     script = (
-        f'source "{LIB / "launcher_core.sh"}" && '
-        'LC_DURABLE_HELPER_ROOT="$1" && launcher_project_python'
+        f'source "{LIB / "launcher_core.sh"}" && launcher_resolve_roots && '
+        r'printf "%s\n" "$LC_ROOT" "$LU_STATE_ROOT" && launcher_project_python'
     )
-    cases = (
-        ("valid-override", {"LEARN_UKRAINIAN_PYTHON": str(override)}, str(override)),
-        ("invalid-file", {"LEARN_UKRAINIAN_PYTHON": str(plain)}, None),
-        ("unset", {}, str(primary / ".venv" / "bin" / "python")),
-    )
-    for name, extra, expected in cases:
-        result = subprocess.run(
-            ["bash", "-c", script, "launcher", str(primary)],
-            cwd=worktree,
-            env={**_base_env(tmp_path), **extra},
-            capture_output=True,
-            text=True,
-            timeout=30,
-            check=False,
-        )
-        if expected is None:
-            assert result.returncode != 0, (name, result.stderr)
-            assert str(primary / ".venv" / "bin" / "python") not in result.stdout
-        else:
-            assert result.returncode == 0, (name, result.stderr)
-            assert result.stdout.strip() == expected
-    missing = _layout(tmp_path / "missing", primary_venv=False, worktree_venv=True)
-    refused = subprocess.run(
-        ["bash", "-c", script, "launcher", str(missing[0])],
-        cwd=missing[1],
-        env=_base_env(tmp_path),
-        capture_output=True,
-        text=True,
-        timeout=30,
-        check=False,
-    )
-    assert refused.returncode != 0
-    assert str(missing[1] / ".venv" / "bin" / "python") not in refused.stdout
-
-
-def test_session_setup_interpreter_matrix(tmp_path: Path) -> None:
-    """SessionStart selects the override or the primary venv, or refuses."""
-    primary, worktree, log = _layout(tmp_path, primary_venv=True, worktree_venv=True)
-    override = _wrapper(tmp_path / "override-python", log)
-    plain = tmp_path / "plain-file"
-    plain.write_text("", encoding="utf-8")
-    hook = HOOKS / "session-setup.sh"
-
-    def run(extra: dict[str, str], project: Path) -> subprocess.CompletedProcess[str]:
-        log.write_text("", encoding="utf-8")
-        env = {
-            **_base_env(tmp_path),
-            "CLAUDE_PROJECT_DIR": str(project),
-            "LEARN_UKRAINIAN_PRIMARY_REPO_ROOT": str(primary),
-            "SESSION_START_BUDGET_SECONDS": "60",
-            "LEARN_UKRAINIAN_CLAUDEX_RUN_ID": "interpreter-rule",
-            "LEARN_UKRAINIAN_CLAUDEX_LAUNCH_GENERATION": "1",
-            "CLAUDE_CODE_FILE_READ_MAX_OUTPUT_TOKENS": "1",
-            **extra,
-        }
-        return subprocess.run(
-            ["bash", str(hook)],
-            cwd=project,
-            env=env,
-            input=SESSION_STDIN,
-            capture_output=True,
-            text=True,
-            timeout=90,
-            check=False,
-        )
-
-    selected = run({"LEARN_UKRAINIAN_PYTHON": str(override)}, worktree)
+    env = {**host_layout.env, "LU_PYTHON": str(host_layout.python)}
+    selected = _bash(script, cwd=worktree, env=env)
     assert selected.returncode == 0, selected.stderr
-    assert log.read_text(encoding="utf-8").split()[0] == str(override)
-    assert str(worktree / ".venv" / "bin" / "python") not in log.read_text(encoding="utf-8")
-
-    refused = run({"LEARN_UKRAINIAN_PYTHON": str(plain)}, worktree)
-    assert refused.returncode != 0
-    assert "not an executable file" in refused.stderr
-    assert log.read_text(encoding="utf-8") == ""
-
-    primary_selected = run({}, worktree)
-    assert primary_selected.returncode == 0, primary_selected.stderr
-    picked = set(log.read_text(encoding="utf-8").split())
-    assert str(primary / ".venv" / "bin" / "python") in picked
-    assert str(worktree / ".venv" / "bin" / "python") not in picked
-
-    _bare_primary, bare_worktree, bare_log = _layout(tmp_path / "bare", primary_venv=False, worktree_venv=True)
-    bare = subprocess.run(
-        ["bash", str(hook)],
-        cwd=bare_worktree,
-        env={
-            **_base_env(tmp_path),
-            "CLAUDE_PROJECT_DIR": str(bare_worktree),
-            "LEARN_UKRAINIAN_PRIMARY_REPO_ROOT": str(_bare_primary),
-            "SESSION_START_BUDGET_SECONDS": "60",
-        },
-        input=SESSION_STDIN,
-        capture_output=True,
-        text=True,
-        timeout=90,
-        check=False,
+    assert selected.stdout.splitlines() == [product, state, str(host_layout.python)]
+    refused = _bash(
+        script, cwd=worktree, env={**env, "LEARN_UKRAINIAN_PYTHON": str(primary / ".venv/bin/python")},
     )
-    assert bare.returncode != 0
-    assert "project interpreter not found" in bare.stderr
-    assert str(_bare_primary / ".venv" / "bin" / "python") in bare.stderr
-    assert str(bare_worktree / ".venv" / "bin" / "python") not in bare.stderr
-    assert bare_log.read_text(encoding="utf-8") == ""
+    assert refused.returncode == 3
+    assert "[legacy_conflict]" in refused.stderr
+    assert log.read_text() == ""
+
+
+def test_session_setup_interpreter_matrix(tmp_path: Path, host_layout) -> None:
+    """SessionStart uses the runtime binding and rejects its conflicting assertions."""
+    primary, worktree, log = _layout(tmp_path, primary_venv=True, worktree_venv=True)
+    hook = HOOKS / "session-setup.sh"
+    env = {
+        **_base_env(tmp_path),
+        **host_layout.env,
+        "CLAUDE_PROJECT_DIR": host_layout.data["repos"]["public"],
+        "LU_PYTHON": str(host_layout.python),
+        "SESSION_START_BUDGET_SECONDS": "60",
+        "LEARN_UKRAINIAN_CLAUDEX_RUN_ID": "interpreter-rule",
+        "LEARN_UKRAINIAN_CLAUDEX_LAUNCH_GENERATION": "1",
+        "CLAUDE_CODE_FILE_READ_MAX_OUTPUT_TOKENS": "1",
+    }
+
+    def run(environment: dict[str, str]) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ["bash", str(hook)], cwd=worktree, env=environment, input=SESSION_STDIN,
+            capture_output=True, text=True, timeout=90, check=False,
+        )
+
+    selected = run(env)
+    assert selected.returncode == 0, selected.stderr
+    assert json.loads(selected.stdout)["hookSpecificOutput"]["hookEventName"] == "SessionStart"
+
+    refused = run({**env, "LEARN_UKRAINIAN_PYTHON": str(primary / ".venv/bin/python")})
+    assert refused.returncode != 0
+    assert "[legacy_conflict]" in refused.stderr
+
+    unbound = run({name: value for name, value in env.items() if name != "LU_PYTHON"})
+    assert unbound.returncode != 0
+    assert "[missing_interpreter_binding]" in unbound.stderr
+    assert log.read_text(encoding="utf-8") == ""
 
 
 def test_deployed_guards_do_not_import_a_planted_stdlib_module(tmp_path: Path) -> None:
@@ -454,7 +395,7 @@ def test_deploy_inventory_uses_installed_hook_modules() -> None:
     assert {name for name, record in python_hooks.items() if record["targets"]} == set()
 
 
-def test_deployed_probe_does_not_execute_a_worktree_venv_when_git_cannot_name_the_primary(tmp_path: Path) -> None:
+def test_deployed_probe_does_not_execute_a_worktree_venv_when_git_cannot_name_the_primary(tmp_path: Path, host_layout) -> None:
     """A stale worktree gitfile is not an interpreter when git cannot name the primary."""
     product = tmp_path / "wt"
     log = tmp_path / "picked.log"
@@ -467,20 +408,21 @@ def test_deployed_probe_does_not_execute_a_worktree_venv_when_git_cannot_name_th
     env = {
         "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
         "HOME": str(tmp_path / "home"),
-        "CLAUDE_PROJECT_DIR": str(product),
+        **host_layout.env,
+        "LU_PYTHON": str(host_layout.python),
     }
     result = subprocess.run(
         ["bash", str(deployed / "goal-driver-stop.sh")],
         input="{}\n",
         text=True,
         capture_output=True,
-        cwd=tmp_path,
+        cwd=product,
         env=env,
         timeout=30,
         check=False,
     )
     assert result.returncode == 1, result.stderr
-    assert "LEARN_UKRAINIAN_PRIMARY_REPO_ROOT must name the primary checkout" in result.stderr
+    assert "[invalid_invocation_git]" in result.stderr
     assert not log.exists()
 
 
@@ -555,7 +497,7 @@ def test_routed_scripts_do_not_build_a_venv_interpreter_path() -> None:
         assert ".venv/bin/python" not in text, relative
 
 
-def _tracked_pre_push_scans_the_outgoing_range(tmp_path: Path) -> None:
+def _tracked_pre_push_scans_the_outgoing_range(tmp_path: Path, host_layout) -> None:
     """Defect class: a tracked pre-push hook that skips machinery's scanner, or pushes when that scanner cannot start.
 
     A temporary repository, synthetic matcher fixtures, and a local bare remote. The planted value is the
@@ -573,11 +515,10 @@ def _tracked_pre_push_scans_the_outgoing_range(tmp_path: Path) -> None:
     (repo / ".venv").symlink_to(Path(sys.executable).resolve().parents[1], target_is_directory=True)
     make_tooling(tmp_path / "private-fixture/tools/public_opsec_scan")
     remote = tmp_path / "remote.git"
-    env = {key: value for key, value in os.environ.items() if not key.startswith(("GIT_", "PRE_COMMIT", "LU_OPSEC", "PYTHON"))}
+    env = {**_base_env(host_layout.file.parent), **host_layout.env}
     env.update(
         PATH=os.pathsep.join([str(Path(real_git).parent), os.defpath]),
-        LEARN_UKRAINIAN_PYTHON=sys.executable,
-        LEARN_UKRAINIAN_PRIMARY_REPO_ROOT=str(repo),
+        LU_PYTHON=str(host_layout.python),
         GIT_CONFIG_GLOBAL=os.devnull,
         GIT_CONFIG_NOSYSTEM="1",
         GIT_TERMINAL_PROMPT="0",
@@ -598,9 +539,19 @@ def _tracked_pre_push_scans_the_outgoing_range(tmp_path: Path) -> None:
     git("add", "file.txt")
     git("commit", "-q", "--no-verify", "-m", "base")
     git("init", "-q", "--bare", str(remote))
-    git("remote", "add", "origin", str(remote))
+    origin = "https://github.com/agentic-machinery/machinery.git"
+    git("remote", "add", "origin", origin)
+    host_layout.data["repos"]["machinery"] = str(repo)
+    host_layout.write()
+    env.update(
+        GIT_CONFIG_COUNT="2",
+        GIT_CONFIG_KEY_0=f"url.{remote.as_uri()}.insteadOf",
+        GIT_CONFIG_VALUE_0=origin,
+        GIT_CONFIG_KEY_1="core.hooksPath",
+        GIT_CONFIG_VALUE_1=".githooks",
+    )
+    assert git("remote", "get-url", "origin").stdout.strip() == remote.as_uri()
     git("push", "-q", "--no-verify", "origin", "HEAD:refs/heads/main")
-    git("config", "core.hooksPath", ".githooks")
 
     def remote_has(sha: str) -> bool:
         probe = subprocess.run(
@@ -635,7 +586,7 @@ def _tracked_pre_push_scans_the_outgoing_range(tmp_path: Path) -> None:
     assert not remote_has(missing)
 
 
-def test_project_python_and_githooks_follow_the_rule(tmp_path: Path) -> None:
+def test_project_python_and_githooks_follow_the_rule(tmp_path: Path, host_layout) -> None:
     """The hook installer and the hooks use the selector, not a worktree venv.
 
     ``pre_commit/project_python.sh`` is gone. The installed ``install_git_hooks.sh``
@@ -652,7 +603,7 @@ def test_project_python_and_githooks_follow_the_rule(tmp_path: Path) -> None:
     plain.write_text("", encoding="utf-8")
     installer = (machinery_root() / "install_git_hooks.sh").read_text(encoding="utf-8")
     assert "lu_machinery/lib/project_interpreter.sh" in installer
-    assert "project_hook_context_resolve" in installer
+    assert "project_host_context --require-checkout" in installer
     assert "project_python.sh" not in installer
     assert not (SOURCE / "lu_machinery/pre_commit/project_python.sh").exists()
     selector = (
@@ -682,30 +633,24 @@ def test_project_python_and_githooks_follow_the_rule(tmp_path: Path) -> None:
     assert primary_selected.returncode == 0, primary_selected.stderr
     assert primary_selected.stdout.strip() == str(primary / ".venv/bin/python")
 
-    hook_log = tmp_path / "hook.log"
-    hook_override = _wrapper(tmp_path / "hook-python", hook_log)
-    packaged = machinery_root()
-    library = worktree / "lu_machinery" / "lib" / "project_interpreter.sh"
-    library.parent.mkdir(parents=True)
-    shutil.copy2(packaged / "lib" / "project_interpreter.sh", library)
-    hook_lib = primary / ".githooks"
+    bound_checkout = Path(host_layout.data["repos"]["machinery"])
+    hook_lib = bound_checkout / ".githooks"
     hook_lib.mkdir()
     shutil.copy2(_checkout() / ".githooks" / "_lib.sh", hook_lib / "_lib.sh")
     hook = _run(
         ["bash", "-c", f'source "{hook_lib / "_lib.sh"}" && run_project_python -c "print(1)"'],
-        cwd=worktree,
-        env={**_base_env(tmp_path), "LEARN_UKRAINIAN_PYTHON": str(hook_override),
-             "LEARN_UKRAINIAN_PRIMARY_REPO_ROOT": str(primary)},
+        cwd=bound_checkout,
+        env={**_base_env(tmp_path), **host_layout.env, "LU_PYTHON": str(host_layout.python)},
     )
     assert hook.returncode == 0, hook.stderr
-    assert hook_log.read_text(encoding="utf-8").split()[0] == str(hook_override)
+    assert hook.stdout == "1\n"
     for relative in (".githooks/_lib.sh", ".githooks/commit-msg", ".githooks/post-merge", ".githooks/pre-push"):
         assert "run_project_python" in (_checkout() / relative).read_text(encoding="utf-8")
     assert "project_python.sh" not in (_checkout() / ".githooks" / "_lib.sh").read_text(encoding="utf-8")
     hook_text = (_checkout() / ".githooks" / "pre-push").read_text(encoding="utf-8")
     assert ".pre-commit-config.yaml" not in hook_text
     assert "lint_opsec" not in hook_text
-    _tracked_pre_push_scans_the_outgoing_range(tmp_path / "push-proof")
+    _tracked_pre_push_scans_the_outgoing_range(tmp_path / "push-proof", host_layout)
 
 
 def test_repo_root_launchers_follow_the_rule(tmp_path: Path) -> None:
@@ -733,7 +678,7 @@ def test_repo_root_launchers_follow_the_rule(tmp_path: Path) -> None:
         assert str(worktree / ".venv/bin/python") not in picked, script
 
 
-def test_remaining_shell_programs_select_the_rule_and_refuse_invalid(tmp_path: Path) -> None:
+def test_remaining_shell_programs_select_the_rule_and_refuse_invalid(tmp_path: Path, host_layout) -> None:
     """Each remaining routed program executes the configured interpreter and does not fall back."""
     primary, worktree, log = _layout(tmp_path, primary_venv=True, worktree_venv=True)
     plain = tmp_path / "plain-file"
@@ -781,16 +726,28 @@ def test_remaining_shell_programs_select_the_rule_and_refuse_invalid(tmp_path: P
     assert str(primary / ".venv/bin/python") in log.read_text(encoding="utf-8"), heal_selected.stderr
 
     codex = SOURCE / "lu_machinery/agent_runtime/codex_hook_entry.sh"
-    payload = '{"cwd": "' + str(worktree) + '"}'
-    codex_extra = {"CLAUDE_PROJECT_DIR": str(worktree), "LEARN_UKRAINIAN_PRIMARY_REPO_ROOT": str(primary)}
-    codex_refused = refused([str(codex), "pre-tool-use"], cwd=worktree, extra=codex_extra, stdin=payload)
-    assert codex_refused.returncode != 0
-    assert log.read_text(encoding="utf-8") == ""
-    codex_selected = selected([str(codex), "pre-tool-use"], cwd=worktree, extra=codex_extra, stdin=payload)
-    assert str(override) in log.read_text(encoding="utf-8"), codex_selected.stderr
-    # A policy startup/import failure must block; Codex only blocks exit 2.
-    assert codex_selected.returncode == 2, codex_selected.stderr
-    assert "CODEX-HOOK-POLICY-FAILED: the policy exited 1" in codex_selected.stderr
+    payload = json.dumps({"tool_name": "Read", "cwd": str(worktree), "tool_input": {}})
+    bound_env = {**_base_env(tmp_path), **host_layout.env, "LU_PYTHON": str(host_layout.python)}
+    codex_refused = _run(
+        [str(codex), "pre-tool-use"], cwd=worktree,
+        env={**bound_env, "LEARN_UKRAINIAN_PYTHON": str(plain)}, stdin=payload,
+    )
+    assert codex_refused.returncode == 2
+    assert "[legacy_conflict]" in codex_refused.stderr
+    codex_selected = _run([str(codex), "pre-tool-use"], cwd=worktree, env=bound_env, stdin=payload)
+    assert codex_selected.returncode == 0, codex_selected.stderr
+
+    for name in ("driver_state_inject.sh", "pending_orders_inject.sh"):
+        argv = ["bash", str(SOURCE / "lu_machinery/agy_hooks" / name)]
+        denied = _run(
+            argv, cwd=worktree, env={**bound_env, "LEARN_UKRAINIAN_PYTHON": str(plain)}, stdin="{}",
+        )
+        assert json.loads(denied.stdout)["decision"] == "deny"
+        assert "[legacy_conflict]" in denied.stderr
+        selected_hook = _run(argv, cwd=worktree, env={**bound_env, "LU_DRIVER_STATE_PYTHON": str(decoy)}, stdin="{}")
+        assert selected_hook.returncode == 0, selected_hook.stderr
+        assert json.loads(selected_hook.stdout).get("decision") != "deny"
+        assert decoy_log.read_text(encoding="utf-8") == ""
 
     deploy = str(SOURCE / "lu_machinery/deploy_prompts.sh")
     deploy_extra = {"LU_PRODUCT_ROOT": str(primary)}
@@ -808,11 +765,6 @@ def test_remaining_shell_programs_select_the_rule_and_refuse_invalid(tmp_path: P
         (SOURCE / "lu_machinery/agent_runtime/shims/npx", ["--version"], "", {}),
         (SOURCE / "lu_machinery/dispatcher/npm_shims/npm", ["--version"], "", {}),
         (SOURCE / "lu_machinery/dispatcher/npm_shims/npx", ["--version"], "", {}),
-        (SOURCE / "lu_machinery/agy_hooks/driver_state_inject.sh", [], "{}",
-         {"LU_DRIVER_STATE_FILE": str(tmp_path / "state"), "SESSION_HANDOFF_AGENT": "probe",
-          "LU_DRIVER_STATE_PYTHON": str(decoy), "LEARN_UKRAINIAN_PRIMARY_REPO_ROOT": str(primary)}),
-        (SOURCE / "lu_machinery/agy_hooks/pending_orders_inject.sh", [], "{}",
-         {"LU_DRIVER_STATE_PYTHON": str(decoy), "LEARN_UKRAINIAN_PRIMARY_REPO_ROOT": str(primary)}),
     ):
         run = selected(["bash", str(script), *argv], cwd=worktree, extra=extra, stdin=stdin)
         assert str(override) in log.read_text(encoding="utf-8"), (script, run.returncode, run.stderr)
@@ -952,7 +904,7 @@ if sys.path.count(checkout) > before.count(checkout):
 
 
 def test_retired_model_check_uses_the_rule_not_the_helper_venv(tmp_path: Path) -> None:
-    """Defect: the retired-model check runs the helper-root venv and ignores LEARN_UKRAINIAN_PYTHON."""
+    """Defect: the retired-model check runs the helper-root venv and ignores LU_PYTHON."""
     decoy_log = tmp_path / "decoy.log"
     decoy_log.write_text("", encoding="utf-8")
     helper = tmp_path / "helper"
@@ -972,7 +924,7 @@ def test_retired_model_check_uses_the_rule_not_the_helper_venv(tmp_path: Path) -
     selected = subprocess.run(
         ["bash", "-c", script, "probe", str(helper)],
         cwd=tmp_path,
-        env={**_base_env(tmp_path), "LEARN_UKRAINIAN_PYTHON": str(override)},
+        env={**_base_env(tmp_path), "LU_PYTHON": str(override)},
         capture_output=True,
         text=True,
         timeout=60,
@@ -984,7 +936,7 @@ def test_retired_model_check_uses_the_rule_not_the_helper_venv(tmp_path: Path) -
     refused = subprocess.run(
         ["bash", "-c", script, "probe", str(helper)],
         cwd=tmp_path,
-        env={**_base_env(tmp_path), "LEARN_UKRAINIAN_PYTHON": str(plain)},
+        env={**_base_env(tmp_path), "LU_PYTHON": str(plain)},
         capture_output=True,
         text=True,
         timeout=30,
@@ -1013,24 +965,23 @@ def test_handoff_alias_error_names_the_packaged_map(tmp_path: Path) -> None:
     assert "scripts/config/launcher_stream_aliases.tsv" not in result.stderr
 
 
-def test_subdirectory_does_not_select_a_nested_venv(tmp_path: Path) -> None:
-    """Defect: a subdirectory with no .git is its own primary, so a nested virtualenv bypasses the checkout."""
+def test_subdirectory_does_not_select_a_nested_venv(tmp_path: Path, host_layout) -> None:
+    """A nested virtualenv cannot replace the Codex hook runtime."""
     primary, _worktree, log = _layout(tmp_path, primary_venv=True, worktree_venv=False)
     nested = primary / "nested"
     nested.mkdir()
     nested_log = tmp_path / "nested.log"
     nested_log.write_text("", encoding="utf-8")
     _record(nested / ".venv" / "bin" / "python", nested_log, code=0)
-    base = _base_env(tmp_path)
-    package = machinery_root()
     codex = _run(
-        [str(package / "agent_runtime" / "codex_hook_entry.sh"), "pre-tool-use"],
+        [str(machinery_root() / "agent_runtime" / "codex_hook_entry.sh"), "pre-tool-use"],
         cwd=nested,
-        env={**base, "LEARN_UKRAINIAN_PRIMARY_REPO_ROOT": str(primary)},
-        stdin=json.dumps({"tool_input": {"workdir": str(nested)}}),
+        env={**_base_env(tmp_path), **host_layout.env, "LU_PYTHON": str(host_layout.python)},
+        stdin=json.dumps({"tool_name": "Read", "cwd": str(nested), "tool_input": {"workdir": str(nested)}}),
     )
-    assert nested_log.read_text(encoding="utf-8") == "", codex.stderr
-    assert str(primary / ".venv/bin/python") in log.read_text(encoding="utf-8"), codex.stderr
+    assert codex.returncode == 0, codex.stderr
+    assert nested_log.read_text(encoding="utf-8") == ""
+    assert log.read_text(encoding="utf-8") == ""
 
 
 def test_a_receipt_for_a_different_tool_or_base_fallback_is_never_reused(tmp_path):

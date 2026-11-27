@@ -3,32 +3,6 @@
 # Sourced, never registered as a hook; executing it directly does nothing.
 # State I/O is delegated to the descriptor-relative Python helper (#9791).
 
-# The machinery code root (#100 R51, R62, R69, R66): the release the one project
-# interpreter imports, never this file's location and never <project>/lu_machinery.
-# Before importing that release, the probe needs the configured primary
-# checkout LEARN_UKRAINIAN_PRIMARY_REPO_ROOT, exactly as the installed rule does,
-# and then accepts an absolute executable LEARN_UKRAINIAN_PYTHON or the anchor's
-# .venv. A checkout's own Git metadata never names the probe's primary: whoever
-# works in a checkout can rewrite it. Invalid configuration does not fall back.
-_context_rule_root() {
-  local root="$1" git_path line
-  git_path="$root/.git"
-  # The installed _project_hook_git_layout criteria fence the probe: only a
-  # real, non-symlinked Git directory of its own may supply an interpreter.
-  [ ! -L "$git_path" ] && [ -d "$git_path" ] || return 1
-  [ ! -e "$git_path/commondir" ] && [ ! -L "$git_path/commondir" ] || return 1
-  [ -d "$git_path/objects" ] && [ -d "$git_path/refs" ] || return 1
-  [ -f "$git_path/HEAD" ] && [ ! -L "$git_path/HEAD" ] || return 1
-  IFS= read -r line < "$git_path/HEAD" || true
-  case "$line" in
-    ref:*)
-      line="${line#ref:}"
-      [[ "${line#"${line%%[![:space:]]*}"}" = refs/* ]] || return 1
-      ;;
-    *) [[ "$line" =~ ^[0-9a-fA-F]{40}([0-9a-fA-F]{24})?$ ]] || return 1 ;;
-  esac
-  printf '%s\n' "$root"
-}
 # The physical path of directory $1, or return 1; as the installed rule's
 # _project_physical_dir: the x sentinel keeps a trailing newline $(...) would
 # strip, and a path with a newline refuses rather than being checked as its
@@ -40,95 +14,23 @@ _context_physical_dir() {
   [[ "$dir" != *$'\n'* ]] || return 1
   printf '%s\n' "$dir"
 }
-_context_rule_probe() {
-  local configured="${LEARN_UKRAINIAN_PYTHON:-}" anchor="${LEARN_UKRAINIAN_PRIMARY_REPO_ROOT:-}" root
-  # The anchor passes the installed rule's checks before any interpreter, even
-  # a configured one, is chosen: an invalid anchor refuses before a process starts.
-  case "$anchor" in
-    /*) ;;
-    *) echo "${0##*/}: project interpreter not found: LEARN_UKRAINIAN_PRIMARY_REPO_ROOT must name the primary checkout" >&2; return 1 ;;
-  esac
-  if ! root="$(_context_physical_dir "$anchor")" || ! root="$(_context_rule_root "$root")"; then
-    echo "${0##*/}: project interpreter not found: LEARN_UKRAINIAN_PRIMARY_REPO_ROOT=$anchor is not a primary checkout" >&2
-    return 1
-  fi
-  if [ -n "$configured" ]; then
-    case "$configured" in
-      /*) ;;
-      *) echo "${0##*/}: LEARN_UKRAINIAN_PYTHON must be an absolute path, got $configured" >&2; return 1 ;;
-    esac
-    [ -f "$configured" ] && [ -x "$configured" ] \
-      || { echo "${0##*/}: LEARN_UKRAINIAN_PYTHON=$configured is not an executable file" >&2; return 1; }
-    printf '%s\n' "$configured"
-    return 0
-  fi
-  [ -f "$root/.venv/bin/python" ] && [ -x "$root/.venv/bin/python" ] \
-    || { echo "${0##*/}: project interpreter not found: $root/.venv/bin/python; set LEARN_UKRAINIAN_PYTHON" >&2; return 1; }
-  printf '%s\n' "$root/.venv/bin/python"
-}
-_context_import_release() {
-  local found
-  found="$("$1" -I -c 'import os, lu_machinery; print(os.path.dirname(os.path.dirname(os.path.abspath(lu_machinery.__file__))))' 2>/dev/null)" \
-    && [ -f "$found/lu_machinery/lib/project_interpreter.sh" ] \
-    && source "$found/lu_machinery/lib/project_interpreter.sh" 2>/dev/null \
-    || { echo "${0##*/}: no installed lu_machinery release: the project interpreter $1 cannot import lu_machinery" >&2; return 1; }
-  MACHINERY_DIR="$found"
-}
-
-# Set PROJECT_DIR, MACHINERY_DIR, CONTEXT_PROJECT_PYTHON and the explicit
-# PROJECT_HOOK_STATE_ROOT if configured. An empty argument
-# lets the rule select the nearest physical cwd ancestor with a .git entry.
-# Source the release's project_interpreter.sh. The probe
-# only finds the release; the release's resolver then decides, and its release is
-# sourced when it differs. Fails closed: on any doubt it says why on stderr and
-# returns 1, and the hook refuses instead of running code from anywhere else.
+# The deployment or launcher supplies the runtime. Only its isolated host
+# context entry may select the product, state directory and machinery code.
 context_machinery_bootstrap() {
-  local project_dir="$1" probe resolved state
-  MACHINERY_DIR="" CONTEXT_PROJECT_PYTHON="" PROJECT_HOOK_STATE_ROOT=""
-  # Preserve the rule's refusal of nonempty relative roots before any import.
-  case "$project_dir" in
-    ''|/*) ;;
-    *) echo "${0##*/}: project root must be an absolute checkout path" >&2; return 1 ;;
-  esac
-  # This probe selects code only. The installed hook rule below decides the
-  # product, shared state and interpreter before callers use them.
-  probe="$(_context_rule_probe)" || return 1
-  _context_import_release "$probe" || return 1
-  if [ -n "$project_dir" ]; then
-    project_hook_context_resolve "$project_dir" || {
-      echo "${0##*/}: HOOK-BOOTSTRAP-FAILED: product root, shared state or interpreter unavailable" >&2
-      MACHINERY_DIR=""; return 1;
-    }
-  else
-    project_hook_context_resolve || {
-      echo "${0##*/}: HOOK-BOOTSTRAP-FAILED: product root, shared state or interpreter unavailable" >&2
-      MACHINERY_DIR=""; return 1;
-    }
+  local python="${LU_PYTHON:-}" assignments
+  if [[ "$python" != /* || ! -f "$python" || ! -x "$python" ]]; then
+    printf '%s\n' 'HOOK-BOOTSTRAP-FAILED: [missing_interpreter_binding] LU_PYTHON must name an absolute executable.' >&2
+    return 2
   fi
+  assignments="$("$python" -I -B -m lu_machinery.host_context shell)" || return 2
+  eval "$assignments"
+  # shellcheck disable=SC2034  # Read by the hooks that source this library.
   PROJECT_DIR="$LU_PRODUCT_ROOT"
-  resolved="$LEARN_UKRAINIAN_PYTHON"
-  if [ "$resolved" != "$probe" ]; then
-    _context_import_release "$resolved" || { MACHINERY_DIR=""; return 1; }
-  fi
-  if [ -n "${LU_STATE_ROOT:-}${LEARN_UKRAINIAN_STATE_ROOT:-}" ]; then
-    if ! state="$(project_python_run "$resolved" -c '
-import sys
-from pathlib import Path
-from lu_machinery.common.repo_root import MachineryConfigError, configured_hook_state_root
-try:
-    root = configured_hook_state_root(Path(sys.argv[1]))
-except MachineryConfigError as exc:
-    sys.exit(str(exc))
-if root is None:
-    sys.exit("configured hook state root is unavailable")
-print(root)
-' "$LEARN_UKRAINIAN_PRIMARY_REPO_ROOT")" || [[ "$state" != /* ]]; then
-      echo "${0##*/}: HOOK-BOOTSTRAP-FAILED: explicit runtime state root did not resolve" >&2
-      return 1
-    fi
-    PROJECT_HOOK_STATE_ROOT="$state"
-  fi
-  CONTEXT_PROJECT_PYTHON="$resolved"
+  MACHINERY_DIR="$LU_MACHINERY_CODE_ROOT"
+  PROJECT_HOOK_STATE_ROOT="$LU_STATE_ROOT"
+  CONTEXT_PROJECT_PYTHON="$LU_PYTHON"
+  # shellcheck source=lu_machinery/lib/project_interpreter.sh
+  source "$MACHINERY_DIR/lu_machinery/lib/project_interpreter.sh"
 }
 
 # The one project interpreter. Never fall back to PATH Python or a component override.
@@ -140,7 +42,7 @@ context_hook_state() {
   # stdlib-only: -I keeps the cwd and PYTHONPATH off its import path.
   helper="$MACHINERY_DIR/agents_extensions/shared/hooks/context-hook-state.py"
   [ -f "$helper" ] || return 0
-  "$CONTEXT_PROJECT_PYTHON" -I "$helper" "$operation" "${PROJECT_HOOK_STATE_ROOT:-$project_dir}" "$session_id" "$@" 2>/dev/null || true
+  "$CONTEXT_PROJECT_PYTHON" -I "$helper" "$operation" "$PROJECT_HOOK_STATE_ROOT" "$session_id" "$@" 2>/dev/null || true
 }
 
 # Latest assistant input/cache usage from a Claude Code transcript, or 0.
@@ -246,27 +148,13 @@ context_checkout_root() {
   fi
 }
 
-# The configured state directory already validated by the hook bootstrap.
-# With no state setting, a non-Git project uses the configured primary;
-# linked worktrees keep sharing session records and leases via Git's common
-# directory or the launcher's canonical checkout override.
+# Durable hooks share the state directory from the host binding.
 context_canonical_root() {
-  local project_dir="$1" state
-  if [ -n "${PROJECT_HOOK_STATE_ROOT:-}" ]; then
-    printf '%s\n' "$PROJECT_HOOK_STATE_ROOT"
-    return 0
+  if [ -z "${PROJECT_HOOK_STATE_ROOT:-}" ]; then
+    printf '%s\n' 'HOOK-BOOTSTRAP-FAILED: [missing_state_binding] hook context was not loaded.' >&2
+    return 1
   fi
-  if context_outside_checkouts "${CLAUDE_PROJECT_DIR:-$project_dir}"; then
-    if ! state="$(project_python_run "$CONTEXT_PROJECT_PYTHON" -c \
-        'from lu_machinery.common.repo_root import state_root; print(state_root())' 2>/dev/null)" \
-        || [[ "$state" != /* ]]; then
-      echo "${0##*/}: HOOK-BOOTSTRAP-FAILED: no runtime-state root (set LU_PRIMARY_REPO_ROOT)" >&2
-      return 1
-    fi
-    printf '%s\n' "$state"
-    return 0
-  fi
-  context_checkout_root "$@"
+  printf '%s\n' "$PROJECT_HOOK_STATE_ROOT"
 }
 
 # True when <dir> is an existing directory outside every checkout: no .git entry

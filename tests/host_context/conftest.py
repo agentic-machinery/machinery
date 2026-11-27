@@ -8,6 +8,7 @@ import sys
 import sysconfig
 import venv
 from dataclasses import dataclass
+from importlib.metadata import version
 from pathlib import Path
 
 import pytest
@@ -32,6 +33,30 @@ class HostLayout:
             [self.python, "-I", "-B", "-m", "lu_machinery.host_context", "check", "--json", *args],
             cwd="/", env=self.env if env is None else env, capture_output=True, text=True, check=False, timeout=30,
         )
+
+
+def installed_hook_env(layout: HostLayout) -> dict[str, str]:
+    """Bind a native hook to the installed test interpreter and matching root assertions."""
+    layout.data["runtime"].update(python=sys.executable, lu_machinery=version("lu-machinery"))
+    layout.data["products"]["public"]["python"] = sys.executable
+    layout.write()
+    state = Path(layout.data["state_root"])
+    batch = state / "batch_state"
+    primary = layout.data["repos"]["machinery"]
+    return {
+        **layout.env,
+        "LU_PYTHON": sys.executable,
+        "LEARN_UKRAINIAN_PYTHON": sys.executable,
+        "LU_PRODUCT_ROOT": layout.data["repos"]["public"],
+        "LU_PRIMARY_REPO_ROOT": primary,
+        "LEARN_UKRAINIAN_PRIMARY_REPO_ROOT": primary,
+        "LU_STATE_ROOT": str(state),
+        "LU_TASKS_DIR": str(batch / "tasks"),
+        "FLEET_COMMS_ROOT": str(batch / "fleet-comms/v1"),
+        "LEARN_UKRAINIAN_BATCH_STATE_DIR": str(batch),
+        "LEARN_UKRAINIAN_OWNERSHIP_LEDGER": str(batch / "tasks/write-ownership.sqlite3"),
+        "LU_GITHUB_CACHE_DIR": str(batch / "github-client"),
+    }
 
 
 def git(checkout, *args):

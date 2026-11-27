@@ -2,7 +2,7 @@
 # Harness hook entry point for the pinned driver state (lu_machinery.driver_state).
 #   driver_state_inject.sh [agy-hook|agy-stop-hook|agy-pretool-hook|claude-hook|claude-stop-hook]
 # The product, shared-state anchor and interpreter come from the one hook rule,
-# project_hook_context_resolve (lib/project_interpreter.sh), before any directory
+# project_host_context (lib/project_interpreter.sh), before any directory
 # change or Python start; never from this script's location. Without that
 # context the hook answers in its mode's native refusal shape: AGY Stop
 # continues, other AGY entries deny, Claude Stop blocks and Claude
@@ -25,24 +25,17 @@ case "$mode" in
 esac
 bootstrap_failed() {
   cat >/dev/null 2>&1
-  printf '%s %s\n' 'HOOK-BOOTSTRAP-FAILED: product root, shared state, interpreter or machinery unavailable.' "${1:-${PROJECT_HOOK_BOOTSTRAP_STEP:-machinery}}" >&2
+  if [ "$#" -gt 0 ]; then
+      printf 'HOOK-BOOTSTRAP-FAILED: [hook_unavailable] %s\n' "$1" >&2
+  fi
   printf '%s\n' "$refusal"
   exit 0
 }
-code=$(cd "$(dirname "$0")/../.." 2>/dev/null && pwd) || bootstrap_failed root
+code=$(cd "$(dirname "$0")/../.." 2>/dev/null && pwd) || bootstrap_failed "installed hook directory is unavailable."
 # shellcheck disable=SC1091
-source "$code/lu_machinery/lib/project_interpreter.sh" || bootstrap_failed machinery
-# The rendered Claude entry opts into the host binding explicitly. Existing
-# registrations still use the legacy bootstrap when their caller exports LU_PYTHON.
-case "$mode:${2:-}" in
-  claude-*:--host-context)
-    project_host_context || bootstrap_failed context
-    py="$LU_PYTHON" ;;
-  *:)
-    project_hook_context_resolve 2>/dev/null || bootstrap_failed
-    py="$LEARN_UKRAINIAN_PYTHON" ;;
-  *) bootstrap_failed context ;;
-esac
+source "$code/lu_machinery/lib/project_interpreter.sh" || bootstrap_failed "installed hook code is unavailable."
+project_host_context || bootstrap_failed
+py="$LU_PYTHON"
 # Ordinary sessions have no driver gate and need no temporary files.
 if [ -z "${LU_DRIVER_STATE_FILE:-}" ] || [ -z "${SESSION_HANDOFF_AGENT:-}" ]; then
   cat >/dev/null

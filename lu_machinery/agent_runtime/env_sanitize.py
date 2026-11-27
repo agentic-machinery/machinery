@@ -106,9 +106,7 @@ _PUSH_CREDENTIAL_NAMES = (
 # before the value-pattern filter. Their names remain narrowly allowlisted.
 # The #7827 dispatch markers ride here for the same reason: a task id
 # containing ``sk-`` must still reach the worker's SessionStart gate.
-# ``LU_PRODUCT_ROOT`` names the product checkout (often a worktree named after a
-# task) that hooks and the installed package serve. ``LEARN_UKRAINIAN_PRIMARY_REPO_ROOT``
-# is the configured shared-state anchor, without which every hook bootstrap refuses.
+# Hook bootstrap paths are validated against the host binding before use.
 _SAFE_VALUE_NAME_ALLOWLIST = {
     "LEARN_UKRAINIAN_DISPATCH_AGENT",
     "LEARN_UKRAINIAN_DISPATCH_TASK_ID",
@@ -117,7 +115,10 @@ _SAFE_VALUE_NAME_ALLOWLIST = {
     "PYTHONPYCACHEPREFIX",
     "RUFF_CACHE_DIR",
     "TMPDIR",
+    "LU_HOST_CONTEXT",
+    "LU_PRIMARY_REPO_ROOT",
     "LU_PRODUCT_ROOT",
+    "LU_PYTHON",
     "LU_RUNTIME_TMP_BASE_ROOT",
     "LU_RUNTIME_TMP_ROOT",
     "LU_TASK_EVIDENCE_DIR",

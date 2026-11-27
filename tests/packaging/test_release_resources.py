@@ -150,7 +150,7 @@ print(json.dumps(result))
     expected_block = (
         f'<rules-core seat="core" sha256="{hashlib.sha256(core.encode()).hexdigest()}">\n{core}</rules-core>'
     )
-    shell_env = {**env, "TMPDIR": str(scratch / "shell-tmp")}
+    shell_env = {**env, "TMPDIR": str(scratch / "shell-tmp"), "LU_PYTHON": str(executable)}
     Path(shell_env["TMPDIR"]).mkdir()
     helper = scratch / "launcher-helper"
     helper.mkdir()

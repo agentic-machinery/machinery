@@ -742,15 +742,16 @@ def test_real_reader_unavailable_warns_without_disclosing_target(name, tmp_path)
         },
     )
     args = ("--epic", "infra") if name == "start-claude-driver.sh" else ()
+    unreachable = "http://127.0.0.1:1"
     result = run_launcher(
         name,
         *args,
         "--model",
         "sonnet",
         root=checkout,
-        env={"LU_MONITOR_LOOPBACK": "file:private-telemetry-target", "LU_CLAUDE_CAP_OVERRIDE": "0"},
+        env={"LU_MONITOR_LOOPBACK": unreachable, "LU_CLAUDE_CAP_OVERRIDE": "0"},
     )
     assert result.returncode == 0, result.stderr
     assert "warning: Claude weekly usage unknown or invalid" in result.stderr
     assert "claude-sonnet-5-5" in _exec_line(result.stdout)
-    assert "private-telemetry-target" not in result.stdout + result.stderr
+    assert unreachable not in result.stdout + result.stderr

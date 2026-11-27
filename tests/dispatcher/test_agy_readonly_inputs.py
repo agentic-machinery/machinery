@@ -10,18 +10,16 @@ import time
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
+
 import pytest
+
 from lu_machinery import host_context
+from lu_machinery.common.repo_root import machinery_root
 from lu_machinery.dispatcher import agy_sandbox, cli, git, store, worker
 from lu_machinery.dispatcher.providers import agy as agy_provider
-from tests.helpers.product_tree import configured_roots  # noqa: F401
 from tests.dispatcher.test_providers_b import _github_meta_path
-from lu_machinery.common.repo_root import machinery_root
+from tests.helpers.product_tree import configured_roots  # noqa: F401
 from tests.host_context.conftest import host_layout as host_layout
-
-
-
-
 
 
 def _git(cwd: Path, *args: str) -> str:
@@ -417,7 +415,10 @@ def test_read_only_agy_cannot_read_sibling_task_records(tmp_path, monkeypatch, c
     host_layout.data["repos"] = {
         "machinery": str(configured_roots.primary), "public": str(configured_roots.product),
     }
-    host_layout.data["runtime"]["python"] = os.environ.get("LEARN_UKRAINIAN_PYTHON", str(host_layout.python))
+    host_layout.data["runtime"]["python"] = sys.executable
+    monkeypatch.setenv("LU_PYTHON", sys.executable)
+    monkeypatch.setenv("LEARN_UKRAINIAN_PYTHON", sys.executable)
+    monkeypatch.setenv("LU_PRODUCT_ROOT", str(configured_roots.product))
     host_layout.write()
     monkeypatch.setenv(host_context.CONTEXT_ENV, str(host_layout.file))
     for name, value in host_context._state_assertions(state).items():
@@ -430,6 +431,11 @@ def test_read_only_agy_cannot_read_sibling_task_records(tmp_path, monkeypatch, c
         path.parent.mkdir(exist_ok=True)
         path.write_text("fixture\n")
 
+    # Defect class: the read-only AGY guard loses its runtime inputs or treats a missing projection as approval.
+    payload = shlex.quote(json.dumps({"toolCall": {"name": "run_command", "args": {"CommandLine": "printf safe"}}}))
+    allow_decision = shlex.quote('"decision": "allow"')
+    deny_decision = shlex.quote('"decision": "deny"')
+    hook = '"$LU_PYTHON" -I -m lu_machinery.agent_runtime.agy_hook_config --run-hook agy-secret-print'
     script = (
         'set -eu; '
         'grep -q "machinery.sandbox-state.v1" "$LU_HOST_CONTEXT"; '
@@ -437,6 +443,13 @@ def test_read_only_agy_cannot_read_sibling_task_records(tmp_path, monkeypatch, c
         f'if touch {shlex.quote(str(state / "unexpected"))} 2>/dev/null; then exit 3; fi; '
         f'test ! -e {shlex.quote(str(host_layout.file))}; '
         'test "$(ls -A "$LU_TASKS_DIR")" = agy-mask.inputs; '
+        f'test "$LU_PYTHON" = {shlex.quote(sys.executable)}; '
+        'test "$LU_PYTHON" = "$LEARN_UKRAINIAN_PYTHON"; '
+        f'test "$LU_PRODUCT_ROOT" = {shlex.quote(str(configured_roots.product))}; '
+        f'allowed=$(printf %s {payload} | {hook}); '
+        f'printf "%s\\n" "$allowed" | grep -q {allow_decision}; '
+        f'denied=$(printf %s {payload} | env -u LU_HOST_CONTEXT {hook}); '
+        f'printf "%s\\n" "$denied" | grep -q {deny_decision}; '
         'cat "$LU_TASKS_DIR/agy-mask.inputs/packet.txt" README.md'
     )
     argv, env = _launch(tmp_path, worktree, "agy-mask", ["/bin/sh", "-c", script], [])

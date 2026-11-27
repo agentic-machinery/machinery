@@ -11,13 +11,15 @@ from pathlib import Path
 import pytest
 
 from lu_machinery.agent_runtime.adapters.agy import AgyAdapter, _agy_version
+from tests.agent_runtime.agy_hook_helpers import bind_registration_runtime as bind_registration_runtime
 from tests.agent_runtime.agy_hook_helpers import register_agy_hooks
+from tests.agent_runtime.agy_hook_helpers import registration_host as registration_host
 from tests.agent_runtime.product_roots import (  # noqa: F401
     agent_runtime_roots,
     configured_roots,
 )
 
-pytestmark = pytest.mark.usefixtures("agent_runtime_roots")
+pytestmark = pytest.mark.usefixtures("agent_runtime_roots", "bind_registration_runtime")
 
 # Placeholder per key delegate.py assigns. An unmapped key still gets a
 # value so a new read-only or review assignment is sent, not dropped.

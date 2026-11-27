@@ -820,7 +820,7 @@ def build(tree: Tree, inputs: Tree | CommitInputs | None = None, *, workspace: b
             add(".agent", path, Output(blob, 0o644, "fleet", "generated:core"))
         add(".agent", "rules.json", Output(encoded({"exclude": ["core.md", "model-assignment.md", "workflow.md"]}), 0o644, "fleet", "generated:agy-excludes"))
     hook_python = None
-    native_configs = {"claude": ".claude/settings.json"}
+    native_configs = {"claude": ".claude/settings.json", "agy": ".agents/hooks.json", "codex": ".codex/hooks.json"}
     for provider in providers:
         required_configs = inventory["required_hooks"].get(provider, {})
         hook_configs = dict(required_configs)
@@ -833,7 +833,7 @@ def build(tree: Tree, inputs: Tree | CommitInputs | None = None, *, workspace: b
                 raise Invalid("missing provider settings: " + config)
             try:
                 settings = decode(output.blob)
-                entries = list(_native_hook_entries(settings)) if config == native_config else []
+                entries = list(_native_hook_entries(settings))
                 for hook_entry, hook_mode in entries:
                     hook_entry["command"] = f"{NATIVE_HOOK_DECLARATION} {hook_mode}"
                 if workspace and config == ".claude/settings.json":

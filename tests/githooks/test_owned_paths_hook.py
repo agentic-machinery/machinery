@@ -14,6 +14,7 @@ import json
 import os
 import shutil
 import subprocess
+from importlib.metadata import version
 from pathlib import Path
 
 import pytest
@@ -21,6 +22,7 @@ import yaml
 
 from tests.helpers import machinery_package
 from tests.helpers.wheel import install_release, release_wheel
+from tests.host_context.conftest import build_host_layout
 from tests.opsec_fixtures import TOKEN, make_tooling
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -55,24 +57,12 @@ def wheel(tmp_path_factory: pytest.TempPathFactory) -> Path:
 
 
 def _base_env() -> dict[str, str]:
-    hidden = {
-        "PYTHONPATH",
-        "PYTHONHOME",
-        "PYTHONSAFEPATH",
-        "VIRTUAL_ENV",
-        "LEARN_UKRAINIAN_DISPATCH_TASK_ID",
-        "LEARN_UKRAINIAN_PYTHON",
-        "LU_TASKS_DIR",
-        # A dispatched worker inherits the boundary broker; host-mode hook runs must not.
-        "LU_WRITE_BOUNDARY_BROKER",
+    return {
+        "PATH": _PATH,
+        "LANG": "C.UTF-8",
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_CONFIG_NOSYSTEM": "1",
     }
-    env = {
-        key: value
-        for key, value in os.environ.items()
-        if not key.startswith("GIT_") and key not in hidden
-    }
-    env["PATH"] = _PATH
-    return env
 
 
 def _git(
@@ -96,9 +86,9 @@ def _run(
     )
 
 
-def _installed_python(tmp_path: Path, wheel: Path, *, dependencies: bool = False) -> Path:
+def _installed_python(tmp_path: Path, wheel: Path) -> Path:
     """A fresh interpreter whose only copy of the package is the installed release wheel."""
-    python = install_release(wheel, tmp_path / "venv", dependencies=dependencies)
+    python = install_release(wheel, tmp_path / "venv", dependencies=True)
     origin = _run(
         [str(python), "-P", "-c", "import lu_machinery; print(lu_machinery.__file__)"],
         cwd=tmp_path,
@@ -124,6 +114,23 @@ def _installer(python: Path) -> Path:
     installer = _site(python) / machinery_package() / "install_git_hooks.sh"
     assert installer.is_file()
     return installer
+
+
+def _bind_product_runtime(repo: Path, python: Path, env: dict[str, str]) -> None:
+    """Bind the fixture checkout to the actual wheel interpreter."""
+    assert _git(
+        repo, "remote", "add", "origin", "https://github.com/learn-ukrainian/learn-ukrainian.github.io.git",
+        env=env,
+    ).returncode == 0
+    layout = build_host_layout(repo.parent / f"{repo.name}-binding")
+    layout.data["repos"]["public"] = str(repo)
+    layout.data["runtime"].update(python=str(python), lu_machinery=version("lu-machinery"))
+    layout.data["products"]["public"]["python"] = str(python)
+    layout.write()
+    env.update(
+        layout.env, LU_PYTHON=str(python), LU_STATE_ROOT=layout.data["state_root"],
+        HOME=str(layout.file.parent), TMPDIR=str(repo.parent),
+    )
 
 
 def _product_repo(
@@ -154,9 +161,14 @@ def _product_repo(
         ("commit", "-q", "--allow-empty", "-m", "base"),
     ):
         assert _git(repo, *args, env=env).returncode == 0
-    # The shared hook boundary requires an explicit primary-state anchor.
-    env["LEARN_UKRAINIAN_PRIMARY_REPO_ROOT"] = str(repo)
-    installed = _run(["/usr/bin/bash", str(_installer(python))], cwd=repo, env=env)
+    _bind_product_runtime(repo, python, env)
+    installer = ["/usr/bin/bash", str(_installer(python))]
+    assert _git(repo, "config", "core.hooksPath", ".other-hooks", env=env).returncode == 0
+    refused = _run(installer, cwd=repo, env=env)
+    hooks_path = _git(repo, "config", "--get", "core.hooksPath", env=env)
+    assert (refused.returncode, hooks_path.stdout.strip()) == (2, ".other-hooks"), refused.stderr
+    assert _git(repo, "config", "core.hooksPath", ".githooks", env=env).returncode == 0
+    installed = _run(installer, cwd=repo, env=env)
     assert installed.returncode == 0, installed.stderr
     assert "pre-commit: installed" in installed.stdout
     delegator = repo / ".git" / "hooks" / "pre-commit"
@@ -172,9 +184,10 @@ def _product_repo(
     return repo
 
 
-def _task(repo: Path, tasks: Path, env: dict[str, str]) -> dict[str, str]:
+def _task(repo: Path, env: dict[str, str]) -> dict[str, str]:
     base = _git(repo, "rev-parse", "HEAD", env=env).stdout.strip()
-    tasks.mkdir()
+    tasks = Path(env["LU_STATE_ROOT"]) / "batch_state" / "tasks"
+    tasks.mkdir(parents=True)
     (tasks / "owned-paths-task.json").write_text(
         json.dumps(
             {
@@ -209,7 +222,7 @@ def test_dispatched_commit_outside_owned_paths_is_refused_at_commit_time(tmp_pat
     assert origin.stdout.strip().startswith(str(python.parents[1]))
     assert REPO_ROOT.as_posix() not in origin.stdout
     base = _git(repo, "rev-parse", "HEAD", env=env).stdout.strip()
-    task_env = _task(repo, tmp_path / "tasks", env)
+    task_env = _task(repo, env)
     (repo / "outside.txt").write_text("out of scope\n", encoding="utf-8")
     assert _git(repo, "add", "outside.txt", env=env).returncode == 0
 
@@ -235,7 +248,7 @@ def test_missing_owned_path_checker_refuses_instead_of_skipping(tmp_path, wheel)
     env["LEARN_UKRAINIAN_PYTHON"] = str(python)
     repo = _product_repo(tmp_path, env, python)
     base = _git(repo, "rev-parse", "HEAD", env=env).stdout.strip()
-    task_env = _task(repo, tmp_path / "tasks", env)
+    task_env = _task(repo, env)
     (repo / "outside.txt").write_text("out of scope\n", encoding="utf-8")
     assert _git(repo, "add", "outside.txt", env=env).returncode == 0
 
@@ -260,6 +273,7 @@ def test_missing_tracked_hook_is_not_reported_installed(tmp_path, wheel):
     )
     (absent / ".githooks" / "pre-commit").unlink()
     assert _git(absent, "init", "-q", "-b", "main", env=env).returncode == 0
+    _bind_product_runtime(absent, python, env)
     refused = _run(["/usr/bin/bash", str(_installer(python))], cwd=absent, env=env)
     assert refused.returncode != 0
     assert "installed" not in refused.stdout
@@ -296,7 +310,7 @@ def _commit_msg_product(tmp_path: Path, wheel: Path) -> tuple[Path, dict[str, st
     installed catalog places it beside the configured primary, so no host rule is needed.
     """
     env = _base_env()
-    python = _installed_python(tmp_path, wheel, dependencies=True)
+    python = _installed_python(tmp_path, wheel)
     env["LEARN_UKRAINIAN_PYTHON"] = str(python)
     env["PRE_COMMIT_HOME"] = str(tmp_path / "pre-commit-home")
     repo = _product_repo(
@@ -306,11 +320,12 @@ def _commit_msg_product(tmp_path: Path, wheel: Path) -> tuple[Path, dict[str, st
         config=_PRODUCT_PRE_COMMIT_CONFIG,
         files={_PLAN: 'version: "1.0"\ntitle: Greetings\n'},
     )
-    env["LEARN_UKRAINIAN_PRIMARY_REPO_ROOT"] = str(repo)
     catalog = yaml.safe_load(
         (_site(python) / machinery_package() / "config" / "fleet_repos.yaml").read_text(encoding="utf-8")
     )
-    make_tooling(tmp_path / catalog["repos"]["infra-private"]["local_name"] / "tools" / "public_opsec_scan")
+    layout = json.loads(Path(env["LU_HOST_CONTEXT"]).read_text())
+    repos_parent = Path(layout["repos"]["machinery"]).parent
+    make_tooling(repos_parent / catalog["repos"]["infra-private"]["local_name"] / "tools" / "public_opsec_scan")
     delegator = repo / ".git" / "hooks" / "commit-msg"
     assert "generated by scripts/install_git_hooks.sh" in delegator.read_text(encoding="utf-8")
     return repo, env

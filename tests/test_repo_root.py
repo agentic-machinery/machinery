@@ -12,6 +12,7 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -19,6 +20,7 @@ from lu_machinery.common import profile
 from lu_machinery.common import repo_root as rr
 from lu_machinery.common.repo_root import main_checkout_root, project_interpreter
 from lu_machinery.orchestration import worktree_claims
+from tests.host_context.conftest import host_layout as host_layout
 
 REPO = Path(__file__).resolve().parents[1]
 
@@ -477,34 +479,35 @@ def test_package_imports_and_help_work_with_nothing_configured(tmp_path):
     assert _tree(decoy) == before
 
 
+@pytest.fixture
+def bound_hooks(unconfigured, host_layout, monkeypatch):
+    for key in (
+        "LU_TASKS_DIR", "LU_GITHUB_CACHE_DIR", "FLEET_COMMS_ROOT", "LEARN_UKRAINIAN_BATCH_STATE_DIR",
+        "LEARN_UKRAINIAN_OWNERSHIP_LEDGER", "LU_FLEET_REPO_SELECTOR_FILE", "LU_REPOS_ROOT",
+    ):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setattr(sys, "executable", str(host_layout.python))
+    for key, value in host_layout.env.items():
+        monkeypatch.setenv(key, value)
+    # The hook supplies canonical variables which may be absent on entry.
+    with patch.dict(os.environ):
+        yield host_layout
+
+
 @pytest.mark.parametrize("configured", [rr.PRODUCT_ROOT_ENV, "CLAUDE_PROJECT_DIR"])
 @pytest.mark.parametrize("shape", ["symlinked-git", "malformed-gitfile", "newline-named"])
-def test_a_configured_product_cannot_hide_a_bad_invocation_git(unconfigured, tmp_path, monkeypatch, shape, configured):
-    """Defect class (C3): a configured product root hiding the invocation checkout's symlinked or malformed ``.git``.
-
-    ``newline-named`` is the same symlinked ``.git`` in a directory whose name ends in a
-    newline, beside a clean-named real primary that command substitution would strip it to.
-
-    Configured precedence stays: a well-formed invocation directory still resolves to the
-    configured product. Only the invocation's own Git metadata is refused, at the hook-root
-    rule and at the AGY startup gate, before any interpreter or hook config is accepted.
-    """
+def test_a_configured_product_cannot_hide_a_bad_invocation_git(bound_hooks, tmp_path, monkeypatch, shape, configured):
+    """The hook rejects malformed Git metadata in the actual invocation directory."""
     from lu_machinery.agent_runtime import agy_hook_config as hooks
 
-    primary = _primary_checkout(tmp_path / "primary")
-    product = tmp_path / "product"
-    product.mkdir()
-    monkeypatch.setenv(rr.PRIMARY_ROOT_ENV, str(primary))
-    monkeypatch.setenv(rr.LU_STATE_ROOT_ENV, str(primary))
-    # Empty, not unset: the gate sets a missing product root, and this restores it.
-    monkeypatch.setenv(rr.PRODUCT_ROOT_ENV, "")
+    primary = Path(bound_hooks.data["repos"]["machinery"])
+    product = Path(bound_hooks.data["repos"]["public"])
     monkeypatch.setenv(configured, str(product))
     bad = tmp_path / ("invocation\n" if shape == "newline-named" else "invocation")
     bad.mkdir()
     if shape == "newline-named":
-        # The clean namesake is a valid primary: checking it instead of ``bad`` would accept.
         _primary_checkout(tmp_path / "invocation")
-    if shape in ("symlinked-git", "newline-named"):
+    if shape in {"symlinked-git", "newline-named"}:
         (bad / ".git").symlink_to(primary / ".git")
     else:
         (bad / ".git").write_text(f"gitdir: {tmp_path / 'elsewhere' / 'x'}\n", encoding="utf-8")
@@ -512,94 +515,55 @@ def test_a_configured_product_cannot_hide_a_bad_invocation_git(unconfigured, tmp
     good.mkdir()
     home = tmp_path / "home"
     home.mkdir()
-    # Written literally, so the case does not depend on how the registration is built.
     command = {"type": "command", "command": hooks.native_hook_command(hooks.GUARD_MODE), "timeout": 10}
     registration = {hooks.GUARD_NAME: {"PreToolUse": [{"matcher": "run_command", "hooks": [command]}]}}
     for workspace in (bad, good):
         (workspace / ".agents").mkdir()
         (workspace / ".agents" / "hooks.json").write_text(json.dumps(registration), encoding="utf-8")
 
-    with pytest.raises(rr.ProductRootError, match="no hook context resolves"):
+    with pytest.raises(rr.ProductRootError, match=r"\[invalid_invocation_git\]"):
         rr.native_hook_roots(bad)
     with pytest.raises(hooks.AgyHookConfigError, match="hook_context_unavailable"):
         hooks.require_hook_config(bad, home)
-    assert rr.native_hook_roots(good) == (product, primary.resolve())
+    assert rr.native_hook_roots(good) == (product, primary)
     hooks.require_hook_config(good, home)
 
 
-def test_native_hook_roots_admit_a_dedicated_non_git_state_root_beside_the_git_anchor(unconfigured, tmp_path, monkeypatch):
-    """Defect class: the hook boundary refusing the detached layout (a dedicated non-Git LU_STATE_ROOT
-    beside a Git primary anchor) or admitting a malformed state root. Every Python hook re-runs this
-    rule, so a refusal here refused every driver-state and audit hook from the CTO workspace."""
-    primary = _primary_checkout(tmp_path / "primary")
-    workspace, state = tmp_path / "cto-workspace", tmp_path / "state"
-    workspace.mkdir()
-    state.mkdir()
-    monkeypatch.setenv(rr.PRIMARY_ROOT_ENV, str(primary))
-    monkeypatch.setenv("CLAUDE_PROJECT_DIR", str(workspace))
-    monkeypatch.setenv(rr.LU_STATE_ROOT_ENV, str(state))
-    assert rr.native_hook_roots(workspace) == (workspace, primary.resolve())
-    # A state root that is a checkout or inside any checkout must still be refused; a stray .git still refuses.
-    other = _primary_checkout(tmp_path / "other")
-    other_sub = other / "nested-state"
-    other_sub.mkdir()
-    primary_sub = primary / "nested-state"
-    primary_sub.mkdir()
-    link_to_other_sub = tmp_path / "link-to-other-sub"
-    link_to_other_sub.symlink_to(other_sub, target_is_directory=True)
-    outside = tmp_path / "outside-target"
-    outside.mkdir()
-    link_inside_other = other / "link-to-outside"
-    link_inside_other.symlink_to(outside, target_is_directory=True)
-    stray = tmp_path / "stray"
-    (stray / ".git").mkdir(parents=True)
-    stray_sub = stray / "nested-state"
-    stray_sub.mkdir()
-    for refused in (other, other_sub, primary_sub, link_to_other_sub, link_inside_other, stray, stray_sub):
-        monkeypatch.setenv(rr.LU_STATE_ROOT_ENV, str(refused))
-        with pytest.raises(rr.ProductRootError, match="no hook context resolves"):
-            rr.native_hook_roots(workspace)
-    # An unsearchable directory whose `.git` lookup fails with EACCES must fail closed, not appear non-Git.
-    if os.geteuid() != 0:
-        unsearchable = _primary_checkout(tmp_path / "unsearchable-other")
-        unsearchable.chmod(0o600)
-        try:
-            monkeypatch.setenv(rr.LU_STATE_ROOT_ENV, str(unsearchable))
-            with pytest.raises(rr.ProductRootError, match="no hook context resolves"):
-                rr.native_hook_roots(workspace)
-        finally:
-            unsearchable.chmod(0o755)
-    # The alias is the generated hook command's checkout state root: named non-Git, it refuses there and here.
-    monkeypatch.delenv(rr.LU_STATE_ROOT_ENV)
+def test_native_hook_roots_admit_a_dedicated_non_git_state_root_beside_the_git_anchor(bound_hooks, tmp_path, monkeypatch):
+    """The hook admits detached state and refuses an asserted state path that disagrees."""
+    primary = Path(bound_hooks.data["repos"]["machinery"])
+    product = Path(bound_hooks.data["repos"]["public"])
+    workspace = Path(bound_hooks.data["cto"]["workspace"])
+    state = Path(bound_hooks.data["state_root"])
+    assert rr.native_hook_roots(workspace) == (product, primary)
     monkeypatch.setenv(rr.STATE_ROOT_ENV, str(state))
-    with pytest.raises(rr.ProductRootError, match="no hook context resolves"):
-        rr.native_hook_roots(workspace)
+    assert rr.native_hook_roots(workspace) == (product, primary)
+
+    monkeypatch.delenv(rr.STATE_ROOT_ENV)
+    other = _primary_checkout(tmp_path / "other")
+    nested = other / "nested-state"
+    nested.mkdir(mode=0o700)
+    for refused in (other, nested):
+        monkeypatch.setenv(rr.LU_STATE_ROOT_ENV, str(refused))
+        with pytest.raises(rr.ProductRootError, match=r"\[legacy_conflict\] LU_STATE_ROOT"):
+            rr.native_hook_roots(workspace)
+        monkeypatch.delenv(rr.LU_STATE_ROOT_ENV)
+        bound_hooks.data["state_root"] = str(refused)
+        bound_hooks.write()
+        with pytest.raises(rr.ProductRootError, match=r"\[state_root_in_git\]"):
+            rr.native_hook_roots(workspace)
+        bound_hooks.data["state_root"] = str(state)
+        bound_hooks.write()
 
 
 def test_the_native_hook_contract_bytes_match_the_product_contract():
-    """Defect class: the installed hook resolver block or tail drifting from the product's coordinated contract.
-
-    Product manifests carry these exact bytes and the installed validator compares them
-    byte for byte, so a change on one side alone refuses every product hook registration.
-    """
-    import hashlib
-
+    """The product's command declaration selects exactly one installed hook mode."""
     from lu_machinery.agent_runtime import agy_hook_config as hooks
 
-    digest = {
-        "resolvers": hashlib.sha256(hooks._hook_resolvers().encode()).hexdigest(),
-        "tail": hashlib.sha256(hooks._HOOK_TAIL.encode()).hexdigest(),
-        "audit_tail": hashlib.sha256(hooks._AUDIT_HOOK_TAIL.encode()).hexdigest(),
-        "guard_tail": hashlib.sha256(hooks._GUARD_HOOK_TAIL.encode()).hexdigest(),
-    }
-    assert digest == {
-        "resolvers": "14fd6464950653da6ec18ddc09445077532975999f1e54bdca8a6e109a34b0d5",
-        "tail": "54569cfc49db1ec65191d713492a0e765cdc3b04b46ecba77b3dc8a39884c1a8",
-        "audit_tail": "1924ef1b52e5de1eef216e8976048723e7a3ae58207c486dbde5db12447424a1",
-        "guard_tail": "bd53ab0788a15ae62dcfc2bdb1ab6b918b94a9dadc02e17526462bcce067f3a2",
-    }
-    # Product PR 13005 retains this audit extension until machinery owns it.
-    assert "claude-audit-hook" in hooks.NATIVE_HOOK_MODES
+    declaration = "lu-machinery-hook-v2 claude-audit-hook"
+    assert hooks.hook_mode_for_source(declaration) == "claude-audit-hook"
+    with pytest.raises(hooks.AgyHookConfigError, match="unsupported_hook_mode"):
+        hooks.hook_mode_for_source(declaration + " extra")
 
 
 # --------------------------------------------------------------------------- A08.1 consumer profile and LU_* names
@@ -634,7 +598,7 @@ def _executable(path: Path) -> Path:
     return path
 
 
-def test_lu_and_legacy_root_names_resolve_alike_and_a_conflict_refuses(unconfigured, tmp_path, monkeypatch):
+def test_lu_and_legacy_root_names_resolve_alike_and_a_conflict_refuses(bound_hooks, tmp_path, monkeypatch):
     """Defect class: alias split, where LU_* and LEARN_UKRAINIAN_* silently select different roots.
 
     New-only, legacy-only and agreeing settings resolve alike; differing ones refuse naming both;
@@ -690,11 +654,11 @@ def test_lu_and_legacy_root_names_resolve_alike_and_a_conflict_refuses(unconfigu
             with pytest.raises(rr.MachineryConfigError) as refused:
                 call(invalid)
             assert not isinstance(refused.value, rr.StateRootError), refused.value
-    # The native hook boundary refuses a conflict before it runs the shell rule.
+    # The native hook boundary refuses a conflicting assertion before starting a subprocess.
     monkeypatch.setenv(rr.LU_PRIMARY_ROOT_ENV, str(primary))
     monkeypatch.setenv(rr.PRIMARY_ROOT_ENV, str(other))
     monkeypatch.setattr(subprocess, "run", lambda *args, **kwargs: pytest.fail("the hook rule ran"))
-    with pytest.raises(rr.ProductRootError, match="compatibility alias"):
+    with pytest.raises(rr.ProductRootError, match=r"\[legacy_conflict\]"):
         rr.native_hook_roots(tmp_path)
     assert _tree(tmp_path) == before
 
@@ -1009,7 +973,7 @@ def test_host_profile_outside_state_root_via_lu_profile_path(unconfigured, tmp_p
     ["today-primary", "non-git-clean", "non-git-with-legacy", "non-git-without-repos-root"],
 )
 def test_every_entry_point_converges_for_primary_and_non_git_state_root(
-    unconfigured, tmp_path, monkeypatch, layout_kind: str
+    unconfigured, tmp_path, monkeypatch, host_layout, layout_kind: str
 ):
     """Convergence test: Monitor, CLI, dispatcher, session supervisor, control plane and keeper-facing
     resolvers all converge on the exact same DBs, task store, lock paths and sibling checkouts for
@@ -1048,7 +1012,7 @@ def test_every_entry_point_converges_for_primary_and_non_git_state_root(
     subprocess.run(["git", "-C", str(primary), "config", "user.name", "T"], check=True, timeout=30)
     subprocess.run(["git", "-C", str(primary), "commit", "--allow-empty", "-qm", "init"], check=True, timeout=30)
     subprocess.run(["git", "-C", str(primary), "worktree", "add", "-q", "-b", "conv", str(worktree)], check=True, timeout=30)
-    python = _executable(tmp_path / "runtime" / "bin" / "python")
+    python = _executable(tmp_path / "legacy-runtime" / "bin" / "python")
 
     for name in (
         "FLEET_COMMS_ROOT",
@@ -1075,7 +1039,7 @@ def test_every_entry_point_converges_for_primary_and_non_git_state_root(
             expected_lock_dir = (primary / ".git" / worktree_claims.LOCK_DIR_NAME).resolve()
         else:
             dedicated = tmp_path / "var-lib-machinery"
-            dedicated.mkdir()
+            dedicated.mkdir(mode=0o700)
             expected_state = dedicated.resolve()
             monkeypatch.setenv(rr.LU_STATE_ROOT_ENV, str(dedicated))
             monkeypatch.setenv(rr.LU_INTERPRETER_ENV, str(python))
@@ -1153,16 +1117,26 @@ def test_every_entry_point_converges_for_primary_and_non_git_state_root(
         assert thread_handoff.canonical_state_root(primary).resolve() == expected_state
 
         # Session supervisor shell helper entry point
-        sup_script = f'source "{rr.machinery_path("lib/session_supervisor.sh")}"; _canonical_state_root "$1"'
+        host_layout.data["state_root"] = str(expected_state)
+        host_layout.write()
+        sup_script = (
+            f'source "{rr.machinery_path("lib/session_supervisor.sh")}"; '
+            'project_host_context --directory "$1" && printf "%s\n" "$LU_STATE_ROOT"'
+        )
         sup_res = subprocess.run(
             ["bash", "-c", sup_script, "bash", str(primary)],
+            env={**host_layout.env, "LU_PYTHON": str(host_layout.python)},
             capture_output=True,
             text=True,
             check=False,
             timeout=30,
         )
-        assert sup_res.returncode == 0, sup_res.stderr
-        assert Path(sup_res.stdout.strip()).resolve() == expected_state
+        if layout_kind == "today-primary":
+            assert sup_res.returncode == 2, sup_res.stderr
+            assert "[state_root_in_git]" in sup_res.stderr
+        else:
+            assert sup_res.returncode == 0, sup_res.stderr
+            assert Path(sup_res.stdout.strip()).resolve() == expected_state
     finally:
         monitor_context.production_context.cache_clear()
         for name in api_config_caches:

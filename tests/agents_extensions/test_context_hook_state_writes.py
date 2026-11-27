@@ -20,6 +20,7 @@ from tests.agents_extensions.test_context_latest_usage import (
     incident_usage,
     write_usage,
 )
+from tests.host_context.conftest import build_host_layout
 
 HOOKS = machinery_path('agents_extensions/shared/hooks')
 HELPER = HOOKS / "context-hook-state.py"
@@ -37,14 +38,9 @@ def state_module():
 
 @pytest.fixture
 def hook_case(tmp_path):
-    project = tmp_path / "project"
-    project.mkdir()
-    subprocess.run(
-        ["git", "init", "-q", "--initial-branch=main", str(project)],
-        check=True, capture_output=True,
-        env={key: value for key, value in os.environ.items() if not key.startswith("GIT_")},
-    )
-    record = project / ".agent" / "sessions" / f"{SESSION}.json"
+    layout = build_host_layout(tmp_path / "binding")
+    project = Path(layout.data["repos"]["public"])
+    record = Path(layout.data["state_root"]) / ".agent" / "sessions" / f"{SESSION}.json"
     record.parent.mkdir(parents=True)
     record.write_text(
         json.dumps(
@@ -67,30 +63,12 @@ def hook_case(tmp_path):
         )
         + "\n"
     )
-    env = os.environ.copy()
-    for name in (
-        "CLAUDE_NON_INTERACTIVE",
-        "LEARN_UK_PIPELINE",
-        "LEARN_UKRAINIAN_PIPELINE",
-        "GEMINI_SESSION",
-        "GROK_AGENT",
-        "CODEX_THREAD_ID",
-        "CODEX_SESSION_ID",
-        "SESSION_HANDOFF_AGENT",
-        "LEARN_UKRAINIAN_DISPATCH_TASK_ID",
-        "SESSION_EPIC",
-        "CODEX_CANONICAL_REPO_ROOT",
-    ):
-        env.pop(name, None)
-    env.update(
-        {
-            "CLAUDE_PROJECT_DIR": str(project),
-            "LU_PRODUCT_ROOT": str(project),
-            "LEARN_UKRAINIAN_PYTHON": sys.executable,
-            "LEARN_UKRAINIAN_PRIMARY_REPO_ROOT": str(project),
-            "LU_STATE_ROOT": str(project),
-        }
-    )
+    env = {
+        **layout.env,
+        "PATH": os.defpath, "HOME": str(tmp_path),
+        "CLAUDE_PROJECT_DIR": str(project),
+        "LU_PYTHON": str(layout.python), "LU_STATE_ROOT": layout.data["state_root"],
+    }
     payload = json.dumps(
         {
             "session_id": SESSION,
@@ -124,9 +102,9 @@ def run_hook(case, hook="context-monitor.sh", refused=None):
 
 
 def test_advisor_aggregate_does_not_write_false_emergency_state(hook_case):
-    project, _, payload = hook_case
+    _, env, payload = hook_case
     transcript = Path(json.loads(payload)["transcript_path"])
-    state = project / f"batch_state/context_monitor/{SESSION}.tier"
+    state = Path(env["LU_STATE_ROOT"]) / f"batch_state/context_monitor/{SESSION}.tier"
     write_usage(transcript, incident_usage())
     assert run_hook(hook_case) == ""
     assert not state.exists()
@@ -142,17 +120,17 @@ def test_advisor_aggregate_does_not_write_false_emergency_state(hook_case):
 @pytest.mark.parametrize("redirect", ["tier", "lock", "directory", "batch_state"])
 @pytest.mark.parametrize("hook", ["context-monitor.sh", "context-rollover-guard.sh"])
 def test_redirect_refused_leaves_outside_byte_identical(hook_case, tmp_path, redirect, hook):
-    project, _, _ = hook_case
+    _, env, _ = hook_case
     outside = tmp_path / "outside"
     outside.mkdir()
     target = outside / f"{SESSION}.tier"
     original = b"3 760000\n"
     target.write_bytes(original)
-    state = project / "batch_state/context_monitor"
+    state = Path(env["LU_STATE_ROOT"]) / "batch_state/context_monitor"
     if redirect == "batch_state":
         (outside / "context_monitor").mkdir()
         (outside / "context_monitor" / f"{SESSION}.tier").write_bytes(original)
-        (project / "batch_state").symlink_to(outside, target_is_directory=True)
+        state.parent.symlink_to(outside, target_is_directory=True)
     elif redirect == "directory":
         state.parent.mkdir()
         state.symlink_to(outside, target_is_directory=True)
@@ -167,8 +145,8 @@ def test_redirect_refused_leaves_outside_byte_identical(hook_case, tmp_path, red
 
 
 def test_legacy_predictable_temp_name_is_never_used(hook_case, tmp_path):
-    project, _, _ = hook_case
-    state = project / "batch_state/context_monitor"
+    project, env, _ = hook_case
+    state = Path(env["LU_STATE_ROOT"]) / "batch_state/context_monitor"
     state.mkdir(parents=True)
     target = tmp_path / "outside"
     target.write_bytes(b"unchanged\n")
@@ -202,7 +180,7 @@ def test_legacy_predictable_temp_name_is_never_used(hook_case, tmp_path):
 
 @pytest.mark.parametrize("hide_flock", [False, True])
 def test_twelve_concurrent_calls_announce_each_tier_once(hook_case, tmp_path, hide_flock):
-    project, env, payload = hook_case
+    _, env, payload = hook_case
     if hide_flock:
         binaries = tmp_path / "bin"
         binaries.mkdir()
@@ -230,11 +208,13 @@ def test_twelve_concurrent_calls_announce_each_tier_once(hook_case, tmp_path, hi
         announcements = [json.loads(output)["hookSpecificOutput"]["additionalContext"] for output in outputs if output]
         assert len(announcements) == 1
         assert announcements[0].startswith(prefix)
-        assert (project / f"batch_state/context_monitor/{SESSION}.tier").read_text() == f"{tier} {tokens}\n"
+        state = Path(env["LU_STATE_ROOT"]) / f"batch_state/context_monitor/{SESSION}.tier"
+        assert state.read_text() == f"{tier} {tokens}\n"
 
 
 def test_live_holder_never_stolen_and_killed_holder_recovered(hook_case):
-    project, _, _ = hook_case
+    _, env, _ = hook_case
+    state = Path(env["LU_STATE_ROOT"])
     holder = subprocess.Popen(
         [
             sys.executable,
@@ -246,7 +226,7 @@ def test_live_holder_never_stolen_and_killed_holder_recovered(hook_case):
             "lock=m.lock_session(d,sys.argv[3]+'.lock'); "
             "print('locked',flush=True); sys.stdin.read()",
             str(HELPER),
-            str(project),
+            str(state),
             SESSION,
         ],
         stdin=subprocess.PIPE,
@@ -259,8 +239,8 @@ def test_live_holder_never_stolen_and_killed_holder_recovered(hook_case):
         # A full hook waits only a bounded time, fails open, and cannot claim.
         assert run_hook(hook_case) == ""
         assert holder.poll() is None
-        assert not (project / f"batch_state/context_monitor/{SESSION}.tier").exists()
-        lock = project / f"batch_state/context_monitor/{SESSION}.lock"
+        assert not (state / f"batch_state/context_monitor/{SESSION}.tier").exists()
+        lock = state / f"batch_state/context_monitor/{SESSION}.lock"
         inode = lock.stat().st_ino
         holder.kill()
         holder.wait(timeout=5)
@@ -353,30 +333,22 @@ def test_invalid_state_rearms_safely(state_module, tmp_path, raw, capsys):
 
 
 def test_helper_unavailable_refuses_without_announcement(hook_case):
-    hook_case[1]["LEARN_UKRAINIAN_PYTHON"] = "/unavailable/interpreter"
-    run_hook(hook_case, refused="LEARN_UKRAINIAN_PYTHON=/unavailable/interpreter is not an executable file")
-    assert not (hook_case[0] / "batch_state").exists()
+    hook_case[1]["LU_PYTHON"] = "/unavailable/interpreter"
+    run_hook(hook_case, refused="[missing_interpreter_binding]")
+    assert not (Path(hook_case[1]["LU_STATE_ROOT"]) / "batch_state").exists()
 
 
 def test_missing_resolver_refuses_without_path_python(hook_case):
-    hook_case[1].pop("LEARN_UKRAINIAN_PYTHON")
-    run_hook(hook_case, refused="project interpreter not found")
-    assert not (hook_case[0] / "batch_state").exists()
+    hook_case[1].pop("LU_PYTHON")
+    run_hook(hook_case, refused="[missing_interpreter_binding]")
+    assert not (Path(hook_case[1]["LU_STATE_ROOT"]) / "batch_state").exists()
 
 
 def test_invalid_worktree_metadata_refuses_interpreter(hook_case):
-    project, env, _ = hook_case
-    env.pop("LEARN_UKRAINIAN_PYTHON")
-    scripts = project / "scripts/lib"
-    scripts.mkdir(parents=True)
-    canonical = HOOKS.parents[2]
-    (scripts / "project_interpreter.sh").symlink_to(machinery_path("lib/project_interpreter.sh"))
-    # A fixture worktree with real Git metadata, pointing to this repository's
-    # canonical shared interpreter; no worktree-local interpreter is created.
+    project, _, _ = hook_case
     shutil.rmtree(project / ".git")
-    (project / ".git").write_text(f"gitdir: {canonical / '.git'}\n")
-    # Invalid metadata must fail closed, rather than select a planted Python.
-    run_hook(hook_case, refused="project interpreter not found")
+    (project / ".git").write_text("gitdir: invalid\n")
+    run_hook(hook_case, refused="[invalid_invocation_git]")
     assert not (project / ".venv").exists()
 
 
@@ -436,10 +408,10 @@ def test_replaced_lock_name_refused(state_module, tmp_path, monkeypatch):
 
 def test_unknown_usage_never_sets_a_tier_or_demands_a_handoff(hook_case, tmp_path):
     """A transcript without model usage must not be sized into a tier or a hand-off demand (bytes/7 estimate removed)."""
-    project, _, payload = hook_case
+    _, env, payload = hook_case
     transcript = Path(json.loads(payload)["transcript_path"])
     transcript.write_text(json.dumps({"type": "user", "message": {"content": "x" * 6_000_000}}) + "\n")
-    state = project / f"batch_state/context_monitor/{SESSION}.tier"
+    state = Path(env["LU_STATE_ROOT"]) / f"batch_state/context_monitor/{SESSION}.tier"
     unknown = json.loads(run_hook(hook_case))["hookSpecificOutput"]["additionalContext"]
     assert unknown.startswith("Context usage is unknown right now")
     assert not state.exists()
@@ -449,7 +421,7 @@ def test_unknown_usage_never_sets_a_tier_or_demands_a_handoff(hook_case, tmp_pat
     assert state.read_text() == "3 760000\n"
 
     # A fresh status-line figure is live usage even though the transcript has none.
-    record = project / ".agent" / "sessions" / f"{SESSION}.json"
+    record = Path(env["LU_STATE_ROOT"]) / ".agent" / "sessions" / f"{SESSION}.json"
     data = json.loads(record.read_text())
     data.update(observed_context_used_tokens=770_000, observed_context_used_at_epoch=int(time.time()))
     record.write_text(json.dumps(data))

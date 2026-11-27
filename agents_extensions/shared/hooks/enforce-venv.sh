@@ -25,60 +25,13 @@ if echo "$COMMAND" | grep -qE '^python3?[[:space:]]'; then
     exit 0
   fi
 
-  # The suggestion is the interpreter project_interpreter.sh would pick
-  # (LEARN_UKRAINIAN_PYTHON, else the primary checkout's .venv). The directory
-  # in the tool payload may be a subdirectory. A directory with no .git is not
-  # a checkout: the bootstrap would treat it as one and execute
-  # <subdir>/.venv/bin/python. Walk up to the checkout that contains it first.
-  CHECKOUT="${LEARN_UK_CANONICAL_ROOT:-}"
-  if [ -z "$CHECKOUT" ]; then
-    CHECKOUT=$(printf '%s' "$INPUT" | jq -r '
-      .tool_input.workdir
-      // .tool_input.cwd
-      // .tool_input.working_directory
-      // .cwd
-      // empty
-    ')
-    [ -n "$CHECKOUT" ] || CHECKOUT="${CLAUDE_PROJECT_DIR:-${LU_PRODUCT_ROOT:-$PWD}}"
-  fi
-  if ! CHECKOUT="$(cd -P "$CHECKOUT" 2>/dev/null && pwd)"; then
-    printf 'enforce-venv: tool directory is not a directory\n' >&2
-    exit 2
-  fi
-  _root="$CHECKOUT"
-  while [ ! -e "$_root/.git" ]; do
-    _parent="$(dirname "$_root")"
-    if [ "$_parent" = "$_root" ]; then
-      # Outside every checkout (the CTO workspace): no checkout can name the
-      # interpreter, so the hook rule's own roots decide (the configured product,
-      # else the project directory, under the configured primary anchor).
-      _root=""
-      break
-    fi
-    _root="$_parent"
-  done
-  CHECKOUT="$_root"
-  unset _root _parent
+  # A tool's working directory cannot choose a Python executable.
   # shellcheck source=agents_extensions/shared/hooks/context-rollover-lib.sh
   source "$(dirname "${BASH_SOURCE[0]}")/context-rollover-lib.sh" \
     || { printf 'enforce-venv: context-rollover-lib.sh is missing beside this hook\n' >&2; exit 2; }
-  context_machinery_bootstrap "$CHECKOUT" || exit 2
+  context_machinery_bootstrap || exit 2
   PYTHON_BIN="$CONTEXT_PROJECT_PYTHON"
-
-  PRIMARY_ROOT=""
-  if [ -z "$CHECKOUT" ]; then
-    # The interpreter came from the anchor; so does its version pin.
-    PYTHON_VERSION_FILE="$LEARN_UKRAINIAN_PRIMARY_REPO_ROOT/.python-version"
-  elif PRIMARY_ROOT="$(project_primary_root_resolve "$CHECKOUT" 2>/dev/null)"; then
-    PYTHON_VERSION_FILE="$PRIMARY_ROOT/.python-version"
-  else
-    PYTHON_VERSION_FILE=""
-  fi
-  if [ -z "${LEARN_UKRAINIAN_PYTHON:-}" ] && [ ! -f "$PYTHON_VERSION_FILE" ]; then
-    printf 'Unqualified interpreter blocked: project Python pin is missing at %s\n' \
-      "${PYTHON_VERSION_FILE:-<unresolved primary>}" >&2
-    exit 2
-  fi
+  PYTHON_VERSION_FILE="$LU_PRIMARY_REPO_ROOT/.python-version"
   if [ -f "$PYTHON_VERSION_FILE" ]; then
     EXPECTED_PYTHON_VERSION=$(head -1 "$PYTHON_VERSION_FILE" | tr -d '[:space:]')
     ACTUAL_PYTHON_VERSION=$("$PYTHON_BIN" --version 2>&1)

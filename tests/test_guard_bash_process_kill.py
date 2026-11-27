@@ -8,7 +8,8 @@ from pathlib import Path
 
 import pytest
 
-from tests.test_secret_print_hook import ADAPTER, HARNESS_NAMES, assert_decision, event
+from tests.host_context.conftest import host_layout as host_layout
+from tests.test_secret_print_hook import ADAPTER, HARNESS_NAMES, NATIVE_ENV, assert_decision, event
 from tests.test_secret_print_hook import secret_print_product as secret_print_product
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -182,5 +183,11 @@ def test_self_matching_process_kill(command: str, refused: bool) -> None:
 
 @pytest.fixture(autouse=True)
 def process_kill_product(secret_print_product, monkeypatch):
-    monkeypatch.setitem(ENV, "LU_PRODUCT_ROOT", str(secret_print_product))
-    monkeypatch.setitem(OVERRIDE_ENV, "LU_PRODUCT_ROOT", str(secret_print_product))
+    for name in (
+        "LU_HOST_CONTEXT", "LU_PRODUCT_ROOT", "LU_PRIMARY_REPO_ROOT", "LEARN_UKRAINIAN_PRIMARY_REPO_ROOT",
+        "LU_STATE_ROOT", "LU_PYTHON", "LEARN_UKRAINIAN_PYTHON",
+        "LU_TASKS_DIR", "LEARN_UKRAINIAN_BATCH_STATE_DIR", "LEARN_UKRAINIAN_OWNERSHIP_LEDGER", "LU_GITHUB_CACHE_DIR",
+        "FLEET_COMMS_ROOT",
+    ):
+        monkeypatch.setitem(ENV, name, NATIVE_ENV[name])
+        monkeypatch.setitem(OVERRIDE_ENV, name, NATIVE_ENV[name])

@@ -3,24 +3,9 @@
 # route, credential, endpoint, and binary decision; this file owns only the
 # uniform public CLI and driver lifecycle.
 #
-# A consumer's root wrapper (start-*.sh in the product checkout) loads the
-# installed release's copy of this file. The product interpreter names the
-# release it imports, as the installed hooks find theirs, and the wrapper names
-# its own checkout as the product (launcher_resolve_product_root):
-#   ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
-#   export LU_PRODUCT_ROOT="$ROOT"
-#   case "${LEARN_UKRAINIAN_PYTHON:-}" in
-#     /*) LU_PYTHON="$LEARN_UKRAINIAN_PYTHON" ;;
-#     *) echo "Set LEARN_UKRAINIAN_PYTHON to an absolute trusted interpreter path" >&2; exit 2 ;;
-#   esac
-#   LU_MACHINERY_DIR="$("$LU_PYTHON" -I -c 'import os, lu_machinery; print(os.path.dirname(os.path.abspath(lu_machinery.__file__)))')"
-#   source "$LU_MACHINERY_DIR/lib/launcher_core.sh"
-# Under `set -e` a failed lookup stops the wrapper before it sources anything.
-# Every launch, from a primary checkout or a linked worktree, requires an
-# operator-configured absolute interpreter, even for --help. The wrapper never
-# discovers code by executing a checkout-local .venv: whoever works in a checkout
-# can rewrite its Git metadata into a primary-shaped .git directory, and no local
-# check tells that from a real primary (#100).
+# Wrappers load this file from the configured machinery runtime. The host
+# binding supplies the product checkout, state directory and interpreter.
+# Invocation metadata can refuse a launch, but cannot choose those bindings.
 
 # Fixed arguments a public wrapper adds to its caller's argv: launcher options
 # (the CTO lane) and leading provider arguments (the bio
@@ -231,23 +216,13 @@ launcher_refuse_unclassified_provider_option() {
   launcher_error "unclassified provider option '$1' before '--'; put provider options after -- or attach its value as '$1=VALUE'."
 }
 
-# Project interpreter for helper modules. One rule (R66): LEARN_UKRAINIAN_PYTHON
-# when it is an absolute executable file, else the .venv of the helper root
-# launcher_resolve_roots validated (#9118, #9121), else refuse. An invalid
-# override does not fall back. Call after launcher_resolve_roots; callers exit 3.
+# launcher_resolve_roots validates this interpreter before helpers run.
 launcher_project_python() {
-  local configured python
-  configured="$(project_interpreter_configured)" || return 1
-  if [ -n "$configured" ]; then
-    printf '%s\n' "$configured"
-    return 0
-  fi
-  python="${LC_DURABLE_HELPER_ROOT:-}/.venv/bin/python"
-  if [ -z "${LC_DURABLE_HELPER_ROOT:-}" ] || [ ! -f "$python" ] || [ ! -x "$python" ]; then
-    launcher_error "project interpreter not found: $python"
+  if [ -z "${LU_PYTHON:-}" ]; then
+    launcher_error 'missing_interpreter_binding: launcher host context is unavailable.'
     return 1
   fi
-  printf '%s\n' "$python"
+  printf '%s\n' "$LU_PYTHON"
 }
 
 # Apply launcher-control and credential cleanup only inside the child process.
@@ -608,27 +583,9 @@ LC_GIT_LOCAL_ENV_VARS=(
   GIT_REPLACE_REF_BASE GIT_PREFIX GIT_SHALLOW_FILE GIT_COMMON_DIR
 )
 
-# Sets LC_ROOT, the product checkout this launch serves (session root, deploy
-# target, wrapper entry, driver state). The rule is common/repo_root.py
-# in_tree_source (C-4843), decided from the package directory's unresolved name
-# (LC_MACHINERY_PACKAGE):
-# - the in-tree source copy (a package directory not named lu_machinery inside a
-#   product checkout) keeps the default it always had, the checkout holding it;
-# - the lu_machinery package (installed under site-packages, or a standalone
-#   machinery checkout) derives no product from its own location. The wrapper
-#   names the product with LU_PRODUCT_ROOT, selected by the shared
-#   project_product_root_resolve rule (an absolute path of an existing
-#   directory); unset or invalid refuses before any side effect.
-# Either way the chosen LC_ROOT is exported as LU_PRODUCT_ROOT, so every helper,
-# hook and provider child selects this product, never an ambient value naming
-# another checkout (common/repo_root.py product_root reads LU_PRODUCT_ROOT
-# first). launcher_resolve_roots then decides, once, whether LC_ROOT's Git
-# metadata is trusted and which primary checkout supplies the helpers.
-#
-# Workspace mode (LC_WORKSPACE_ROOT set) replaces the product checkout as the
-# session root with the CTO workspace: see launcher_resolve_workspace_root.
+# The validated product is the default session root. The installed CTO
+# launcher takes its session root from the explicitly selected workspace.
 launcher_resolve_product_root() {
-  local root
   if [ -n "${LC_WORKSPACE_ROOT:-}" ]; then
     launcher_resolve_workspace_root
     return
@@ -638,42 +595,13 @@ launcher_resolve_product_root() {
     launcher_error "LC_WORKSPACE_ROOT_REQUIRED: the package CTO launcher runs only from the CTO workspace; set LC_WORKSPACE_ROOT (lu-start-cto exports it). A product checkout keeps its own start-claude-cto.sh."
     return 1
   fi
-  if [ "$LC_MACHINERY_PACKAGE" != lu_machinery ]; then
-    LC_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-    export LU_PRODUCT_ROOT="$LC_ROOT"
-    return 0
-  fi
-  if [ -z "${LU_PRODUCT_ROOT:-}" ]; then
-    launcher_error "LU_PRODUCT_ROOT_REQUIRED: the lu_machinery launcher core derives no product checkout from its own location; the wrapper must set LU_PRODUCT_ROOT to the product checkout."
-    return 1
-  fi
-  if ! root="$(project_product_root_resolve "$LU_PRODUCT_ROOT" 2>/dev/null)"; then
-    launcher_error "LU_PRODUCT_ROOT_INVALID: LU_PRODUCT_ROOT must be an absolute path of an existing directory: $LU_PRODUCT_ROOT"
-    return 1
-  fi
-  LC_ROOT="$root"
-  export LU_PRODUCT_ROOT="$root"
+  LC_ROOT="$LU_PRODUCT_ROOT"
 }
 
-# Workspace mode: the CTO seat runs from a generated directory that is neither a
-# checkout nor inside one (agent_deploy --workspace renders it). LC_WORKSPACE_ROOT
-# names it; it becomes LC_ROOT, the session root: Claude's working directory and
-# project directory, the deploy target, the DRIVER-STATE pointer and the lease
-# receipt. It is never the product, the state root or a trust anchor:
-# - only the installed package's start-claude-cto.sh, a Claude driver, may use it,
-#   so no product wrapper or other seat can be re-rooted by an inherited value;
-# - it must be an absolute physical path (no symlink, dot segment or trailing
-#   slash), an existing directory with no .git entry in it or any ancestor, and
-#   the launch's working directory, so Claude's project directory, its memory
-#   key and the DRIVER-STATE pointer name the same directory;
-# - LU_PRODUCT_ROOT stays the product's own input: optional here, validated when
-#   set, and never the workspace;
-# - launcher_resolve_roots requires a configured primary checkout as the helper
-#   and hook trust anchor and resolves the interpreter from it or the configured
-#   one, never from the workspace.
-# Any other shape refuses (exit 3) before a side effect.
+# Only the installed CTO driver runs from a workspace. It must start from
+# a physical directory outside Git so the CLI and driver state share one cwd.
 launcher_resolve_workspace_root() {
-  local workspace="$LC_WORKSPACE_ROOT" physical wrapper_dir ancestor cwd product
+  local workspace="$LC_WORKSPACE_ROOT" physical wrapper_dir cwd
   if [ "${0##*/}" != start-claude-cto.sh ] || [ "${LC_PROVIDER:-}" != claude ] || [ "${LC_MODE:-}" != driver ] \
     || ! wrapper_dir="$(CDPATH='' cd -P -- "$(dirname -- "$0")" 2>/dev/null && pwd -P)" \
     || [ "$wrapper_dir" != "$LC_MACHINERY_DIR" ]; then
@@ -688,207 +616,58 @@ launcher_resolve_workspace_root() {
     launcher_error "LC_WORKSPACE_ROOT_INVALID: must name an existing directory by its physical path (no symlink, dot segment or trailing slash), not /: $workspace"
     return 1
   fi
-  ancestor="$physical"
-  while :; do
-    if [ -e "$ancestor/.git" ] || [ -L "$ancestor/.git" ]; then
-      launcher_error "LC_WORKSPACE_ROOT_INVALID: a workspace must be outside every Git checkout; ${ancestor%/}/.git exists."
-      return 1
-    fi
-    [ -n "$ancestor" ] || break
-    ancestor="${ancestor%/*}"
-  done
   if ! cwd="$(_project_physical_dir .)" || [ "$cwd" != "$physical" ]; then
     launcher_error "LC_WORKSPACE_ROOT_CWD: run the CTO from its workspace (cd $physical first); the working directory is Claude's project directory."
     return 1
-  fi
-  if [ -n "${LU_PRODUCT_ROOT:-}" ]; then
-    if ! product="$(project_product_root_resolve "$LU_PRODUCT_ROOT" 2>/dev/null)"; then
-      launcher_error "LU_PRODUCT_ROOT_INVALID: LU_PRODUCT_ROOT must be an absolute path of an existing directory: $LU_PRODUCT_ROOT"
-      return 1
-    fi
-    if [ "$(_project_physical_dir "$product")" = "$physical" ]; then
-      launcher_error "LU_PRODUCT_ROOT_INVALID: the product checkout cannot be the CTO workspace: $LU_PRODUCT_ROOT"
-      return 1
-    fi
-    export LU_PRODUCT_ROOT="$product"
-  else
-    unset LU_PRODUCT_ROOT
   fi
   LC_ROOT="$physical"
   export LC_WORKSPACE_ROOT="$physical"
 }
 
-# LC_DURABLE_HELPER_ROOT is the primary checkout that every launcher helper
-# interpreter and helper script runs from. It is resolved by the shared
-# project_interpreter.sh check (gitfile shape + back-pointer, never git, never
-# `commondir`), and an ambient value is overwritten. Untrusted git metadata
-# refuses the launch rather than falling back to a worktree-local root (#9121).
-#
-# The one exception is CODEX_CANONICAL_REPO_ROOT on a Codex launch: an
-# operator-set override (docs/SCRIPTS.md, #5438) and the only accepted way to
-# name a primary that Git cannot prove from the worktree, such as a
-# `--separate-git-dir` primary with no `<primary>/.git/worktrees/<name>`.
-# When set, it replaces the gitfile check and must itself be the primary
-# checkout of this worktree's Git common directory, on `main`; any mismatch
-# refuses. Unset, nothing here falls back to it.
+# Resolve the host binding before any launch side effect. The product checkout
+# and state root are independent of the directory from which the agent runs.
 launcher_resolve_roots() {
+  local worktree_root="" main_root=""
   unset "${LC_GIT_LOCAL_ENV_VARS[@]}"
-  LC_SESSION_ROOT="$LC_ROOT"
-  LC_DURABLE_HELPER_ROOT=""
   if [ -n "${LC_WORKSPACE_ROOT:-}" ]; then
-    # A workspace has no Git metadata and resolves to itself; it must never
-    # supply the helpers or the interpreter. The configured primary does.
-    LC_DURABLE_HELPER_ROOT="$(launcher_workspace_primary_root)" || exit 3
-  elif [ "${LC_PROVIDER:-}" = codex ] && [ -n "${CODEX_CANONICAL_REPO_ROOT:-}" ]; then
-    LC_DURABLE_HELPER_ROOT="$(launcher_canonical_override_root "$CODEX_CANONICAL_REPO_ROOT")" || exit 1
-  elif ! LC_DURABLE_HELPER_ROOT="$(project_primary_root_resolve "$LC_ROOT")"; then
-    launcher_error "refusing to run launcher helpers from $LC_ROOT; its git metadata does not validate."
-    exit 3
-  elif { [ -e "$LC_ROOT/.git" ] || [ -L "$LC_ROOT/.git" ]; } && ! _project_hook_git_layout "$LC_DURABLE_HELPER_ROOT"; then
-    # An empty or stray .git directory resolves as its own primary; only a
-    # real repository may supply the helpers and the exported interpreter.
-    launcher_error "refusing to run launcher helpers from $LC_ROOT; its primary $LC_DURABLE_HELPER_ROOT is not a Git repository."
-    exit 3
-  elif [ ! -e "$LC_ROOT/.git" ] && [ ! -L "$LC_ROOT/.git" ] \
-    && [ "$LC_DURABLE_HELPER_ROOT" != "$(cd -P "$(dirname "${BASH_SOURCE[0]}")/../.." 2>/dev/null && pwd)" ]; then
-    # A root without .git resolves to itself. That is safe only for this
-    # launcher's own code tree (#9121: it grants nothing new). A product named
-    # by LU_PRODUCT_ROOT is not that tree, and its own .venv would become the
-    # interpreter every child trusts. So the helper root is the shared-state
-    # primary, validated by the one hook-root rule
-    # (project_hook_roots_resolve, which needs an explicit anchor for such a
-    # root), else the launch refuses.
-    if ! LC_DURABLE_HELPER_ROOT="$(project_hook_roots_resolve "$LC_ROOT" 2>/dev/null \
-      && printf '%s\n' "$LEARN_UKRAINIAN_PRIMARY_REPO_ROOT")" || [ -z "$LC_DURABLE_HELPER_ROOT" ]; then
-      launcher_error "refusing to run launcher helpers from $LC_ROOT: a product root without .git needs LEARN_UKRAINIAN_PRIMARY_REPO_ROOT naming its primary checkout."
+    project_host_context --directory "$LC_WORKSPACE_ROOT" --outside-checkout || exit 3
+  else
+    project_host_context --directory "${LC_ROOT:-.}" || exit 3
+  fi
+  launcher_resolve_product_root || exit 3
+  if [ -z "${LC_WORKSPACE_ROOT:-}" ] && [ "$main_root" = "$LU_PRODUCT_ROOT" ]; then
+    LC_ROOT="$worktree_root"
+  fi
+
+  LC_SESSION_ROOT="$LC_ROOT"
+  LC_DURABLE_HELPER_ROOT="$LU_PRIMARY_REPO_ROOT"
+  if [ "${LC_PROVIDER:-}" = codex ]; then
+    # Codex's canonical checkout is a property of its target, not its runtime.
+    if [ -n "${CODEX_CANONICAL_REPO_ROOT:-}" ]; then
+      LC_DURABLE_HELPER_ROOT="$(launcher_canonical_override_root "$CODEX_CANONICAL_REPO_ROOT")" || exit 1
+    else
+      LC_DURABLE_HELPER_ROOT="$LU_PRODUCT_ROOT"
+    fi
+  fi
+  if [ -n "${LC_WORKSPACE_ROOT:-}" ]; then
+    if [[ "$LU_STATE_ROOT" = "$LC_ROOT" || "$LU_STATE_ROOT" = "$LC_ROOT/"* ]]; then
+      launcher_error 'invalid_workspace: the state root is inside the workspace.'
+      exit 3
+    fi
+    if ! "$LU_PYTHON" -I -c '
+import os
+import sys
+from pathlib import Path
+
+workspace = Path(sys.argv[1])
+config = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude").resolve()
+if config.is_relative_to(workspace):
+    raise SystemExit("invalid_workspace: CLAUDE_CONFIG_DIR selects account settings inside the workspace")
+' "$LC_ROOT"; then
       exit 3
     fi
   fi
   export LC_SESSION_ROOT LC_DURABLE_HELPER_ROOT
-  # Every child of this launch (the agent shims put on PATH next, the inbox
-  # watcher, the canaries, hooks and the provider) takes the interpreter and the
-  # shared-state anchor from the roots resolved here, never from its own
-  # location: an installed package's children sit in site-packages, from which
-  # nothing can be derived (common/repo_root.py names a launcher as a supplier).
-  # - LEARN_UKRAINIAN_PYTHON, the project interpreter (R66), is exported as the
-  #   configured one. Nothing is exported when it does not resolve; each helper
-  #   site then refuses with its own error.
-  # - LEARN_UKRAINIAN_PRIMARY_REPO_ROOT, the shared-state anchor, is the helper
-  #   root every launcher helper already anchors on. Every hook bootstrap needs
-  #   it, in-tree copy or installed package (#100), and an operator-set value is
-  #   kept. It is exported only when the shared-state admission
-  #   (common/repo_root.py configured_primary_root, asked once here) accepts
-  #   it: an anchor that admission refuses, such as a --separate-git-dir
-  #   primary, would turn "no anchor" into a different refusal its callers do
-  #   not expect, so such a launch keeps no anchor, as before.
-  # - A Claude launch is stricter (product launcher-primary-root-export): its
-  #   hooks take their trust anchor from this launcher's own helper root,
-  #   never from the product checkout or the caller's inherited override. The
-  #   inherited value is replaced, and a helper root that the hook boundary
-  #   (project_hook_roots_resolve: primary layout, LEARN_UKRAINIAN_STATE_ROOT,
-  #   invocation Git metadata) or shared-state admission refuses ends the
-  #   launch instead of starting Claude without a valid anchor.
-  local python
-  if python="$(launcher_project_python 2>/dev/null)"; then
-    export LEARN_UKRAINIAN_PYTHON="$python"
-  elif [ -n "${LC_WORKSPACE_ROOT:-}" ]; then
-    # Every later child resolves its interpreter from this export; without it a
-    # resolver would treat the workspace as a checkout and trust its .venv.
-    launcher_error "LC_WORKSPACE_ROOT: no project interpreter (set LEARN_UKRAINIAN_PYTHON or give the primary checkout a .venv); refusing to start."
-    exit 3
-  fi
-  if [ "${LC_PROVIDER:-}" = claude ]; then
-    if ! (export LEARN_UKRAINIAN_PRIMARY_REPO_ROOT="$LC_DURABLE_HELPER_ROOT"; project_hook_roots_resolve "$LC_ROOT") \
-      || { [ -n "${LEARN_UKRAINIAN_PYTHON:-}" ] && project_python_command "$LEARN_UKRAINIAN_PYTHON" \
-        && ! LEARN_UKRAINIAN_PRIMARY_REPO_ROOT="$LC_DURABLE_HELPER_ROOT" "${PROJECT_PYTHON_COMMAND[@]}" -c \
-          "from $LC_MACHINERY_PACKAGE.common.repo_root import configured_primary_root; configured_primary_root()" \
-          >/dev/null 2>&1; }; then
-      launcher_error 'LEARN_UKRAINIAN_PRIMARY_REPO_ROOT: invalid launcher primary layout, conflicting LEARN_UKRAINIAN_STATE_ROOT or invalid invocation Git metadata; refusing to start Claude.'
-      exit 3
-    fi
-    export LEARN_UKRAINIAN_PRIMARY_REPO_ROOT="$LC_DURABLE_HELPER_ROOT"
-    if [ -n "${LC_WORKSPACE_ROOT:-}" ]; then
-      launcher_validate_workspace_roots || exit 3
-    fi
-    if [ "${LC_DRY_RUN:-0}" = 1 ]; then
-      printf 'LAUNCHER_DRY_RUN=1: child environment LEARN_UKRAINIAN_PRIMARY_REPO_ROOT=%q\n' "$LEARN_UKRAINIAN_PRIMARY_REPO_ROOT"
-    fi
-  elif [ -z "${LEARN_UKRAINIAN_PRIMARY_REPO_ROOT:-}" ] \
-    && [ -n "${LEARN_UKRAINIAN_PYTHON:-}" ] && project_python_command "$LEARN_UKRAINIAN_PYTHON" \
-    && LEARN_UKRAINIAN_PRIMARY_REPO_ROOT="$LC_DURABLE_HELPER_ROOT" "${PROJECT_PYTHON_COMMAND[@]}" -c \
-      "from $LC_MACHINERY_PACKAGE.common.repo_root import configured_primary_root; configured_primary_root()" \
-      >/dev/null 2>&1; then
-    export LEARN_UKRAINIAN_PRIMARY_REPO_ROOT="$LC_DURABLE_HELPER_ROOT"
-  fi
-}
-
-# The workspace launch's helper root: the operator-configured primary checkout
-# (LU_PRIMARY_REPO_ROOT or its alias; both set must agree), named by its physical
-# path, which must pass the primary-layout check. Unset or invalid refuses: a
-# workspace launch has no Git metadata to derive one from.
-launcher_workspace_primary_root() {
-  local configured="${LU_PRIMARY_REPO_ROOT:-}" alias="${LEARN_UKRAINIAN_PRIMARY_REPO_ROOT:-}" physical
-  if [ -n "$configured" ] && [ -n "$alias" ] && [ "$configured" != "$alias" ]; then
-    launcher_error "LC_WORKSPACE_ROOT: LU_PRIMARY_REPO_ROOT and LEARN_UKRAINIAN_PRIMARY_REPO_ROOT are set to different values."
-    return 1
-  fi
-  configured="${configured:-$alias}"
-  if [ -z "$configured" ]; then
-    launcher_error "LC_WORKSPACE_ROOT: a workspace launch needs LU_PRIMARY_REPO_ROOT naming the primary checkout that anchors hooks and the interpreter."
-    return 1
-  fi
-  if [[ "$configured" != /* ]] || ! physical="$(_project_physical_dir "$configured")" \
-    || ! _project_hook_git_layout "$physical"; then
-    launcher_error "LC_WORKSPACE_ROOT: LU_PRIMARY_REPO_ROOT is not a real primary Git checkout: $configured"
-    return 1
-  fi
-  # The hook bootstrap exports the anchor's physical path under the alias; any other
-  # spelling here would then disagree with LU_PRIMARY_REPO_ROOT and refuse every hook.
-  if [ "$physical" != "$configured" ]; then
-    launcher_error "LC_WORKSPACE_ROOT: name the primary checkout by its physical path (no symlink, dot segment or trailing slash): $configured"
-    return 1
-  fi
-  # The hook contract reads the alias as a checkout state root that must be the
-  # anchor; a dedicated non-Git state root is named by LU_STATE_ROOT only.
-  if [ -n "${LEARN_UKRAINIAN_STATE_ROOT:-}" ] && [ ! -e "$LEARN_UKRAINIAN_STATE_ROOT/.git" ] \
-    && [ ! -L "$LEARN_UKRAINIAN_STATE_ROOT/.git" ]; then
-    launcher_error "LC_WORKSPACE_ROOT: name a non-Git state root with LU_STATE_ROOT, not LEARN_UKRAINIAN_STATE_ROOT (hooks read the alias as the primary checkout)."
-    return 1
-  fi
-  printf '%s\n' "$configured"
-}
-
-# A workspace launch's hooks will run the shared hook rule from the workspace as
-# their project directory, and every machinery tool will read state_root(). Run
-# both rules here, before any side effect, with the hooks' own inputs: the rule
-# refuses a state root that is a second checkout or has a stray .git, and
-# state_root() refuses a missing or relative one. The state root must also stay
-# out of the workspace, which the session itself writes.
-launcher_validate_workspace_roots() {
-  local reason
-  project_python_command "$LEARN_UKRAINIAN_PYTHON" || return 1
-  if ! reason="$(CLAUDE_PROJECT_DIR="$LC_ROOT" "${PROJECT_PYTHON_COMMAND[@]}" -c '
-import os
-import sys
-from pathlib import Path
-from lu_machinery.agent_deploy.plan import Invalid, relative
-from lu_machinery.common.repo_root import MachineryConfigError, native_hook_roots, state_root
-workspace = Path(sys.argv[1])
-try:
-    relative(sys.argv[1].removeprefix("/"))
-    native_hook_roots(workspace)
-    state = state_root().resolve()
-    claude_config = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude").resolve()
-except (Invalid, MachineryConfigError, OSError) as exc:
-    sys.exit(f"{type(exc).__name__}: {exc}")
-if state == workspace or workspace in state.parents:
-    sys.exit(f"the state root {state} is the workspace or inside it")
-if claude_config.is_relative_to(workspace):
-    sys.exit("CLAUDE_CONFIG_DIR selects account settings inside the workspace")
-' "$LC_ROOT" 2>&1 >/dev/null)"; then
-    launcher_error "LC_WORKSPACE_ROOT: the workspace path, hook context or state root does not validate: ${reason##*$'\n'}"
-    return 1
-  fi
 }
 
 # Prints the physical path of an operator-named primary checkout, or explains
@@ -1599,7 +1378,7 @@ launcher_bind_drive_epic() {
   fi
   local canary_status='not run' state_python='.venv/bin/python'
   # A workspace has no .venv: name the exported project interpreter instead.
-  if [ -n "${LC_WORKSPACE_ROOT:-}" ]; then state_python='"$LEARN_UKRAINIAN_PYTHON" -I'; fi
+  if [ -n "${LC_WORKSPACE_ROOT:-}" ]; then state_python='"$LU_PYTHON" -I'; fi
   # A successful hook alone is no execution evidence; dry runs never run a probe.
   if [ "${LC_PROVIDER_CANARY_RAN:-0}" = 1 ] && [ "$LC_DRY_RUN" != 1 ]; then canary_status='ran'; fi
   LC_DRIVER_PROMPT="First run lu-driver-state render --lane ${state_lane}, then lu-driver-state check --lane ${state_lane}. Read the newest full-content DB handoff_note as authority for goals, tasks, decisions and handoff state. Load ${skill_dir}/${entry_skill}/SKILL.md from the workspace root before continuing. The launcher already claimed the ${LC_EPIC} lease; provider canary: ${canary_status}; do not claim, renew, or reopen the lease. ${fleet_clause}${work_clause} Obtain independent cross-family review. The .claude/${LC_EPIC}-epic/DRIVER-STATE.md pointer holds only pinned provider/stream facts and DB render instructions; keep it under 4 KiB and do not update it when a goal lands. After any compaction or doubt, first repeat lu-driver-state render --lane ${state_lane} and lu-driver-state check --lane ${state_lane}; use ${state_python} -m ${LC_MACHINERY_PACKAGE}.driver_state whoami only as a pinned-identity diagnostic. For each handoff, write exactly one full-content DB handoff_note carrying rollover/lineage IDs, full live task IDs/run nonces, open order message IDs, PR heads and the next three actions. A temporary path or markdown content cannot substitute. Follow its standing decision policy: decide and execute reversible rule-following choices yourself, never ask for overrides, do listed actions in the same turn, escalate only deletes, money, security or rule changes (final message starts CTO-ESCALATION:), and end each turn with the privately configured worker target met and a wake-up armed."
@@ -1783,9 +1562,6 @@ launcher_main() {
     launcher_error "${0##*/} fixes the lane '$LC_WRAPPER_FIXED_EPIC'; refusing the caller's lane '$LC_EPIC'."
     exit 2
   fi
-  # Help and usage errors need no product checkout, so they come first; every
-  # later step serves LC_ROOT.
-  launcher_resolve_product_root || exit 3
   LC_FORWARD_ARGS=(
     ${LC_WRAPPER_PROVIDER_ARGS[@]+"${LC_WRAPPER_PROVIDER_ARGS[@]}"}
     ${LC_FORWARD_ARGS[@]+"${LC_FORWARD_ARGS[@]}"}
@@ -1861,7 +1637,7 @@ launcher_main() {
     # shellcheck source=scripts/lib/deploy_extensions.sh
     source "$LC_MACHINERY_DIR/lib/deploy_extensions.sh"
     if [ -n "${LC_WORKSPACE_ROOT:-}" ]; then
-      if ! verify_agent_workspace "$LC_ROOT" "$LEARN_UKRAINIAN_PYTHON"; then
+      if ! verify_agent_workspace "$LC_ROOT" "$LU_PYTHON"; then
         launcher_error "refusing to launch ${LC_PROVIDER}: workspace agent-extensions verification failed."
         exit 1
       fi

@@ -452,6 +452,7 @@ SESSION_IDENTITY_ENV_VARS = (
     # Codex hook probe session (scripts/agent_runtime/codex_hook_probe.py).
     "CODEX_HOOK_PROBE_LOG",
     "CODEX_HOOK_PROBE_DENY_TOOLS",
+    "CODEX_COMPACT_SESSION_START",
     # Harness-native ids the hooks read; the harness, not a launcher, sets them.
     "LEARN_UK_HOOK_SESSION_ID",
     "CODEX_THREAD_ID",
