@@ -2198,7 +2198,10 @@ def test_finding_outcome_ledger_keeps_one_label_per_finding_and_skips_damaged_li
             rows.finding_outcome(kind="label", task_id="o1-review", repository="learn-ukrainian/machinery", pr=1,
                                  finding_id="F1", head=_HEAD_A, started_at=_START_A, reviewer_model=bad_model,
                                  label="fixed", recorded_at=_at(1))
-    for bad_head, bad_start in ((None, _START_A), ("not-a-sha", _START_A), (_HEAD_A, None), (_HEAD_A, "not-a-time")):
+    for bad_head, bad_start in (
+        (None, _START_A), ("not-a-sha", _START_A), ("a" * 64, _START_A), ("A" * 40, _START_A),
+        (_HEAD_A, None), (_HEAD_A, "not-a-time"),
+    ):
         with pytest.raises(ValueError, match="wrong shape"):
             rows.finding_outcome(kind="label", task_id="o1-review", repository="learn-ukrainian/machinery", pr=1,
                                  finding_id="F1", head=bad_head, started_at=bad_start,
@@ -2229,9 +2232,14 @@ def test_finding_outcome_ledger_keeps_one_label_per_finding_and_skips_damaged_li
         rows.record_finding_outcomes(batch_state, [legacy])
     extra = {**first, "note": "free text"}
     half_bound = {k: v for k, v in first.items() if k != "started_at"}
-    # Unhashable values, half-bound run keys, invalid reviewer_model, and wrong types are damaged lines too.
-    damaged = [extra, half_bound, {**first, "label": ["fixed"]}, {**first, "kind": {"label": 1}}, {**first, "pr": "1"},
-               {**first, "reviewer_model": "unknown"}, {**first, "reviewer_model": ["claude-opus-5-5"]}]
+    # A 64-hex head is refused on raw write as well as on read (only 40-hex Git commit SHAs are valid).
+    sha256_head = {**first, "finding_id": "F8", "head": "a" * 64}
+    with pytest.raises(ValueError, match="wrong shape"):
+        rows.record_finding_outcomes(batch_state, [sha256_head])
+    # Unhashable values, half-bound run keys, 64-hex heads, invalid reviewer_model, and wrong types are damaged lines.
+    damaged = [extra, half_bound, sha256_head, {**first, "label": ["fixed"]}, {**first, "kind": {"label": 1}},
+               {**first, "pr": "1"}, {**first, "reviewer_model": "unknown"},
+               {**first, "reviewer_model": ["claude-opus-5-5"]}]
     # A repeated member name: the decoder would keep "wrong" and hide "fixed".
     repeated = json.dumps({**first, "finding_id": "F5"})[:-1].encode() + b', "label": "wrong"}'
     with path.open("ab") as stream:
@@ -2246,12 +2254,19 @@ def test_finding_outcome_ledger_keeps_one_label_per_finding_and_skips_damaged_li
         ("o1-review", "other/repo", 1, "F0", _HEAD_A, t_start): ("claude-opus-5-5", "wrong", t_label),
     }
     assert contests == {("o1-review", machinery, 1, "F0", _HEAD_A, t_start): t_contest}
-    assert counts == {"lines": 4, "unattributed_labels": 1, "malformed_lines": 9}
-    # A writer that finds damaged and legacy lines still keeps one label per finding (legacy F9 is protected too).
+    assert counts == {"lines": 4, "unattributed_labels": 1, "malformed_lines": 10}
+    # A writer that finds damaged and legacy lines still keeps one label per finding (legacy F9 recorded at _at(1)
+    # protects a run that started at _START_A = _at(2) <= _at(1)).
     assert _label(batch_state, "o1-review", 1, "F0", "fixed") == 0
     assert _label(batch_state, "o1-review", 1, "F9", "fixed") == 0
     with pytest.raises(rows.OutcomeConflict):
         _label(batch_state, "o1-review", 1, "F9", "wrong", "already correct")
+    # PR1553-R2-F1: a newer run of the same task id that started AFTER legacy F9 was recorded (_at(0.5) > _at(1))
+    # gets its own run-bound label without conflicting with or being suppressed by the earlier run's legacy line.
+    assert _label(batch_state, "o1-review", 1, "F9", "wrong", "new run finding is wrong",
+                  head=_HEAD_B, started_at=_at(0.5), recorded_at=_at(0.25)) == 1
+    labels_after, _, _ = rows.read_finding_outcomes(batch_state)
+    assert ("o1-review", machinery, 1, "F9", _HEAD_B, rows.timestamp(_at(0.5))) in labels_after
 
 
 def test_author_results_split_by_risk_tier(tmp_path):

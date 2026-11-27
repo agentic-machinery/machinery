@@ -1105,6 +1105,7 @@ def read_publications(batch_state_dir: Path) -> tuple[dict[str, list[dict[str, A
 OUTCOME_SCHEMA = "review-finding-outcome.v1"
 OUTCOMES_FILE = "finding-outcomes.jsonl"
 _FINDING_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,63}\Z")
+_GIT_HEAD_SHA = re.compile(r"[0-9a-f]{40}\Z")
 _OUTCOME_REVIEWER_MODEL = "reviewer_model"
 _OUTCOME_RUN_KEYS = frozenset({"head", "started_at"})
 _OUTCOME_KEYS = {
@@ -1131,7 +1132,10 @@ def _outcome_ok(entry: object, *, require_run_binding: bool = False) -> bool:
         return False
     if require_run_binding and (not has_head or (kind == "label" and _OUTCOME_REVIEWER_MODEL not in entry)):
         return False
-    if has_head and not (_sha(entry["head"]) and timestamp(entry["started_at"]) is not None):
+    if has_head and not (
+        isinstance(entry["head"], str) and _GIT_HEAD_SHA.fullmatch(entry["head"]) is not None
+        and timestamp(entry["started_at"]) is not None
+    ):
         return False
     if _OUTCOME_REVIEWER_MODEL in entry:
         reviewer = entry[_OUTCOME_REVIEWER_MODEL]
@@ -1240,19 +1244,33 @@ def record_finding_outcomes(batch_state_dir: Path, entries: Iterable[Mapping[str
 
     with _locked(batch_state_dir, wait_s) as rows_file:
         path = rows_file.with_name(OUTCOMES_FILE)
-        present = {key(e): e for e in _outcome_lines(path, Counter())}
+        present: dict[tuple[str, str, int | str, int, str, str, tuple[str, datetime] | None], dict[str, Any]] = {}
+        for existing in _outcome_lines(path, Counter()):
+            present.setdefault(key(existing), existing)
+
+        def legacy_match(snapshot: Mapping[str, Any]) -> Mapping[str, Any] | None:
+            if snapshot["kind"] != "label":
+                return None
+            legacy = present.get((*base_key(snapshot), None))
+            if legacy is None:
+                return None
+            # A legacy label recorded before this candidate run started belongs to an earlier run, not this one.
+            legacy_recorded = cast(datetime, timestamp(legacy["recorded_at"]))
+            candidate_started = cast(datetime, timestamp(snapshot["started_at"]))
+            return None if legacy_recorded < candidate_started else legacy
+
+        planned: dict[tuple[str, str, int | str, int, str, str, tuple[str, datetime] | None], Mapping[str, Any]] = {}
         for snapshot, _ in checked:
-            held = present.get(key(snapshot))
-            if held is None and snapshot["kind"] == "label":
-                held = present.get((*base_key(snapshot), None))
+            exact = key(snapshot)
+            held = present.get(exact) or planned.get(exact) or legacy_match(snapshot)
             if held is not None and snapshot["kind"] == "label" and held["label"] != snapshot["label"]:
                 raise OutcomeConflict(
                     f"finding {snapshot['finding_id']} of {snapshot['task_id']} is already labelled {held['label']}")
+            planned.setdefault(exact, snapshot)
         added = 0
         for snapshot, line in checked:
             exact = key(snapshot)
-            legacy_held = snapshot["kind"] == "label" and (*base_key(snapshot), None) in present
-            if exact not in present and not legacy_held:
+            if exact not in present and legacy_match(snapshot) is None:
                 _append_line(path, line)
                 present[exact] = snapshot
                 added += 1

@@ -3233,6 +3233,16 @@ def _run_records(task_id: str, task_root: Path) -> int:
     return found
 
 
+def _normalized_started(record: Mapping[str, Any]) -> str | None:
+    """``capability_failure.run_started`` with UTC-overflow timestamps returning None instead of raising."""
+    from lu_machinery.review.capability_failure import run_started
+
+    try:
+        return run_started(record)
+    except OverflowError:
+        return None
+
+
 def record_finding_outcome(
     task_id: str, *, pr_number: int, finding_id: str, label: str, evidence: str | None,
     task_root: Path | None = None, now: datetime | None = None,
@@ -3241,7 +3251,6 @@ def record_finding_outcome(
     holds on PR ``pr_number``. One label per finding: the same label again is a no-op, another one is refused."""
     from lu_machinery.api import model_stats_rows
     from lu_machinery.common.task_store_paths import tasks_dir
-    from lu_machinery.review.capability_failure import run_started
     from lu_machinery.review.findings import EVIDENCED_OUTCOME_LABELS, FINDING_OUTCOME_LABELS
 
     task_root = task_root or tasks_dir()
@@ -3267,7 +3276,7 @@ def record_finding_outcome(
         raise RecordError(f"review {task_id} names no repository and reviewed head")
     if task.get("pinned_head") is not None and task["pinned_head"] != reviewed:
         raise RecordError("reviewed SHA conflicts with pinned head")
-    started = run_started(task)
+    started = _normalized_started(task)
     started_at = model_stats_rows.timestamp(started) if started is not None else None
     if started is None or started_at is None:
         raise RecordError(f"review {task_id} has no valid start timestamp")
@@ -3359,7 +3368,6 @@ def _store_contests(task_root: Path, task_id: str, reply: str, *,
     An id that is no P0-P2 finding of that reply is reported unmatched and never stored; a reply that matches none
     stores nothing. None when the reply contests nothing; never raises."""
     from lu_machinery.api import model_stats_rows
-    from lu_machinery.review.capability_failure import run_started
 
     contested = _contested_ids(reply)
     if not contested:
@@ -3385,7 +3393,7 @@ def _store_contests(task_root: Path, task_id: str, reply: str, *,
                     f"review(s) of another task" + ("; this task id blocked it too" if task_id in seats else ""))
         target, target_started = round_blocking[0]
         record, target_reply = _task(target["task_id"], task_root)
-        if record.get("worktree_base_sha") != target["head"] or run_started(record) != target_started:
+        if record.get("worktree_base_sha") != target["head"] or _normalized_started(record) != target_started:
             return (f"not stored: unresolved: the task record of {target['task_id']} is not the run published at "
                     f"{target['head'][:12]}")
         blocking = _blocking_finding_ids(target_reply) or frozenset()

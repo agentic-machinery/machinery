@@ -1268,6 +1268,13 @@ def test_finding_outcome_verb_refuses_unpublished_unknown_or_nonblocking_finding
     with pytest.raises(recorder.RecordError, match="no structured findings"):
         recorder.record_finding_outcome("review-text", pr_number=42, finding_id="F1", label="fixed", evidence=None,
                                         task_root=tasks)
+    # A damaged task timestamp that overflows UTC returns a typed refusal (exit 1) instead of raising OverflowError.
+    for idx, overflow_ts in enumerate(("0001-01-01T00:00:00+01:00", "9999-12-31T23:59:59-01:00")):
+        overflow_id = f"review-overflow-{idx}"
+        write_task(tasks, task_id=overflow_id, reply=_blocking_reply(["P1"]), started_at=overflow_ts)
+        assert recorder.main(["finding-outcome", "--task-id", overflow_id, "--pr", "42", "--finding", "F1",
+                              "--label", "fixed"]) == 1
+        assert f"finding outcome refused: review {overflow_id} has no valid start timestamp" in capsys.readouterr().out
     # The review is dispatched again under its id at the same head: the label ledger names the task id, not the run,
     # so neither run's finding takes a label any more.
     hot = tasks / "review-one.json"
@@ -1278,7 +1285,9 @@ def test_finding_outcome_verb_refuses_unpublished_unknown_or_nonblocking_finding
     with pytest.raises(recorder.RecordError, match="review task id review-one names 2 runs in the task store"):
         label("F2", "fixed")
     assert len(_outcomes(tmp_path)) == 2
-    assert set(censuses) == {"review-one", "review-grok", "review-early", "review-text"}
+    assert set(censuses) == {
+        "review-one", "review-grok", "review-early", "review-text", "review-overflow-0", "review-overflow-1",
+    }
 
 
 @pytest.mark.usefixtures('configured_roots', 'recorder_matcher')
