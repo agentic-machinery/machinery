@@ -54,7 +54,6 @@ from lu_machinery.common.jsonl import jsonl_lines
 from lu_machinery.common.repo_root import machinery_path
 from lu_machinery.fleet.claude_account_lane import ClaudeAccount, account_from_record
 from lu_machinery.fleet_comms.review_publication import (
-    BLOCKING_PRIORITIES,
     DEFAULT_STATUS_CONTEXT,
     REVIEW_SCHEMA_VERSION,
     ReviewPublicationError,
@@ -3178,6 +3177,9 @@ def _store_publication(
 # A later review contests an author's outcome label with this line in its reply's ``overall.explanation``.
 _CONTEST_LINE = re.compile(r"^[ \t]*CONTEST[ \t]+([A-Za-z0-9][A-Za-z0-9._:-]{0,63})[ \t]*:[ \t]*\S", re.MULTILINE)
 MAX_EVIDENCE_CHARS = 500
+# The findings a CHANGES_REQUESTED review blocks with, and so the ones an author labels: every reachable P0-P2
+# finding is an in-scope blocker (review policy section 3); a P3-only reply is published as an approval.
+LABELLED_PRIORITIES = frozenset({"P0", "P1", "P2"})
 
 
 def _structured_reply(reply: str) -> tuple[Mapping[str, Any], Any] | None:
@@ -3191,12 +3193,12 @@ def _structured_reply(reply: str) -> tuple[Mapping[str, Any], Any] | None:
 
 
 def _blocking_finding_ids(reply: str) -> frozenset[str] | None:
-    """The ids of the P0-P1 findings of a structured reply; None when the reply has no structured findings."""
+    """The ids of the P0-P2 findings of a structured reply; None when the reply has no structured findings."""
     structured = _structured_reply(reply)
     if structured is None:
         return None
     return frozenset(finding.finding_id for finding in structured[1].findings
-                     if finding.priority in BLOCKING_PRIORITIES)
+                     if finding.priority in LABELLED_PRIORITIES)
 
 
 def _contested_ids(reply: str) -> tuple[str, ...]:
@@ -3220,7 +3222,7 @@ def record_finding_outcome(
     task_id: str, *, pr_number: int, finding_id: str, label: str, evidence: str | None,
     task_root: Path | None = None, now: datetime | None = None,
 ) -> dict[str, Any]:
-    """Store the author's outcome label for one P0-P1 finding of a review whose CHANGES_REQUESTED verdict the ledger
+    """Store the author's outcome label for one P0-P2 finding of a review whose CHANGES_REQUESTED verdict the ledger
     holds on PR ``pr_number``. One label per finding: the same label again is a no-op, another one is refused."""
     from lu_machinery.api import model_stats_rows
     from lu_machinery.common.task_store_paths import tasks_dir
@@ -3239,7 +3241,7 @@ def record_finding_outcome(
     if blocking is None:
         raise RecordError("review reply has no structured findings: only code-review-findings.v1 findings take a label")
     if finding_id not in blocking:
-        raise RecordError(f"finding {finding_id!r} is not a P0-P1 finding of review {task_id}")
+        raise RecordError(f"finding {finding_id!r} is not a P0-P2 finding of review {task_id}")
     repository, reviewed = task.get("repository"), task.get("worktree_base_sha")
     if not isinstance(repository, str) or not isinstance(reviewed, str) or not SHA.fullmatch(reviewed):
         raise RecordError(f"review {task_id} names no repository and reviewed head")
@@ -3271,7 +3273,7 @@ def _store_contests(task_root: Path, task_id: str, reply: str, *, repository: st
     """Store each ``CONTEST <id>`` line of a just-published review against the PR's previous blocking review of
     record: the newest other CHANGES_REQUESTED publication on the PR that comes before this review's own publication
     (by GitHub's comment time, then ledger order), so a rerun after a later round binds the same round. An id that
-    is no P0-P1 finding of that review is reported unmatched and never stored. None when the reply contests nothing;
+    is no P0-P2 finding of that review is reported unmatched and never stored. None when the reply contests nothing;
     never raises."""
     from lu_machinery.api import model_stats_rows
 
@@ -3307,7 +3309,7 @@ def finding_outcome_main(argv: list[str]) -> int:
 
     parser = argparse.ArgumentParser(
         prog=f"{RECORDER_COMMAND} finding-outcome",
-        description="Record what became of one blocking (P0-P1) finding of a published CHANGES_REQUESTED review.\n"
+        description="Record what became of one blocking (P0-P2) finding of a published CHANGES_REQUESTED review.\n"
         "The author records one label per finding before the next round; that round's reviewer may contest it\n"
         "with a line 'CONTEST <finding-id>: <reason>' in its reply's overall.explanation. Labels:\n"
         + "".join(f"  {name}: {meaning}\n" for name, meaning in FINDING_OUTCOME_LABELS.items())
@@ -3321,7 +3323,7 @@ def finding_outcome_main(argv: list[str]) -> int:
     )
     parser.add_argument("--task-id", required=True, help="Review task whose blocking verdict is published")
     parser.add_argument("--pr", type=int, required=True, help="PR number the verdict is published on")
-    parser.add_argument("--finding", required=True, help="Id of one P0-P1 finding of that review's reply")
+    parser.add_argument("--finding", required=True, help="Id of one P0-P2 finding of that review's reply")
     parser.add_argument("--label", required=True, choices=tuple(FINDING_OUTCOME_LABELS), help="The finding's outcome")
     parser.add_argument("--evidence", help="One line backing the label; required for every label but fixed")
     args = parser.parse_args(argv)

@@ -2039,9 +2039,10 @@ def test_finding_precision_follows_the_files_the_author_changed_before_the_same_
         # PRs 1, 4 and 12 were approved later by Opus at another head; PR 4's blocked head could not be read.
         "reviews_approved_later": 3, "reviews_approved_later_read": 2,
         "precision": stats._rate(2, 3), "precision_ci": stats._wilson(2, 3),
-        # No finding carries an author label: all eight P0-P1 findings of the published blocking reviews are unlabelled.
+        # No finding carries an author label: all ten P0-P2 findings of the published blocking reviews (the eight
+        # P0-P1 ones above, and the P2 findings of PRs 1 and 8) are unlabelled.
         "labels": {"fixed": 0, "wrong": 0, "invented": 0, "out_of_scope": 0, "duplicate": 0, "contested": 0,
-                   "unlabelled": 8},
+                   "unlabelled": 10},
         "real_precision": stats._rate(0, 0), "real_precision_ci": stats._wilson(0, 0),
     }
     assert opus["precision"]["low_sample"] and opus["precision"]["n"] == 3
@@ -2091,9 +2092,10 @@ def test_finding_outcome_labels_count_per_reviewer_and_a_contest_holds_the_label
     batch_state, tasks = _state(tmp_path)
     sol = {"agent": "codex", "model": "gpt-6.1-sol", "resolved_model": "gpt-6.1-sol"}
     blocked = {"started_at": _at(7), "finished_at": _at(6)}
-    # Opus, PR 1: three P0-P1 findings and one P2. F0 fixed, F1 wrong, F2 invented but contested by the next round.
+    # Opus, PR 1: three P0-P1 findings, one P2 and one P3. F0 fixed, F1 wrong, F2 invented but contested by the next
+    # round; the P2 finding is unlabelled and the P3 one never counts (it cannot block).
     _findings_review(tasks, "o1-review", "incorrect",
-                     [("P1", "src/a.py"), ("P1", "src/b.py"), ("P0", "src/c.py"), ("P2", "src/d.py")],
+                     [("P1", "src/a.py"), ("P1", "src/b.py"), ("P0", "src/c.py"), ("P2", "src/d.py"), ("P3", "src/e.py")],
                      pr=1, pinned_head="a" * 40, **blocked)
     # Opus, PR 2: two blocking findings, one labelled out_of_scope, one left unlabelled; a contest of the unlabelled
     # one has no label to hold out.
@@ -2129,7 +2131,7 @@ def test_finding_outcome_labels_count_per_reviewer_and_a_contest_holds_the_label
     for payload in (snapshot["windows"]["7d"], snapshot["page_windows"]["7d"]):
         found = {row["model"]: row for row in payload["reviewer_accuracy"]["findings"]}
         assert found["claude-opus-5-5"]["labels"] == {**zero, "fixed": 1, "wrong": 1, "out_of_scope": 1,
-                                                      "contested": 1, "unlabelled": 1}
+                                                      "contested": 1, "unlabelled": 2}
         # The contested invented label is held out: fixed over fixed, wrong and invented is 1 of 2.
         assert found["claude-opus-5-5"]["real_precision"] == stats._rate(1, 2)
         assert found["gpt-6.1-sol"]["labels"] == {**zero, "invented": 1, "wrong": 1, "unlabelled": 1}

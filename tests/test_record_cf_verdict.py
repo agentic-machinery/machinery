@@ -1140,10 +1140,10 @@ def test_published_verdict_stores_one_local_publication_marker(monkeypatch, tmp_
 
 
 def _blocking_reply(priorities, explanation="The change breaks a case."):
-    """A ``code-review-findings.v1`` reply with findings F1.. of these priorities (CHANGES_REQUESTED with a P0-P1)."""
+    """A ``code-review-findings.v1`` reply with findings F1.. of these priorities (CHANGES_REQUESTED with a P0-P2)."""
     return json.dumps({
         "schema_version": "code-review-findings.v1",
-        "overall": {"correctness": "incorrect" if any(p in ("P0", "P1") for p in priorities) else "correct",
+        "overall": {"correctness": "incorrect" if any(p in ("P0", "P1", "P2") for p in priorities) else "correct",
                     "explanation": explanation, "confidence": 0.9},
         "findings": [{
             "id": f"F{number}", "title": "A defect", "body": "The change breaks a case.", "priority": priority,
@@ -1165,12 +1165,12 @@ def _outcomes(tmp_path):
 @pytest.mark.usefixtures("agent_runtime_roots")
 def test_finding_outcome_verb_refuses_unpublished_unknown_or_nonblocking_findings(monkeypatch, tmp_path, capsys):
     """Defect class: an outcome label recorded for a finding the statistics cannot attribute to the review's own
-    published blocking verdict (no publication, a publication at another head, an unknown id, a P2 finding, an
+    published blocking verdict (no publication, a publication at another head, an unknown id, a P3 finding, an
     unstructured reply), without the evidence its label needs, as free text in the ledger, as a second, different
     label of one finding, or a same-label retry refused for its new evidence."""
     monkeypatch.setenv("LEARN_UKRAINIAN_DISPATCH_TASK_ID", "author-task")
     tasks, _comments, _calls = setup_record(monkeypatch, tmp_path)
-    write_task(tasks, reply=_blocking_reply(["P1", "P2"]))
+    write_task(tasks, reply=_blocking_reply(["P2", "P3"]))
 
     def label(finding, name, evidence=None):
         return recorder.record_finding_outcome("review-one", pr_number=42, finding_id=finding, label=name,
@@ -1190,7 +1190,7 @@ def test_finding_outcome_verb_refuses_unpublished_unknown_or_nonblocking_finding
         recorder.record_finding_outcome("review-one", pr_number=43, finding_id="F1", label="fixed", evidence=None,
                                         task_root=tasks)
     for finding in ("F2", "F9"):
-        with pytest.raises(recorder.RecordError, match="is not a P0-P1 finding of review review-one"):
+        with pytest.raises(recorder.RecordError, match="is not a P0-P2 finding of review review-one"):
             label(finding, "fixed")
     with pytest.raises(recorder.RecordError, match="label wrong needs --evidence"):
         label("F1", "wrong", "  ")
@@ -1217,7 +1217,7 @@ def test_finding_outcome_verb_refuses_unpublished_unknown_or_nonblocking_finding
     monkeypatch.setattr(task_store_paths, "tasks_dir", lambda *_args, **_kwargs: tasks)
     assert recorder.main(["finding-outcome", "--task-id", "review-one", "--pr", "42", "--finding", "F2",
                           "--label", "fixed"]) == 1
-    assert "finding outcome refused: finding 'F2' is not a P0-P1 finding" in capsys.readouterr().out
+    assert "finding outcome refused: finding 'F2' is not a P0-P2 finding" in capsys.readouterr().out
     assert recorder.main(["finding-outcome", "--task-id", "review-one", "--pr", "42", "--finding", "F1",
                           "--label", "wrong", "--evidence", "scripts/example.py:1 already resets the state"]) == 0
     assert json.loads(capsys.readouterr().out)["status"] == "already recorded"
@@ -1233,7 +1233,7 @@ def test_finding_outcome_verb_refuses_unpublished_unknown_or_nonblocking_finding
 def test_record_stores_a_contest_only_against_the_previous_blocking_round(monkeypatch, tmp_path):
     """Defect class: a CONTEST line bound to another round than the PR's previous blocking review (an older round,
     the contesting review itself, a later round on a rerun, a tie in GitHub's comment time taken in the wrong
-    order), stored for an id that is no P0-P1 finding of that round, or a reply that contests nothing changing the
+    order), stored for an id that is no P0-P2 finding of that round, or a reply that contests nothing changing the
     receipt."""
     from lu_machinery.review import capability_failure
 
@@ -1245,11 +1245,11 @@ def test_record_stores_a_contest_only_against_the_previous_blocking_round(monkey
         write_task(tasks, task_id=task_id, reply=reply)
         return recorder.record(task_id, pr_number=42, task_root=tasks, lock_root=tmp_path / "locks")
 
-    first = publish("review-one", _blocking_reply(["P1", "P1", "P2"]))
+    first = publish("review-one", _blocking_reply(["P1", "P2", "P3"]))
     assert "outcome_contests" not in first
     # Every fake comment has the same GitHub time: the later ledger line is the later round.
     second = publish("review-two", _blocking_reply(
-        ["P1"], "Two labels do not hold.\nCONTEST F2: the reset is still missing\n  CONTEST F3: P2 is no label\n"
+        ["P1"], "Two labels do not hold.\nCONTEST F2: the reset is still missing\n  CONTEST F3: P3 is no label\n"
                 "CONTEST F9: no such finding\nA prose CONTEST F1: mid-line is no contest"))
     assert second["outcome_contests"] == "stored against review-one: F2; unmatched: F3, F9"
     third = publish("review-three", _blocking_reply(["P1"], "CONTEST F1: still open\nCONTEST F2: still open"))
