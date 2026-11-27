@@ -574,6 +574,7 @@ def test_recent_review_counts_reads_published_code_infra_records_and_fails_close
     stats.mkdir()
     now = datetime(2026, 11, 27, 16, 0, tzinfo=UTC)
     repo_slug = "agentic-machinery/machinery"
+    valid_tokens = {"fresh_input": 100, "cached_input": 50, "output": 25}
     sha_sol = "a" * 40
     sha_grok = "b" * 40
     sha_old = "c" * 40
@@ -582,34 +583,55 @@ def test_recent_review_counts_reads_published_code_infra_records_and_fails_close
     sha_mismatch = "f" * 40
     sha_superseded = "1" * 40
     sha_unclassified = "2" * 40
+    sha_bad_selector = "3" * 40
+
+    def make_row(**overrides):
+        base = {
+            "schema": "model-stats-row.v1",
+            "harness": "codex",
+            "effort": "high",
+            "status": "done",
+            "repo": "machinery",
+            "tokens": valid_tokens,
+        }
+        base.update(overrides)
+        return base
+
     pubs = [
         {"schema": "review-publication.v1", "task_id": "t-sol", "repository": repo_slug, "pr": 1, "head": sha_sol, "verdict": "APPROVED", "published_at": "2026-11-26T12:00:00Z"},
+        # F5: newer future-dated publication for the same target must NOT hide the valid in-window publication above.
+        {"schema": "review-publication.v1", "task_id": "t-sol", "repository": repo_slug, "pr": 1, "head": sha_sol, "verdict": "APPROVED", "published_at": "2026-12-27T12:00:00Z"},
         {"schema": "review-publication.v1", "task_id": "t-grok", "repository": repo_slug, "pr": 2, "head": sha_grok, "verdict": "CHANGES_REQUESTED", "published_at": "2026-11-27T12:00:00Z"},
         {"schema": "review-publication.v1", "task_id": "t-old", "repository": repo_slug, "pr": 3, "head": sha_old, "verdict": "APPROVED", "published_at": "2026-11-10T12:00:00Z"},
         {"schema": "review-publication.v1", "task_id": "t-uk", "repository": repo_slug, "pr": 4, "head": sha_uk, "verdict": "APPROVED", "published_at": "2026-11-27T10:00:00Z"},
         # F1: malformed non-string verdict (list/dict) must be skipped, never TypeError.
         {"schema": "review-publication.v1", "task_id": "t-bad-verdict", "repository": repo_slug, "pr": 5, "head": sha_sol, "verdict": ["APPROVED"], "published_at": "2026-11-27T11:00:00Z"},
-        # F5: future publication timestamp must be excluded.
+        # F3: publication with malformed fleet_repo_selector receipt must be rejected by canonical validator.
+        {"schema": "review-publication.v1", "task_id": "t-bad-selector", "repository": repo_slug, "pr": 11, "head": sha_bad_selector, "verdict": "APPROVED", "published_at": "2026-11-27T11:00:00Z", "fleet_repo_selector": {"selector_value": "bad", "selector_sha256": "not-a-sha"}},
+        # F5: future-only publication timestamp must be excluded.
         {"schema": "review-publication.v1", "task_id": "t-future", "repository": repo_slug, "pr": 6, "head": sha_future, "verdict": "APPROVED", "published_at": "2026-12-27T12:00:00Z"},
         # F3: publication for a different head must not match the row.
         {"schema": "review-publication.v1", "task_id": "t-mismatch", "repository": repo_slug, "pr": 7, "head": "9" * 40, "verdict": "APPROVED", "published_at": "2026-11-27T11:00:00Z"},
-        # F3: superseded task whose latest row changed role to write.
+        # F3: superseded task whose latest valid row changed role to write.
         {"schema": "review-publication.v1", "task_id": "t-superseded", "repository": repo_slug, "pr": 8, "head": sha_superseded, "verdict": "APPROVED", "published_at": "2026-11-27T11:00:00Z"},
         # F3: unclassified review class must not be counted.
         {"schema": "review-publication.v1", "task_id": "t-unclassified", "repository": repo_slug, "pr": 9, "head": sha_unclassified, "verdict": "APPROVED", "published_at": "2026-11-27T11:00:00Z"},
     ]
     rows = [
-        {"schema": "model-stats-row.v1", "task_id": "t-sol", "role": "review", "model": CURRENT_SOL, "class": "infra/critical", "repo": "machinery", "pr": 1, "pinned_head": sha_sol},
+        make_row(task_id="t-sol", role="review", model=CURRENT_SOL, **{"class": "infra/critical"}, pr=1, pinned_head=sha_sol),
+        # F3: damaged later row missing tokens must be rejected by canonical _well_formed, preserving Sol credit.
+        {"schema": "model-stats-row.v1", "task_id": "t-sol", "role": "review", "model": "grok-4.7-high", "class": "infra/critical", "repo": "machinery", "pr": 1, "pinned_head": sha_sol},
         # Branch-only review row (pr: None) still matches matching repo + head.
-        {"schema": "model-stats-row.v1", "task_id": "t-grok", "role": "review", "model": "grok-4.7-high", "class": "code/high", "repo": "machinery", "pr": None, "pinned_head": sha_grok},
-        {"schema": "model-stats-row.v1", "task_id": "t-old", "role": "review", "model": "claude-opus-5-5", "class": "code/medium", "repo": "machinery", "pr": 3, "pinned_head": sha_old},
-        {"schema": "model-stats-row.v1", "task_id": "t-uk", "role": "review", "model": "gemini-4-neon", "class": "ukrainian/high", "repo": "machinery", "pr": 4, "pinned_head": sha_uk},
-        {"schema": "model-stats-row.v1", "task_id": "t-unpub", "role": "review", "model": "gemini-4-neon", "class": "code/high", "repo": "machinery", "pr": 10, "pinned_head": sha_sol},
-        {"schema": "model-stats-row.v1", "task_id": "t-future", "role": "review", "model": "claude-opus-5-5", "class": "code/high", "repo": "machinery", "pr": 6, "pinned_head": sha_future},
-        {"schema": "model-stats-row.v1", "task_id": "t-mismatch", "role": "review", "model": "claude-opus-5-5", "class": "code/high", "repo": "machinery", "pr": 7, "pinned_head": sha_mismatch},
-        {"schema": "model-stats-row.v1", "task_id": "t-superseded", "role": "review", "model": "claude-opus-5-5", "class": "code/high", "repo": "machinery", "pr": 8, "pinned_head": sha_superseded},
-        {"schema": "model-stats-row.v1", "task_id": "t-superseded", "role": "write", "model": "claude-opus-5-5", "class": "code", "repo": "machinery", "pr": 8, "pinned_head": sha_superseded},
-        {"schema": "model-stats-row.v1", "task_id": "t-unclassified", "role": "review", "model": "claude-opus-5-5", "class": "unclassified", "repo": "machinery", "pr": 9, "pinned_head": sha_unclassified},
+        make_row(task_id="t-grok", role="review", model="grok-4.7-high", **{"class": "code/high"}, pr=None, pinned_head=sha_grok),
+        make_row(task_id="t-old", role="review", model="claude-opus-5-5", **{"class": "code/medium"}, pr=3, pinned_head=sha_old),
+        make_row(task_id="t-uk", role="review", model="gemini-4-neon", **{"class": "ukrainian/high"}, pr=4, pinned_head=sha_uk),
+        make_row(task_id="t-unpub", role="review", model="gemini-4-neon", **{"class": "code/high"}, pr=10, pinned_head=sha_sol),
+        make_row(task_id="t-bad-selector", role="review", model="claude-opus-5-5", **{"class": "code/high"}, pr=11, pinned_head=sha_bad_selector),
+        make_row(task_id="t-future", role="review", model="claude-opus-5-5", **{"class": "code/high"}, pr=6, pinned_head=sha_future),
+        make_row(task_id="t-mismatch", role="review", model="claude-opus-5-5", **{"class": "code/high"}, pr=7, pinned_head=sha_mismatch),
+        make_row(task_id="t-superseded", role="review", model="claude-opus-5-5", **{"class": "code/high"}, pr=8, pinned_head=sha_superseded),
+        make_row(task_id="t-superseded", role="write", model="claude-opus-5-5", **{"class": "code"}, pr=8, pinned_head=sha_superseded),
+        make_row(task_id="t-unclassified", role="review", model="claude-opus-5-5", **{"class": "unclassified"}, pr=9, pinned_head=sha_unclassified),
     ]
     (stats / "publications.jsonl").write_text("\n".join(json.dumps(p) for p in pubs) + "\n", encoding="utf-8")
     (stats / "rows.jsonl").write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
@@ -618,8 +640,8 @@ def test_recent_review_counts_reads_published_code_infra_records_and_fails_close
     assert counts == {CURRENT_SOL: 1, "grok-4.7": 1}
     assert reviewer_resolver.read_recent_review_counts(tmp_path / "missing") == {}
 
-    # F5: cache expires exactly at the timestamp boundary (even within the same minute).
-    clock_state = {"now": datetime(2026, 12, 3, 11, 59, 59, tzinfo=UTC)}
+    # F5: forward expiry AND clock rollback across publication/expiry timestamps always reflect current clock.
+    clock_state = {"now": datetime(2026, 11, 26, 12, 0, 0, tzinfo=UTC)}
 
     class _ControlledDatetime(datetime):
         @classmethod
@@ -627,12 +649,17 @@ def test_recent_review_counts_reads_published_code_infra_records_and_fails_close
             return clock_state["now"] if tz is None else clock_state["now"].astimezone(tz)
 
     monkeypatch.setattr(reviewer_resolver, "datetime", _ControlledDatetime)
-    monkeypatch.setattr(reviewer_resolver, "_RECENT_REVIEW_CACHE", None)
+    assert reviewer_resolver.read_recent_review_counts(tmp_path, window_days=7) == {CURRENT_SOL: 1}
+    # Roll clock back 1 second before t-sol publication timestamp -> must drop to {}.
+    clock_state["now"] = datetime(2026, 11, 26, 11, 59, 59, tzinfo=UTC)
+    assert reviewer_resolver.read_recent_review_counts(tmp_path, window_days=7) == {}
+    # Advance to just before t-sol expiry, then past it, then roll back 1 second across expiry.
+    clock_state["now"] = datetime(2026, 12, 3, 11, 59, 59, tzinfo=UTC)
     assert reviewer_resolver.read_recent_review_counts(tmp_path, window_days=7) == {CURRENT_SOL: 1, "grok-4.7": 1}
-    # 2 seconds later (same minute? cross 12:00:00Z + 1s): t-sol (2026-11-26T12:00:00Z) expires.
     clock_state["now"] = datetime(2026, 12, 3, 12, 0, 1, tzinfo=UTC)
     assert reviewer_resolver.read_recent_review_counts(tmp_path, window_days=7) == {"grok-4.7": 1}
-    # Exactly at the next boundary (7d after t-grok 2026-11-27T12:00:00Z + 1us): t-grok expires too.
+    clock_state["now"] = datetime(2026, 12, 3, 11, 59, 59, tzinfo=UTC)
+    assert reviewer_resolver.read_recent_review_counts(tmp_path, window_days=7) == {CURRENT_SOL: 1, "grok-4.7": 1}
     clock_state["now"] = datetime(2026, 12, 4, 12, 0, 0, 1, tzinfo=UTC)
     assert reviewer_resolver.read_recent_review_counts(tmp_path, window_days=7) == {}
     monkeypatch.undo()
