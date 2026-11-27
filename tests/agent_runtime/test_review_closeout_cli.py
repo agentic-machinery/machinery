@@ -323,15 +323,11 @@ def test_resolve_reviewer_cli_excludes_grok_for_grok_adapter_path(tmp_path, monk
     payload = json.loads(proc.stdout)
     assert payload["resolved_risk"] == "critical"
     grok_entries = [entry for entry in payload["trace"] if entry["family"] == "xai"]
-    if injected_grok:
-        assert {entry["name"] for entry in grok_entries} == {"grok-4.7-cursor-fallback"}
-        for grok in grok_entries:
-            assert grok["status"] == "excluded"
-            assert "subject exclusion" in grok["reason"]
-            assert "subject seat grok" in grok["reason"]
-    else:
-        # The automatic ladders list no Grok seat at all.
-        assert grok_entries == []
+    assert {entry["name"] for entry in grok_entries} == {"grok-4.7-cursor-fallback"}
+    for grok in grok_entries:
+        assert grok["status"] == "excluded"
+        assert "subject exclusion" in grok["reason"]
+        assert "subject seat grok" in grok["reason"]
     assert payload["selected"] is None or payload["selected"]["family"] != "xai"
     selected = payload["selected"]
     assert selected is None or selected["family"] not in {"openai", "xai"}
@@ -1259,16 +1255,18 @@ def test_pr_mode_target_keeps_the_base_name_for_authorship_exclusion(tmp_path, m
 # restoring that spelling in the stdout reproduces the previous digests.
 # The Neon seat replaces the Flash trace row for low and medium risk.
 # NEON-SOLTIER-1120 (2026-11-20) adds Neon as an eligible critical trace row on security paths; Opus stays selected.
+# REVIEW-ROTATION-GROK-1127 (2026-11-27) puts Sol, Opus, Neon and pinned Cursor Grok in one equal peer row at every
+# risk with least-used recent review count and catalog-order tie-break.
 @pytest.mark.parametrize(
     "author,risk,path,digest",
     [
-        (CURRENT_SOL, "medium", "ordinary.py", "c40560750db50e8cb3fb5f3b1a0306f85f46c9fddbd16bac8c7f25a19f06a5a3"),
-        ("claude-opus-5-5", "low", "ordinary.py", "0c344d1acfc5c53a8c8853062d0eb38577c4699fb5863daf3bd0259763229a10"),
+        (CURRENT_SOL, "medium", "ordinary.py", "e0f7476b9efa248c8ac1763750c3ac52269b13fdf5d3b8400f9755ea856afe11"),
+        ("claude-opus-5-5", "low", "ordinary.py", "df57599169edf59fe540ca28c27d9c0ffd11fc04db9462b80b789d472677e9a7"),
         (
             CURRENT_SOL,
             "low",
             "lu_machinery/agent_runtime/target_admission.py",
-            "e0a0c58465fd5020f7b5ce4064ae0cf5502756c070c56d74c9235961c37963c2",
+            "d587d94dc29b9fa88c829acd3e4f02af863f30c83e8e4ae69ec67d01cb94ea75",
         ),
     ],
 )

@@ -464,3 +464,124 @@ def test_frozen_complete_reviewer_receipts(index, tmp_path, monkeypatch):
     expected = deepcopy(APPROVED_BASELINE["reviewer"][index])
     expected["value"]["catalog_reviewed_on"] = CURRENT_CATALOG_REVIEW_DATE
     assert res == expected
+
+
+def test_review_rotation_grok_1127_equal_peer_group_and_rotation():
+    """Defect class: catalog order pinning one reviewer or leaking author/capped/excluded seats."""
+    from lu_machinery.review.reviewer_resolver import candidate_dispatch_model
+
+    fresh = {"freshness": "fresh", "age_s": 10}
+    snapshot = {
+        "diagnostics": {"stale": False},
+        "agents": {
+            "claude": {"status": "cool", "remaining_pct": 60, "health": {"healthy": True}, "codexbar": {**fresh, "weekly_remaining_pct": 60, "primary_remaining_pct": 60}},
+            "agy": {"status": "cool", "health": {"healthy": True}},
+            "cursor": {"status": "cool", "health": {"healthy": True}},
+            "codex": {"status": "near_cap", "remaining_pct": 3, "health": {"healthy": True}, "codexbar": {**fresh, "weekly_remaining_pct": 3}},
+        },
+        "codex_accounts": {
+            "codex:b": {"status": "cool", "remaining_pct": 63, "health": {"healthy": True}, "codexbar": {**fresh, "weekly_remaining_pct": 63}},
+            "codex:a": {"status": "near_cap", "remaining_pct": 3, "health": {"healthy": True}, "codexbar": {**fresh, "weekly_remaining_pct": 3}},
+        },
+    }
+    expected_cycle = {
+        "anthropic": ["openai_frontier_b", "gemini-4-neon-high", "grok-4.7-cursor-fallback"],
+        "openai": ["claude-opus-5-5", "gemini-4-neon-high", "grok-4.7-cursor-fallback"],
+        "google": ["openai_frontier_b", "claude-opus-5-5", "grok-4.7-cursor-fallback"],
+        "xai": ["openai_frontier_b", "claude-opus-5-5", "gemini-4-neon-high"],
+    }
+    authors = {
+        "anthropic": "claude-opus-5-5",
+        "openai": CURRENT_SOL,
+        "google": "gemini-4-neon",
+        "xai": "grok-4.7",
+    }
+    for risk in ("critical", "high", "medium", "low"):
+        for profile in ("code", "infra"):
+            for family, author in authors.items():
+                counts: dict[str, int] = {}
+                picks: list[str] = []
+                for _ in range(8):
+                    res = resolve_reviewer(
+                        ResolverInputs(
+                            author_model=author,
+                            review_profile=profile,
+                            domain=profile,
+                            risk=risk,
+                            routing_snapshot=snapshot,
+                            claude_account=HOST_ACCOUNT,
+                        ),
+                        recent_review_counts=counts,
+                    )
+                    assert res.selected is not None, (risk, profile, family, res.fail_closed_reason)
+                    assert res.selected.family != family
+                    assert res.selected.name != "openai_frontier"  # codex:a yields to funded codex:b
+                    if res.selected.family == "xai":
+                        assert res.selected.transport == "cursor"
+                        assert candidate_dispatch_model(
+                            load_model_catalog() and __import__("lu_machinery.review.reviewer_resolver", fromlist=["REVIEW_CANDIDATES"]).REVIEW_CANDIDATES[res.selected.name]
+                        ) == "grok-4.7-high"
+                    picks.append(res.selected.name)
+                    counts[res.selected.concrete_model] = counts.get(res.selected.concrete_model, 0) + 1
+                cycle = expected_cycle[family]
+                assert picks == [cycle[i % len(cycle)] for i in range(8)], (risk, profile, family)
+
+    # Capped Claude pool (with AGY down so Opus-AGY cannot stand in) and excluded Codex account a are never selected.
+    capped = deepcopy(snapshot)
+    capped["agents"]["claude"]["remaining_pct"] = 5
+    capped["agents"]["claude"]["codexbar"]["weekly_remaining_pct"] = 5
+    capped["agents"]["agy"]["status"] = "unhealthy"
+    capped["codex_accounts"]["codex:b"]["remaining_pct"] = 0
+    res_capped = resolve_reviewer(
+        ResolverInputs(author_model="gemini-4-neon", risk="critical", routing_snapshot=capped, claude_account=HOST_ACCOUNT),
+        excluded_quota_buckets=frozenset({"codex:a"}),
+        recent_review_counts={"grok-4.7": 99},
+    )
+    assert res_capped.selected is not None and res_capped.selected.name == "grok-4.7-cursor-fallback"
+    trace_by_name = {entry.name: entry for entry in res_capped.trace}
+    assert trace_by_name["claude-opus-5-5"].status == "excluded"
+    assert trace_by_name["openai_frontier"].status == "excluded"
+    assert trace_by_name["openai_frontier_b"].status == "excluded"
+
+
+def test_recent_review_counts_reads_published_code_infra_records_and_fails_closed(tmp_path):
+    """Defect class: rotation miscounting expired, unpublished, Ukrainian, or invalid review records."""
+    from datetime import UTC, datetime
+
+    from lu_machinery.review.reviewer_resolver import read_recent_review_counts
+
+    stats = tmp_path / "model-stats"
+    stats.mkdir()
+    now = datetime(2026, 11, 27, 16, 0, tzinfo=UTC)
+    pubs = [
+        {"schema": "review-publication.v1", "task_id": "t-sol", "repository": "a/b", "pr": 1, "head": "a" * 40, "verdict": "APPROVED", "published_at": "2026-11-26T12:00:00Z"},
+        {"schema": "review-publication.v1", "task_id": "t-grok", "repository": "a/b", "pr": 2, "head": "b" * 40, "verdict": "CHANGES_REQUESTED", "published_at": "2026-11-27T12:00:00Z"},
+        {"schema": "review-publication.v1", "task_id": "t-old", "repository": "a/b", "pr": 3, "head": "c" * 40, "verdict": "APPROVED", "published_at": "2026-11-10T12:00:00Z"},
+        {"schema": "review-publication.v1", "task_id": "t-uk", "repository": "a/b", "pr": 4, "head": "d" * 40, "verdict": "APPROVED", "published_at": "2026-11-27T10:00:00Z"},
+    ]
+    rows = [
+        {"task_id": "t-sol", "role": "review", "model": CURRENT_SOL, "class": "infra/critical"},
+        {"task_id": "t-grok", "role": "review", "model": "grok-4.7-high", "class": "code/high"},
+        {"task_id": "t-old", "role": "review", "model": "claude-opus-5-5", "class": "code/medium"},
+        {"task_id": "t-uk", "role": "review", "model": "gemini-4-neon", "class": "ukrainian/high"},
+        {"task_id": "t-unpub", "role": "review", "model": "gemini-4-neon", "class": "code/high"},
+    ]
+    (stats / "publications.jsonl").write_text("\n".join(json.dumps(p) for p in pubs) + "\n", encoding="utf-8")
+    (stats / "rows.jsonl").write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
+
+    counts = read_recent_review_counts(tmp_path, window_days=7, now=now)
+    assert counts == {CURRENT_SOL: 1, "grok-4.7": 1}
+    assert read_recent_review_counts(tmp_path / "missing") == {}
+
+    with pytest.raises(ValueError, match="window_days"):
+        read_recent_review_counts(tmp_path, window_days=0, now=now)
+    with pytest.raises(ValueError, match="non-negative integer"):
+        resolve_reviewer(
+            ResolverInputs(author_model="claude-opus-5-5", risk="high", claude_account=HOST_ACCOUNT),
+            recent_review_counts={CURRENT_SOL: -1},
+        )
+    with pytest.raises(ValueError, match="non-negative integer"):
+        resolve_reviewer(
+            ResolverInputs(author_model="claude-opus-5-5", risk="high", claude_account=HOST_ACCOUNT),
+            recent_review_counts={CURRENT_SOL: True},
+        )

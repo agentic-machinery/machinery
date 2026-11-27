@@ -891,12 +891,12 @@ def test_sources_tool_overlay_adds_only_approved_read_only_grants(configuration)
 
 
 def test_grok_ukrainian_role_confers_no_ukrainian_review_route():
-    """C-5307 restores native review without admitting Ukrainian review."""
+    """REVIEW-ROTATION-GROK-1127 admits code/infra critical review without admitting Ukrainian review."""
     source = Path(__file__).resolve().parents[2]
     catalog = yaml.safe_load((source / machinery_package() / "config/model_catalog.yaml").read_text(encoding="utf-8"))
     assert "ukrainian_review" not in catalog["models"]["grok-4.7"]["roles"]
     assert catalog["models"]["grok-4.7"]["lifecycle"] == "active"
-    assert catalog["models"]["grok-4.7"]["roles"] == ["coding", "standard_review"]
+    assert catalog["models"]["grok-4.7"]["roles"] == ["coding", "standard_review", "critical_review"]
     assert catalog["models"]["grok-4.7"]["transports"] == ["native_grok", "cursor"]
     assert catalog["seats"]["xai_reviewer"]["routes"]["cursor_fallback"]["review_profiles"] == ["code", "infra"]
 
@@ -962,10 +962,12 @@ def test_catalog_authorizes_no_claude_review_through_cursor():
         on_ladder = {name for rung in ladders[risk] for name in rung}
         assert ("claude-sonnet-5-5" in on_ladder) == (risk in {"medium", "low"}), risk
         assert "claude-opus-5-5" in on_ladder, risk
-        assert not [name for name in on_ladder if candidates[name]["transport"] == "cursor"], risk
+        assert [name for name in on_ladder if candidates[name]["transport"] == "cursor"] == [
+            "grok-4.7-cursor-fallback"
+        ], risk
     for risk in ("low", "medium", "high", "critical"):
         routes = catalog["roles"][f"code_review_{risk}"]["routes"]
-        assert not [route for route in routes if route.endswith("/cursor_fallback")]
+        assert [route for route in routes if route.endswith("/cursor_fallback")] == ["xai_reviewer/cursor_fallback"]
     assert list(catalog["seats"]["anthropic_authority"]["routes"]) == ["native", "agy"]
     assert catalog["seats"]["xai_reviewer"]["model_id"] == "grok-4.7"
     opus = catalog["models"]["claude-opus-5-5"]
@@ -984,7 +986,7 @@ def test_catalog_authorizes_no_claude_review_through_cursor():
 # the #10262 explicit AGY review-risk refusals in both configurations, and the #10630
 # capture-driver account; see SPEC.md.
 PINNED_DIGESTS = {
-    "v2-baseline.json.gz": "d94c14be33c51fa19b83f710e9088549ca82fa4e65c9fd369ab8aa491849a808",
+    "v2-baseline.json.gz": "7526654c31aaf036ef7e0980b0b386c20c8a887619fa6f6915d088474ab3ebf1",
     "routing-10263.json.gz": "3385853a0070ab9a2f77e1fb40d9178ce195e44e7fd6b8c8245702ec529b7d16",
     "SHA256SUMS": "4cba22dff8338f75c8ae96b35119c3da2bea3b3d7d6418c49e466ddc0ddf73a8",
     "SPEC.md": "ed7438340b60df7dcf51271dac1b03952fe96617edd249f14aaed1ecb33a0ede",
@@ -1037,11 +1039,12 @@ def assert_frozen_routing_fixture_pinned(root: Path) -> None:
 # The current fixture contains only the expanded catalog and the existing 1432
 # reviewer cases. It was computed with pure resolver calls, without launching workers.
 _V2_BASELINE_PATH = FIXTURE / "v2-baseline.json.gz"
-assert hashlib.sha256(_V2_BASELINE_PATH.read_bytes()).hexdigest() == "d94c14be33c51fa19b83f710e9088549ca82fa4e65c9fd369ab8aa491849a808"
+assert hashlib.sha256(_V2_BASELINE_PATH.read_bytes()).hexdigest() == "7526654c31aaf036ef7e0980b0b386c20c8a887619fa6f6915d088474ab3ebf1"
 _V2_BASELINE = json.loads(gzip.decompress(_V2_BASELINE_PATH.read_bytes()))
 # The Sol 6.2 recapture (2026-11-17) also carries the corrected hramatka Gemma text.
-# The NEON-SOLTIER-1120 recapture (2026-11-20) admits Neon on infra and critical/security review
-# (after Sol and Opus on critical, alongside the Opus seats on high, unchanged on medium and low).
+# The NEON-SOLTIER-1120 recapture (2026-11-20) admits Neon on infra and critical/security review.
+# The REVIEW-ROTATION-GROK-1127 recapture (2026-11-27) puts Sol, Opus, Neon and pinned Cursor Grok
+# in one equal peer row at every risk level with least-used rotation and catalog-order tie-break.
 CURRENT_BASELINE = _V2_BASELINE["baseline"]
 CURRENT_INPUTS = _V2_BASELINE["inputs"]
 CURRENT_CATALOG_REVIEW_DATE = "2026-11-23"
@@ -1049,7 +1052,8 @@ CURRENT_CATALOG_REVIEW_DATE = "2026-11-23"
 GROK_REVIEW_CANDIDATE = {
     "model_id": "grok-4.7", "route": "cursor", "transport": "cursor",
     "invocation": ".venv/bin/python scripts/dispatch.py dispatch --agent cursor --model grok-4.7-high --effort high",
-    "review_profiles": ["code", "infra"], "capabilities": ["code_review"], "suitability_roles": ["standard_review"],
+    "review_profiles": ["code", "infra"], "capabilities": ["code_review"],
+    "suitability_roles": ["critical_review", "standard_review"],
 }
 
 MUSE_REVIEW_CANDIDATE = {
@@ -1129,7 +1133,7 @@ def assert_frozen_surfaces(actual, *, surfaces):
             expected["reviewed_on"] = CURRENT_CATALOG_REVIEW_DATE
             # Pin the prose corrected in the catalog review without recapturing routing data.
             reviewed_prose = {
-                ("policy", "notes"): "2d58c3951163f3989f322c0519d34804cbae7eeafb6f1826db675bb7b465c683",
+                ("policy", "notes"): "431b522fb266db24ee960cf46a0248ad100c1f51c7631ec7da4fc8a4b71693f4",
                 ("models", "muse-wonder-full-1.0", "notes"):
                     "3304e52346e8fcc32a733bb072ead7e4e2a82a8ffbba58465dd01617e632b4c0",
                 ("models", "claude-fable-5-1", "notes"):
@@ -1209,7 +1213,9 @@ def refresh_current_baseline():
             if "owned_paths" in case:
                 case["owned_paths"] = tuple(case["owned_paths"])
             receipts.append(approved_dispatcher_spelling(observed(
-                lambda case=case: resolve_reviewer(ResolverInputs(**case, claude_account=HOST_ACCOUNT)))))
+                lambda case=case: resolve_reviewer(
+                    ResolverInputs(**case, claude_account=HOST_ACCOUNT), recent_review_counts={}
+                ))))
     capture["baseline"]["reviewer"] = receipts
     assert capture["inputs"] == _V2_BASELINE["inputs"]
     raw = gzip.compress(encode(capture), mtime=0)
