@@ -25,7 +25,9 @@ repos:
     streams:
       epics:
         title: "Machinery epic coordination"
-        epics: [1532]
+        # #1415 is closed: it stays only as an audit traversal root until its open children are re-homed.
+        # No closed_epics entry for it: that would drop it from traversal. New issues use #1532.
+        epics: [1415, 1532]
 streams:
   epics:
     title: "Epic coordination"
