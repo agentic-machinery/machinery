@@ -76,9 +76,27 @@ _SEALED_REVIEW_EXECUTABLE = "agent_runtime.runner:invoke_inter_agent"
 # and a short import spelling (the package directory on ``sys.path``) cannot shorten it.
 _NATIVE_REVIEW_EXECUTABLE = f"{Path(os.path.abspath(__file__)).parents[1].name}/dispatch.py"
 RECENT_REVIEW_WINDOW_DAYS = 7
+# Frozen input contract for both rotation ledgers: a deeper line is skipped, never parsed.
+_RECENT_REVIEW_JSON_MAX_DEPTH = 16
 _CODE_INFRA_REVIEW_CLASSES = frozenset(
     f"{profile}/{risk}" for profile in VALID_REVIEW_PROFILES for risk in (*VALID_RISKS, "unknown")
 )
+
+
+def _labels_intact(row: Mapping[str, object]) -> bool:
+    """Whether every label already has the persisted shape, so the canonical sanitiser would change none.
+
+    A row with a missing, non-string or malformed label is skipped instead of being coerced to
+    ``unknown``, so it can never supersede an earlier valid row for the same task.
+    """
+    from lu_machinery.api import model_stats_rows
+
+    labels = model_stats_rows._LABEL_FIELDS
+    optional_labels = ("author_model", "data_class")
+    sanitised = model_stats_rows._sanitised({name: row.get(name) for name in (*labels, *optional_labels)})
+    return all(type(row.get(name)) is str and sanitised[name] == row[name] for name in labels) and all(
+        row.get(name) is None or (type(row[name]) is str and sanitised[name] == row[name]) for name in optional_labels
+    )
 
 
 def _open_regular_in_dir(dir_fd: int, filename: str) -> int | None:
@@ -150,7 +168,7 @@ def read_recent_review_counts(
             with os.fdopen(pubs_fd, "rb") as stream:
                 for line_index, line in enumerate(stream):
                     try:
-                        entry = json_depth.loads(line, max_depth=model_stats_rows._JSON_MAX_DEPTH)
+                        entry = json_depth.loads(line, max_depth=_RECENT_REVIEW_JSON_MAX_DEPTH)
                     except (ValueError, RecursionError):
                         continue
                     if not model_stats_rows._publication_ok(entry):
@@ -178,7 +196,7 @@ def read_recent_review_counts(
             with os.fdopen(rows_fd, "rb") as stream:
                 for line in stream:
                     try:
-                        row = json_depth.loads(line, max_depth=model_stats_rows._JSON_MAX_DEPTH)
+                        row = json_depth.loads(line, max_depth=_RECENT_REVIEW_JSON_MAX_DEPTH)
                     except (ValueError, RecursionError):
                         continue
                     if not isinstance(row, dict) or row.get("schema") != model_stats_rows.ROW_SCHEMA:
@@ -189,11 +207,13 @@ def read_recent_review_counts(
                         or tid not in pubs_by_task
                         or not model_stats_rows.valid_task_id(tid)
                         or not model_stats_rows._well_formed(row)
+                        or not _labels_intact(row)
                     ):
                         continue
-                    # Apply last-row-wins across validated rows before filtering by
-                    # role or review class so a superseding valid row drops stale credit.
-                    latest_rows[tid] = model_stats_rows._sanitised(row)
+                    # Apply last-row-wins across fully validated rows before filtering by
+                    # role or review class so a superseding valid row drops stale credit,
+                    # while a malformed row never replaces an earlier valid one.
+                    latest_rows[tid] = row
         except OSError:
             return {}
     finally:
@@ -209,7 +229,7 @@ def read_recent_review_counts(
         pinned_head = row.get("pinned_head")
         if not isinstance(pinned_head, str):
             continue
-        row_repo = row.get("repo") or "public"
+        row_repo = row["repo"]
         row_pr = row.get("pr")
         entries = sorted(pubs_by_task[tid], key=lambda item: (item[0], item[1]), reverse=True)
         matched = next(
@@ -224,10 +244,8 @@ def read_recent_review_counts(
         )
         if matched is None:
             continue
-        raw_model = row.get("model")
-        if isinstance(raw_model, str) and raw_model.strip():
-            canonical = resolve_catalog_model_id(raw_model, _MODEL_CATALOG) or raw_model.strip()
-            counts_counter[canonical] += 1
+        model = str(row["model"])  # a persisted model label, checked by _labels_intact
+        counts_counter[resolve_catalog_model_id(model, _MODEL_CATALOG) or model] += 1
 
     return dict(counts_counter)
 

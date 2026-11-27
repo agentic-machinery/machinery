@@ -693,3 +693,80 @@ def test_recent_review_counts_reads_published_code_infra_records_and_fails_close
             ResolverInputs(author_model="claude-opus-5-5", risk="high", claude_account=HOST_ACCOUNT),
             recent_review_counts={CURRENT_SOL: True},
         )
+
+
+def _nested(levels: int) -> object:
+    value: object = 0
+    for _ in range(levels):
+        value = {"x": value}
+    return value
+
+
+_ROTATION_SHA = "a" * 40
+_ROTATION_VALID_ROW = {
+    "schema": "model-stats-row.v1",
+    "task_id": "t-sol",
+    "harness": "codex",
+    "model": CURRENT_SOL,
+    "effort": "high",
+    "role": "review",
+    "class": "code/high",
+    "status": "done",
+    "repo": "machinery",
+    "tokens": {"fresh_input": 100, "cached_input": 50, "output": 25},
+    "pr": 1,
+    "pinned_head": _ROTATION_SHA,
+}
+
+
+@pytest.mark.parametrize(
+    ("later", "expected"),
+    [
+        # Malformed top-level labels: skipped, never coerced to "unknown" over the valid row.
+        ({"role": ["review"]}, "sol"),
+        ({"repo": ["machinery"]}, "sol"),
+        ({"class": {"code": "high"}}, "sol"),
+        ({"model": True}, "sol"),
+        ({"status": 5}, "sol"),
+        ({"status": "done; rm"}, "sol"),
+        ({"harness": "bad label!"}, "sol"),
+        ({"harness": None}, "sol"),
+        ({"effort": ["high"]}, "sol"),
+        ({"repo": None}, "sol"),
+        ({"author_model": ["gpt"]}, "sol"),
+        ({"data_class": {"public": True}}, "sol"),
+        # Frozen 16-level nesting contract: a depth-17 later row is skipped; depth 16 still supersedes.
+        ({"extra": _nested(16)}, "sol"),
+        ({"extra": _nested(15)}, "grok"),
+        # A valid later row for the same task supersedes, and a valid role change drops review credit.
+        ({}, "grok"),
+        ({"role": "write", "class": "unclassified"}, None),
+    ],
+)
+def test_recent_review_counts_malformed_later_row_never_replaces_valid_row(tmp_path, later, expected):
+    """Defect class: a later malformed or over-deep row erasing or transferring an earlier valid row's credit."""
+    from datetime import UTC, datetime
+
+    from lu_machinery.review import reviewer_resolver
+
+    stats = tmp_path / "model-stats"
+    stats.mkdir()
+    publication = {
+        "schema": "review-publication.v1",
+        "task_id": "t-sol",
+        "repository": "agentic-machinery/machinery",
+        "pr": 1,
+        "head": _ROTATION_SHA,
+        "verdict": "APPROVED",
+        "published_at": "2026-11-26T12:00:00Z",
+    }
+    superseding = {**_ROTATION_VALID_ROW, "model": "grok-4.7-high", "harness": "cursor", **later}
+    (stats / "publications.jsonl").write_text(json.dumps(publication) + "\n", encoding="utf-8")
+    (stats / "rows.jsonl").write_text(
+        json.dumps(_ROTATION_VALID_ROW) + "\n" + json.dumps(superseding) + "\n", encoding="utf-8"
+    )
+
+    counts = reviewer_resolver.read_recent_review_counts(
+        tmp_path, window_days=7, now=datetime(2026, 11, 27, 16, 0, tzinfo=UTC)
+    )
+    assert counts == {None: {}, "sol": {CURRENT_SOL: 1}, "grok": {"grok-4.7": 1}}[expected]
