@@ -2084,9 +2084,10 @@ def _contest(batch_state: Path, task_id: str, pr: int, finding_id: str, conteste
 
 
 def test_finding_outcome_labels_count_per_reviewer_and_a_contest_holds_the_label_out(tmp_path):
-    """Defect class: author labels charged to another reviewer than the one whose finding they label, a contested
-    author claim counted as settled, a label on an unpublished review counted, a contest without a label counted, or
-    unlabelled findings miscounted. Every expected figure below is counted by hand."""
+    """Defect class: author labels charged to another reviewer, or another PR, than the publication whose finding they
+    label, a contested author claim counted as settled, a label on an unpublished review counted, a contest without a
+    label counted, a published review left out because its row names no author model, or unlabelled findings
+    miscounted. Every expected figure below is counted by hand."""
     batch_state, tasks = _state(tmp_path)
     sol = {"agent": "codex", "model": "gpt-6.1-sol", "resolved_model": "gpt-6.1-sol"}
     blocked = {"started_at": _at(7), "finished_at": _at(6)}
@@ -2103,9 +2104,12 @@ def test_finding_outcome_labels_count_per_reviewer_and_a_contest_holds_the_label
                      **blocked, **sol)
     # Opus, PR 4: a blocking reply never published: its label counts nowhere.
     _findings_review(tasks, "o4-review", "incorrect", [("P1", "src/a.py")], pr=4, pinned_head="d" * 40, **blocked)
+    # Sol, PR 5: a published blocking review whose row names no author model still counts: one label, one unlabelled.
+    _findings_review(tasks, "s5-review", "incorrect", [("P1", "src/a.py"), ("P0", "src/b.py")], pr=5,
+                     pinned_head="e" * 40, **blocked, **{**sol, "review_author_model": None})
     rows.backfill(tasks, batch_state)
     _publish(batch_state, ("o1-review", 1, "a" * 40, "CHANGES_REQUESTED"), ("o2-review", 2, "b" * 40, "CHANGES_REQUESTED"),
-             ("s3-review", 3, "c" * 40, "CHANGES_REQUESTED"))
+             ("s3-review", 3, "c" * 40, "CHANGES_REQUESTED"), ("s5-review", 5, "e" * 40, "CHANGES_REQUESTED"))
     assert _label(batch_state, "o1-review", 1, "F0", "fixed") == 1
     assert _label(batch_state, "o1-review", 1, "F1", "wrong", "the guard on line 3 already returns early") == 1
     assert _label(batch_state, "o1-review", 1, "F2", "invented", "src/c.py has no such function") == 1
@@ -2114,9 +2118,13 @@ def test_finding_outcome_labels_count_per_reviewer_and_a_contest_holds_the_label
     assert _contest(batch_state, "o2-review", 2, "F1", "o2b-review") == 1
     assert _label(batch_state, "s3-review", 3, "F0", "invented", "no such call site exists") == 1
     assert _label(batch_state, "o4-review", 4, "F0", "wrong", "already correct") == 1
+    assert _label(batch_state, "s5-review", 5, "F1", "wrong", "the guard already returns early") == 1
+    # Lines naming another PR than the review's publication: they never label or contest the PR 1 findings.
+    assert _label(batch_state, "o1-review", 9, "F0", "invented", "a label for another PR") == 1
+    assert _contest(batch_state, "o1-review", 9, "F1", "o9-review") == 1
 
     snapshot = stats.collect(batch_state, tmp_path, NOW, landing=stats.Landing())
-    assert snapshot["coverage"]["finding_outcomes"] == {"lines": 8}
+    assert snapshot["coverage"]["finding_outcomes"] == {"lines": 11}
     zero = dict.fromkeys(("fixed", "wrong", "invented", "out_of_scope", "duplicate", "contested", "unlabelled"), 0)
     for payload in (snapshot["windows"]["7d"], snapshot["page_windows"]["7d"]):
         found = {row["model"]: row for row in payload["reviewer_accuracy"]["findings"]}
@@ -2124,21 +2132,22 @@ def test_finding_outcome_labels_count_per_reviewer_and_a_contest_holds_the_label
                                                       "contested": 1, "unlabelled": 1}
         # The contested invented label is held out: fixed over fixed, wrong and invented is 1 of 2.
         assert found["claude-opus-5-5"]["real_precision"] == stats._rate(1, 2)
-        assert found["gpt-6.1-sol"]["labels"] == {**zero, "invented": 1}
-        assert found["gpt-6.1-sol"]["real_precision"] == stats._rate(0, 1)
+        assert found["gpt-6.1-sol"]["labels"] == {**zero, "invented": 1, "wrong": 1, "unlabelled": 1}
+        assert found["gpt-6.1-sol"]["real_precision"] == stats._rate(0, 2)
 
 
 def test_finding_outcome_ledger_keeps_one_label_per_finding_and_skips_damaged_lines(tmp_path):
-    """Defect class: a relabel, a repeated contest, a label without its required evidence, a self-contest or a
-    damaged ledger line silently changing what the statistics count."""
+    """Defect class: a relabel, a same-label retry refused for its new evidence, a repeated contest, a label without
+    its required evidence, a self-contest, or a damaged ledger line (including one whose member names repeat)
+    silently changing what the statistics count."""
     batch_state, _ = _state(tmp_path)
     assert _label(batch_state, "o1-review", 1, "F0", "fixed") == 1
     # The same label again adds nothing; another label for the finding is refused and writes nothing.
     assert _label(batch_state, "o1-review", 1, "F0", "fixed") == 0
     with pytest.raises(rows.OutcomeConflict):
         _label(batch_state, "o1-review", 1, "F0", "wrong", "already correct")
-    with pytest.raises(rows.OutcomeConflict):
-        _label(batch_state, "o1-review", 1, "F0", "fixed", "now with evidence")
+    # A retry with the same label and other evidence is a no-op too: the first line and its evidence stay.
+    assert _label(batch_state, "o1-review", 1, "F0", "fixed", "now with evidence") == 0
     # Every label but fixed needs its evidence; an unknown label and a self-contest are never written.
     for label in ("wrong", "invented", "out_of_scope", "duplicate"):
         with pytest.raises(ValueError, match="wrong shape"):
@@ -2157,12 +2166,14 @@ def test_finding_outcome_ledger_keeps_one_label_per_finding_and_skips_damaged_li
     # Unhashable values where a label or kind belongs, and a value of the wrong type, are damaged lines too.
     first = json.loads(good.splitlines()[0])
     damaged = [extra, {**first, "label": ["fixed"]}, {**first, "kind": {"label": 1}}, {**first, "pr": "1"}]
+    # A repeated member name: the decoder would keep "wrong" and hide "fixed".
+    repeated = json.dumps({**first, "finding_id": "F5"})[:-1].encode() + b', "label": "wrong"}'
     with path.open("ab") as stream:
-        stream.write(b"{not json\n" + b"".join(json.dumps(line).encode() + b"\n" for line in damaged))
+        stream.write(b"{not json\n" + b"".join(json.dumps(line).encode() + b"\n" for line in damaged) + repeated + b"\n")
     labels, contests, counts = rows.read_finding_outcomes(batch_state)
-    assert labels == {"o1-review": {"F0": "fixed"}}
-    assert contests == {("o1-review", "F0")}
-    assert counts == {"lines": 2, "malformed_lines": 5}
+    assert labels == {("o1-review", 1): {"F0": "fixed"}}
+    assert contests == {("o1-review", 1, "F0")}
+    assert counts == {"lines": 2, "malformed_lines": 6}
     # A writer that finds the damaged lines still keeps one label per finding.
     assert _label(batch_state, "o1-review", 1, "F0", "fixed") == 0
 

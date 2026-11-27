@@ -970,19 +970,23 @@ LABEL_OUTCOMES = (*FINDING_OUTCOME_LABELS, "contested", "unlabelled")
 
 @dataclass(frozen=True)
 class _Outcomes:
-    """The finding-outcome ledger: each review task's labels (finding id to label) and the contested findings."""
-    labels: Mapping[str, Mapping[str, str]] = field(default_factory=dict)
-    contests: frozenset[tuple[str, str]] = frozenset()
+    """The finding-outcome ledger: the labels (finding id to label) of each (review task, PR) publication and the
+    contested (review task, PR, finding id)."""
+    labels: Mapping[tuple[str, int], Mapping[str, str]] = field(default_factory=dict)
+    contests: frozenset[tuple[str, int, str]] = frozenset()
 
 
-def _label_tally(tally: Counter[str], row: _Row, count: int | None, outcomes: _Outcomes) -> None:
-    """Count one blocking review's P0-P1 findings by their author labels. The writer admits a label only for a P0-P1
-    finding of the review's own reply, so the labels never outnumber them; a contested label counts as contested."""
-    labels = outcomes.labels.get(row.task_id, {})
+def _label_tally(tally: Counter[str], row: _Row, outcomes: _Outcomes) -> None:
+    """Count one published blocking review's P0-P1 findings by their author labels, joined on the PR its publication
+    names. The writer admits a label only for a P0-P1 finding of the review's own reply, so the labels never outnumber
+    them; a contested label counts as contested. Unlabelled findings need the reply's priority counts."""
+    pr = cast(int, row.published_pr)
+    labels = outcomes.labels.get((row.task_id, pr), {})
     for finding_id, label in labels.items():
-        tally["label:" + ("contested" if (row.task_id, finding_id) in outcomes.contests else label)] += 1
-    if count is not None:
-        tally["label:unlabelled"] += max(count - len(labels), 0)
+        tally["label:" + ("contested" if (row.task_id, pr, finding_id) in outcomes.contests else label)] += 1
+    priorities = row.review[1] if row.review is not None else None
+    if priorities is not None:
+        tally["label:unlabelled"] += max(sum(priorities[p] for p in BLOCKING) - len(labels), 0)
 
 
 def _finding_outcomes(rows: Iterable[_Row], touched: Mapping[_HeadPair, frozenset[str]],
@@ -998,15 +1002,23 @@ def _finding_outcomes(rows: Iterable[_Row], touched: Mapping[_HeadPair, frozense
     their changed files read. Precision is fixed over fixed plus dismissed. Findings settle on the reviewer ids as recorded; ``name`` (the page's label bucket) applies
     only when the counts are grouped, so one reviewer's approval never settles another's finding.
 
-    ``labels`` counts the same findings by the author's recorded label (``outcomes``), whatever their file outcome:
-    ``fixed`` (a real error), ``wrong``, ``invented``, ``out_of_scope``, ``duplicate``, ``contested`` (a later review
-    contested the label) and ``unlabelled`` (from the review's P0-P1 count; none when that count is unknown).
+    ``labels`` counts the P0-P1 findings of every published blocking review of known effort, whether or not its row
+    names the author's model, by the author's recorded label (``outcomes``), whatever their file outcome: ``fixed``
+    (a real error), ``wrong``, ``invented``, ``out_of_scope``, ``duplicate``, ``contested`` (a later review contested
+    the label) and ``unlabelled`` (from the review's P0-P1 count; none when that count is unknown).
     ``real_precision`` is fixed over fixed plus wrong plus invented.
     """
     rows = list(rows)
     outcomes = outcomes or _Outcomes()
     counts: dict[str, Counter[str]] = defaultdict(Counter)
     efforts: dict[str, set[str]] = defaultdict(set)
+    for row in rows:
+        # Labels measure the reviewer alone: a blocking verdict published at the row's head counts whether or not the
+        # row names the PR author's model.
+        if row.effort != UNKNOWN_EFFORT and row.published == "CHANGES_REQUESTED" and row.published_pr is not None:
+            model = name(row.model)
+            efforts[model].add(row.effort)
+            _label_tally(counts[model], row, outcomes)
     for row in rows:
         # A formal review names its author's model; one dispatched by branch alone has no PR until a publication
         # supplies it, so the author model, not the PR, decides.
@@ -1022,7 +1034,6 @@ def _finding_outcomes(rows: Iterable[_Row], touched: Mapping[_HeadPair, frozense
         tally = counts[model]
         efforts[model].add(row.effort)
         tally["reviews"] += 1
-        _label_tally(tally, row, count, outcomes)
         if paths is None:
             tally["unknown"] += count or 0
             tally["reviews_without_paths"] += 1

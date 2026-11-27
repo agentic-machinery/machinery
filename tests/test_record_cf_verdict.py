@@ -1164,9 +1164,10 @@ def _outcomes(tmp_path):
 @pytest.mark.usefixtures('configured_roots', 'recorder_matcher')
 @pytest.mark.usefixtures("agent_runtime_roots")
 def test_finding_outcome_verb_refuses_unpublished_unknown_or_nonblocking_findings(monkeypatch, tmp_path, capsys):
-    """Defect class: an outcome label recorded for a finding the statistics cannot attribute to a published blocking
-    review (no publication, an unknown id, a P2 finding, an unstructured reply), without the evidence its label
-    needs, as free text in the ledger, or as a second, different label of one finding."""
+    """Defect class: an outcome label recorded for a finding the statistics cannot attribute to the review's own
+    published blocking verdict (no publication, a publication at another head, an unknown id, a P2 finding, an
+    unstructured reply), without the evidence its label needs, as free text in the ledger, as a second, different
+    label of one finding, or a same-label retry refused for its new evidence."""
     monkeypatch.setenv("LEARN_UKRAINIAN_DISPATCH_TASK_ID", "author-task")
     tasks, _comments, _calls = setup_record(monkeypatch, tmp_path)
     write_task(tasks, reply=_blocking_reply(["P1", "P2"]))
@@ -1179,7 +1180,13 @@ def test_finding_outcome_verb_refuses_unpublished_unknown_or_nonblocking_finding
         label("F1", "fixed")
     assert recorder.record("review-one", pr_number=42, task_root=tasks, lock_root=tmp_path / "locks")["verdict"] == (
         "CHANGES_REQUESTED")
-    with pytest.raises(recorder.RecordError, match="no published CHANGES_REQUESTED verdict"):
+    # A ledger line for this task on PR 43 at another head than the one it reviewed names no publication of it.
+    from lu_machinery.api import model_stats_rows
+
+    model_stats_rows.record_publications(tmp_path, [model_stats_rows.publication(
+        task_id="review-one", repository="owner/repo", pr=43, head="b" * 40, verdict="CHANGES_REQUESTED",
+        published_at="2026-09-23T13:00:00Z")])
+    with pytest.raises(recorder.RecordError, match="no published CHANGES_REQUESTED verdict .* at its reviewed head"):
         recorder.record_finding_outcome("review-one", pr_number=43, finding_id="F1", label="fixed", evidence=None,
                                         task_root=tasks)
     for finding in ("F2", "F9"):
@@ -1194,6 +1201,7 @@ def test_finding_outcome_verb_refuses_unpublished_unknown_or_nonblocking_finding
     assert _outcomes(tmp_path) == []
     assert label("F1", "wrong", "scripts/example.py:1 already resets the state")["status"] == "recorded"
     assert label("F1", "wrong", "scripts/example.py:1 already resets the state")["status"] == "already recorded"
+    assert label("F1", "wrong", "the reset runs on every call")["status"] == "already recorded"
     with pytest.raises(recorder.RecordError, match="already labelled wrong: a finding takes one label"):
         label("F1", "fixed")
     [line] = _outcomes(tmp_path)
@@ -1224,8 +1232,9 @@ def test_finding_outcome_verb_refuses_unpublished_unknown_or_nonblocking_finding
 @pytest.mark.usefixtures("agent_runtime_roots")
 def test_record_stores_a_contest_only_against_the_previous_blocking_round(monkeypatch, tmp_path):
     """Defect class: a CONTEST line bound to another round than the PR's previous blocking review (an older round,
-    the contesting review itself, a tie in GitHub's comment time taken in the wrong order), stored for an id that is
-    no P0-P1 finding of that round, or a reply that contests nothing changing the receipt."""
+    the contesting review itself, a later round on a rerun, a tie in GitHub's comment time taken in the wrong
+    order), stored for an id that is no P0-P1 finding of that round, or a reply that contests nothing changing the
+    receipt."""
     from lu_machinery.review import capability_failure
 
     tasks, _comments, _calls = setup_record(monkeypatch, tmp_path)
@@ -1247,9 +1256,11 @@ def test_record_stores_a_contest_only_against_the_previous_blocking_round(monkey
     assert third["outcome_contests"] == "stored against review-two: F1; unmatched: F2"
     assert [(line["task_id"], line["finding_id"], line["contested_by"]) for line in _outcomes(tmp_path)] == [
         ("review-one", "F2", "review-two"), ("review-two", "F1", "review-three")]
-    # A rerun stores nothing twice.
+    # A rerun stores nothing twice, and a rerun of round 2 after round 3 still binds round 1.
     assert recorder.record("review-three", pr_number=42, task_root=tasks, lock_root=tmp_path / "locks")[
         "outcome_contests"] == "stored against review-two: F1; unmatched: F2"
+    assert recorder.record("review-two", pr_number=42, task_root=tasks, lock_root=tmp_path / "locks")[
+        "outcome_contests"] == "stored against review-one: F2; unmatched: F3, F9"
     assert len(_outcomes(tmp_path)) == 2
 
 
