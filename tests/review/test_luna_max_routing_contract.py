@@ -526,9 +526,10 @@ def test_critical_review_never_falls_back_to_fable(author):
             routing_snapshot={"claude": "unhealthy", "agy": "unhealthy", "codex": "unhealthy", "cursor": "healthy"}, claude_account=HOST_ACCOUNT,
         )
     )
-    # REVIEW-ROTATION-GROK-1127: pinned Cursor Grok fills critical when Claude/AGY/Codex are down;
-    # when Cursor is down too, the resolver fails closed and never falls back to Fable.
-    assert resolution.selected is not None and resolution.selected.name == "grok-4.7-cursor-fallback"
+    # REVIEW-ROTATION-GROK-1127: Grok holds no critical sign-off, so with Claude/AGY/Codex down the
+    # resolver fails closed even though Cursor is healthy, and never falls back to Fable.
+    assert resolution.selected is None
+    assert not any(entry.name == "grok-4.7-cursor-fallback" and entry.status == "eligible" for entry in resolution.trace)
     assert not any(entry.name.startswith("claude-fable") for entry in resolution.trace)
     all_down = resolve_reviewer(
         ResolverInputs(
@@ -1465,9 +1466,9 @@ def test_scripts_relocation_follows_the_reviewed_repository(repository, relocate
     )
     governed = [entry.name for entry in result.trace if "subject exclusion" in (entry.reason or "")]
     if relocated:
-        # _FORKED_ADAPTERS governs agy/claude/codex/deepseek/gemini, not cursor/grok;
-        # pinned Cursor Grok stays eligible while the governed seats are subject-excluded.
-        assert result.selected is not None and result.selected.name == "grok-4.7-cursor-fallback"
+        # _FORKED_ADAPTERS governs agy/claude/codex/deepseek/gemini; Grok holds no critical
+        # sign-off (REVIEW-ROTATION-GROK-1127), so the critical security review fails closed.
+        assert result.selected is None
         assert "openai_frontier" in governed and "gemini-4-neon-high" in governed
     else:
         assert result.selected is not None and result.selected.family != "anthropic"
@@ -1540,7 +1541,7 @@ def test_reviewer_preview_without_branch_facts_judges_scripts_paths_by_repositor
     payload = json.loads(capsys.readouterr().out)
     governed = [entry["name"] for entry in payload["trace"] if "subject exclusion" in (entry.get("reason") or "")]
     if relocated:
-        assert code == 0 and payload["selected"]["name"] == "grok-4.7-cursor-fallback"
+        assert code == 1 and payload["selected"] is None
         assert "openai_frontier" in governed
     else:
         assert code == 0 and payload["selected"]["family"] != "anthropic"
@@ -1864,9 +1865,14 @@ _AUTHORITY_DOWN = {
 def test_exact_review_seat_matrix(author, risk, profile, state, snapshot, fallback):
     """Whole-ladder choices preserve other models' suitability at every risk."""
     if fallback:
-        # REVIEW-ROTATION-GROK-1127: pinned Cursor Grok fills when authorities are down,
-        # unless Cursor itself is down or the author is xai/moonshot (Cursor union lineage).
-        expected = None if state == "all-down" or author in {"grok-4.7", "kimi-code/k3"} else "grok-4.7-cursor-fallback"
+        # REVIEW-ROTATION-GROK-1127: pinned Cursor Grok fills low/medium/high when authorities are down,
+        # unless Cursor itself is down or the author is xai/moonshot (Cursor union lineage). Grok
+        # holds no critical sign-off, so critical fails closed.
+        expected = (
+            None
+            if risk == "critical" or state == "all-down" or author in {"grok-4.7", "kimi-code/k3"}
+            else "grok-4.7-cursor-fallback"
+        )
     elif author == CURRENT_SOL:
         expected = "claude-opus-5-5"
     else:
@@ -1906,7 +1912,7 @@ def test_last_resort_never_beats_eligible_sol_or_opus(profile, primary):
 @pytest.mark.parametrize("candidate", ["grok-4.7-cursor-fallback"])
 @pytest.mark.parametrize("profile", ["code", "infra"])
 def test_grok_critical_review_pin_fails_the_risk_gate(candidate, profile):
-    """REVIEW-ROTATION-GROK-1127 admits pinned Cursor Grok at critical while keeping family independence."""
+    """REVIEW-ROTATION-GROK-1127 keeps Grok out of critical and security final sign-off, even when pinned."""
     inputs = ResolverInputs(
         author_model=CURRENT_SOL,
         risk="critical",
@@ -1915,10 +1921,8 @@ def test_grok_critical_review_pin_fails_the_risk_gate(candidate, profile):
         pressure_override_reason="admission probe", claude_account=HOST_ACCOUNT,
     )
     resolution = resolve_reviewer(inputs, ladder=((REVIEW_CANDIDATES[candidate],),))
-    assert resolution.selected is not None and resolution.selected.name == candidate
-    same_family = resolve_reviewer(replace(inputs, author_model="grok-4.7"), ladder=((REVIEW_CANDIDATES[candidate],),))
-    assert same_family.selected is None
-    assert same_family.fail_closed_reason == f"explicit reviewer pin {candidate!r} failed a hard eligibility gate"
+    assert resolution.selected is None
+    assert resolution.fail_closed_reason == f"explicit reviewer pin {candidate!r} failed a hard eligibility gate"
 
 
 _SOL_OPUS = {CURRENT_SOL, "claude-opus-5-5"}
@@ -2069,7 +2073,6 @@ def test_critical_ladder_admits_neon_for_non_google_authors_and_excludes_google_
         "claude-opus-5-5",
         "claude-opus-5-5-agy",
         "gemini-4-neon-high",
-        "grok-4.7-cursor-fallback",
     ]
     high_names = [candidate.name for rung in REVIEW_LADDERS["high"] for candidate in rung]
     assert high_names == [

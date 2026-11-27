@@ -235,7 +235,7 @@ REVIEW_REQUIRED: dict[ReviewTier, str] = {
     "low": "one quick red-team pass: one non-author reviewer, --risk low, at most one fix confirmation",
     "medium": "one cross-family review",
     "ukrainian-content": "the Ukrainian profile's seats",
-    "high": "one cross-family review at --risk high or critical (Sol, Opus or Neon)",
+    "high": "one cross-family review at --risk high (Sol, Opus, Neon or Grok; the resolver picks) or critical (Sol, Opus or Neon)",
 }
 
 

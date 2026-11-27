@@ -50,15 +50,18 @@ requires a recorded APPROVE and the other merge gates. The author fixes a break-
 and the same reviewer confirms the fix in one delta round. That is the whole Low budget.
 
 The reviewer's risk is the `--risk` passed to the resolver: `high` or `critical` for a High-tier
-change. At `critical` and `high` the resolver seats Sol, Opus and Gemini 4 Neon High for code and
-infra (NEON-SOLTIER-1120: Neon sits after Sol and Opus on critical and alongside the Opus seats on
-high). For `code` and `infra` reviews the
+change. At `high`, `medium` and `low` the resolver seats Sol, Opus, Gemini 4 Neon High and pinned
+Cursor Grok 4.7 High as one equal group for code and infra, picking the eligible seat with the
+fewest recent reviews of record (REVIEW-ROTATION-GROK-1127). At `critical` it seats Sol, Opus and
+Gemini 4 Neon High only: critical and security sign-off stay unchanged pending planted-defect data
+(operator decides). For `code` and `infra` reviews the
 security-path classifier (`lu_machinery/review/security_paths.py`) is a floor: a change touching
 one of its paths, either name of a rename or a deletion included, is reviewed at `critical`
 whatever risk was passed. Nothing lowers that floor.
 
 One exact-head cross-family review per change (owner decision C-5345, 2026-11-12).
-Critical and high risk take Sol, Opus or Gemini 4 Neon High (NEON-SOLTIER-1120). There is no second review.
+High risk takes Sol, Opus, Gemini 4 Neon High or Grok 4.7 High; critical risk takes Sol, Opus or Gemini 4 Neon High
+(REVIEW-ROTATION-GROK-1127). There is no second review.
 
 ## 3. Findings
 

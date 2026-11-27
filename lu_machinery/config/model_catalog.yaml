@@ -48,9 +48,12 @@ policy:
       review through the existing Cursor transport, on trial (C-5308).
       Native Grok remains available for coding. Older Grok models remain
       historical identities.
-      Grok has no driver or Ukrainian authority; REVIEW-ROTATION-GROK-1127
-      admits Grok through its pinned Cursor route grok-4.7-high as an equal
-      formal code/infra reviewer alongside Sol, Opus and Neon at every risk level.
+      Grok has no driver, Ukrainian, or critical/security final-signoff
+      authority; REVIEW-ROTATION-GROK-1127 admits Grok through its pinned
+      Cursor route grok-4.7-high as an equal formal code/infra reviewer
+      alongside Sol, Opus and Neon at low, medium and high risk. Critical and
+      security sign-off stay Sol, Opus and Neon pending planted-defect data
+      (operator decides).
     - >-
       Kimi models are retired (OO-58, #11327, 2026-10-21; unused since
       2026-10-13, reconfirmed 2026-10-18 and 2026-10-21). Dispatch refuses
@@ -109,16 +112,17 @@ review_scheduler:
     code:
       critical: [critical_review]
       # REVIEW-ROTATION-GROK-1127 (operator 2026-11-27): Sol 6.2, Opus 5.5,
-      # Neon High and pinned Cursor Grok 4.7 High all hold critical_review and
-      # rank equally at every risk level.
-      high: [critical_review, strong_review, standard_review, long_context_review]
-      medium: [critical_review, standard_review, strong_review, long_context_review, routine_review]
-      low: [critical_review, routine_review, standard_review, strong_review, long_context_review]
+      # Neon High and pinned Cursor Grok 4.7 High all hold standard_review and
+      # rank equally at low, medium and high. Critical keeps critical_review
+      # only (Sol, Opus and Neon; Grok holds no critical_review).
+      high: [standard_review, critical_review, strong_review, long_context_review]
+      medium: [standard_review, critical_review, strong_review, long_context_review, routine_review]
+      low: [standard_review, critical_review, routine_review, strong_review, long_context_review]
     infra:
       critical: [critical_review, security_review]
-      high: [critical_review, security_review, strong_review, standard_review, long_context_review]
-      medium: [critical_review, standard_review, strong_review, security_review, long_context_review, routine_review]
-      low: [critical_review, routine_review, standard_review, strong_review, security_review, long_context_review]
+      high: [standard_review, critical_review, security_review, strong_review, long_context_review]
+      medium: [standard_review, critical_review, strong_review, security_review, long_context_review, routine_review]
+      low: [standard_review, critical_review, routine_review, strong_review, security_review, long_context_review]
   # Operator decision 2026-10-03 (#9583): activity admission reads a pinned
   # model's catalog `roles`. A review, critique or approval of record (delegate
   # review dispatch, bridge review, recorded verdict) needs a `review` role; an
@@ -156,7 +160,8 @@ review_scheduler:
   # pins, custom ladders and delegate review admission all apply it.
   # REVIEW-ROTATION-GROK-1127 (operator 2026-11-27): Sol 6.2, Opus 5.5,
   # Gemini 4 Neon High and pinned Cursor Grok 4.7 High are one equal formal
-  # code/infra reviewer group at every risk tier, including high and critical.
+  # code/infra reviewer group at low, medium and high risk. Critical and
+  # security sign-off stay Sol 6.2, Opus 5.5 and Neon High (no Grok).
   risk_reviewer_models:
     high:
     - {role: openai_frontier_coder}
@@ -642,6 +647,7 @@ models:
       - orchestration
       - architecture
       - agentic_coding
+      - standard_review
       - critical_review
       - security_review
     transports: [native_claude, agy]
@@ -819,7 +825,7 @@ models:
     tier: frontier_authority
     lifecycle: active
     runtime_model_ids: [gemini-4-neon-low, gemini-4-neon-medium, gemini-4-neon-xhigh]
-    roles: [orchestration, implementation, agentic_coding, advisory, long_context_review, critical_review, ukrainian_review]
+    roles: [orchestration, implementation, agentic_coding, advisory, standard_review, long_context_review, critical_review, ukrainian_review]
     transports: [agy]
     strengths: [listed_agy_selector, one_million_token_context, four_thinking_levels]
     weaknesses: [provider_listing_is_not_qualification]
@@ -995,22 +1001,23 @@ models:
     lifecycle: active
     # C-5307 reverses GROK-CANCEL-1110 for this model; REVIEW-ROTATION-GROK-1127
     # places pinned Cursor grok-4.7-high in the equal formal code/infra review
-    # group at every risk level alongside Sol 6.2, Opus 5.5 and Neon High.
+    # group at low, medium and high risk alongside Sol 6.2, Opus 5.5 and Neon High.
     # Native CLI selector: grok-4.7; attested modelUsage id: grok-4.7-build.
     # Formal Cursor reviews use the exact high-effort wire pin.
     routing_wire_ids: {native_grok: grok-4.7, cursor: grok-4.7-high}
     aliases: [grok-4.7-build, grok-4.7-high]
     runtime_model_ids: [grok-4.7-build]
-    roles: [coding, standard_review, critical_review]
+    roles: [coding, standard_review]
     transports: [native_grok, cursor]
     strengths: [strong_coding, sharp_review, agentic_work, residual_positional_review]
     weaknesses: [native_subscription_window]
     notes: >-
       Operator order C-5307 restores native coding and Cursor review;
       REVIEW-ROTATION-GROK-1127 admits pinned Cursor grok-4.7-high as an equal
-      formal code/infra reviewer at every risk level alongside Sol 6.2, Opus 5.5
-      and Neon High. The native read-only canary accepts grok-4.7 and attests
-      grok-4.7-build. It holds no driver or Ukrainian role. Formal reviews use
+      formal code/infra reviewer at low, medium and high risk alongside Sol 6.2,
+      Opus 5.5 and Neon High. The native read-only canary accepts grok-4.7 and
+      attests grok-4.7-build. It holds no driver, Ukrainian, or critical/security
+      final-signoff role. Formal reviews use
       the existing Cursor provider at grok-4.7-high. The native runtime transport
       supports coding; no native dispatcher provider exists.
     sources:
@@ -1458,22 +1465,28 @@ formal_cf_defaults:
 
 review_ladders:
   # Hard filters precede last-resort preference, then suitability and quality.
-  # REVIEW-ROTATION-GROK-1127 (operator 2026-11-27): at every risk level, Sol,
-  # Opus, Neon and pinned Cursor Grok (grok-4.7-high) are one equal group; the
-  # resolver picks the eligible seat with the fewest recent reviews of record
-  # (ties broken by catalog order).
+  # REVIEW-ROTATION-GROK-1127 (operator 2026-11-27): at low, medium and high
+  # risk, Sol, Opus, Neon and pinned Cursor Grok (grok-4.7-high) are one equal
+  # group; critical holds Sol, Opus and Neon only. The resolver picks the
+  # eligible seat with the fewest recent reviews of record (ties broken by
+  # catalog order).
   # No Claude model reviews through Cursor (D-129, #10464).
   # Unsubscribed models have no review candidates. Fable holds no review role (#9583).
-  critical: &frontier_review_peer_group
+  critical:
+    - - {role: openai_frontier_coder, seat: openai_frontier, route_name: native_b, field: legacy_label}
+      - {role: openai_frontier_coder, seat: openai_frontier, route_name: native, field: legacy_label}
+      - {role: anthropic_authority_reviewer, seat: anthropic_authority, route_name: native, field: legacy_label}
+      - {role: anthropic_authority_reviewer, seat: anthropic_authority, route_name: agy, field: legacy_label}
+      - {role: legacy_reviewers, seat: google_bounded, route_name: native, field: legacy_label}
+  # High lists only review_scheduler.risk_reviewer_models.high (#9538): when
+  # no seat is eligible the resolver returns no reviewer with a stated reason.
+  high:
     - - {role: openai_frontier_coder, seat: openai_frontier, route_name: native_b, field: legacy_label}
       - {role: openai_frontier_coder, seat: openai_frontier, route_name: native, field: legacy_label}
       - {role: anthropic_authority_reviewer, seat: anthropic_authority, route_name: native, field: legacy_label}
       - {role: anthropic_authority_reviewer, seat: anthropic_authority, route_name: agy, field: legacy_label}
       - {role: legacy_reviewers, seat: google_bounded, route_name: native, field: legacy_label}
       - {role: legacy_reviewers, seat: xai_reviewer, route_name: cursor_fallback, field: legacy_label}
-  # High lists only review_scheduler.risk_reviewer_models.high (#9538): when
-  # no seat is eligible the resolver returns no reviewer with a stated reason.
-  high: *frontier_review_peer_group
   medium: &practical_first_code_review
     - - {role: openai_frontier_coder, seat: openai_frontier, route_name: native_b, field: legacy_label}
       - {role: openai_frontier_coder, seat: openai_frontier, route_name: native, field: legacy_label}
@@ -1515,7 +1528,7 @@ seats:
       cursor_fallback:
         legacy_name: grok-4.7-cursor-fallback
         effort: high
-        suitability_roles: [critical_review, standard_review]
+        suitability_roles: [standard_review]
         route: cursor
         transport: cursor
         invocation: .venv/bin/python -m lu_machinery.dispatch dispatch --agent cursor --model {wire_id} --effort high
@@ -1739,7 +1752,6 @@ roles:
     - anthropic_authority/native
     - anthropic_authority/agy
     - google_bounded/native
-    - xai_reviewer/cursor_fallback
     cardinality: many
     risk: critical
     required_model_roles:
