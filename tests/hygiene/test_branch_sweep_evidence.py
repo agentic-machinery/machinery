@@ -40,6 +40,7 @@ def repo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     git(root, "commit", "-m", "base")
     git(root, "remote", "add", "origin", str(remote))
     git(root, "push", "-u", "origin", "main")
+    monkeypatch.setenv("LU_STATE_ROOT", str(root))
     return root
 
 

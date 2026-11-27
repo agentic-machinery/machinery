@@ -114,9 +114,10 @@ def test_no_checkout_teardown_retains_unattributed_output_without_ignore_rules(t
     assert "missing canonical task attribution; refusing worktree removal" in caplog.text
 
 
-def test_acp_teardown_explicit_retention_preserves_canonical_bytes(tmp_path):
+def test_acp_teardown_explicit_retention_preserves_canonical_bytes(tmp_path, monkeypatch):
     primary = _make_primary(tmp_path)
-    tasks = primary / "batch_state/tasks"
+    monkeypatch.setenv("LU_STATE_ROOT", str(tmp_path))
+    tasks = tmp_path / "batch_state/tasks"
     tasks.mkdir(parents=True)
     record = tasks / "retained-9742.json"
     result = record.with_suffix(".result")
@@ -145,7 +146,7 @@ def test_acp_teardown_explicit_retention_preserves_canonical_bytes(tmp_path):
         assert receipt["retention_disposition"] == "retained" and receipt["owner"] == "retained-9742"
         assert receipt["next_condition"]
         assert_record_only(receipt, {".cache/output.bin": b"ignored output\x00\xff"})
-        assert not (primary / "batch_state/preserved").exists()
+        assert not (tmp_path / "batch_state/preserved").exists()
         assert [hashlib.sha256(p.read_bytes()).hexdigest() for p in (result, output)] == before[1:]
         assert workspace.exists() and _git(workspace, "rev-parse", "HEAD").stdout.strip() == head
         row = _acp_execution._remove_runtime_worktree(

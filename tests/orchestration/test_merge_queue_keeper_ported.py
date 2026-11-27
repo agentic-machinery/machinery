@@ -1003,7 +1003,9 @@ def test_report_does_not_write_state(tmp_path: Path, monkeypatch: pytest.MonkeyP
 
 
 def test_lock_overlap_exits_without_network(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    lock_path = tmp_path / "batch_state/locks/merge_queue_keeper.lock"
+    state_root = tmp_path / "state"
+    monkeypatch.setenv("LU_STATE_ROOT", str(state_root))
+    lock_path = state_root / "batch_state/locks/merge_queue_keeper.lock"
     lock_path.parent.mkdir(parents=True)
     with lock_path.open("a+") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -1771,7 +1773,9 @@ def test_throttled_uses_the_last_observed_run(tmp_path: Path) -> None:
 def test_slow_mode_skips_apply_without_network(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     from datetime import UTC, datetime
 
-    state = tmp_path / "batch_state/merge_queue_keeper.json"
+    state_root = tmp_path / "state"
+    monkeypatch.setenv("LU_STATE_ROOT", str(state_root))
+    state = state_root / "batch_state/merge_queue_keeper.json"
     state.parent.mkdir(parents=True)
     state.write_text(json.dumps({"queued": {}, "drops": {}, "observed": datetime.now(UTC).isoformat()}))
     flag = tmp_path / "slow"

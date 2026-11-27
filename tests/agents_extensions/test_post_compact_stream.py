@@ -154,7 +154,7 @@ def _run_hook(
             "SESSION_EPIC": selector,
             "LEARN_UKRAINIAN_PYTHON": str(wrapper),
             "LEARN_UKRAINIAN_PRIMARY_REPO_ROOT": str(repo),
-            "LEARN_UKRAINIAN_STATE_ROOT": str(repo),
+            "LU_STATE_ROOT": str(repo),
             "LU_PRODUCT_ROOT": str(repo),
             "SESSION_BOUNDED_RUNNER": str(machinery_path('agent_runtime/bounded_command.py')),
             "CODEX_COMPACT_SESSION_START": "1",

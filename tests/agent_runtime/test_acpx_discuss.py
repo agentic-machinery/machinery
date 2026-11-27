@@ -334,6 +334,7 @@ def test_panel_with_a_kimi_seat_is_refused_before_any_call(tmp_path, monkeypatch
 def test_conversation_survives_dispatch_worktree_cleanup(tmp_path, monkeypatch):
     monkeypatch.setenv("LU_ACPX_TRANSPORT", "active")
     monkeypatch.delenv("FLEET_COMMS_ROOT", raising=False)
+    monkeypatch.setenv("LU_STATE_ROOT", str(tmp_path))
     monkeypatch.setattr(acpx_discuss, "classify_repo_path", lambda *_a, **_k: "dispatch_worktree")
     primary = tmp_path / "primary"
     (primary / ".git").mkdir(parents=True)
@@ -365,7 +366,7 @@ def test_conversation_survives_dispatch_worktree_cleanup(tmp_path, monkeypatch):
 
     shutil.rmtree(primary / ".worktrees")
 
-    assert root == primary / "batch_state" / "fleet-comms" / "v1"
+    assert root == tmp_path / "batch_state" / "fleet-comms" / "v1"
     assert not worktree.exists()
     with ArtifactStore(root=root) as reopened:
         row = reopened.connection.execute(

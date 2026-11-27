@@ -259,6 +259,7 @@ def test_publish_runs_the_fleet_comms_channel_publish_command(monkeypatch, tmp_p
         (tmp_path / ".git" / entry).mkdir(parents=True)
     (tmp_path / ".git" / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
     monkeypatch.setenv("LEARN_UKRAINIAN_PRIMARY_REPO_ROOT", str(tmp_path))
+    monkeypatch.setenv("LU_STATE_ROOT", str(tmp_path))
     monkeypatch.delenv("LU_TEST_DISPATCH_HEALTHY_HOST", raising=False)
     monkeypatch.setattr(adm, "primary_checkout", lambda: tmp_path)
     seen: dict = {}

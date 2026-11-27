@@ -675,6 +675,7 @@ exec {shlex.quote(sys.executable)} "$@"
         # The one interpreter rule (R66, #100 R74): the publisher uses the configured interpreter.
         "LEARN_UKRAINIAN_PYTHON": str(bindir / "python"),
         "FLEET_COMMS_ROOT": str(plane),
+        "LU_STATE_ROOT": str(tmp_path),
         "LEARN_UKRAINIAN_PRIMARY_REPO_ROOT": os.environ["LEARN_UKRAINIAN_PRIMARY_REPO_ROOT"],
         "SESSION_HANDOFF_AGENT": "fixture-driver",
         "TEST_PUBLISH_ARGS": str(tmp_path / "publish-args"),

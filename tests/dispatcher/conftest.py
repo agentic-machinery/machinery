@@ -259,7 +259,8 @@ def sandbox(tmp_path, hermetic_monitor, configured_roots, sources_product_root, 
     # The dispatcher runs as a subprocess here, out of reach of the in-process probe stub
     # (conftest ``dispatch_slice_probe``); without the forced fallback it asks the host user
     # manager and starts every stub worker in a real ``lu-worker-*`` scope.
-    env = {**os.environ, "LU_TASKS_DIR": str(tasks), "LU_DISPATCH_ISOLATION": "fallback", "LU_PRODUCT_ROOT": str(repo), "LEARN_UKRAINIAN_PRIMARY_REPO_ROOT": str(repo)}
+    env = {**os.environ, "LU_TASKS_DIR": str(tasks), "LU_DISPATCH_ISOLATION": "fallback",
+           "LU_STATE_ROOT": str(repo), "LU_PRODUCT_ROOT": str(repo), "LEARN_UKRAINIAN_PRIMARY_REPO_ROOT": str(repo)}
     env.pop("PYTHONPATH", None)
     if "LU_NODE_TOOLCHAIN_DIRS" not in env:
         from lu_machinery.dispatcher import site_deps
@@ -370,6 +371,7 @@ def local_branches(repo):
 
 def in_process_repo(sandbox, monkeypatch):
     monkeypatch.setenv("LU_TASKS_DIR", str(sandbox.tasks))
+    monkeypatch.setenv("LU_STATE_ROOT", str(sandbox.repo))
     monkeypatch.setenv("LU_PRODUCT_ROOT", str(sandbox.repo))
     monkeypatch.setenv("LEARN_UKRAINIAN_PRIMARY_REPO_ROOT", str(sandbox.repo))
     monkeypatch.setattr(git, "machinery_path", lambda _rel: sandbox.repo / "lu_machinery/config/fleet_repos.yaml")

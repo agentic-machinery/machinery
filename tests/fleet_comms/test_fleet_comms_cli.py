@@ -161,14 +161,11 @@ def test_plane_status_cli_root_flag(tmp_path: Path, monkeypatch: pytest.MonkeyPa
 
     loop = tmp_path / "loop"
     loop.symlink_to(loop)
-    default_root = checkout / "batch_state" / "fleet-comms" / "v1"
+    state = tmp_path / "state"
+    default_root = state / "batch_state" / "fleet-comms" / "v1"
     default_root.parent.mkdir(parents=True)
     default_root.symlink_to(loop)
-    # The default plane is the shared-state anchor's, so name the checkout as that anchor.
-    for part in ("objects", "refs"):
-        (checkout / ".git" / part).mkdir()
-    (checkout / ".git" / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
-    monkeypatch.setenv("LEARN_UKRAINIAN_PRIMARY_REPO_ROOT", str(checkout))
+    monkeypatch.setenv("LU_STATE_ROOT", str(state))
     before = sorted(tmp_path.rglob("*"))
     monkeypatch.chdir(checkout)
     connect = Mock(side_effect=AssertionError("unresolvable root reached backend"))

@@ -84,6 +84,7 @@ def report_checkout(tmp_path, monkeypatch):
     (tmp_path / ".gitignore").write_text("batch_state/\n")
     monkeypatch.setenv("LU_PRODUCT_ROOT", str(tmp_path))
     monkeypatch.setenv("LEARN_UKRAINIAN_PRIMARY_REPO_ROOT", str(tmp_path))
+    monkeypatch.setenv("LU_STATE_ROOT", str(tmp_path))
     monkeypatch.delenv("LEARN_UKRAINIAN_STATE_ROOT", raising=False)
 
 

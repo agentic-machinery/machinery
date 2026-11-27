@@ -62,6 +62,7 @@ def _run_hook(worktree: Path, primary: Path, **overrides: str) -> str:
     environment.update(
         CLAUDE_PROJECT_DIR=str(worktree),
         LEARN_UKRAINIAN_PRIMARY_REPO_ROOT=str(primary),
+        LU_STATE_ROOT=str(primary),
         SESSION_HANDOFF_AGENT="claude",
         **overrides,
     )

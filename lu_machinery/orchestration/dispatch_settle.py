@@ -27,7 +27,7 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from lu_machinery.common import github_client, json_depth
 from lu_machinery.common.git_credentials import verification_credentials
-from lu_machinery.common.repo_root import state_root
+from lu_machinery.common.repo_root import primary_root, state_root
 from lu_machinery.dispatcher import write_boundary
 from lu_machinery.fleet import idle_settle as idle_settle
 from lu_machinery.guardrails.delegate_ownership import (
@@ -548,7 +548,7 @@ def settle_task(
         # Pure history: skip branch/PR probing that requires the reaped worktree.
         pr_url, pr_number = None, None
     else:
-        pr_cwd = worktree if worktree is not None and worktree.is_dir() else root
+        pr_cwd = worktree if worktree is not None and worktree.is_dir() else primary_root()
         pr_url, pr_number = _find_pr(branch, pr_cwd)
 
     if push and worktree is not None and branch and (commits_ahead or 0) > 0:

@@ -611,7 +611,7 @@ def test_dispatcher_killed_while_provisioning_its_worktree_leaves_it_removable(s
     # The remover reads the records of the checkout that controls the tree, so keep them there.
     tasks = sandbox.repo / "batch_state" / "tasks"
     sandbox.env["LU_TASKS_DIR"] = str(tasks)
-    for name, value in (("LU_TASKS_DIR", tasks), ("LU_PRODUCT_ROOT", sandbox.repo),
+    for name, value in (("LU_TASKS_DIR", tasks), ("LU_STATE_ROOT", sandbox.repo), ("LU_PRODUCT_ROOT", sandbox.repo),
                         ("LEARN_UKRAINIAN_PRIMARY_REPO_ROOT", sandbox.repo)):
         monkeypatch.setenv(name, str(value))
     # The child actually dies. No exception handler or finally can preserve its attribution for it.
