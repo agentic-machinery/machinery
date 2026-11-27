@@ -633,13 +633,13 @@ def _unreadable_recipient_cause(recipient: str) -> tuple[str, str] | None:
     """``(name, cause)`` when no drain reads this recipient, else ``None``; reads no store.
 
     Mirrors ``deliveries pending``: a historical alias is not checked, and the
-    standing comes from one roster read. Only a proven standing refuses; an
-    unknown one (incomplete roster, damaged task record) is admitted, so doubt
-    never hides mail, and the claim path then answers as it did before this check.
-
-    Each evidence source fails on its own. An unreadable alias or roster source
-    proves nothing about the name's registration, so ``not_registered`` is not
-    refused then; a readable terminal task record still proves ``settled_task``.
+    standing comes from one roster read. It refuses only on complete registration
+    evidence: the alias lookup succeeded and the roster is complete. A registered
+    name then matches before any task record, so a task id that equals a
+    registered inbox never refuses that inbox. During any roster or alias outage,
+    and for an unknown standing (damaged task record) or any failure to classify,
+    the name is admitted, so doubt never hides mail; the claim path then answers
+    as it did before this check.
     """
     from lu_machinery.agent_identity import resolve_recipient_alias
     from lu_machinery.fleet_comms.authority import (
@@ -650,19 +650,13 @@ def _unreadable_recipient_cause(recipient: str) -> tuple[str, str] | None:
     )
 
     name = _nonempty(recipient, field="recipient")
-    registration_known = True
     try:
         if resolve_recipient_alias(name) != name:
             return None
-    except Exception:
-        registration_known = False
-    try:
-        roster = _load_roster()
-    except Exception:
-        registration_known = False
-        roster = (frozenset(), False)
-    try:
-        standing = _recipient_standing(name, roster[0], roster[1] and registration_known)
+        registered, complete = _load_roster()
+        if not complete:
+            return None
+        standing = _recipient_standing(name, registered, complete)
     except Exception:
         return None
     if standing not in {"not_registered", "settled_task"}:

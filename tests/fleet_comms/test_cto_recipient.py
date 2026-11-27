@@ -347,31 +347,39 @@ def test_claim_and_receive_admit_a_recipient_of_unknown_standing(plane, tasks, c
     assert received["delivery"]["recipient"] == name
 
 
-@pytest.mark.parametrize("unreadable", ["alias_source", "roster_source"])
+@pytest.mark.parametrize(("kind", "outage"), [
+    ("task", "alias_source"),
+    ("task", "roster_incomplete"),
+    ("slot", "alias_source"),
+    ("slot", "roster_incomplete"),
+    ("slot", None),
+])
 @pytest.mark.parametrize("operation", ["receive", "claim"])
-def test_a_settled_task_is_refused_when_a_roster_source_is_unreadable(
-    plane, tasks, capsys, monkeypatch, unreadable, operation,
+def test_a_settled_task_record_never_refuses_without_complete_registration_evidence(
+    plane, tasks, capsys, monkeypatch, tmp_path, kind, outage, operation,
 ):
-    """Defect class: a failure in one evidence source (alias or roster read) discards the task record's proof of
-    settlement, so mail queued to a settled task is leased instead of refused."""
+    """Defect class: a settled task record whose id equals a registered inbox (a slot-only name here) refuses that
+    live inbox, because during a roster or alias outage nothing proves the name is not registered."""
     from lu_machinery import agent_identity
     from lu_machinery.common.profile import ProfileError
-    from lu_machinery.fleet_comms import authority
+    from lu_machinery.ops import driver_lanes
 
-    worker = tasks("cto-10-i10-worker", "running")
+    lanes = {item.sender for item in driver_lanes.load_registry().lanes}
+    slots = agent_identity._load_registry_slots(agent_identity.ASSIGNMENTS_PATH)
+    name = "cto-10-i10-worker" if kind == "task" else next(slot for slot in slots if slot not in lanes)
+    tasks(name, "running")
     with AuthorityService(root=plane) as service:
-        service.publish_message(sender="claude-cto", body="apply option B", recipients=(worker,))
-    tasks(worker, "done")
-    before = delivery_snapshot(plane)
+        service.publish_message(sender="claude-cto", body="apply option B", recipients=(name,))
+    tasks(name, "done")
+    if outage == "alias_source":
+        def unavailable():
+            raise ProfileError("area_assignments entry names a missing file")
 
-    def fail():
-        raise ProfileError("area_assignments entry names a missing file")
-
-    target = (agent_identity, "default_assignments_path") if unreadable == "alias_source" else (authority, "_load_roster")
-    monkeypatch.setattr(*target, fail)
-    refused = run(capsys, "deliveries", operation, "--recipient", worker, "--worker-id", worker, expected=EXIT_ERROR)
-    assert (refused["error"], refused["queued"], refused["running"]) == ("recipient_settled", 1, 0)
-    assert delivery_snapshot(plane) == before
+        monkeypatch.setattr(agent_identity, "default_assignments_path", unavailable)
+    elif outage == "roster_incomplete":
+        monkeypatch.setattr(agent_identity, "ASSIGNMENTS_PATH", tmp_path / "unavailable")
+    got = run(capsys, "deliveries", operation, "--recipient", name, "--worker-id", "seat-1")
+    assert (got["delivery"] if operation == "receive" else got)["recipient"] == name
 
 
 def test_dead_subscription_still_receiving_broadcasts_ends_when_its_task_settles(plane, tasks):
