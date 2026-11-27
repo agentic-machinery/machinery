@@ -7,6 +7,7 @@ import importlib.util
 import json
 import os
 import re
+import runpy
 import shlex
 import sys
 import uuid
@@ -25,7 +26,6 @@ from lu_machinery.common.safe_open import safe_open_below
 from lu_machinery.host_context import (
     HostContextError,
     hook_environment,
-    hook_interpreter,
     load_hook_context,
 )
 
@@ -197,19 +197,23 @@ def run_native_hook(mode: str) -> int:
         return _refuse_hook(mode, "invalid_invocation_git", "invocation directory is unavailable")
 
     env = {**os.environ, **hook_environment(context)}
-    python = os.fspath(context.runtime.python)
     try:
         if mode in CLAUDE_GUARD_MODES or mode == "claude-audit-hook":
             entry = "audit-primary-checkout-dirt" if mode == "claude-audit-hook" else mode.removeprefix("claude-")
             module = f"agents_extensions.shared.hooks.{entry}"
             if importlib.util.find_spec(module) is None:
                 return _refuse_hook(mode, "hook_unavailable", "installed hook module is missing")
-            os.execve(python, [python, "-I", "-m", module], env)
+            # The native entry is already running under the validated isolated
+            # interpreter. Run the release-owned module in the same process.
+            os.environ.update(hook_environment(context))
+            sys.argv[:] = [module]
+            runpy.run_module(module, run_name="__main__", alter_sys=True)
+            return 0
         else:
             script = machinery_path("agy_hooks/driver_state_inject.sh")
             if not script.is_file():
                 return _refuse_hook(mode, "hook_unavailable", "installed hook script is missing")
-            os.execve("/bin/bash", ["/bin/bash", os.fspath(script), mode], env)
+            os.execve("/bin/bash", ["/bin/bash", os.fspath(script), mode, "--host-context"], env)
     except (ImportError, OSError):
         return _refuse_hook(mode, "hook_exec_failed", "installed hook could not be started")
 
@@ -327,14 +331,9 @@ def _legacy_hook_command(mode: str) -> str:
 
 
 def native_hook_command(mode: str, *, python: Path | None = None) -> str:
-    """Render a native hook with the machinery interpreter selected by deployment."""
-    if mode not in _CLAUDE_NATIVE_MODES:
+    """Render a bound Claude command or retain the published legacy registration."""
+    if python is None or mode not in _CLAUDE_NATIVE_MODES:
         return _legacy_hook_command(mode)
-    if python is None:
-        try:
-            python = hook_interpreter()
-        except HostContextError as exc:
-            raise AgyHookConfigError(exc.code) from None
     command = "exec " + shlex.join([
         os.fspath(python), "-I", "-B", "-m", "lu_machinery.agent_runtime.agy_hook_config", "--run-hook", mode,
     ])

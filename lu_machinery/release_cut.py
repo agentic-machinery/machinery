@@ -1326,8 +1326,11 @@ class Cut:
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text(json.dumps(data))
         deploy: list[str | Path] = [python, "-I", "-m", "lu_machinery.agent_deploy", "--project-root", consumer]
-        self.run(deploy, env=self.scratch_env())
-        self.run([*deploy, "--check"], env=self.scratch_env())
+        binding = self.work / "agent-consumer-binding"
+        binding.mkdir(mode=0o700)
+        deploy_env = self._consumer_env(binding, python, consumer)
+        self.run(deploy, env=deploy_env)
+        self.run([*deploy, "--check"], env=deploy_env)
         self.say("every module imports from the installed wheel; deployer apply and check pass on a scratch consumer")
 
     def _consumer_interpreter(self, python: Path, product: Path) -> Path:

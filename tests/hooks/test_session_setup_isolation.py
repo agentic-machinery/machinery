@@ -19,6 +19,7 @@ from pathlib import Path
 import pytest
 
 from lu_machinery.common.repo_root import machinery_root
+from tests.host_context.conftest import host_layout as host_layout
 
 _REPO_ROOT = machinery_root().parent
 _HOOK = _REPO_ROOT / "agents_extensions" / "shared" / "hooks" / "session-setup.sh"
@@ -77,6 +78,7 @@ def _run_hook(
     plant_log: Path,
     hook: Path = _HOOK,
     primary: Path | None = None,
+    binding_env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     env = {
         "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
@@ -93,6 +95,7 @@ def _run_hook(
     env["LEARN_UKRAINIAN_PRIMARY_REPO_ROOT"] = str(primary or project or cwd)
     if pythonpath is not None:
         env["PYTHONPATH"] = pythonpath
+    env.update(binding_env or {})
     return subprocess.run(
         ["bash", str(hook)], cwd=cwd, env=env, input=_STDIN, capture_output=True, text=True, timeout=120, check=False
     )
@@ -121,18 +124,21 @@ def test_hook_tree_supplies_its_code_to_a_project_without_machinery(tmp_path: Pa
     assert not (_REPO_ROOT / ".agent" / "sessions" / "isolation-probe.json").exists()
 
 
-def _deploy_lines(project: Path, tmp_path: Path, cwd: Path | None = None, primary: Path | None = None) -> list[str]:
+def _deploy_lines(
+    project: Path, tmp_path: Path, binding_env: dict[str, str], cwd: Path | None = None, primary: Path | None = None,
+) -> list[str]:
     home = tmp_path / "home"
     home.mkdir(exist_ok=True)
     result = _run_hook(
-        cwd=cwd or project, home=home, project=project, pythonpath=None, plant_log=tmp_path / "log", primary=primary
+        cwd=cwd or project, home=home, project=project, pythonpath=None, plant_log=tmp_path / "log",
+        primary=primary, binding_env=binding_env,
     )
     assert result.returncode == 0, result.stderr
     context = json.loads(result.stdout)["hookSpecificOutput"]["additionalContext"]
     return [line.strip() for line in context.splitlines() if "DEPLOY DRIFT" in line]
 
 
-def test_session_start_drift_check_matches_the_installed_deployer(tmp_path: Path) -> None:
+def test_session_start_drift_check_matches_the_installed_deployer(tmp_path: Path, host_layout) -> None:
     """Defect class: the SessionStart drift check gives false drift on a clean release deployment or hides real drift.
 
     A consumer deployed by the installed release keeps only its own sources, so only the deployer's check can
@@ -171,17 +177,22 @@ def test_session_start_drift_check_matches_the_installed_deployer(tmp_path: Path
     descriptor["sources"]["shared"] = {"path": "agents_extensions/shared", "required": True}
     (project / "agents_extensions/deployment.v1.json").write_text(json.dumps(descriptor), encoding="utf-8")
     deploy = [sys.executable, "-I", "-m", "lu_machinery.agent_deploy", "--project-root", str(project)]
-    applied = subprocess.run(deploy, capture_output=True, text=True, check=False)
+    host_layout.data["runtime"]["python"] = sys.executable
+    host_layout.data["repos"] = {"machinery": str(project)}
+    host_layout.data["products"]["public"]["repo"] = "machinery"
+    host_layout.write()
+    binding_env = {**host_layout.env, "LU_PRODUCT_ROOT": str(project)}
+    applied = subprocess.run(deploy, env=binding_env, capture_output=True, text=True, check=False, timeout=120)
     assert applied.returncode == 0, applied.stderr
     (project / ".claude/atlas-epic").mkdir()
     (project / ".claude/atlas-epic/DRIVER-STATE.md").write_text("runtime\n", encoding="utf-8")
 
     # The second start also sees the session state and lease the first one wrote.
-    assert _deploy_lines(project, tmp_path) == []
-    assert _deploy_lines(project, tmp_path) == []
+    assert _deploy_lines(project, tmp_path, binding_env) == []
+    assert _deploy_lines(project, tmp_path, binding_env) == []
     link = tmp_path / "project-link"
     link.symlink_to(project)
-    assert _deploy_lines(Path(str(link) + "/"), tmp_path, cwd=project) == []
+    assert _deploy_lines(Path(str(link) + "/"), tmp_path, binding_env, cwd=project) == []
     # A root whose name ends in a newline is unsafe input, so its clean namesake (the valid project
     # beside it) is never checked in its place: as the anchor it refuses before any interpreter
     # starts, and as the configured product it refuses at the hook bootstrap, even from a clean cwd.
@@ -201,11 +212,11 @@ def test_session_start_drift_check_matches_the_installed_deployer(tmp_path: Path
     worktree = tmp_path / "worktree"
     subprocess.run(["git", "-C", str(project), "worktree", "add", "-q", str(worktree)], check=True)
     assert (worktree / "agents_extensions/deployment.v1.json").is_file()
-    assert _deploy_lines(worktree, tmp_path, primary=project) == []
+    assert _deploy_lines(worktree, tmp_path, binding_env, primary=project) == []
 
     deployed = next(path for path in sorted((project / ".claude/rules").iterdir()) if path.is_file())
     deployed.write_bytes(deployed.read_bytes() + b"edited\n")
-    assert _deploy_lines(project, tmp_path) == [
+    assert _deploy_lines(project, tmp_path, binding_env) == [
         "- DEPLOY DRIFT: 1 file(s) differ between agents_extensions/shared/ and .claude/. Run: npm run agents:deploy"
     ]
 
@@ -370,15 +381,16 @@ def test_launcher_library_python_children_never_import_from_the_cwd(tmp_path: Pa
         assert set(children) == {"-I"}, children
 
 
-def test_workspace_session_reads_its_account_memory_and_writes_state_to_the_state_root(tmp_path: Path) -> None:
+def test_workspace_session_reads_its_account_memory_and_writes_state_to_the_state_root(tmp_path: Path, host_layout) -> None:
     """Defect class: hooks reading another account's or another root's memory or state. From a
     non-Git project directory (the CTO workspace) the memory check reads the workspace's directory
     under CLAUDE_CONFIG_DIR, and session state goes to the configured state root, never the workspace."""
     primary = _scratch_project(tmp_path)
     (primary / ".python-version").write_text(platform.python_version() + "\n")
-    workspace, state, home, account = (tmp_path / name for name in ("cto-workspace", "state", "home", "account-b"))
+    workspace, state, home, account = (tmp_path / name for name in ("cto-workspace", "workspace-state", "home", "account-b"))
     for path in (workspace, state, home):
         path.mkdir()
+    state.chmod(0o700)
     key = re.sub(r"[^A-Za-z0-9-]", "-", str(workspace))
     memory = account / "projects" / key / "memory" / "MEMORY.md"
     memory.parent.mkdir(parents=True)
@@ -419,6 +431,12 @@ def test_workspace_session_reads_its_account_memory_and_writes_state_to_the_stat
     (source / "deployment.v1.json").write_text(json.dumps(
         {"providers": ["claude"], "sources": {"claude": {"path": "agents_extensions/claude", "required": True}},
          "preserve": []}))
+    host_layout.data["state_root"] = str(state)
+    host_layout.data["runtime"]["python"] = sys.executable
+    host_layout.data["repos"] = {"machinery": str(primary)}
+    host_layout.data["products"]["public"]["repo"] = "machinery"
+    host_layout.write()
+    env.update(host_layout.env)
     subprocess.run([sys.executable, "-I", "-m", "lu_machinery.agent_deploy", "--workspace", "--project-root",
                     str(workspace)], env=env, check=True, capture_output=True, timeout=120)
     drift_env = {**env, "LU_PRODUCT_ROOT": str(primary), "CODEX_CANONICAL_REPO_ROOT": str(primary)}
