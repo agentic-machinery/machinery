@@ -632,23 +632,27 @@ def _refuse_kimi_recipients(recipients: list[str] | tuple[str, ...]) -> None:
 def _unreadable_recipient_cause(recipient: str) -> tuple[str, str] | None:
     """``(name, cause)`` when no drain reads this recipient, else ``None``; reads no store.
 
-    Mirrors ``deliveries pending``: a historical alias is not checked, and only
-    a proven standing refuses. An unknown standing (incomplete roster, damaged
-    task record) is admitted, so doubt never hides mail.
+    Mirrors ``deliveries pending``: a historical alias is not checked, and the
+    standing comes from one roster read. Only a proven standing refuses. An
+    unknown standing (incomplete roster, damaged task record), or any failure to
+    classify (an unreadable profile or assignments source), is admitted, so doubt
+    never hides mail; the claim path then answers as it did before this check.
     """
     from lu_machinery.agent_identity import resolve_recipient_alias
     from lu_machinery.fleet_comms.authority import (
         AuthorityRecipientRefused,
+        _load_roster,
         _nonempty,
         _recipient_standing,
-        _registered_recipients,
-        _roster_complete,
     )
 
     name = _nonempty(recipient, field="recipient")
-    if resolve_recipient_alias(name) != name:
+    try:
+        if resolve_recipient_alias(name) != name:
+            return None
+        standing = _recipient_standing(name, *_load_roster())
+    except Exception:
         return None
-    standing = _recipient_standing(name, _registered_recipients(), _roster_complete())
     if standing not in {"not_registered", "settled_task"}:
         return None
     return name, AuthorityRecipientRefused(name, standing).cause
@@ -658,13 +662,13 @@ def _refuse_unreadable_recipient(args: argparse.Namespace, name: str, cause: str
     """Refuse claim or receive for a recipient no drain reads, naming its open rows without leasing them.
 
     A publish under an incomplete roster can still queue rows to such a name,
-    so the refusal counts them (read only) for the operator to act on.
+    so the refusal counts them (read only) for the operator to act on. The
+    refusal stands whatever the store does: a failed count reports null counts.
     """
-    from lu_machinery.control_plane.storage import ControlPlaneError
-    from lu_machinery.fleet_comms.artifacts import ArtifactStoreError
-    from lu_machinery.fleet_comms.authority import AuthorityService, AuthorityServiceError
+    from lu_machinery.fleet_comms.authority import AuthorityService
 
     counts: dict[str, int | None] = {"queued": None, "running": None}
+    held = "its open deliveries could not be counted"
     try:
         with AuthorityService(root=_authority_root(args)) as service:
             rows = service.store.connection.execute(
@@ -672,21 +676,20 @@ def _refuse_unreadable_recipient(args: argparse.Namespace, name: str, cause: str
                    WHERE recipient = ? AND state IN ('queued', 'running') GROUP BY state""",
                 (name,),
             ).fetchall()
-        counts = {"queued": 0, "running": 0}
-        counts.update({str(state): int(count) for state, count in rows})
-        held = f"{counts['queued']} queued and {counts['running']} running deliveries to it are held, not claimed"
-    except (AuthorityServiceError, OSError, sqlite3.Error, PlaneRootAnchorError, ControlPlaneError, ArtifactStoreError):
-        # Storage exceptions may contain private paths or SQL; never echo them.
-        held = "its open deliveries could not be counted"
+        found = {"queued": 0, "running": 0}
+        found.update({str(state): int(count) for state, count in rows})
+        counts = dict(found)
+        held = f"{found['queued']} queued and {found['running']} running deliveries to it are held, not claimed"
+    except Exception:
+        # Any store failure (path, SQLite, schema or migration) leaves the counts unknown; its text
+        # may contain private paths or SQL, so it is never echoed.
+        pass
+    detail = (
+        f"no drain reads {name}; {held}. A dispatched task's recipient is its bare task id. "
+        + "deliveries expire-stale counts such rows and --apply dead-letters them."
+    )
     sys.stdout.write(_json_dump({
-        "error": cause,
-        "recipient": name,
-        **counts,
-        "detail": (
-            f"no drain reads {name}; {held}. A dispatched task's recipient is its bare task id. "
-            "deliveries expire-stale counts such rows and --apply dead-letters them."
-        ),
-        "content_included": False,
+        "error": cause, "recipient": name, **counts, "detail": detail, "content_included": False,
     }))
     return EXIT_ERROR
 

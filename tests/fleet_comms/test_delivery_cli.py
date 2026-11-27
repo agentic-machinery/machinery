@@ -19,6 +19,16 @@ SUPERVISORY_INBOX = "supervisor:epic:9999"
 
 
 @pytest.fixture
+def placeholder_seats_registered(placeholder_seats_registered, monkeypatch):
+    """The shared fixture, extended to the one roster read that claim and receive classify against."""
+    from lu_machinery.fleet_comms import authority
+
+    real_load = authority._load_roster
+    placeholders = authority._registered_recipients() - real_load()[0]
+    monkeypatch.setattr(authority, "_load_roster", lambda: (real_load()[0] | placeholders, real_load()[1]))
+
+
+@pytest.fixture
 def plane(tmp_path, monkeypatch):
     root = tmp_path / "plane"
     monkeypatch.setenv("FLEET_COMMS_ROOT", str(root))

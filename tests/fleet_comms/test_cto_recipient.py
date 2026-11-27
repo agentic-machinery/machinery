@@ -288,31 +288,61 @@ def test_claim_and_receive_refuse_a_recipient_no_drain_reads_and_name_its_open_r
     run(capsys, "deliveries", operation, "--recipient", "claude-cto", "--worker-id", "seat-1")
 
 
-def test_unreadable_recipient_refusal_survives_an_unreadable_store_without_leaking_it(tmp_path, tasks, capsys):
-    """Defect class: a store error on the refusal path turns into an empty answer or prints a private path."""
+@pytest.mark.parametrize("failure", ["root_is_a_file", "schema_refused"])
+def test_unreadable_recipient_refusal_survives_an_unreadable_store_without_leaking_it(
+    tmp_path, tasks, capsys, monkeypatch, failure,
+):
+    """Defect class: a store error on the refusal path escapes as a traceback, reads as empty, or prints a private path."""
+    from lu_machinery.fleet_comms import artifacts
+    from lu_machinery.fleet_comms.migrations import CommsMigrationError
+
     root = tmp_path / "private-path-sentinel"
-    root.write_text("not a directory")
-    refused = run(
-        capsys, "deliveries", "receive", "--recipient", "epics", "--worker-id", "epics", "--root", str(root),
-        expected=EXIT_ERROR,
-    )
-    assert (refused["error"], refused["queued"], refused["running"]) == ("recipient_not_registered", None, None)
-    assert "could not be counted" in refused["detail"]
-    assert "private-path-sentinel" not in json.dumps(refused)
-
-
-@pytest.mark.parametrize("doubt", ["roster", "task_status"])
-def test_claim_and_receive_admit_a_recipient_of_unknown_standing(plane, tasks, capsys, monkeypatch, tmp_path, doubt):
-    """Defect class: doubt about a recipient's standing (incomplete roster, damaged task record) refuses and hides mail."""
-    from lu_machinery import agent_identity
-
-    if doubt == "roster":
-        name = "epics"
-        monkeypatch.setattr(agent_identity, "ASSIGNMENTS_PATH", tmp_path / "unavailable")
+    if failure == "root_is_a_file":
+        root.write_text("not a directory")
     else:
-        name = tasks("cto-9-i9-worker", "paused")
+        def refuse(_conn):
+            raise CommsMigrationError(f"newer schema in {root}/comms.sqlite3")
+
+        monkeypatch.setattr(artifacts, "apply_migrations", refuse)
+    for operation in ("receive", "claim"):
+        refused = run(
+            capsys, "deliveries", operation, "--recipient", "epics", "--worker-id", "epics", "--root", str(root),
+            expected=EXIT_ERROR,
+        )
+        assert (refused["error"], refused["queued"], refused["running"]) == ("recipient_not_registered", None, None)
+        assert "could not be counted" in refused["detail"]
+        assert "private-path-sentinel" not in json.dumps(refused)
+
+
+@pytest.mark.parametrize("doubt", ["roster", "task_status", "profile_source", "roster_repaired_between_reads"])
+def test_claim_and_receive_admit_a_recipient_of_unknown_standing(plane, tasks, capsys, monkeypatch, tmp_path, doubt):
+    """Defect class: doubt about a recipient's standing (incomplete or changing roster, unreadable profile source,
+    damaged task record) refuses and hides mail."""
+    from lu_machinery import agent_identity
+    from lu_machinery.common.profile import ProfileError
+    from lu_machinery.fleet_comms import authority
+
+    name = tasks("cto-9-i9-worker", "paused") if doubt == "task_status" else "epics"
     with AuthorityService(root=plane) as service:
         import_legacy(service, name, f"doubt-{doubt}")
+    if doubt == "roster":
+        monkeypatch.setattr(agent_identity, "ASSIGNMENTS_PATH", tmp_path / "unavailable")
+    elif doubt == "profile_source":
+        def unavailable():
+            raise ProfileError("area_assignments entry names a missing file")
+
+        monkeypatch.setattr(agent_identity, "default_assignments_path", unavailable)
+    elif doubt == "roster_repaired_between_reads":
+        # The first read sees the roster mid-repair (incomplete); later reads see it restored, without `epics`.
+        real_load = authority._load_roster
+        reads = []
+
+        def load():
+            reads.append(1)
+            names, _complete = real_load()
+            return (names, False) if len(reads) == 1 else (names, True)
+
+        monkeypatch.setattr(authority, "_load_roster", load)
     received = run(capsys, "deliveries", "receive", "--recipient", name, "--worker-id", "seat-1")
     assert received["delivery"]["recipient"] == name
 
