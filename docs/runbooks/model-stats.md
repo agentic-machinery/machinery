@@ -409,16 +409,23 @@ the author labels each P0-P2 finding of that review (every finding that can bloc
 `record_cf_verdict finding-outcome --task-id <review> --pr <N> --finding <id> --label <label> [--evidence '<line>']`:
 `fixed` (a real error, changed), `wrong` (the code was already correct), `invented` (it cites a file, line,
 symbol or behaviour that does not exist), `out_of_scope` or `duplicate`. Every label except `fixed` needs one line
-of evidence. The verb refuses a finding that is not a P0-P2 finding of the review's structured reply and a review
-with no published `CHANGES_REQUESTED` verdict on that PR in the publication ledger. One label per finding: the
-same label again is a no-op, and another one is refused. The next review of the PR may contest a label with a line
-`CONTEST <finding-id>: <reason>` in its reply's `overall.explanation`. When `record` publishes that review, it
-stores each contested id that is a P0-P2 finding of the PR's previous blocking review of record (the newest other
-`CHANGES_REQUESTED` publication; of two at one GitHub time, the later ledger line) and reports
-`outcome_contests` (`stored against <review>: <ids>; unmatched: <ids>`); a reply that contests nothing adds no
-field. A contested label counts as `contested`, not as its label. `unlabelled` is the review's P0-P2 count minus
-its labels (the file-inferred figures above cover P0-P1 only). `real_precision` is `fixed / (fixed + wrong + invented)` with its Wilson interval; a label is the
-author's word unless a later review contested it.
+of evidence. The verb refuses a finding that is not a P0-P2 finding of the review's structured reply, a review
+with no published `CHANGES_REQUESTED` verdict on that PR in the publication ledger, and a review task id that names
+more than one run on that PR (a task id can be dispatched again; a label line names the task id, not the run). One
+label per finding: the same label again is a no-op, and another one is refused. The next review of the PR may
+contest a label with a line `CONTEST <finding-id>: <reason>` in its reply's `overall.explanation`. When `record`
+publishes that review, it binds the PR's previous blocking review of record from the PR's own verdict comments (the
+newest other `CHANGES_REQUESTED` comment before this run's), reads that review's reply only from the run its
+comment names (the task record's reviewed head and start must equal the marker's, else
+`not stored: unresolved: ...`), stores each contested id that is a P0-P2 finding of that reply and reports
+`outcome_contests` (`stored against <review>: <ids>; unmatched: <ids>`, or `not stored: unmatched: <ids>` when no
+id matched, which writes nothing); a reply that contests nothing adds no field. A failed write reports
+`failed: <reason>`; recording the same verdict again while the head stands retries it. A contested label counts as
+`contested`, not as its label. `unlabelled` is the review's P0-P2 count minus its labels (the file-inferred figures
+above cover P0-P1 only); when published blocking rows of more than one run share one task id and PR, their labels
+name no one run and all their findings count as `unlabelled`. `real_precision` is
+`fixed / (fixed + wrong + invented)` with its Wilson interval; a label is the author's word unless a later review
+contested it.
 
 Both line kinds go to `batch_state/model-stats/finding-outcomes.jsonl` (schema `review-finding-outcome.v1`)
 under the rows lock; the recorder is its one writer. It keeps the evidence only as its SHA-256, never the text: the

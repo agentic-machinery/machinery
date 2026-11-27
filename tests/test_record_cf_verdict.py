@@ -1226,6 +1226,16 @@ def test_finding_outcome_verb_refuses_unpublished_unknown_or_nonblocking_finding
     with pytest.raises(recorder.RecordError, match="no structured findings"):
         recorder.record_finding_outcome("review-text", pr_number=42, finding_id="F1", label="fixed", evidence=None,
                                         task_root=tasks)
+    # The review is dispatched again under its id at the same head: the label ledger names the task id, not the run,
+    # so neither run's finding takes a label any more.
+    hot = tasks / "review-one.json"
+    old_run = {**json.loads(hot.read_text()), "schema_version": 2, "task_id": "review-one"}
+    (tasks / "review-one.20261120T120000Z.archived.json").write_text(json.dumps(old_run))
+    (tasks / "review-one.20261120T120000Z.archived.result").write_bytes((tasks / "review-one.result").read_bytes())
+    write_task(tasks, reply=_blocking_reply(["P2", "P2"]), started_at="2026-09-23T14:00:00.000001+00:00")
+    with pytest.raises(recorder.RecordError, match="review task id review-one names 2 runs in the task store"):
+        label("F2", "fixed")
+    assert len(_outcomes(tmp_path)) == 1
 
 
 @pytest.mark.usefixtures('configured_roots', 'recorder_matcher')
@@ -1233,9 +1243,9 @@ def test_finding_outcome_verb_refuses_unpublished_unknown_or_nonblocking_finding
 def test_record_stores_a_contest_only_against_the_previous_blocking_round(monkeypatch, tmp_path):
     """Defect class: a CONTEST line bound to another round than the PR's previous blocking review (an older round,
     the contesting review itself, a later round on a rerun, a tie in GitHub's comment time taken in the wrong
-    order, a round whose local publication marker is missing), stored for an id that is no P0-P2 finding of that
-    round, lost when the contesting review's own run stored none, or a reply that contests nothing changing the
-    receipt."""
+    order, a round whose local publication marker is missing), read from another run's reply than the one that
+    round published (a task id dispatched again), stored for an id that is no P0-P2 finding of that round, a reply
+    whose ids all miss reported as stored, or a reply that contests nothing changing the receipt."""
     from lu_machinery.review import capability_failure
 
     tasks, _comments, _calls = setup_record(monkeypatch, tmp_path)
@@ -1266,14 +1276,17 @@ def test_record_stores_a_contest_only_against_the_previous_blocking_round(monkey
     assert recorder.record("review-two", pr_number=42, task_root=tasks, lock_root=tmp_path / "locks")[
         "outcome_contests"] == "stored against review-one: F2; unmatched: F3, F9"
     assert len(_outcomes(tmp_path)) == 2
-    # A contest no run stored (a review recorded before this release) is restored by the one-PR import, bound from
-    # the same comments to the same rounds.
-    (tmp_path / "model-stats" / "finding-outcomes.jsonl").unlink()
-    receipt = recorder.import_publications(days=1, dry_run=False, task_root=tasks, only=("owner/repo", 42),
-                                           adapter=recorder.GitHubAdapter(tmp_path))
-    assert receipt["contest_replies"] == 2
-    assert [(line["task_id"], line["finding_id"], line["contested_by"]) for line in _outcomes(tmp_path)] == [
-        ("review-one", "F2", "review-two"), ("review-two", "F1", "review-three")]
+    # A reply whose contested ids are all no P0-P2 finding of the previous round stores nothing and says so.
+    assert publish("review-four", _blocking_reply(["P1"], "CONTEST F7: no such finding"))["outcome_contests"] == (
+        "not stored: unmatched: F7")
+    assert len(_outcomes(tmp_path)) == 2
+    # Round 4's task id is dispatched again at the same head: its task record is now another run than the one its
+    # comment published, so a contest of round 4 is unresolved and writes nothing.
+    write_task(tasks, task_id="review-four", reply=_blocking_reply(["P1", "P1"]),
+               started_at="2026-09-23T14:00:00.000001+00:00")
+    assert publish("review-five", _blocking_reply(["P1"], "CONTEST F1: still open"))["outcome_contests"] == (
+        f"not stored: unresolved: the task record of review-four is not the run published at {SHA[:12]}")
+    assert len(_outcomes(tmp_path)) == 2
 
 
 @pytest.mark.usefixtures('configured_roots', 'recorder_matcher')
