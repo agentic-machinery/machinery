@@ -83,6 +83,37 @@ def test_selection_audit_reads_definitions_from_the_product_tree(tmp_path: Path)
         data_tier.load_selection(tmp_path)
 
 
+def test_selection_audit_rejects_a_link_outside_the_checkout(tmp_path: Path) -> None:
+    """Defect class: a tests/ path that resolves through a file or directory link outside the checkout."""
+    outside = tmp_path / "outside.py"
+    outside.write_text("def test_reads_store():\n    return None\n", encoding="utf-8")
+    checkout = tmp_path / "product"
+    nodeid = "tests/test_example.py::test_reads_store"
+    payload = {"schema": 1, "class_c_merge_group": 1, "nodeids": [nodeid], "files": ["tests/test_example.py"]}
+    ci = checkout / "scripts" / "ci"
+    ci.mkdir(parents=True)
+    (ci / "data_tier_selection.json").write_text(json.dumps(payload), encoding="utf-8")
+    linked = checkout / "tests" / "test_example.py"
+    linked.parent.mkdir(parents=True)
+    linked.symlink_to(outside)
+    with pytest.raises(data_tier.DataTierError, match="resolves outside the tested checkout"):
+        data_tier.load_selection(checkout)
+
+    linked.unlink()
+    outside_dir = tmp_path / "outside-dir"
+    outside_dir.mkdir()
+    (outside_dir / "test_example.py").write_text("def test_reads_store():\n    return None\n", encoding="utf-8")
+    nested = checkout / "tests" / "linked"
+    nested.symlink_to(outside_dir, target_is_directory=True)
+    nested_id = "tests/linked/test_example.py::test_reads_store"
+    (ci / "data_tier_selection.json").write_text(
+        json.dumps({**payload, "nodeids": [nested_id], "files": ["tests/linked/test_example.py"]}),
+        encoding="utf-8",
+    )
+    with pytest.raises(data_tier.DataTierError, match="resolves outside the tested checkout"):
+        data_tier.load_selection(checkout)
+
+
 WRITER = """
 import json, os, sqlite3, sys
 repo, store, exposed, existing, output, atlas, host, git, scratch, *read_only = sys.argv[1:]
@@ -443,7 +474,7 @@ def test_collection_time_data_skip_is_in_junit(tmp_path: Path, monkeypatch: pyte
 def test_failure_reporting_uses_one_fake_gh_issue_and_clean_comment_once(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Defect class: gh is run from a non-checkout and fails because the repository was not passed."""
+    """Defect classes: gh is run from a non-checkout without a repository; a non-GitHub origin matches a github.com suffix."""
     checkout = tmp_path / "product"
     checkout.mkdir()
     empty = tmp_path / "empty"
@@ -532,6 +563,15 @@ def test_failure_reporting_uses_one_fake_gh_issue_and_clean_comment_once(
     result = json.loads(state.read_text())
     assert len(result["comments"]) == 2
     assert result["calls"].count(["issue", "create"]) == 1
+    calls_before = len(result["calls"])
+    for origin in (
+        "https://notgithub.com/example-org/example-product.git",
+        "https://evil.example/github.com/example-org/example-product.git",
+    ):
+        subprocess.run([*git, "remote", "set-url", "origin", origin], cwd=checkout, check=True, timeout=30)
+        with pytest.raises(data_tier.DataTierError, match="not a GitHub owner/name"):
+            data_tier.report(failed, baseline, checkout)
+    assert len(json.loads(state.read_text())["calls"]) == calls_before
 
 
 @pytest.mark.usefixtures('configured_roots', '_no_live_pool')

@@ -80,7 +80,13 @@ ABSOLUTE_PATH = re.compile(r"(?<![A-Za-z0-9])/(?!/)[^\s\]\[),:;]+")
 NETWORK_ADDRESS = re.compile(r"https?://[^\s\]\[),:;]+|(?<!\d)(?:\d{1,3}\.){3}\d{1,3}(?!\d)")
 # owner/name, read from the product checkout's origin. Never a baked slug.
 _REPOSITORY = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
-_GITHUB_REMOTE = re.compile(r"(?ai:github\.com)[:/]([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(?:\.git)?/?$")
+# Anchored GitHub origin forms. The host is exactly github.com; a suffix or a path is not enough.
+_GITHUB_REMOTE_PATTERNS = (
+    re.compile(r"^https?://(?:[^/@\s]+@)?github\.com/([^/\s]+)/([^/\s]+?)(?:\.git)?/?$", re.IGNORECASE),
+    re.compile(r"^ssh://git@github\.com/([^/\s]+)/([^/\s]+?)(?:\.git)?/?$", re.IGNORECASE),
+    re.compile(r"^git@github\.com:([^/\s]+)/([^/\s]+?)(?:\.git)?/?$", re.IGNORECASE),
+    re.compile(r"^git://github\.com/([^/\s]+)/([^/\s]+?)(?:\.git)?/?$", re.IGNORECASE),
+)
 
 
 class DataTierError(RuntimeError):
@@ -171,9 +177,21 @@ def _test_path(relative: str) -> PurePosixPath | None:
     return path
 
 
+def _resolved_test_file(checkout: Path, relative: str) -> Path:
+    """The selection file after resolving links, inside the checkout's tests directory."""
+    path = _test_path(relative)
+    if path is None:
+        raise DataTierError("data-tier selection contains an invalid test file")
+    root = checkout.resolve()
+    candidate = root.joinpath(*path.parts).resolve()
+    if not candidate.is_relative_to(root / "tests"):
+        raise DataTierError(f"data-tier selection file resolves outside the tested checkout: {relative}")
+    return candidate
+
+
 def _defined_tests(checkout: Path, relative: str) -> set[str]:
     """Module-level test functions and one-level class methods defined in one file."""
-    candidate = checkout.joinpath(*PurePosixPath(relative).parts)
+    candidate = _resolved_test_file(checkout, relative)
     try:
         tree = ast.parse(candidate.read_text(encoding="utf-8"))
     except (OSError, SyntaxError, UnicodeError) as error:
@@ -218,13 +236,13 @@ def load_selection(checkout: Path, expected_sha256: str | None = None) -> tuple[
             missing.append(nodeid)
             continue
         if relative not in definitions:
-            if not checkout.joinpath(*PurePosixPath(relative).parts).is_file():
+            if not _resolved_test_file(checkout, relative).is_file():
                 missing.append(nodeid)
                 continue
             definitions[relative] = _defined_tests(checkout, relative)
         if qualname not in definitions[relative]:
             missing.append(nodeid)
-    absent_files = [relative for relative in files if not checkout.joinpath(*PurePosixPath(relative).parts).is_file()]
+    absent_files = [relative for relative in files if not _resolved_test_file(checkout, relative).is_file()]
     if absent_files:
         shown = ", ".join(absent_files[:20])
         extra = f" (+{len(absent_files) - 20} more)" if len(absent_files) > 20 else ""
@@ -813,7 +831,7 @@ def github_repository(checkout: Path) -> str:
     ``gh`` to discover the repository there.
     """
     url = command(["git", "remote", "get-url", "origin"], cwd=checkout).stdout.strip()
-    match = _GITHUB_REMOTE.search(url)
+    match = next((found for pattern in _GITHUB_REMOTE_PATTERNS if (found := pattern.fullmatch(url))), None)
     if match is None:
         raise DataTierError("product origin is not a GitHub owner/name")
     owner, name = match.group(1), match.group(2)
