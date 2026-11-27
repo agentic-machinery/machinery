@@ -44,7 +44,7 @@ Supported typed relations are `root`, `subagent_of`, `reviewer_for`, `handoff_of
 ## Inspect before mutation
 
 ```bash
-.venv/bin/python -m lu_machinery.orchestration.task_family inspect \
+"$LU_PYTHON" -I -m lu_machinery.orchestration.task_family inspect \
   --manifest /absolute/manifest.json --json
 ```
 

@@ -2,7 +2,7 @@
 
 For every change to learner-facing Ukrainian (lessons, modules, plans, practice decks, word
 cards, dataset rows). What blocks, reporting by class and evidence stay in
-`agents_extensions/shared/rules/ukrainian-linguistics.md` §8; budget and ledger stay in
+`$LU_PRODUCT_ROOT/agents_extensions/shared/rules/ukrainian-linguistics.md` §8 (a product rule); budget and ledger stay in
 [policy](policy.md). Operator-approved plan, 2026-10-27 (tracker C-2811).
 
 ## Seats
@@ -25,7 +25,6 @@ cards, dataset rows). What blocks, reporting by class and evidence stay in
   `lu_machinery/config/model_catalog.yaml` review profiles). Admitting Grok via Cursor for Ukrainian needs a
   separate catalog change backed by the measurement below (Grok 25/27, Sources tools
   reachable).
-  Muse is advisory only, never a seat, until it can call the Sources tools.
 - `closeout_cli resolve-reviewer` refuses content profiles, so this table is the seat source.
   Dispatch each seat with `--review-profile ukrainian` and record each verdict.
   `freeze --review-profile ukrainian` only stores a behavior-proof carrier.

@@ -49,7 +49,7 @@ the file at its merge-base) uses the installed release copy, which the PR cannot
 Every round's brief, round 1 and each delta, carries the section this prints, verbatim:
 
 ```bash
-"$PY" -P -m lu_machinery.review.closeout_cli --state-file "$STATE" \
+"$PY" -I -m lu_machinery.review.closeout_cli --state-file "$STATE" \
   checklist --base "origin/$BASE" --head "$HEAD_SHA" --repo-root .
 ```
 
@@ -71,7 +71,7 @@ other exit 1 (a malformed checklist or map at the merge-base, an unreadable diff
 fail-closed: escalate to the CTO, and never hand-write the section.
 
 For the `ukrainian` profile, identify the contracts in
-[`ukrainian-linguistics.md` §8](../../../rules/ukrainian-linguistics.md#ukrainian-linguistic-principles),
+the product rule `$LU_PRODUCT_ROOT/agents_extensions/shared/rules/ukrainian-linguistics.md` §8,
 as the merge-base holds it:
 Every Ukrainian-profile brief identifies these contracts and their applicability, including level, track, workflow, learner state where relevant, and explicit exceptions.
 

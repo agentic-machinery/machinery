@@ -9,11 +9,11 @@ A pointer skill. The rules that govern public text are in
 `docs/dev/agent-public-text.md` (the typed publisher) and rules core P8 (operational
 security). This file adds only the order of operations; it is not a second copy of them.
 
-Recipes run with the primary checkout's interpreter, resolved once
+Recipes run with the installed machinery interpreter, resolved once
 ([delivery](../full-send/references/delivery.md#interpreter)):
 
 ```bash
-PY="$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")/.venv/bin/python"
+PY="${LU_PYTHON:?LU_PYTHON is not set}"
 ```
 
 ## Every agent comment
@@ -30,8 +30,8 @@ PY="$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")/.venv/
 4. **Post through the publisher**, never raw `gh` writes:
 
    ```bash
-   "$PY" -m lu_machinery.publish pr-comment --number "$PR" --body-file "$BODY"
-   "$PY" -m lu_machinery.publish issue-comment --number "$ISSUE" --body-file "$BODY"
+   "$PY" -I -m lu_machinery.publish pr-comment --number "$PR" --body-file "$BODY"
+   "$PY" -I -m lu_machinery.publish issue-comment --number "$ISSUE" --body-file "$BODY"
    ```
 
 5. **Verify the result**: the command exited 0, and the comment is visible

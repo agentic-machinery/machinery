@@ -4,18 +4,18 @@
 > resolves the exact target, runs a non-mutating review, resolves a
 > cross-family reviewer, and requires separate behavior proof for
 > user-visible changes. For the exact-head review comment, use
-> `"$PY" -m lu_machinery.review.record_cf_verdict` after the toolful review settles.
-> Resolve `PRIMARY_REPO` and `PY` with the [review-loop setup](../review-loop/SKILL.md#review-loop)
-> to use current primary-checkout recorder rules regardless of branch age.
+> `"$PY" -I -m lu_machinery.review.record_cf_verdict` after the toolful review settles.
+> Resolve `PY` with the [review-loop setup](../review-loop/SKILL.md#review-loop); the `-I` run
+> uses the installed recorder rules regardless of branch age.
 
 All state for one review lives in a single JSON file so every step below
 can be a separate CLI call. Pick a path once per review and reuse it:
 
 ```
-STATE_FILE=.agent/review-closeout/<short-slug>.json
+STATE_FILE="$LU_STATE_ROOT/.agent/review-closeout/<short-slug>.json"
 ```
 
-Every subcommand is `.venv/bin/python -m lu_machinery.review.closeout_cli --state-file "$STATE_FILE" ...`.
+Every subcommand is `"$LU_PYTHON" -I -m lu_machinery.review.closeout_cli --state-file "$STATE_FILE" ...`.
 
 ---
 
@@ -23,20 +23,20 @@ Every subcommand is `.venv/bin/python -m lu_machinery.review.closeout_cli --stat
 
 ```bash
 # local: staged + unstaged + untracked, diffed against HEAD
-.venv/bin/python -m lu_machinery.review.closeout_cli --state-file "$STATE_FILE" \
+"$LU_PYTHON" -I -m lu_machinery.review.closeout_cli --state-file "$STATE_FILE" \
   target --mode local --repo-root .
 
 # commit: one already-made commit vs its parent
-.venv/bin/python -m lu_machinery.review.closeout_cli --state-file "$STATE_FILE" \
+"$LU_PYTHON" -I -m lu_machinery.review.closeout_cli --state-file "$STATE_FILE" \
   target --mode commit --commit <sha> --repo-root .
 
 # branch: explicit base, merge-base semantics
-.venv/bin/python -m lu_machinery.review.closeout_cli --state-file "$STATE_FILE" \
+"$LU_PYTHON" -I -m lu_machinery.review.closeout_cli --state-file "$STATE_FILE" \
   target --mode branch --branch <branch> --base <base-ref> --repo-root .
 
 # pr: actual PR base (never an assumed default branch), merge-base semantics —
 # diffs against the fork point, not the base branch's possibly-since-moved tip
-.venv/bin/python -m lu_machinery.review.closeout_cli --state-file "$STATE_FILE" \
+"$LU_PYTHON" -I -m lu_machinery.review.closeout_cli --state-file "$STATE_FILE" \
   target --mode pr --pr <number> --repo-root .
 ```
 
@@ -66,7 +66,7 @@ never does it.
 ## Step 2: Freeze the scope baseline — before the first review pass
 
 ```bash
-.venv/bin/python -m lu_machinery.review.closeout_cli --state-file "$STATE_FILE" freeze \
+"$LU_PYTHON" -I -m lu_machinery.review.closeout_cli --state-file "$STATE_FILE" freeze \
   --issue "<issue/request reference>" \
   --intended-behavior "<what this change is supposed to do>" \
   --non-goals "<what it explicitly does not do>" \
@@ -122,12 +122,13 @@ review — a different target, a redone freeze — means picking a new
 Run linters and type checks in **check-only** mode. Review preparation
 must never mutate the source tree:
 
-- Python: `.venv/bin/ruff check {files}` — **never `--fix`** during review
+- Python: the repository's pinned Ruff, `ruff check {files}` (the product checkout's
+  `.venv/bin/ruff` in the product) — **never `--fix`** during review
   prep. A fix is a finding like any other; applying it is Step 6's job,
   done explicitly, by the accountable agent.
 - TypeScript/JS: `npx tsc --noEmit`, `npx eslint {files}` (no `--fix`).
 - Credential, identity, transport or hook changes: confirm the author ran
-  `scripts/audit/secret_scan_local.py tree` (offline) or run it yourself; quote
+  `"$LU_PRODUCT_ROOT/.venv/bin/python" "$LU_PRODUCT_ROOT/scripts/audit/secret_scan_local.py" --repo <checkout> tree` (offline) or run it yourself; quote
   only its totals and per-detector counts, read the report only through its
   `show-keys` and `count` subcommands (never `jq`, `cat` or `grep`), and never
   quote a value, path, commit or line. Runbook:
@@ -149,16 +150,16 @@ Pull a fresh routing snapshot, then resolve:
 
 ```bash
 curl -s 'http://localhost:8765/api/state/routing-budget?fresh_codexbar=true' \
-  | .venv/bin/python -c 'import json,sys; d=json.load(sys.stdin); print(json.dumps(d.get("lane_health", d)))' \
-  > /tmp/routing-snapshot.json
+  | "$LU_PYTHON" -I -c 'import json,sys; d=json.load(sys.stdin); print(json.dumps(d.get("lane_health", d)))' \
+  > "$TMPDIR/routing-snapshot.json"
 
-.venv/bin/python -m lu_machinery.review.closeout_cli --state-file "$STATE_FILE" resolve-reviewer \
+"$LU_PYTHON" -I -m lu_machinery.review.closeout_cli --state-file "$STATE_FILE" resolve-reviewer \
   --author-model "<the author's actual model/seat, e.g. claude-opus-5-5, gpt-6.2-sol, grok-4.7>" \
   --review-profile "<same profile as Step 2>" \
   --risk "<same risk as Step 2>" \
   --domain "<code|infra>" \
   --data-egress-policy "<omit unless this run is genuinely local-interactive>" \
-  --routing-snapshot-file /tmp/routing-snapshot.json \
+  --routing-snapshot-file "$TMPDIR/routing-snapshot.json" \
   --owned-path "<each changed per-seat adapter or reviewer hook; repeat the flag>"
 ```
 
@@ -231,7 +232,7 @@ trigger is reachable under the input contract and the
 when a one-shot run's pinned bytes bound its input. Reviewers keep their own independent
 adversarial cases; the author's matrix narrows nothing.
 
-For `verify_review.py`, a structured reply may use bare schema-valid JSON or
+For `lu_machinery.verify_review`, a structured reply may use bare schema-valid JSON or
 the review-loop envelope: one leading `VERDICT:` line, one `SCORE:` line and
 exactly one fenced JSON object. Other prose is not evidence. The header must
 agree with `overall.correctness`; the digest covers the whole raw reply.
@@ -247,10 +248,10 @@ diff, missing head files and symlinks remain refused. See
 For every finding, raise it, then adjudicate it:
 
 ```bash
-.venv/bin/python -m lu_machinery.review.closeout_cli --state-file "$STATE_FILE" finding raise \
+"$LU_PYTHON" -I -m lu_machinery.review.closeout_cli --state-file "$STATE_FILE" finding raise \
   --id F1 --summary "<one-line summary>" --source "reviewer:<concrete_model>"
 
-.venv/bin/python -m lu_machinery.review.closeout_cli --state-file "$STATE_FILE" finding adjudicate \
+"$LU_PYTHON" -I -m lu_machinery.review.closeout_cli --state-file "$STATE_FILE" finding adjudicate \
   --id F1 --disposition "<in_scope_blocker|follow_up|stop_and_escalate>" \
   --rationale "<why this disposition>"
 ```
@@ -323,7 +324,7 @@ egress/refusal guards; each of those is a real assertion.
 **If the reviewer/challenger is unavailable**, raise the finding anyway (if
 you have one from your own read) and leave it unadjudicated — do not
 invent a disposition to unblock yourself, and do not apply it "as-is."
-`scripts.review.findings.FindingsLedger.apply` structurally refuses to
+`lu_machinery.review.findings.FindingsLedger.apply` structurally refuses to
 apply anything that wasn't adjudicated to `in_scope_blocker`; there is no
 CLI path around that. Run `finding report` at any point to see every
 finding's full history, including ones still marked `UNADJUDICATED` — they
@@ -332,7 +333,7 @@ must appear in your final report, not vanish from it.
 Only apply a fix for a finding once it is adjudicated `in_scope_blocker`:
 
 ```bash
-.venv/bin/python -m lu_machinery.review.closeout_cli --state-file "$STATE_FILE" finding apply --id F1
+"$LU_PYTHON" -I -m lu_machinery.review.closeout_cli --state-file "$STATE_FILE" finding apply --id F1
 ```
 
 (or `finding skip --id F1 --rationale "..."` for an explicit, rationale-carrying
@@ -347,7 +348,7 @@ After applying findings, re-check the breakers before calling the review
 done. For `mode=local` the working tree alone is the signal:
 
 ```bash
-.venv/bin/python -m lu_machinery.review.closeout_cli --state-file "$STATE_FILE" check-expansion --repo-root .
+"$LU_PYTHON" -I -m lu_machinery.review.closeout_cli --state-file "$STATE_FILE" check-expansion --repo-root .
 ```
 
 For `mode=commit`/`branch`/`pr`, fixes land as **commits**, not working-tree
@@ -362,14 +363,14 @@ stored root is absent. After `target --repo public --repo-root .` from a
 linked worktree, this command measures that worktree's `HEAD`:
 
 ```bash
-.venv/bin/python -m lu_machinery.review.closeout_cli --state-file "$STATE_FILE" \
+"$LU_PYTHON" -I -m lu_machinery.review.closeout_cli --state-file "$STATE_FILE" \
   check-expansion --repo-root . --current-head HEAD
 ```
 
 Then record the cycle:
 
 ```bash
-.venv/bin/python -m lu_machinery.review.closeout_cli --state-file "$STATE_FILE" record-cycle --outstanding-count <N>
+"$LU_PYTHON" -I -m lu_machinery.review.closeout_cli --state-file "$STATE_FILE" record-cycle --outstanding-count <N>
 ```
 
 Apply the canonical
@@ -414,7 +415,7 @@ flag, an HTTP endpoint, UI, or a generated artifact like deployed skill
 mirrors or built docs), drive it exactly as a source-blind user would and
 record what you actually observed — not what the diff implies should
 happen. For the Monitor API, the Sources server, and the pinned host units,
-run `.venv/bin/python -m lu_machinery.ops.verify_run --area api`, `--area sources`,
+run `"$LU_PYTHON" -I -m lu_machinery.ops.verify_run --area api`, `--area sources`,
 or `--area host`, as mapped in `agents_extensions/shared/skills/verify/SKILL.md`,
 and record the receipt. For every other surface, use whatever real,
 product-specific surface applies:
@@ -427,11 +428,11 @@ make this skill review learner content. `behavior-proof receipt` writes that
 carrier's receipt from the live pull-request comments.
 
 ```bash
-.venv/bin/python -m lu_machinery.review.closeout_cli --state-file "$STATE_FILE" \
+"$LU_PYTHON" -I -m lu_machinery.review.closeout_cli --state-file "$STATE_FILE" \
   behavior-proof record --surface source_aware --status pass \
   --command '<actual command>' --cwd . --exit-code 0 \
   --observation '<what happened>' --evidence-ref '<durable evidence reference>'
-.venv/bin/python -m lu_machinery.review.closeout_cli --state-file "$STATE_FILE" \
+"$LU_PYTHON" -I -m lu_machinery.review.closeout_cli --state-file "$STATE_FILE" \
   behavior-proof record --surface source_blind --status pass \
   --command '<actual user-facing command>' --cwd . --exit-code 0 \
   --observation '<what happened>' --evidence-ref '<durable evidence reference>'
@@ -439,7 +440,7 @@ carrier's receipt from the live pull-request comments.
 
 The recorder emits `behavior_proof.schema_version: behavior-proof.v1`; the
 verifier rejects unversioned proof. Then pass `--behavior-proof-state-file
-"$STATE_FILE"` to `scripts/verify_review.py`. A `source_blind` `pass` records
+"$STATE_FILE"` to `"$LU_PYTHON" -I -m lu_machinery.verify_review`. A `source_blind` `pass` records
 an explicit `blind_enforced: false` by default; its receipt is explicitly
 `declared-blind/unenforced` unless a target-bound isolation attestation is
 validated by the isolation interface. Any `blind_enforced: true` requires that
@@ -448,7 +449,8 @@ the field.
 
 - **Python CLI** (e.g. this closeout CLI itself): invoke the actual
   entry point from a shell with real arguments —
-  `.venv/bin/python -m <module> <args>` — and read its stdout/stderr/exit
+  `"$LU_PYTHON" -I -m <module> <args>` (a product module: the product checkout's
+  `.venv/bin/python`) — and read its stdout/stderr/exit
   code, not the source.
 - **HTTP endpoint / Monitor API**: `curl` the real route and inspect the
   response body/status code.

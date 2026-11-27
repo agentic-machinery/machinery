@@ -8,7 +8,7 @@ never starts another turn.
 ## Start a turn
 
 ```bash
-.venv/bin/python -m lu_machinery.dispatch dispatch --agent <driver-agent> --model <driver-model> \
+"$LU_PYTHON" -I -m lu_machinery.dispatch dispatch --agent <driver-agent> --model <driver-model> \
   --mode orchestrator --stream epic:<n> --repo <fleet-key> --initiator claude-cto \
   --hard-timeout 7200 --task-id turn-<slug> --prompt-file <brief.md> --worktree
 ```

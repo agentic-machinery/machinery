@@ -13,10 +13,10 @@ other queue view disagree, the private board wins and you correct the other view
 session. Contract: `docs/runbooks/hramatka-driver-queue.md`.
 
 Before a new dispatch, scope or PR, run
-`.venv/bin/python -m lu_machinery.fleet.hramatka_scope_gate --action <action> --issue-repo <repo> --issue <n>`
+`"$LU_PYTHON" -I -m lu_machinery.fleet.hramatka_scope_gate --action <action> --issue-repo <repo> --issue <n>`
 (actions: `cleanup`, `escalate`, `new_dispatch`, `new_pr`, `new_scope`, `review`,
 `unblock_own_open_pr`); only `ALLOW` permits the action. Before declaring a Hramatka handoff
-verified-clean, run `.venv/bin/python -m lu_machinery.fleet.hramatka_hygiene_check`: only exit 0
+verified-clean, run `"$LU_PYTHON" -I -m lu_machinery.fleet.hramatka_hygiene_check`: only exit 0
 is a pass, and exit 2 (`unknown`, GitHub unreachable) is never clean.
 
 Host actions on the Hramatka host follow the §7-rollout table in

@@ -21,7 +21,7 @@ simpler manual procedure beats new tooling.
 The tier comes from the files changed, never from the author. The path-to-tier table lives in
 one place, `lu_machinery/config/review_tiers.yaml`, and `lu_machinery/review/tiers.py` applies
 it for the publisher's merge gate, the merge-queue keeper, the integration sweep, the queue's CI
-review gate and the recorder's Low rule (`python -m lu_machinery.review.tiers` prints it). A PR spanning tiers takes the highest tier it touches, so one non-Trivial file makes the
+review gate and the recorder's Low rule (`"$LU_PYTHON" -I -m lu_machinery.review.tiers` prints it). A PR spanning tiers takes the highest tier it touches, so one non-Trivial file makes the
 whole PR non-Trivial. Deleting a High-tier path, learner-facing content or a Trivial doc keeps
 that path's tier; only deletions of other unused code are Low.
 
@@ -138,8 +138,8 @@ rise, tighten the tier for that path; otherwise loosen with evidence.
 
 ## Recording the verdict
 
-The recorder implements the rounds above. Resolve `PRIMARY_REPO` and `PY` as in the
-[review-loop setup](../SKILL.md#review-loop) and use the primary recorder.
+The recorder implements the rounds above. Resolve `PY` as in the
+[review-loop setup](../SKILL.md#review-loop) and run the installed recorder.
 
 - **The verdict of record** is the reviewer's reply at the exact pushed head, recorded on the
   PR with `record_cf_verdict.py --task-id <task> --pr <N>`. The live resolver picks the
@@ -174,6 +174,6 @@ The recorder implements the rounds above. Resolve `PRIMARY_REPO` and `PY` as in 
   failure instead of a verdict, which charges no round once per lineage:
 
   ```bash
-  "$PY" -m lu_machinery.review.record_cf_verdict capability-failure --task-id "$REVIEW_TASK" --pr "$PR" \
+  "$PY" -I -m lu_machinery.review.record_cf_verdict capability-failure --task-id "$REVIEW_TASK" --pr "$PR" \
     --capability <sources-mcp|test-execution|shell|browser|checkout-data|ci-logs> --authority claude-cto
   ```

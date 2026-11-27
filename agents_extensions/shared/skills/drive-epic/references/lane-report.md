@@ -14,8 +14,8 @@ At most 8 lines, in this order:
 
 Per deliverable, one blocker line: `state | blocker | who fixes | next | ETA`.
 
-Any usage report lists all 10 pools: Claude a, Claude b, Codex/Sol (+ reset credits),
-Grok+Cursor, Muse, AGY, OpenRouter, DeepSeek, Claude API keys (2), Codex API credits. A pool
+Any usage report lists all 9 pools: Claude a, Claude b, Codex/Sol (+ reset credits),
+Grok+Cursor, AGY, OpenRouter, DeepSeek, Claude API keys (2), Codex API credits. A pool
 with no reader says NOT CHECKED plus the command that would read it.
 
 Timestamps come from `date -u` only.

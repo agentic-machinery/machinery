@@ -6,14 +6,13 @@ and check.
 
 ## Interpreter
 
-Linked dispatch worktrees have no `.venv` of their own. Resolve the primary checkout's
-interpreter once per shell, as drive-epic §6 does
+Linked dispatch worktrees have no `.venv` of their own. Use the installed machinery
+interpreter the launcher exports as `LU_PYTHON`, once per shell, as drive-epic §6 does
 ([review-merge-cleanup](../../drive-epic/references/review-merge-cleanup.md)), and run every
-recipe in the delivery skills with `"$PY"`:
+machinery recipe in the delivery skills with `"$PY" -I -m lu_machinery.<module>`:
 
 ```bash
-PRIMARY_REPO="$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")"
-PY="$PRIMARY_REPO/.venv/bin/python"
+PY="${LU_PYTHON:?LU_PYTHON is not set}"
 ```
 
 ## Hand-off record
@@ -67,7 +66,7 @@ types, use the supported append-only correction before the criterion is checked
 or the issue is closed as completed:
 
 ```bash
-"$PY" -m lu_machinery.orchestration.task_closeout correct-evidence-types \
+"$PY" -I -m lu_machinery.orchestration.task_closeout correct-evidence-types \
   --state-file ledger.json --ac-id AC-02 \
   --required-evidence document --required-evidence review \
   --actor codex/task-id --reason 'This criterion verifies documentation'

@@ -10,11 +10,11 @@ Run the same work as [full-send](../full-send/SKILL.md) steps 1 to 7, then hand 
 ready to merge. Anyone may run this skill, including workers. Its terminal is `ready`, never
 `merge`.
 
-Recipes run with the primary checkout's interpreter, resolved once
+Recipes run with the installed machinery interpreter, resolved once
 ([delivery](../full-send/references/delivery.md#interpreter)):
 
 ```bash
-PY="$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")/.venv/bin/python"
+PY="${LU_PYTHON:?LU_PYTHON is not set}"
 ```
 
 ## Never merge
@@ -32,11 +32,11 @@ direct `pr-merge`) and what follows belong to the receiving driver.
 On an existing PR, before the first edit:
 
 ```bash
-"$PY" -m lu_machinery.publish pr-edit --number "$PR" --add-labels hold
-"$PY" -m lu_machinery.publish pr-disarm --number "$PR"
+"$PY" -I -m lu_machinery.publish pr-edit --number "$PR" --add-labels hold
+"$PY" -I -m lu_machinery.publish pr-disarm --number "$PR"
 gh pr view "$PR" --json id,labels,autoMergeRequest
-"$PY" -m lu_machinery.gh_merge_queue_status "$PR" --repo "$REPO" --branch "$BASE" --json
-"$PY" -m lu_machinery.publish pr-dequeue --node-id "$PR_NODE_ID"   # only if queued
+"$PY" -I -m lu_machinery.gh_merge_queue_status "$PR" --repo "$REPO" --branch "$BASE" --json
+"$PY" -I -m lu_machinery.publish pr-dequeue --node-id "$PR_NODE_ID"   # only if queued
 ```
 
 `pr-dequeue` takes the PR's node id (`id` above), not its number. Verify each result: the
@@ -48,9 +48,9 @@ A new PR has no labels at creation (`pr-create` takes none), so open it with a `
 then add the `hold` label and verify it before any approval is recorded:
 
 ```bash
-"$PY" -m lu_machinery.publish pr-create --title "[hold] $TITLE" --body-file "$BODY" \
+"$PY" -I -m lu_machinery.publish pr-create --title "[hold] $TITLE" --body-file "$BODY" \
   --base main --head "$BRANCH"
-"$PY" -m lu_machinery.publish pr-edit --number "$PR" --add-labels hold
+"$PY" -I -m lu_machinery.publish pr-edit --number "$PR" --add-labels hold
 ```
 
 ## Stop at the gate
