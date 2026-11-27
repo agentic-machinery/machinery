@@ -303,7 +303,8 @@ def _scan_quoted_value_end(text: str, start: int, quote: str, *, allow_backslash
 
     Single linear pass without regex backtracking: handles backslash escapes for
     double-quoted values and ``=`` single-quoted values, and ``''`` escapes for
-    single-quoted values.
+    single-quoted values. Unterminated values always return ``None`` so the
+    caller redacts fail-closed through end of text.
     """
     pos = start + 1
     end = len(text)
@@ -319,22 +320,20 @@ def _scan_quoted_value_end(text: str, start: int, quote: str, *, allow_backslash
             else:
                 pos += 1
         return None
-    fallback_end: int | None = None
     while pos < end:
         char = text[pos]
         if allow_backslash and char == "\\":
             if pos + 1 >= end:
-                return fallback_end
+                return None
             pos += 2
         elif char == "'":
             if pos + 1 < end and text[pos + 1] == "'":
-                fallback_end = pos + 1
                 pos += 2
             else:
                 return pos + 1
         else:
             pos += 1
-    return fallback_end
+    return None
 
 
 def _redact_assignments(text: str) -> str:

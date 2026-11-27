@@ -103,8 +103,11 @@ _RELATIVE_NAME_CHAR_RE = re.compile(r"[\w~%+@$-]")
 _ASCII_ALPHA = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz")
 _ASCII_DIGITS = frozenset("0123456789")
 _ASCII_ALNUM = _ASCII_ALPHA | _ASCII_DIGITS
+_UNICODE_ASCII_IGNORECASE_EXTRA = frozenset("\u0130\u0131\u017f\u212a")
 _HOST_CHARS = _ASCII_ALNUM | frozenset(".-")
 _USER_HOST_BOUNDARY_CHARS = _HOST_CHARS | frozenset("_")
+_TRANSCRIPT_INITIAL_CHARS = _ASCII_ALNUM | _UNICODE_ASCII_IGNORECASE_EXTRA
+_TRANSCRIPT_BODY_CHARS = _USER_HOST_BOUNDARY_CHARS | _UNICODE_ASCII_IGNORECASE_EXTRA
 _HOST_PORT_LEFT_BLOCK = _USER_HOST_BOUNDARY_CHARS | frozenset("@")
 _HOST_PORT_RIGHT_BLOCK = _ASCII_ALNUM | frozenset("_.%")
 _SSH_ALIAS_RE = re.compile(
@@ -786,12 +789,12 @@ def _iter_transcript_filenames(text: str) -> Iterable[tuple[int, int, str]]:
     n = len(text)
     for suffix in _JSONL_SUFFIX_RE.finditer(text):
         end = suffix.end()
-        if end < n and text[end] in _USER_HOST_BOUNDARY_CHARS:
+        if end < n and text[end] in _TRANSCRIPT_BODY_CHARS:
             continue
         start = suffix.start()
-        while start > 0 and text[start - 1] in _USER_HOST_BOUNDARY_CHARS:
+        while start > 0 and text[start - 1] in _TRANSCRIPT_BODY_CHARS:
             start -= 1
-        if start < suffix.start() and text[start] in _ASCII_ALNUM:
+        if start < suffix.start() and text[start] in _TRANSCRIPT_INITIAL_CHARS:
             yield start, end, text[start:end]
 
 

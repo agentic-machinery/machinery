@@ -304,19 +304,24 @@ def _redaction_seconds(text):
             id="alert-66-single-quoted-equals",
         ),
         pytest.param(
+            "PASSWORD='" + "''" * 50_000 + "trailing-suffix\\",
+            f"PASSWORD='{REDACTION}",
+            id="alert-66-single-quoted-equals-unterminated-after-escape",
+        ),
+        pytest.param(
             'PASSWORD="' + '\\"' * 50_000,
             f'PASSWORD="{REDACTION}',
             id="alert-66-double-quoted",
         ),
         pytest.param(
-            "PASSWORD: '" + "''" * 50_000,
-            f"PASSWORD: '{REDACTION}''",
+            "PASSWORD: '" + "''" * 50_000 + "trailing-suffix",
+            f"PASSWORD: '{REDACTION}",
             id="alert-66-single-quoted-yaml",
         ),
     ],
 )
 def test_quoted_assignment_redaction_completes_in_bounded_time(raw, expected):
-    """Defect class: polynomial-ReDoS backtracking in quoted assignment redaction (machinery-infra#1580)."""
+    """Defect class: polynomial-ReDoS backtracking and fail-open unterminated quotes (machinery-infra#1580)."""
     started = time.perf_counter()
     redacted = redact_text(raw)
     elapsed = time.perf_counter() - started
