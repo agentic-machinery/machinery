@@ -3449,7 +3449,8 @@ def import_publications(
         for entry in found:
             try:
                 reply = _task(entry["task_id"], task_store)[1]
-            except RecordError:
+            except (RecordError, RecursionError):  # one unreadable or over-deep task never stops the others
+                counts["contest_tasks_unreadable"] = counts.get("contest_tasks_unreadable", 0) + 1
                 continue
             receipt = _store_contests(task_store, entry["task_id"], reply, publications=found, head=entry["head"])
             counts["contest_replies"] += receipt is not None and receipt.startswith("stored against ")
