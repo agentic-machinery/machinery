@@ -22,7 +22,9 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from lu_machinery import state_paths
 from lu_machinery.common import json_depth
+from lu_machinery.common.repo_root import MachineryConfigError
 from lu_machinery.common.task_store_paths import TaskRecordReadRefusal, read_cached_task_record
 from lu_machinery.control_plane.storage import (
     Authority,
@@ -48,7 +50,6 @@ GATE_TO_MERGE_THRESHOLD_S = 3_600
 # still merge) and is never stored. Closed-unmerged PRs are left uncached
 # because this lookup does not fetch ``closedAt``.
 _MERGE_CACHE_ENV = "FLEET_COMMS_PR_MERGE_CACHE"
-_MERGE_CACHE_REL = Path("batch_state") / "fleet-comms" / "pr-merge-facts.json"
 _GRAPHQL_BATCH_SIZE = 50
 _GH_TIMEOUT_S = 30
 _REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
@@ -558,20 +559,14 @@ def _add_event(
 
 
 def _default_merge_cache_path() -> Path | None:
-    """Shared cache on the primary checkout, or ``None`` when it cannot be anchored."""
+    """Shared cache under the configured state root, or ``None`` when unconfigured."""
     override = os.environ.get(_MERGE_CACHE_ENV, "").strip()
     if override:
         return Path(override).expanduser()
     try:
-        from lu_machinery.guardrails.worktree_containment import (
-            NotAGitRepositoryError,
-            resolve_main_root,
-        )
-
-        base = resolve_main_root(Path.cwd())
-    except NotAGitRepositoryError:
+        return state_paths.pr_merge_cache_path()
+    except MachineryConfigError:
         return None
-    return base / _MERGE_CACHE_REL
 
 
 def _fact_key(repo: str, pr_number: int) -> str:

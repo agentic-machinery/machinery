@@ -15,6 +15,7 @@ from typing import Any
 
 import yaml
 
+from lu_machinery import state_paths
 from lu_machinery.common.repo_root import machinery_path, state_root
 
 from .failure_codes import provider_failure_code, provider_stderr_error
@@ -146,7 +147,7 @@ def default_failover_config_path() -> Path:
 
 
 def default_cooldown_db_path() -> Path:
-    return state_root() / "batch_state" / "agent_runtime_failover_cooldowns.sqlite3"
+    return state_paths.failover_cooldowns_db(state_root())
 
 
 def _configured_path(env_name: str, default: Path) -> Path:

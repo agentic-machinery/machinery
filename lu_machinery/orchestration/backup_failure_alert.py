@@ -35,11 +35,12 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+from lu_machinery import state_paths
 from lu_machinery.common import json_depth
 from lu_machinery.common.repo_root import state_root
 
-DEFAULT_STATE_DIR = Path("batch_state") / "backups" / "alerts"
-LAST_RUN_RECEIPT = Path("batch_state") / "backups" / "last-run.json"
+DEFAULT_STATE_DIR = state_paths.BACKUP_ALERTS_REL
+LAST_RUN_RECEIPT = state_paths.BACKUP_LAST_RUN_REL
 CHANNEL = "cto"
 # Stable operational seat, independent of provider/model routing.
 RECIPIENT = "claude-cto"
@@ -162,7 +163,7 @@ def publish_transition(path: Path, publish: Publisher, message: str, key: str, s
 
 def receipt_summary(project_root: Path) -> str:
     try:
-        receipt = json_depth.loads((project_root / LAST_RUN_RECEIPT).read_text(encoding="utf-8"), max_depth=512)
+        receipt = json_depth.loads(state_paths.backup_last_run_path(project_root).read_text(encoding="utf-8"), max_depth=512)
     except (OSError, ValueError):
         return "last-run receipt: absent or unreadable"
     if not isinstance(receipt, dict):
@@ -363,7 +364,7 @@ def main(argv: list[str] | None = None, publish: Publisher | None = None) -> int
     except ValueError as error:
         print(f"backup-alert: {error}", file=sys.stderr)
         return 1
-    state_dir = args.state_dir or project_root / DEFAULT_STATE_DIR
+    state_dir = args.state_dir or state_paths.backup_alerts_dir(project_root)
     try:
         print(
             handle(

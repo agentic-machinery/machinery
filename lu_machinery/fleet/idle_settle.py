@@ -33,6 +33,7 @@ from typing import Any
 
 if __package__ in (None, ""):  # run as a file: put the repository root on sys.path
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from lu_machinery import state_paths
 from lu_machinery.common import json_depth
 from lu_machinery.common.jsonl import jsonl_lines
 from lu_machinery.common.repo_root import state_root
@@ -84,7 +85,7 @@ ENFORCE_DISHONEST = "DISHONEST"
 
 def default_store_path(repo_root: Path | None = None) -> Path:
     root = state_root(repo_root)
-    return root / "batch_state" / "idle_settle" / "events.jsonl"
+    return state_paths.idle_settle_events_path(root)
 
 
 def infer_settle_kind(task_id: str | None) -> str:

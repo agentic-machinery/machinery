@@ -22,6 +22,7 @@ from typing import Any
 
 if __package__ in (None, ""):  # run as a file: put the repository root on sys.path
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from lu_machinery import state_paths
 from lu_machinery.agent_runtime.errors import (
     AgentRuntimeError,
     AgentStalledError,
@@ -109,7 +110,7 @@ def _sanitized_namespace(namespace: str | None) -> str | None:
 
 def load_receipt(receipt_path: Path | None = None) -> dict[str, Any] | None:
     if receipt_path is None:
-        receipt_path = state_root() / "batch_state" / "runtime" / "codex-transport-health.json"
+        receipt_path = state_paths.codex_transport_health_path(state_root())
     try:
         payload = json_depth.loads(receipt_path.read_text(encoding="utf-8"), max_depth=512)
     except (OSError, json.JSONDecodeError):
@@ -253,7 +254,7 @@ def probe_codex_transport(
 ) -> dict[str, Any]:
     """Probe one genuinely fresh Codex worker or reuse an unexpired receipt."""
     if receipt_path is None:
-        receipt_path = state_root() / "batch_state" / "runtime" / "codex-transport-health.json"
+        receipt_path = state_paths.codex_transport_health_path(state_root())
     checked_now = now or _utc_now()
     if not force_fresh:
         cached = current_transport_health(
@@ -396,7 +397,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         args.config = args.config or default_config_path()
         if args.receipt is None:
-            args.receipt = state_root() / "batch_state" / "runtime" / "codex-transport-health.json"
+            args.receipt = state_paths.codex_transport_health_path(state_root())
     except MachineryConfigError as exc:
         raise SystemExit(f"codex transport health: {exc}") from None
     if args.command == "status":

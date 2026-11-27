@@ -46,6 +46,7 @@ from pathlib import Path
 from types import ModuleType
 from typing import Any
 
+from lu_machinery import state_paths
 from lu_machinery.agent_identity import RETIRED_AGENT_ALIASES
 from lu_machinery.common import json_depth
 from lu_machinery.common.repo_root import state_root
@@ -140,7 +141,7 @@ def _usage_dir() -> Path:
     # All linked worktrees share the primary checkout's runtime-state plane so
     # the Monitor API sees one fleet-wide usage stream and cross-process pilot
     # locks/idempotency checks cannot split by worktree (#5171, #6063).
-    path = state_root() / "batch_state" / "api_usage"
+    path = state_paths.api_usage_dir(state_root())
     path.mkdir(parents=True, exist_ok=True)
     return path
 

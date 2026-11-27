@@ -594,17 +594,17 @@ def _product_checkout() -> Path | None:
 
 
 def _fleet_plane() -> Path:
+    from lu_machinery import state_paths
     from lu_machinery.common.repo_root import MachineryConfigError, configured_host_state_root, state_root
-    from lu_machinery.fleet_comms.paths import DEFAULT_ROOT_REL
     from lu_machinery.guardrails.worktree_containment import canonicalize
 
     override = os.environ.get("FLEET_COMMS_ROOT")
     try:
         if override:
             host_state = configured_host_state_root()
-            path = host_state / DEFAULT_ROOT_REL if host_state is not None else Path(override).expanduser()
+            path = state_paths.fleet_comms_dir(host_state) if host_state is not None else Path(override).expanduser()
         else:
-            path = state_root() / DEFAULT_ROOT_REL
+            path = state_paths.fleet_comms_dir(state_root())
     except MachineryConfigError as exc:
         raise Refused("Fleet Comms state is not configured consistently") from exc
     if not path.is_absolute():

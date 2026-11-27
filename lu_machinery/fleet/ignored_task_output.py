@@ -26,6 +26,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
+from lu_machinery import state_paths
 from lu_machinery.common import json_depth, profile
 from lu_machinery.common.repo_root import MachineryConfigError, machinery_path
 from lu_machinery.fleet.regenerable_output import committed_release_pins, is_regenerable_ignored_path
@@ -828,7 +829,7 @@ def capture_abandon_output(
     digest = hashlib.sha256(
         json.dumps([(entry["path"], entry["size"], entry["sha256"]) for entry in paths]).encode()
     ).hexdigest()
-    parent = primary / "batch_state" / "preserved" / identity
+    parent = state_paths.preserved_dir(primary, identity)
     if parent.is_relative_to(worktree):
         raise ValueError("preservation destination is inside the worktree")
     location = _reusable_copy(parent, worktree, files, digest, require_archive=True)
@@ -854,9 +855,9 @@ def capture_abandon_output(
         archive = location.with_suffix(".tar")
         if created is not None:
             with contextlib.ExitStack() as held:
-                root_fd = artifacts._open_trusted_root(primary / "batch_state")
+                root_fd = artifacts._open_trusted_root(state_paths.batch_state_dir(primary))
                 held.callback(os.close, root_fd)
-                parts = artifacts._relative_parts(archive, primary / "batch_state")
+                parts = artifacts._relative_parts(archive, state_paths.batch_state_dir(primary))
                 parent_fd, owned = artifacts._walk_parent(root_fd, parts[:-1])
                 if owned:
                     held.callback(os.close, parent_fd)
@@ -873,7 +874,7 @@ def capture_abandon_output(
             locator["archive"] = {
                 "path": archive.relative_to(primary).as_posix(),
                 "sha256": hashlib.sha256(
-                    artifacts._read_preserved_bytes(archive, root=primary / "batch_state").payload
+                    artifacts._read_preserved_bytes(archive, root=state_paths.batch_state_dir(primary)).payload
                 ).hexdigest(),
             }
         else:
@@ -922,7 +923,7 @@ def _abandon_regular(
     primary: Path, path: Path, *, read_payload: bool, max_bytes: int | None = None
 ) -> tuple[bytes, str]:
     """Hash a regular file in bounded reads, walking descriptor-relative without links."""
-    root = primary / "batch_state"
+    root = state_paths.batch_state_dir(primary)
     parts = artifacts._relative_parts(path, root)
     with contextlib.ExitStack() as held:
         root_fd = artifacts._open_trusted_root(root)
@@ -971,7 +972,7 @@ def _abandon_file(
     name, digest = entry.get("path"), entry.get("sha256")
     if not isinstance(name, str) or not isinstance(digest, str) or not re.fullmatch(r"[a-f0-9]{64}", digest):
         raise ValueError("terminal-abandon preservation locator invalid")
-    root = primary / "batch_state"
+    root = state_paths.batch_state_dir(primary)
     parts = artifacts._relative_parts(primary / name, root)
     if not parts:
         raise ValueError("terminal-abandon preservation locator invalid")
@@ -1848,7 +1849,7 @@ def preserve_worktree_artifacts(
             metadata["next_condition"] = "owner retrieves output exceeding the preservation cap"
             raise ValueError(f"ignored output exceeds preservation cap ({total_bytes} > {cap} bytes)")
         if copy_required and (files or absent or kept):
-            parent = primary / "batch_state" / "preserved" / identity
+            parent = state_paths.preserved_dir(primary, identity)
             if parent.is_relative_to(worktree):
                 raise ValueError("preservation destination is inside the worktree")
             # Bind copying to the original inventory, including mutations before

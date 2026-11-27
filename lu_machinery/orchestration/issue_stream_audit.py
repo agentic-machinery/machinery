@@ -47,6 +47,7 @@ from pathlib import Path
 
 import yaml
 
+from lu_machinery import state_paths
 from lu_machinery.common import json_depth, profile
 from lu_machinery.common.repo_root import github_slug, machinery_path, product_root, state_root
 from lu_machinery.opsec.prepublish import publication_cli
@@ -121,11 +122,7 @@ MembershipResolver = Callable[[int, int], bool]
 
 def refresh_sidecar_paths(root: Path | None = None) -> tuple[Path, Path]:
     """Return shared-state sidecars; root is only an in-tree start hint."""
-    batch_state = state_root(root) / "batch_state"
-    return (
-        batch_state / "issue_stream_audit_refresh.json",
-        batch_state / "issue_stream_audit_refresh.lock",
-    )
+    return state_paths.issue_stream_audit_refresh_paths(state_root(root))
 
 
 # Grace for the spawn→acquire race: the scheduler writes ``scheduled``, spawns
@@ -1931,7 +1928,7 @@ def run_audit(
     """
     if repo is None:
         root = product_root(repo_root)
-        cache_path = state_root() / "batch_state/issue_stream_audit.json"
+        cache_path = state_paths.issue_stream_audit_path(state_root())
         repository = "/".join(_repo_owner_name(root))
         repo_norm = fleet_repos.ascii_repo_slug(repository, strip=False)
         expected_norm = fleet_repos.ascii_repo_slug(github_slug(), strip=False)
@@ -1998,7 +1995,7 @@ def run_audit(
         include_milestones=is_default,
     )
     if is_default:
-        publish_cache(report, registry, state_root() / "batch_state/issue_stream_audit.json")
+        publish_cache(report, registry, state_paths.issue_stream_audit_path(state_root()))
     return report
 
 
@@ -2086,7 +2083,7 @@ def _is_valid_cached_report(report: object) -> bool:
 
 def read_cache(max_age_s: float = DEFAULT_CACHE_MAX_AGE_S) -> dict | None:
     validated_max_age = _validate_max_age(max_age_s)
-    path = state_root() / "batch_state/issue_stream_audit.json"
+    path = state_paths.issue_stream_audit_path(state_root())
     try:
         report = json_depth.loads(path.read_text(encoding="utf-8"), max_depth=512)
     except (OSError, ValueError):
@@ -2291,7 +2288,7 @@ def read_membership_index(max_age_s: int, *, cache_path: Path | None = None) -> 
     separate live auditor run, so discovery/gate paths stay offline and
     non-mutating.
     """
-    path = cache_path if cache_path is not None else state_root() / "batch_state/issue_stream_audit.json"
+    path = cache_path if cache_path is not None else state_paths.issue_stream_audit_path(state_root())
     try:
         report = json_depth.loads(path.read_text(encoding="utf-8"), max_depth=512)
     except (OSError, ValueError):

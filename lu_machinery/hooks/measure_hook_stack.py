@@ -19,6 +19,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from lu_machinery import state_paths
 from lu_machinery.common.repo_root import (
     MachineryConfigError,
     machinery_path,
@@ -205,7 +206,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         root = product_root()
-        out = args.out or state_root() / "batch_state" / "hook-audit-measure.json"
+        out = args.out or state_paths.hook_audit_measure_path(state_root())
         stack = _stack(root)
     except MachineryConfigError as exc:
         raise SystemExit(f"measure_hook_stack: {exc}") from None

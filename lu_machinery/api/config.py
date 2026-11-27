@@ -7,6 +7,7 @@ code in ``scripts.project_api.config`` (Monitor split, C-4687).
 import os
 from pathlib import Path
 
+from lu_machinery import state_paths
 from lu_machinery.common.repo_root import StateRootError, machinery_path, product_root, state_root
 
 
@@ -23,7 +24,7 @@ def _live_repo_root() -> Path:
 
 def batch_state_path(shared_root: Path) -> Path:
     """Resolve the Monitor store and validate its legacy environment assertion."""
-    path = shared_root / "batch_state"
+    path = state_paths.batch_state_dir(shared_root)
     setting = "LEARN_UKRAINIAN_BATCH_STATE_DIR"
     if setting in os.environ and os.environ[setting] != str(path):
         raise StateRootError(f"{setting} disagrees with the durable state root")

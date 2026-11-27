@@ -54,6 +54,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from lu_machinery import state_paths
 from lu_machinery.common import json_depth
 from lu_machinery.common.repo_root import MachineryConfigError, main_checkout_root, product_root, state_root
 from lu_machinery.common.scratch import (
@@ -1372,7 +1373,7 @@ def sweep(
     ):
         raise ValueError("temp root must be a real temporary directory")
     root = temp_root.resolve()
-    if batch_state and (root != repo_root.resolve() / "batch_state" or scratch is not None):
+    if batch_state and (root != state_paths.batch_state_dir(repo_root.resolve()) or scratch is not None):
         raise ValueError("batch expiry requires the repository batch_state root and explicit metadata")
     if settled_task_only and (batch_state or scratch is not None):
         raise ValueError("settled-task-only cannot be combined with other expiry modes")
@@ -1990,7 +1991,7 @@ def main(argv: list[str] | None = None) -> int:
         if not math.isfinite(args.digest_limit_mib) or args.digest_limit_mib < 0:
             raise ValueError("digest limit must be finite and non-negative")
         report = sweep(
-            temp_root=state_root() / "batch_state" if args.batch_state else args.temp_root or SYSTEM_TEMP_AREAS[0],
+            temp_root=state_paths.batch_state_dir(state_root()) if args.batch_state else args.temp_root or SYSTEM_TEMP_AREAS[0],
             task_root=args.task_root,
             min_age_s=args.min_age_hours * 3600,
             scratch=scratch,

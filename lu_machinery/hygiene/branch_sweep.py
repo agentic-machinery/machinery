@@ -34,6 +34,7 @@ from typing import Literal, overload
 
 if __package__ in (None, ""):  # run as a file: put the repository root on sys.path
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from lu_machinery import state_paths
 from lu_machinery.common import github_client, json_depth
 from lu_machinery.common.git_context import UnsafeBranchNameError, sanitized_git_env, validate_plain_branch_name
 from lu_machinery.common.jsonl import jsonl_lines, physical_lines
@@ -65,10 +66,10 @@ _MERGE_SUBJECT_RE = re.compile(r"^Merge pull request #([0-9]+)(?!\w)")
 _SQUASH_SUBJECT_RE = re.compile(r"\(#([0-9]+)\)[ \t\r\n]*$")
 _HTTP_STATUS_RE = re.compile(r"HTTP/\d+(?:\.\d+)?\s+(\d+)")
 _CLOCK_SKEW = timedelta(seconds=10)
-LEDGER_PATH = Path("batch_state") / "branch-archive" / "evidence.jsonl"
-ARCHIVE_DIR = Path("batch_state") / "branch-archive"
-RECEIPT_PATH = ARCHIVE_DIR / "stale-local-receipts.jsonl"
-ARCHIVE_LOCK_PATH = ARCHIVE_DIR / "archive.lock"
+LEDGER_PATH = state_paths.BRANCH_ARCHIVE_LEDGER_REL
+ARCHIVE_DIR = state_paths.BRANCH_ARCHIVE_REL
+RECEIPT_PATH = state_paths.BRANCH_ARCHIVE_RECEIPT_REL
+ARCHIVE_LOCK_PATH = state_paths.BRANCH_ARCHIVE_LOCK_REL
 DEFAULT_ARCHIVE_AFTER_DAYS = 7
 # A released task younger than this still names work someone may return to.
 # Archival waits. Patch-id deletion and the other dispositions do not.
@@ -344,7 +345,7 @@ def _valid(name: str, repo: Path) -> bool:
 
 
 def _task_records(repo: Path) -> list[tuple[Path, dict[str, object]]]:
-    task_dir = reaper.control_plane_root(repo) / "batch_state" / "tasks"
+    task_dir = state_paths.tasks_dir(reaper.control_plane_root(repo))
     records: list[tuple[Path, dict[str, object]]] = []
     with task_archive_lock(task_dir):
         for path in task_dir.glob("*.json"):
@@ -1573,7 +1574,7 @@ def _write_verified_bundle(repo: Path, confirmed: list[tuple[Decision, Branch]])
     temporary = Path(temporary_name)
     filename = temporary.name.removeprefix(".").removesuffix(".tmp") + ".bundle"
     bundle_path = directory / filename
-    relative = (ARCHIVE_DIR / filename).as_posix()
+    relative = state_paths.branch_archive_rel(filename).as_posix()
     try:
         _checked(repo, "bundle", "create", str(temporary), *refs, "--not", main_ref)
         _seal_regular_file(temporary)
@@ -2006,9 +2007,21 @@ def _review_bundle_decisions(repo: Path) -> list[Decision]:
         age_days = max(0, int(now - child.st_mtime) // 86400)
         if age_days < BUNDLE_REVIEW_DAYS:
             continue
+        if not _bundle_name_ok(path.name):
+            listed.append(
+                Decision(
+                    _bundle_archive_locator(path.name),
+                    "review-bundle",
+                    "bundle filename rejected by path validation; retained for manual review; not deleted",
+                    None,
+                    None,
+                    age_days,
+                )
+            )
+            continue
         listed.append(
             Decision(
-                (ARCHIVE_DIR / path.name).as_posix(),
+                state_paths.branch_archive_rel(path.name).as_posix(),
                 "review-bundle",
                 "bundle older than 90 days; listed for review; not deleted",
                 None,
@@ -2032,26 +2045,47 @@ class AgeOutResult:
     locator: str | None = None
 
 
+def _restore_bundle_name_ok(name: str) -> bool:
+    """Safe plain POSIX ``*.bundle`` basename for receipt-backed restore (preserves historical names)."""
+    return (
+        bool(name)
+        and "\x00" not in name
+        and "/" not in name
+        and name == Path(name).name
+        and name.endswith(".bundle")
+        and not name.startswith(".")
+    )
+
+
 def _bundle_name_ok(name: str) -> bool:
-    return bool(name) and name == Path(name).name and name.endswith(".bundle") and not name.startswith(".")
+    return state_paths.is_valid_component(name) and _restore_bundle_name_ok(name)
 
 
-def _age_out_candidates(directory: Path, *, now: float, min_days: int) -> list[tuple[Path, int, int]]:
-    """Regular ``*.bundle`` files at least ``min_days`` old by mtime: (path, age_days, size)."""
+def _bundle_archive_locator(name: str) -> str:
+    return state_paths.branch_archive_rel(name).as_posix() if state_paths.is_valid_component(name) else name
+
+
+def _age_out_candidates(directory: Path, *, now: float, min_days: int) -> list[tuple[Path, int, int, bool]]:
+    """Regular non-hidden ``*.bundle`` files at least ``min_days`` old: (path, age_days, size, name_valid)."""
     try:
         info = os.lstat(directory)
     except FileNotFoundError:
         return []
     if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
         raise RuntimeError("archive path is not a plain directory")
-    found: list[tuple[Path, int, int]] = []
+    found: list[tuple[Path, int, int, bool]] = []
     for path in sorted(directory.iterdir(), key=lambda item: item.name):
         child = os.lstat(path)
-        if stat.S_ISLNK(child.st_mode) or not stat.S_ISREG(child.st_mode) or not _bundle_name_ok(path.name):
+        if (
+            stat.S_ISLNK(child.st_mode)
+            or not stat.S_ISREG(child.st_mode)
+            or not path.name.endswith(".bundle")
+            or path.name.startswith(".")
+        ):
             continue
         age_days = max(0, int(now - child.st_mtime) // 86400)
         if age_days >= min_days:
-            found.append((path, age_days, child.st_size))
+            found.append((path, age_days, child.st_size, _bundle_name_ok(path.name)))
     return found
 
 
@@ -2151,7 +2185,7 @@ def _age_out_one(
     child = os.lstat(path)
     age_days = max(0, int(now - child.st_mtime) // 86400)
     name = path.name
-    relative = (ARCHIVE_DIR / name).as_posix()
+    relative = state_paths.branch_archive_rel(name).as_posix()
     if stat.S_ISLNK(child.st_mode) or not stat.S_ISREG(child.st_mode) or age_days < min_days:
         return AgeOutResult(relative, "retained", "bundle changed since it was listed", age_days, child.st_size)
     checksum = _bundle_sha256(path)
@@ -2215,20 +2249,53 @@ def age_out_bundles(
         return []
     if not resolved.available or resolved.path is None:
         reason = f"bulk root unavailable ({resolved.reason}); nothing removed"
-        return [AgeOutResult((ARCHIVE_DIR / p.name).as_posix(), "retained", reason, a, s) for p, a, s in candidates]
+        return [
+            AgeOutResult(
+                _bundle_archive_locator(p.name),
+                "retained",
+                reason if valid else "bundle filename rejected by path validation; kept local",
+                a,
+                s,
+            )
+            for p, a, s, valid in candidates
+        ]
     if not apply:
         return [
-            AgeOutResult((ARCHIVE_DIR / p.name).as_posix(), "would-age-out", "dry run", a, s) for p, a, s in candidates
+            AgeOutResult(
+                _bundle_archive_locator(p.name),
+                "would-age-out" if valid else "retained",
+                "dry run" if valid else "bundle filename rejected by path validation; kept local",
+                a,
+                s,
+            )
+            for p, a, s, valid in candidates
         ]
     results: list[AgeOutResult] = []
     with _archive_lock(repo):
         bulk_directory = _bulk_archive_dir(resolved, create=True)
-        for path, age_days, size in candidates:
+        for path, age_days, size, valid in candidates:
+            if not valid:
+                results.append(
+                    AgeOutResult(
+                        _bundle_archive_locator(path.name),
+                        "retained",
+                        "bundle filename rejected by path validation; kept local",
+                        age_days,
+                        size,
+                    )
+                )
+                continue
             try:
                 results.append(_age_out_one(repo, path, bulk_directory, resolved, min_days=min_days, now=stamp))
-            except (OSError, RuntimeError, subprocess.TimeoutExpired) as exc:
+            except (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired) as exc:
                 results.append(
-                    AgeOutResult((ARCHIVE_DIR / path.name).as_posix(), "retained", f"kept local: {exc}", age_days, size)
+                    AgeOutResult(
+                        _bundle_archive_locator(path.name),
+                        "retained",
+                        f"kept local: {exc}",
+                        age_days,
+                        size,
+                    )
                 )
     return results
 
@@ -2241,7 +2308,7 @@ def restore_bundle(
     resolution: storage_topology.BulkRootResolution | None = None,
 ) -> Path:
     """Copy a relocated bundle back from the bulk mirror and prove it. Never replaces a file, never deletes."""
-    if not _bundle_name_ok(name):
+    if not _restore_bundle_name_ok(name):
         raise RuntimeError("bundle name must be a plain *.bundle file name")
     records = [row for row in _relocation_records(repo) if row.get("bundle") == name]
     if not records:
@@ -2366,7 +2433,7 @@ def _format_decision(item: Decision) -> str:
 def _main_bundles(args: argparse.Namespace) -> int:
     try:
         repo = reaper.resolve_repo_root()
-        if args.restore_bundle:
+        if args.restore_bundle is not None:
             restored = restore_bundle(repo, args.restore_bundle, destination=args.restore_to)
             print(json.dumps({"ok": True, "restored": str(restored)}) if args.json else f"restored: {restored}")
             return 0
@@ -2385,9 +2452,9 @@ def _main_bundles(args: argparse.Namespace) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    if args.age_out_bundles and args.restore_bundle:
+    if args.age_out_bundles and args.restore_bundle is not None:
         build_parser().error("--age-out-bundles and --restore-bundle cannot be combined")
-    if args.age_out_bundles or args.restore_bundle:
+    if args.age_out_bundles or args.restore_bundle is not None:
         return _main_bundles(args)
     token = _ARCHIVE_AFTER_DAYS.set(args.archive_after_days)
     try:

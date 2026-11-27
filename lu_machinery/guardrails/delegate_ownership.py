@@ -57,6 +57,7 @@ except ModuleNotFoundError as exc:
     if str(_install_root) not in sys.path:
         sys.path.insert(0, str(_install_root))
     from lu_machinery.lib.readonly_sqlite import SQLiteConnection  # type: ignore[no-redef]
+from lu_machinery import state_paths
 from lu_machinery.common import json_depth
 
 # Anchor ledger + task-state to the PRIMARY checkout (not a worktree copy),
@@ -85,8 +86,8 @@ def default_ledger_path() -> Path:
         host_state = configured_host_state_root()
         if host_state is None:
             return Path(override)
-        return host_state / "batch_state" / "tasks" / "write-ownership.sqlite3"
-    return state_root() / "batch_state" / "tasks" / "write-ownership.sqlite3"
+        return state_paths.write_ownership_db(host_state)
+    return state_paths.write_ownership_db(state_root())
 
 
 def default_task_state_dir() -> Path:

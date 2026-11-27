@@ -40,6 +40,7 @@ from typing import Any, NamedTuple, cast
 
 import yaml
 
+from lu_machinery import state_paths
 from lu_machinery.common import json_depth, profile
 from lu_machinery.common.repo_root import github_slug, machinery_path, state_root
 from lu_machinery.orchestration import issue_stream_audit as isa
@@ -617,7 +618,7 @@ def _iter_bounded_lines(path: Path, budget: _ByteBudget, max_line_chars: int = M
 def _scan_telemetry(
     root: Path, window_days: int, now: datetime, known_ids: set[str]
 ) -> dict[str, Any]:
-    events_dir = root / "batch_state" / "telemetry" / "events"
+    events_dir = state_paths.telemetry_events_dir(root)
     start = now - timedelta(days=window_days)
     acc = _Accumulator()
     budget = _ByteBudget(MAX_SCAN_BYTES)

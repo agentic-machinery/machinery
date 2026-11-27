@@ -14,6 +14,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from lu_machinery import state_paths
 from lu_machinery.common.repo_root import state_root
 from lu_machinery.secret_redactor import redact_text, redact_value
 
@@ -104,7 +105,7 @@ def _current_or_new_env_id(env_name: str, prefix: str) -> str:
 
 def _event_dir() -> Path:
     override = os.environ.get(_EVENTS_DIR_ENV)
-    path = Path(override) if override else state_root() / "batch_state" / "telemetry" / "events"
+    path = Path(override) if override else state_paths.telemetry_events_dir(state_root())
     path.mkdir(parents=True, exist_ok=True)
     return path
 

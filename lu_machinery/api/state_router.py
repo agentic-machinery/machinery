@@ -26,6 +26,7 @@ import yaml
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 
+from lu_machinery import state_paths
 from lu_machinery.agent_identity import normalize_seat, seat_read_aliases
 from lu_machinery.agent_runtime.acp_health import probe_acp_health
 from lu_machinery.agent_runtime.usage import summarize_fleet_burn, summarize_lane_runtime
@@ -1082,7 +1083,7 @@ def _compute_dispatch_routing_budget(
     resolved_batch_state = (
         batch_state_dir
         if batch_state_dir is not None
-        else state_root() / "batch_state"
+        else state_paths.batch_state_dir(state_root())
     )
     usage_dir = resolved_batch_state / "api_usage"
     runtime_records_7d = _runtime_usage_records_7d(usage_dir=usage_dir)

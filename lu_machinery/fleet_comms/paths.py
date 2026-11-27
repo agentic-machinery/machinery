@@ -6,6 +6,7 @@ import os
 import sysconfig
 from pathlib import Path
 
+from lu_machinery import state_paths
 from lu_machinery.common.repo_root import (
     MachineryConfigError,
     configured_host_state_root,
@@ -23,7 +24,7 @@ from lu_machinery.guardrails.worktree_containment import (
 
 ENV_ROOT = "FLEET_COMMS_ROOT"
 ENV_ALLOW_LOCAL_SHADOW = "FLEET_COMMS_ALLOW_LOCAL_SHADOW"
-DEFAULT_ROOT_REL = Path("batch_state") / "fleet-comms" / "v1"
+DEFAULT_ROOT_REL = state_paths.FLEET_COMMS_REL
 RETIRED_LOCAL_MARKER = "READ_ME_CANONICAL_ON_JOB_HOST.txt"
 RETIRED_LOCAL_PLANE_MESSAGE = (
     "local fleet-comms sqlite is retired; the job-host Monitor owns "
@@ -91,7 +92,7 @@ def assert_store_write_allowed(store: Path, *, package_file: str) -> None:
     try:
         package = resolve_path(package_file).parents[1]
         state = resolve_path(state_root(), strict=True)
-        live_store = resolve_path(state / DEFAULT_ROOT_REL / "comms.sqlite3")
+        live_store = resolve_path(state_paths.fleet_comms_db(state))
         store = resolve_path(store)
         if store != live_store and not (
             store.exists() and live_store.exists() and store.samefile(live_store)
@@ -183,13 +184,13 @@ def local_plane_is_retired(
     env = os.environ.get(ENV_ROOT)
     if env:
         host_state = configured_host_state_root()
-        path = host_state / DEFAULT_ROOT_REL if host_state is not None else Path(env).expanduser()
+        path = state_paths.fleet_comms_dir(host_state) if host_state is not None else Path(env).expanduser()
         return _retired_marker_present(path.resolve())
     try:
         base = _resolve_repo_plane_base(repo_root, allow_non_git=False) if repo_root is not None else state_root()
     except (PlaneRootAnchorError, NotAGitRepositoryError, MachineryConfigError, OSError, RuntimeError):
         return False
-    return _retired_marker_present((base / DEFAULT_ROOT_REL).resolve())
+    return _retired_marker_present(state_paths.fleet_comms_dir(base).resolve())
 
 
 def _refuse_retired_local_plane(root: Path) -> None:
@@ -234,12 +235,12 @@ def default_plane_root(
         env = os.environ.get(ENV_ROOT)
         if env:
             host_state = configured_host_state_root()
-            root = validate_plane_root(host_state / DEFAULT_ROOT_REL if host_state is not None else Path(env))
+            root = validate_plane_root(state_paths.fleet_comms_dir(host_state) if host_state is not None else Path(env))
         elif repo_root is None:
-            root = validate_plane_root(state_root() / DEFAULT_ROOT_REL)
+            root = validate_plane_root(state_paths.fleet_comms_dir(state_root()))
         else:
             base = _resolve_repo_plane_base(repo_root, allow_non_git=allow_non_git)
-            root = validate_plane_root(base / DEFAULT_ROOT_REL)
+            root = validate_plane_root(state_paths.fleet_comms_dir(base))
         _refuse_retired_local_plane(root)
     except PlaneRootAnchorError:
         raise
