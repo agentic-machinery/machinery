@@ -3245,11 +3245,6 @@
     {
       "path": "lu_machinery/dispatcher/store.py",
       "code": "assignment",
-      "message": "Incompatible types in assignment (expression has type \"None | Path\", variable has type \"Path\")"
-    },
-    {
-      "path": "lu_machinery/dispatcher/store.py",
-      "code": "assignment",
       "message": "Incompatible types in assignment (expression has type \"None | str\", target has type \"None\")"
     },
     {
@@ -3286,21 +3281,6 @@
       "path": "lu_machinery/dispatcher/store.py",
       "code": "call-overload",
       "message": "No overload variant of \"update\" of \"MutableMapping\" matches argument types \"str\", \"str\", \"Any\""
-    },
-    {
-      "path": "lu_machinery/dispatcher/store.py",
-      "code": "truthy-function",
-      "message": "Function \"locate_task_record\" could always be true in boolean context"
-    },
-    {
-      "path": "lu_machinery/dispatcher/store.py",
-      "code": "truthy-function",
-      "message": "Function \"relocated_result_file\" could always be true in boolean context"
-    },
-    {
-      "path": "lu_machinery/dispatcher/store.py",
-      "code": "truthy-function",
-      "message": "Function \"relocated_result_file\" could always be true in boolean context"
     },
     {
       "path": "lu_machinery/dispatcher/store.py",

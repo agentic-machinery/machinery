@@ -228,8 +228,9 @@ def _load_roster() -> tuple[frozenset[str], bool]:
     ``external_recipients`` list (agents outside the launcher fleet whose inbox
     an external bridge drains), and lane senders from ``config/driver_lanes.json``
     (the lanes the context guard hands off). The roster is complete only when the slot
-    roster names at least one slot and the lane file loads with at least one
-    lane; an incomplete roster proves no name unregistered. The result is
+    file passes the assignments contract whole and names at least one slot, the
+    external list reads, and the lane file loads with at least one lane; an
+    incomplete roster proves no name unregistered. The result is
     cached per file identity (path, mtime, size), so every claim does not
     reparse both files.
     """
@@ -261,7 +262,12 @@ def _load_roster() -> tuple[frozenset[str], bool]:
     external: tuple[str, ...] = ()
     external_availability: Literal["available", "unavailable"] = "unavailable"
     if assignments is not None:
-        slots = agent_identity._load_registry_slots(assignments)
+        # Strict: a file that fails the assignments contract (one malformed area included) yields no
+        # slots, so the roster is incomplete rather than complete without that area's slots.
+        try:
+            slots = agent_identity._load_registry_slots(assignments, strict=True)
+        except Exception as exc:
+            _LOG.warning("fleet_comms slot roster unreadable: %s", type(exc).__name__)
         external, external_availability = load_external_recipients(assignments)
     lanes: tuple[str, ...] = ()
     if lane_data is not None:
@@ -317,8 +323,9 @@ def _roster_complete() -> bool:
 def _task_standing(name: str) -> Literal["live", "settled", "unknown"] | None:
     """A dispatch task's standing by its record: live while spawning or running, settled at a terminal status.
 
-    ``None`` when no task record has this id; ``unknown`` when the record cannot
-    be read or its status is missing, not a string or not a known status.
+    ``None`` only when the store proves no task record has this id; ``unknown``
+    when the record or its absence cannot be read (an access failure included)
+    or its status is missing, not a string or not a known status.
     """
     if not _TASK_ID_RE.fullmatch(name) or ".." in name:
         return None
@@ -558,7 +565,12 @@ def pending_delivery_snapshot(recipient: str, *, root: Path | None = None, limit
         from lu_machinery.agent_identity import resolve_recipient_alias
 
         # A historical alias names no roster seat; only a canonical name has a standing to check.
-        if resolve_recipient_alias(recipient) == recipient:
+        # An alias that cannot be told from a canonical name (roster unreadable) is unverified, never refused.
+        try:
+            canonical = resolve_recipient_alias(recipient, strict=True) == recipient
+        except Exception:
+            return {**unknown, "reason": "recipient_standing_unverified"}
+        if canonical:
             standing = _recipient_standing(recipient, *_load_roster())
             if standing in {"not_registered", "settled_task"}:
                 return {**unknown, "reason": AuthorityRecipientRefused(recipient, standing).cause}

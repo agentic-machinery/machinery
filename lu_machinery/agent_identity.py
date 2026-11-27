@@ -181,39 +181,54 @@ def default_assignments_path() -> Path:
     return profile.config_path("area_assignments", default=_PACKAGED_ASSIGNMENTS_PATH)
 
 
-def _load_registry_slots(assignments_path: Path | None = None) -> tuple[str, ...]:
+def _read_assignments(path: Path, *, strict: bool) -> dict[Any, Any]:
+    """The ``assignments`` mapping of ``area_assignments.yaml``.
+
+    Lenient (the default): an empty mapping on a missing file, parse error or
+    missing PyYAML, and a malformed area is left for the caller to skip.
+    ``strict``: the file must pass the one assignments contract
+    (``validate_fleet_taxonomy.load_validated_assignments``: schema, unique
+    keys, non-blank slots); any doubt raises, so a caller that decides from
+    the roster sees the failure instead of a partial answer.
+    """
+    if strict:
+        from lu_machinery.orchestration.validate_fleet_taxonomy import load_validated_assignments
+
+        return dict(load_validated_assignments(path)["assignments"])
+    try:
+        if not path.is_file():  # never block on a FIFO
+            return {}
+        import yaml
+
+        raw_data = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    assignments = raw_data.get("assignments") if isinstance(raw_data, dict) else None
+    return assignments if isinstance(assignments, dict) else {}
+
+
+def _slots_of(assignments: dict[Any, Any]) -> tuple[str, ...]:
+    slots: list[str] = []
+    for area_data in assignments.values():
+        if isinstance(area_data, dict):
+            area_slots = area_data.get("slots", [])
+            if isinstance(area_slots, (list, tuple)):
+                for slot in area_slots:
+                    if isinstance(slot, str) and slot.strip() and slot.strip() not in slots:
+                        slots.append(slot.strip())
+    return tuple(slots)
+
+
+def _load_registry_slots(assignments_path: Path | None = None, *, strict: bool = False) -> tuple[str, ...]:
     """Load slot identities from area_assignments.yaml.
 
-    Lazy load, fail-open: returns empty tuple on missing file, parse error,
-    or missing PyYAML.
+    Lazy load, fail-open by default: returns empty tuple on missing file, parse
+    error, or missing PyYAML, and skips a malformed area. ``strict=True``
+    raises instead (see ``_read_assignments``): a reader that refuses or
+    removes mail on the roster needs the whole roster or none.
     """
     path = (assignments_path or default_assignments_path()).resolve()
-    try:
-        if not path.is_file():
-            return ()
-        text = path.read_text(encoding="utf-8")
-        try:
-            import yaml
-
-            raw_data = yaml.safe_load(text)
-        except ImportError:
-            return ()
-        if not isinstance(raw_data, dict):
-            return ()
-        assignments = raw_data.get("assignments")
-        if not isinstance(assignments, dict):
-            return ()
-        slots: list[str] = []
-        for area_data in assignments.values():
-            if isinstance(area_data, dict):
-                area_slots = area_data.get("slots", [])
-                if isinstance(area_slots, (list, tuple)):
-                    for slot in area_slots:
-                        if isinstance(slot, str) and slot.strip() and slot.strip() not in slots:
-                            slots.append(slot.strip())
-        return tuple(slots)
-    except Exception:
-        return ()
+    return _slots_of(_read_assignments(path, strict=strict))
 
 
 def get_valid_agents(*, assignments_path: Path | None = None) -> tuple[str, ...]:
@@ -254,50 +269,42 @@ def get_valid_recipient_agents(*, assignments_path: Path | None = None) -> tuple
     return get_valid_agents(assignments_path=assignments_path)
 
 
-def _load_empty_slot_areas(assignments_path: Path | None = None, *, provider: str | None = None) -> tuple[str, ...]:
+def _empty_slot_areas_of(assignments: dict[Any, Any], provider: str | None) -> tuple[str, ...]:
+    areas: list[str] = []
+    for name, area_data in assignments.items():
+        if not isinstance(name, str) or not isinstance(area_data, dict):
+            continue
+        area_slots = area_data.get("slots", [])
+        if isinstance(area_slots, (list, tuple)):
+            legacy_monitor = (
+                name == "monitor"
+                and provider in {"claude", "codex", "gemini", "grok", "cursor"}
+                and all(isinstance(slot, str) and slot.strip() for slot in area_slots)
+            )
+            if not area_slots or legacy_monitor:
+                areas.append(name.strip())
+    return tuple(areas)
+
+
+def _load_empty_slot_areas(
+    assignments_path: Path | None = None,
+    *,
+    provider: str | None = None,
+    strict: bool = False,
+) -> tuple[str, ...]:
     """Areas retaining legacy bare-provider inbox aliases.
 
     Empty rosters retain their historical fallback. The six legacy monitor
     providers keep it when dedicated slots are added for other seats.
 
-    Same lazy fail-open contract as ``_load_registry_slots``: empty tuple on
-    missing file, parse error, or missing PyYAML.
+    Same lazy contract as ``_load_registry_slots``: fail-open (empty tuple on
+    missing file, parse error, or missing PyYAML) unless ``strict``, which raises.
     """
     path = (assignments_path or default_assignments_path()).resolve()
-    try:
-        if not path.is_file():
-            return ()
-        text = path.read_text(encoding="utf-8")
-        try:
-            import yaml
-
-            raw_data = yaml.safe_load(text)
-        except ImportError:
-            return ()
-        if not isinstance(raw_data, dict):
-            return ()
-        assignments = raw_data.get("assignments")
-        if not isinstance(assignments, dict):
-            return ()
-        areas: list[str] = []
-        for name, area_data in assignments.items():
-            if not isinstance(name, str) or not isinstance(area_data, dict):
-                continue
-            area_slots = area_data.get("slots", [])
-            if isinstance(area_slots, (list, tuple)):
-                legacy_monitor = (
-                    name == "monitor"
-                    and provider in {"claude", "codex", "gemini", "grok", "cursor"}
-                    and all(isinstance(slot, str) and slot.strip() for slot in area_slots)
-                )
-                if not area_slots or legacy_monitor:
-                    areas.append(name.strip())
-        return tuple(areas)
-    except Exception:
-        return ()
+    return _empty_slot_areas_of(_read_assignments(path, strict=strict), provider)
 
 
-def resolve_recipient_alias(agent: str, *, assignments_path: Path | None = None) -> str:
+def resolve_recipient_alias(agent: str, *, assignments_path: Path | None = None, strict: bool = False) -> str:
     """Resolve dedicated slot aliases and legacy bare-provider inbox aliases.
 
     ``codex-curriculum-upgrade`` addresses the registered ``codex-core`` slot;
@@ -313,19 +320,31 @@ def resolve_recipient_alias(agent: str, *, assignments_path: Path | None = None)
     and unknown names pass through unchanged too so validators still reject
     them (a typo of a registered lane must not silently read the provider
     inbox).
+
+    By default an unreadable roster resolves no alias, so an alias reads as
+    canonical. ``strict=True`` raises instead whenever the answer depends on
+    the roster and the roster cannot be read whole: a caller that refuses a
+    canonical name must not refuse an alias it failed to recognise.
     """
     if not agent:
         return agent
-    valids = get_valid_agents(assignments_path=assignments_path)
+    provider, sep, area = agent.partition("-")
+    if agent in STATIC_VALID_AGENTS or not sep or not provider or not area or provider not in STATIC_VALID_AGENTS:
+        return agent  # no roster makes this name an alias
+    if strict:
+        assignments = _read_assignments((assignments_path or default_assignments_path()).resolve(), strict=True)
+        valids: tuple[str, ...] = (*STATIC_VALID_AGENTS, *_slots_of(assignments))
+    else:
+        assignments, valids = {}, get_valid_agents(assignments_path=assignments_path)
     if agent == "codex-curriculum-upgrade" and "codex-core" in valids:
         return "codex-core"
     if agent in valids:
         return agent
-    provider, sep, area = agent.partition("-")
-    if not sep or not provider or not area:
-        return agent
-    if provider not in STATIC_VALID_AGENTS:
-        return agent
-    if area in _load_empty_slot_areas(assignments_path, provider=provider):
+    empty_areas = (
+        _empty_slot_areas_of(assignments, provider)
+        if strict
+        else _load_empty_slot_areas(assignments_path, provider=provider)
+    )
+    if area in empty_areas:
         return provider
     return agent

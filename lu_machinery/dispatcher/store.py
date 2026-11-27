@@ -21,6 +21,7 @@ from lu_machinery.dispatcher.types import ReviewAttempt, StartRefusal
 from lu_machinery.orchestration.task_record_store import (
     NonFiniteRecordValue,
     TaskIdentityMismatch,
+    archived_task_record_path,
     is_identical_copy,
     iter_task_records,
     locate_task_record,
@@ -30,6 +31,7 @@ from lu_machinery.orchestration.task_record_store import (
     record_json,
     relocated_result_file,
     task_archive_lock,
+    task_record_path,
     task_state_lock,
 )
 
@@ -446,15 +448,29 @@ def _worktree_may_exist(path: str | None) -> bool:
     return True
 
 
+def _require_absent(tasks_root: Path, task_id: str) -> None:
+    """Prove that neither the hot nor the archived record exists; anything else is ``TASK_RECORD_UNREADABLE``.
+
+    ``locate_task_record`` answers "no record" for a name it cannot stat too (an
+    access failure on 3.14 ``is_file``), so absence is proven only by
+    ``FileNotFoundError`` or ``NotADirectoryError`` on both locations.
+    """
+    for candidate in (task_record_path(tasks_root, task_id), archived_task_record_path(tasks_root, task_id)):
+        try:
+            os.stat(candidate)
+        except (FileNotFoundError, NotADirectoryError):
+            continue
+        except OSError as exc:
+            raise TaskRecordError("TASK_RECORD_UNREADABLE") from exc
+        raise TaskRecordError("TASK_RECORD_UNREADABLE")  # a non-file entry, or one written since the lookup
+
+
 def read(task_id: str, nonce: str | None = None, *, missing_ok=False, tasks_root: Path | None = None) -> dict | None:
-    path = record_path(task_id)
-    if tasks_root is not None:
-        path = tasks_root / path.name
-    if locate_task_record:
-        path = locate_task_record(path.parent, task_id)
-    elif not path.exists():
-        path = path.parent / "archive" / path.name
-    if path is None or not path.exists():
+    """The task's record, hot or archived; ``None`` with ``missing_ok`` only when no record is proven to exist."""
+    root = record_path(task_id).parent if tasks_root is None else tasks_root
+    path = locate_task_record(root, task_id)
+    if path is None:
+        _require_absent(root, task_id)
         if missing_ok:
             return None
         raise ValueError("task not found")
@@ -466,8 +482,7 @@ def read(task_id: str, nonce: str | None = None, *, missing_ok=False, tasks_root
         raise TaskRecordError("TASK_RECORD_DAMAGED") from exc
     if nonce is not None and record.get("run_nonce") != nonce:
         raise ValueError("run nonce mismatch")
-    if relocated_result_file:
-        record["result_file"] = relocated_result_file(path, record.get("result_file"))
+    record["result_file"] = relocated_result_file(path, record.get("result_file"))
     return record
 
 
@@ -898,8 +913,7 @@ def list_tasks(status: str | None = None, include_archive=False, *, strict=False
                 if record is None or "task_id" not in record:
                     continue
                 if status is None or record.get("status") == status:
-                    if relocated_result_file:
-                        record["result_file"] = relocated_result_file(path, record.get("result_file"))
+                    record["result_file"] = relocated_result_file(path, record.get("result_file"))
                     records.append(record)
             except TaskIdentityMismatch as exc:
                 # An exact copy of the named record is no run of its own; any other misnamed file refuses.
