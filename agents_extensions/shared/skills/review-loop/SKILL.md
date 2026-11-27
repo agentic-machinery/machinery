@@ -162,7 +162,16 @@ interpreter does not select the primary checkout's Python modules.
    equal to the current pushed tip. Read the findings themselves, not only the verdict line.
    Give each finding a stable id and a disposition in the ledger ([policy](references/policy.md)).
    Fixes go to the authoring lane (the worker itself when it runs the loop); a driver does not
-   patch them in.
+   patch them in. Once a `CHANGES_REQUESTED` verdict is recorded (step 7), the author labels each
+   of its P0-P1 findings before the next round: `fixed` (a real error, changed), `wrong` (the
+   code was already correct), `invented` (it cites a file, line, symbol or behaviour that does
+   not exist), `out_of_scope` or `duplicate`. Every label except `fixed` needs one line of
+   evidence, which also goes in the delta brief. Model stats counts the labels per reviewer.
+
+   ```bash
+   "$PY" -m lu_machinery.review.record_cf_verdict finding-outcome --task-id "$REVIEW_TASK" --pr "$PR" \
+     --finding F2 --label wrong --evidence '<one line that shows it>'
+   ```
 6. **Next round or stop.** The budget is three charged rounds per lineage, and nobody adds
    one ([policy](references/policy.md#4-convergence)). A dispatch reserves its head. A recognized
    verdict or a completed review with a nonempty reply charges that head before publication.

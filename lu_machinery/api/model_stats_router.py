@@ -56,6 +56,7 @@ from lu_machinery.common.git_context import sanitized_git_env
 from lu_machinery.dispatcher.types import NEVER_STARTED, StartRefusal
 from lu_machinery.orchestration.agent_ledger import TASK_FAMILIES
 from lu_machinery.orchestration.fleet_repos import FleetRepo, FleetRepoError, load_fleet_repos, resolve_fleet_repo
+from lu_machinery.review.findings import FINDING_OUTCOME_LABELS
 from lu_machinery.review.language_lane import UKRAINIAN_TASK_FAMILIES
 from lu_machinery.review.model_catalog import (
     MECHANICAL_FAMILIES,
@@ -76,6 +77,7 @@ from .model_stats_rows import (
     fleet_catalog,
     model_catalog_reading,
     path_digest,
+    read_finding_outcomes,
     read_publications,
     read_rows,
     refresh_readings,
@@ -961,8 +963,30 @@ def head_pairs(rows: Iterable[_Row]) -> set[_HeadPair]:
     return pairs
 
 
+# What became of a blocking finding by its author's label (``record_cf_verdict finding-outcome``): the labels, a label
+# a later review contested, and a finding with no label.
+LABEL_OUTCOMES = (*FINDING_OUTCOME_LABELS, "contested", "unlabelled")
+
+
+@dataclass(frozen=True)
+class _Outcomes:
+    """The finding-outcome ledger: each review task's labels (finding id to label) and the contested findings."""
+    labels: Mapping[str, Mapping[str, str]] = field(default_factory=dict)
+    contests: frozenset[tuple[str, str]] = frozenset()
+
+
+def _label_tally(tally: Counter[str], row: _Row, count: int | None, outcomes: _Outcomes) -> None:
+    """Count one blocking review's P0-P1 findings by their author labels. The writer admits a label only for a P0-P1
+    finding of the review's own reply, so the labels never outnumber them; a contested label counts as contested."""
+    labels = outcomes.labels.get(row.task_id, {})
+    for finding_id, label in labels.items():
+        tally["label:" + ("contested" if (row.task_id, finding_id) in outcomes.contests else label)] += 1
+    if count is not None:
+        tally["label:unlabelled"] += max(count - len(labels), 0)
+
+
 def _finding_outcomes(rows: Iterable[_Row], touched: Mapping[_HeadPair, frozenset[str]],
-                      name: Callable[[str], str] = str) -> list[dict[str, Any]]:
+                      name: Callable[[str], str] = str, outcomes: _Outcomes | None = None) -> list[dict[str, Any]]:
     """Per reviewer model: what became of each P0-P1 finding of its blocking reviews of record.
 
     Only published verdicts count. A parsed blocking reply with no publication recorded (an unpublished run, or one
@@ -973,8 +997,14 @@ def _finding_outcomes(rows: Iterable[_Row], touched: Mapping[_HeadPair, frozense
     finding paths, ``reviews_approved_later`` have such an approval and ``reviews_approved_later_read`` of those had
     their changed files read. Precision is fixed over fixed plus dismissed. Findings settle on the reviewer ids as recorded; ``name`` (the page's label bucket) applies
     only when the counts are grouped, so one reviewer's approval never settles another's finding.
+
+    ``labels`` counts the same findings by the author's recorded label (``outcomes``), whatever their file outcome:
+    ``fixed`` (a real error), ``wrong``, ``invented``, ``out_of_scope``, ``duplicate``, ``contested`` (a later review
+    contested the label) and ``unlabelled`` (from the review's P0-P1 count; none when that count is unknown).
+    ``real_precision`` is fixed over fixed plus wrong plus invented.
     """
     rows = list(rows)
+    outcomes = outcomes or _Outcomes()
     counts: dict[str, Counter[str]] = defaultdict(Counter)
     efforts: dict[str, set[str]] = defaultdict(set)
     for row in rows:
@@ -992,6 +1022,7 @@ def _finding_outcomes(rows: Iterable[_Row], touched: Mapping[_HeadPair, frozense
         tally = counts[model]
         efforts[model].add(row.effort)
         tally["reviews"] += 1
+        _label_tally(tally, row, count, outcomes)
         if paths is None:
             tally["unknown"] += count or 0
             tally["reviews_without_paths"] += 1
@@ -1014,6 +1045,7 @@ def _finding_outcomes(rows: Iterable[_Row], touched: Mapping[_HeadPair, frozense
     out = []
     for model, tally in sorted(counts.items(), key=lambda item: (-item[1]["reviews"], item[0])):
         decided = tally["fixed"] + tally["dismissed"]
+        real, judged = tally["label:fixed"], sum(tally["label:" + label] for label in ("fixed", "wrong", "invented"))
         out.append({
             "model": model, "identity": identity(model), "efforts": sorted(efforts[model]),
             "blocking_reviews": tally["reviews"],
@@ -1024,6 +1056,8 @@ def _finding_outcomes(rows: Iterable[_Row], touched: Mapping[_HeadPair, frozense
             "blocking_findings": sum(tally[outcome] for outcome in FINDING_OUTCOMES),
             **{outcome: tally[outcome] for outcome in FINDING_OUTCOMES},
             "precision": _rate(tally["fixed"], decided), "precision_ci": _wilson(tally["fixed"], decided),
+            "labels": {label: tally["label:" + label] for label in LABEL_OUTCOMES},
+            "real_precision": _rate(real, judged), "real_precision_ci": _wilson(real, judged),
         })
     return out
 
@@ -1072,6 +1106,28 @@ def _author_risks(record_prs: Iterable[Mapping[str, Any]], prs: Iterable[Mapping
             for author in sorted(set(cells) | set(without_record), key=lambda a: (-total(a), a))]
 
 
+def _eligible_merges(landing: Landing, until: datetime) -> Iterator[tuple[tuple[str, str], _MergedPR, datetime, bool]]:
+    """Each merged PR with a full seven days of local follow-up: its key, merge, the end of that follow-up, and whether
+    a fix or revert in the same repository named it within the seven days."""
+    by_sha = {(repo, pr.sha): number for (repo, number), pr in landing.prs.items()}
+    reworked: set[tuple[str, str]] = set()
+    earlier: dict[tuple[str, str], _MergedPR] = {}
+    # Mainline order distinguishes two merges with the same second-resolution timestamp.
+    for (repo, own_number), followup in reversed(landing.prs.items()):
+        if followup.at >= until:
+            continue
+        reverted = {by_sha[repo, sha] for sha in followup.reverted_shas if (repo, sha) in by_sha}
+        for number in followup.references | reverted:
+            if (pr := earlier.get((repo, number))) and timedelta(0) <= followup.at - pr.at <= _REWORK_WINDOW:
+                reworked.add((repo, number))
+        earlier[repo, own_number] = followup
+    for (repo, number), pr in landing.prs.items():
+        eligible_at = pr.at + _REWORK_WINDOW
+        if eligible_at >= until or repo not in landing.observed_through or eligible_at > landing.observed_through[repo]:
+            continue
+        yield (repo, number), pr, eligible_at, (repo, number) in reworked
+
+
 def _merge_outcomes(landing: Landing, rows: Iterable[_Row], record_prs: Iterable[Mapping[str, Any]],
                     until: datetime) -> list[tuple[str, datetime, bool]]:
     """One observation per attributed merge with a full seven days of local follow-up."""
@@ -1085,29 +1141,25 @@ def _merge_outcomes(landing: Landing, rows: Iterable[_Row], record_prs: Iterable
         if delivery := row.raw.get("landing"):
             deliveries[repo, delivery["merge_sha"]].add(row.model)
     reviewed_authors = {pr["key"]: pr["author"] for pr in record_prs}
-    by_sha = {(repo, pr.sha): number for (repo, number), pr in landing.prs.items()}
-    reworked: set[tuple[str, str]] = set()
-    earlier: dict[tuple[str, str], _MergedPR] = {}
-    # Mainline order distinguishes two merges with the same second-resolution timestamp.
-    for (repo, own_number), followup in reversed(landing.prs.items()):
-        if followup.at >= until:
-            continue
-        reverted = {by_sha[repo, sha] for sha in followup.reverted_shas if (repo, sha) in by_sha}
-        for number in followup.references | reverted:
-            if (pr := earlier.get((repo, number))) and timedelta(0) <= followup.at - pr.at <= _REWORK_WINDOW:
-                reworked.add((repo, number))
-        earlier[repo, own_number] = followup
     outcomes = []
-    for (repo, number), pr in landing.prs.items():
-        eligible_at = pr.at + _REWORK_WINDOW
-        if eligible_at >= until or repo not in landing.observed_through or eligible_at > landing.observed_through[repo]:
-            continue
+    for (repo, number), pr, eligible_at, had_rework in _eligible_merges(landing, until):
         authors = {writers[repo, task] for task in pr.task_ids if (repo, task) in writers}
         authors.update(deliveries.get((repo, pr.sha), ()))
         author = "+".join(sorted(authors)) or reviewed_authors.get((repo, number))
         if author:
-            outcomes.append((author, eligible_at, (repo, number) in reworked))
+            outcomes.append((author, eligible_at, had_rework))
     return outcomes
+
+
+def _reviewer_merge_outcomes(landing: Landing, rows: Iterable[_Row], until: datetime) -> list[tuple[str, datetime, bool]]:
+    """The reviewer miss proxy: one observation per reviewer model whose APPROVED verdict the recorder published on a
+    merged PR with a full seven days of follow-up, reworked when a fix or revert named that PR (as for authors)."""
+    approvers: dict[tuple[str, str], set[str]] = defaultdict(set)
+    for row in rows:
+        if row.published == "APPROVED" and row.published_pr is not None:
+            approvers[str(row.raw.get("repo") or "public"), str(row.published_pr)].add(row.model)
+    return [(model, eligible_at, had_rework) for key, _, eligible_at, had_rework in _eligible_merges(landing, until)
+            for model in sorted(approvers.get(key, ()))]
 
 
 def _post_merge_rework(outcomes: Iterable[tuple[str, datetime, bool]], since: datetime,
@@ -1811,13 +1863,16 @@ def _charts(models: list[dict[str, Any]], prs: list[dict[str, Any]], rows: list[
         },
         "ukrainian": ukrainian,
         "limits": {
-            "precision": "No finding outcome is recorded. A blocking finding counts as fixed when the author's "
+            "precision": "Precision is inferred from files: a blocking finding counts as fixed when the author's "
                          "later head changed its file before the same reviewer approved, else dismissed; a file "
                          "changed for another reason (another finding, a merge of main) still counts as fixed, and "
                          "a fix made in a different file counts as dismissed. Only verdicts the recorder published "
                          "count; a blocking reply with no recorded publication (an unpublished run, or one from "
-                         "before the publication ledger and not imported) is of unknown publication and left out.",
-            "recall": "No planted-defect result is recorded in the summary rows.",
+                         "before the publication ledger and not imported) is of unknown publication and left out. "
+                         "Real precision uses the author's recorded label instead (fixed over fixed, wrong and "
+                         "invented); a label is the author's word unless a later review contested it.",
+            "recall": "No planted-defect result is recorded in the summary rows. The reviewer miss proxy counts "
+                      "merged PRs a reviewer approved that a fix or revert named within seven days.",
             "links": "This snapshot does not include task ids.",
             "quota": "An allowance reading is the whole pool, not the one model. Overlapping tasks are charged "
                      "that pool's net drop once. A cluster shared by more than one model or effort, or one that "
@@ -1837,11 +1892,11 @@ def summarize(rows: Iterable[_Row], fine: _Fine | None = None,
               prs: list[dict[str, Any]] | None = None, *, history: list[_Row] | None = None,
               touched: Mapping[_HeadPair, frozenset[str]] | None = None,
               accuracy_rows: list[_Row] | None = None, reviewer_name: Callable[[str], str] = str,
-              record_prs: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+              record_prs: list[dict[str, Any]] | None = None, outcomes: _Outcomes | None = None) -> dict[str, Any]:
     """Every figure of one window's rows. ``touched`` is ``scan_touched`` over these rows' head pairs. Reviewer
     accuracy settles findings on ``accuracy_rows`` (default: these rows), whose reviewer ids must be the recorded
     ones, and groups them under ``reviewer_name``. ``record_prs`` is the window's published cohort
-    (``_prs(of_record=True)``; default: these rows')."""
+    (``_prs(of_record=True)``; default: these rows'). ``outcomes`` is the finding-outcome ledger (default: none)."""
     selected = list(rows)
     fine = _fine(selected) if fine is None else fine
     prs = _prs(selected) if prs is None else prs
@@ -1855,7 +1910,7 @@ def summarize(rows: Iterable[_Row], fine: _Fine | None = None,
         "models": models, "authors": _authors(prs), "author_risks": _author_risks(record_prs, prs),
         "first_round_matrix": _matrix(prs),
         "reviewer_accuracy": {"findings": _finding_outcomes(selected if accuracy_rows is None else accuracy_rows,
-                                                            touched or {}, reviewer_name),
+                                                            touched or {}, reviewer_name, outcomes),
                               "planted_defect_recall": PLANTED_DEFECT_RECALL},
         "review_levels": _review_levels(selected, models, selected if history is None else history),
         "allowance": _allowance_rows(selected), "charts": _charts(models, prs, known), "records": len(selected),
@@ -1984,6 +2039,8 @@ def collect(batch_state_dir: Path, primary_root: Path, now: datetime | None = No
     until = now or datetime.now(UTC)
     raw_rows, row_counts = read_rows(batch_state_dir)
     publications, publication_counts = read_publications(batch_state_dir)
+    labels, contests, outcome_counts = read_finding_outcomes(batch_state_dir)
+    outcomes = _Outcomes(labels, frozenset(contests))
     catalog = fleet_catalog()
     keys = repository_keys(catalog)
     moments = [m for m in map(_moment, raw_rows) if m]
@@ -2012,6 +2069,7 @@ def collect(batch_state_dir: Path, primary_root: Path, now: datetime | None = No
             if row.review_author and retired_subscription_model(row.review_author) else row
             for row in rows if not retired_subscription_model(row.model)]
     merge_outcomes = _merge_outcomes(landing, rows, all_record_prs, until)
+    reviewer_merge_outcomes = _reviewer_merge_outcomes(landing, rows, until)
     pairs = head_pairs(rows)
     touched = scan_touched(primary_root, pairs, catalog)
     # Group on page labels so tables and charts have one row per bucket. The raw repository remains the PR join key.
@@ -2034,9 +2092,10 @@ def collect(batch_state_dir: Path, primary_root: Path, now: datetime | None = No
         if name in TOKEN_METRIC_WINDOWS:
             token_windows[name] = {"rows": token_metrics, "merged_prs": merged_prs}
         windows[name] = {"window": window, **summarize(selected, fine, prs, history=rows, touched=touched,
-                                                       record_prs=record_prs),
+                                                       record_prs=record_prs, outcomes=outcomes),
                          "token_use": token_use,
-                         "post_merge_rework_proxy": _post_merge_rework(merge_outcomes, rework_since)}
+                         "post_merge_rework_proxy": _post_merge_rework(merge_outcomes, rework_since),
+                         "reviewer_miss_proxy": _post_merge_rework(reviewer_merge_outcomes, rework_since)}
         # Bound each member of the author id after deriving PR outcomes: a joint author stays joint, never a known model.
         page_prs, page_record_prs = (
             [{**pr, "author": _page_author(pr["author"]), "reviewer": _page_model(pr["reviewer"]),
@@ -2044,11 +2103,13 @@ def collect(batch_state_dir: Path, primary_root: Path, now: datetime | None = No
             for cohort in (prs, record_prs))
         page_selected = [row for row in page_rows if since <= row.moment]
         page_summary = summarize(page_selected, prs=page_prs, record_prs=page_record_prs, history=page_rows,
-                                 touched=touched, accuracy_rows=selected, reviewer_name=_page_model)
+                                 touched=touched, accuracy_rows=selected, reviewer_name=_page_model, outcomes=outcomes)
         sample_windows[name] = {"window": window, "models": _sample_models(page_summary["models"])}
         page_windows[name] = {"window": window, **page_window(page_summary),
                               "token_use": token_use,
-                              "post_merge_rework_proxy": _post_merge_rework(merge_outcomes, rework_since, _page_author)}
+                              "post_merge_rework_proxy": _post_merge_rework(merge_outcomes, rework_since, _page_author),
+                              "reviewer_miss_proxy": _post_merge_rework(reviewer_merge_outcomes, rework_since,
+                                                                        _page_model)}
         # /metrics labels come from a finite set: a model outside the catalog's known values is "other".
         # 24h stays off this label set.
         if name in METRIC_WINDOWS:
@@ -2072,6 +2133,7 @@ def collect(batch_state_dir: Path, primary_root: Path, now: datetime | None = No
         "worker_allowance": _worker_allowance([row for row in rows if row.moment >= until - timedelta(days=7)]),
         "coverage": {"rows": dict(sorted(row_counts.items())), "landing": landing.to_dict(),
                      "publications": dict(sorted(publication_counts.items())),
+                     "finding_outcomes": dict(sorted(outcome_counts.items())),
                      # Blocked-to-approved head pairs whose changed files were read from a local checkout.
                      "finding_heads": {"pairs": len(pairs), "read": len(touched)}},
     }

@@ -295,9 +295,8 @@ so differences between columns are on the reviewers' side; choosing a review cla
 confounds inside a class (some authors get the hardest or most security-sensitive work), and a cell below 10 PRs
 is marked low sample.
 
-No record says which reviewer findings were real: the reviewer chooses finding ids afresh in every reply, and
-the verdict recorder links no later round to an earlier finding (it keeps only the P3 residual ids of an
-approval). [Reviewer accuracy](#reviewer-accuracy) estimates it from what the author changed instead.
+Which reviewer findings were real comes from the author's outcome labels where they are recorded, and is
+estimated from what the author changed otherwise (see [Reviewer accuracy](#reviewer-accuracy)).
 
 On 2026-11-16 over all history (parsed reviews of record): with Sol 6.1 as first reviewer, Grok 4.7 PRs were
 approved first time 78% (178 PRs), Sonnet 5.5 68% (164) and Opus 5.5 45% (362); inside infra/critical alone
@@ -308,7 +307,7 @@ blocked first round, 81% of Opus 5.5 PRs were approved on a new head and 1.5% on
 ## Reviewer accuracy
 
 Approval rate and findings per review say how strict a reviewer is, not whether it is right. `reviewer_accuracy`
-adds two measures.
+adds the measures below, and each window adds the reviewer miss proxy.
 
 **Finding precision** (`reviewer_accuracy.findings`). A blocking review of record is a review whose
 `CHANGES_REQUESTED` verdict the verdict recorder published on the PR at the row's head, as the
@@ -404,6 +403,34 @@ approved, 2 of 942 were approved on the same head (the recorder refuses such an 
 
 On 2026-11-19 over 30 days (backfilled copy): GPT-6.1 Sol 0.949 (237 settled findings, 157 open), Opus 5.5 0.868
 (91, 28 open), GPT-6.2 Sol 1.0 (3, 35 open, low sample), Grok 4.7 1.0 (7, low sample).
+
+**Outcome labels** (`reviewer_accuracy.findings[].labels`). After it records a `CHANGES_REQUESTED` verdict,
+the author labels each P0-P1 finding of that review with
+`record_cf_verdict finding-outcome --task-id <review> --pr <N> --finding <id> --label <label> [--evidence '<line>']`:
+`fixed` (a real error, changed), `wrong` (the code was already correct), `invented` (it cites a file, line,
+symbol or behaviour that does not exist), `out_of_scope` or `duplicate`. Every label except `fixed` needs one line
+of evidence. The verb refuses a finding that is not a P0-P1 finding of the review's structured reply and a review
+with no published `CHANGES_REQUESTED` verdict on that PR in the publication ledger. One label per finding: the
+same label again is a no-op, and another one is refused. The next review of the PR may contest a label with a line
+`CONTEST <finding-id>: <reason>` in its reply's `overall.explanation`. When `record` publishes that review, it
+stores each contested id that is a P0-P1 finding of the PR's previous blocking review of record (the newest other
+`CHANGES_REQUESTED` publication; of two at one GitHub time, the later ledger line) and reports
+`outcome_contests` (`stored against <review>: <ids>; unmatched: <ids>`); a reply that contests nothing adds no
+field. A contested label counts as `contested`, not as its label. `unlabelled` is the review's P0-P1 count minus
+its labels. `real_precision` is `fixed / (fixed + wrong + invented)` with its Wilson interval; a label is the
+author's word unless a later review contested it.
+
+Both line kinds go to `batch_state/model-stats/finding-outcomes.jsonl` (schema `review-finding-outcome.v1`)
+under the rows lock; the recorder is its one writer. It keeps the evidence only as its SHA-256, never the text: the
+text stays in the PR and the delta brief. A line without the writer's shape is skipped and counted in
+`coverage.finding_outcomes.malformed_lines`. The file sits beside the publication ledger rather than inside it, so a
+reader of an older release never counts these lines as damaged publications.
+
+**Reviewer miss proxy** (`reviewer_miss_proxy` in each window, beside `post_merge_rework_proxy`): per reviewer
+model, the merged PRs on which the recorder published its `APPROVED` verdict, and how many of them a fix or revert
+in the same repository named within seven days, by the same landing scan and window rule as the author proxy.
+Every reviewer that published an approval of the PR is charged once. It is a proxy: a fix can name a PR for a
+defect no reviewer could have seen.
 
 **Planted-defect recall** (`reviewer_accuracy.planted_defect_recall`) is `unknown` with `missing_input` named: the
 summary rows carry no seeded or known-answer defect result. The frozen known-answer set (`docs/review-eval`) is
