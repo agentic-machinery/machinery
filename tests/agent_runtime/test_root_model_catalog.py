@@ -153,7 +153,7 @@ def test_execution_default_resolves_active_selector_and_rejects_hold():
 
 def test_fallback_sonnet_candidate_cannot_reenter_automatic_ladder():
     broken = deepcopy(load_model_catalog())
-    broken["review_ladders"]["medium"][3] = ["claude-sonnet-5"]
+    broken["review_ladders"]["medium"][1] = ["claude-sonnet-5"]
     with pytest.raises(ModelCatalogError, match=r"unknown candidate|must reference an active model"):
         validate_catalog(broken)
 
@@ -449,14 +449,13 @@ def test_catalog_rejects_a_high_ladder_seat_outside_risk_reviewer_models(candida
 
 
 def test_risk_reviewer_models_names_sol_and_opus_at_high():
-    """Critical eligibility uses critical_review without another allowlist; retired Grok is not named (GROK-CANCEL-1110).
-
-    Neon follows Sol and Opus at high (GEMINI-TIERS-1119).
-    """
+    """REVIEW-ROTATION-GROK-1127: Sol, Opus, Neon and pinned Cursor Grok are equal at high and critical."""
     catalog = load_model_catalog()
-    assert catalog["review_scheduler"]["risk_reviewer_models"] == {"high": [CURRENT_SOL, "claude-opus-5-5", "gemini-4-neon"]}
+    assert catalog["review_scheduler"]["risk_reviewer_models"] == {
+        "high": [CURRENT_SOL, "claude-opus-5-5", "gemini-4-neon", "grok-4.7"],
+    }
     assert risk_reviewer_refusal("gemini-4-neon-high", "high", catalog) is None
-    assert risk_reviewer_refusal("grok-4.7", "high", catalog) is not None
+    assert risk_reviewer_refusal("grok-4.7", "high", catalog) is None
     assert risk_reviewer_refusal("claude-opus-5-5-high", "high", catalog) is None
     assert risk_reviewer_refusal(CURRENT_SOL, "HIGH", catalog) is None
     assert "performed only by" in risk_reviewer_refusal("claude-sonnet-5-5", "high", catalog)
