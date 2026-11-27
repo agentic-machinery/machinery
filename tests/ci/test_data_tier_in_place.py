@@ -61,7 +61,7 @@ def _write_selection(checkout: Path, payload: dict, source: str) -> None:
 
 
 def test_selection_audit_reads_definitions_from_the_product_tree(tmp_path: Path) -> None:
-    """Defect class: the audit trusts a stored class_c count, so a removed definition or a stale count drifts silently."""
+    """Defect class: a stored count, a removed definition, or a supported selector the collector already keeps."""
     nodeid = "tests/test_example.py::test_reads_store"
     source = "def test_reads_store():\n    return None\n"
     stale = {"schema": 1, "class_c_merge_group": 127, "nodeids": [nodeid], "files": ["tests/test_example.py"]}
@@ -81,6 +81,43 @@ def test_selection_audit_reads_definitions_from_the_product_tree(tmp_path: Path)
     _write_selection(tmp_path, stale, "def test_other():\n    return None\n")
     with pytest.raises(data_tier.DataTierError, match="absent from the product tree"):
         data_tier.load_selection(tmp_path)
+
+    nested = "tests/test_example.py::Outer::Inner::test_reads_store"
+    nested_source = (
+        "class Outer:\n"
+        "    class Inner:\n"
+        "        def test_reads_store(self):\n"
+        "            return None\n"
+    )
+    _write_selection(
+        tmp_path,
+        {**stale, "nodeids": ["tests/test_example.py", data_tier._key(nodeid), nested]},
+        nested_source,
+    )
+    assert data_tier.load_selection(tmp_path)[0]["nodeids"] == [
+        "tests/test_example.py",
+        data_tier._key(nodeid),
+        nested,
+    ]
+    _write_selection(tmp_path, {**stale, "nodeids": ["sha256:abcd"]}, source)
+    with pytest.raises(data_tier.DataTierError, match="absent from the product tree"):
+        data_tier.load_selection(tmp_path)
+    broken = tmp_path / "tests" / "test_broken.py"
+    broken.write_text("def test_broken(\n", encoding="utf-8")
+    _write_selection(
+        tmp_path,
+        {
+            **stale,
+            "nodeids": [nodeid, "tests/test_broken.py::test_missing", "tests/test_broken.py"],
+            "files": ["tests/test_example.py", "tests/test_broken.py"],
+        },
+        source,
+    )
+    assert [item.split("::", 1)[0] for item in data_tier.load_selection(tmp_path)[0]["nodeids"]] == [
+        "tests/test_example.py",
+        "tests/test_broken.py",
+        "tests/test_broken.py",
+    ]
 
 
 def test_selection_audit_rejects_a_link_outside_the_checkout(tmp_path: Path) -> None:
@@ -474,7 +511,7 @@ def test_collection_time_data_skip_is_in_junit(tmp_path: Path, monkeypatch: pyte
 def test_failure_reporting_uses_one_fake_gh_issue_and_clean_comment_once(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Defect classes: gh is run from a non-checkout without a repository; a non-GitHub origin matches a github.com suffix."""
+    """Defect classes: gh needs --repo; a non-GitHub origin; one SCP slash; an inherited GH_HOST."""
     checkout = tmp_path / "product"
     checkout.mkdir()
     empty = tmp_path / "empty"
@@ -494,7 +531,9 @@ def test_failure_reporting_uses_one_fake_gh_issue_and_clean_comment_once(
     state.write_text(json.dumps({"issue": None, "comments": [], "calls": []}), encoding="utf-8")
     executable.write_text(
         f"#!{sys.executable}\n"
-        "import json, pathlib, sys\n"
+        "import json, os, pathlib, sys\n"
+        "if os.environ.get('GH_HOST') != 'github.com':\n"
+        "    sys.exit(4)\n"
         f"path = pathlib.Path({str(state)!r})\n"
         "state = json.loads(path.read_text())\n"
         "args = sys.argv[1:]\n"
@@ -524,6 +563,7 @@ def test_failure_reporting_uses_one_fake_gh_issue_and_clean_comment_once(
     )
     executable.chmod(executable.stat().st_mode | stat.S_IXUSR)
     monkeypatch.setenv("PATH", str(tmp_path) + os.pathsep + os.environ["PATH"])
+    monkeypatch.setenv("GH_HOST", "github.example.invalid")
     failed = {
         "run_key": "run-1",
         "main_sha": "a" * 40,
@@ -715,6 +755,7 @@ def nightly(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[SimpleN
     monkeypatch.setattr(data_tier.test_slots, "enabled", lambda: False)
     events = []
     reports = []
+    repositories: list[str | None] = []
     snapshots = []
     remove_snapshot = data_tier.shutil.rmtree
 
@@ -724,7 +765,13 @@ def nightly(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[SimpleN
     monkeypatch.setattr(data_tier, "require_memory", lambda: None)
     monkeypatch.setattr(data_tier, "prune_stale_worktrees", lambda _primary: None)
     monkeypatch.setattr(data_tier, "make_test_worktree", lambda _primary: checkout)
-    monkeypatch.setattr(data_tier, "command", lambda *args, **kwargs: SimpleNamespace(stdout="a" * 40))
+    def git_command(argv: list[str], **kwargs: object) -> SimpleNamespace:
+        if "get-url" in argv:
+            name = "tested-product" if kwargs.get("cwd") == checkout else "primary-product"
+            return SimpleNamespace(stdout=f"git@github.com:example-org/{name}.git\n")
+        return SimpleNamespace(stdout="a" * 40)
+
+    monkeypatch.setattr(data_tier, "command", git_command)
     monkeypatch.setattr(data_tier, "bulk_status", lambda *args: (None, "unavailable"))
     monkeypatch.setattr(data_tier, "stop_scope", lambda unit: events.append("stop"))
     monkeypatch.setattr(data_tier, "remove_test_worktree", lambda *args: events.append("remove"))
@@ -739,8 +786,9 @@ def nightly(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[SimpleN
 
     monkeypatch.setattr(data_tier, "run_process_group", execute)
 
-    def report(summary: dict, baseline: dict, checkout: Path) -> str:
+    def report(summary: dict, baseline: dict, checkout: Path, *, repository: str | None = None) -> str:
         reports.append(json.loads(json.dumps(summary)))
+        repositories.append(repository)
         return "reported"
 
     monkeypatch.setattr(data_tier, "report", report)
@@ -752,6 +800,7 @@ def nightly(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[SimpleN
             snapshots=snapshots,
             events=events,
             reports=reports,
+            repositories=repositories,
             execute=execute,
         )
     finally:
@@ -889,6 +938,12 @@ def test_every_runner_failure_reaches_report(
         monkeypatch.setattr(data_tier, "run_process_group", execute)
     assert data_tier.main(["run"]) == 1
     assert len(nightly.reports) == 1
+    expected_repo = (
+        "example-org/primary-product"
+        if failure in {"memory", "interpreter", "worktree"}
+        else "example-org/tested-product"
+    )
+    assert nightly.repositories == [expected_repo]
     summary = nightly.reports[0]
     assert data_tier.run_failed(summary)
     body = data_tier.issue_body(summary, {})
@@ -911,8 +966,9 @@ def test_github_failure_is_single_attempt_and_persisted(
 ) -> None:
     calls = []
 
-    def report(summary: dict, baseline: dict, checkout: Path) -> str:
+    def report(summary: dict, baseline: dict, checkout: Path, *, repository: str | None = None) -> str:
         calls.append(json.loads(json.dumps(summary)))
+        assert repository == "example-org/tested-product"
         raise data_tier.DataTierError("gh unavailable at /private/gh")
 
     monkeypatch.setattr(data_tier, "report", report)
