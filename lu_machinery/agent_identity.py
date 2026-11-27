@@ -235,14 +235,15 @@ def _load_registry_slots(assignments_path: Path | None = None, *, strict: bool =
 def get_valid_agents(*, assignments_path: Path | None = None) -> tuple[str, ...]:
     """Return valid agent identities: static tuple extended by registry-derived slots.
 
-    Keyed by file mtime+size to prevent stale caching in long-lived processes
-    while avoiding re-parsing unchanged files.
+    Keyed by the file's identity (device, inode, ctime, mtime, size) to prevent
+    stale caching in long-lived processes while avoiding re-parsing unchanged
+    files; ctime moves on any rewrite or permission change.
     """
     path = (assignments_path or default_assignments_path()).resolve()
     slots: tuple[str, ...] = ()
     try:
         st = path.stat()
-        cache_key = (str(path), st.st_mtime, st.st_size)
+        cache_key = (str(path), st.st_dev, st.st_ino, st.st_ctime_ns, st.st_mtime_ns, st.st_size)
         if cache_key == _SLOTS_CACHE.get("key"):
             slots = _SLOTS_CACHE.get("slots", ())
         else:

@@ -319,17 +319,18 @@ def test_failed_record_recovery_types_os_errors_and_keeps_a_removed_tree(tmp_pat
         store.publish_failed_record(dict(record), unwritable)
     unreadable = tmp_path / "unreadable.json"
     unreadable.write_text("{")
-    read_text = type(unreadable).read_text
+    real_open = store.os.open
 
     def denied(path, *args, **kwargs):
-        if path == unreadable:
+        if Path(path) == unreadable:
             raise PermissionError("test denial")
-        return read_text(path, *args, **kwargs)
+        return real_open(path, *args, **kwargs)
 
-    monkeypatch.setattr(type(unreadable), "read_text", denied)
+    monkeypatch.setattr(store.os, "open", denied)
     with pytest.raises(store.TaskRecordError, match=r"^TASK_RECORD_IO_ERROR: PermissionError$"):
         store.publish_failed_record(dict(record), unreadable)
-    assert read_text(unreadable) == "{"
+    monkeypatch.undo()
+    assert unreadable.read_text() == "{"
     reaped = tmp_path / "probe.json"
     reaped.write_text('{"schema_version":2,')
     store.publish_failed_record(dict(record, worktree_disposition="removed", worktree_disposition_reason="merged"), reaped)

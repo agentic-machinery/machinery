@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 
 import pytest
 import yaml
@@ -332,7 +333,7 @@ def test_incomplete_roster_proves_no_name_unregistered_and_removes_nothing(
 
 @pytest.mark.parametrize("doubt", [
     "malformed_area", "unknown_roster_key", "task_store_unreadable", "record_not_readable", "record_not_utf8",
-    "hot_entry_not_a_file", "dangling_record_link", "dangling_tasks_dir_link",
+    "hot_entry_not_a_file", "dangling_record_link", "dangling_tasks_dir_link", "roster_fifo",
 ])
 def test_partly_unreadable_roster_or_task_store_keeps_mail_queued_through_expire_stale_apply(
     plane, tasks, monkeypatch, tmp_path, capsys, doubt,
@@ -349,7 +350,9 @@ def test_partly_unreadable_roster_or_task_store_keeps_mail_queued_through_expire
     roster.write_text(yaml.safe_dump(data), encoding="utf-8")
     monkeypatch.setattr(agent_identity, "ASSIGNMENTS_PATH", roster)
     worker = tasks("cto-7-i7-worker", "running")
-    victim = {"malformed_area": "codex-doubt-probe", "unknown_roster_key": "eggbot"}.get(doubt, worker)
+    victim = {
+        "malformed_area": "codex-doubt-probe", "unknown_roster_key": "eggbot", "roster_fifo": "codex-doubt-probe",
+    }.get(doubt, worker)
     with AuthorityService(root=plane) as service:
         service.publish_message(sender="claude-cto", body="b", recipients=(victim,))
     tasks_dir = tmp_path / "tasks"
@@ -367,12 +370,18 @@ def test_partly_unreadable_roster_or_task_store_keeps_mail_queued_through_expire
             data["external_recipient"] = data.pop("external_recipients")  # a misspelt key the contract refuses
             roster.write_text(yaml.safe_dump(data), encoding="utf-8")
             assert authority._roster_complete() is False
+        elif doubt == "roster_fifo":
+            roster.unlink()
+            os.mkfifo(roster)  # no writer: a reader that opens it blocking never returns
+            assert authority._roster_complete() is False
         else:
             if doubt == "task_store_unreadable":
                 tasks_dir.chmod(0o600)  # no search permission: every record stat fails with EACCES
             elif doubt == "record_not_readable":
                 hot.chmod(0)  # found by stat, refused at open
             elif doubt == "record_not_utf8":
+                # A non-UTF-8 locale (ISO-8859-1 accepts every byte) must not decide how a record decodes.
+                monkeypatch.setattr(io, "text_encoding", lambda encoding, stacklevel=2: encoding or "iso-8859-1")
                 hot.write_bytes(b'{"status": "done", "error": "\xff"}')  # a terminal status beside bytes that are not UTF-8
             elif doubt == "dangling_tasks_dir_link":
                 tasks_dir.rename(moved)

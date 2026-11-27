@@ -336,13 +336,20 @@ def _load_roster() -> tuple[frozenset[str], bool]:
 def load_external_recipients(
     path: Path,
 ) -> tuple[tuple[str, ...], Literal["available", "unavailable"]]:
-    """Read exact external recipient names, distinguishing an empty list from a failed read."""
+    """Read exact external recipient names, distinguishing an empty list from a failed read.
+
+    The file is read as UTF-8 without blocking: a FIFO, a directory or any other
+    non-regular entry at ``path`` is a failed read.
+    """
     try:
         import yaml
-    except ImportError:
+
+        from lu_machinery.orchestration.validate_fleet_taxonomy import read_regular_file_bytes
+    except Exception:  # a missing or broken dependency of the reader
         return (), "unavailable"
     try:
-        data = yaml.safe_load(path.read_text(encoding="utf-8"))
+        _, raw = read_regular_file_bytes(path)  # its refusals are ValueErrors
+        data = yaml.safe_load(raw.decode("utf-8"))
     except (OSError, ValueError, yaml.YAMLError, RecursionError):
         return (), "unavailable"
     if not isinstance(data, dict):
