@@ -411,12 +411,16 @@ the author labels each P0-P2 finding of that review (every finding that can bloc
 symbol or behaviour that does not exist), `out_of_scope` or `duplicate`. Every label except `fixed` needs one line
 of evidence. The verb refuses a finding that is not a P0-P2 finding of the review's structured reply, a review
 with no published `CHANGES_REQUESTED` verdict on that PR in the publication ledger, and a review task id that names
-more than one run on that PR (a task id can be dispatched again; a label line names the task id, not the run). One
+more than one run record in the task store (a task id can be dispatched again; a label line names the task id, not
+the run). The reply, the run census and the label's time are read under the task-store lock that archive and restore
+moves take. One
 label per finding: the same label again is a no-op, and another one is refused. The next review of the PR may
 contest a label with a line `CONTEST <finding-id>: <reason>` in its reply's `overall.explanation`. When `record`
-publishes that review, it binds the PR's previous blocking review of record from the PR's own verdict comments (the
-newest other `CHANGES_REQUESTED` comment before this run's), reads that review's reply only from the run its
-comment names (the task record's reviewed head and start must equal the marker's, else
+publishes that review, it binds the PR's previous blocking review of record from the PR's own verdict comments: the
+`CHANGES_REQUESTED` comment of the newest earlier head before this run's comment (a round reviews one head, so a
+comment at the contesting review's own head is a sibling seat of its round, never the round it contests). That round
+must name one blocking review, else `not stored: unresolved: <n> blocking reviews of the previous round ...`. It
+reads that review's reply only from the run its comment names (the task record's reviewed head and start must equal the marker's, else
 `not stored: unresolved: ...`), stores each contested id that is a P0-P2 finding of that reply and reports
 `outcome_contests` (`stored against <review>: <ids>; unmatched: <ids>`, or `not stored: unmatched: <ids>` when no
 id matched, which writes nothing); a reply that contests nothing adds no field. A failed write reports
@@ -424,7 +428,8 @@ id matched, which writes nothing); a reply that contests nothing adds no field. 
 `contested`, not as its label. `unlabelled` is the review's P0-P2 count minus its labels (the file-inferred figures
 above cover P0-P1 only). A label line names the task id, not the run, and the summary rows keep only an id's newest
 run, so a label recorded before that run started (it labels an earlier run of an id dispatched again) counts
-nowhere, and that finding counts as `unlabelled`. An unreadable fleet registry counts no label
+nowhere, and that finding counts as `unlabelled`. A row counts toward the labels only when its publication was posted
+after its run started: a verdict an earlier run of a reused id published at the same head joins the newest row too. An unreadable fleet registry counts no label
 (`coverage.finding_outcomes.registry_unreadable`). `real_precision` is
 `fixed / (fixed + wrong + invented)` with its Wilson interval; a label is the author's word unless a later review
 contested it.
@@ -438,7 +443,8 @@ reader of an older release never counts these lines as damaged publications.
 **Reviewer miss proxy** (`reviewer_miss_proxy` in each window, beside `post_merge_rework_proxy`): per reviewer
 model, the merged PRs on which the recorder published its `APPROVED` verdict, and how many of them a fix or revert
 in the same repository named within seven days, by the same landing scan and window rule as the author proxy.
-Every reviewer that published an approval of the PR is charged once. It is a proxy: a fix can name a PR for a
+Every reviewer that published an approval of the PR is charged once; a row's approval counts only when it was posted
+after the row's run started, as for the labels. It is a proxy: a fix can name a PR for a
 defect no reviewer could have seen.
 
 **Planted-defect recall** (`reviewer_accuracy.planted_defect_recall`) is `unknown` with `missing_input` named: the
