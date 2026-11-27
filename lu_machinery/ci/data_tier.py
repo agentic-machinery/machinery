@@ -4,8 +4,9 @@ Use the nightly systemd timer after installation, or run a no-report subset to
 check the host. The tests run in a fresh code-only checkout of ``origin/main``;
 the logical stores and the host data they read stay where they are and are
 mounted read-only into the test process (bubblewrap), never snapshotted or
-copied. The audited selection and known failures come from that checkout. This
-module never edits the primary checkout or its data.
+copied. The audited selection is the set of test definitions that exist in
+that checkout, and the known failures come from that checkout. This module
+never edits the primary checkout or its data.
 """
 
 from __future__ import annotations
@@ -29,6 +30,7 @@ import xml.etree.ElementTree as ET
 from collections import Counter
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, cast, get_args
+from urllib.parse import urlsplit
 
 from lu_machinery import state_paths
 from lu_machinery.ci._location import module_name
@@ -76,6 +78,19 @@ EXPOSED_DATA = (
 )
 ABSOLUTE_PATH = re.compile(r"(?<![A-Za-z0-9])/(?!/)[^\s\]\[),:;]+")
 NETWORK_ADDRESS = re.compile(r"https?://[^\s\]\[),:;]+|(?<!\d)(?:\d{1,3}\.){3}\d{1,3}(?!\d)")
+# owner/name, read from the product checkout's origin. Never a baked slug.
+_REPOSITORY = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+_GITHUB_HOST = "github.com"
+# SCP-style SSH. ASCII case-folding only, so a dotless i cannot stand in for i.
+# One optional trailing slash; a second slash still fails the match.
+_SCP_ORIGIN = re.compile(
+    r"^git@github\.com:(?P<owner>[^/\s]+)/(?P<repo>[^/\s]+)/?$",
+    re.IGNORECASE | re.ASCII,
+)
+# The same digest the collection plugin stores for a node id it cannot name up front.
+_SELECTOR_HASH = re.compile(r"sha256:[0-9a-f]{64}")
+# XML 1.0 Char, so a synthetic JUnit name still parses. ElementTree writes the rest.
+_XML_FORBIDDEN = re.compile("[^\t\n\r\u0020-\ud7ff\ue000-\ufffd\U00010000-\U0010ffff]")
 
 
 class DataTierError(RuntimeError):
@@ -156,29 +171,76 @@ def _product_json(checkout: Path, relative: PurePosixPath) -> tuple[dict, str]:
     return value, hashlib.sha256(raw).hexdigest()
 
 
+def _test_path(relative: str) -> PurePosixPath | None:
+    """A repository-relative test file, or None when the path can leave the checkout."""
+    if not isinstance(relative, str) or not relative.startswith("tests/") or not relative.endswith(".py"):
+        return None
+    path = PurePosixPath(relative)
+    if path.is_absolute() or ".." in path.parts:
+        return None
+    return path
+
+
+def _resolved_test_file(checkout: Path, relative: str) -> Path:
+    """The selection file after resolving links, inside the checkout's tests directory."""
+    path = _test_path(relative)
+    if path is None:
+        raise DataTierError("data-tier selection contains an invalid test file")
+    root = checkout.resolve()
+    candidate = root.joinpath(*path.parts).resolve()
+    if not candidate.is_relative_to(root / "tests"):
+        raise DataTierError(f"data-tier selection file resolves outside the tested checkout: {relative}")
+    return candidate
+
+
 def load_selection(checkout: Path, expected_sha256: str | None = None) -> tuple[dict, str]:
     """The audited selection from the tested checkout and its digest.
 
-    The pytest child passes the digest the parent validated, so both use the same bytes.
+    The parent checks that each selector names a file in this checkout. Pytest
+    collection decides whether the selector matches a test, including inherited
+    methods, conditionals and aliases. A stored ``class_c_merge_group`` count is
+    historical and is not the audit. The pytest child passes the digest the
+    parent validated, so both use the same bytes.
     """
     selection, digest = _product_json(checkout, SELECTION)
     if expected_sha256 is not None and digest != expected_sha256:
         raise DataTierError(f"{SELECTION} changed after the runner validated it")
     try:
         ids, files = selection["nodeids"], selection["files"]
-        compatible = (
-            selection["schema"] == 1
-            and isinstance(ids, list)
-            and isinstance(files, list)
-            and len(ids) == selection["class_c_merge_group"]
-            and len(ids) == len(set(ids))
-        )
+        compatible = selection["schema"] == 1 and isinstance(ids, list) and isinstance(files, list)
     except (KeyError, TypeError) as error:
         raise DataTierError(f"{SELECTION} lacks a schema-1 field: {error}") from error
-    if not compatible:
+    if not compatible or not all(isinstance(nodeid, str) for nodeid in ids) or len(ids) != len(set(ids)):
         raise DataTierError("data-tier selection count or uniqueness differs from the audited class C")
-    if not all(isinstance(path, str) and path.startswith("tests/") and path.endswith(".py") for path in files):
+    if any(_test_path(path) is None for path in files):
         raise DataTierError("data-tier selection contains an invalid test file")
+    listed = set(files)
+    missing: list[str] = []
+    for nodeid in ids:
+        # A hash has no path. Collection accounts for it, or the run is not clean.
+        if _SELECTOR_HASH.fullmatch(nodeid):
+            continue
+        # A bracket on a file-only selector is not the file pytest will report.
+        if "::" not in nodeid and "[" in nodeid:
+            missing.append(nodeid)
+            continue
+        relative, separator, qualname = nodeid.split("[", 1)[0].partition("::")
+        if _test_path(relative) is None or relative not in listed or (separator and not qualname):
+            missing.append(nodeid)
+            continue
+        if not _resolved_test_file(checkout, relative).is_file():
+            missing.append(nodeid)
+    absent_files = [relative for relative in files if not _resolved_test_file(checkout, relative).is_file()]
+    if absent_files:
+        shown = ", ".join(absent_files[:20])
+        extra = f" (+{len(absent_files) - 20} more)" if len(absent_files) > 20 else ""
+        raise DataTierError(f"data-tier selection file is absent from the product tree: {shown}{extra}")
+    if missing:
+        shown = ", ".join(missing[:20])
+        extra = f" (+{len(missing) - 20} more)" if len(missing) > 20 else ""
+        raise DataTierError(
+            f"data-tier selection names {len(missing)} test(s) absent from the product tree: {shown}{extra}"
+        )
     return selection, digest
 
 
@@ -535,6 +597,18 @@ def _key(nodeid: str) -> str:
     return "sha256:" + hashlib.sha256(nodeid.encode()).hexdigest()
 
 
+def _xml_text(value: str) -> str:
+    """Replace characters XML 1.0 forbids so a synthetic JUnit receipt still parses."""
+    return _XML_FORBIDDEN.sub(lambda match: f"\\u{ord(match.group()):04x}", value)
+
+
+def _requested_file_selector(selector: str, only: str) -> bool:
+    """A file or exact selector whose path is the file a subset run asked for."""
+    if _SELECTOR_HASH.fullmatch(selector):
+        return False
+    return selector.split("::", 1)[0] == only
+
+
 class SelectionPlugin:
     def __init__(self, selection: dict, only: str | None, bulk_reason: str | None, collected: Path) -> None:
         self.selection = selection
@@ -545,13 +619,29 @@ class SelectionPlugin:
         self.bulk_skipped: list[str] = []
         self.collection_skips: list[tuple[str, str]] = []
         self.collection_errors: list[tuple[str, str]] = []
+        self.accounted: set[str] = set()
 
     def pytest_collectreport(self, report: pytest.CollectReport) -> None:
         if report.failed:
             self.collection_errors.append((report.nodeid, safe_text(str(report.longrepr))))
-        if report.skipped and report.nodeid in self.selection["nodeids"]:
-            detail = report.longrepr[2] if isinstance(report.longrepr, tuple) else str(report.longrepr)
-            self.collection_skips.append((report.nodeid, safe_text(str(detail))))
+        if not report.skipped:
+            return
+        detail = report.longrepr[2] if isinstance(report.longrepr, tuple) else str(report.longrepr)
+        reason = safe_text(str(detail))
+        recorded = {nodeid for nodeid, _reason in self.collection_skips}
+        nodeid = report.nodeid
+        if nodeid in self.selection["nodeids"] and nodeid not in recorded:
+            self.collection_skips.append((nodeid, reason))
+            recorded.add(nodeid)
+        # An import-time skip is the module path. Exact ids in that file are the same skip.
+        if "::" in nodeid or _SELECTOR_HASH.fullmatch(nodeid):
+            return
+        for selector in self.selection["nodeids"]:
+            if selector in recorded or "::" not in selector:
+                continue
+            if selector.split("::", 1)[0] == nodeid:
+                self.collection_skips.append((selector, reason))
+                recorded.add(selector)
 
     def pytest_collection_modifyitems(self, items: list[pytest.Item], config: pytest.Config) -> None:
         wanted = set(self.selection["nodeids"])
@@ -561,6 +651,12 @@ class SelectionPlugin:
             nodeid = item.nodeid
             key = _key(nodeid)
             file = nodeid.split("::", 1)[0]
+            if nodeid in wanted:
+                self.accounted.add(nodeid)
+            if key in wanted:
+                self.accounted.add(key)
+            if file in wanted:
+                self.accounted.add(file)
             keep = (nodeid in wanted or key in wanted or file in wanted) and (self.only is None or file == self.only)
             if any(item.get_closest_marker(marker) for marker in ("live_network", "live_github", "postgres")):
                 keep = False
@@ -590,11 +686,31 @@ def pytest_child(args: argparse.Namespace) -> int:
     )
     if collection_status not in (0, 1, 5) or (collection_status == 1 and not plugin.collection_errors):
         return int(collection_status)
+    for nodeid, _reason in plugin.collection_skips:
+        plugin.accounted.add(nodeid)
+    error_ids = {nodeid for nodeid, _reason in plugin.collection_errors}
+    for selector in selection["nodeids"]:
+        if selector in plugin.accounted or selector in error_ids:
+            plugin.accounted.add(selector)
+            continue
+        if not selector.startswith("sha256:") and selector.split("::", 1)[0] in error_ids:
+            plugin.accounted.add(selector)
+    # A subset still audits file and exact selectors of the requested file. A digest has no path.
+    only = args.only
+    audited = (
+        selection["nodeids"]
+        if only is None
+        else [nodeid for nodeid in selection["nodeids"] if _requested_file_selector(nodeid, only)]
+    )
+    unmatched = [nodeid for nodeid in audited if nodeid not in plugin.accounted]
+    # Zero matches and zero unmatched selectors is an empty audit. Unmatched selectors
+    # still need the synthetic receipt below, or the parent only sees a missing JUnit.
     if (
         not plugin.selected_nodeids
         and not plugin.bulk_skipped
         and not plugin.collection_skips
         and not plugin.collection_errors
+        and not unmatched
     ):
         raise DataTierError("the audited selection collected no tests")
     if plugin.selected_nodeids:
@@ -619,27 +735,35 @@ def pytest_child(args: argparse.Namespace) -> int:
     else:
         ET.ElementTree(ET.Element("testsuite")).write(args.junit, encoding="utf-8", xml_declaration=True)
         status = 0
-    if plugin.bulk_skipped or plugin.collection_skips or plugin.collection_errors:
+    if plugin.bulk_skipped or plugin.collection_skips or plugin.collection_errors or unmatched:
         tree = ET.parse(args.junit)
         suite = next(tree.iter("testsuite"))
         for nodeid in plugin.bulk_skipped:
-            case = ET.SubElement(suite, "testcase", classname="data_tier", name=safe_text(nodeid))
-            ET.SubElement(case, "skipped", message=f"bulk root unavailable: {safe_text(args.bulk_reason)}")
+            case = ET.SubElement(suite, "testcase", classname="data_tier", name=_xml_text(safe_text(nodeid)))
+            ET.SubElement(
+                case, "skipped", message=_xml_text(f"bulk root unavailable: {safe_text(args.bulk_reason)}")
+            )
         for nodeid, reason in plugin.collection_skips:
-            case = ET.SubElement(suite, "testcase", classname="data_tier", name=safe_text(nodeid))
-            ET.SubElement(case, "skipped", message=reason)
+            case = ET.SubElement(suite, "testcase", classname="data_tier", name=_xml_text(safe_text(nodeid)))
+            ET.SubElement(case, "skipped", message=_xml_text(reason))
         for nodeid, reason in plugin.collection_errors:
-            case = ET.SubElement(suite, "testcase", classname="data_tier", name=safe_text(nodeid))
-            ET.SubElement(case, "error", message=reason)
+            case = ET.SubElement(suite, "testcase", classname="data_tier", name=_xml_text(safe_text(nodeid)))
+            ET.SubElement(case, "error", message=_xml_text(reason))
+        for nodeid in unmatched:
+            case = ET.SubElement(suite, "testcase", classname="data_tier", name=_xml_text(safe_text(nodeid)))
+            ET.SubElement(case, "error", message="selector matched no collected test")
         skipped = len(plugin.bulk_skipped) + len(plugin.collection_skips)
-        added = skipped + len(plugin.collection_errors)
+        added = skipped + len(plugin.collection_errors) + len(unmatched)
         for element in {tree.getroot(), suite}:
             if element.tag in {"testsuite", "testsuites"}:
                 element.set("tests", str(int(element.get("tests", "0")) + added))
                 element.set("skipped", str(int(element.get("skipped", "0")) + skipped))
-                element.set("errors", str(int(element.get("errors", "0")) + len(plugin.collection_errors)))
+                element.set(
+                    "errors",
+                    str(int(element.get("errors", "0")) + len(plugin.collection_errors) + len(unmatched)),
+                )
         tree.write(args.junit, encoding="utf-8", xml_declaration=True)
-    return status or (1 if plugin.collection_errors else 0)
+    return status or (1 if plugin.collection_errors or unmatched else 0)
 
 
 def read_child_output(path: Path) -> bytes | None:
@@ -750,8 +874,72 @@ def run_failed(summary: dict) -> bool:
     )
 
 
-def _gh(args: list[str], *, input_text: str | None = None) -> str:
-    result = github_client.run(["gh", *args], input=input_text, capture_output=True, text=True, check=False, timeout=90)
+def _github_slug(url: str) -> str | None:
+    """``owner/name`` when ``url`` is a GitHub origin whose host is exactly github.com."""
+    if not url or any(char.isspace() for char in url) or "\\" in url or "?" in url or "#" in url:
+        return None
+    scp = _SCP_ORIGIN.fullmatch(url)
+    if scp is not None:
+        owner, name = scp.group("owner"), scp.group("repo")
+    else:
+        try:
+            parts = urlsplit(url)
+            host = parts.hostname
+            port = parts.port
+        except ValueError:
+            return None
+        if (
+            parts.scheme not in {"https", "ssh"}
+            or parts.query
+            or parts.fragment
+            or host is None
+            or host.lower() != _GITHUB_HOST
+            or port is not None
+            or (parts.scheme == "ssh" and parts.username != "git")
+        ):
+            return None
+        path = parts.path[:-1] if parts.path.endswith("/") else parts.path
+        segments = path.split("/")
+        if len(segments) != 3 or not segments[1] or not segments[2]:
+            return None
+        owner, name = segments[1], segments[2]
+    if name.endswith(".git"):
+        name = name[: -len(".git")]
+    repository = f"{owner}/{name}"
+    if owner in {".", ".."} or name in {".", ".."} or _REPOSITORY.fullmatch(repository) is None:
+        return None
+    return repository
+
+
+def github_repository(checkout: Path) -> str:
+    """Owner/name from the product checkout's origin.
+
+    The service working directory is not a Git checkout, so reporting cannot ask
+    ``gh`` to discover the repository there. The host has to be github.com itself.
+    """
+    url = command(["git", "remote", "get-url", "origin"], cwd=checkout).stdout.strip()
+    repository = _github_slug(url)
+    if repository is None:
+        raise DataTierError("product origin is not a GitHub owner/name")
+    return repository
+
+
+def _gh(args: list[str], *, repository: str, input_text: str | None = None) -> str:
+    """Run one gh command with the repository named, independent of the working directory."""
+    if len(args) < 2 or _REPOSITORY.fullmatch(repository) is None:
+        raise DataTierError("product origin is not a GitHub owner/name")
+    # The validated origin is github.com. Do not follow an inherited GH_HOST.
+    environment = os.environ.copy()
+    environment["GH_HOST"] = _GITHUB_HOST
+    result = github_client.run(
+        ["gh", args[0], args[1], "--repo", repository, *args[2:]],
+        input=input_text,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=90,
+        env=environment,
+    )
     observation = getattr(result, "github_result", None)
     if observation is not None and (observation.stale or observation.error == "github_rate_limited"):
         raise github_client.GitHubRateLimited(observation.reset_at)
@@ -760,7 +948,10 @@ def _gh(args: list[str], *, input_text: str | None = None) -> str:
     return result.stdout
 
 
-def report(summary: dict, baseline: dict[str, int]) -> str:
+def report(
+    summary: dict, baseline: dict[str, int], checkout: Path, *, repository: str | None = None
+) -> str:
+    repository = repository or github_repository(checkout)
     issues = json_depth.loads(
         _gh(
             [
@@ -774,8 +965,10 @@ def report(summary: dict, baseline: dict[str, int]) -> str:
                 "100",
                 "--json",
                 "number,title,state",
-            ]
-        ), max_depth=512
+            ],
+            repository=repository,
+        ),
+        max_depth=512,
     )
     matching = [issue for issue in issues if issue["title"] == ISSUE_TITLE]
     if len(matching) > 1:
@@ -785,15 +978,19 @@ def report(summary: dict, baseline: dict[str, int]) -> str:
         body = issue_body(summary, baseline)
         if issue:
             if issue["state"] != "OPEN":
-                _gh(["issue", "reopen", str(issue["number"])])
-            _gh(["issue", "edit", str(issue["number"]), "--body-file", "-"], input_text=body)
+                _gh(["issue", "reopen", str(issue["number"])], repository=repository)
+            _gh(["issue", "edit", str(issue["number"]), "--body-file", "-"], repository=repository, input_text=body)
             return f"updated issue #{issue['number']}"
         created = _gh(
-            ["issue", "create", "--title", ISSUE_TITLE, "--label", "infra", "--body-file", "-"], input_text=body
+            ["issue", "create", "--title", ISSUE_TITLE, "--label", "infra", "--body-file", "-"],
+            repository=repository,
+            input_text=body,
         )
         return f"created {created.strip()}"
     if issue and issue["state"] == "OPEN":
-        comments = json_depth.loads(_gh(["issue", "view", str(issue["number"]), "--json", "comments"]), max_depth=512)["comments"]
+        comments = json_depth.loads(
+            _gh(["issue", "view", str(issue["number"]), "--json", "comments"], repository=repository), max_depth=512
+        )["comments"]
         marker = f"Data-tier clean run `{summary['run_key']}`"
         if not any(marker in comment["body"] for comment in comments):
             _gh(
@@ -803,9 +1000,10 @@ def report(summary: dict, baseline: dict[str, int]) -> str:
                     str(issue["number"]),
                     "--body",
                     marker + f": {summary['passed']} passed, {summary['skipped']} skipped.",
-                ]
+                ],
+                repository=repository,
             )
-        _gh(["issue", "close", str(issue["number"])])
+        _gh(["issue", "close", str(issue["number"])], repository=repository)
         return f"closed issue #{issue['number']} after clean run"
     return "no issue change"
 
@@ -831,6 +1029,7 @@ def run(args: argparse.Namespace) -> int:
     }
     baseline: dict[str, int] = {}
     primary = checkout = output_dir = child_dir = log = scope_unit = None
+    reporting_repository: str | None = None
     slots: test_slots.Hold | None = None
     scope_may_exist = False
     try:
@@ -934,7 +1133,7 @@ def run(args: argparse.Namespace) -> int:
             {
                 "run_key": run_key,
                 "pytest_exit": pytest_exit,
-                "selection_cases": selection["class_c_merge_group"],
+                "selection_cases": len(selection["nodeids"]),
                 "collected": len(json_depth.loads(collected_data, max_depth=512)) if collected_data is not None else 0,
             }
         )
@@ -954,6 +1153,13 @@ def run(args: argparse.Namespace) -> int:
                 summary["runner_errors"].append(f"scope cleanup failed: {safe_text(str(error))}")
         if slots is not None and scope_stopped:
             slots.release()
+        if checkout is not None and not args.no_report:
+            try:
+                reporting_repository = github_repository(checkout)
+            except Exception as error:
+                cast(list[str], summary["runner_errors"]).append(
+                    f"origin capture failed: {safe_text(str(error))}"
+                )
         if checkout and scope_stopped:
             try:
                 summary["discarded_output"] = discard_run_output(checkout)
@@ -989,7 +1195,17 @@ def run(args: argparse.Namespace) -> int:
     persist()
     if not args.no_report:
         try:
-            print(report(summary, baseline))
+            if checkout is not None:
+                report_checkout = checkout
+            elif primary is not None:
+                report_checkout = primary
+            else:
+                raise DataTierError("product checkout is unavailable")
+            if reporting_repository is None:
+                if checkout is not None:
+                    raise DataTierError("product origin is not a GitHub owner/name")
+                reporting_repository = github_repository(report_checkout)
+            print(report(summary, baseline, report_checkout, repository=reporting_repository))
         except github_client.GitHubRateLimited:
             # The timer records the reset. Persist the test result first,
             # and never repeat a partially successful publishing sequence.
