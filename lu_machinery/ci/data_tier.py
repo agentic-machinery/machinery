@@ -1126,7 +1126,9 @@ def run(args: argparse.Namespace) -> int:
             try:
                 reporting_repository = github_repository(checkout)
             except Exception as error:
-                summary["runner_errors"].append(f"origin capture failed: {safe_text(str(error))}")
+                cast(list[str], summary["runner_errors"]).append(
+                    f"origin capture failed: {safe_text(str(error))}"
+                )
         if checkout and scope_stopped:
             try:
                 summary["discarded_output"] = discard_run_output(checkout)
@@ -1162,13 +1164,17 @@ def run(args: argparse.Namespace) -> int:
     persist()
     if not args.no_report:
         try:
+            if checkout is not None:
+                report_checkout = checkout
+            elif primary is not None:
+                report_checkout = primary
+            else:
+                raise DataTierError("product checkout is unavailable")
             if reporting_repository is None:
                 if checkout is not None:
                     raise DataTierError("product origin is not a GitHub owner/name")
-                if primary is None:
-                    raise DataTierError("product checkout is unavailable")
-                reporting_repository = github_repository(primary)
-            print(report(summary, baseline, checkout or primary, repository=reporting_repository))
+                reporting_repository = github_repository(report_checkout)
+            print(report(summary, baseline, report_checkout, repository=reporting_repository))
         except github_client.GitHubRateLimited:
             # The timer records the reset. Persist the test result first,
             # and never repeat a partially successful publishing sequence.
