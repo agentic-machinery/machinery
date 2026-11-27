@@ -1,10 +1,11 @@
 # Catalog routing tables
 
 Generated from `lu_machinery/config/model_catalog.yaml`; do not edit the tables.
-Regenerate with the task-prescribed interpreter:
+Regenerate from the machinery checkout root, without `-I`, so the checkout's own catalog
+and output are used (with `-I` the installed release would be read and written):
 
 ```bash
-.venv/bin/python -m agents_extensions.shared.skills.drive-epic.scripts.render_catalog_tables --write
+"$LU_PYTHON" -m agents_extensions.shared.skills.drive-epic.scripts.render_catalog_tables --write
 ```
 
 These are candidate identities and order, not permission or health evidence.

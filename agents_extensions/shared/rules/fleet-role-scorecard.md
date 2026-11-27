@@ -47,14 +47,12 @@
 | **Claude Opus 5.5** | Hard Claude-lane coding, deep code review and hard advisory judgment | Costly as bulk worker | Anthropic / native Claude or verified Cursor slug | Hard coding, review and advisor @ high; designated approver with Sol 6.2 (#9583, #9616) |
 | **Gemini 4 Neon High** | Peer of Opus 5.5 and Sol 6.2 for hard/security coding, stream driving, and code/infra CF review at every risk tier (including critical and security paths); 1M context; VESUM-backed Ukrainian review | Provisional (operator 2026-11-20, NEON-SOLTIER-1120); designated approval remains Opus 5.5 + Sol 6.2; same-family review of Google work is not independent | Google / native AGY | Hard/security coder, driver peer, code/infra/critical/security CF reviewer @ high, and Ukrainian reviewer with Sources MCP |
 | **GPT-6 Luna** | Fast bounded implementation, recon, and mechanical checks | Never sole architecture/security/language/release authority | OpenAI / native Codex | Bounded worker / recon @ high |
-| **Claude Haiku** | Fast cheap recon/triage on Anthropic lane; good for log/search skim | Never sole architecture/security/language/release authority | Anthropic | Recon (with Luna / 3.5 Flash) |
+| **Claude Haiku** | Fast cheap recon/triage on Anthropic lane; good for log/search skim | Never sole architecture/security/language/release authority | Anthropic | Recon (with Luna) |
 | **Sonnet 5.5** | Well-scoped everyday coding and bug fixes; polished English reports, runbooks, write-ups, PR/issue prose, decks, spreadsheets, design review of pages/artifacts; faster and uses fewer tokens than Sonnet 5 | Weaker than Opus 5.5 on complex, open-ended work; security-sensitive code authoring (hooks/guards, launchers, credentials/secrets, dispatch admission, sandbox/permissions) goes to Opus 5.5, Codex Sol or Gemini 4 Neon High; Ukrainian curriculum content stays with sanctioned language lanes (Opus 5.5 for Claude); escalate hard judgment to Opus 5.5 / Sol 6.2; designated approval remains separate | Anthropic | Provisional practical worker: after 10 recorded Sonnet 5.5 review or implementation outcomes, adopt or demote with evidence (#9111) |
 | **Grok 4.7** | Strong coding agent; token-efficient; good CF review value | No driver or high/critical review seat; formal review requires the exact Cursor pin and runtime attestation | xAI; SuperGrok Heavy = capacity entitlement (re-verify) | Worker; eligible for low/medium code/infra CF review through attested Cursor `grok-4.7-high` when admitted by the resolver; outside the ordinary review ladders (C-5307) |
-| **Gemini 3.8 Flash High** | Multilingual / designated UA language seat; semantic review | Not bulk CRUD default; language outputs need sources | Google / AGY | Language lane (3.1 Pro is retired, not subscribed, operator 2026-10-23) |
-| **K3** | Retired (OO-58, #11327) | No executable route and no substitution | Moonshot | Not a lane |
-| **GLM-5.3** | Deep bug/security; large-context code coherence | Weak UA pedagogy; **LOCAL-ONLY** China-egress | Zhipu / opencode local | Local CF code only; never CI |
+| **GLM-5.3** | Retired, not subscribed (operator 2026-10-23) | No executable route, reviewer ladder or substitution | Zhipu / opencode | Not a lane |
 | **DeepSeek V4.1 Flash** | Latest Flash coding through opencode; `ask-deepseek` is consult-only for non-language work | Never private-repository content or secrets; review-of-record and Ukrainian work need measured evidence first; Pro and older ids retired | Direct DeepSeek API or OpenRouter with a named US provider allow-list; `lu_machinery/ai_agent_bridge/routing_guard.py` still refuses `openrouter/deepseek` until that allow-list exists | Coding execution only; no review or budget substitution |
-| **Cursor** (`grok-4.7` / `composer-2.5`; Auto) | Mechanical code/infra when free; first-class worker (#6468) | Auto only for a well-defined coding dispatch (owned paths, PASS DoR card; operator decision 2026-09-30); driver seat, review, design, consults and recon pin a concrete model; Auto never formal CF identity; adapter gate #6469 | Cursor harness multi-model | Worker (impl) |
+| **Cursor** (`grok-4.7`; Auto) | Mechanical code/infra when free; first-class worker (#6468) | Auto only for a well-defined coding dispatch (owned paths, PASS DoR card; operator decision 2026-09-30); driver seat, review, design, consults and recon pin a concrete model; Auto never formal CF identity; adapter gate #6469 | Cursor harness multi-model | Worker (impl) |
 
 ---
 
@@ -64,12 +62,10 @@ Never use a fixed unordered list that can pick the author’s family.
 
 | Author family | Prefer CF reviewers (code/infra) | Avoid as sole CF |
 |---|---|---|
-| Anthropic (Opus/Sonnet; Fable parked) | Grok, GPT-6.2 Sol, GLM local, Gemini | Sonnet/Opus self-family |
-| OpenAI (GPT-6.2 Sol, GPT-6 Luna) | Grok, Opus/Sonnet, GLM local, Gemini; security-sensitive diffs are raised to `--risk critical`, which excludes Sonnet 5.5 (resolver floor, #9125) | GPT-6 self-family |
-| xAI (Grok) | Opus/Sonnet, GPT-6.2 Sol, GLM local, Gemini; security-sensitive diffs are raised to `--risk critical`, which excludes Sonnet 5.5 (resolver floor, #9125) | Grok self-family |
-| Google (Gemini via AGY) | Grok, OpenAI, Anthropic, GLM local | Gemini self-family alone for CF of Gemini-authored infra |
-| Moonshot (K3 retired, Cursor Composer) | Grok, OpenAI, Anthropic, GLM local, Gemini | Composer self-family; K3 is not a reviewer |
-| Zhipu (GLM) | Grok, OpenAI, Anthropic, Gemini | GLM self-family |
+| Anthropic (Opus/Sonnet; Fable parked) | Grok, GPT-6.2 Sol, Gemini | Sonnet/Opus self-family |
+| OpenAI (GPT-6.2 Sol, GPT-6 Luna) | Grok, Opus/Sonnet, Gemini; security-sensitive diffs are raised to `--risk critical`, which excludes Sonnet 5.5 (resolver floor, #9125) | GPT-6 self-family |
+| xAI (Grok) | Opus/Sonnet, GPT-6.2 Sol, Gemini; security-sensitive diffs are raised to `--risk critical`, which excludes Sonnet 5.5 (resolver floor, #9125) | Grok self-family |
+| Google (Gemini via AGY) | Grok, OpenAI, Anthropic | Gemini self-family alone for CF of Gemini-authored infra |
 
 **Task-family qualification overrides:** language CF must be LANGUAGE-LANES-qualified; FOLK uses the review-loop ukrainian seats, with no Claude seat, per the folk rubric.
 
@@ -160,9 +156,9 @@ Polished English work     → Sonnet 5.5 (reports, runbooks, write-ups, PR/issue
 Ukrainian curriculum      → sanctioned language lanes; Opus 5.5 for Claude (never Sonnet 5.5)
 Hard code                 → GPT-6.2 Sol high | Claude Opus 5.5 high | Gemini 4 Neon High; Opus/Sol advice
 Orchestrate stream        → GPT-6.2 Sol high | Claude Opus 5.5 high | Gemini 4 Neon High (exactly one)
-UI / visual product       → Opus/Sol design → K3 or Sol/Opus/Grok implement web/UI code → Opus/Sol first if systems-hard
+UI / visual product       → Opus/Sol design → Sol/Opus/Grok implement web/UI code → Opus/Sol first if systems-hard
 UA language                 → fresh-build writer gemini-4-neon-high (AGY); writer alternatives Sol 6.2 / Opus 5.5; review per LANGUAGE-LANES + VESUM/sources
-Security/bug CF             → author-family-conditional (Grok/GLM/Opus/…)
+Security/bug CF             → author-family-conditional (Grok/Opus/…)
 Architecture decision       → Opus/Sol advice → designated approval (operator, or Opus 5.5 + Sol 6.2: the non-author's approval when one authored it, both otherwise) → orchestrator integrates
 Recon                     → GPT-6 Luna high (Sol envelope) | Claude Haiku | Gemini 4 Hydrogen (Sol envelope)
 ```

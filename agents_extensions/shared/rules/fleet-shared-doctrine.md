@@ -6,7 +6,6 @@
 **Complements:**
 
 - `agents_extensions/shared/rules/model-assignment.md` — machine routing / LANGUAGE-LANES
-- [`agent-bridge.md`](agent-bridge.md) — review isolation, cross-family review, worktree reaper
 - `agents_extensions/shared/rules/operator-expectations.md` — operator contract
 
 ---
@@ -28,9 +27,9 @@ If a scorecard row conflicts with LANGUAGE-LANES, egress, or review-gate rules �
 
 | Term | Meaning |
 |---|---|
-| **Family** | Independence unit for CF review (e.g. Anthropic, OpenAI, xAI, Google, Moonshot, Zhipu/GLM, DeepSeek, Cursor-backed-*pinned*). |
+| **Family** | Independence unit for CF review (e.g. Anthropic, OpenAI, xAI, Google, DeepSeek, Cursor-backed-*pinned*). |
 | **Provider** | Who hosts the weights/API (OpenAI, Anthropic, xAI, Google, …). |
-| **Harness** | Runtime that invokes the model (native Claude CLI, Codex, Grok Build, AGY, Hermes, Cursor, opencode). **Cursor is a harness/product**, not automatically a family. |
+| **Harness** | Runtime that invokes the model (native Claude CLI, Codex, AGY, Hermes, Cursor, opencode). **Cursor is a harness/product**, not automatically a family. |
 | **Route** | Concrete path: provider + intermediary (if any) + region/retention class. |
 | **Egress** | Where prompt/code data may leave (Western lab, China-route, local-only). |
 | **CF review** | Cross-**family** formal review of a change; discussion/panel alone does **not** satisfy the gate. |
@@ -70,8 +69,8 @@ Assign by **role × task family × harness × route/egress**, not marketing rank
 
 ## 4. Cost discipline (Opus / Sol advisors; future xAI ceiling)
 
-- **Cursor (operator 2026-09-22; Auto scope operator decision 2026-09-30):** prefer **`--agent cursor --model grok-4.7-high`** for mechanical **and** ordinary infra/code implement when fit allows — not LANGUAGE-LANES, not advisor/authority. Cursor Auto runs only a well-defined coding task (`--research-role implementation` write dispatch, owned paths, PASS DoR card); the driver seat, design, consults, discussions and recon pin `grok-4.7` or `composer-2.5`, and a review runs the approved concrete model the reviewer resolver selects. `cursor:auto` never CF-of-record.
-- **Utilize, do not trim (operator 2026-08-08 / #6468):** free/behind seats (Cursor, AGY, Claude routine, Grok workers) with open in-scope work must be pulled before feeding Codex near_cap mechanical jobs. Pool and Z.AI/GLM are retired (operator 2026-10-23). Kimi is retired (OO-58, #11327). Cutting subscriptions is a last resort after sustained measured zero use, not a response to multi-driver complexity. Concurrent drivers (~2 Grok + 1 Claude + 1–4 Codex) share free pools; coordinate via `/api/delegate/active`.
+- **Cursor (operator 2026-09-22; Auto scope operator decision 2026-09-30):** prefer **`--agent cursor --model grok-4.7-high`** for mechanical **and** ordinary infra/code implement when fit allows — not LANGUAGE-LANES, not advisor/authority. Cursor Auto runs only a well-defined coding task (`--research-role implementation` write dispatch, owned paths, PASS DoR card); the driver seat, design, consults, discussions and recon pin `grok-4.7`, and a review runs the approved concrete model the reviewer resolver selects. `cursor:auto` never CF-of-record.
+- **Utilize, do not trim (operator 2026-08-08 / #6468):** free/behind seats (Cursor, AGY, Claude routine, Grok workers) with open in-scope work must be pulled before feeding Codex near_cap mechanical jobs. Pool and Z.AI/GLM are retired (operator 2026-10-23). Kimi is retired (OO-58, #11327). Cutting subscriptions is a last resort after sustained measured zero use, not a response to multi-driver complexity. Concurrent drivers (~1 Claude + 1–4 Codex) share free pools; coordinate via `/api/delegate/active`.
 - **DeepSeek:** latest V4.1 Flash coding through opencode is allowed on the direct DeepSeek API or OpenRouter with a named US provider allow-list. Never send private-repository content or secrets. Review-of-record and Ukrainian work need measured evidence first; Pro and older ids stay retired. `ask-deepseek` is consult-only for non-language work. Budget substitution never selects DeepSeek. `lu_machinery/ai_agent_bridge/routing_guard.py` still refuses `openrouter/deepseek` until that allow-list exists.
 - **OpenRouter:** harness for DeepSeek and other routed models. Pool is retired. Gemma is live for hramatka only, through OpenCode, and is not a review, consultation or Ukrainian-language seat. Not a general multi-model bus.
 - **Timed pauses:** near_cap/paused lanes carry **return-at** — auto-return, never permanent neglect.
@@ -139,7 +138,7 @@ At `low` or `medium`, Sonnet 5.5 can check in before finishing. Make completion 
 | Activity | Entry |
 |---|---|
 | Thin orchestration | One accountable lead selected from the current catalog for the stream |
-| Implementation | `lu_machinery/dispatch.py dispatch --worktree` |
+| Implementation | `"$LU_PYTHON" -I -m lu_machinery.dispatch dispatch --worktree` |
 | Formal code CF review | Qualified native toolful lane resolved through the canonical `local-code-review` workflow |
 | Advisory design | Qualified advisor from the current catalog with an **explicit decision question** |
 | Multi-agent debate | `discuss` — **not** the merge gate |
@@ -181,7 +180,7 @@ Before dispatch, classify **data class** and **route**:
 | Public open-source code | Standard fleet routes OK |
 | Curriculum drafts / unreleased content | Prefer Western lab routes; record route |
 | Secrets, tokens, learner PII | **Default-deny** external routes |
-| Local-only policy lanes (GLM) | Never CI; never sensitive classes |
+| Local-only policy lanes | Never CI; never sensitive classes |
 
 Record when relevant: **provider, intermediary, region/retention, data class**. Brand labels (“China”) are insufficient without the concrete route.
 

@@ -21,7 +21,7 @@ semantics, scope freezing, non-mutating checks, cross-family reviewer
 resolution, finding adjudication, and separate behavior proof. A clean
 working tree never substitutes for reviewing a requested commit or PR.
 
-For the review of record, use `"$PY" -m lu_machinery.review.record_cf_verdict` after the
+For the review of record, use `"$LU_PYTHON" -I -m lu_machinery.review.record_cf_verdict` after the
 toolful review settles. It posts a PR comment bound to the exact head, with
 model/family/harness provenance. GitHub rejects an API approval review when the
 shared bot identity also authored the PR (`gh pr review --approve` uses that API).
@@ -35,7 +35,7 @@ so the recorder uses current primary-checkout rules on older branches too.
 Red-team exception (`workflow.md` § Merge policy), for code review only:
 only when no eligible outside-family reviewer exists, resolve with
 `closeout_cli resolve-reviewer --review-mode red_team`, dispatch a
-separate review task with `dispatch.py dispatch --review-mode red_team
+separate review task with `"$LU_PYTHON" -I -m lu_machinery.dispatch dispatch --review-mode red_team
 --prompt-file <file>` whose prompt text names a red team, then publish
 with `record_cf_verdict.py --review-mode red_team --red-team-prompt
 <file>`. The author's task stays refused, and so does every canonical
@@ -61,7 +61,7 @@ outside-family reviewer is available.
 ## Execute
 
 Read and follow [`local-code-review-checklist.md`](local-code-review-checklist.md)
-in full. It drives `.venv/bin/python -m lu_machinery.review.closeout_cli` for every
+in full. It drives `"$LU_PYTHON" -I -m lu_machinery.review.closeout_cli` for every
 step that has a deterministic answer (target resolution, scope-baseline
 freeze and breakers, reviewer resolution, findings adjudication) and tells
 you exactly what to reason about yourself. Do not re-run test suites that the

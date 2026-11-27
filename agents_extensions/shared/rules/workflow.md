@@ -13,7 +13,7 @@ A session with a known assigned functional role opts into that role's bounded
 pointer-only cold start:
 
 ```python
-from ai_agent_bridge.monitor_client import MonitorClient
+from lu_machinery.ai_agent_bridge.monitor_client import MonitorClient
 boot = MonitorClient().bootstrap(role="quality")
   # boot["rules"].body     — condensed rules markdown
   # boot["session"].body   — condensed session summary
@@ -46,12 +46,12 @@ curl -s 'http://localhost:8765/api/knowledge/cold-start?role=quality'  # role-sc
 # Generic or genuinely role-unknown session: skip the role-scoped request; remain pointer-free.
 curl -s "http://localhost:8765/api/comms/inbox?agent=$SESSION_HANDOFF_AGENT"  # queued deliveries for your seat
 # Fleet-comms durable authority: query live mode + parity (see fleet-comms-coordination.md)
-.venv/bin/python -m lu_machinery.fleet_comms plane-status
+"$LU_PYTHON" -I -m lu_machinery.fleet_comms plane-status
 ```
 
 ### Public GitHub publishing
 
-Publish agent-authored GitHub changes with `python -m lu_machinery.publish` using
+Publish agent-authored GitHub changes with `"$LU_PYTHON" -I -m lu_machinery.publish` using
 its named verbs and closed fields. Repository code uses the same module API.
 Raw `gh` is reserved for the strict read allowlist and verified private
 repository writes. API reads use the module's named read helpers; arbitrary
@@ -60,7 +60,7 @@ Run Python with the task's prescribed project interpreter.
 
 ### Project Research Registry — orchestrator dispatch duty
 
-Cold-start awareness is not enough. Before **every** `dispatch.py dispatch`, the
+Cold-start awareness is not enough. Before **every** `"$LU_PYTHON" -I -m lu_machinery.dispatch dispatch`, the
 accountable orchestrator must classify the task from its issue/brief and record
 one of these outcomes in the brief or orchestration note:
 
@@ -78,7 +78,7 @@ one of these outcomes in the brief or orchestration note:
 Example scoped dispatch fragment:
 
 ```bash
-.venv/bin/python -m lu_machinery.dispatch dispatch --model <catalog-model> \
+"$LU_PYTHON" -I -m lu_machinery.dispatch dispatch --model <catalog-model> \
   --agent codex --task-id quality-4952 \
   --prompt-file docs/dispatch-briefs/quality-4952.md --worktree \
   --mode workspace-write \
@@ -99,7 +99,7 @@ not justify fabricating pointers or claiming their delivery.
 
 ### Dispatch brief unit (binding — #5737)
 
-Every `dispatch.py dispatch` `--prompt-file` (and equivalent inline prompt) must name
+Every `"$LU_PYTHON" -I -m lu_machinery.dispatch dispatch` `--prompt-file` (and equivalent inline prompt) must name
 **one shippable unit** and its **acceptance criteria** — not an open-ended objective.
 
 - **Shippable unit: one user-visible outcome, delivered whole, in one PR** (owned paths +
@@ -158,7 +158,7 @@ Verify the exact pushed head against the task's reviewed head before recording
 the result. Subject-seat and subject-family exclusions remain explicit inputs.
 
 A formal review runs as a dispatch v2 bound attempt (`--review-id`, `--attempt-id`,
-`--review-attempt`, a rendered `--prompt-file`), recorded by `scripts.review.record`;
+`--review-attempt`, a rendered `--prompt-file`), recorded by the product's `scripts.review.record` (product interpreter, from `$LU_PRODUCT_ROOT`);
 the recipe is `docs/runbooks/formal-review-attempt-isolation.md` § Running a bound
 attempt. A plain read-only dispatch does not provide protected isolation, Sources
 receipts or legacy authoring-review admission. Missing required evidence blocks closeout.
@@ -191,11 +191,10 @@ with `review-loop` for review rounds and the budget.
 1. Independent exact-head review **APPROVE** on the tip you intend to land, at the tier the
    [review policy](../skills/review-loop/references/policy.md#2-risk-tier-is-set-by-the-change)
    sets: cross-family, except any qualified non-author reviewer at Low tier.
-2. Open the PR if it is not already open, then run `"$PY" -m lu_machinery.review.record_cf_verdict` to bind the completed
+2. Open the PR if it is not already open, then run `"$LU_PYTHON" -I -m lu_machinery.review.record_cf_verdict` to bind the completed
    review, reviewed head, and author qualification in a **PR comment bound to the head SHA**,
-   with reviewer model/family/harness provenance. Resolve `PRIMARY_REPO` and `PY` with the
-   [review-loop setup](../skills/review-loop/SKILL.md#review-loop) to use current recorder rules
-   regardless of the caller's branch age. GitHub rejects API approval reviews
+   with reviewer model/family/harness provenance. The `-I` run loads the installed machinery
+   release, so its recorder rules apply regardless of the caller's branch age. GitHub rejects API approval reviews
    from the shared bot identity when it also authored the PR; do not use
    `gh pr review --approve` for this publication. The comment records independent
    cross-family review, not self-approval. Require the **PR CI Gate green**
@@ -314,7 +313,7 @@ for every worker/reviewer process using the target worktrees to exit, then run
 with the task-prescribed project interpreter:
 
 ```bash
-.venv/bin/python -m lu_machinery.orchestration.merge_closeout <N> --repo <owner/name> --repo-root <checkout> --apply
+"$LU_PYTHON" -I -m lu_machinery.orchestration.merge_closeout <N> --repo <owner/name> --repo-root <checkout> --apply
 ```
 
 Require exit 0 and the receipt proving that no dispatch worktree still holds the
@@ -388,8 +387,8 @@ spot-check via `X-Agent` trailers + stream issue links when CI queues back up.
 
 Thread rollover handoffs are managed by the `thread-rollover` skill. When a
 thread approaches context threshold, use the `thread-rollover` skill to prepare
-a packet via `.venv/bin/python -m lu_machinery.orchestration.thread_handoff prepare --agent codex --active-thread-id <id>`.
-This creates an isolated `handoff.md` inside `.agent/thread-rollovers/codex/<lineage-id>/`.
+a packet via `"$LU_PYTHON" -I -m lu_machinery.orchestration.thread_handoff prepare --agent codex --active-thread-id <id>`.
+This creates an isolated `handoff.md` inside `$LU_STATE_ROOT/.agent/thread-rollovers/codex/<lineage-id>/`.
 Do **not** write `docs/session-state/current.md` or any other git-tracked
 handoff file just to survive compaction.
 
@@ -578,7 +577,7 @@ through Fleet Comms; the CTO opens, folds or drops them.
 - These intake rules bind every lane, the CTO included.
 - **New stream?** Only with a new epic + a registry entry in the same PR — streams are
   deliberate, not emergent.
-- Auditor: `.venv/bin/python -m lu_machinery.orchestration.issue_stream_audit` (`--check` for
+- Auditor: `"$LU_PYTHON" -I -m lu_machinery.orchestration.issue_stream_audit` (`--check` for
   gates, `--migrate` to convert body references into native sub-issues).
 
 ## Mandatory task workflow
@@ -638,7 +637,7 @@ Every task follows this workflow. No exceptions for non-trivial changes.
 The machine gate is:
 
 ```bash
-.venv/bin/python -m lu_machinery.orchestration.task_closeout --help
+"$LU_PYTHON" -I -m lu_machinery.orchestration.task_closeout --help
 ```
 
 Read-only `reconcile` appends an idempotent observation receipt. Remote changes
@@ -665,7 +664,7 @@ with no path check, and `delegate --agent agy` with no review-typing flag
 is not gated.
 ```bash
 printf '%s\n' "Adversarial review for #NNN. Read {path}." | \
-  .venv/bin/python -m lu_machinery.ai_agent_bridge ask-claude - \
+  "$LU_PYTHON" -I -m lu_machinery.ai_agent_bridge ask-claude - \
     --task-id review-NNN --review --branch <branch>
 ```
 
@@ -757,11 +756,11 @@ curl -s http://127.0.0.1:8765/api/fleet/acp/conversations/CONVERSATION_ID
 curl -s http://127.0.0.1:8765/api/runtime/acp/conversations/CONVERSATION_ID/transcript
 
   # Post (one recipient per --recipient; threading with --in-reply-to / --correlation-id)
-.venv/bin/python -I -m lu_machinery.fleet_comms channel publish reviews - \
+"$LU_PYTHON" -I -m lu_machinery.fleet_comms channel publish reviews - \
   --sender "$SESSION_HANDOFF_AGENT" --recipient claude-cto --idempotency-key KEY < message.md
 
   # Multi-agent bounded discussion
-.venv/bin/python -m lu_machinery.ai_agent_bridge discuss architecture \
+"$LU_PYTHON" -I -m lu_machinery.ai_agent_bridge discuss architecture \
   "Should we extract the V6 god object?" \
   --with claude,gemini,codex --max-rounds 2
 ```
@@ -774,7 +773,7 @@ Fleet Comms job; read its transcript with
 only). `GET /api/fleet/acp/conversations/<conversation-id>` is its body-free
 metadata.
 
-**Full docs**: `docs/best-practices/agent-bridge.md`.
+**Full docs**: `docs/best-practices/agent-bridge.md` in the product checkout (`$LU_PRODUCT_ROOT`).
 
 The legacy `ask-gemini` / `ask-claude` / `ask-codex` commands are
 NOT deprecated — they stay alive for one-shot delegations. Use

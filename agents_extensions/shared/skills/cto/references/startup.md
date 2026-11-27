@@ -5,7 +5,9 @@ the read-only primary checkout); scratch goes in the session scratchpad (`<scrat
 Commands below never rely on the working directory: `$LEARN_UKRAINIAN_PYTHON` is the
 project interpreter the launcher exported, and the task store is `LU_TASKS_DIR`, else
 `<state root>/batch_state/tasks`, where the state root is `LU_STATE_ROOT`, else the primary
-checkout (`LEARN_UKRAINIAN_PRIMARY_REPO_ROOT`).
+checkout (`LEARN_UKRAINIAN_PRIMARY_REPO_ROOT`). The CTO workspace is not a Git checkout: a bare
+repository path below (`docs/runbooks/…`, `lu_machinery/config/…`) is in the machinery primary
+checkout, `$LU_PRIMARY_REPO_ROOT`; run Git there with `git -C` and `gh` with `-R <owner/name>`.
 
 ## 0. This skill is the entry point
 

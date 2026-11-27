@@ -20,7 +20,8 @@ Your `argparse.ArgumentParser` must include all of:
    - Example value or expected format
 
 3. **`epilog=`** (with `formatter_class=argparse.RawDescriptionHelpFormatter`):
-   - 1–3 concrete `.venv/bin/python scripts/…` usage examples for the common cases
+   - 1–3 concrete usage examples for the common cases: `"$LU_PRODUCT_ROOT/.venv/bin/python" scripts/…`
+     for a product script, `"$LU_PYTHON" -I -m lu_machinery.…` for a machinery module
    - `Outputs:` — files written, DB updates, side effects
    - `Exit codes:` — what 0 and ≥1 mean
    - `Related:` — the template/prompt it uses, prod version, relevant doc, EPIC/issue
@@ -33,9 +34,9 @@ commit. Don't leave it worse than you found it.
 
 ## Reference implementation
 
-`scripts/build/v7_build.py` — mirror this pattern.
+`scripts/build/v7_build.py` (a product script) — mirror this pattern.
 
-Run: `.venv/bin/python scripts/build/v7_build.py --help`
+Run: `"$LU_PRODUCT_ROOT/.venv/bin/python" "$LU_PRODUCT_ROOT/scripts/build/v7_build.py" --help`
 
 ## Why this matters
 

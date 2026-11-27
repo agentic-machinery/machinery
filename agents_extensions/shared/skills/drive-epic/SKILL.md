@@ -34,13 +34,13 @@ the operator to merge.
 
 At each turn end and at session end:
 
-- [ ] `.venv/bin/python -m lu_machinery.hygiene.branch_sweep --json` reviewed and its
+- [ ] `"$LU_PYTHON" -I -m lu_machinery.hygiene.branch_sweep --json` reviewed and its
       proven-safe deletions applied (`--apply`), then `git fetch --prune`. Every `merge_closeout`
       residual and every SKIPPED row gets a decision (remove it safely, or record a verified
       reason to keep it); never force removal.
 - [ ] A settled task's worktree is gone (`worktree_disposition`); remove a `retained` or `error`
       one only after its content is published:
-      `.venv/bin/python -m lu_machinery.orchestration.worktree_claims remove <path> --owner-task-id <task> --reason <why>`.
+      `"$LU_PYTHON" -I -m lu_machinery.orchestration.worktree_claims remove <path> --owner-task-id <task> --reason <why>`.
 - [ ] No lane issue has a merged PR and no disposition; none is kept open as a running log.
 - [ ] Every live worker has an armed wait, and no finished worker waits on the operator.
 - [ ] The residual count is quoted from a tool; above zero it has a next dispatch this session
@@ -55,8 +55,8 @@ Git hygiene is rules core P4: the primary checkout stays on `main` and read-only
 applies every message marked `unread` or `read-but-not-live-consumed`, then acks it:
 
 ```bash
-.venv/bin/python -I -m lu_machinery.fleet_comms deliveries receive --recipient "$SESSION_HANDOFF_AGENT" --worker-id "$SESSION_HANDOFF_AGENT"
-.venv/bin/python -I -m lu_machinery.fleet_comms deliveries ack <delivery-id> --worker-id "$SESSION_HANDOFF_AGENT" --fence-token <n>
+"$LU_PYTHON" -I -m lu_machinery.fleet_comms deliveries receive --recipient "$SESSION_HANDOFF_AGENT" --worker-id "$SESSION_HANDOFF_AGENT"
+"$LU_PYTHON" -I -m lu_machinery.fleet_comms deliveries ack <delivery-id> --worker-id "$SESSION_HANDOFF_AGENT" --fence-token <n>
 ```
 
 Record every order, in-flight task (with its full run nonce), blocker, decision and next action
@@ -88,9 +88,9 @@ needs evidence, dropped needs an operator reference): [handoff](references/hando
 7. **§4a Inbox drain** immediately before dispatch.
 8. **§4 Dispatch** only with a green task card and preflight, explicit model, research metadata
    and `--owned-path`.
-9. **§5 Settle.** Arm `.venv/bin/python -m lu_machinery.dispatch wait <task-id> --run-nonce <nonce>`
+9. **§5 Settle.** Arm `"$LU_PYTHON" -I -m lu_machinery.dispatch wait <task-id> --run-nonce <nonce>`
    (or Monitor) in the dispatch turn; state a worker's status only after
-   `.venv/bin/python -m lu_machinery.dispatch status <task-id>` this turn, and record its task ID,
+   `"$LU_PYTHON" -I -m lu_machinery.dispatch status <task-id>` this turn, and record its task ID,
    full nonce, status and head in its tracker item.
 10. **§5a Inbox drain** after settle.
 11. **§6 Review, §7 landing, §7a closeout, §7-rollout** run through the delivery skills above;

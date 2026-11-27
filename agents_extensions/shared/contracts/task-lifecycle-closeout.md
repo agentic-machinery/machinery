@@ -8,7 +8,7 @@ The implementation is `lu_machinery/orchestration/task_lifecycle.py`. The operat
 entry point is:
 
 ```bash
-.venv/bin/python -m lu_machinery.orchestration.task_closeout --help
+"$LU_PYTHON" -I -m lu_machinery.orchestration.task_closeout --help
 ```
 
 ## Authority and storage
@@ -20,8 +20,8 @@ entry point is:
   dispatch worktree, commits, trailers, changed paths, branches, and cleanup.
 - The lifecycle ledger is an append-only projection of those observations. It
   cannot overwrite contradictory authority facts.
-- Runtime ledgers live below the primary checkout's shared Git directory at
-  `.agent/task-lifecycle/<repository-digest>/issue-<number>.json`. The exact
+- Runtime ledgers live below the shared state root at
+  `$LU_STATE_ROOT/.agent/task-lifecycle/<repository-digest>/issue-<number>.json`. The exact
   `task-identity.v1` repository and issue deterministically locate the same
   ledger after delegation, worktree changes, process crashes, or rollover.
 - Writes are locked and atomic. Replaying an identical observation returns the
@@ -106,7 +106,7 @@ Each contributing comment also has its own review evidence record. Executing
 the learner page on a local merge of that head is separate evidence; it does
 not replace the head binding, and this receipt is not a review of record.
 Prefer a shared
-`.agent/review-closeout/` receipt path so rollover and worktree cleanup do not
+`$LU_STATE_ROOT/.agent/review-closeout/` receipt path so rollover and worktree cleanup do not
 discard the proof.
 
 Evidence due at `ISSUE_CLOSED` or `CLEANED_UP` may be derived from the
@@ -160,7 +160,7 @@ and initialization timestamps are excluded from that comparison.
 To correct wrongly frozen required evidence types, use:
 
 ```bash
-.venv/bin/python -m lu_machinery.orchestration.task_closeout correct-evidence-types \
+"$LU_PYTHON" -I -m lu_machinery.orchestration.task_closeout correct-evidence-types \
   --state-file ledger.json --ac-id AC-02 \
   --required-evidence document --required-evidence review \
   --actor codex/task-id --reason 'This criterion verifies documentation'
@@ -202,7 +202,7 @@ A successor thread that takes over an issue whose ledger another identity create
 binds itself explicitly, with the same identity and policy arguments as `init`:
 
 ```bash
-.venv/bin/python -m lu_machinery.orchestration.task_closeout bind-successor \
+"$LU_PYTHON" -I -m lu_machinery.orchestration.task_closeout bind-successor \
   --identity-file identity.json --ac-policy ac-policy.json \
   --author-family codex --required-check 'CI Gate'
 ```
@@ -271,7 +271,7 @@ is `BLOCKED_WITH_RECEIPT` with an owner, reason, evidence, and next action.
 the task's dispatch worktree is still present, and removes none. The
 dispatcher settles its own worktree (`_reap_settled` in
 `lu_machinery/dispatcher/worker.py`); a worktree it retained is removed with
-`python -m lu_machinery.orchestration.worktree_claims remove PATH --owner-task-id ID`,
+`"$LU_PYTHON" -I -m lu_machinery.orchestration.worktree_claims remove PATH --owner-task-id ID`,
 which never forces. A valid earlier observation makes capture a no-op. Capture
 failure retains the worktree; an explicit `--no-lifecycle-observation REASON`
 is logged in the cleanup report. Tasks without a lifecycle ledger retain their

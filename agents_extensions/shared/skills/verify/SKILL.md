@@ -9,9 +9,9 @@ One command checks the area a change can break. Run it from a machinery checkout
 
 | Area | Run when the diff touches | Command |
 | --- | --- | --- |
-| api | `lu_machinery/api/`, Monitor route or page contracts, or dashboard HTML | `.venv/bin/python -m lu_machinery.ops.verify_run --area api` |
-| sources | the Sources server, its unit, or a caller of `verify_word` | `.venv/bin/python -m lu_machinery.ops.verify_run --area sources` |
-| host | `packaging/systemd/`, the loopback target, or a long-running unit | `.venv/bin/python -m lu_machinery.ops.verify_run --area host` |
+| api | `lu_machinery/api/`, Monitor route or page contracts, or dashboard HTML | `"$LU_PYTHON" -I -m lu_machinery.ops.verify_run --area api` |
+| sources | the Sources server, its unit, or a caller of `verify_word` | `"$LU_PYTHON" -I -m lu_machinery.ops.verify_run --area sources` |
+| host | `packaging/systemd/`, the loopback target, or a long-running unit | `"$LU_PYTHON" -I -m lu_machinery.ops.verify_run --area host` |
 
 Pass means exit 0 and `"ok": true` in the receipt.
 

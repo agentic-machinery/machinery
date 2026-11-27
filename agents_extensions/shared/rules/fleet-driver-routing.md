@@ -37,7 +37,7 @@ and ≥2 tiers for 14 consecutive days. A review does not expire the standing ru
 review seat and, since operator 2026-09-29 (#9230), took over the former Astra advisory seat at `high`.
 Ordinary advice uses Opus 5.5 / Sol 6.2; Fable and the former Astra seat hold no advisory role (#9583).
 Luna @ `high` handles routine bounded work and scouting under the driver-brief or Sol-envelope contract (§2).
-`gpt-6-sol` remains retired and is not routable. Astra (`gpt-6-astra`) is routable only for the Codex red-team code-review exception for Sol-authored PRs until 2026-11-04T00:00Z (#10437). Designated approval remains separate
+`gpt-6-sol` remains retired and is not routable. `gpt-6-astra` is retired (its red-team exception, #10437, expired 2026-11-04). Designated approval remains separate
 from ordinary advice; do not spend advisory turns on ordinary implementation or review.
 
 **Standing routing preference (#9583, operator decision 2026-10-03):** advice, critique, review and
@@ -62,18 +62,18 @@ resolver selects. A review of Grok-authored work runs the reviewer resolver's no
 through Cursor (D-129, #10464), and the Other Models pool never carries a review. DeepSeek V4.1 Flash coding through opencode is allowed; review-of-record and Ukrainian work need measured evidence first; `deepseek-v4.1-flash` remains active in the catalog, and Pro is retired.
 
 **Use active catalog seats with headroom.** Live check:
-`.venv/bin/python -m lu_machinery.fleet.capacity_pick` (preferred) +
-`.venv/bin/python -m lu_machinery.fleet.usage show` (per-lane remaining% + pace lines)
+`"$LU_PYTHON" -I -m lu_machinery.fleet.capacity_pick` (preferred) +
+`"$LU_PYTHON" -I -m lu_machinery.fleet.usage show` (per-lane remaining% + pace lines)
 + `/api/delegate/active` + disk. (`codexbar usage` is retired — do not cite it.)
 
-**Mandatory pre-dispatch (binding):** Before every implement `dispatch.py dispatch`, run:
+**Mandatory pre-dispatch (binding):** Before every implement `"$LU_PYTHON" -I -m lu_machinery.dispatch dispatch`, run:
 
 ```bash
-.venv/bin/python -m lu_machinery.fleet.capacity_pick
+"$LU_PYTHON" -I -m lu_machinery.fleet.capacity_pick
 # pace detail per lane (remaining%, pace lines, will_last, deficit):
-.venv/bin/python -m lu_machinery.fleet.usage show
+"$LU_PYTHON" -I -m lu_machinery.fleet.usage show
 # then dispatch with an explicit eligible provider/model:
-.venv/bin/python -m lu_machinery.dispatch dispatch --agent <lane> --model <catalog-model> --prompt-file <brief> --worktree
+"$LU_PYTHON" -I -m lu_machinery.dispatch dispatch --agent <lane> --model <catalog-model> --prompt-file <brief> --worktree
 ```
 
 **Refuse deficit when cooler seats exist.** Do **not** habit-route to Codex (or any
@@ -122,7 +122,7 @@ plan window is exhausted read `credit_use_unconfirmed` and keep near_cap/AVOID. 
 naive-timestamp or non-numeric credit data also keep near_cap/AVOID. Admission is a separate question
 from the recommendation: whenever the plan window is at or below the threshold and a fresh positive
 balance exists (states `credit_balance_present`, `credit_use_unconfirmed` and `credits_unverified`
-from unreadable usage records), `dispatch.py dispatch` refuses any model outside the lane allowlist
+from unreadable usage records), `"$LU_PYTHON" -I -m lu_machinery.dispatch dispatch` refuses any model outside the lane allowlist
 (Codex: `gpt-6.2-sol`, `gpt-6-luna`) with `CREDIT_PERIOD_MODEL_REFUSED`, even when the router no
 longer recommends the lane. Nothing is gated with a healthy plan window, with no fresh positive
 balance (near cap without credits: unchanged), or on other lanes. Dispatch v2 requires an explicit `--model`. A broken policy file restricts only Codex, to the built-in copy of that allowlist; other
@@ -130,8 +130,8 @@ lanes are unaffected. The reset advice is text only: spending a free full reset 
 decision, and no tool consumes credits or resets.
 Luna handles bounded work under the driver-brief or Sol-envelope contract (§2); hard advice uses Opus 5.5 / Sol 6.2.
 
-The operator records a shared assertion at `batch_state/routing_budget/operator_reset_reserve.json`
-in the primary checkout. Its exact JSON fields are `schema_version` (`operator-reset-reserve.v1`),
+The operator records a shared assertion at
+`$LU_STATE_ROOT/batch_state/routing_budget/operator_reset_reserve.json` (the shared state root). Its exact JSON fields are `schema_version` (`operator-reset-reserve.v1`),
 `provider` (`codex`), positive integer `remaining_resets`, and UTC ISO-8601 `confirmed_at` /
 `expires_at`. Expiry must be after confirmation and at most 24 hours later. Dispatch worktrees
 read the same assertion; missing, malformed, expired, or unverified input leaves the reserve
@@ -151,7 +151,6 @@ Source: [cursor.com/docs/models-and-pricing](https://cursor.com/docs/models-and-
 | Claude Sonnet 5.5 | $2 | $2.50 | $0.20 | $10 | `claude-sonnet-5-5-high` — not a review route (D-129) |
 | Claude Opus 5.5 | — | — | — | — | `claude-opus-5-5-high` — not a review route (D-129) |
 | Claude Fable 5.1 | $10 | $12.50 | $0.25 | $50 | native Claude CLI only; unavailable through Cursor; not a review route (D-129) |
-| Gemini 3.8 Flash | $0.75 | — | $0.075 | $3.50 | pass only if `cursor-agent --list-models` shows it |
 
 Cursor's catalog has no GPT-6 slug; GPT-6.2 Sol and GPT-6 Luna run on the native Codex CLI.
 Claude Opus 5.5 hard coding uses the native Claude CLI; the model catalog carries no Opus
@@ -180,15 +179,15 @@ Other bounded work retains the existing envelope flow:
 
 ```text
 0) Driver fixes the worker dispatch arguments and prints their binding digest:
-   dispatch.py dispatch <worker args> --print-advisory-binding
+   "$LU_PYTHON" -I -m lu_machinery.dispatch dispatch <worker args> --print-advisory-binding
 1) ADVISOR envelope from the catalog advisor route (the Sol advisor (`gpt-6.2-sol` @ high)):
-   dispatch.py dispatch --agent codex --model gpt-6.2-sol --mode read-only \
+   "$LU_PYTHON" -I -m lu_machinery.dispatch dispatch --agent codex --model gpt-6.2-sol --mode read-only \
      --prompt-file <advisor-brief>
    Put the worker binding digest and envelope request in the advisor brief.
    → task_contract, owned_paths, max_changed_files, max_non_test_loc, constraints,
      risk_boundaries, acceptance_evidence, escalation_triggers
 2) BOUNDED worker executes ONLY that envelope:
-   dispatch.py dispatch <worker args> --advisory-task <advisor task id>
+   "$LU_PYTHON" -I -m lu_machinery.dispatch dispatch <worker args> --advisory-task <advisor task id>
 3) Driver integrates; formal CF = independent cross-family (discussion ≠ CF)
 ```
 
@@ -214,9 +213,9 @@ the routing card records why heap was refused.
 
 ## 3. Mandatory pre-dispatch routing card
 
-Before **every** `dispatch.py dispatch` and before every cross-family review
+Before **every** `"$LU_PYTHON" -I -m lu_machinery.dispatch dispatch` and before every cross-family review
 request that spends a scarce seat, the live driver MUST record (handoff, issue
-comment, or `batch_state/` receipt — not only inner monologue):
+comment, or `$LU_STATE_ROOT/batch_state/` receipt — not only inner monologue):
 
 ```text
 ROUTING_CARD_V1
@@ -251,7 +250,7 @@ whichever the breadth script reports):
 | After | Minimum |
 | --- | --- |
 | ≥3 implement dispatches | ≥**2** distinct **agents** AND ≥**2** **tiers** used, **or** a single `NOTE: fleet_breadth` with tool-backed blockers |
-| Handoff / FAIL-HANDOFF | Attach `.venv/bin/python -m lu_machinery.fleet.driver_breadth_report --initiator <prefix> --since-hours 24` output (or equivalent). Missing report = incomplete handoff. |
+| Handoff / FAIL-HANDOFF | Attach `"$LU_PYTHON" -I -m lu_machinery.fleet.driver_breadth_report --initiator <prefix> --since-hours 24` output (or equivalent). Missing report = incomplete handoff. |
 
 Trivial one-shot (typo, single-file comment) is exempt if labeled
 `ROUTING_CARD_V1 tier: heap` with `acceptance_cmd` and **no** multi-file product claim.
@@ -274,9 +273,9 @@ Trivial one-shot (typo, single-file comment) is exempt if labeled
 ## 6. Mechanical report
 
 ```bash
-.venv/bin/python -m lu_machinery.fleet.driver_breadth_report --help
-.venv/bin/python -m lu_machinery.fleet.driver_breadth_report --initiator claude --since-hours 24
-.venv/bin/python -m lu_machinery.fleet.driver_breadth_report --initiator claude --since-hours 24 --enforce
+"$LU_PYTHON" -I -m lu_machinery.fleet.driver_breadth_report --help
+"$LU_PYTHON" -I -m lu_machinery.fleet.driver_breadth_report --initiator claude --since-hours 24
+"$LU_PYTHON" -I -m lu_machinery.fleet.driver_breadth_report --initiator claude --since-hours 24 --enforce
 ```
 
 `--enforce` exits **2** when the breadth floor fails without a recorded NOTE file

@@ -8,6 +8,7 @@
 schema: rules-core-manifest.v2
 files:
   core: agents_extensions/shared/rules/core.md
+  # The addendum is a product rule, read below the product checkout ($LU_PRODUCT_ROOT).
   content_addendum: agents_extensions/shared/rules/core-curriculum.md
 core:
   # p0-tool

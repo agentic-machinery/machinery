@@ -2,7 +2,7 @@
 
 Every seat loads [`core.md`](core.md), the short binding rule set, through
 `/api/rules?scope=core&format=markdown` or the same offline loader. Curriculum
-seats use `scope=content`, which adds `core-curriculum.md`. The unscoped API
+seats use `scope=content`, which adds the product's `core-curriculum.md` (`$LU_PRODUCT_ROOT`). The unscoped API
 also serves the binding core (at most 40,000 UTF-8 bytes); other rules load
 through the task scopes below. `scope=full` retains the complete reference
 for explicit policy audits.
@@ -20,8 +20,8 @@ retain relevant context across phases and reload when its contents change.
 | --- | --- |
 | Any repository change, including documentation | `agents_extensions/shared/rules/critical-rules.md`; `agents_extensions/shared/rules/dispatch-must-use-worktree.md`; `agents_extensions/shared/rules/workflow.md` sections on task workflow and merge policy; `agents_extensions/shared/rules/design-charter.md` |
 | CLI implementation or interface change | `agents_extensions/shared/rules/cli-help-standard.md` |
-| Curriculum planning, build, repair, or semantic review | `agents_extensions/shared/rules/non-negotiable-rules.md`; select the relevant curriculum skill below |
-| Core fresh lesson-based build (epic #7994 / #8397: arcs, plans, evidence packs, engine, lesson reviews) | `docs/epics/fresh-build-build-program.md`; then `fresh-build-requirements.md`, `fresh-build-plan-schema.md`, `fresh-build-writer-contract.md`, `fresh-build-review-contracts.md` as the phase needs |
+| Curriculum planning, build, repair, or semantic review | `$LU_PRODUCT_ROOT/agents_extensions/shared/rules/non-negotiable-rules.md`; select the relevant curriculum skill below |
+| Core fresh lesson-based build (epic #7994 / #8397: arcs, plans, evidence packs, engine, lesson reviews) | `$LU_PRODUCT_ROOT/docs/epics/fresh-build-build-program.md`; then `fresh-build-requirements.md`, `fresh-build-plan-schema.md`, `fresh-build-writer-contract.md`, `fresh-build-review-contracts.md` as the phase needs |
 | Assigning workers or choosing model/provider routes | `agents_extensions/shared/rules/model-assignment.md`; `agents_extensions/shared/rules/workflow.md` research-registry and pre-dispatch sections; use live catalog and quota evidence |
 | Explicitly assigned epic/track driver | `agents_extensions/shared/rules/fleet-comms-coordination.md`; `agents_extensions/shared/rules/fleet-driver-routing.md`; `agents_extensions/shared/rules/fleet-shared-doctrine.md`; `agents_extensions/shared/rules/fleet-role-scorecard.md`; `drive-epic` skill |
 | Fleet Comms action outside an assigned driver role | `agents_extensions/shared/rules/fleet-comms-coordination.md`; preserve existing ownership and use only the requested action |

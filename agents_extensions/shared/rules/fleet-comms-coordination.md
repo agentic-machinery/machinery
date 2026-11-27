@@ -22,7 +22,7 @@ that skill). Do not reintroduce claims Sol rejected (see §Plane modes).
 | **Seat onboarding contract** | Task-oriented ownership matrix (discuss / delegate / fleet-comms / ACPX / Buzz deferred), retired-seat refusal, smoke | `docs/runbooks/agent-seat-onboarding.md` |
 | **`drive-epic` skill** | Method playbook (orient → topology → route → dispatch → settle → CF → merge → handoff) | `agents_extensions/shared/skills/drive-epic/SKILL.md` |
 | **Epic roster runbook** | Operator seat routing (which model drives which epic) | `docs/runbooks/epic-orchestrator-roster.md` |
-| **Live routing data** | Caps, ladders, reviewer seats, **live plane mode** | `/api/rules?scope=task:routing` (or `scope=full`) model-assignment + `lu_machinery/config/model_catalog.yaml` + `lu_machinery/config/fleet_communications.yaml` + `.venv/bin/python -I -m lu_machinery.fleet_comms plane-status` |
+| **Live routing data** | Caps, ladders, reviewer seats, **live plane mode** | `/api/rules?scope=task:routing` (or `scope=full`) model-assignment + `lu_machinery/config/model_catalog.yaml` + `lu_machinery/config/fleet_communications.yaml` + `"$LU_PYTHON" -I -m lu_machinery.fleet_comms plane-status` |
 | **Launchers** | Lease claim + dual-aware pointer (not a second design) | interactive `start-*.sh`, provider `start-*-driver.sh` |
 
 **Golden rule (from drive-epic):** rules + skill teach **method**; roster/caps/modes are
@@ -40,7 +40,7 @@ at the **onboarding contract** for ownership and experimental ACPX scope; this r
 | Caveman | Optional output-style compression (lite default); never persisted GitHub/curriculum text |
 
 - ACP / ACPX are **toolless**. Use them only for inter-agent communication (state transfer). Do **not** use `ask-*` ACP/ACPX for plan, create, review, or design tasks.
-- For plan, create, review, and design, use **toolful** native or `dispatch.py` seats (claude/codex/glm/opencode; Grok 4.7 codes and reviews code/infra through Cursor at `grok-4.7-high` (C-5307) and is not a plan, design, or advisory seat; review of Grok-authored work stays on the resolver's non-xAI pick; agy only for bounded task-level work, never plan or design, operator decision 2026-10-03, #9584; Kimi is retired (OO-58, #11327) and is not a seat).
+- For plan, create, review, and design, use **toolful** native or `dispatch.py` seats (claude/codex/opencode; Grok 4.7 codes and reviews code/infra through Cursor at `grok-4.7-high` (C-5307) and is not a plan, design, or advisory seat; review of Grok-authored work stays on the resolver's non-xAI pick; agy only for bounded task-level work, never plan or design, operator decision 2026-10-03, #9584; Kimi is retired (OO-58, #11327) and is not a seat).
 - Explicit: `ask-* --type review` over ACP is **not** the review-of-record path when the reviewer needs to read the tree. Review of record = the `review-loop` skill (qualified toolful exact-head approval, bound with `record_cf_verdict.py`, then same-head CI).
 - Caveman is **style**, not transport. Default intensity: **lite** (drop filler/hedging, keep articles and full sentences). Never use it as a substitute for fleet-comms durable state, and never caveman persisted artifacts (commits, PR/issue bodies, curriculum, runbooks, review-of-record text posted on GitHub).
 
@@ -62,7 +62,7 @@ The live driver claims, reads, and applies its own ordinary deliveries, then
 acknowledges each delivery with its returned fence token:
 
 ```bash
-.venv/bin/python -I -m lu_machinery.fleet_comms deliveries ack "<delivery-id>" \
+"$LU_PYTHON" -I -m lu_machinery.fleet_comms deliveries ack "<delivery-id>" \
   --worker-id "<launcher-worker-id>" --fence-token "<returned-fence-token>"
 ```
 
@@ -72,7 +72,7 @@ Use the launcher-provided worker identity throughout the
 ## Plane modes
 
 ```bash
-.venv/bin/python -I -m lu_machinery.fleet_comms plane-status
+"$LU_PYTHON" -I -m lu_machinery.fleet_comms plane-status
 ```
 
 Implemented modes are `off` | `shadow` | `dual_write` | `authority`. Production
@@ -99,13 +99,13 @@ cold-prompts; silent plane flips; “for now” cutovers.
 
 ```bash
 # Topology / health / parity
-.venv/bin/python -I -m lu_machinery.fleet_comms plane-status
-.venv/bin/python -I -m lu_machinery.fleet_comms metrics
-.venv/bin/python -I -m lu_machinery.fleet_comms backlog
-.venv/bin/python -I -m lu_machinery.fleet_comms dead-letters
+"$LU_PYTHON" -I -m lu_machinery.fleet_comms plane-status
+"$LU_PYTHON" -I -m lu_machinery.fleet_comms metrics
+"$LU_PYTHON" -I -m lu_machinery.fleet_comms backlog
+"$LU_PYTHON" -I -m lu_machinery.fleet_comms dead-letters
 
 # Continuity (lease already claimed by launcher — do not re-open)
-.venv/bin/python -m lu_machinery.session_streams tail --stream epic:<N> --limit 20
+"$LU_PYTHON" -I -m lu_machinery.session_streams tail --stream epic:<N> --limit 20
 
 # Cross-family PR review and landing: the review-loop and full-send / full-stop skills.
 # SHIELDED formal path (review-pr / lu-review snaps / shielded-reviews) is RETIRED —
@@ -127,8 +127,8 @@ Inspect the chronological event and selection trace before attributing
 concentration to an orchestrator or scheduler. A “No ledger update” cue is
 stale activity evidence, not provider-liveness proof and not authority to
 reclaim a lease early. Corroborate headroom with
-`.venv/bin/python -m lu_machinery.fleet.capacity_pick` and
-`.venv/bin/python -m lu_machinery.fleet.usage show` (2026-10-16) and durable authority
+`"$LU_PYTHON" -I -m lu_machinery.fleet.capacity_pick` and
+`"$LU_PYTHON" -I -m lu_machinery.fleet.usage show` (2026-10-16) and durable authority
 job/reservation state. The dashboard is read-only: its filters, search,
 details, and load-more controls never select, retry, cancel, reclaim, or reroute
 work.
@@ -143,7 +143,7 @@ Every epic driver session (any harness) MUST:
 
 1. Obey this rule (via `/api/rules?scope=task:fleet-comms`, `scope=task:driver`,
    `scope=full`, or offline fallback of this file).
-2. Run `.venv/bin/python -I -m lu_machinery.fleet_comms plane-status` before assuming message-plane availability.
+2. Run `"$LU_PYTHON" -I -m lu_machinery.fleet_comms plane-status` before assuming message-plane availability.
 3. Use fleet-comms for durable coordination, queues, messages, conversations, artifacts,
    retries, dead letters, receipts, formal jobs, and session continuity. In authority
    mode, never create a new legacy bridge/channel/broker/file coordination write.
@@ -156,8 +156,8 @@ Every epic driver session (any harness) MUST:
 5. Treat launcher-claimed stream leases as held — do not open/resume the lease yourself.
 6. **Session health by seat:**
    - **gemini / codex:** canary mint/score with the seat lane
-     (`.venv/bin/python -m lu_machinery.session_canary.gemini_lane …` or
-     `.venv/bin/python -m lu_machinery.session_canary.codex_lane …`); end on
+     (`"$LU_PYTHON" -I -m lu_machinery.session_canary.gemini_lane …` or
+     `"$LU_PYTHON" -I -m lu_machinery.session_canary.codex_lane …`); end on
      FAIL-HANDOFF (&lt;8/10), not compact count.
    - **Claude / Sonnet:** SessionStart / PostCompact + thread-handoff — **no** canary lane
      (do not invent `<model>_lane`).
@@ -173,8 +173,8 @@ Every epic driver session (any harness) MUST:
 
 ## Operator launch surface (#5632)
 
-- Driver entrypoints: `./start-claude-driver.sh --epic <epic> [--model claude-sonnet-5-5]`,
-  and `./start-codex-driver.sh --epic <epic>`. Interactive launchers reject `--epic`.
+- Driver entrypoints (product checkout launchers): `"$LU_PRODUCT_ROOT/start-claude-driver.sh" --epic <epic> [--model claude-sonnet-5-5]`,
+  and `"$LU_PRODUCT_ROOT/start-codex-driver.sh" --epic <epic>`; the CTO seat starts with `lu-start-cto`. Interactive launchers reject `--epic`.
 - Gemini/AGY (Flash) is not an epic-driver seat (operator decision 2026-10-03, #9584).
 - Seat routing reminder: `docs/runbooks/epic-orchestrator-roster.md` (Sonnet 5.5→well-scoped routine work, Opus→hard Claude-lane work — it
   spends the cross-family review-of-record seat). **Live policy** is still
@@ -193,7 +193,7 @@ Supported fleet seats cold-start through:
 
 1. This rule (binding fleet-comms musts).
 2. **`docs/runbooks/agent-seat-onboarding.md`** — ownership matrix for `discuss`,
-   `dispatch.py dispatch`, Fleet Comms authority + read-only legacy projections,
+   `"$LU_PYTHON" -I -m lu_machinery.dispatch dispatch`, Fleet Comms authority + read-only legacy projections,
    experimental ACPX (default-off/shadow, one read-only/stateless Codex
    participant), and **Buzz deferred**. Kimi routes are retired (OO-58,
    #11327): do not select a Kimi model or KimiCC. Also covers rollback and
@@ -225,10 +225,10 @@ Never auto-reset branches for review thrash. Do not reintroduce sealed formal CF
 For normal **read-only inter-agent communication**, ACP is the only provider
 transport. Fleet launchers make ordinary (non-review) `ask-*` and `discuss`
 calls that name **2 to 4 distinct enabled seats** use the durable ACP controller:
-Codex, Claude, Cursor, Pool, AGY, GLM, and DeepSeek. Kimi seats are never participants (retired, OO-58, #11327; the runtime refuses them). Grok 4.7 codes and reviews through Cursor at `grok-4.7-high` (C-5307); it is not a driver.
+Codex, Claude, Cursor, AGY, and DeepSeek (GLM and Pool are retired, 2026-10-23). Kimi seats are never participants (retired, OO-58, #11327; the runtime refuses them). Grok 4.7 codes and reviews through Cursor at `grok-4.7-high` (C-5307); it is not a driver.
 Any other participant count is rejected before a conversation begins. Operators
 can inspect the direct command with
-`.venv/bin/python -I -m lu_machinery.fleet_comms acp-discuss --help`.
+`"$LU_PYTHON" -I -m lu_machinery.fleet_comms acp-discuss --help`.
 Selection starts no process at cold start and does not change `dispatch.py`.
 The default is two rounds and the hard maximum is three.
 

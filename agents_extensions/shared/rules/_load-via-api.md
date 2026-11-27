@@ -38,6 +38,11 @@ read this full fallback list — same paths, same order as
     agents_extensions/shared/rules/fleet-shared-doctrine.md
     agents_extensions/shared/rules/fleet-role-scorecard.md
 
+These are logical paths, here and below: fleet rules resolve inside the installed machinery
+release, and product rules (`rules_core._PRODUCT_RULES`, such as `non-negotiable-rules.md` and
+`core-curriculum.md`, and any path outside `agents_extensions/shared`) resolve under the product
+checkout, `$LU_PRODUCT_ROOT`.
+
 Scoped selections — `GET /api/rules?scope=<scope>&format=markdown`, each with
 its own hash. Offline, `lu_machinery/lib/rules_core.py` reads the same files in the
 same order. Launchers and ACP asks inject the core; dispatch v2 requires it
