@@ -20,6 +20,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from lu_machinery import state_paths
 from lu_machinery.common import json_depth
 from lu_machinery.common.repo_root import state_root
 
@@ -81,7 +82,7 @@ def safe_path_component(value: str) -> str:
 
 
 def ledger_dir(repo_root: Path) -> Path:
-    return repo_root / "batch_state" / "agent-ledger"
+    return state_paths.agent_ledger_dir(repo_root)
 
 
 def tasks_dir(repo_root: Path) -> Path:

@@ -16,6 +16,7 @@ from pathlib import Path
 
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from lu_machinery import state_paths
 from lu_machinery.common import json_depth
 from lu_machinery.common.nofollow_walk import ComponentOpenError, open_directory_component
 from lu_machinery.common.repo_root import primary_root
@@ -96,7 +97,11 @@ def manifest_release_proven(task: dict, pin: dict, record: dict, batch: Path, ch
         return False
     if pin.get("task_id") != task["task_id"] or pin.get("run_nonce") != nonce:
         return False
-    if record.get("schema") != ignored_task_output.PRESERVED_ARTIFACTS_SCHEMA or record.get("location") != f"batch_state/preserved/{task['task_id']}/{child}":
+    try:
+        expected_location = state_paths.preserved_rel(task["task_id"], child).as_posix()
+    except (ValueError, TypeError):
+        return False
+    if record.get("schema") != ignored_task_output.PRESERVED_ARTIFACTS_SCHEMA or record.get("location") != expected_location:
         return False
     if release.get("owner") != task["task_id"] or release.get("run_nonce") != nonce or release.get("retrieval_proof_sha256") != digest:
         return False

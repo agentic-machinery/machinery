@@ -15,6 +15,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from lu_machinery import state_paths
 from lu_machinery.common import github_client, json_depth
 from lu_machinery.common.repo_root import product_root, state_root
 from lu_machinery.review.verdict_parser import ACCEPTED_VERDICT_TOKENS, recognized_verdicts, unsupported_verdict_tokens
@@ -54,7 +55,7 @@ def _is_pr_number(target: str) -> bool:
 
 
 def _task_state_path(task_id: str) -> Path:
-    tasks_dir = state_root() / "batch_state" / "tasks"
+    tasks_dir = state_paths.tasks_dir(state_root())
     tasks_dir.mkdir(parents=True, exist_ok=True)
     safe = task_id.replace("/", "_").replace("\\", "_")
     return tasks_dir / f"{safe}.json"

@@ -21,6 +21,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+from lu_machinery import state_paths
 from lu_machinery.common import json_depth
 from lu_machinery.common.repo_root import state_root
 from lu_machinery.common.task_scratch import mount_points
@@ -55,7 +56,7 @@ class RetentionListError(ValueError):
 
 def default_batch_root() -> Path:
     """The primary checkout's shared batch_state directory."""
-    return state_root() / "batch_state"
+    return state_paths.batch_state_dir(state_root())
 
 
 def load_holds(path: Path) -> list[dict[str, Any]]:
@@ -111,7 +112,7 @@ def scratch_expiry(
             return None, "expiry_held"
         tracked = subprocess.run(
             ["git", "-C", str(origin.parent.parent), "ls-files", "-z", "--",
-             f":(literal)batch_state/{origin.name}"], capture_output=True, check=True, timeout=15,
+             f":(literal){state_paths.batch_state_rel(origin.name).as_posix()}"], capture_output=True, check=True, timeout=15,
         )
         if tracked.stdout:
             return None, "expiry_tracked"
@@ -204,7 +205,20 @@ def report(
         if path.name in EXCLUDED:
             counts["excluded"] += 1
             continue
-        row: dict[str, Any] = {"path": f"batch_state/{path.name}/"}
+        try:
+            rel_path = state_paths.batch_state_rel(path.name).as_posix()
+        except ValueError:
+            counts["unknown"] += 1
+            rows.append(
+                {
+                    "path": path.name,
+                    "status": "unknown",
+                    "reason": "invalid_name",
+                    "newest_write_utc": None,
+                }
+            )
+            continue
+        row: dict[str, Any] = {"path": f"{rel_path}/"}
         held = [hold for hold in holds if hold["parts"][0] == path.name]
         allocated, newest, reason = tree_activity(path, cutoff)
         if held:

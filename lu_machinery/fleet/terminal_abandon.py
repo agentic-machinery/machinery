@@ -18,6 +18,7 @@ from typing import Any
 _IMPORT_ROOT = str(Path(__file__).resolve().parents[2])
 if _IMPORT_ROOT not in sys.path:
     sys.path.insert(0, _IMPORT_ROOT)
+from lu_machinery import state_paths
 from lu_machinery.agent_runtime.attribution import resolve_invocation_attribution
 from lu_machinery.common import json_depth, task_store_paths
 from lu_machinery.common.repo_root import state_root
@@ -49,7 +50,7 @@ RECOVERY = (
 
 
 def _regular_bytes(path: Path, primary: Path) -> bytes:
-    leaf = artifacts._read_preserved_bytes(path, root=primary / "batch_state")
+    leaf = artifacts._read_preserved_bytes(path, root=state_paths.batch_state_dir(primary))
     if leaf.file_type != "regular":
         raise Refusal("INVALID_INPUT", "input must be a regular file below batch_state, without symlink ancestors")
     return leaf.payload
@@ -269,7 +270,7 @@ def record_abandon(
     caller = resolve_invocation_attribution()
     primary = state_root().resolve(strict=True)
     tasks = task_store_paths.tasks_dir()
-    if tasks.absolute() != primary / "batch_state/tasks" or tasks.resolve(strict=True) != tasks.absolute():
+    if tasks.absolute() != state_paths.tasks_dir(primary) or tasks.resolve(strict=True) != tasks.absolute():
         raise Refusal("INVALID_INPUT", "task store must be the canonical control-plane store without symlinks")
     path = locate_task_record(tasks, task_id)
     recovery_reason = f"manual item {task_id}: {RECOVERY}" if recover_creator else RECOVERY

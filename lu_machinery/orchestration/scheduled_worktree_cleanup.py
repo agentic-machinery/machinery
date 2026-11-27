@@ -41,6 +41,7 @@ from typing import Any
 _IMPORT_ROOT = str(Path(__file__).resolve().parents[2])
 if _IMPORT_ROOT not in sys.path:
     sys.path.insert(0, _IMPORT_ROOT)
+from lu_machinery import state_paths
 from lu_machinery.common import github_client, json_depth
 from lu_machinery.common.repo_root import MachineryConfigError, main_checkout_root, product_root, repos_root, state_root
 from lu_machinery.common.task_scratch import recover_orphans as recover_task_scratch
@@ -571,7 +572,7 @@ def report_terminal_worktrees(repo_root: Path) -> dict[str, Any]:
     """Inventory old terminal work without preserving or changing the worktrees."""
     rows: list[dict[str, Any]] = []
     root = repo_root.resolve()
-    tasks_dir = worktree_git.control_plane_root(root) / "batch_state" / "tasks"
+    tasks_dir = state_paths.tasks_dir(worktree_git.control_plane_root(root))
     now = datetime.now(UTC)
     with task_archive_lock(tasks_dir):
         for path in iter_task_records(tasks_dir, include_archive=True):
@@ -1806,7 +1807,7 @@ def batch_state_retention_reports(repo_roots: list[Path], *, apply: bool) -> lis
 
     reports: list[dict[str, Any]] = []
     for repo_root in repo_roots:
-        batch_state = Path(repo_root) / "batch_state"
+        batch_state = state_paths.batch_state_dir(Path(repo_root))
         try:
             info = batch_state.lstat()
         except OSError:

@@ -550,9 +550,10 @@ def _override_admitted(
     import io
 
     try:
+        from lu_machinery import state_paths
         from lu_machinery.common.repo_root import state_root
 
-        target = log_path or state_root() / "batch_state/opsec/overrides.jsonl"
+        target = log_path or state_paths.opsec_overrides_path(state_root())
         with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
             admitted = authority.authorize(destination, list(blocks), reason, target)
     except authority.OverrideBlocked as exc:

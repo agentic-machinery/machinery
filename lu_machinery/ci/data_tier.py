@@ -30,6 +30,7 @@ from collections import Counter
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, cast, get_args
 
+from lu_machinery import state_paths
 from lu_machinery.ci._location import module_name
 from lu_machinery.common import github_client, json_depth, test_slots
 from lu_machinery.common.repo_root import (
@@ -836,7 +837,7 @@ def run(args: argparse.Namespace) -> int:
         if args.only and not args.no_report:
             raise DataTierError("a subset requires --no-report")
         primary = primary_checkout()
-        output_dir = state_root() / "batch_state" / "data-tier"
+        output_dir = state_paths.data_tier_dir(state_root())
         output_dir.mkdir(parents=True, exist_ok=True)
         junit = output_dir / f"{run_key}.junit.xml"
         collected = output_dir / f"{run_key}.collected.json"

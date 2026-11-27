@@ -30,6 +30,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, cast
 
+from lu_machinery import state_paths
 from lu_machinery.common import github_client, json_depth
 from lu_machinery.common.repo_root import MACHINERY_ENV_VARS, STATE_ROOT_ENV
 
@@ -152,7 +153,7 @@ def _root() -> Path:
 
 
 def receipt_root(root: Path | None = None) -> Path:
-    return (root or _root()) / "batch_state" / RECEIPT_DIR
+    return state_paths.contract_canary_dir(RECEIPT_DIR, root=root or _root())
 
 
 def _receipt_path(head: str, route: str, root: Path | None = None) -> Path:
@@ -503,7 +504,7 @@ def run(args: argparse.Namespace) -> int:
         LEARN_UKRAINIAN_PRIMARY_REPO_ROOT=primary,
         LU_PRODUCT_ROOT=str(product_root()),
         LU_STATE_ROOT=str(state),
-        LU_TASKS_DIR=str(state / "batch_state" / "tasks"),
+        LU_TASKS_DIR=str(state_paths.tasks_dir(state)),
     )
     head = args.head
     if args.pr is not None:

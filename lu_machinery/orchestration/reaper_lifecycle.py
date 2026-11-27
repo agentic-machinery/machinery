@@ -16,10 +16,10 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from lu_machinery import state_paths
 from lu_machinery.orchestration.execution_safe_git import primary_repository
 from lu_machinery.orchestration.execution_safe_git import run_git as safe_git
 
-_STATE_RELATIVE = Path("batch_state") / "worktree-reaper"
 _JOURNAL_NAME = "journal.jsonl"
 DEFAULT_GIT_TIMEOUT_SECONDS = 30.0
 
@@ -29,7 +29,7 @@ def utc_now() -> datetime:
 
 
 def _state_dir(repo_root: Path) -> Path:
-    return repo_root / _STATE_RELATIVE
+    return state_paths.worktree_reaper_dir()
 
 
 def journal_path(repo_root: Path) -> Path:

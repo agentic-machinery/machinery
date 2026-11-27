@@ -2130,9 +2130,10 @@ def observe_pressure(
                 "psi": admission_shadow.transition(pressure, {}, time.time()),
                 "persistence": persistence,
             }
+        from lu_machinery import state_paths
         from lu_machinery.common.repo_root import state_root
 
-        root = Path(directory) if directory else state_root() / "batch_state" / "admission-shadow"
+        root = Path(directory) if directory else state_paths.admission_shadow_dir(state_root())
         return admission_shadow.observe(root, pressure, context)
     except Exception as exc:  # optional diagnostics must never abort admission
         return {

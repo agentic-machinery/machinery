@@ -13,6 +13,7 @@ from dataclasses import replace
 from datetime import UTC, date, datetime
 from pathlib import Path
 
+from lu_machinery import state_paths
 from lu_machinery.ci import check_issue_task_quality as checker
 from lu_machinery.common import github_client, json_depth
 from lu_machinery.common.repo_root import product_root, state_root
@@ -237,7 +238,7 @@ def build_report() -> dict:
 
 def persisted_payload(day: str, *, root: Path | None = None, build=build_report) -> bytes:
     """Persist a daily payload in shared state; root is only an in-tree start hint."""
-    directory = state_root(root) / "batch_state/reports"
+    directory = state_paths.reports_dir(state_root(root))
     directory.mkdir(parents=True, exist_ok=True)
     path = directory / f"issue-quality-report-{day}.json"
     if not path.exists():

@@ -48,6 +48,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import quote, quote_plus, urlencode, urlsplit
 
+from lu_machinery import state_paths
 from lu_machinery.common import github_usage, json_depth
 from lu_machinery.common.repo_root import configured_host_state_root, machinery_path, state_root
 
@@ -1054,7 +1055,7 @@ def _cache_directory():
         return path
     try:
         root = state_root()
-        candidate = root / "batch_state" / "github-client"
+        candidate = state_paths.github_client_dir(root)
         if candidate.exists():
             if not os.access(candidate, os.W_OK):
                 return None

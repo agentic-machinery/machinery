@@ -18,6 +18,7 @@ from typing import Any
 
 if __package__ in (None, ""):  # run as a file: put the repository root on sys.path
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from lu_machinery import state_paths
 from lu_machinery.common import json_depth
 from lu_machinery.common.repo_root import MachineryConfigError, state_root
 from lu_machinery.fleet import idle_settle as idle_settle
@@ -238,7 +239,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     try:
-        tasks_dir = args.tasks_dir if args.tasks_dir is not None else state_root() / "batch_state" / "tasks"
+        tasks_dir = args.tasks_dir if args.tasks_dir is not None else state_paths.tasks_dir(state_root())
         idle_path = args.idle_store if args.idle_store is not None else idle_settle.default_store_path()
     except MachineryConfigError as exc:
         parser.error(str(exc))

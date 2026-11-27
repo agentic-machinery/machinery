@@ -10,6 +10,7 @@ from collections import OrderedDict, deque
 from pathlib import Path
 from typing import Any
 
+from lu_machinery import state_paths
 from lu_machinery.common.repo_root import MachineryConfigError, configured_host_state_root, state_root
 
 # Keep one version per path, including foreign-file classifications. Entry and
@@ -124,9 +125,9 @@ def tasks_dir() -> Path:
     if override:
         host_state = configured_host_state_root()
         if host_state is not None:
-            return host_state / "batch_state" / "tasks"
+            return state_paths.tasks_dir(host_state)
         return Path(override)
-    return state_root() / "batch_state" / "tasks"
+    return state_paths.tasks_dir(state_root())
 
 
 _MAX_SYMLINK_HOPS = 40

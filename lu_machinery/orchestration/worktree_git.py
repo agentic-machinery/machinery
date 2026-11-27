@@ -20,6 +20,7 @@ from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, urlsplit
 
+from lu_machinery import state_paths
 from lu_machinery.common import github_client, json_depth
 from lu_machinery.control_plane.storage import StoreId
 from lu_machinery.control_plane.storage import connect as cp_connect
@@ -773,7 +774,7 @@ def _has_active_rollover_lease(repo_root: Path, info: WorktreeInfo) -> str | Non
     worktree_path = os.path.realpath(info.path)
     for candidate_dir in (
         primary / ".agent" / "thread-rollovers",
-        primary / "batch_state" / "thread-rollovers",
+        state_paths.thread_rollovers_dir(primary),
     ):
         if not candidate_dir.is_dir():
             continue
@@ -828,7 +829,7 @@ def _has_active_ownership_claim(repo_root: Path, task_id: str | None) -> str | N
 def _task_record(repo_root: Path, task_id: str | None) -> dict[str, Any] | None:
     if not task_id:
         return None
-    task_file = control_plane_root(repo_root) / "batch_state" / "tasks" / f"{task_id}.json"
+    task_file = state_paths.tasks_dir(control_plane_root(repo_root)) / f"{task_id}.json"
     try:
         payload = json_depth.loads(task_file.read_text(encoding="utf-8"), max_depth=512)
     except (OSError, json.JSONDecodeError):
@@ -858,7 +859,7 @@ def _activity_reason(
         return f"{worktree_claims.LOCK_UNAVAILABLE} ({exc})"
     review_claim = worktree_claims.active_worktree_claim_refusal(
         info.path,
-        tasks_dir=control_root / "batch_state" / "tasks",
+        tasks_dir=state_paths.tasks_dir(control_root),
         repo_root=primary,
         review_inputs_only=True,
     )
@@ -990,7 +991,7 @@ def _resolve_activity_probe(
     task_id = _dispatch_task_id(repo_root, info)
     if task_id and (Path(task_id).name != task_id or task_id in {".", ".."}):
         return None, f"{probe.reason}; local_task_unattributed"
-    task_file = control_plane_root(repo_root) / "batch_state" / "tasks" / f"{task_id}.json" if task_id else None
+    task_file = state_paths.tasks_dir(control_plane_root(repo_root)) / f"{task_id}.json" if task_id else None
     try:
         try:
             raw_payload = task_file.read_text(encoding="utf-8") if task_file else None
