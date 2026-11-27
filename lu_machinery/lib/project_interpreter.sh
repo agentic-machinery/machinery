@@ -122,6 +122,19 @@ project_python_run() {
     "${PROJECT_PYTHON_COMMAND[@]}" "$@"
 }
 
+# The deployer or launcher supplies LU_PYTHON. The host binding, never the
+# invocation checkout, determines whether that interpreter may run the entry.
+project_host_context() {
+    local python="${LU_PYTHON:-}" assignments
+    if [[ "$python" != /* || ! -f "$python" || ! -x "$python" ]]; then
+        printf '%s\n' 'HOOK-BOOTSTRAP-FAILED: [missing_interpreter_binding] LU_PYTHON must name an absolute executable.' >&2
+        return 2
+    fi
+    assignments="$("$python" -I -B -m lu_machinery.host_context shell "$@")" || return 2
+    # Values are quoted by the isolated runtime after validation.
+    eval "$assignments"
+}
+
 # The block between the two marker lines is also the resolver of every native
 # hook command: agent_runtime/agy_hook_config.native_hook_command embeds it
 # verbatim, so a hook validates its interpreter before any Python starts. It

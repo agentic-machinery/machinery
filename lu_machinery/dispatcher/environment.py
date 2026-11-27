@@ -17,6 +17,7 @@ from lu_machinery.common.repo_root import (
     PROFILE_PATH_ENV,
     REPOS_ROOT_ENV,
     STATE_ROOT_ENV,
+    configured_interpreter,
     project_interpreter,
 )
 from lu_machinery.common.task_store_paths import tasks_dir
@@ -249,7 +250,6 @@ def child_env(spec: TaskSpec) -> dict[str, str]:
         env.update(
             PATH=f"{shims}{os.pathsep}{original_path}" if original_path else str(shims),
             AGENT_ORIGINAL_PATH=original_path,
-            LEARN_UKRAINIAN_PYTHON=str(project_interpreter(env=source)),
         )
     elif any((spec.worktree / name).is_symlink() for name in ("node_modules", "site/node_modules")):
         raise ValueError("npm/npx guard unavailable for shared node_modules links")
@@ -287,13 +287,12 @@ def child_env(spec: TaskSpec) -> dict[str, str]:
         configured = os.environ.get(name, "")
         if configured:
             env[name] = configured
-    # Write providers need these paths for Git hooks. No credential is added.
-    # Read-only AGY, Claude and Muse launchers also need the configured interpreter and product.
-    if spec.mode == "workspace-write" or (spec.mode == "read-only" and spec.agent in {"agy", "claude", "muse"}):
-        for name in (INTERPRETER_ENV, LU_INTERPRETER_ENV, PRODUCT_ROOT_ENV):
-            configured = os.environ.get(name, "")
-            if configured:
-                env[name] = configured
+    # Git hooks and tools use the same interpreter in every provider and mode.
+    interpreter = project_interpreter(env=source) if shims is not None else configured_interpreter(source)
+    if interpreter is not None:
+        env[LU_INTERPRETER_ENV] = env[INTERPRETER_ENV] = str(interpreter)
+    if product := source.get(PRODUCT_ROOT_ENV):
+        env[PRODUCT_ROOT_ENV] = product
     if spec.mode == "read-only" and spec.agent == "agy" and (fleet := os.environ.get("FLEET_COMMS_ROOT", "")):
         # The read-only AGY launcher runs on the host with this environment. It refuses a task artifacts directory
         # that overlaps the dispatcher's Fleet store, as the write boundary does with its --host-env copy. Its

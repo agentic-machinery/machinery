@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import os
 import re
 import shlex
+import sys
 import uuid
 from contextlib import suppress
 from dataclasses import dataclass
+from hashlib import sha256
 from pathlib import Path
 
 from lu_machinery.common import json_depth
@@ -19,6 +22,12 @@ from lu_machinery.common.repo_root import (
     main_checkout_root,
 )
 from lu_machinery.common.safe_open import safe_open_below
+from lu_machinery.host_context import (
+    HostContextError,
+    hook_environment,
+    hook_interpreter,
+    load_hook_context,
+)
 
 GUARD_NAME = "shell-secret-print-guard"
 GUARD_TIMEOUT_FLOOR = 10
@@ -145,6 +154,98 @@ exit 2
 """.replace("@MODES@", "|".join(CLAUDE_GUARD_MODES))
 
 
+_CLAUDE_NATIVE_MODES = (
+    "claude-hook",
+    "claude-stop-hook",
+    "claude-audit-hook",
+    *CLAUDE_GUARD_MODES,
+)
+
+_HOOK_REFUSALS: dict[str, tuple[str, str | bool, str]] = {
+    "claude-stop-hook": ("decision", "block", "reason"),
+    "claude-hook": ("continue", False, "stopReason"),
+}
+
+
+def _hook_refusal(mode: str, diagnostic: str) -> dict[str, str | bool] | None:
+    refusal = _HOOK_REFUSALS.get(mode)
+    if refusal is None:
+        return None
+    key, value, reason = refusal
+    return {key: value, reason: diagnostic}
+
+
+def _refuse_hook(mode: str, code: str, message: str) -> int:
+    diagnostic = f"HOOK-BOOTSTRAP-FAILED: [{code}] {message}"
+    print(diagnostic, file=sys.stderr)
+    answer = _hook_refusal(mode, diagnostic)
+    if answer is None:
+        return 2
+    print(json.dumps(answer))
+    return 0
+
+
+def run_native_hook(mode: str) -> int:
+    """Validate the host binding before starting a registered Claude hook."""
+    if mode not in _CLAUDE_NATIVE_MODES:
+        return _refuse_hook("", "unsupported_hook_mode", "hook mode is not registered")
+    try:
+        context, _ = load_hook_context(Path.cwd())
+    except HostContextError as exc:
+        return _refuse_hook(mode, exc.code, str(exc))
+    except OSError:
+        return _refuse_hook(mode, "invalid_invocation_git", "invocation directory is unavailable")
+
+    env = {**os.environ, **hook_environment(context)}
+    python = os.fspath(context.runtime.python)
+    try:
+        if mode in CLAUDE_GUARD_MODES or mode == "claude-audit-hook":
+            entry = "audit-primary-checkout-dirt" if mode == "claude-audit-hook" else mode.removeprefix("claude-")
+            module = f"agents_extensions.shared.hooks.{entry}"
+            if importlib.util.find_spec(module) is None:
+                return _refuse_hook(mode, "hook_unavailable", "installed hook module is missing")
+            os.execve(python, [python, "-I", "-m", module], env)
+        else:
+            script = machinery_path("agy_hooks/driver_state_inject.sh")
+            if not script.is_file():
+                return _refuse_hook(mode, "hook_unavailable", "installed hook script is missing")
+            os.execve("/bin/bash", ["/bin/bash", os.fspath(script), mode], env)
+    except (ImportError, OSError):
+        return _refuse_hook(mode, "hook_exec_failed", "installed hook could not be started")
+
+
+NATIVE_HOOK_DECLARATION = "lu-machinery-hook-v2"
+# Fingerprints of the published commands let product sources migrate at deploy
+# time without changing AGY and Codex registrations during the rollout.
+_LEGACY_HOOK_MODE = {
+    "9c07093232c7b899a129972fc53f27aecd400e833964e2a23b46bf7e22776d55": "claude-hook",
+    "79defbb55ba4156729e2683a7230fba44e592939e0359479b653a583275fce8a": "claude-stop-hook",
+    "cc04c744b0f94a1798a535eaf4476bbe39fcd61f5686bc366cb9675d7a4e0339": "claude-audit-hook",
+    "a31855c82de580929ba8b9d5941a1aec4068e689d13d4e25097a8a68a4a87e97": "claude-heal-core-bare",
+    "bfa38242e7dd49626bb8722c89b2f3de3a0d5aecef9bde5d186f72f93cf080cd": "claude-guard-branch-switch-in-main",
+    "c517cc9348e7c7b20909113d635489ce1c95077dc398fbafc2918cfab2230e0a": "claude-guard-admin-merge",
+    "755a6838ea933927fe42cc00aeaffc66468b664406ac346ad4d64a089c5bec8b": "claude-guard-pr-merge",
+    "480d96c562fb568238340a849214c757082debbcc267fd96fbbadd6d6e0feda5": "claude-guard-secret-print",
+    "2976e241d25f41d7c89d4cfcd6e5f06e635cc683cc7400c2579ea47f910dbf7f": "claude-guard-primary-checkout-write",
+    "1a71485aefc055285e289067d727605774e02491c8318c2a58f418a44b91601a": "claude-guard-public-github-text",
+}
+
+
+def hook_mode_for_source(command: str) -> str | None:
+    """Identify an exact native hook declaration or a published legacy command."""
+    if command.startswith(NATIVE_HOOK_DECLARATION):
+        for mode in _CLAUDE_NATIVE_MODES:
+            if command == f"{NATIVE_HOOK_DECLARATION} {mode}":
+                return mode
+        raise AgyHookConfigError("unsupported_hook_mode")
+    legacy_mode = _LEGACY_HOOK_MODE.get(sha256(command.encode()).hexdigest())
+    if legacy_mode is not None:
+        return legacy_mode
+    if "lu-machinery-hook-v1" in command:
+        raise AgyHookConfigError("invalid_legacy_hook_command")
+    return None
+
+
 @dataclass(frozen=True)
 class HookConfigResult:
     status: str
@@ -204,7 +305,7 @@ def _hook_resolvers() -> str:
     return "".join(lines[begins[0] + 1 : ends[0]])
 
 
-def native_hook_command(mode: str) -> str:
+def _legacy_hook_command(mode: str) -> str:
     """The one native hook command for ``mode``; every product manifest uses these bytes.
 
     ``/bin/bash -c <body> lu-machinery-hook-v1 <mode>``, serialized with ``shlex.join``.
@@ -223,6 +324,27 @@ def native_hook_command(mode: str) -> str:
         tail = _HOOK_TAIL
     body = "set -u\n" + _hook_resolvers() + tail
     return shlex.join(["/bin/bash", "-c", body, NATIVE_HOOK_NAME, mode])
+
+
+def native_hook_command(mode: str, *, python: Path | None = None) -> str:
+    """Render a native hook with the machinery interpreter selected by deployment."""
+    if mode not in _CLAUDE_NATIVE_MODES:
+        return _legacy_hook_command(mode)
+    if python is None:
+        try:
+            python = hook_interpreter()
+        except HostContextError as exc:
+            raise AgyHookConfigError(exc.code) from None
+    command = "exec " + shlex.join([
+        os.fspath(python), "-I", "-B", "-m", "lu_machinery.agent_runtime.agy_hook_config", "--run-hook", mode,
+    ])
+    # An interpreter that cannot start cannot format the provider's refusal itself.
+    diagnostic = "HOOK-BOOTSTRAP-FAILED: [hook_exec_failed] machinery interpreter could not run the hook"
+    refusal = _hook_refusal(mode, diagnostic)
+    if refusal is not None:
+        report = shlex.join(["printf", "%s\n", json.dumps(refusal)])
+        return f"({command}) || {report}"
+    return f"({command}) || exit 2"
 
 
 def _check_file(path: Path, command: str) -> None:
@@ -440,6 +562,10 @@ def require_hook_config(cwd: Path, home: Path, agy_home: Path | None = None, *, 
 
 
 def main(argv: list[str] | None = None) -> int:
+    if argv is None:
+        argv = sys.argv[1:]
+    if len(argv) == 2 and argv[0] == "--run-hook":
+        return run_native_hook(argv[1])
     # Named canonically, under the unresolved name of the package directory this file is in.
     entry = f"-m {Path(__file__).absolute().parents[1].name}.agent_runtime.agy_hook_config"
     parser = argparse.ArgumentParser(

@@ -52,6 +52,7 @@ def host_layout(tmp_path):
     site = runtime / "lib" / f"python{sys.version_info.major}.{sys.version_info.minor}" / "site-packages"
     source = Path(host_context.__file__).resolve().parent
     (site / "lu_machinery").symlink_to(source, target_is_directory=True)
+    (site / "agents_extensions").symlink_to(source.parent / "agents_extensions", target_is_directory=True)
     (site / "fixture-deps.pth").write_text(sysconfig.get_path("purelib") + "\n", encoding="utf-8")
     metadata = site / f"lu_machinery-{_VERSION}.dist-info"
     metadata.mkdir()

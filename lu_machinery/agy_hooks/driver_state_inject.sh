@@ -32,8 +32,19 @@ bootstrap_failed() {
 code=$(cd "$(dirname "$0")/../.." 2>/dev/null && pwd) || bootstrap_failed root
 # shellcheck disable=SC1091
 source "$code/lu_machinery/lib/project_interpreter.sh" || bootstrap_failed machinery
-project_hook_context_resolve 2>/dev/null || bootstrap_failed
-py="$LEARN_UKRAINIAN_PYTHON"
+case "$mode" in
+  claude-*)
+    if [ "${LU_PYTHON+x}" ]; then
+      project_host_context || bootstrap_failed context
+      py="$LU_PYTHON"
+    else
+      project_hook_context_resolve 2>/dev/null || bootstrap_failed
+      py="$LEARN_UKRAINIAN_PYTHON"
+    fi ;;
+  *)
+    project_hook_context_resolve 2>/dev/null || bootstrap_failed
+    py="$LEARN_UKRAINIAN_PYTHON" ;;
+esac
 # Ordinary sessions have no driver gate and need no temporary files.
 if [ -z "${LU_DRIVER_STATE_FILE:-}" ] || [ -z "${SESSION_HANDOFF_AGENT:-}" ]; then
   cat >/dev/null

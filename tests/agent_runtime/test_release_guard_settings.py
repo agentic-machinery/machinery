@@ -2,18 +2,21 @@
 
 from __future__ import annotations
 
+import copy
 import json
+import os
 import shlex
+import subprocess
 import sys
 from pathlib import Path
+
 import pytest
-from lu_machinery.agent_runtime.adapters import claude
-import copy
-import os
-import subprocess
+
 from lu_machinery.agent_runtime import agy_hook_config as config
-from tests.helpers.product_tree import configured_roots as configured_roots
+from lu_machinery.agent_runtime.adapters import claude
 from tests.agent_runtime.product_roots import agent_runtime_roots as agent_runtime_roots
+from tests.helpers.product_tree import configured_roots as configured_roots
+
 
 def test_product_tree_cannot_supply_fleet_guard_executables(tmp_path, monkeypatch):
     """A consumer without fleet sources still gets the release's mandatory guards."""
@@ -59,14 +62,14 @@ def test_native_guard_commands_run_the_release_guard_and_stale_bytes_refuse(tmp_
         hooks = [{"type": "command", "command": command, "onFailure": "block"} for command in commands]
         settings.write_text(json.dumps({"hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": hooks}]}}))
 
-    write(*map(config.native_hook_command, (*config.CLAUDE_GUARD_MODES, "claude-audit-hook")))
+    write(*(f"{config.NATIVE_HOOK_DECLARATION} {mode}" for mode in (*config.CLAUDE_GUARD_MODES, "claude-audit-hook")))
     hooks = Path(claude.__file__).absolute().parents[3] / "agents_extensions/shared/hooks"
     # The audit is an unpaired observer in worker settings; every guard runs from the release.
     assert json.loads(claude._worker_guard_settings()) == {"hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": [
         {"type": "command", "onFailure": "block",
          "command": shlex.join([sys.executable, "-I", str(hooks / (mode.removeprefix("claude-") + ".py"))])}
         for mode in config.CLAUDE_GUARD_MODES]}]}}
-    write(config.native_hook_command("claude-guard-admin-merge").replace("set -u\n", "set -u \n", 1))
+    write(f"{config.NATIVE_HOOK_DECLARATION}  claude-guard-admin-merge")
     with pytest.raises(RuntimeError, match="unsupported form"):
         claude._worker_guard_settings()
 
@@ -515,8 +518,7 @@ def test_scoped_home_must_be_absolute(tmp_path):
 def test_review_provisioner_writes_absolute_guard_and_keeps_command_denial(tmp_path):
     import os
 
-    from lu_machinery.agent_runtime.review_mcp import _populate_agy_review_home
-    from lu_machinery.agent_runtime.review_mcp import agy_review_settings
+    from lu_machinery.agent_runtime.review_mcp import _populate_agy_review_home, agy_review_settings
 
     home = tmp_path / "attempt-home"
     home.mkdir(mode=0o700)
