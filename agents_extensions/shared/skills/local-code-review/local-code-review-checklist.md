@@ -151,11 +151,11 @@ Pull a fresh routing snapshot, then resolve:
 ```bash
 (
   set -eo pipefail
-  SNAPSHOT_FILE="$(mktemp)"
+  SNAPSHOT_FILE="$(mktemp)" || exit "$?"
   trap 'rm -f -- "$SNAPSHOT_FILE"' EXIT
   curl -s 'http://localhost:8765/api/state/routing-budget?fresh_codexbar=true' \
     | "$LU_PYTHON" -I -c 'import json,sys; d=json.load(sys.stdin); print(json.dumps(d.get("lane_health", d)))' \
-    > "$SNAPSHOT_FILE"
+    > "$SNAPSHOT_FILE" || exit "$?"
 
   "$LU_PYTHON" -I -m lu_machinery.review.closeout_cli --state-file "$STATE_FILE" resolve-reviewer \
     --author-model "<the author's actual model/seat, e.g. claude-opus-5-5, gpt-6.2-sol, grok-4.7>" \
