@@ -1031,7 +1031,7 @@ high, unchanged on medium and low). Neon High handles Ukrainian review with Sour
 | Gemini 4 Hydrogen (Medium) | `gemini-4-hydrogen-medium` | `frontier_practical` | Default AGY work dispatch, interactive launcher, and certified `start-gemini-driver.sh` pin |
 | Gemini 4 Neon | `gemini-4-neon-high`, `gemini-4-neon-medium` | `frontier_practical` | High for hard/security coding, stream driving, formal code/infra review at every risk tier (peer of Opus 5.5 and Sol 6.2, NEON-SOLTIER-1120), Ukrainian review with Sources MCP, fresh-build lesson writing (UK-WRITER-NEON-1121), and ACP consultation. High or Medium for [supplemental review](#gemini-4-neon-advisory-routing) only under the complete `MEASURE:` brief line (`review-loop` step 3). |
 | Gemini 4 Carbon | `gemini-4-carbon-medium` | `frontier_practical` | Retired. Existing receipts retain their Carbon model IDs. |
-| Gemini 3.8 Flash (High) | `gemini-3.8-flash-high` | `frontier_practical` | Explicit pin only until Google retires it. Existing receipts retain the original ID. |
+| Gemini 3.8 Flash (High) | `gemini-3.8-flash-high` | `frontier_practical` | Retired (GEMINI-TIERS-1119). Existing receipts retain the original ID. |
 | Gemini 3.7 Flash (High) | `gemini-3.7-flash-high` | `frontier_practical` | Retired |
 | Gemini 3.6 Flash (High) | `gemini-3.6-flash-high` | `frontier_practical` | Retired |
 | Gemini 3.1 Pro (High) | `gemini-3.1-pro-high` | `frontier_practical` | Retired |

@@ -146,7 +146,7 @@ Timers, keeper nudges and reminders are wakeups, not stop conditions: continue a
 until its terminal goal, a real blocker, an explicit operator pause or the seat's handoff signal.
 A dispatch returning is not a settle. Arm
 `"$LU_PYTHON" -I -m lu_machinery.dispatch wait <task-id> --run-nonce <nonce>` in the same turn (or watch
-the task's `$LU_STATE_ROOT/batch_state/tasks/<id>.json` `status` with the Monitor tool); ending a turn with a
+the task's `<id>.json` `status` in the task store (`$LU_TASKS_DIR`, default `$LU_STATE_ROOT/batch_state/tasks`) with the Monitor tool); ending a turn with a
 live worker and no wait is a driver defect. When it returns, read the result and act. The wait
 is a §2c fill window, not an idle period.
 

@@ -78,7 +78,8 @@ hard-code or invent a server host.
      `"$LU_PYTHON" -I -m lu_machinery.orchestration.codex_transport_health status
      --json`; only the bounded launcher/probe command may refresh it;
    - routing budget: the capacity commands below;
-   - active delegates: exact `$LU_STATE_ROOT/batch_state/tasks/<task-id>.json` records plus
+   - active delegates: exact `<task-id>.json` records in
+     the task store (`$LU_TASKS_DIR`, default `$LU_STATE_ROOT/batch_state/tasks`) plus
      GitHub PR state.
 7. Retry the API on the next material cycle; a temporary fallback never
    permanently demotes it. After a write that must be immediately visible, use

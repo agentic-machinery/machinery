@@ -182,7 +182,7 @@ only limit (`model-assignment.md`, Claude headless advisor).
 Briefs state expected eligible PR lines and files; require a one-line size justification
 above the `workflow.md` small-batch threshold, including data files.
 A brief or acceptance criterion never orders a worker to regenerate or deploy gitignored copies
-(for example `lu_machinery.agent_deploy --project-root <worktree>`, or the product's `npm run agents:deploy`) inside its worktree. Before writing an acceptance criterion
+(for example `lu_machinery.agent_deploy` or the product's `npm run agents:deploy`) inside its worktree. Before writing an acceptance criterion
 about generated files, check `.gitignore` and whether those files belong in the PR: a worker that
 deployed agent copies in its worktree hit the pre-push refusal of untracked inputs, deleted the
 copies, broke its own hooks and could not finish.

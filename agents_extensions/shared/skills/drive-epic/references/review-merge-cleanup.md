@@ -36,7 +36,7 @@ execute it verbatim:
 
 ```bash
 set -euo pipefail
-PY="${LU_PYTHON:?LU_PYTHON is not set}"
+PY="${LU_PYTHON:-${LEARN_UKRAINIAN_PYTHON:?set LU_PYTHON or LEARN_UKRAINIAN_PYTHON}}"
 
 # If requires_silence_timeout is true, set SILENCE_TIMEOUT_SECONDS from current
 # seat/runtime guidance and add --silence-timeout "$SILENCE_TIMEOUT_SECONDS".

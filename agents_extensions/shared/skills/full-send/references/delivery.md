@@ -7,12 +7,12 @@ and check.
 ## Interpreter
 
 Linked dispatch worktrees have no `.venv` of their own. Use the installed machinery
-interpreter the launcher exports as `LU_PYTHON`, once per shell, as drive-epic §6 does
+interpreter the launcher exports as `LU_PYTHON` (or only its alias `LEARN_UKRAINIAN_PYTHON`), once per shell, as drive-epic §6 does
 ([review-merge-cleanup](../../drive-epic/references/review-merge-cleanup.md)), and run every
 machinery recipe in the delivery skills with `"$PY" -I -m lu_machinery.<module>`:
 
 ```bash
-PY="${LU_PYTHON:?LU_PYTHON is not set}"
+PY="${LU_PYTHON:-${LEARN_UKRAINIAN_PYTHON:?set LU_PYTHON or LEARN_UKRAINIAN_PYTHON}}"
 ```
 
 ## Hand-off record

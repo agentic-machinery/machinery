@@ -13,7 +13,7 @@ Recipes run with the installed machinery interpreter, resolved once
 ([delivery](../full-send/references/delivery.md#interpreter)):
 
 ```bash
-PY="${LU_PYTHON:?LU_PYTHON is not set}"
+PY="${LU_PYTHON:-${LEARN_UKRAINIAN_PYTHON:?set LU_PYTHON or LEARN_UKRAINIAN_PYTHON}}"
 ```
 
 ## Every agent comment

@@ -13,11 +13,11 @@ skill never overrides repository rules or the operator-only list (rules core P6)
 The landing order is `workflow.md` § Merge policy. The hand-off record, proof rules and the
 gate are in [delivery](references/delivery.md).
 
-Recipes run with the installed machinery interpreter, which the launcher exports as
-`LU_PYTHON`; dispatch worktrees have no `.venv` of their own:
+Recipes run with the installed machinery interpreter, `LU_PYTHON` (launchers that export only
+the alias `LEARN_UKRAINIAN_PYTHON` are covered); dispatch worktrees have no `.venv` of their own:
 
 ```bash
-PY="${LU_PYTHON:?LU_PYTHON is not set}"
+PY="${LU_PYTHON:-${LEARN_UKRAINIAN_PYTHON:?set LU_PYTHON or LEARN_UKRAINIAN_PYTHON}}"
 ```
 
 A dispatched worker runs under `--permission-mode dontAsk`, which denies any command its allowlist
@@ -64,7 +64,7 @@ dispatch. After one denial, retry once in a literal form before you stop; a seco
    never on `main`. Implementation and fixes go to the authoring lane: a worker makes them
    itself, a driver dispatches them (rules core P1). Fix the case that happened, not every case
    that could. Save command output (for example `lu_machinery.dispatch wait` or `status`) only under
-   `$LU_STATE_ROOT/batch_state/tasks/<task-id>.artifacts/` or the session scratch, never as `*.json` beside the
+   `$LU_TASKS_DIR/<task-id>.artifacts/` (default task store `$LU_STATE_ROOT/batch_state/tasks`) or the session scratch, never as `*.json` beside the
    task records, which every ledger scan reads as records.
 
    **X-Verified commit line.** Every commit adds one declaration line in the same

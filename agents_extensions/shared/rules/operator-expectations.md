@@ -29,7 +29,7 @@ are the tie-breakers.
    **The primary checkout is strictly read-only.** Do not drop scratch files, test scripts,
    or command outputs into its root directory under any circumstances. If you need a
    temporary file for discovery or testing, put it in your assigned worktree or an ignored
-   scratch directory (like `$LU_STATE_ROOT/batch_state/tasks/<task-id>.artifacts/`).
+   scratch directory (like `<task-id>.artifacts/` in the task store (`$LU_TASKS_DIR`, default `$LU_STATE_ROOT/batch_state/tasks`)).
    `core.bare=true` on primary is a **bug** to heal (`git config core.bare false` +
    `extensions.worktreeConfig=true`), never an intentional mode. PRs for everything — no
    direct commits to main. **Merge duty:** nobody arms auto-merge. The worker that
@@ -164,7 +164,8 @@ are the tie-breakers.
     already ordered or cleared). Agent-system PRs (agent definitions, skills, rules, hooks,
     launchers, settings sources) land like every other PR: independent cross-family review
     at the exact head, CI Gate green on that head, then the driver enqueues, runs
-    `merge_closeout`, and deploys with `"$LU_PYTHON" -I -m lu_machinery.agent_deploy --project-root <checkout>`. Never ask the operator to
+    `merge_closeout`, and, once the release carrying the change is installed, applies it to the consumer with
+    `"$LU_PYTHON" -I -m lu_machinery.agent_deploy --project-root <consumer checkout>`. Never ask the operator to
     approve, merge, or deploy them. Routine host maintenance is driver work, done then
     reported, including with sudo where the host requires it: pull merged `main`, restart
     an updated or broken service after checking no active dispatch depends on it, install

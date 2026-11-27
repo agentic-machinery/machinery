@@ -3,8 +3,10 @@
 <critical>
 
 ### 1. Work in `agents_extensions/` First
-**NEVER** edit `.claude/`, `.codex/`, `.agent/`, `.gemini/` directly. Edit in `agents_extensions/`, then sync with `"$LU_PYTHON" -I -m lu_machinery.agent_deploy --project-root <checkout>`
-(in the product checkout, `npm run agents:deploy` wraps the same command).
+**NEVER** edit `.claude/`, `.codex/`, `.agent/`, `.gemini/` directly. Edit the source in `agents_extensions/`. Fleet resources
+ship in the machinery release; `"$LU_PYTHON" -I -m lu_machinery.agent_deploy --project-root <consumer checkout>`
+(`--workspace` for the generated CTO workspace; the product's `npm run agents:deploy` wraps it) applies the
+installed release and the consumer's own extensions to an enrolled consumer.
 
 ### 2. Use Python venv
 **ALWAYS** the prescribed venv interpreter, **NEVER** `python3` or `python` directly.

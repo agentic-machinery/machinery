@@ -180,7 +180,6 @@ Before dispatch, classify **data class** and **route**:
 | Public open-source code | Standard fleet routes OK |
 | Curriculum drafts / unreleased content | Prefer Western lab routes; record route |
 | Secrets, tokens, learner PII | **Default-deny** external routes |
-| Local-only policy lanes | Never CI; never sensitive classes |
 
 Record when relevant: **provider, intermediary, region/retention, data class**. Brand labels (“China”) are insufficient without the concrete route.
 
