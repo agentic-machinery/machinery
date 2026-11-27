@@ -1437,17 +1437,19 @@ def test_cto_pointer_names_cto_lane_and_operator_escalation(
     assert "Ask the operator only about deleting data" in cto_from_comment
     assert "CTO blocker delta policy" not in cto_from_comment
 
-    # Legacy merge-base CTO pointer refreshes lane, seat, escalation, and worker wording.
+    # Legacy merge-base CTO pointer, truncated/wrapped/indented/setext policy headings, and
+    # wrong-seat policies all refresh to one authoritative seat-scoped policy while keeping other sections.
     legacy_cto = (
         "# Driver state: epics\n\n## Epic\n- Stream: epics\n"
         "- Seat: driver (one per stream; the launcher owns the lease)\n\n"
         "## Database authority\n"
         "- First run `lu-driver-state render --lane epics`, then `lu-driver-state check --lane epics` on startup.\n\n"
         "## Standing decision policy\n"
-        "- Ask the CTO only about deleting data, spending money, security or secrets, rule changes, or a true conflict "
-        "between two operator rules. Post it through Fleet Comms and start the final message with `CTO-ESCALATION:`.\n"
+        "- Ask the CTO only about deleting data, spending money, security or secrets, rule changes, or a true conflict\n"
+        "  between two operator rules. Post it through Fleet Comms and start the final message with `CTO-ESCALATION:`.\n"
         "- End every turn with the privately configured worker target met and a wake-up armed "
-        "(a background `lu_machinery/dispatch.py wait` or the `schedule` tool), never with a question.\n"
+        "(a background `lu_machinery/dispatch.py wait` or the `schedule` tool), never with a question.\n\n"
+        "## Pinned notes\n- Keep provider fact\n"
     )
     refreshed_cto = driver_state.render_injection(legacy_cto, cto_path)
     assert "- Seat: cto (the launcher owns the epics lease)" in refreshed_cto
@@ -1456,8 +1458,27 @@ def test_cto_pointer_names_cto_lane_and_operator_escalation(
     assert "--lane epics" not in refreshed_cto
     assert "Ask the operator only about deleting data" in refreshed_cto
     assert "Ask the CTO" not in refreshed_cto
+    assert "Post it through Fleet Comms" not in refreshed_cto
     assert "End each turn with free worker slots filled with ready work and a wake-up armed" in refreshed_cto
     assert "privately configured worker target" not in refreshed_cto
+    assert "- Keep provider fact" in refreshed_cto
+    assert refreshed_cto.count("## Standing decision policy") == 1
+
+    for variant in (
+        "# Driver state: epics\n\n## Standing decision policy\n",
+        "# Driver state: epics\n\n  ## Standing decision policy\n- stale\n",
+        "# Driver state: epics\n\nStanding decision policy\n---\n- stale\n",
+    ):
+        rendered_variant = driver_state.render_injection(variant, cto_path)
+        assert rendered_variant.count("## Standing decision policy") == 1
+        assert "Ask the operator only about deleting data" in rendered_variant
+        assert "- stale" not in rendered_variant
+
+    infra_from_cto_text = driver_state.render_injection(cto_template, infra_path)
+    assert infra_from_cto_text.count("## Standing decision policy") == 1
+    assert "Ask the CTO only about deleting data" in infra_from_cto_text
+    assert "Post it through Fleet Comms" in infra_from_cto_text
+    assert "Ask the operator" not in infra_from_cto_text
 
     infra_injected = driver_state.render_injection("# Driver state: infra\n\n## Epic\n- Stream: infra\n", infra_path)
     assert "lu-driver-state render --lane infra" in infra_injected
@@ -1486,16 +1507,23 @@ def test_cto_pointer_names_cto_lane_and_operator_escalation(
     assert "Ask the operator only about deleting data" in custom_cto
     monkeypatch.delenv("SESSION_SEAT", raising=False)
 
-    # Relative vs absolute symlink alias resolves identically (lexical parent, no symlink chase) and loops fail closed.
+    # Bare relative vs absolute paths match both inside a canonical epic dir and for a root symlink alias.
+    monkeypatch.chdir(cto_path.parent)
+    bare_cto = driver_state.render_injection("# Driver state: epics\n", Path("DRIVER-STATE.md"))
+    abs_cto = driver_state.render_injection("# Driver state: epics\n", cto_path)
+    assert bare_cto == abs_cto
+    assert "lu-driver-state render --lane cto" in bare_cto
+    assert "Ask the operator only about deleting data" in bare_cto
+    monkeypatch.chdir(tmp_path)
+
     alias = tmp_path / "DRIVER-STATE.md"
     alias.symlink_to(cto_path)
     monkeypatch.setenv("SESSION_EPIC", "infra")
     rel_out = driver_state.render_injection("# Alias\n", Path("DRIVER-STATE.md"))
     abs_out = driver_state.render_injection("# Alias\n", alias)
+    assert rel_out == abs_out
     assert "lu-driver-state render --lane infra" in rel_out
-    assert "lu-driver-state render --lane infra" in abs_out
     assert "Ask the CTO only about deleting data" in rel_out
-    assert "Ask the CTO only about deleting data" in abs_out
     loop_dir = tmp_path / ".claude" / "epics-epic" / "loop"
     loop_dir.mkdir()
     loop_link = loop_dir / "DRIVER-STATE.md"

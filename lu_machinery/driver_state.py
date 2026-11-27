@@ -149,10 +149,6 @@ def render_policy(*, is_cto: bool = False) -> str:
 POLICY = render_policy()
 _CTO_SEAT = "cto (the launcher owns the epics lease)"
 _DRIVER_SEAT = "driver (one per stream; the launcher owns the lease)"
-_LEGACY_CTO_ESCALATION_RE = re.compile(
-    r"^\s*-\s*Ask the CTO only about deleting data, spending money, security or secrets,"
-)
-_LEGACY_WORKER_TARGET_RE = re.compile(r"^\s*-\s*End every turn with the privately configured worker target met\b")
 _LEGACY_EPICS_LANE_RE = re.compile(r"\blu-driver-state\s+(render|check)\s+--lane(\s+|=)epics(?![a-z0-9-])")
 _LEGACY_DRIVER_SEAT_LINE = f"- Seat: {_DRIVER_SEAT}"
 _CTO_SEAT_LINE = f"- Seat: {_CTO_SEAT}"
@@ -192,8 +188,11 @@ def render_template(epic: str) -> str:
 
 
 def _epic_from_path(path: Path) -> str | None:
-    """Extract a validated epic selector from the pointer path's lexical parent directory."""
-    parent = path.parent.name
+    """Extract a validated epic selector from the pointer path's anchored lexical parent directory."""
+    try:
+        parent = Path(os.path.abspath(path)).parent.name
+    except OSError:
+        return None
     if not parent.endswith("-epic"):
         return None
     epic = parent.removesuffix("-epic")
@@ -292,32 +291,26 @@ def render_injection(text: str, path: Path) -> str:
         for index, token in enumerate(tokens)
         if token.type == "heading_open" and token.level == 0 and token.tag in {"h1", "h2"}
     ]
-    has_policy = False
     for index in range(len(headings) - 1, -1, -1):
         start, title, token = headings[index]
-        if token.tag != "h2" or token.markup != "##" or not lines[start].startswith("##"):
+        if token.tag != "h2":
             continue
         end = headings[index + 1][0] if index + 1 < len(headings) else len(lines)
         if title == "CTO blocker delta policy":
-            del lines[start:end]
+            if token.markup == "##" and lines[start].startswith("##"):
+                del lines[start:end]
             continue
         if title.strip().lower() == POLICY_TITLE.lower():
-            has_policy = True
-            for line_idx in range(start + 1, end):
-                line = lines[line_idx]
-                if is_cto and _LEGACY_CTO_ESCALATION_RE.match(line):
-                    lines[line_idx] = _with_line_ending(line, _escalation_policy_line(is_cto=True))
-                elif _LEGACY_WORKER_TARGET_RE.match(line):
-                    lines[line_idx] = _with_line_ending(line, _WORKER_POLICY_LINE)
+            del lines[start:end]
     if is_cto:
         for line_idx, line in enumerate(lines):
             if line.rstrip("\r\n") == _LEGACY_DRIVER_SEAT_LINE:
                 lines[line_idx] = _with_line_ending(line, _CTO_SEAT_LINE)
             elif _LEGACY_EPICS_LANE_RE.search(line):
                 lines[line_idx] = _LEGACY_EPICS_LANE_RE.sub(r"lu-driver-state \1 --lane\2cto", line)
-    text = "".join(lines)
-    if not has_policy:
-        text = text.rstrip() + "\n\n" + render_policy(is_cto=is_cto)
+    body = "".join(lines).rstrip()
+    policy = render_policy(is_cto=is_cto)
+    text = f"{body}\n\n{policy}" if body else policy
     lane = state_lane or "<lane>"
     message = (
         "PINNED DRIVER STATE (pinned facts only; re-injected every model call). "
