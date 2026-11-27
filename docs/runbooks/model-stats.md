@@ -415,7 +415,8 @@ with no published `CHANGES_REQUESTED` verdict on that PR at its reviewed head at
 publication ledger, and a review task id that names more than one run record in the task store (a task id can be
 dispatched again; a label line names the task id, not the run). The reply, the run census and the label's time
 are read under the task-store lock that archive and restore moves take. Each label line stores the labelled
-review's canonical `reviewer_model` at write time (attested from the review task record). One label per finding:
+review's reviewed `head`, normalized `started_at`, and canonical `reviewer_model` at write time (attested from the
+review task record), and each contest line stores the target run's validated `head` and normalized `started_at`. One label per finding:
 the same label again is a no-op, and another one is refused. The next review of the PR may contest a label with a
 line `CONTEST <finding-id>: <reason>` in its reply's `overall.explanation`. When `record` publishes that review,
 it binds the PR's previous round from the PR's own verdict comments: the newest earlier head with any verdict
@@ -430,10 +431,12 @@ when no id matched, which writes nothing); a reply that contests nothing adds no
 `failed: <reason>`; recording the same verdict again while the head stands retries it.
 
 Per-reviewer label statistics count label lines directly by their stored `reviewer_model` (filtered to the window
-by `recorded_at`), with no join to the rows or publication ledgers. A label contested before the snapshot time
-counts as `contested`, not as its label. Legacy label lines written without `reviewer_model` are accepted as valid
-lines (remaining conflict-protected on write), counted in `coverage.finding_outcomes.unattributed_labels`, and
-attributed to no reviewer. An unreadable fleet registry counts no label
+by `recorded_at`), with no join to the rows or publication ledgers. A label contested for the same run (`task_id`,
+repository identity, `pr`, `finding_id`, `head`, `started_at`) before the snapshot time counts as `contested`, not
+as its label; a contest for another run of a reused task id never suppresses an earlier run's label. Legacy lines
+written without `reviewer_model` or run binding (`head` and `started_at`) are accepted as valid lines (legacy
+labels remaining conflict-protected on write), counted in `coverage.finding_outcomes.unattributed_labels` and
+`coverage.finding_outcomes.unbound_contests`, and attributed to no reviewer. An unreadable fleet registry counts no label
 (`coverage.finding_outcomes.registry_unreadable`). `real_precision` is `fixed / (fixed + wrong + invented)` with
 its Wilson interval; a label is the author's word unless a later review contested it.
 

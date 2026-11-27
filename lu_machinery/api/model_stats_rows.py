@@ -1106,6 +1106,7 @@ OUTCOME_SCHEMA = "review-finding-outcome.v1"
 OUTCOMES_FILE = "finding-outcomes.jsonl"
 _FINDING_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,63}\Z")
 _OUTCOME_REVIEWER_MODEL = "reviewer_model"
+_OUTCOME_RUN_KEYS = frozenset({"head", "started_at"})
 _OUTCOME_KEYS = {
     "label": frozenset({"schema", "kind", "task_id", "repository", "pr", "finding_id", "label", "evidence_sha256",
                         "recorded_by", "recorded_at"}),
@@ -1114,7 +1115,7 @@ _OUTCOME_KEYS = {
 }
 
 
-def _outcome_ok(entry: object, *, require_reviewer_model: bool = False) -> bool:
+def _outcome_ok(entry: object, *, require_run_binding: bool = False) -> bool:
     # Every membership test below reads a string first: a list or object in a damaged line is unhashable.
     if not isinstance(entry, dict):
         return False
@@ -1122,17 +1123,20 @@ def _outcome_ok(entry: object, *, require_reviewer_model: bool = False) -> bool:
     if not isinstance(kind, str) or kind not in _OUTCOME_KEYS:
         return False
     expected = _OUTCOME_KEYS[kind]
-    if kind == "label":
-        if entry.keys() - {_OUTCOME_REVIEWER_MODEL} != expected:
-            return False
-        if require_reviewer_model and _OUTCOME_REVIEWER_MODEL not in entry:
-            return False
-        if _OUTCOME_REVIEWER_MODEL in entry:
-            reviewer = entry[_OUTCOME_REVIEWER_MODEL]
-            if not isinstance(reviewer, str) or not reviewer or model_label(reviewer, "") != reviewer or reviewer == "unknown":
-                return False
-    elif entry.keys() != expected:
+    optional = _OUTCOME_RUN_KEYS | ({_OUTCOME_REVIEWER_MODEL} if kind == "label" else frozenset())
+    if not (expected <= entry.keys() <= (expected | optional)):
         return False
+    has_head, has_started = "head" in entry, "started_at" in entry
+    if has_head != has_started:
+        return False
+    if require_run_binding and (not has_head or (kind == "label" and _OUTCOME_REVIEWER_MODEL not in entry)):
+        return False
+    if has_head and not (_sha(entry["head"]) and timestamp(entry["started_at"]) is not None):
+        return False
+    if _OUTCOME_REVIEWER_MODEL in entry:
+        reviewer = entry[_OUTCOME_REVIEWER_MODEL]
+        if not isinstance(reviewer, str) or not reviewer or model_label(reviewer, "") != reviewer or reviewer == "unknown":
+            return False
     pr, repository, finding_id = entry["pr"], entry["repository"], entry["finding_id"]
     if not (entry["schema"] == OUTCOME_SCHEMA and valid_task_id(entry["task_id"])
             and isinstance(repository, str) and REPOSITORY_SLUG.fullmatch(repository) is not None
@@ -1149,14 +1153,17 @@ def _outcome_ok(entry: object, *, require_reviewer_model: bool = False) -> bool:
 
 
 def finding_outcome(*, kind: str, task_id: str, repository: str, pr: int, finding_id: str, recorded_at: str,
-                    reviewer_model: str | None = None, label: str | None = None, evidence: str | None = None,
-                    recorded_by: str | None = None, contested_by: str | None = None) -> dict[str, Any]:
+                    head: str | None = None, started_at: str | None = None, reviewer_model: str | None = None,
+                    label: str | None = None, evidence: str | None = None, recorded_by: str | None = None,
+                    contested_by: str | None = None) -> dict[str, Any]:
     """One outcome-ledger line: the author's ``label`` for one blocking finding of the published review ``task_id``
-    (carrying ``reviewer_model``, the labelled review's concrete model at write time), or a later review's ``contest``
-    of that label. The evidence line is kept only as its SHA-256: the text stays in the PR and the delta brief.
-    Raises ValueError when a field has the wrong shape, so a malformed line is never written."""
+    (carrying ``head``, ``started_at``, and ``reviewer_model`` at write time), or a later review's ``contest`` of that
+    label (carrying the target run's ``head`` and ``started_at``). The evidence line is kept only as its SHA-256: the
+    text stays in the PR and the delta brief. Raises ValueError when a field has the wrong shape, so a malformed line
+    is never written."""
     entry: dict[str, Any] = {"schema": OUTCOME_SCHEMA, "kind": kind, "task_id": task_id, "repository": repository,
-                             "pr": pr, "finding_id": finding_id, "recorded_at": recorded_at}
+                             "pr": pr, "finding_id": finding_id, "head": head, "started_at": started_at,
+                             "recorded_at": recorded_at}
     if kind == "label":
         entry.update(reviewer_model=reviewer_model, label=label, recorded_by=recorded_by,
                      evidence_sha256=None if evidence is None else hashlib.sha256(evidence.encode()).hexdigest())
@@ -1164,7 +1171,7 @@ def finding_outcome(*, kind: str, task_id: str, repository: str, pr: int, findin
         if reviewer_model is not None:
             raise ValueError("finding outcome field has the wrong shape")
         entry["contested_by"] = contested_by
-    if not _outcome_ok(entry, require_reviewer_model=True):
+    if not _outcome_ok(entry, require_run_binding=True):
         raise ValueError("finding outcome field has the wrong shape")
     return entry
 
@@ -1198,13 +1205,14 @@ def record_finding_outcomes(batch_state_dir: Path, entries: Iterable[Mapping[str
                             wait_s: float | None = None) -> int:
     """Append, under ``rows.lock``, each entry the outcome ledger does not hold yet; the count added.
 
-    A label line is one per (review task, repository, PR, finding), the repository by its identity across a transfer:
-    the same label again adds nothing and keeps the first line and its evidence, and another label raises
-    OutcomeConflict before anything is written. Every newly written label line must carry ``reviewer_model``; existing
-    legacy lines without it are still read so they remain conflict-protected. A contest line is one per (review task,
-    repository, PR, finding, contesting task). Every entry is checked from the exact JSON bytes that will be written:
-    one malformed entry raises ValueError and writes nothing. TimeoutError when ``wait_s`` passes first; OSError when
-    the ledger cannot be written.
+    A label line is one per (review task, repository, PR, finding, head, started_at), the repository by its identity
+    across a transfer: the same label again adds nothing and keeps the first line and its evidence, and another label
+    raises OutcomeConflict before anything is written. Every newly written line must carry ``head`` and
+    ``started_at`` (and ``reviewer_model`` on labels); existing legacy lines without them are still read so legacy
+    labels remain conflict-protected. A contest line is one per (review task, repository, PR, finding, contesting
+    task, head, started_at). Every entry is checked from the exact JSON bytes that will be written: one malformed
+    entry raises ValueError and writes nothing. TimeoutError when ``wait_s`` passes first; OSError when the ledger
+    cannot be written.
     """
     checked = []
     for entry in entries:
@@ -1216,59 +1224,76 @@ def record_finding_outcomes(batch_state_dir: Path, entries: Iterable[Mapping[str
             snapshot = _load_line(line)
         except (TypeError, ValueError, RecursionError) as exc:
             raise ValueError("finding outcome field has the wrong shape") from exc
-        if not _outcome_ok(snapshot, require_reviewer_model=True):
+        if not _outcome_ok(snapshot, require_run_binding=True):
             raise ValueError("finding outcome field has the wrong shape")
         checked.append((snapshot, line))
 
-    def key(entry: Mapping[str, Any]) -> tuple[str, str, int | str, int, str, str]:
+    def base_key(entry: Mapping[str, Any]) -> tuple[str, str, int | str, int, str, str]:
         return (entry["kind"], entry["task_id"], repository_identity(entry["repository"]), entry["pr"],
                 entry["finding_id"], entry.get("contested_by") or "")
+
+    def run_key(entry: Mapping[str, Any]) -> tuple[str, datetime] | None:
+        return (entry["head"], cast(datetime, timestamp(entry["started_at"]))) if "head" in entry else None
+
+    def key(entry: Mapping[str, Any]) -> tuple[str, str, int | str, int, str, str, tuple[str, datetime] | None]:
+        return (*base_key(entry), run_key(entry))
 
     with _locked(batch_state_dir, wait_s) as rows_file:
         path = rows_file.with_name(OUTCOMES_FILE)
         present = {key(e): e for e in _outcome_lines(path, Counter())}
         for snapshot, _ in checked:
             held = present.get(key(snapshot))
+            if held is None and snapshot["kind"] == "label":
+                held = present.get((*base_key(snapshot), None))
             if held is not None and snapshot["kind"] == "label" and held["label"] != snapshot["label"]:
                 raise OutcomeConflict(
                     f"finding {snapshot['finding_id']} of {snapshot['task_id']} is already labelled {held['label']}")
         added = 0
         for snapshot, line in checked:
-            if key(snapshot) not in present:
+            exact = key(snapshot)
+            legacy_held = snapshot["kind"] == "label" and (*base_key(snapshot), None) in present
+            if exact not in present and not legacy_held:
                 _append_line(path, line)
-                present[key(snapshot)] = snapshot
+                present[exact] = snapshot
                 added += 1
         return added
 
 
-OutcomeFindingKey = tuple[str, int | str, int, str]
+OutcomeFindingKey = tuple[str, int | str, int, str, str, datetime]
 
 
 def read_finding_outcomes(batch_state_dir: Path) -> tuple[
         dict[OutcomeFindingKey, tuple[str, str, datetime]], dict[OutcomeFindingKey, datetime], Counter[str]]:
-    """The attributed labels (each keyed by (review task, repository identity, PR, finding id) to (reviewer model,
-    label, recorded time)), the earliest contest time of each contested finding, and read counts. A missing ledger
-    gives none. Legacy label lines written without ``reviewer_model`` are not malformed and count in
-    ``unattributed_labels`` without joining another ledger. FleetRepoError when the fleet registry cannot be read."""
+    """The attributed run-bound labels (each keyed by (review task, repository identity, PR, finding id, head,
+    started_at) to (reviewer model, label, recorded time)), the earliest contest time of each run-bound contested
+    finding, and read counts. A missing ledger gives none. Legacy lines written without ``reviewer_model`` or run
+    binding (``head`` and ``started_at``) are not malformed and count in ``unattributed_labels`` or
+    ``unbound_contests`` without joining another ledger or suppressing another run. FleetRepoError when the fleet
+    registry cannot be read."""
     counts: Counter[str] = Counter()
     labels: dict[OutcomeFindingKey, tuple[str, str, datetime]] = {}
-    seen_labels: set[OutcomeFindingKey] = set()
     contests: dict[OutcomeFindingKey, datetime] = {}
     for entry in _outcome_lines(batch_state_dir / ROWS_DIR / OUTCOMES_FILE, counts):
-        finding_key: OutcomeFindingKey = (
-            entry["task_id"], repository_identity(entry["repository"]), entry["pr"], entry["finding_id"],
-        )
+        repo_id = repository_identity(entry["repository"])
         moment = cast(datetime, timestamp(entry["recorded_at"]))
         if entry["kind"] == "label":
-            if finding_key in seen_labels:
-                continue
-            seen_labels.add(finding_key)
             reviewer = entry.get(_OUTCOME_REVIEWER_MODEL)
-            if reviewer is None:
+            if reviewer is None or "head" not in entry:
                 counts["unattributed_labels"] += 1
                 continue
-            labels[finding_key] = (model_id(reviewer), entry["label"], moment)
+            finding_key: OutcomeFindingKey = (
+                entry["task_id"], repo_id, entry["pr"], entry["finding_id"],
+                entry["head"], cast(datetime, timestamp(entry["started_at"])),
+            )
+            labels.setdefault(finding_key, (model_id(reviewer), entry["label"], moment))
         else:
+            if "head" not in entry:
+                counts["unbound_contests"] += 1
+                continue
+            finding_key = (
+                entry["task_id"], repo_id, entry["pr"], entry["finding_id"],
+                entry["head"], cast(datetime, timestamp(entry["started_at"])),
+            )
             previous = contests.get(finding_key)
             if previous is None or moment < previous:
                 contests[finding_key] = moment

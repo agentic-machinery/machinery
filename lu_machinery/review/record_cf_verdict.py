@@ -3241,6 +3241,7 @@ def record_finding_outcome(
     holds on PR ``pr_number``. One label per finding: the same label again is a no-op, another one is refused."""
     from lu_machinery.api import model_stats_rows
     from lu_machinery.common.task_store_paths import tasks_dir
+    from lu_machinery.review.capability_failure import run_started
     from lu_machinery.review.findings import EVIDENCED_OUTCOME_LABELS, FINDING_OUTCOME_LABELS
 
     task_root = task_root or tasks_dir()
@@ -3266,8 +3267,9 @@ def record_finding_outcome(
         raise RecordError(f"review {task_id} names no repository and reviewed head")
     if task.get("pinned_head") is not None and task["pinned_head"] != reviewed:
         raise RecordError("reviewed SHA conflicts with pinned head")
-    started_at = model_stats_rows.timestamp(task.get("started_at"))
-    if started_at is None:
+    started = run_started(task)
+    started_at = model_stats_rows.timestamp(started) if started is not None else None
+    if started is None or started_at is None:
         raise RecordError(f"review {task_id} has no valid start timestamp")
     # A task id can be dispatched again (the older run stays under a stamped name), and the label ledger keys a finding
     # by task id, not by run: label only a review whose id names one run, the one whose reply was read.
@@ -3298,8 +3300,8 @@ def record_finding_outcome(
     try:
         entry = model_stats_rows.finding_outcome(
             kind="label", task_id=task_id, repository=published[0]["repository"], pr=pr_number,
-            finding_id=finding_id, reviewer_model=reviewer_model, label=label, evidence=evidence or None,
-            recorded_by=author if model_stats_rows.valid_task_id(author) else None,
+            finding_id=finding_id, head=reviewed, started_at=started, reviewer_model=reviewer_model, label=label,
+            evidence=evidence or None, recorded_by=author if model_stats_rows.valid_task_id(author) else None,
             recorded_at=observed.isoformat())
         added = model_stats_rows.record_finding_outcomes(task_root.parent, [entry])
     except model_stats_rows.OutcomeConflict as exc:
@@ -3394,7 +3396,8 @@ def _store_contests(task_root: Path, task_id: str, reply: str, *,
         moment = datetime.now(UTC).isoformat()
         model_stats_rows.record_finding_outcomes(task_root.parent, [model_stats_rows.finding_outcome(
             kind="contest", task_id=target["task_id"], repository=target["repository"], pr=target["pr"],
-            finding_id=finding_id, contested_by=task_id, recorded_at=moment) for finding_id in matched],
+            finding_id=finding_id, head=target["head"], started_at=target_started, contested_by=task_id,
+            recorded_at=moment) for finding_id in matched],
             wait_s=model_stats_rows.SETTLEMENT_LOCK_WAIT_S)
     except Exception as exc:  # the verdict is already published; name the failure, never raise past it
         return f"failed: {type(exc).__name__}"

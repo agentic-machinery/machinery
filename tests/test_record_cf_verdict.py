@@ -1226,7 +1226,8 @@ def test_finding_outcome_verb_refuses_unpublished_unknown_or_nonblocking_finding
     [line] = _outcomes(tmp_path)
     assert line == {
         "schema": "review-finding-outcome.v1", "kind": "label", "task_id": "review-one", "repository": "owner/repo",
-        "pr": 42, "finding_id": "F1", "reviewer_model": CURRENT_SOL, "label": "wrong", "recorded_by": "author-task",
+        "pr": 42, "finding_id": "F1", "head": SHA, "started_at": "2026-09-23T12:00:00.000001+00:00",
+        "reviewer_model": CURRENT_SOL, "label": "wrong", "recorded_by": "author-task",
         "evidence_sha256": hashlib.sha256(b"scripts/example.py:1 already resets the state").hexdigest(),
         "recorded_at": line["recorded_at"],
     }
@@ -1367,8 +1368,31 @@ def test_record_stores_a_contest_only_against_the_previous_blocking_round(monkey
                    started_at="2026-09-23T15:00:00.000001+00:00")["outcome_contests"] == (
         f"not stored: unresolved: the previous round at {'9' * 12} has 0 blocking review(s) of another task; this task "
         "id blocked it too")
-    assert [(line["task_id"], line["finding_id"], line["contested_by"]) for line in _outcomes(tmp_path)][2:] == [
-        ("review-five", "F1", "review-six-b")]
+    assert [(line["task_id"], line["finding_id"], line["contested_by"], line["head"], line["started_at"])
+            for line in _outcomes(tmp_path)][2:] == [
+        ("review-five", "F1", "review-six-b", "5" * 40, "2026-09-23T12:00:00.000001+00:00")]
+    # PR1553-R1-F1: label F1 of review-ten run 1, then reuse task id review-ten on a newer head/start on the same PR
+    # and contest F1 of run 2 from review-eleven. The contest carries run 2's head/start and never suppresses run 1's
+    # label.
+    run1_start = "2026-09-23T12:00:00.000001+00:00"
+    run2_start = "2026-09-23T12:30:00.000001+00:00"
+    assert publish("review-ten", _blocking_reply(["P1"]), "b" * 40, started_at=run1_start)["verdict"] == "CHANGES_REQUESTED"
+    assert recorder.record_finding_outcome(
+        "review-ten", pr_number=42, finding_id="F1", label="fixed", evidence=None, task_root=tasks)["status"] == "recorded"
+    hot_ten = tasks / "review-ten.json"
+    (tasks / "review-ten.20260923T121500Z.archived.json").write_text(
+        json.dumps({**json.loads(hot_ten.read_text()), "schema_version": 2, "task_id": "review-ten"}))
+    (tasks / "review-ten.20260923T121500Z.archived.result").write_bytes((tasks / "review-ten.result").read_bytes())
+    assert publish("review-ten", _blocking_reply(["P1"]), "c" * 40, started_at=run2_start)["verdict"] == "CHANGES_REQUESTED"
+    assert publish("review-eleven", _blocking_reply(["P1"], "CONTEST F1: run 2 finding still open"), "d" * 40)[
+        "outcome_contests"] == "stored against review-ten: F1"
+    from lu_machinery.api import model_stats_rows
+
+    labels, contests, _ = model_stats_rows.read_finding_outcomes(tmp_path)
+    repo_id = model_stats_rows.repository_identity("owner/repo")
+    run1_key = ("review-ten", repo_id, 42, "F1", "b" * 40, model_stats_rows.timestamp(run1_start))
+    run2_key = ("review-ten", repo_id, 42, "F1", "c" * 40, model_stats_rows.timestamp(run2_start))
+    assert run1_key in labels and run1_key not in contests and run2_key in contests
 
 
 @pytest.mark.usefixtures('configured_roots', 'recorder_matcher')

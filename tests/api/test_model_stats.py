@@ -2064,30 +2064,38 @@ def test_finding_precision_follows_the_files_the_author_changed_before_the_same_
     assert stats._diff_blocks(output, ["a" * 40]) is None
 
 
+_HEAD_A = "a" * 40
+_HEAD_B = "b" * 40
+_START_A = _at(2)
+_START_B = _at(1.5)
+
+
 def _label(batch_state: Path, task_id: str, pr: int, finding_id: str, label: str, evidence: str | None = None,
-           *, reviewer_model: str = "claude-opus-5-5", repository: str = "learn-ukrainian/machinery",
-           recorded_at: str = _at(1)) -> int:
+           *, head: str = _HEAD_A, started_at: str = _START_A, reviewer_model: str = "claude-opus-5-5",
+           repository: str = "learn-ukrainian/machinery", recorded_at: str = _at(1)) -> int:
     """An author label line, as the verdict recorder's finding-outcome verb writes it."""
     return rows.record_finding_outcomes(batch_state, [rows.finding_outcome(
-        kind="label", task_id=task_id, repository=repository, pr=pr, finding_id=finding_id,
-        reviewer_model=reviewer_model, label=label, evidence=evidence, recorded_by="author-task",
-        recorded_at=recorded_at)])
+        kind="label", task_id=task_id, repository=repository, pr=pr, finding_id=finding_id, head=head,
+        started_at=started_at, reviewer_model=reviewer_model, label=label, evidence=evidence,
+        recorded_by="author-task", recorded_at=recorded_at)])
 
 
 def _contest(batch_state: Path, task_id: str, pr: int, finding_id: str, contested_by: str,
-             *, repository: str = "learn-ukrainian/machinery", recorded_at: str = _at(0.5)) -> int:
+             *, head: str = _HEAD_A, started_at: str = _START_A, repository: str = "learn-ukrainian/machinery",
+             recorded_at: str = _at(0.5)) -> int:
     """A contest line, as the verdict recorder writes it when a later review contests a label."""
     return rows.record_finding_outcomes(batch_state, [rows.finding_outcome(
-        kind="contest", task_id=task_id, repository=repository, pr=pr, finding_id=finding_id,
-        contested_by=contested_by, recorded_at=recorded_at)])
+        kind="contest", task_id=task_id, repository=repository, pr=pr, finding_id=finding_id, head=head,
+        started_at=started_at, contested_by=contested_by, recorded_at=recorded_at)])
 
 
 def test_finding_outcome_labels_count_per_reviewer_and_a_contest_holds_the_label_out(tmp_path):
     """Defect class: label stats depending on a rows or publications join, a contested author claim counted as
-    settled, a future contest or label leaking into an earlier snapshot, a contest on another PR or repository
-    holding out a finding, a contest without a label counted, a legacy line without reviewer_model rejected as
-    malformed or misattributed, a retired model kept, or a non-catalog model leaking onto the page view. Every
-    expected figure below is counted by hand."""
+    settled, a contest from another run of a reused task id (different head or start) or an unbound legacy contest
+    suppressing an earlier run's label, a future contest or label leaking into an earlier snapshot, a contest on
+    another PR or repository holding out a finding, a contest without a label counted, a legacy line without
+    reviewer_model or run binding rejected as malformed or misattributed, a retired model kept, or a non-catalog
+    model leaking onto the page view. Every expected figure below is counted by hand."""
     batch_state, _ = _state(tmp_path)
     # No summary rows and no publications: label stats read only finding-outcomes.jsonl by stored reviewer_model.
     # Opus: fixed, wrong, invented (contested before NOW), out_of_scope, duplicate; plus one label contested only
@@ -2102,9 +2110,12 @@ def test_finding_outcome_labels_count_per_reviewer_and_a_contest_holds_the_label
     assert _contest(batch_state, "o2-review", 2, "F2", "o2b-review",
                     recorded_at=(NOW + timedelta(hours=1)).isoformat()) == 1
     assert _label(batch_state, "o2-review", 2, "F3", "fixed", recorded_at=NOW.isoformat()) == 1
-    # Contests on another PR, another repository, or an unlabelled finding never affect PR 1's labels.
+    # Contests on another PR, another repository, another run (different head or start of the same task id on the same
+    # PR), or an unlabelled finding never affect PR 1's labels.
     assert _contest(batch_state, "o1-review", 9, "F0", "o9-review") == 1
     assert _contest(batch_state, "o1-review", 1, "F1", "o9-review", repository="other/repo") == 1
+    assert _contest(batch_state, "o1-review", 1, "F0", "o1c-review", head=_HEAD_B, started_at=_START_B) == 1
+    assert _contest(batch_state, "o1-review", 1, "F0", "o1d-review", head=_HEAD_A, started_at=_START_B) == 1
     assert _contest(batch_state, "o2-review", 2, "F9", "o2b-review") == 1
     # Sol: one wrong inside 7d, one fixed 10 days ago (inside 30d/all, outside 7d).
     assert _label(batch_state, "s1-review", 3, "F0", "wrong", "already handled", reviewer_model="gpt-6.2-sol") == 1
@@ -2115,17 +2126,23 @@ def test_finding_outcome_labels_count_per_reviewer_and_a_contest_holds_the_label
     assert _label(batch_state, "g1-review", 5, "F0", "invented", "no such symbol", reviewer_model="grok-4.7-high") == 1
     assert _label(batch_state, "k1-review", 6, "F0", "fixed", reviewer_model="kimi-k3") == 1
     assert _label(batch_state, "u1-review", 7, "F0", "fixed", reviewer_model="custom-reviewer") == 1
-    # A legacy review-finding-outcome.v1 label line without reviewer_model is not malformed and counts nowhere.
-    legacy_line = {
+    # Legacy review-finding-outcome.v1 lines without reviewer_model/head/started_at are not malformed, count in
+    # unattributed_labels / unbound_contests, and never suppress bound labels.
+    legacy_label = {
         "schema": rows.OUTCOME_SCHEMA, "kind": "label", "task_id": "legacy-review",
         "repository": "agentic-machinery/machinery", "pr": 8, "finding_id": "F1", "label": "fixed",
         "evidence_sha256": None, "recorded_by": "author-task", "recorded_at": _at(1),
     }
+    legacy_contest = {
+        "schema": rows.OUTCOME_SCHEMA, "kind": "contest", "task_id": "o1-review",
+        "repository": "agentic-machinery/machinery", "pr": 1, "finding_id": "F0",
+        "contested_by": "legacy-r2", "recorded_at": _at(0.5),
+    }
     with (batch_state / rows.ROWS_DIR / rows.OUTCOMES_FILE).open("ab") as stream:
-        stream.write(json.dumps(legacy_line).encode() + b"\n")
+        stream.write(json.dumps(legacy_label).encode() + b"\n" + json.dumps(legacy_contest).encode() + b"\n")
 
     snapshot = stats.collect(batch_state, tmp_path, NOW, landing=stats.Landing())
-    assert snapshot["coverage"]["finding_outcomes"] == {"lines": 18, "unattributed_labels": 1}
+    assert snapshot["coverage"]["finding_outcomes"] == {"lines": 21, "unattributed_labels": 1, "unbound_contests": 1}
     zero = dict.fromkeys(("fixed", "wrong", "invented", "out_of_scope", "duplicate", "contested"), 0)
     full_7d = {row["model"]: row for row in snapshot["windows"]["7d"]["reviewer_accuracy"]["labels"]}
     assert set(full_7d) == {"claude-opus-5-5", "gpt-6.2-sol", "grok-4.7", "custom-reviewer"}
@@ -2154,10 +2171,10 @@ def test_finding_outcome_labels_count_per_reviewer_and_a_contest_holds_the_label
 
 
 def test_finding_outcome_ledger_keeps_one_label_per_finding_and_skips_damaged_lines(tmp_path):
-    """Defect class: a relabel, a same-label retry refused for its new evidence, a repeated contest, a label without
-    its required evidence or reviewer_model, a legacy line without reviewer_model losing conflict protection or
-    counted as malformed, a self-contest, or a damaged ledger line (including one whose member names repeat)
-    silently changing what the statistics count."""
+    """Defect class: a relabel, a same-label retry refused for its new evidence, a repeated contest, a label or
+    contest without required run binding (head and started_at) or reviewer_model, a half-bound line accepted, a
+    legacy line without run binding losing conflict protection or counted as malformed, a self-contest, or a damaged
+    ledger line (including one whose member names repeat) silently changing what the statistics count."""
     batch_state, _ = _state(tmp_path)
     assert _label(batch_state, "o1-review", 1, "F0", "fixed") == 1
     # The same label again adds nothing; another label for the finding is refused and writes nothing.
@@ -2172,18 +2189,28 @@ def test_finding_outcome_ledger_keeps_one_label_per_finding_and_skips_damaged_li
         _label(batch_state, "o1-review", 1, "F0", "wrong", "already correct", repository="agentic-machinery/machinery")
     assert _label(batch_state, "o1-review", 1, "F0", "fixed", repository="agentic-machinery/machinery") == 0
     assert _label(batch_state, "o1-review", 1, "F0", "wrong", "already correct", repository="other/repo") == 1
-    # Every label but fixed needs its evidence; every new label needs a concrete reviewer_model; contests take none.
+    # Every label but fixed needs its evidence; every new line needs head + started_at; labels need reviewer_model.
     for label in ("wrong", "invented", "out_of_scope", "duplicate"):
         with pytest.raises(ValueError, match="wrong shape"):
             _label(batch_state, "o1-review", 1, "F1", label)
     for bad_model in (None, "", "unknown", "has space", "../escape"):
         with pytest.raises(ValueError, match="wrong shape"):
             rows.finding_outcome(kind="label", task_id="o1-review", repository="learn-ukrainian/machinery", pr=1,
-                                 finding_id="F1", reviewer_model=bad_model, label="fixed", recorded_at=_at(1))
+                                 finding_id="F1", head=_HEAD_A, started_at=_START_A, reviewer_model=bad_model,
+                                 label="fixed", recorded_at=_at(1))
+    for bad_head, bad_start in ((None, _START_A), ("not-a-sha", _START_A), (_HEAD_A, None), (_HEAD_A, "not-a-time")):
+        with pytest.raises(ValueError, match="wrong shape"):
+            rows.finding_outcome(kind="label", task_id="o1-review", repository="learn-ukrainian/machinery", pr=1,
+                                 finding_id="F1", head=bad_head, started_at=bad_start,
+                                 reviewer_model="claude-opus-5-5", label="fixed", recorded_at=_at(1))
+        with pytest.raises(ValueError, match="wrong shape"):
+            rows.finding_outcome(kind="contest", task_id="o1-review", repository="learn-ukrainian/machinery", pr=1,
+                                 finding_id="F0", head=bad_head, started_at=bad_start, contested_by="o1b-review",
+                                 recorded_at=_at(1))
     with pytest.raises(ValueError, match="wrong shape"):
         rows.finding_outcome(kind="contest", task_id="o1-review", repository="learn-ukrainian/machinery", pr=1,
-                             finding_id="F0", reviewer_model="claude-opus-5-5", contested_by="o1b-review",
-                             recorded_at=_at(1))
+                             finding_id="F0", head=_HEAD_A, started_at=_START_A, reviewer_model="claude-opus-5-5",
+                             contested_by="o1b-review", recorded_at=_at(1))
     with pytest.raises(ValueError, match="wrong shape"):
         _label(batch_state, "o1-review", 1, "F1", "dismissed", "a word outside the vocabulary")
     with pytest.raises(ValueError, match="wrong shape"):
@@ -2194,15 +2221,16 @@ def test_finding_outcome_ledger_keeps_one_label_per_finding_and_skips_damaged_li
     good = path.read_bytes()
     assert b"already correct" not in good and b"now with evidence" not in good
     machinery = rows.repository_identity("learn-ukrainian/machinery")
-    # Writing a raw legacy label line without reviewer_model via record_finding_outcomes is refused.
+    # Writing a raw legacy label line without reviewer_model/head/started_at via record_finding_outcomes is refused.
     first = json.loads(good.splitlines()[0])
-    legacy = {k: v for k, v in first.items() if k != "reviewer_model"}
+    legacy = {k: v for k, v in first.items() if k not in ("reviewer_model", "head", "started_at")}
     legacy["finding_id"] = "F9"
     with pytest.raises(ValueError, match="wrong shape"):
         rows.record_finding_outcomes(batch_state, [legacy])
     extra = {**first, "note": "free text"}
-    # Unhashable values where a label or kind belongs, invalid reviewer_model, and wrong types are damaged lines too.
-    damaged = [extra, {**first, "label": ["fixed"]}, {**first, "kind": {"label": 1}}, {**first, "pr": "1"},
+    half_bound = {k: v for k, v in first.items() if k != "started_at"}
+    # Unhashable values, half-bound run keys, invalid reviewer_model, and wrong types are damaged lines too.
+    damaged = [extra, half_bound, {**first, "label": ["fixed"]}, {**first, "kind": {"label": 1}}, {**first, "pr": "1"},
                {**first, "reviewer_model": "unknown"}, {**first, "reviewer_model": ["claude-opus-5-5"]}]
     # A repeated member name: the decoder would keep "wrong" and hide "fixed".
     repeated = json.dumps({**first, "finding_id": "F5"})[:-1].encode() + b', "label": "wrong"}'
@@ -2212,12 +2240,13 @@ def test_finding_outcome_ledger_keeps_one_label_per_finding_and_skips_damaged_li
     labels, contests, counts = rows.read_finding_outcomes(batch_state)
     t_label = rows.timestamp(_at(1))
     t_contest = rows.timestamp(_at(0.5))
+    t_start = rows.timestamp(_START_A)
     assert labels == {
-        ("o1-review", machinery, 1, "F0"): ("claude-opus-5-5", "fixed", t_label),
-        ("o1-review", "other/repo", 1, "F0"): ("claude-opus-5-5", "wrong", t_label),
+        ("o1-review", machinery, 1, "F0", _HEAD_A, t_start): ("claude-opus-5-5", "fixed", t_label),
+        ("o1-review", "other/repo", 1, "F0", _HEAD_A, t_start): ("claude-opus-5-5", "wrong", t_label),
     }
-    assert contests == {("o1-review", machinery, 1, "F0"): t_contest}
-    assert counts == {"lines": 4, "unattributed_labels": 1, "malformed_lines": 8}
+    assert contests == {("o1-review", machinery, 1, "F0", _HEAD_A, t_start): t_contest}
+    assert counts == {"lines": 4, "unattributed_labels": 1, "malformed_lines": 9}
     # A writer that finds damaged and legacy lines still keeps one label per finding (legacy F9 is protected too).
     assert _label(batch_state, "o1-review", 1, "F0", "fixed") == 0
     assert _label(batch_state, "o1-review", 1, "F9", "fixed") == 0

@@ -970,10 +970,11 @@ LABEL_OUTCOMES = (*FINDING_OUTCOME_LABELS, "contested")
 
 @dataclass(frozen=True)
 class _Outcomes:
-    """The finding-outcome ledger: attributed labels keyed by (review task, repository identity, PR, finding id) to
-    (reviewer model, label, recorded time), and each contested finding's earliest contest time."""
-    labels: Mapping[tuple[str, int | str, int, str], tuple[str, str, datetime]] = field(default_factory=dict)
-    contests: Mapping[tuple[str, int | str, int, str], datetime] = field(default_factory=dict)
+    """The finding-outcome ledger: attributed run-bound labels keyed by (review task, repository identity, PR,
+    finding id, head, started_at) to (reviewer model, label, recorded time), and each run-bound contested finding's
+    earliest contest time."""
+    labels: Mapping[tuple[str, int | str, int, str, str, datetime], tuple[str, str, datetime]] = field(default_factory=dict)
+    contests: Mapping[tuple[str, int | str, int, str, str, datetime], datetime] = field(default_factory=dict)
 
 
 def _label_outcomes(outcomes: _Outcomes, *, since: datetime, until: datetime,
