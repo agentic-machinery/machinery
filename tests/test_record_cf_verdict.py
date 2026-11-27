@@ -1233,7 +1233,8 @@ def test_finding_outcome_verb_refuses_unpublished_unknown_or_nonblocking_finding
 def test_record_stores_a_contest_only_against_the_previous_blocking_round(monkeypatch, tmp_path):
     """Defect class: a CONTEST line bound to another round than the PR's previous blocking review (an older round,
     the contesting review itself, a later round on a rerun, a tie in GitHub's comment time taken in the wrong
-    order), stored for an id that is no P0-P2 finding of that round, or a reply that contests nothing changing the
+    order, a round whose local publication marker is missing), stored for an id that is no P0-P2 finding of that
+    round, lost when the contesting review's own run stored none, or a reply that contests nothing changing the
     receipt."""
     from lu_machinery.review import capability_failure
 
@@ -1252,6 +1253,9 @@ def test_record_stores_a_contest_only_against_the_previous_blocking_round(monkey
         ["P1"], "Two labels do not hold.\nCONTEST F2: the reset is still missing\n  CONTEST F3: P3 is no label\n"
                 "CONTEST F9: no such finding\nA prose CONTEST F1: mid-line is no contest"))
     assert second["outcome_contests"] == "stored against review-one: F2; unmatched: F3, F9"
+    # Round 2's local marker is lost (a failed store): the PR's own comments still say round 2 came before round 3.
+    ledger = tmp_path / "model-stats" / "publications.jsonl"
+    ledger.write_text("".join(line + "\n" for line in ledger.read_text().splitlines() if '"review-two"' not in line))
     third = publish("review-three", _blocking_reply(["P1"], "CONTEST F1: still open\nCONTEST F2: still open"))
     assert third["outcome_contests"] == "stored against review-two: F1; unmatched: F2"
     assert [(line["task_id"], line["finding_id"], line["contested_by"]) for line in _outcomes(tmp_path)] == [
@@ -1262,6 +1266,14 @@ def test_record_stores_a_contest_only_against_the_previous_blocking_round(monkey
     assert recorder.record("review-two", pr_number=42, task_root=tasks, lock_root=tmp_path / "locks")[
         "outcome_contests"] == "stored against review-one: F2; unmatched: F3, F9"
     assert len(_outcomes(tmp_path)) == 2
+    # A contest no run stored (a review recorded before this release) is restored by the one-PR import, bound from
+    # the same comments to the same rounds.
+    (tmp_path / "model-stats" / "finding-outcomes.jsonl").unlink()
+    receipt = recorder.import_publications(days=1, dry_run=False, task_root=tasks, only=("owner/repo", 42),
+                                           adapter=recorder.GitHubAdapter(tmp_path))
+    assert receipt["contest_replies"] == 2
+    assert [(line["task_id"], line["finding_id"], line["contested_by"]) for line in _outcomes(tmp_path)] == [
+        ("review-one", "F2", "review-two"), ("review-two", "F1", "review-three")]
 
 
 @pytest.mark.usefixtures('configured_roots', 'recorder_matcher')

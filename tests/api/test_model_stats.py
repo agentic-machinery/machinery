@@ -2070,17 +2070,19 @@ def test_finding_precision_follows_the_files_the_author_changed_before_the_same_
     assert stats._diff_blocks(output, ["a" * 40]) is None
 
 
-def _label(batch_state: Path, task_id: str, pr: int, finding_id: str, label: str, evidence: str | None = None) -> int:
+def _label(batch_state: Path, task_id: str, pr: int, finding_id: str, label: str, evidence: str | None = None,
+           repository: str = "learn-ukrainian/machinery") -> int:
     """An author label line, as the verdict recorder's finding-outcome verb writes it."""
     return rows.record_finding_outcomes(batch_state, [rows.finding_outcome(
-        kind="label", task_id=task_id, repository="learn-ukrainian/machinery", pr=pr, finding_id=finding_id,
+        kind="label", task_id=task_id, repository=repository, pr=pr, finding_id=finding_id,
         label=label, evidence=evidence, recorded_by="author-task", recorded_at=NOW.isoformat())])
 
 
-def _contest(batch_state: Path, task_id: str, pr: int, finding_id: str, contested_by: str) -> int:
+def _contest(batch_state: Path, task_id: str, pr: int, finding_id: str, contested_by: str,
+             repository: str = "learn-ukrainian/machinery") -> int:
     """A contest line, as the verdict recorder writes it when a later review contests a label."""
     return rows.record_finding_outcomes(batch_state, [rows.finding_outcome(
-        kind="contest", task_id=task_id, repository="learn-ukrainian/machinery", pr=pr, finding_id=finding_id,
+        kind="contest", task_id=task_id, repository=repository, pr=pr, finding_id=finding_id,
         contested_by=contested_by, recorded_at=NOW.isoformat())])
 
 
@@ -2121,12 +2123,16 @@ def test_finding_outcome_labels_count_per_reviewer_and_a_contest_holds_the_label
     assert _label(batch_state, "s3-review", 3, "F0", "invented", "no such call site exists") == 1
     assert _label(batch_state, "o4-review", 4, "F0", "wrong", "already correct") == 1
     assert _label(batch_state, "s5-review", 5, "F1", "wrong", "the guard already returns early") == 1
-    # Lines naming another PR than the review's publication: they never label or contest the PR 1 findings.
+    # Lines naming another PR, or another repository at the same PR, than the review's publication: they never label
+    # or contest the PR 1 findings (F3 stays unlabelled, F0 stays fixed, F1 stays wrong).
     assert _label(batch_state, "o1-review", 9, "F0", "invented", "a label for another PR") == 1
     assert _contest(batch_state, "o1-review", 9, "F1", "o9-review") == 1
+    assert _label(batch_state, "o1-review", 1, "F3", "invented", "a label for another repository",
+                  repository="other/repo") == 1
+    assert _contest(batch_state, "o1-review", 1, "F0", "o9-review", repository="other/repo") == 1
 
     snapshot = stats.collect(batch_state, tmp_path, NOW, landing=stats.Landing())
-    assert snapshot["coverage"]["finding_outcomes"] == {"lines": 11}
+    assert snapshot["coverage"]["finding_outcomes"] == {"lines": 13}
     zero = dict.fromkeys(("fixed", "wrong", "invented", "out_of_scope", "duplicate", "contested", "unlabelled"), 0)
     for payload in (snapshot["windows"]["7d"], snapshot["page_windows"]["7d"]):
         found = {row["model"]: row for row in payload["reviewer_accuracy"]["findings"]}
@@ -2150,6 +2156,12 @@ def test_finding_outcome_ledger_keeps_one_label_per_finding_and_skips_damaged_li
         _label(batch_state, "o1-review", 1, "F0", "wrong", "already correct")
     # A retry with the same label and other evidence is a no-op too: the first line and its evidence stay.
     assert _label(batch_state, "o1-review", 1, "F0", "fixed", "now with evidence") == 0
+    # The repository's other slug names the same repository: still one label per finding. Another repository's
+    # publication at the same PR number is another key.
+    with pytest.raises(rows.OutcomeConflict):
+        _label(batch_state, "o1-review", 1, "F0", "wrong", "already correct", repository="agentic-machinery/machinery")
+    assert _label(batch_state, "o1-review", 1, "F0", "fixed", repository="agentic-machinery/machinery") == 0
+    assert _label(batch_state, "o1-review", 1, "F0", "wrong", "already correct", repository="other/repo") == 1
     # Every label but fixed needs its evidence; an unknown label and a self-contest are never written.
     for label in ("wrong", "invented", "out_of_scope", "duplicate"):
         with pytest.raises(ValueError, match="wrong shape"):
@@ -2163,6 +2175,7 @@ def test_finding_outcome_ledger_keeps_one_label_per_finding_and_skips_damaged_li
     path = batch_state / rows.ROWS_DIR / rows.OUTCOMES_FILE
     good = path.read_bytes()
     assert b"already correct" not in good and b"now with evidence" not in good
+    machinery = rows.repository_identity("learn-ukrainian/machinery")
     extra = json.loads(good.splitlines()[0])
     extra["note"] = "free text"
     # Unhashable values where a label or kind belongs, and a value of the wrong type, are damaged lines too.
@@ -2173,9 +2186,9 @@ def test_finding_outcome_ledger_keeps_one_label_per_finding_and_skips_damaged_li
     with path.open("ab") as stream:
         stream.write(b"{not json\n" + b"".join(json.dumps(line).encode() + b"\n" for line in damaged) + repeated + b"\n")
     labels, contests, counts = rows.read_finding_outcomes(batch_state)
-    assert labels == {("o1-review", 1): {"F0": "fixed"}}
-    assert contests == {("o1-review", 1, "F0")}
-    assert counts == {"lines": 2, "malformed_lines": 6}
+    assert labels == {("o1-review", machinery, 1): {"F0": "fixed"}, ("o1-review", "other/repo", 1): {"F0": "wrong"}}
+    assert contests == {("o1-review", machinery, 1, "F0")}
+    assert counts == {"lines": 3, "malformed_lines": 6}
     # A writer that finds the damaged lines still keeps one label per finding.
     assert _label(batch_state, "o1-review", 1, "F0", "fixed") == 0
 

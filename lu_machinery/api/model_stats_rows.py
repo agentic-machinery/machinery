@@ -1086,15 +1086,6 @@ def record_publications(batch_state_dir: Path, entries: Iterable[Mapping[str, An
         return added
 
 
-def publications_newest_first(batch_state_dir: Path) -> list[dict[str, Any]]:
-    """Every well-formed ledger line, newest first by GitHub's comment time; of two at the same time, the later line
-    first (the order ``read_publications`` gives within one task)."""
-    lines = _publication_lines(batch_state_dir / ROWS_DIR / PUBLICATIONS_FILE, Counter())
-    order = sorted(enumerate(lines), key=lambda item: (cast(datetime, timestamp(item[1]["published_at"])), item[0]),
-                   reverse=True)
-    return [entry for _, entry in order]
-
-
 def read_publications(batch_state_dir: Path) -> tuple[dict[str, list[dict[str, Any]]], Counter[str]]:
     """Each review task's published verdicts, newest first by GitHub's comment time (of two at the same time, the
     later line first, so a history import appended after a newer publication never comes before it), and read
@@ -1191,9 +1182,10 @@ def record_finding_outcomes(batch_state_dir: Path, entries: Iterable[Mapping[str
                             wait_s: float | None = None) -> int:
     """Append, under ``rows.lock``, each entry the outcome ledger does not hold yet; the count added.
 
-    A label line is one per (review task, PR, finding): the same label again adds nothing and keeps the first line and
-    its evidence, and another label raises OutcomeConflict before anything is written. A contest line is one per
-    (review task, PR, finding, contesting task). Every entry is checked from the exact JSON bytes that will be written: one malformed entry
+    A label line is one per (review task, repository, PR, finding), the repository by its identity across a transfer:
+    the same label again adds nothing and keeps the first line and its evidence, and another label raises
+    OutcomeConflict before anything is written. A contest line is one per (review task, repository, PR, finding,
+    contesting task). Every entry is checked from the exact JSON bytes that will be written: one malformed entry
     raises ValueError and writes nothing. TimeoutError when ``wait_s`` passes first; OSError when the ledger cannot
     be written.
     """
@@ -1211,8 +1203,9 @@ def record_finding_outcomes(batch_state_dir: Path, entries: Iterable[Mapping[str
             raise ValueError("finding outcome field has the wrong shape")
         checked.append((snapshot, line))
 
-    def key(entry: Mapping[str, Any]) -> tuple[str, str, int, str, str]:
-        return (entry["kind"], entry["task_id"], entry["pr"], entry["finding_id"], entry.get("contested_by") or "")
+    def key(entry: Mapping[str, Any]) -> tuple[str, str, int | str, int, str, str]:
+        return (entry["kind"], entry["task_id"], repository_identity(entry["repository"]), entry["pr"],
+                entry["finding_id"], entry.get("contested_by") or "")
 
     with _locked(batch_state_dir, wait_s) as rows_file:
         path = rows_file.with_name(OUTCOMES_FILE)
@@ -1231,20 +1224,23 @@ def record_finding_outcomes(batch_state_dir: Path, entries: Iterable[Mapping[str
         return added
 
 
+OutcomeKey = tuple[str, int | str, int]
+
+
 def read_finding_outcomes(
-        batch_state_dir: Path) -> tuple[dict[tuple[str, int], dict[str, str]], set[tuple[str, int, str]], Counter[str]]:
-    """The labelled findings (finding id to label) of each (review task, PR) publication, the (review task, PR,
-    finding id) a later review contested, and read counts. A missing ledger gives none: every finding is then
-    unlabelled. The writer binds the PR to the review's own repository and reviewed head, so (task, PR) names one
-    publication."""
+        batch_state_dir: Path) -> tuple[dict[OutcomeKey, dict[str, str]], set[tuple[str, int | str, int, str]], Counter[str]]:
+    """The labelled findings (finding id to label) of each (review task, repository identity, PR) publication, the
+    (review task, repository identity, PR, finding id) a later review contested, and read counts. A missing ledger
+    gives none: every finding is then unlabelled. A line counts only for the publication it names."""
     counts: Counter[str] = Counter()
-    labels: dict[tuple[str, int], dict[str, str]] = {}
-    contests: set[tuple[str, int, str]] = set()
+    labels: dict[OutcomeKey, dict[str, str]] = {}
+    contests: set[tuple[str, int | str, int, str]] = set()
     for entry in _outcome_lines(batch_state_dir / ROWS_DIR / OUTCOMES_FILE, counts):
+        identity = repository_identity(entry["repository"])
         if entry["kind"] == "label":
-            labels.setdefault((entry["task_id"], entry["pr"]), {}).setdefault(entry["finding_id"], entry["label"])
+            labels.setdefault((entry["task_id"], identity, entry["pr"]), {}).setdefault(entry["finding_id"], entry["label"])
         else:
-            contests.add((entry["task_id"], entry["pr"], entry["finding_id"]))
+            contests.add((entry["task_id"], identity, entry["pr"], entry["finding_id"]))
     return labels, contests, counts
 
 
