@@ -703,18 +703,15 @@ def pytest_child(args: argparse.Namespace) -> int:
         else [nodeid for nodeid in selection["nodeids"] if _requested_file_selector(nodeid, only)]
     )
     unmatched = [nodeid for nodeid in audited if nodeid not in plugin.accounted]
+    # Zero matches and zero unmatched selectors is an empty audit. Unmatched selectors
+    # still need the synthetic receipt below, or the parent only sees a missing JUnit.
     if (
         not plugin.selected_nodeids
         and not plugin.bulk_skipped
         and not plugin.collection_skips
         and not plugin.collection_errors
+        and not unmatched
     ):
-        if unmatched:
-            shown = ", ".join(unmatched[:20])
-            extra = f" (+{len(unmatched) - 20} more)" if len(unmatched) > 20 else ""
-            raise DataTierError(
-                f"data-tier selection names {len(unmatched)} test(s) absent from collection: {shown}{extra}"
-            )
         raise DataTierError("the audited selection collected no tests")
     if plugin.selected_nodeids:
         status = run_process_group(

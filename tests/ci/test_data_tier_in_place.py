@@ -535,6 +535,57 @@ def test_child_passes_only_selected_ids_to_two_workers(tmp_path: Path, monkeypat
         and "\x00" not in junit.read_text(encoding="utf-8")
         and data_tier.junit_summary(junit)["failed"] == 1
     )
+    # All-unmatched selections must still write the synthetic receipt. The mixed cases
+    # above keep one collected id, which is why they never reached this path.
+    ran_before = len(calls)
+
+    def use_selection(nodeids: list[str]) -> None:
+        monkeypatch.setattr(
+            data_tier,
+            "load_selection",
+            lambda *_args, **_kwargs: (
+                {"nodeids": nodeids, "files": ["tests/test_sample.py"], "bulk_nodeids": []},
+                "0" * 64,
+            ),
+        )
+
+    def assert_unmatched_receipt(selector: str) -> None:
+        assert data_tier.pytest_child(args) == 1
+        receipt = junit.read_text(encoding="utf-8")
+        assert selector in receipt
+        assert "selector matched no collected test" in receipt
+        assert data_tier.junit_summary(junit)["failed"] == 1
+
+    args.only = "tests/test_sample.py"
+    use_selection([missing])
+    assert_unmatched_receipt(missing)
+    args.only = None
+    use_selection([missing])
+    assert_unmatched_receipt(missing)
+    digest = "sha256:" + ("ab" * 32)
+    use_selection([digest])
+    assert_unmatched_receipt(digest)
+    use_selection([forbidden])
+    assert data_tier.pytest_child(args) == 1
+    nul_receipt = junit.read_text(encoding="utf-8")
+    assert "\x00" not in nul_receipt
+    assert "selector matched no collected test" in nul_receipt
+    assert data_tier.junit_summary(junit)["failed"] == 1
+
+    def collect_nothing(_argv: list[str], *, plugins: list[data_tier.SelectionPlugin]) -> int:
+        config = SimpleNamespace(hook=SimpleNamespace(pytest_deselected=lambda items: None))
+        plugins[0].pytest_collection_modifyitems([], config)
+        return 5
+
+    monkeypatch.setattr(pytest, "main", collect_nothing)
+    use_selection(["tests/test_sample.py"])
+    assert_unmatched_receipt("tests/test_sample.py")
+    assert len(calls) == ran_before
+    junit.unlink()
+    use_selection([])
+    with pytest.raises(data_tier.DataTierError, match="the audited selection collected no tests"):
+        data_tier.pytest_child(args)
+    assert not junit.exists()
 
 
 @pytest.mark.usefixtures('configured_roots', '_no_live_pool')
