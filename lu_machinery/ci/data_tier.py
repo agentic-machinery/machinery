@@ -88,6 +88,8 @@ _SCP_ORIGIN = re.compile(
     r"^git@github\.com:(?P<owner>[^/\s]+)/(?P<repo>[^/\s]+)/?$",
     re.IGNORECASE | re.ASCII,
 )
+# The same digest the collection plugin stores for a node id it cannot name up front.
+_SELECTOR_HASH = re.compile(r"sha256:[0-9a-f]{64}")
 
 
 class DataTierError(RuntimeError):
@@ -190,21 +192,27 @@ def _resolved_test_file(checkout: Path, relative: str) -> Path:
     return candidate
 
 
-def _defined_tests(checkout: Path, relative: str) -> set[str]:
-    """Module-level test functions and one-level class methods defined in one file."""
+def _defined_tests(checkout: Path, relative: str) -> set[str] | None:
+    """Qualnames defined in one file, or None when that file is not readable Python.
+
+    None defers the file to pytest collection. A syntax error is a collection
+    result, not a missing test, and must not stop the healthy selections.
+    """
     candidate = _resolved_test_file(checkout, relative)
     try:
         tree = ast.parse(candidate.read_text(encoding="utf-8"))
-    except (OSError, SyntaxError, UnicodeError) as error:
-        raise DataTierError(f"{relative} in the tested checkout is not readable Python") from error
+    except (OSError, SyntaxError, UnicodeError):
+        return None
     found: set[str] = set()
-    for node in tree.body:
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            found.add(node.name)
-        elif isinstance(node, ast.ClassDef):
-            for item in node.body:
-                if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                    found.add(f"{node.name}::{item.name}")
+
+    def walk(body: list[ast.stmt], prefix: str) -> None:
+        for node in body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                found.add(f"{prefix}{node.name}")
+            elif isinstance(node, ast.ClassDef):
+                walk(node.body, f"{prefix}{node.name}::")
+
+    walk(tree.body, "")
     return found
 
 
@@ -229,19 +237,29 @@ def load_selection(checkout: Path, expected_sha256: str | None = None) -> tuple[
         raise DataTierError("data-tier selection contains an invalid test file")
     listed = set(files)
     missing: list[str] = []
-    definitions: dict[str, set[str]] = {}
+    definitions: dict[str, set[str] | None] = {}
     for nodeid in ids:
+        # A hash is resolved by collection, which hashes each item the same way.
+        if _SELECTOR_HASH.fullmatch(nodeid):
+            continue
         base = nodeid.split("[", 1)[0]
         relative, separator, qualname = base.partition("::")
-        if not separator or not qualname or _test_path(relative) is None or relative not in listed:
+        if _test_path(relative) is None or relative not in listed or (separator and not qualname):
             missing.append(nodeid)
             continue
         if relative not in definitions:
             if not _resolved_test_file(checkout, relative).is_file():
+                definitions[relative] = set()
+            else:
+                definitions[relative] = _defined_tests(checkout, relative)
+        defined = definitions[relative]
+        if defined is None:
+            continue
+        if not separator:
+            if not _resolved_test_file(checkout, relative).is_file():
                 missing.append(nodeid)
-                continue
-            definitions[relative] = _defined_tests(checkout, relative)
-        if qualname not in definitions[relative]:
+            continue
+        if qualname not in defined:
             missing.append(nodeid)
     absent_files = [relative for relative in files if not _resolved_test_file(checkout, relative).is_file()]
     if absent_files:
@@ -879,6 +897,9 @@ def _gh(args: list[str], *, repository: str, input_text: str | None = None) -> s
     """Run one gh command with the repository named, independent of the working directory."""
     if len(args) < 2 or _REPOSITORY.fullmatch(repository) is None:
         raise DataTierError("product origin is not a GitHub owner/name")
+    # The validated origin is github.com. Do not follow an inherited GH_HOST.
+    environment = os.environ.copy()
+    environment["GH_HOST"] = _GITHUB_HOST
     result = github_client.run(
         ["gh", args[0], args[1], "--repo", repository, *args[2:]],
         input=input_text,
@@ -886,6 +907,7 @@ def _gh(args: list[str], *, repository: str, input_text: str | None = None) -> s
         text=True,
         check=False,
         timeout=90,
+        env=environment,
     )
     observation = getattr(result, "github_result", None)
     if observation is not None and (observation.stale or observation.error == "github_rate_limited"):
@@ -895,8 +917,10 @@ def _gh(args: list[str], *, repository: str, input_text: str | None = None) -> s
     return result.stdout
 
 
-def report(summary: dict, baseline: dict[str, int], checkout: Path) -> str:
-    repository = github_repository(checkout)
+def report(
+    summary: dict, baseline: dict[str, int], checkout: Path, *, repository: str | None = None
+) -> str:
+    repository = repository or github_repository(checkout)
     issues = json_depth.loads(
         _gh(
             [
@@ -974,6 +998,7 @@ def run(args: argparse.Namespace) -> int:
     }
     baseline: dict[str, int] = {}
     primary = checkout = output_dir = child_dir = log = scope_unit = None
+    reporting_repository: str | None = None
     slots: test_slots.Hold | None = None
     scope_may_exist = False
     try:
@@ -1097,6 +1122,11 @@ def run(args: argparse.Namespace) -> int:
                 summary["runner_errors"].append(f"scope cleanup failed: {safe_text(str(error))}")
         if slots is not None and scope_stopped:
             slots.release()
+        if checkout is not None:
+            try:
+                reporting_repository = github_repository(checkout)
+            except Exception as error:
+                summary["runner_errors"].append(f"origin capture failed: {safe_text(str(error))}")
         if checkout and scope_stopped:
             try:
                 summary["discarded_output"] = discard_run_output(checkout)
@@ -1132,9 +1162,13 @@ def run(args: argparse.Namespace) -> int:
     persist()
     if not args.no_report:
         try:
-            if primary is None:
-                raise DataTierError("product checkout is unavailable")
-            print(report(summary, baseline, primary))
+            if reporting_repository is None:
+                if checkout is not None:
+                    raise DataTierError("product origin is not a GitHub owner/name")
+                if primary is None:
+                    raise DataTierError("product checkout is unavailable")
+                reporting_repository = github_repository(primary)
+            print(report(summary, baseline, checkout or primary, repository=reporting_repository))
         except github_client.GitHubRateLimited:
             # The timer records the reset. Persist the test result first,
             # and never repeat a partially successful publishing sequence.
