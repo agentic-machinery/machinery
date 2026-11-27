@@ -293,7 +293,7 @@ not an empty inbox: report it to `claude-cto` and stop dependent work.
   --recipient "$LEARN_UKRAINIAN_DISPATCH_TASK_ID" --worker-id "$LEARN_UKRAINIAN_DISPATCH_TASK_ID"
 ```
 
-Exit 0 returns `{"delivery": {"delivery_id": "...", "fence_token": 1,
+A reply exits 0 and returns the delivery: `{"delivery": {"delivery_id": "...", "fence_token": 1,
 "sender": "claude-cto", "body": "the reply", ...}, "content_included": true}`.
 Read and apply `delivery.body`, then acknowledge
 with **`delivery.delivery_id` and `delivery.fence_token` from that same output**:
