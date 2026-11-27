@@ -35,24 +35,22 @@ before round 1 and before every further round.
 **Read the tier first**, at the pushed head, with the classifier the merge gates use:
 
 ```bash
-"$PY" -m lu_machinery.review.tiers --repository "$REPOSITORY" --pr "$PR"
+"$PY" -I -m lu_machinery.review.tiers --repository "$REPOSITORY" --pr "$PR"
 ```
 
 `trivial` needs no review: stop here, seat no reviewer, and land on required CI. `low` gets the
 policy's quick red-team pass, with `--risk low` and break-it findings only. Other tiers continue
 below.
 
-Recipes run with the primary checkout's interpreter, resolved once
+Recipes run with the installed machinery interpreter, resolved once
 ([delivery](../full-send/references/delivery.md#interpreter)):
 
 ```bash
-PRIMARY_REPO="$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")"
-PY="$PRIMARY_REPO/.venv/bin/python"
+PY="${LU_PYTHON:-${LEARN_UKRAINIAN_PYTHON:?set LU_PYTHON or LEARN_UKRAINIAN_PYTHON}}"
 ```
 
-Invoke the recorder by its absolute primary-checkout path below. This applies current
-recorder rules even when the caller's branch predates a recorder fix. Resolving only the
-interpreter does not select the primary checkout's Python modules.
+Every recipe runs with `-I`, so it loads the installed machinery release, never the caller's
+branch: the recorder rules apply even when the branch predates a recorder fix.
 
 ## Steps
 
@@ -87,9 +85,9 @@ interpreter does not select the primary checkout's Python modules.
 
    ```bash
    REVIEW_PROFILE=infra   # or code, as derived above
-   "$PY" -m lu_machinery.review.closeout_cli --state-file "$STATE" \
+   "$PY" -I -m lu_machinery.review.closeout_cli --state-file "$STATE" \
      target --mode branch --branch "$BRANCH" --base "origin/$BASE"
-   "$PY" -m lu_machinery.review.closeout_cli --state-file "$STATE" \
+   "$PY" -I -m lu_machinery.review.closeout_cli --state-file "$STATE" \
      resolve-reviewer --author-model "$AUTHOR_MODEL" --review-profile "$REVIEW_PROFILE" \
      --domain "$REVIEW_PROFILE" --risk "$RISK"
    ```
@@ -111,7 +109,7 @@ interpreter does not select the primary checkout's Python modules.
    exactly. Do not add `--require-review-verdict` to these bound attempts.
 
    ```bash
-   "$PY" -m lu_machinery.dispatch dispatch \
+   "$PY" -I -m lu_machinery.dispatch dispatch \
      --agent "$REVIEW_AGENT" --model "$REVIEW_MODEL" --effort high \
      --mode read-only --worktree --task-id "$REVIEW_TASK" \
      --prompt-file "$REVIEW_BRIEF" --branch "$BRANCH" --pinned-head "$HEAD_SHA" --pr "$PR" \
@@ -152,7 +150,7 @@ interpreter does not select the primary checkout's Python modules.
 4. **Wait on that task and nonce.** Never re-dispatch.
 
    ```bash
-   "$PY" -m lu_machinery.dispatch wait "$REVIEW_TASK" --run-nonce "$REVIEW_NONCE" --timeout 1800
+   "$PY" -I -m lu_machinery.dispatch wait "$REVIEW_TASK" --run-nonce "$REVIEW_NONCE" --timeout 1800
    ```
 
    Exit 0: `done`. Exit 124: client expiry while the task still runs; run the same wait again.
@@ -173,7 +171,7 @@ interpreter does not select the primary checkout's Python modules.
    applies the clean-merge exemption and the lineage's one repair-verification round:
 
    ```bash
-   "$PY" -m lu_machinery.review.record_cf_verdict budget-check --repository "$REPOSITORY" --pr "$PR"
+   "$PY" -I -m lu_machinery.review.record_cf_verdict budget-check --repository "$REPOSITORY" --pr "$PR"
    ```
 
    Exit 0 admits the round; carry any `repair_round` receipt (its approved and candidate heads,
@@ -194,12 +192,12 @@ interpreter does not select the primary checkout's Python modules.
    ([policy](references/policy.md#recording-the-verdict)).
 
    ```bash
-   "$PY" -m lu_machinery.review.record_cf_verdict --task-id "$REVIEW_TASK" --pr "$PR"
+   "$PY" -I -m lu_machinery.review.record_cf_verdict --task-id "$REVIEW_TASK" --pr "$PR"
    ```
 
    Exit 0 means recorded with a JSON receipt; exit 1 means refused, so nothing is recorded.
    If an accepted P0 or P1 finding lands on a PR that already has a recorded APPROVE, add the
-   `hold` label at once: `"$PY" -m lu_machinery.publish pr-edit --number "$PR" --add-labels hold`.
+   `hold` label at once: `"$PY" -I -m lu_machinery.publish pr-edit --number "$PR" --add-labels hold`.
 
 ## Always true, whatever the round
 

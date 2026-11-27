@@ -13,11 +13,11 @@ skill never overrides repository rules or the operator-only list (rules core P6)
 The landing order is `workflow.md` § Merge policy. The hand-off record, proof rules and the
 gate are in [delivery](references/delivery.md).
 
-Recipes run with the primary checkout's interpreter, resolved once
-([delivery](references/delivery.md#interpreter)):
+Recipes run with the installed machinery interpreter, `LU_PYTHON` (launchers that export only
+the alias `LEARN_UKRAINIAN_PYTHON` are covered); dispatch worktrees have no `.venv` of their own:
 
 ```bash
-PY="$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")/.venv/bin/python"
+PY="${LU_PYTHON:-${LEARN_UKRAINIAN_PYTHON:?set LU_PYTHON or LEARN_UKRAINIAN_PYTHON}}"
 ```
 
 A dispatched worker runs under `--permission-mode dontAsk`, which denies any command its allowlist
@@ -63,8 +63,8 @@ dispatch. After one denial, retry once in a literal form before you stop; a seco
 2. **Make the smallest change that achieves the outcome**, in a dispatch worktree on a branch,
    never on `main`. Implementation and fixes go to the authoring lane: a worker makes them
    itself, a driver dispatches them (rules core P1). Fix the case that happened, not every case
-   that could. Save command output (for example `dispatch.py wait` or `status`) only under
-   `batch_state/tasks/<task-id>.artifacts/` or the session scratch, never as `*.json` beside the
+   that could. Save command output (for example `lu_machinery.dispatch wait` or `status`) only under
+   `$LU_TASKS_DIR/<task-id>.artifacts/` (default task store `$LU_STATE_ROOT/batch_state/tasks`) or the session scratch, never as `*.json` beside the
    task records, which every ledger scan reads as records.
 
    **X-Verified commit line.** Every commit adds one declaration line in the same
@@ -90,7 +90,7 @@ dispatch. After one denial, retry once in a literal form before you stop; a seco
    nightly and manual runs, so in a merge-queue repository a failure in the merge group can still eject the PR. An open PR is not approval.
 
    ```bash
-   "$PY" -m lu_machinery.publish pr-create --title "$TITLE" --body-file "$BODY" \
+   "$PY" -I -m lu_machinery.publish pr-create --title "$TITLE" --body-file "$BODY" \
      --base main --head "$BRANCH"
    ```
 
@@ -123,7 +123,7 @@ dispatch. After one denial, retry once in a literal form before you stop; a seco
 
    ```bash
    gh pr view "$PR" --json state,isDraft,headRefOid,baseRefName,mergeable,mergeStateStatus,autoMergeRequest
-   "$PY" -m lu_machinery.publish read queue-status --repo "$REPO" --number "$PR" --branch "$BASE"
+   "$PY" -I -m lu_machinery.publish read queue-status --repo "$REPO" --number "$PR" --branch "$BASE"
    ```
 
    `true` means a merge queue and `false` none; keep it as `$QUEUE` for step 8. Any other
@@ -140,7 +140,7 @@ dispatch. After one denial, retry once in a literal form before you stop; a seco
 8. **Drain the inbox, then land** at the approved head, once step 7 holds for the kind you read.
 
    - Merge queue: the merge-queue keeper may already have queued the PR, so check
-     `"$PY" -m lu_machinery.gh_merge_queue_status "$PR" --repo "$REPO" --branch "$BASE" --json`
+     `"$PY" -I -m lu_machinery.gh_merge_queue_status "$PR" --repo "$REPO" --branch "$BASE" --json`
      first. `pr-merge` enqueues, and landing also needs a green merge-group CI Gate on the real
      candidate. Queued is not merged. A PR the CTO labelled `merge-priority` after its
      exact-head approval enqueues at the front of the queue on its own (`workflow.md` § Merge
@@ -150,7 +150,7 @@ dispatch. After one denial, retry once in a literal form before you stop; a seco
      no reason to stop.
 
    ```bash
-   "$PY" -m lu_machinery.publish pr-merge --repo "$REPO" --number "$PR" --match-head "$HEAD_SHA" \
+   "$PY" -I -m lu_machinery.publish pr-merge --repo "$REPO" --number "$PR" --match-head "$HEAD_SHA" \
      --expect-queue "$QUEUE"
    ```
 
@@ -186,7 +186,7 @@ dispatch. After one denial, retry once in a literal form before you stop; a seco
     outside those worktrees:
 
     ```bash
-    "$PY" -m lu_machinery.orchestration.merge_closeout "$PR" --repo <owner/name> --repo-root <checkout> --apply
+    "$PY" -I -m lu_machinery.orchestration.merge_closeout "$PR" --repo <owner/name> --repo-root <checkout> --apply
     ```
 
     Require exit 0 and a residue-free receipt. `merge_closeout` checks worktree and branch
@@ -213,7 +213,7 @@ first review of record, at most **one per PR lineage**.
 - **Execution:** run with a hard timeout of 900 seconds:
 
   ```bash
-  "$PY" -m lu_machinery.dispatch dispatch \
+  "$PY" -I -m lu_machinery.dispatch dispatch \
     --agent opencode --model deepseek-v4.1-flash --mode read-only \
     --hard-timeout 900 --worktree --task-id "$PRECHECK_TASK" \
     --prompt-file "$PRECHECK_PROMPT" --pinned-head "$HEAD_SHA"
@@ -258,7 +258,7 @@ paths, task id, run nonce, reason and approval reference to `claude-cto` through
 The coordinator records the grant, then replies to the task-ID recipient with the JSON receipt:
 
 ```bash
-/abs/path/.venv/bin/python -m lu_machinery.dispatch grant-paths TASK --run-nonce NONCE \
+"$PY" -I -m lu_machinery.dispatch grant-paths TASK --run-nonce NONCE \
   --owned-path tests/fixture.py --reason 'Approved fixture change' --approval-ref message-id
 ```
 
@@ -272,11 +272,11 @@ when a grant is refused; never widen the record yourself or bypass a hook.
 A dispatched worker's Fleet recipient is its task id, `$LEARN_UKRAINIAN_DISPATCH_TASK_ID`; the
 coordinator publishes the reply there, and claiming needs no registered seat. Use it as the
 `--worker-id` too. Put the question and that recipient name in the message to `claude-cto`
-(literal interpreter path, as above):
+(the literal `LU_PYTHON` path in place of `"$PY"`, as above):
 
 ```bash
 printf '%s\n' "question: <one decision, the options, your recommendation>; reply to: $LEARN_UKRAINIAN_DISPATCH_TASK_ID" |
-  /abs/path/.venv/bin/python -I -m lu_machinery.fleet_comms channel publish cto - \
+  "$PY" -I -m lu_machinery.fleet_comms channel publish cto - \
     --sender "$LEARN_UKRAINIAN_DISPATCH_TASK_ID" --source cto --recipient claude-cto \
     --idempotency-key "ask-$LEARN_UKRAINIAN_DISPATCH_TASK_ID-<n>"
 ```
@@ -289,7 +289,7 @@ hide errors with `|| true`. Exit 1 alone means no reply yet. Exit 3 is a typed e
 not an empty inbox: report it to `claude-cto` and stop dependent work.
 
 ```bash
-/abs/path/.venv/bin/python -I -m lu_machinery.fleet_comms deliveries receive \
+"$PY" -I -m lu_machinery.fleet_comms deliveries receive \
   --recipient "$LEARN_UKRAINIAN_DISPATCH_TASK_ID" --worker-id "$LEARN_UKRAINIAN_DISPATCH_TASK_ID"
 ```
 
@@ -299,7 +299,7 @@ Read and apply `delivery.body`, then acknowledge
 with **`delivery.delivery_id` and `delivery.fence_token` from that same output**:
 
 ```bash
-/abs/path/.venv/bin/python -I -m lu_machinery.fleet_comms deliveries ack "<delivery.delivery_id>" \
+"$PY" -I -m lu_machinery.fleet_comms deliveries ack "<delivery.delivery_id>" \
   --worker-id "$LEARN_UKRAINIAN_DISPATCH_TASK_ID" --fence-token "<delivery.fence_token>"
 ```
 

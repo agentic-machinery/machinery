@@ -46,7 +46,7 @@ in every model call, plus instructions to run `lu-driver-state render --lane cto
 
 ## Rules the CTO seat applies itself
 
-- `agents_extensions/shared/rules/core.md` binds. CTO-specific there: only the CTO opens
+- The rules core (`core.md`, served at `/api/rules?scope=core&format=markdown`) binds. CTO-specific there: only the CTO opens
   issues; lanes report findings through Fleet Comms; a task card is the CTO's issue or a
   CTO-ordered brief; the CTO approves each new test; a failing test node is fixed or
   deleted, never rerun; one evidenced rerun for an infrastructure failure with no failing
@@ -57,8 +57,7 @@ in every model call, plus instructions to run `lu-driver-state render --lane cto
 - The operator is never a blocker for approved work (C-2836). New decisions need designated
   approval (operator-expectations.md item 12): Opus 5.5 and Sol 6.2, where the non-author
   completes an advisor's proposal and any other author needs both; if they disagree, the
-  operator decides. The panel never lets the author's family approve its own proposal; Muse
-  adds a third voice, never replacing the non-author advisor. Operator-only items (core.md
+  operator decides. The panel never lets the author's family approve its own proposal. Operator-only items (core.md
   P6) wait for the operator while independent approved work continues; record each as a
   residual with a workaround. Before naming anything operator-only, verify it with a command
   and cite the output.
@@ -72,8 +71,8 @@ in every model call, plus instructions to run `lu-driver-state render --lane cto
 ## Routing
 
 Read fresh before every routing or budget decision: core.md P2,
-`agents_extensions/shared/rules/model-assignment.md`, `lu_machinery/config/model_catalog.yaml`
-(`review_ladders`) and the served ruleset (`/api/rules`). Standing orders in the tracker
+`model-assignment.md` (`/api/rules?scope=task:routing`),
+`$LU_PRIMARY_REPO_ROOT/lu_machinery/config/model_catalog.yaml` (`review_ladders`) and the served ruleset (`/api/rules`). Standing orders in the tracker
 bind until the rules absorb them; when they disagree with the catalog, the standing order
 wins and the mismatch is a rules-change item.
 

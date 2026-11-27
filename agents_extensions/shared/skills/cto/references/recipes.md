@@ -27,7 +27,7 @@ publish_order() {
   local body="$1" recipient="$2" idempotency_key="$3"
   shift 3
   sed "s/@UTC@/$(date -u +%Y-%m-%dT%H:%M:%SZ)/g" "$body" |
-    "$PROJECT_PYTHON" -I -m lu_machinery.fleet_comms channel publish cto - \
+    "$LU_PYTHON" -I -m lu_machinery.fleet_comms channel publish cto - \
       --sender "$LU_INBOX_WORKER" --source cto --recipient "$recipient" \
       --idempotency-key "$idempotency_key" "$@"
 }
@@ -118,16 +118,16 @@ guarded remover.
   found none. Explain how the brief relates to any overlapping work.
 - Read the provider's full docs (`llms-full.txt` or equivalent) before the first paid call and put its request and response rules in the brief.
 - Before amending a live worker's brief, check its PR and put the change in a separate task if review has started.
-- Get a PR's branch with `gh pr view <PR> --json headRefName` in the same script that writes the brief.
+- Get a PR's branch with `gh pr view <PR> -R <owner/name> --json headRefName` in the same script that writes the brief.
 
 Record each new in-flight task with `lu-driver-state add --lane cto --kind inflight`, its
 owner and done condition. Attach its task ID with `link <id> task <task-id>` and record the
 FULL run nonce with `note <id> <text>` so the tracker handoff can re-arm its wait.
 
 Run every dispatch through the scratch table helper. It builds each
-`dispatch.py dispatch` argv from a table and logs stdout and stderr per task; grep the log
+`"$LU_PYTHON" -I -m lu_machinery.dispatch dispatch` argv from a table and logs stdout and stderr per task; grep the log
 for `run_nonce=`, `SUBSTITUTE` and `queued behind`. Record the actual substituted identity.
-Run Claude-account dispatches from the seat as `env -u CLAUDE_CONFIG_DIR "$LEARN_UKRAINIAN_PYTHON" -I
+Run Claude-account dispatches from the seat as `env -u CLAUDE_CONFIG_DIR "$LU_PYTHON" -I
 -m lu_machinery.dispatch dispatch ... --claude-account <label>`: the launcher exports
 `CLAUDE_CONFIG_DIR` into the seat's shells, and the dispatcher refuses an explicit account
 while that ambient value is set (`claude_account_ambient_conflict`).
@@ -154,17 +154,17 @@ passes sets `--hard-timeout 14400`, because the dispatcher default is 7200 secon
 (`lu_machinery/dispatcher/cli.py`) and a running task's deadline cannot be extended.
 `--silence-timeout` (default 3600 seconds) applies separately, so a quiet wait can still end after 3600 seconds of silence.
 Use exact owned file paths; never claim a shared subtree for an optional edit.
-Before dispatch, check every owned path in the brief and the `--owned-path` flags with `git ls-files --error-unmatch <path>`, or mark it in the brief as a new file the worker creates.
-Before dispatching an open issue, run `git log origin/main --oneline --grep='#<N>'` and read the issue's linked PRs; if fixes already landed, verify the acceptance criteria on main and close or narrow the issue instead of dispatching.
+Before dispatch, check every owned path in the brief and the `--owned-path` flags with `git -C <repo-root> ls-files --error-unmatch <path>`, or mark it in the brief as a new file the worker creates.
+Before dispatching an open issue, run `git -C <repo-root> log origin/main --oneline --grep='#<N>'` and read the issue's linked PRs; if fixes already landed, verify the acceptance criteria on main and close or narrow the issue instead of dispatching.
 Before briefing a fix for a refusal or a fail-closed check, confirm that the state after the fix is allowed by policy (attested model and variant, operator keep-list, honest provenance); a census or residual that names such a blocker stops the dispatch, and the item is recorded as blocked instead.
-Before choosing owned paths, `git grep` the changed modules' names in `tests/`, including the
+Before choosing owned paths, `git -C <repo-root> grep` the changed modules' names in `tests/`, including the
 root `tests/*.py` files, and make every file that matches an owned path, so the worker can
 update the tests that pin the changed behaviour.
-A brief whose change adds or renames tracked files under `registry/` or `docs/` also owns
+A product brief whose change adds or renames tracked files under `registry/` or `docs/` also owns
 `docs/knowledge/catalogue.yaml` and `docs/README.md`, because the docs catalogue check
 requires every tracked file under those roots to be covered by a family glob and, when that
 catalogue changes, the generated family table in `docs/README.md` regenerated
-(`"$LEARN_UKRAINIAN_PYTHON" -I -m lu_machinery.docs.catalogue readme`).
+(`"$LU_PYTHON" -I -m lu_machinery.docs.catalogue readme`).
 Retained evidence, evaluation material and anything a later session needs goes under
 `<durable-state-root>/<topic>/` (mode 0700 when private), never a session scratchpad, and the
 brief names that path.
@@ -182,7 +182,7 @@ only limit (`model-assignment.md`, Claude headless advisor).
 Briefs state expected eligible PR lines and files; require a one-line size justification
 above the `workflow.md` small-batch threshold, including data files.
 A brief or acceptance criterion never orders a worker to regenerate or deploy gitignored copies
-(for example `npm run agents:deploy`) inside its worktree. Before writing an acceptance criterion
+(for example `lu_machinery.agent_deploy` or the product's `npm run agents:deploy`) inside its worktree. Before writing an acceptance criterion
 about generated files, check `.gitignore` and whether those files belong in the PR: a worker that
 deployed agent copies in its worktree hit the pre-push refusal of untracked inputs, deleted the
 copies, broke its own hooks and could not finish.

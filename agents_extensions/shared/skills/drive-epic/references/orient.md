@@ -17,11 +17,11 @@ blockers, decisions and next actions. The database is the lane's handoff; the ma
 only a pointer ([handoff](handoff.md)).
 
 ```bash
-.venv/bin/python -m lu_machinery.fleet_comms cold-start-board   # cold-start first action
+"$LU_PYTHON" -I -m lu_machinery.fleet_comms cold-start-board   # cold-start first action
 curl -sS --max-time 2 "http://127.0.0.1:8765/api/orient?lean=true" || true
 curl -sS --max-time 2 "http://127.0.0.1:8765/api/work/v1/projection?stream=<your-stream>" || true  # best-effort: degraded or absent sources are normal
 curl -sS --max-time 2 "http://127.0.0.1:8765/api/work/v1/next?stream=<your-stream>" || true  # stream-scoped pick list
-.venv/bin/python -m lu_machinery.fleet_comms plane-status        # message-plane mode/parity
+"$LU_PYTHON" -I -m lu_machinery.fleet_comms plane-status        # message-plane mode/parity
 ```
 
 `cold-start-board` probes fleet, plane and stream state so you orient from live data. Query the
@@ -33,7 +33,7 @@ and handoff sources, never replacements for them.
 
 Know your `SESSION_EPIC`, stream and handoff slot; the launcher already claimed the lease, so
 never open or resume it. Session health by seat: **gemini** has a canary lane
-(`.venv/bin/python -m lu_machinery.session_canary.gemini_lane mint --epic <epic>`); **Claude** and
+(`"$LU_PYTHON" -I -m lu_machinery.session_canary.gemini_lane mint --epic <epic>`); **Claude** and
 **Sonnet** use the native SessionStart and PostCompact hooks plus `thread-rollover`.
 
 ## §0b. Fleet Comms inbox count — cold start
@@ -42,7 +42,7 @@ The prompt hook `check-agent-inbox.sh` (`agents_extensions/shared/hooks/`) repor
 deliveries, and this body-free count is the one-shot equivalent:
 
 ```bash
-.venv/bin/python -I -m lu_machinery.fleet_comms deliveries pending --recipient "$SESSION_HANDOFF_AGENT"
+"$LU_PYTHON" -I -m lu_machinery.fleet_comms deliveries pending --recipient "$SESSION_HANDOFF_AGENT"
 ```
 
 It never reads a body and never claims a delivery; the §0a / §4a / §5a / §8a drains in the core
@@ -51,9 +51,9 @@ loop still read, apply and acknowledge everything it points at.
 ## §1. Read topology and metrics (query it, never hold it)
 
 ```bash
-.venv/bin/python -m lu_machinery.fleet_comms metrics        # efficiency metrics (no content)
-.venv/bin/python -m lu_machinery.fleet_comms backlog        # pending/dispatched delivery
-.venv/bin/python -m lu_machinery.fleet_comms dead-letters   # stuck deliveries
+"$LU_PYTHON" -I -m lu_machinery.fleet_comms metrics        # efficiency metrics (no content)
+"$LU_PYTHON" -I -m lu_machinery.fleet_comms backlog        # pending/dispatched delivery
+"$LU_PYTHON" -I -m lu_machinery.fleet_comms dead-letters   # stuck deliveries
 ```
 
 Per-lane budget health and the pace check before dispatch are in

@@ -36,12 +36,11 @@ execute it verbatim:
 
 ```bash
 set -euo pipefail
-PRIMARY_REPO="$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")"
-PY="$PRIMARY_REPO/.venv/bin/python"
+PY="${LU_PYTHON:-${LEARN_UKRAINIAN_PYTHON:?set LU_PYTHON or LEARN_UKRAINIAN_PYTHON}}"
 
 # If requires_silence_timeout is true, set SILENCE_TIMEOUT_SECONDS from current
 # seat/runtime guidance and add --silence-timeout "$SILENCE_TIMEOUT_SECONDS".
-dispatch_result="$("$PY" -m lu_machinery.dispatch dispatch \
+dispatch_result="$("$PY" -I -m lu_machinery.dispatch dispatch \
   --agent "$REVIEW_AGENT" --model "$REVIEW_MODEL" --effort high \
   --mode read-only --worktree --task-id "$REVIEW_TASK" \
   --prompt-file "$REVIEW_BRIEF" --branch "$AUTHOR_BRANCH" \
@@ -54,14 +53,14 @@ REVIEW_NONCE="${dispatch_lines[1]}"
 # Arm in a yielding tool session. Re-arm ONLY wait on client expiry.
 while true; do
   wait_rc=0
-  wait_result="$("$PY" -m lu_machinery.dispatch wait "$REVIEW_TASK" \
+  wait_result="$("$PY" -I -m lu_machinery.dispatch wait "$REVIEW_TASK" \
     --run-nonce "$REVIEW_NONCE" --timeout 1800)" || wait_rc=$?
   if (( wait_rc == 0 )); then printf '%s\n' "$wait_result"; break; fi
   if (( wait_rc == 124 )); then
-    state="$("$PY" -m lu_machinery.dispatch status "$REVIEW_TASK" --run-nonce "$REVIEW_NONCE")"
+    state="$("$PY" -I -m lu_machinery.dispatch status "$REVIEW_TASK" --run-nonce "$REVIEW_NONCE")"
     if "$PY" -c 'import json,sys; sys.exit(json.load(sys.stdin).get("status") not in ("running", "spawning", "done"))' < <(printf '%s\n' "$state"); then continue; fi
     # A terminal state raced expiry: read its same-nonce settlement/exit code.
-    "$PY" -m lu_machinery.dispatch wait "$REVIEW_TASK" --run-nonce "$REVIEW_NONCE" --timeout 1
+    "$PY" -I -m lu_machinery.dispatch wait "$REVIEW_TASK" --run-nonce "$REVIEW_NONCE" --timeout 1
     exit $?
   fi
   printf '%s\n' "$wait_result"
@@ -76,11 +75,11 @@ The outer subprocess timeout instead reports `dispatch.py wait timed out at proc
 while the original review may still be live. Either signal requires the same lookup and
 original-task wait recovery below; neither is a terminal task-record `timeout`.
 Ask itself does not expose the dispatch nonce (or rc 124 for client expiry). Set `REVIEW_TASK` to the original ask's task ID
-and `PRIMARY_REPO`/`PY` as above; query the live task record via `.venv/bin/python -m lu_machinery.dispatch status`:
+and `PY` as above; query the live task record via `"$LU_PYTHON" -I -m lu_machinery.dispatch status`:
 
 ```bash
 set -euo pipefail
-state="$("$PY" -m lu_machinery.dispatch status "$REVIEW_TASK")"
+state="$("$PY" -I -m lu_machinery.dispatch status "$REVIEW_TASK")"
 REVIEW_NONCE="$("$PY" -c 'import json,sys; s=json.load(sys.stdin); n=s.get("run_nonce"); (s.get("task_id")==sys.argv[1] and isinstance(n,str) and n.strip()) or sys.exit("invalid task identity/nonce"); print(n)' "$REVIEW_TASK" <<<"$state")"
 ```
 
@@ -148,7 +147,7 @@ read-only dispatch (#8703; [accepted wording](../../review-loop/references/brief
    included verbatim in the brief. That section alone defines the literal reply lines and
    how a structured findings request refers to the canonical schema.
 8. **Reliability checklist** — the `brief_section` printed by
-   `.venv/bin/python -P -m lu_machinery.review.closeout_cli --state-file <file> checklist --base origin/<base> --head <sha> --repo-root .`
+   `"$LU_PYTHON" -I -m lu_machinery.review.closeout_cli --state-file <file> checklist --base origin/<base> --head <sha> --repo-root .`
    for this round's exact head, verbatim: the checklist items the diff triggers, the owner of
    every area it touches, and the rule that judge inputs are read from the merge-base
    ([`review-loop` brief](../../review-loop/references/brief.md#judge-inputs-come-from-the-merge-base)).
@@ -166,7 +165,7 @@ and the round-2 stop are in [routing-and-dispatch](routing-and-dispatch.md) §4.
 **Ukrainian content variant** (lessons, modules, plans, practice decks, word cards, dataset
 rows): the contract is the unit's plan or acceptance (learning goals, CEFR level, scope,
 sources). Blocking, class reporting and evidence follow
-`agents_extensions/shared/rules/ukrainian-linguistics.md` §8: every Ukrainian error in added
+`$LU_PRODUCT_ROOT/agents_extensions/shared/rules/ukrainian-linguistics.md` §8 (a product rule): every Ukrainian error in added
 or edited text blocks, one finding per error class lists every occurrence with a
 source-verified correction, and an unsourced blocker is INCONCLUSIVE. Seats and finding
 verification: the `review-loop` [ukrainian profile](../../review-loop/references/ukrainian.md).

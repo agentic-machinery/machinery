@@ -30,7 +30,7 @@ never fine.
    the account's access token has merely expired while its refresh token remains. Then the
    blocker is a token refresh, done through the supported refresh path in the private
    operations doc, not an operator re-login.
-3. **Disk and load.** `df -h .`, `uptime`, `git worktree list | wc -l`. When disk climbs,
+3. **Disk and load.** `df -h .`, `uptime`, `git -C "$LU_PRIMARY_REPO_ROOT" worktree list | wc -l`. When disk climbs,
    run the retention tools and clear retained worktrees (published content only) before admitting write workers; never delete bulk
    corpus or data without a separate operator-authorized task (core.md P6).
    **Lane machinery.** Read the latest tick result of the host driver keeper and its lane
@@ -61,7 +61,7 @@ never fine.
    owning tracker item and removal condition; clear it when that condition is met.
    Measure stage time across dispatch, review, PR admission CI, queue CI, merge and closeout
    in both repositories. Act on the slowest stage this cycle, with an owner and next check.
-   Run `"$LEARN_UKRAINIAN_PYTHON" -I -m lu_machinery.orchestration.pr_ownership check` (exit 1 lists ownerless
+   Run `"$LU_PYTHON" -I -m lu_machinery.orchestration.pr_ownership check` (exit 1 lists ownerless
    PRs, 2 is unknown). It is the replacement-owner check `lu_machinery.fleet.pr_owner_check` with
    accepted handoffs counted, and an owner whose supervisor cannot be observed is unknown, not
    ownerless. Dispatch an owner for every ownerless PR, replacing any owner that ended failed,
@@ -99,9 +99,9 @@ never fine.
    starts grace over. The successor inherits the PR's review budget and the head's rerun allowance
    (infrastructure failures only, never a failing test node).
 5. **Live workers.** Active dispatches from the Monitor API, then
-   `"$LEARN_UKRAINIAN_PYTHON" -I -m lu_machinery.dispatch status <task-id> --run-nonce <nonce>` for each task
+   `"$LU_PYTHON" -I -m lu_machinery.dispatch status <task-id> --run-nonce <nonce>` for each task
    the handoff or the view names; task files outrank a partial view. Every running worker
-   has an armed background `dispatch.py wait`. Any terminal status but `done` is an
+   has an armed background `"$LU_PYTHON" -I -m lu_machinery.dispatch wait`. Any terminal status but `done` is an
    attention item; before calling a dispatch dead check open PRs and its worktree for
    unpushed work; check the worktree disposition after terminal status ([recipes](recipes.md#worktree-disposition-before-re-dispatch)).
    List every task result or lane message awaiting a CTO grant or approval, with its age.

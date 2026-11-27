@@ -85,11 +85,11 @@ code (unknown codes are rejected). `driver_breadth_report --enforce`
 fails missing or dishonest idle dispositions.
 
 ```bash
-.venv/bin/python -m lu_machinery.orchestration.dispatch_settle task --task-id <id> \
+"$LU_PYTHON" -I -m lu_machinery.orchestration.dispatch_settle task --task-id <id> \
   --idle-snapshot-json <snap.json> [--dispatched | --disposition <code>]
-.venv/bin/python -m lu_machinery.fleet.idle_settle evaluate \
+"$LU_PYTHON" -I -m lu_machinery.fleet.idle_settle evaluate \
   --snapshot-json <snap.json> --kind dispatch --task-id <id> \
   [--dispatched | --disposition <code>]
-.venv/bin/python -m lu_machinery.fleet.idle_settle report
-.venv/bin/python -m lu_machinery.fleet.idle_settle admission --snapshot-json <snap.json>
+"$LU_PYTHON" -I -m lu_machinery.fleet.idle_settle report
+"$LU_PYTHON" -I -m lu_machinery.fleet.idle_settle admission --snapshot-json <snap.json>
 ```

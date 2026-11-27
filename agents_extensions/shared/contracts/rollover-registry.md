@@ -5,10 +5,11 @@ not create a second task identity and never uses a title as an identifier.
 
 ## Identity and storage
 
-Each record is keyed exactly by `(agent, lineage_id, rollover_id)` and lives at:
+Each record is keyed exactly by `(agent, lineage_id, rollover_id)` and lives below the
+shared state root (`$LU_STATE_ROOT`) at:
 
 ```text
-.agent/thread-rollover-registry/v1/<agent>/<lineage-id>/<rollover-id>/record.json
+$LU_STATE_ROOT/.agent/thread-rollover-registry/v1/<agent>/<lineage-id>/<rollover-id>/record.json
 ```
 
 The embedded `task_identity` must validate against
@@ -143,8 +144,8 @@ maintenance guards; they do not independently establish successor exit.
 `runtime_digest`. The successor ID must match the registry binding.
 
 Only the existing launcher's canonical
-`.agent/claudex-supervisors/<run-id>/runtime.json` is admitted as exit evidence.
-`evidence_paths` must contain only that relative path. The supervisor's runtime
+`.agent/claudex-supervisors/<run-id>/runtime.json` (relative to `$LU_STATE_ROOT`) is admitted as
+exit evidence. `evidence_paths` must contain only that relative path. The supervisor's runtime
 validator must accept it, its `session_id` and `handoff_agent` must match the
 bound successor and registry agent, its state must be `exited`, and its exit
 code must be an integer. Its update timestamp must follow the recorded resume

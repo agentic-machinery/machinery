@@ -15,7 +15,7 @@ is the lane's handoff.
 Record every new order, commitment, goal, in-flight task, blocker, decision and next action as an
 item with the matching kind, an owner and a done condition. Record goals under their program's
 `operator_order` with `--parent <id>`. Every `inflight` item carries the task ID and the FULL run
-nonce (`.venv/bin/python -m lu_machinery.dispatch wait <task-id> --run-nonce <nonce>` compares it
+nonce (`"$LU_PYTHON" -I -m lu_machinery.dispatch wait <task-id> --run-nonce <nonce>` compares it
 exactly). The complete syntax:
 
 ```bash
@@ -63,7 +63,7 @@ copies such as `.claude/skills/` are overwritten on the next deploy.
 
 ```bash
 # Fleet receipt: issue/PR numbers only (no residual tables, no secrets)
-.venv/bin/python -I -m lu_machinery.fleet_comms channel publish <stream-channel> \
+"$LU_PYTHON" -I -m lu_machinery.fleet_comms channel publish <stream-channel> \
   "handoff: tracker=SSOT. Next issues #… Merged PRs #…" \
   --sender "$SESSION_HANDOFF_AGENT" --source <harness> --kind state \
   --idempotency-key "handoff-<epic>-<date>"
@@ -73,7 +73,7 @@ copies such as `.claude/skills/` are overwritten on the next deploy.
 
 Fleet Comms is the durable authority for messages and jobs (plane mode `authority`; query the live
 mode at orient); legacy broker and channel stores are read-only inputs. Live-driver diagnostics:
-`.venv/bin/python -m lu_machinery.session_streams handoff-status --stream <stream-id>`
+`"$LU_PYTHON" -I -m lu_machinery.session_streams handoff-status --stream <stream-id>`
 (for example `epic:4542`). A live driver never runs `handoff-claim`: the launcher already
 claimed the lease, and remote recovery uses Monitor TTL/CAS or an attributed operator release,
 never local PID observations or `--local`. Never flip the plane, enable retention apply or invent

@@ -3,7 +3,7 @@
 <critical>
 
 When you dispatch work to Codex, Gemini, or any other agent via
-`lu_machinery/dispatch.py dispatch` (or any equivalent), the agent MUST work
+`"$LU_PYTHON" -I -m lu_machinery.dispatch dispatch` (or any equivalent), the agent MUST work
 in a git worktree — **not** a feature branch in the main checkout.
 
 ## Why this matters
@@ -35,7 +35,7 @@ Sparse exclusions are defined by `SPARSE_EXCLUDE_DEFAULT` in
 required inputs. Owned paths do not re-include sparse files, and there are no
 automatic sparse anchors.
 
-Running write tasks can receive additional exact owned paths through `dispatch.py grant-paths`.
+Running write tasks can receive additional exact owned paths through `"$LU_PYTHON" -I -m lu_machinery.dispatch grant-paths`.
 The coordinator uses the full-send Fleet Comms request-and-grant exchange; the original
 `owned_paths` stays immutable and the record carries append-only grants bound to its run nonce.
 This guards an honest but mistaken worker, not an OS principal: `granted_by` is explicitly
@@ -55,7 +55,7 @@ Work in a git worktree under `.worktrees/dispatch/<agent>/<task>/`
 (auto-created by the runtime when you pass bare `--worktree`). Do NOT
 create a feature branch in the main checkout. Concrete dispatch:
 
-    .venv/bin/python -m lu_machinery.dispatch dispatch \
+    "$LU_PYTHON" -I -m lu_machinery.dispatch dispatch \
         --agent codex --model gpt-6.2-sol \
         --task-id <task-id> \
         --mode workspace-write \
@@ -64,7 +64,7 @@ create a feature branch in the main checkout. Concrete dispatch:
         --prompt-file brief.md
 
     # For dispatches that warrant peak Opus 5.5 reasoning:
-    .venv/bin/python -m lu_machinery.dispatch dispatch \
+    "$LU_PYTHON" -I -m lu_machinery.dispatch dispatch \
         --agent claude --model claude-opus-5-5 --effort xhigh \
         --task-id <task-id> --mode workspace-write --worktree \
         --base origin/main --prompt-file brief.md
@@ -124,7 +124,8 @@ task identifier you were given (e.g. codex/1879-fix-ci-and-wikipedia).
 
 Before pushing, verify with:
 
-    .venv/bin/python scripts/audit/lint_agent_trailer.py
+    "$LU_PRODUCT_ROOT/.venv/bin/python" "$LU_PRODUCT_ROOT/scripts/audit/lint_agent_trailer.py"   # product checkout
+    "$LU_PYTHON" -I -m lu_machinery.ci.check_agent_attribution --pr origin/main HEAD          # machinery checkout
 ```
 
 For orchestrator-inline commits I make myself: use `claude-inline/orchestrator`

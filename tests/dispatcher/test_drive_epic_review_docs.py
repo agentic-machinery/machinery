@@ -296,9 +296,8 @@ def test_documented_shell_continues_only_same_nonce_wait(tmp_path, scenario, exp
     recipe = next(
         block for block in re.findall(r"^```bash\n(.*?)^```", body, re.M | re.S) if "dispatch_result=" in block
     )
-    # Replace only the interpreter boundary; keep the documented shell, parser,
-    # flags, stdout capture and continuation logic intact.
-    recipe = recipe.replace('PY="$PRIMARY_REPO/.venv/bin/python"', 'PY="$RECIPE_PY"')
+    # Run the documented interpreter line verbatim with only the launcher's legacy alias set,
+    # and keep the documented shell, parser, flags, stdout capture and continuation logic intact.
     helper = tmp_path / "native_boundary.py"
     helper.write_text(
         """import json, os, subprocess, sys
@@ -311,8 +310,8 @@ from lu_machinery.dispatcher import store, worker
 argv = sys.argv[1:]
 if argv[0] == '-c':
     raise SystemExit(subprocess.run([sys.executable, *argv], check=False).returncode)
-assert argv[:2] == ['-m', 'lu_machinery.dispatch']
-del argv[:2]
+assert argv[:3] == ['-I', '-m', 'lu_machinery.dispatch']
+del argv[:3]
 args = dispatch_cli.build_parser().parse_args(argv)
 path = Path(os.environ['RECIPE_CALLS'])
 calls = json.loads(path.read_text()) if path.exists() else []
@@ -374,8 +373,8 @@ raise SystemExit(dispatch_cli.main(argv))
         text=True,
         timeout=45,
         env={
-            **{key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
-            "RECIPE_PY": str(executable),
+            **{key: value for key, value in os.environ.items() if key not in ("PYTHONPATH", "LU_PYTHON")},
+            "LEARN_UKRAINIAN_PYTHON": str(executable),
             "RECIPE_REPO": str(REFERENCE.parents[5]),
             "RECIPE_CALLS": str(call_file),
             "RECIPE_SCENARIO": scenario,
@@ -522,8 +521,8 @@ from lu_machinery.dispatcher import store, worker
 argv = sys.argv[1:]
 if argv[0] == '-c':
     raise SystemExit(subprocess.run([sys.executable, *argv], check=False).returncode)
-assert argv[:2] == ['-m', 'lu_machinery.dispatch']
-del argv[:2]
+assert argv[:3] == ['-I', '-m', 'lu_machinery.dispatch']
+del argv[:3]
 args = dispatch_cli.build_parser().parse_args(argv)
 assert args.command in ('status', 'wait'), 'recovery must never dispatch'
 root = Path(os.environ['RECIPE_ROOT'])
@@ -566,11 +565,10 @@ raise SystemExit(dispatch_cli.main(argv))
     launch = next(block for block in blocks if "dispatch_result=" in block)
     lookup = next(block for block in blocks if 'status "$REVIEW_TASK")' in block)
     # Execute the documented initialization, recovery fence and existing loop verbatim;
-    # substitute only the interpreter boundary, never initialize REVIEW_NONCE in the test.
+    # the interpreter comes from the legacy alias alone; never initialize REVIEW_NONCE in the test.
     initialization = launch.split("# If requires_silence_timeout", 1)[0]
-    initialization = initialization.replace('PY="$PRIMARY_REPO/.venv/bin/python"', 'PY="$RECIPE_PY"')
     loop = "while true; do" + launch.split("while true; do", 1)[1]
-    env = {key: value for key, value in os.environ.items() if key not in ("REVIEW_NONCE", "PYTHONPATH")}
+    env = {key: value for key, value in os.environ.items() if key not in ("REVIEW_NONCE", "PYTHONPATH", "LU_PYTHON")}
     result = subprocess.run(
         ["bash", "-c", initialization + lookup + loop],
         cwd=Path(os.environ["LEARN_UKRAINIAN_PRIMARY_REPO_ROOT"]),
@@ -579,7 +577,7 @@ raise SystemExit(dispatch_cli.main(argv))
         timeout=45,
         env={
             **env,
-            "RECIPE_PY": str(executable),
+            "LEARN_UKRAINIAN_PYTHON": str(executable),
             "RECIPE_REPO": str(REFERENCE.parents[5]),
             "RECIPE_ROOT": str(tmp_path),
             "RECIPE_SCENARIO": scenario,

@@ -3,18 +3,22 @@
 <critical>
 
 ### 1. Work in `agents_extensions/` First
-**NEVER** edit `.claude/`, `.codex/`, `.agent/`, `.gemini/` directly. Edit in `agents_extensions/`, run `npm run agents:deploy` to sync.
+**NEVER** edit `.claude/`, `.codex/`, `.agent/`, `.gemini/` directly. Edit the source in `agents_extensions/`. Fleet resources
+ship in the machinery release; `"$LU_PYTHON" -I -m lu_machinery.agent_deploy --project-root <consumer checkout>`
+(`--workspace` for the generated CTO workspace; the product's `npm run agents:deploy` wraps it) applies the
+installed release and the consumer's own extensions to an enrolled consumer.
 
 ### 2. Use Python venv
-**ALWAYS** `.venv/bin/python`, **NEVER** `python3` or `python` directly.
-- pyenv Python 3.12.15 with `--enable-loadable-sqlite-extensions`
-- Recreate: `rm -rf .venv && ~/.pyenv/versions/3.12.15/bin/python -m venv .venv`
+**ALWAYS** the prescribed venv interpreter, **NEVER** `python3` or `python` directly.
+- Machinery modules: `"$LU_PYTHON" -I -m lu_machinery.<module>`; `LU_PYTHON` is the installed
+  machinery interpreter the launcher exports (Python >= 3.14, `pyproject.toml`).
+- Product scripts: `"$LU_PRODUCT_ROOT/.venv/bin/python"`; the product checkout owns its venv.
 
 ### 3. Language Settings
 **English**: all technical work. **Ukrainian**: curriculum content only.
 
 ### 4. External LLM Access
-Gemini-family work goes through the AGY lane (`ab ask-agy`, `.venv/bin/python -m lu_machinery.dispatch dispatch --agent agy --model <model> --prompt-file <brief>`) per `model-assignment.md`; never Gemini CLI or Gemini Code Assist. No direct provider API keys — every model call goes through a fleet lane.
+Gemini-family work goes through the AGY lane (`ab ask-agy`, `"$LU_PYTHON" -I -m lu_machinery.dispatch dispatch --agent agy --model <model> --prompt-file <brief>`) per `model-assignment.md`; never Gemini CLI or Gemini Code Assist. No direct provider API keys — every model call goes through a fleet lane.
 Code review eligibility follows the `model-assignment.md` Code review row.
 
 ### 5. Coverage and teaching adequacy
@@ -107,7 +111,8 @@ forbidden is the middle path that caused the incident: replying with a question 
 > **Orchestrators:** verify a pushed PR, never a status field. Prior art:
 > `docs/bug-autopsies/codex-dispatch-stall.md` (#2985).
 
-**Local secret scan.** Run `scripts/audit/secret_scan_local.py` (offline TruffleHog) before opening a PR
+**Local secret scan.** Run the product's offline TruffleHog wrapper,
+`"$LU_PRODUCT_ROOT/.venv/bin/python" "$LU_PRODUCT_ROOT/scripts/audit/secret_scan_local.py"`, before opening a PR
 that changes credential, identity, transport or hook code, and after any suspected leak; never run
 TruffleHog in verified mode without an operator decision and never paste raw findings anywhere.
 Runbook: `docs/runbooks/secret-scanning.md`.
@@ -115,7 +120,7 @@ Runbook: `docs/runbooks/secret-scanning.md`.
 **8.4 — Before merge, both must hold: (A) required CI green on the merge candidate, and (B) a review
 artifact from a model family different from the author's.** It must be **independent** (never review
 your own work) and an actual review — *discussion does not satisfy it*. Resolve the seat with
-`.venv/bin/python -m lu_machinery.review.closeout_cli … resolve-reviewer` rather than hand-picking one.
+`"$LU_PYTHON" -I -m lu_machinery.review.closeout_cli … resolve-reviewer` rather than hand-picking one.
 A `FAIL` that is blocked purely by missing evidence (no network, sandboxed filesystem) is **not** a
 pass — get the missing evidence from a lane that can obtain it, then finalise.
 

@@ -7,13 +7,13 @@ semantic title, issue, lineage/generation, rollover and task IDs, timestamps,
 confirmation states, and a safe exact-ID resolution; never choose one by order.
 
 ```bash
-.venv/bin/python -m lu_machinery.orchestration.thread_handoff detect --agent codex
+"$LU_PYTHON" -I -m lu_machinery.orchestration.thread_handoff detect --agent codex
 ```
 
 For a known packet, inspect health without changing it.
 
 ```bash
-.venv/bin/python -m lu_machinery.orchestration.thread_handoff check --agent codex --lineage-id <lineage-id>
+"$LU_PYTHON" -I -m lu_machinery.orchestration.thread_handoff check --agent codex --lineage-id <lineage-id>
 ```
 
 When more than one unrelated packet is pending, generic detection stays

@@ -24,8 +24,8 @@ Before picking a seat, read fresh tool output from all of these:
 
 ```bash
 curl -sS --max-time 3 "http://127.0.0.1:8765/api/state/routing-budget"
-.venv/bin/python -m lu_machinery.fleet.capacity_pick
-.venv/bin/python -m lu_machinery.fleet.usage show     # pace (also the capacity_pick pace column)
+"$LU_PYTHON" -I -m lu_machinery.fleet.capacity_pick
+"$LU_PYTHON" -I -m lu_machinery.fleet.usage show     # pace (also the capacity_pick pace column)
 ```
 
 Prefer cooler, higher-headroom seats; do not habit-route to a hot, `near_cap` or in-flight-saturated
@@ -45,7 +45,7 @@ Binding text: `agents_extensions/shared/rules/fleet-driver-routing.md` (served a
 
 Before **every** implement `dispatch`:
 
-1. Emit a **ROUTING_CARD_V1** (handoff, issue or `batch_state/` receipt) with `tier`
+1. Emit a **ROUTING_CARD_V1** (handoff, issue or `$LU_STATE_ROOT/batch_state/` receipt) with `tier`
    (authority|practical|heap) · `model_x_harness` · `why_this_tier` · `advisor_packet` (required if
    tier=heap) · `owned_paths` · `acceptance_cmd` · at least two `alternatives_considered` ·
    `parallel_free_seats` · quoted `routing_budget_primary` and `capacity_pick_order` (tool
@@ -60,7 +60,7 @@ Before **every** implement `dispatch`:
    or write `NOTE: fleet_breadth` with tool-backed blockers.
 5. Before handoff, run and attach:
    ```bash
-   .venv/bin/python -m lu_machinery.fleet.driver_breadth_report --initiator "$SESSION_HANDOFF_AGENT" --since-hours 24
+   "$LU_PYTHON" -I -m lu_machinery.fleet.driver_breadth_report --initiator "$SESSION_HANDOFF_AGENT" --since-hours 24
    # optional hard check: add --enforce
    ```
 
@@ -96,9 +96,9 @@ that settlement cannot verify (including a commit SHA) or that equals `--branch`
 dispatch; read-only dispatches still accept a SHA base. If frozen inputs require a tree before
 dispatch, create it with `create_worktree` from `lu_machinery.dispatcher.git` (it writes the
 creator receipt; tasks launched with `--cwd` borrow it) and remove it afterwards as the helper cleanup runbook
-(`docs/runbooks/worktree-cleanup.md`, "Remove helper-created trees") says: `.venv/bin/python -m lu_machinery.orchestration.worktree_claims remove PATH`, preceded for
+(`docs/runbooks/worktree-cleanup.md`, "Remove helper-created trees") describes: `"$LU_PYTHON" -I -m lu_machinery.orchestration.worktree_claims remove PATH`, preceded for
 trees that predate receipts by
-`.venv/bin/python -m lu_machinery.orchestration.worktree_claims attribute-helper PATH --actor ACTOR --reason REASON`.
+`"$LU_PYTHON" -I -m lu_machinery.orchestration.worktree_claims attribute-helper PATH --actor ACTOR --reason REASON`.
 
 Dispatch v2 has no budget substitution guard: choose the lane from live capacity evidence, record
 substitutions, and verify the task record's actual agent and model before attributing work. Before
@@ -137,7 +137,7 @@ tests of code that imports a changed shared helper), and adds no test file or ca
 CTO's approval. Never collect the whole `tests/` tree or use `-n auto` or `-n` above 2; run those
 tests in the foreground. PR CI runs the affected tests and the merge-group CI Gate runs the full
 suite on the real candidate (rules core r2-root); those runs are the proof, so trigger no extra
-full runs. Use `.venv/bin/python -m lu_machinery.publish workflow-run --workflow ci.yml --ref <branch>`
+full runs. Use `"$LU_PYTHON" -I -m lu_machinery.publish workflow-run --workflow ci.yml --ref <branch>`
 only when the brief explicitly asks for it.
 
 ## §5. Settle loop (never poll by hand)
@@ -145,8 +145,8 @@ only when the brief explicitly asks for it.
 Timers, keeper nudges and reminders are wakeups, not stop conditions: continue authorized work
 until its terminal goal, a real blocker, an explicit operator pause or the seat's handoff signal.
 A dispatch returning is not a settle. Arm
-`.venv/bin/python -m lu_machinery.dispatch wait <task-id> --run-nonce <nonce>` in the same turn (or watch
-the task's `batch_state/tasks/<id>.json` `status` with the Monitor tool); ending a turn with a
+`"$LU_PYTHON" -I -m lu_machinery.dispatch wait <task-id> --run-nonce <nonce>` in the same turn (or watch
+the task's `<id>.json` `status` in the task store (`$LU_TASKS_DIR`, default `$LU_STATE_ROOT/batch_state/tasks`) with the Monitor tool); ending a turn with a
 live worker and no wait is a driver defect. When it returns, read the result and act. The wait
 is a §2c fill window, not an idle period.
 

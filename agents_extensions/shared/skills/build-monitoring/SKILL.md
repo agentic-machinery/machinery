@@ -11,7 +11,7 @@ Agents may run V7 builds during autonomous orchestration — always pass `--work
 
 ```
 Monitor(
-    command=".venv/bin/python -u scripts/build/v7_build.py {level} {slug} 2>&1 | grep --line-buffered '^{\"event\"'",
+    command="cd \"$LU_PRODUCT_ROOT\" && .venv/bin/python -u scripts/build/v7_build.py {level} {slug} 2>&1 | grep --line-buffered '^{\"event\"'",
     description="V7 build events for {level}/{slug}",
     persistent=True,
     timeout_ms=3600000

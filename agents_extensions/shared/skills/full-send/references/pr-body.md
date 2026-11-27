@@ -40,9 +40,9 @@ or the operator's words in a title or body (rules core P8).
 ## Commands
 
 ```bash
-"$PY" -m lu_machinery.publish pr-create --title "$TITLE" --body-file "$BODY" \
+"$PY" -I -m lu_machinery.publish pr-create --title "$TITLE" --body-file "$BODY" \
   --base main --head "$BRANCH"
-"$PY" -m lu_machinery.publish pr-edit --number "$PR" --body-file "$BODY"
+"$PY" -I -m lu_machinery.publish pr-edit --number "$PR" --body-file "$BODY"
 ```
 
 `pr-create` takes no labels. Open a non-draft PR so PR CI and review bots run, unless the

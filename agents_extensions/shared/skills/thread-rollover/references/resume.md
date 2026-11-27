@@ -11,21 +11,21 @@ Use the replacement already bound to this rollover.
 For a pending packet, bind and resume the exact replacement:
 
 ```bash
-.venv/bin/python -m lu_machinery.orchestration.thread_handoff bootstrap-replacement --agent <agent> --lineage-id <lineage-id> --rollover-id <rollover-id> --replacement-thread-id <exact-replacement-task-id> --evidence "exact replacement binding"
+"$LU_PYTHON" -I -m lu_machinery.orchestration.thread_handoff bootstrap-replacement --agent <agent> --lineage-id <lineage-id> --rollover-id <rollover-id> --replacement-thread-id <exact-replacement-task-id> --evidence "exact replacement binding"
 ```
 
 For an already resumed packet, proceed directly to confirmation:
 
 ```bash
-.venv/bin/python -m lu_machinery.orchestration.thread_handoff confirm-replacement --agent <agent> --lineage-id <lineage-id> --rollover-id <rollover-id> --replacement-thread-id <exact-replacement-task-id>
+"$LU_PYTHON" -I -m lu_machinery.orchestration.thread_handoff confirm-replacement --agent <agent> --lineage-id <lineage-id> --rollover-id <rollover-id> --replacement-thread-id <exact-replacement-task-id>
 ```
 
 The lower-level `resume` and `confirm-started` commands remain available for
 native adapters that have already registered the replacement:
 
 ```bash
-.venv/bin/python -m lu_machinery.orchestration.thread_handoff resume --agent <agent> --lineage-id <lineage-id> --rollover-id <rollover-id> --replacement-thread-id <exact-replacement-task-id>
-.venv/bin/python -m lu_machinery.orchestration.thread_handoff confirm-started --agent <agent> --lineage-id <lineage-id> --rollover-id <rollover-id> --new-thread-id <exact-replacement-task-id>
+"$LU_PYTHON" -I -m lu_machinery.orchestration.thread_handoff resume --agent <agent> --lineage-id <lineage-id> --rollover-id <rollover-id> --replacement-thread-id <exact-replacement-task-id>
+"$LU_PYTHON" -I -m lu_machinery.orchestration.thread_handoff confirm-started --agent <agent> --lineage-id <lineage-id> --rollover-id <rollover-id> --new-thread-id <exact-replacement-task-id>
 ```
 
 Confirmation checks the persisted replacement binding and lease. It requires no

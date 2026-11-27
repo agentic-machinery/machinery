@@ -67,18 +67,19 @@ hard-code or invent a server host.
    capacity, or permission to widen.
 6. Fall back deterministically without abandoning API-first behavior:
    - orient: `git status --short --branch`, lane-scoped `gh pr list`, and
-     `.venv/bin/python -m lu_machinery.fleet_comms plane-status`;
+     `"$LU_PYTHON" -I -m lu_machinery.fleet_comms plane-status`;
    - rules/session: the exact source files named by the manifest;
    - issue membership: `lu_machinery/config/fleet_taxonomy.yaml`,
      `lu_machinery/config/issue_streams.yaml`, and
-     `.venv/bin/python -m lu_machinery.orchestration.issue_stream_audit`;
+     `"$LU_PYTHON" -I -m lu_machinery.orchestration.issue_stream_audit`;
    - worktrees: `git worktree list --porcelain`;
    - runtime inventory: `lu_machinery/config/model_catalog.yaml`;
    - fresh Codex transport:
-     `.venv/bin/python -m scripts.orchestration.codex_transport_health status
+     `"$LU_PYTHON" -I -m lu_machinery.orchestration.codex_transport_health status
      --json`; only the bounded launcher/probe command may refresh it;
    - routing budget: the capacity commands below;
-   - active delegates: exact `batch_state/tasks/<task-id>.json` records plus
+   - active delegates: exact `<task-id>.json` records in
+     the task store (`$LU_TASKS_DIR`, default `$LU_STATE_ROOT/batch_state/tasks`) plus
      GitHub PR state.
 7. Retry the API on the next material cycle; a temporary fallback never
    permanently demotes it. After a write that must be immediately visible, use
@@ -134,8 +135,8 @@ first. Then query the fleet capacity commands as the local quota and health
 probe (`codexbar usage` is retired, 2026-10-16):
 
 ```bash
-.venv/bin/python -m lu_machinery.fleet.capacity_pick --json
-.venv/bin/python -m lu_machinery.fleet.usage show
+"$LU_PYTHON" -I -m lu_machinery.fleet.capacity_pick --json
+"$LU_PYTHON" -I -m lu_machinery.fleet.usage show
 ```
 
 - If direct Gemini is unauthenticated, use the Antigravity Google AI Ultra
@@ -173,14 +174,7 @@ Use the live model catalog and rules as authority. Standing task-fit defaults:
   Opus 5.5 / Sol 6.2 @ `high` (#9583).
 - Claude Opus 5.5 handles hard Claude-lane coding where applicable. Give each
   Hydrogen worker a complete brief with acceptance criteria.
-- Grok may own sustained daily driving where the roster permits. Advisors
-  (Opus 5.5 / Sol 6.2) are summoned for short judgment, not polling.
-- GLM-5.3/z.ai is eligible for public, non-sensitive code/infra, bug/security,
-  and cross-file analysis only. It is local-invocation-only, sends prompt data
-  to China, never runs in CI or automated pipelines, never receives secrets,
-  credentials, learner data, private sources, or sensitive infrastructure, and
-  is never a Ukrainian-language authority. Count it as formal review only when
-  the live machine policy says it is eligible.
+- Advisors (Opus 5.5 / Sol 6.2) are summoned for short judgment, not polling.
 
 ## Compose native V2 and the external fleet
 
@@ -224,7 +218,7 @@ cross-family review.
 - Native children are OpenAI-family helpers and never satisfy the independent
   cross-family review gate.
 
-External work uses `.venv/bin/python -m lu_machinery.dispatch dispatch` with a
+External work uses `"$LU_PYTHON" -I -m lu_machinery.dispatch dispatch` with a
 stable task ID, exact agent/model/harness, explicit mode, lifecycle ledger,
 worktree for writes, and deliberate research classification:
 
@@ -240,7 +234,7 @@ owned paths, lifecycle, state, evidence, PR, reviewer, and disposition.
 
 ## Fleet-comms, review, and closeout
 
-- Run `.venv/bin/python -m lu_machinery.fleet_comms plane-status` before assuming
+- Run `"$LU_PYTHON" -I -m lu_machinery.fleet_comms plane-status` before assuming
   message-plane behavior. Use its metrics, bottleneck, backlog, and
   dead-letter surfaces when the cycle needs them.
 - Drain and acknowledge the exact live-driver inbox at the boundaries required

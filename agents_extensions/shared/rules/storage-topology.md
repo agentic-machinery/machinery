@@ -20,7 +20,7 @@ as directories. If roots are missing or ambiguous, treat bulk as **unavailable**
 
 1. **Status before path invention:**
    ```bash
-   .venv/bin/python -m lu_machinery.storage status
+   "$LU_PYTHON" -I -m lu_machinery.storage status
    # or absolute primary interpreter from a worktree
    ```
 2. **Rebuild / raw JSONL consumers** go through
@@ -83,7 +83,7 @@ file). Generation names are never reused; generations stay WAL and are held
 
 1. **Write only under the store writer lock** (`data/.sources-writer.lock`). In
    Python use `store_writer` from `lu_machinery.storage.generations`; run any other writer
-   as `.venv/bin/python -m lu_machinery.storage write -- <command>`. A writable open
+   as `"$LU_PYTHON" -I -m lu_machinery.storage write -- <command>`. A writable open
    of the store without the lock, or of a generation the selector does not
    select, is refused.
 2. **Change the selection only through `publish_generation`**, holding the lock
@@ -101,7 +101,7 @@ inputs); it is never the only copy of anything, and it never writes
 `sources.db` or `vesum.db`. Readers follow the rules above and open it through
 `scripts.lexdata.generation.open_generation`, which also refuses an
 unpublished or digest-mismatched generation. Its only writer is
-`.venv/bin/python -m scripts.lexdata build`, run from the primary checkout:
+`"$LU_PRODUCT_ROOT/.venv/bin/python" -m scripts.lexdata build`, run from the product's primary checkout:
 `build_store.writer_target` refuses a linked worktree, a network or unknown
 filesystem and symlinked `data`/`data/lexdata` paths. One build holds an
 exclusive lock on `data/lexdata/.build.lock`, writes a new generation file,
@@ -113,10 +113,10 @@ legacy resolution object can carry a fallback path on network refusal; it is
 not the supported contract for new readers.
 
 The store-access ratchet covers `scripts/` and `tests/`. Reproduce its frozen
-baseline with the project interpreter:
+baseline with the machinery interpreter (it reads the product named by `LU_PRODUCT_ROOT`):
 
 ```bash
-<primary-checkout>/.venv/bin/python -m lu_machinery.hygiene.lint_source_db_writable_connects --census <base-commit>
+"$LU_PYTHON" -I -m lu_machinery.hygiene.lint_source_db_writable_connects --census <base-commit>
 ```
 
 It reads tracked commit
