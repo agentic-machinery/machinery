@@ -95,7 +95,9 @@ def test_batch_state_join_outside_state_paths_fails_ratchet(tmp_path):
         encoding="utf-8",
     )
     (pkg / "consumer.py").write_text(
-        "from lu_machinery import state_paths\ndef loc(root):\n    return state_paths.tasks_dir(root)\n",
+        "from lu_machinery import state_paths\n"
+        "def loc(root):\n    return state_paths.tasks_dir(root)\n"
+        'def msg(item: str) -> str:\n    return f"hold path must lie below batch_state/: {item}"\n',
         encoding="utf-8",
     )
     assert boundary_ratchet.batch_state_join_violations(clean_tree) == []
@@ -136,11 +138,15 @@ def test_batch_state_join_outside_state_paths_fails_ratchet(tmp_path):
         'def w(root: str) -> str:\n    return f"{root}{os.sep}batch_state"\n'
         'def x(name: str) -> str:\n    return f"batch_state/{name}"\n'
         'def y(name: str) -> str:\n    return f"batch_state{os.sep}{name}"\n'
-        'def z(name: str) -> str:\n    return f"{state_paths.BATCH_STATE_DIRNAME}/{name}"\n',
+        'def z(name: str) -> str:\n    return f"{state_paths.BATCH_STATE_DIRNAME}/{name}"\n'
+        'def aa(name: str) -> str:\n    return f"batch_state/task-{name}.json"\n'
+        'def ab(name: str) -> str:\n    return f":(literal)batch_state/task-{name}.json"\n'
+        'def ac(root: str) -> str:\n    return f"{root}/batch_state/my folder"\n'
+        'def ad(root: str, name: str) -> str:\n    return f"{root}{os.sep}batch_state/my folder/{name}"\n',
         encoding="utf-8",
     )
     violations = boundary_ratchet.batch_state_join_violations(clean_tree)
-    assert len(violations) == 27
+    assert len(violations) == 31
     assert all(item.startswith("lu_machinery/rogue.py:") for item in violations)
 
     empty_tree = tmp_path / "empty"

@@ -2045,13 +2045,20 @@ class AgeOutResult:
     locator: str | None = None
 
 
-def _bundle_name_ok(name: str) -> bool:
+def _restore_bundle_name_ok(name: str) -> bool:
+    """Safe plain POSIX ``*.bundle`` basename for receipt-backed restore (preserves historical names)."""
     return (
-        state_paths.is_valid_component(name)
+        bool(name)
+        and "\x00" not in name
+        and "/" not in name
         and name == Path(name).name
         and name.endswith(".bundle")
         and not name.startswith(".")
     )
+
+
+def _bundle_name_ok(name: str) -> bool:
+    return state_paths.is_valid_component(name) and _restore_bundle_name_ok(name)
 
 
 def _bundle_archive_locator(name: str) -> str:
@@ -2301,7 +2308,7 @@ def restore_bundle(
     resolution: storage_topology.BulkRootResolution | None = None,
 ) -> Path:
     """Copy a relocated bundle back from the bulk mirror and prove it. Never replaces a file, never deletes."""
-    if not _bundle_name_ok(name):
+    if not _restore_bundle_name_ok(name):
         raise RuntimeError("bundle name must be a plain *.bundle file name")
     records = [row for row in _relocation_records(repo) if row.get("bundle") == name]
     if not records:

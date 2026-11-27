@@ -754,16 +754,6 @@ def _iter_binding_targets(target: ast.AST) -> list[ast.AST]:
     return [target]
 
 
-def _has_batch_state_path_segment(text: str) -> bool:
-    """True when ``text`` contains a ``batch_state`` path segment without whitespace."""
-    if not text or any(ch.isspace() for ch in text):
-        return False
-    return any(
-        seg == "batch_state" or seg.endswith(")batch_state")
-        for seg in text.replace("\\", "/").split("/")
-    )
-
-
 def _joined_str_joins_batch_state(
     node: ast.JoinedStr,
     bound_names: frozenset[str],
@@ -771,41 +761,28 @@ def _joined_str_joins_batch_state(
     state_paths_aliases: frozenset[str],
     sep_names: frozenset[str],
 ) -> bool:
-    """True when an f-string directly joins a path segment with ``batch_state``."""
-    values = node.values
-
-    def _part_has_batch_state(item: ast.AST) -> bool:
-        if isinstance(item, ast.Constant) and isinstance(item.value, str):
-            return _has_batch_state_path_segment(item.value)
-        return isinstance(item, ast.FormattedValue) and _expr_has_batch_state_segment(
-            item.value, bound_names, bound_attrs, state_paths_aliases
-        )
-
-    for idx, part in enumerate(values):
+    """True when a path-shaped f-string directly joins a segment with ``batch_state``."""
+    pieces: list[str] = []
+    for part in node.values:
         if isinstance(part, ast.Constant) and isinstance(part.value, str):
-            text = part.value
-            if not text or any(ch.isspace() for ch in text):
-                continue
-            if idx > 0 and isinstance(values[idx - 1], ast.FormattedValue) and text.startswith(("/", "\\")):
-                if _has_batch_state_path_segment(text):
-                    return True
-                if _part_has_batch_state(values[idx - 1]) and (len(text) > 1 or idx + 1 < len(values)):
-                    return True
-            if (
-                idx + 1 < len(values)
-                and isinstance(values[idx + 1], ast.FormattedValue)
-                and text.endswith(("/", "\\"))
-                and (_has_batch_state_path_segment(text) or _part_has_batch_state(values[idx + 1]))
-            ):
-                return True
-        elif (
-            isinstance(part, ast.FormattedValue)
-            and 0 < idx < len(values) - 1
-            and _is_path_sep_expr(part.value, sep_names)
-            and (_part_has_batch_state(values[idx - 1]) or _part_has_batch_state(values[idx + 1]))
-        ):
-            return True
-    return False
+            pieces.append(part.value.replace("\\", "/"))
+        elif isinstance(part, ast.FormattedValue):
+            if _is_path_sep_expr(part.value, sep_names):
+                pieces.append("/")
+            elif _expr_has_batch_state_segment(part.value, bound_names, bound_attrs, state_paths_aliases):
+                pieces.append("batch_state")
+            else:
+                pieces.append("\x01")
+    rendered = "".join(pieces)
+    if "\n" in rendered or "\r" in rendered or ": " in rendered:
+        return False
+    candidate = rendered.split(")", 1)[1] if rendered.startswith(":(") and ")" in rendered else rendered
+    segments = candidate.split("/")
+    if "batch_state" not in segments:
+        return False
+    if sum(1 for seg in segments if seg) < 2:
+        return False
+    return all(seg == seg.strip() for seg in segments)
 
 
 def _template_has_path_join_placeholder(expr: ast.AST, *, percent: bool) -> bool:
