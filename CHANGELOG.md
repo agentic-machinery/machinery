@@ -9,6 +9,30 @@ this file.
 
 ## [Unreleased]
 
+<a id="v0.1.83"></a>
+## [0.1.83] - 2026-11-27
+
+### Added
+
+- Validate an explicit machinery host context ([#1521](https://github.com/agentic-machinery/machinery/pull/1521))
+- Centralize batch_state store paths ([#1535](https://github.com/agentic-machinery/machinery/pull/1535))
+
+### Changed
+
+- Pin the product consumer check to the host-binding fixture revision ([#1534](https://github.com/agentic-machinery/machinery/pull/1534))
+- Guard the durable state path spelling ([#1536](https://github.com/agentic-machinery/machinery/pull/1536))
+- Use the host binding for hook and launcher startup ([#1531](https://github.com/agentic-machinery/machinery/pull/1531))
+- Keep the suite off the live host binding file ([#1543](https://github.com/agentic-machinery/machinery/pull/1543))
+
+### Fixed
+
+- Require an explicit durable state binding ([#1525](https://github.com/agentic-machinery/machinery/pull/1525))
+- Bind Claude hooks and review dispatch to the runtime ([#1528](https://github.com/agentic-machinery/machinery/pull/1528))
+- An empty claim or receive exits 0 ([#1529](https://github.com/agentic-machinery/machinery/pull/1529))
+- Register the open machinery stream root ([#1533](https://github.com/agentic-machinery/machinery/pull/1533))
+- Account subset selectors and keep synthetic JUnit parseable ([#1542](https://github.com/agentic-machinery/machinery/pull/1542))
+- Use the live host binding for contract canary children ([#1545](https://github.com/agentic-machinery/machinery/pull/1545))
+
 <a id="v0.1.82"></a>
 ## [0.1.82] - 2026-11-26
 
@@ -1862,7 +1886,8 @@ First release: the machinery extracted from learn-ukrainian as the installable `
 - Rollover confirms replacement bindings without a self-answered quiz. ([#65](https://github.com/learn-ukrainian/machinery/pull/65))
 - Deploy derives release identity from packaged bytes. ([#145](https://github.com/learn-ukrainian/machinery/pull/145))
 
-[Unreleased]: https://github.com/agentic-machinery/machinery/compare/v0.1.82...HEAD
+[Unreleased]: https://github.com/agentic-machinery/machinery/compare/v0.1.83...HEAD
+[0.1.83]: https://github.com/agentic-machinery/machinery/compare/v0.1.82...v0.1.83
 [0.1.82]: https://github.com/agentic-machinery/machinery/compare/v0.1.79...v0.1.82
 [0.1.81]: https://github.com/agentic-machinery/machinery/compare/v0.1.79...v0.1.81
 [0.1.80]: https://github.com/agentic-machinery/machinery/compare/v0.1.79...v0.1.80
