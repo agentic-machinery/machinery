@@ -100,6 +100,34 @@ BATCH_STATE_JOIN_R4_PENDING = frozenset(
 )
 _PATH_CTORS = frozenset({"Path", "PurePath", "PosixPath", "PurePosixPath", "WindowsPath", "PureWindowsPath"})
 _OS_PATH_JOIN_NAMES = frozenset({"os.path.join", "posixpath.join", "ntpath.join"})
+_BATCH_STATE_CONST_ATTRS = frozenset(
+    {
+        "BATCH_STATE_DIRNAME",
+        "TASKS_PARTS",
+        "TASKS_ARCHIVE_PARTS",
+        "PRESERVED_PARTS",
+        "REVIEW_RECEIPTS_PARTS",
+        "REVIEW_FINDINGS_PARTS",
+        "REVIEW_MEASUREMENT_PARTS",
+        "FLEET_COMMS_REL",
+        "FLEET_COMMS_RETENTION_REL",
+        "RESET_RESERVE_REL",
+        "BRANCH_ARCHIVE_REL",
+        "BRANCH_ARCHIVE_LEDGER_REL",
+        "BRANCH_ARCHIVE_RECEIPT_REL",
+        "BRANCH_ARCHIVE_LOCK_REL",
+        "BACKUP_ALERTS_REL",
+        "BACKUP_LAST_RUN_REL",
+        "DEFAULT_ROOT_REL",
+        "RESERVE_RELATIVE_PATH",
+        "PLAN_DIR_REL",
+        "DEFAULT_STATE_DIR",
+        "LAST_RUN_RECEIPT",
+        "DB_DIRECTORY",
+        "MEASUREMENT_DIR",
+        "_DEFAULT_RECEIPTS_PARTS",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -643,65 +671,150 @@ def _is_batch_state_segment(value: str) -> bool:
     )
 
 
-def _joined_str_joins_batch_state(node: ast.JoinedStr) -> bool:
-    """True when an f-string directly joins an interpolated expression with ``/batch_state``."""
-    prev_was_expr = False
-    for part in node.values:
-        if isinstance(part, ast.FormattedValue):
-            prev_was_expr = True
-        elif isinstance(part, ast.Constant) and isinstance(part.value, str):
-            text = part.value
-            if prev_was_expr and (text == "/batch_state" or text.startswith("/batch_state/")):
-                return True
-            prev_was_expr = False
-        else:
-            prev_was_expr = False
-    return False
+def _is_state_paths_const_name(name: str) -> bool:
+    return name == "BATCH_STATE_DIRNAME" or name.endswith(("_REL", "_PARTS"))
 
 
-def _expr_has_batch_state_segment(expr: ast.AST, bound: frozenset[str]) -> bool:
+def _expr_has_batch_state_segment(
+    expr: ast.AST,
+    bound_names: frozenset[str],
+    bound_attrs: frozenset[str],
+    state_paths_aliases: frozenset[str],
+) -> bool:
     if isinstance(expr, ast.Starred):
-        return _expr_has_batch_state_segment(expr.value, bound)
+        return _expr_has_batch_state_segment(expr.value, bound_names, bound_attrs, state_paths_aliases)
     if isinstance(expr, ast.Constant) and isinstance(expr.value, str):
         return _is_batch_state_segment(expr.value)
     if isinstance(expr, ast.Name):
-        return expr.id in bound
+        return expr.id in bound_names
+    if isinstance(expr, ast.Attribute):
+        if expr.attr in _BATCH_STATE_CONST_ATTRS or expr.attr in bound_attrs:
+            return True
+        return (
+            isinstance(expr.value, ast.Name)
+            and expr.value.id in state_paths_aliases
+            and _is_state_paths_const_name(expr.attr)
+        )
+    if isinstance(expr, (ast.Tuple, ast.List)):
+        return any(
+            _expr_has_batch_state_segment(elt, bound_names, bound_attrs, state_paths_aliases)
+            for elt in expr.elts
+        )
+    if isinstance(expr, ast.BinOp) and isinstance(expr.op, (ast.Add, ast.Div)):
+        return _expr_has_batch_state_segment(
+            expr.left, bound_names, bound_attrs, state_paths_aliases
+        ) or _expr_has_batch_state_segment(expr.right, bound_names, bound_attrs, state_paths_aliases)
     if isinstance(expr, ast.JoinedStr):
         parts = [
             part.value for part in expr.values if isinstance(part, ast.Constant) and isinstance(part.value, str)
         ]
-        joined = "".join(parts)
-        return _is_batch_state_segment(joined)
+        if _is_batch_state_segment("".join(parts)):
+            return True
+        return any(
+            isinstance(part, ast.FormattedValue)
+            and _expr_has_batch_state_segment(part.value, bound_names, bound_attrs, state_paths_aliases)
+            for part in expr.values
+        )
     return False
 
 
-def _bound_batch_state_names(tree: ast.AST) -> frozenset[str]:
-    """Simple name bindings to a ``batch_state`` path literal or tuple/list of segments."""
-    bound: set[str] = set()
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Assign):
-            targets = node.targets
-            value: ast.AST | None = node.value
-        elif isinstance(node, ast.AnnAssign):
-            targets = [node.target]
-            value = node.value
-        else:
-            continue
-        if value is None:
-            continue
-        matched = False
-        if isinstance(value, ast.Constant) and isinstance(value.value, str):
-            matched = _is_batch_state_segment(value.value)
-        elif isinstance(value, (ast.Tuple, ast.List)):
-            matched = any(
-                isinstance(elt, ast.Constant) and isinstance(elt.value, str) and _is_batch_state_segment(elt.value)
-                for elt in value.elts
-            )
-        if matched:
+def _joined_str_joins_batch_state(
+    node: ast.JoinedStr,
+    bound_names: frozenset[str],
+    bound_attrs: frozenset[str],
+    state_paths_aliases: frozenset[str],
+) -> bool:
+    """True when an f-string directly joins an interpolated expression with ``batch_state``."""
+    values = node.values
+    for idx, part in enumerate(values):
+        if (
+            isinstance(part, ast.Constant)
+            and isinstance(part.value, str)
+            and idx > 0
+            and isinstance(values[idx - 1], ast.FormattedValue)
+        ):
+            text = part.value
+            if text == "/batch_state" or text.startswith("/batch_state/"):
+                return True
+            if text == "/" and idx + 1 < len(values):
+                next_part = values[idx + 1]
+                if isinstance(next_part, ast.FormattedValue) and _expr_has_batch_state_segment(
+                    next_part.value, bound_names, bound_attrs, state_paths_aliases
+                ):
+                    return True
+    return False
+
+
+def _template_has_path_join_placeholder(expr: ast.AST, *, percent: bool) -> bool:
+    if not (isinstance(expr, ast.Constant) and isinstance(expr.value, str)):
+        return False
+    text = expr.value
+    if percent:
+        return "/%" in text or "%s/" in text or "%r/" in text
+    return "/{" in text or "}/" in text
+
+
+def _bound_batch_state_symbols(tree: ast.AST) -> tuple[frozenset[str], frozenset[str], frozenset[str]]:
+    """Collect local names, attributes, and ``state_paths`` aliases carrying ``batch_state`` segments."""
+    bound_names: set[str] = set()
+    bound_attrs: set[str] = set()
+    state_paths_aliases: set[str] = set()
+    assignments: list[tuple[list[ast.AST], ast.AST, bool]] = []
+
+    def _visit(node: ast.AST, *, in_class_body: bool = False) -> None:
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name == "lu_machinery.state_paths" or alias.name.endswith(".state_paths"):
+                    state_paths_aliases.add(alias.asname or alias.name)
+        elif isinstance(node, ast.ImportFrom):
+            mod = node.module or ""
+            for alias in node.names:
+                if alias.name == "state_paths" and mod.endswith("lu_machinery"):
+                    state_paths_aliases.add(alias.asname or alias.name)
+                elif alias.name in _BATCH_STATE_CONST_ATTRS or (
+                    mod.endswith("state_paths") and _is_state_paths_const_name(alias.name)
+                ):
+                    bound_names.add(alias.asname or alias.name)
+        elif isinstance(node, ast.Assign):
+            assignments.append((list(node.targets), node.value, in_class_body))
+        elif isinstance(node, ast.AnnAssign) and node.value is not None:
+            assignments.append(([node.target], node.value, in_class_body))
+
+        if isinstance(node, ast.ClassDef):
+            for stmt in node.body:
+                _visit(stmt, in_class_body=True)
+            for deco in node.decorator_list:
+                _visit(deco, in_class_body=False)
+            for base in node.bases:
+                _visit(base, in_class_body=False)
+            return
+        for child in ast.iter_child_nodes(node):
+            _visit(child, in_class_body=False)
+
+    _visit(tree)
+
+    sp_frozen = frozenset(state_paths_aliases)
+    changed = True
+    while changed:
+        changed = False
+        names_frozen = frozenset(bound_names)
+        attrs_frozen = frozenset(bound_attrs)
+        for targets, value, in_class_body in assignments:
+            if not _expr_has_batch_state_segment(value, names_frozen, attrs_frozen, sp_frozen):
+                continue
             for target in targets:
                 if isinstance(target, ast.Name):
-                    bound.add(target.id)
-    return frozenset(bound)
+                    if target.id not in bound_names:
+                        bound_names.add(target.id)
+                        changed = True
+                    if in_class_body and target.id not in bound_attrs:
+                        bound_attrs.add(target.id)
+                        changed = True
+                elif isinstance(target, ast.Attribute):
+                    if target.attr not in bound_attrs:
+                        bound_attrs.add(target.attr)
+                        changed = True
+    return frozenset(bound_names), frozenset(bound_attrs), sp_frozen
 
 
 def _scan_batch_state_joins(rel: str, source: bytes) -> list[str]:
@@ -709,13 +822,26 @@ def _scan_batch_state_joins(rel: str, source: bytes) -> list[str]:
         tree = ast.parse(source, filename=rel)
     except (SyntaxError, ValueError):
         return [f"{rel}: cannot parse Python for batch_state ratchet"]
-    bound = _bound_batch_state_names(tree)
+    bound_names, bound_attrs, sp_aliases = _bound_batch_state_symbols(tree)
     lines: set[int] = set()
     for node in ast.walk(tree):
-        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Div):
-            if _expr_has_batch_state_segment(node.left, bound) or _expr_has_batch_state_segment(node.right, bound):
+        if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Div, ast.Add)):
+            if _expr_has_batch_state_segment(
+                node.left, bound_names, bound_attrs, sp_aliases
+            ) or _expr_has_batch_state_segment(node.right, bound_names, bound_attrs, sp_aliases):
                 lines.add(node.lineno)
-        elif isinstance(node, ast.JoinedStr) and _joined_str_joins_batch_state(node):
+        elif isinstance(node, ast.BinOp) and isinstance(node.op, ast.Mod):
+            if _expr_has_batch_state_segment(node.left, bound_names, bound_attrs, sp_aliases) or (
+                _template_has_path_join_placeholder(node.left, percent=True)
+                and _expr_has_batch_state_segment(node.right, bound_names, bound_attrs, sp_aliases)
+            ):
+                lines.add(node.lineno)
+        elif isinstance(node, ast.AugAssign) and isinstance(node.op, (ast.Div, ast.Add)):
+            if _expr_has_batch_state_segment(node.value, bound_names, bound_attrs, sp_aliases):
+                lines.add(node.lineno)
+        elif isinstance(node, ast.JoinedStr) and _joined_str_joins_batch_state(
+            node, bound_names, bound_attrs, sp_aliases
+        ):
             lines.add(node.lineno)
         elif isinstance(node, ast.Call):
             name = call_name(node.func)
@@ -725,11 +851,31 @@ def _scan_batch_state_joins(rel: str, source: bytes) -> list[str]:
                 or name in _OS_PATH_JOIN_NAMES
                 or (isinstance(node.func, ast.Attribute) and node.func.attr == "joinpath")
             ):
-                if any(_expr_has_batch_state_segment(arg, bound) for arg in node.args):
+                if any(
+                    _expr_has_batch_state_segment(arg, bound_names, bound_attrs, sp_aliases)
+                    for arg in node.args
+                ):
+                    lines.add(node.lineno)
+            elif isinstance(node.func, ast.Attribute) and node.func.attr == "format":
+                if _expr_has_batch_state_segment(node.func.value, bound_names, bound_attrs, sp_aliases) or (
+                    _template_has_path_join_placeholder(node.func.value, percent=False)
+                    and (
+                        any(
+                            _expr_has_batch_state_segment(arg, bound_names, bound_attrs, sp_aliases)
+                            for arg in node.args
+                        )
+                        or any(
+                            _expr_has_batch_state_segment(kw.value, bound_names, bound_attrs, sp_aliases)
+                            for kw in node.keywords
+                        )
+                    )
+                ):
                     lines.add(node.lineno)
             elif isinstance(node.func, ast.Attribute) and node.func.attr == "add_argument":
                 for kw in node.keywords:
-                    if kw.arg == "default" and _expr_has_batch_state_segment(kw.value, bound):
+                    if kw.arg == "default" and _expr_has_batch_state_segment(
+                        kw.value, bound_names, bound_attrs, sp_aliases
+                    ):
                         lines.add(node.lineno)
     return [f"{rel}:{lineno}: batch_state path join outside lu_machinery/state_paths.py" for lineno in sorted(lines)]
 
@@ -739,7 +885,7 @@ def batch_state_join_violations(root: Path, targets: Sequence[str] | None = None
     pkg = _machinery_top()
     pkg_dir = root / pkg
     if not pkg_dir.is_dir():
-        return []
+        return [f"{pkg}/: package directory not found under {root}; batch_state ratchet cannot run"]
     if targets is None:
         paths = sorted(
             path for path in pkg_dir.rglob("*.py") if _SKIP_DIRS.isdisjoint(path.parts) and path.is_file()
@@ -782,7 +928,8 @@ def evaluate(
     violations.extend(compare(current, baseline))
     full_baseline = load_baseline(baseline_path)
     violations.extend(shrink_violations(root, baseline_path, full_baseline))
-    violations.extend(batch_state_join_violations(root, scope))
+    if (root / _machinery_top()).is_dir():
+        violations.extend(batch_state_join_violations(root, scope))
     return violations
 
 
@@ -1252,8 +1399,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
     try:
-        root = product_root(args.root.absolute() if args.root is not None else None).resolve()
         if args.check_state_paths:
+            root = (
+                args.root.resolve()
+                if args.root is not None
+                else Path(os.path.abspath(__file__)).parents[2]
+            )
             targets = _normalize_targets(root, args.paths) if args.paths else None
             violations = batch_state_join_violations(root, _scope(targets))
             if violations:
@@ -1261,6 +1412,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 return 1
             print("OK: no batch_state path joins outside lu_machinery/state_paths.py")
             return 0
+        root = product_root(args.root.absolute() if args.root is not None else None).resolve()
         baseline = product_tree_path(*BASELINE_PATH.parts, root=root) if args.baseline is None else (
             args.baseline if args.baseline.is_absolute() else root / args.baseline
         )

@@ -28,7 +28,7 @@ from typing import Annotated, Any, get_args
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 
-from lu_machinery import agent_identity
+from lu_machinery import agent_identity, state_paths
 from lu_machinery.agent_runtime.accounting import recorded_model_accounting_fields
 from lu_machinery.common import json_depth
 from lu_machinery.control_plane import storage
@@ -175,7 +175,7 @@ def _plane_root(ctx: MonitorContext | None = None) -> Path:
             pass
         else:
             try:
-                root = validate_plane_root(base / message_plane.DEFAULT_ROOT_REL)
+                root = validate_plane_root(state_paths.fleet_comms_dir(base))
                 if local_plane_is_retired(root=root):
                     raise PlaneRootAnchorError(RETIRED_LOCAL_PLANE_MESSAGE)
             except PlaneRootAnchorError:

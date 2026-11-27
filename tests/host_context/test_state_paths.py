@@ -103,16 +103,42 @@ def test_batch_state_join_outside_state_paths_fails_ratchet(tmp_path):
     (pkg / "rogue.py").write_text(
         "import os\n"
         "from pathlib import Path\n"
+        "from lu_machinery import state_paths\n"
+        "from lu_machinery.fleet_comms import message_plane\n"
+        "class C:\n"
+        '    D = "batch_state/tasks"\n'
+        "class S:\n"
+        "    def __init__(self) -> None:\n"
+        '        self.d = "batch_state/tasks"\n'
+        "    def use(self, root: Path) -> Path:\n"
+        "        return root / self.d\n"
         'def a(root: Path) -> Path:\n    return root / "batch_state" / "split"\n'
         'def b() -> Path:\n    return Path("batch_state/split")\n'
         'def c(root: Path) -> Path:\n    return root.joinpath("batch_state", "split")\n'
         'def d(root: str) -> str:\n    return os.path.join(root, "batch_state", "split")\n'
-        'def e(root: str) -> str:\n    return f"{root}/batch_state/split"\n',
+        'def e(root: str) -> str:\n    return f"{root}/batch_state/split"\n'
+        'def f(root: Path) -> str:\n    return str(root) + "/batch_state/split"\n'
+        'def g(root: str) -> str:\n    return root + "/" + "batch_state"\n'
+        'def h(root: str) -> str:\n    return "{}/batch_state/split".format(root)\n'
+        'def i(root: str) -> str:\n    return "%s/batch_state/split" % root\n'
+        'def j(root: Path) -> Path:\n    root /= "batch_state"\n    return root\n'
+        'def k(root: str) -> str:\n    root += "/batch_state/split"\n    return root\n'
+        'def m(root: Path) -> Path:\n    return root / state_paths.BATCH_STATE_DIRNAME / "tasks"\n'
+        "def n(root: Path) -> Path:\n    return root / message_plane.DEFAULT_ROOT_REL\n"
+        "def o(root: Path) -> Path:\n    return root / C.D\n"
+        'def p(root: Path) -> Path:\n    parts = ("batch_state",) + ("tasks",)\n    return root.joinpath(*parts)\n',
         encoding="utf-8",
     )
     violations = boundary_ratchet.batch_state_join_violations(clean_tree)
-    assert len(violations) == 5
+    assert len(violations) == 17
     assert all(item.startswith("lu_machinery/rogue.py:") for item in violations)
+
+    empty_tree = tmp_path / "empty"
+    empty_tree.mkdir()
+    missing_violations = boundary_ratchet.batch_state_join_violations(empty_tree)
+    assert len(missing_violations) == 1
+    assert "package directory not found" in missing_violations[0]
+    assert boundary_ratchet.main(["--check-state-paths", "--root", str(empty_tree)]) == 1
 
     live_root = Path(state_paths.__file__).resolve().parents[1]
     assert (live_root / "lu_machinery" / "state_paths.py").is_file()

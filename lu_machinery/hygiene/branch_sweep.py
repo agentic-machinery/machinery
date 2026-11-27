@@ -68,8 +68,8 @@ _HTTP_STATUS_RE = re.compile(r"HTTP/\d+(?:\.\d+)?\s+(\d+)")
 _CLOCK_SKEW = timedelta(seconds=10)
 LEDGER_PATH = state_paths.BRANCH_ARCHIVE_LEDGER_REL
 ARCHIVE_DIR = state_paths.BRANCH_ARCHIVE_REL
-RECEIPT_PATH = ARCHIVE_DIR / "stale-local-receipts.jsonl"
-ARCHIVE_LOCK_PATH = ARCHIVE_DIR / "archive.lock"
+RECEIPT_PATH = state_paths.BRANCH_ARCHIVE_RECEIPT_REL
+ARCHIVE_LOCK_PATH = state_paths.BRANCH_ARCHIVE_LOCK_REL
 DEFAULT_ARCHIVE_AFTER_DAYS = 7
 # A released task younger than this still names work someone may return to.
 # Archival waits. Patch-id deletion and the other dispositions do not.
@@ -1574,7 +1574,7 @@ def _write_verified_bundle(repo: Path, confirmed: list[tuple[Decision, Branch]])
     temporary = Path(temporary_name)
     filename = temporary.name.removeprefix(".").removesuffix(".tmp") + ".bundle"
     bundle_path = directory / filename
-    relative = (ARCHIVE_DIR / filename).as_posix()
+    relative = state_paths.branch_archive_rel(filename).as_posix()
     try:
         _checked(repo, "bundle", "create", str(temporary), *refs, "--not", main_ref)
         _seal_regular_file(temporary)
@@ -2009,7 +2009,7 @@ def _review_bundle_decisions(repo: Path) -> list[Decision]:
             continue
         listed.append(
             Decision(
-                (ARCHIVE_DIR / path.name).as_posix(),
+                state_paths.branch_archive_rel(path.name).as_posix(),
                 "review-bundle",
                 "bundle older than 90 days; listed for review; not deleted",
                 None,
@@ -2152,7 +2152,7 @@ def _age_out_one(
     child = os.lstat(path)
     age_days = max(0, int(now - child.st_mtime) // 86400)
     name = path.name
-    relative = (ARCHIVE_DIR / name).as_posix()
+    relative = state_paths.branch_archive_rel(name).as_posix()
     if stat.S_ISLNK(child.st_mode) or not stat.S_ISREG(child.st_mode) or age_days < min_days:
         return AgeOutResult(relative, "retained", "bundle changed since it was listed", age_days, child.st_size)
     checksum = _bundle_sha256(path)
@@ -2216,10 +2216,14 @@ def age_out_bundles(
         return []
     if not resolved.available or resolved.path is None:
         reason = f"bulk root unavailable ({resolved.reason}); nothing removed"
-        return [AgeOutResult((ARCHIVE_DIR / p.name).as_posix(), "retained", reason, a, s) for p, a, s in candidates]
+        return [
+            AgeOutResult(state_paths.branch_archive_rel(p.name).as_posix(), "retained", reason, a, s)
+            for p, a, s in candidates
+        ]
     if not apply:
         return [
-            AgeOutResult((ARCHIVE_DIR / p.name).as_posix(), "would-age-out", "dry run", a, s) for p, a, s in candidates
+            AgeOutResult(state_paths.branch_archive_rel(p.name).as_posix(), "would-age-out", "dry run", a, s)
+            for p, a, s in candidates
         ]
     results: list[AgeOutResult] = []
     with _archive_lock(repo):
@@ -2229,7 +2233,13 @@ def age_out_bundles(
                 results.append(_age_out_one(repo, path, bulk_directory, resolved, min_days=min_days, now=stamp))
             except (OSError, RuntimeError, subprocess.TimeoutExpired) as exc:
                 results.append(
-                    AgeOutResult((ARCHIVE_DIR / path.name).as_posix(), "retained", f"kept local: {exc}", age_days, size)
+                    AgeOutResult(
+                        state_paths.branch_archive_rel(path.name).as_posix(),
+                        "retained",
+                        f"kept local: {exc}",
+                        age_days,
+                        size,
+                    )
                 )
     return results
 

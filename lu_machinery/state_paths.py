@@ -30,8 +30,15 @@ FLEET_COMMS_RETENTION_REL: Path = Path(BATCH_STATE_DIRNAME, "fleet-comms", "rete
 RESET_RESERVE_REL: Path = Path(BATCH_STATE_DIRNAME, "routing_budget", "operator_reset_reserve.json")
 BRANCH_ARCHIVE_REL: Path = Path(BATCH_STATE_DIRNAME, "branch-archive")
 BRANCH_ARCHIVE_LEDGER_REL: Path = BRANCH_ARCHIVE_REL / "evidence.jsonl"
+BRANCH_ARCHIVE_RECEIPT_REL: Path = BRANCH_ARCHIVE_REL / "stale-local-receipts.jsonl"
+BRANCH_ARCHIVE_LOCK_REL: Path = BRANCH_ARCHIVE_REL / "archive.lock"
 BACKUP_ALERTS_REL: Path = Path(BATCH_STATE_DIRNAME, "backups", "alerts")
 BACKUP_LAST_RUN_REL: Path = Path(BATCH_STATE_DIRNAME, "backups", "last-run.json")
+
+
+def branch_archive_rel(filename: str) -> Path:
+    """Return relative ``batch_state/branch-archive/<filename>`` with a validated filename."""
+    return BRANCH_ARCHIVE_REL / _validate_component(filename)
 
 
 def _anchor(root: Path | None) -> Path:
