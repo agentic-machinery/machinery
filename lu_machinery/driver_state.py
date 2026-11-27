@@ -147,6 +147,15 @@ def render_policy(*, is_cto: bool = False) -> str:
 
 
 POLICY = render_policy()
+_CTO_SEAT = "cto (the launcher owns the epics lease)"
+_DRIVER_SEAT = "driver (one per stream; the launcher owns the lease)"
+_LEGACY_CTO_ESCALATION_RE = re.compile(
+    r"^\s*-\s*Ask the CTO only about deleting data, spending money, security or secrets,"
+)
+_LEGACY_WORKER_TARGET_RE = re.compile(r"^\s*-\s*End every turn with the privately configured worker target met\b")
+_LEGACY_EPICS_LANE_RE = re.compile(r"\blu-driver-state\s+(render|check)\s+--lane(\s+|=)epics(?![a-z0-9-])")
+_LEGACY_DRIVER_SEAT_LINE = f"- Seat: {_DRIVER_SEAT}"
+_CTO_SEAT_LINE = f"- Seat: {_CTO_SEAT}"
 # Keep the existing envelope limit after removing the retired posting protocol.
 MAX_ENVELOPE_CHARS = 9_381
 
@@ -178,20 +187,13 @@ def render_template(epic: str) -> str:
     validate_epic(epic)
     is_cto = epic == CTO_EPIC
     state_lane = CTO_STATE_LANE if is_cto else epic
-    seat = (
-        "cto (the launcher owns the epics lease)"
-        if is_cto
-        else "driver (one per stream; the launcher owns the lease)"
-    )
+    seat = _CTO_SEAT if is_cto else _DRIVER_SEAT
     return TEMPLATE.format(epic=epic, seat=seat, state_lane=state_lane, policy=render_policy(is_cto=is_cto))
 
 
 def _epic_from_path(path: Path) -> str | None:
-    """Extract a validated epic selector from ``.../.claude/<epic>-epic/DRIVER-STATE.md``."""
-    try:
-        parent = path.parent.name or path.resolve().parent.name
-    except OSError:
-        return None
+    """Extract a validated epic selector from the pointer path's lexical parent directory."""
+    parent = path.parent.name
     if not parent.endswith("-epic"):
         return None
     epic = parent.removesuffix("-epic")
@@ -203,13 +205,11 @@ def _epic_from_path(path: Path) -> str | None:
 
 
 def _seat_context(path: Path) -> tuple[bool, str | None]:
-    """Resolve ``(is_cto, state_lane)`` from ``path`` first, then the launcher session environment."""
+    """Resolve ``(is_cto, state_lane)`` from ``path`` first, then ``SESSION_EPIC``, then ``SESSION_SEAT``."""
     epic = _epic_from_path(path)
     if epic is not None:
         is_cto = epic == CTO_EPIC
         return is_cto, (CTO_STATE_LANE if is_cto else epic)
-    if os.environ.get("SESSION_SEAT", "").strip() == CTO_STATE_LANE:
-        return True, CTO_STATE_LANE
     session_epic = os.environ.get("SESSION_EPIC", "").strip()
     if session_epic:
         try:
@@ -218,6 +218,8 @@ def _seat_context(path: Path) -> tuple[bool, str | None]:
             return False, None
         is_cto = session_epic == CTO_EPIC
         return is_cto, (CTO_STATE_LANE if is_cto else session_epic)
+    if os.environ.get("SESSION_SEAT", "").strip() == CTO_STATE_LANE:
+        return True, CTO_STATE_LANE
     return False, None
 
 
@@ -274,10 +276,13 @@ def _section(text: str, title: str) -> list[str]:
     return lines
 
 
+def _with_line_ending(line: str, replacement: str) -> str:
+    ending = line[len(line.rstrip("\r\n")) :]
+    return replacement + ending
+
+
 def render_injection(text: str, path: Path) -> str:
     is_cto, state_lane = _seat_context(path)
-    if POLICY_TITLE.lower() not in text.lower():
-        text = text.rstrip() + "\n\n" + render_policy(is_cto=is_cto)
     tokens = MarkdownIt().parse(text)
     # Match the parser's CR/LF line maps without splitting Unicode separators
     # or changing the original line endings in retained pinned state.
@@ -287,18 +292,32 @@ def render_injection(text: str, path: Path) -> str:
         for index, token in enumerate(tokens)
         if token.type == "heading_open" and token.level == 0 and token.tag in {"h1", "h2"}
     ]
+    has_policy = False
     for index in range(len(headings) - 1, -1, -1):
         start, title, token = headings[index]
-        if (
-            title != "CTO blocker delta policy"
-            or token.tag != "h2"
-            or token.markup != "##"
-            or not lines[start].startswith("##")
-        ):
+        if token.tag != "h2" or token.markup != "##" or not lines[start].startswith("##"):
             continue
         end = headings[index + 1][0] if index + 1 < len(headings) else len(lines)
-        del lines[start:end]
+        if title == "CTO blocker delta policy":
+            del lines[start:end]
+            continue
+        if title.strip().lower() == POLICY_TITLE.lower():
+            has_policy = True
+            for line_idx in range(start + 1, end):
+                line = lines[line_idx]
+                if is_cto and _LEGACY_CTO_ESCALATION_RE.match(line):
+                    lines[line_idx] = _with_line_ending(line, _escalation_policy_line(is_cto=True))
+                elif _LEGACY_WORKER_TARGET_RE.match(line):
+                    lines[line_idx] = _with_line_ending(line, _WORKER_POLICY_LINE)
+    if is_cto:
+        for line_idx, line in enumerate(lines):
+            if line.rstrip("\r\n") == _LEGACY_DRIVER_SEAT_LINE:
+                lines[line_idx] = _with_line_ending(line, _CTO_SEAT_LINE)
+            elif _LEGACY_EPICS_LANE_RE.search(line):
+                lines[line_idx] = _LEGACY_EPICS_LANE_RE.sub(r"lu-driver-state \1 --lane\2cto", line)
     text = "".join(lines)
+    if not has_policy:
+        text = text.rstrip() + "\n\n" + render_policy(is_cto=is_cto)
     lane = state_lane or "<lane>"
     message = (
         "PINNED DRIVER STATE (pinned facts only; re-injected every model call). "

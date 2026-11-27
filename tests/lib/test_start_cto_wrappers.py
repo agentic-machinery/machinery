@@ -1414,7 +1414,8 @@ def test_cto_pointer_names_cto_lane_and_operator_escalation(
     assert "End each turn with free worker slots filled with ready work and a wake-up armed" in infra_template
     assert "privately configured worker target" not in infra_template
 
-    # 2. Fallback injection: a pointer lacking Standing decision policy gets seat-scoped lane and policy.
+    # 2. Fallback injection: a pointer lacking a retained Standing decision policy heading gets
+    #    seat-scoped lane and policy; legacy pointers refresh to the seat's lane and escalation.
     monkeypatch.delenv("SESSION_SEAT", raising=False)
     cto_injected = driver_state.render_injection("# Driver state: epics\n\n## Epic\n- Stream: epics\n", cto_path)
     assert "lu-driver-state render --lane cto" in cto_injected
@@ -1426,6 +1427,38 @@ def test_cto_pointer_names_cto_lane_and_operator_escalation(
     assert "End each turn with free worker slots filled with ready work and a wake-up armed" in cto_injected
     assert "privately configured worker target" not in cto_injected
 
+    # Comment or stripped blocker section mentioning the title must not suppress fallback policy.
+    comment_only = (
+        "# Driver state: epics\n\n<!-- Standing decision policy -->\n\n"
+        "## CTO blocker delta policy\n- Standing decision policy note\n"
+    )
+    cto_from_comment = driver_state.render_injection(comment_only, cto_path)
+    assert "## Standing decision policy" in cto_from_comment
+    assert "Ask the operator only about deleting data" in cto_from_comment
+    assert "CTO blocker delta policy" not in cto_from_comment
+
+    # Legacy merge-base CTO pointer refreshes lane, seat, escalation, and worker wording.
+    legacy_cto = (
+        "# Driver state: epics\n\n## Epic\n- Stream: epics\n"
+        "- Seat: driver (one per stream; the launcher owns the lease)\n\n"
+        "## Database authority\n"
+        "- First run `lu-driver-state render --lane epics`, then `lu-driver-state check --lane epics` on startup.\n\n"
+        "## Standing decision policy\n"
+        "- Ask the CTO only about deleting data, spending money, security or secrets, rule changes, or a true conflict "
+        "between two operator rules. Post it through Fleet Comms and start the final message with `CTO-ESCALATION:`.\n"
+        "- End every turn with the privately configured worker target met and a wake-up armed "
+        "(a background `lu_machinery/dispatch.py wait` or the `schedule` tool), never with a question.\n"
+    )
+    refreshed_cto = driver_state.render_injection(legacy_cto, cto_path)
+    assert "- Seat: cto (the launcher owns the epics lease)" in refreshed_cto
+    assert "lu-driver-state render --lane cto" in refreshed_cto
+    assert "lu-driver-state check --lane cto" in refreshed_cto
+    assert "--lane epics" not in refreshed_cto
+    assert "Ask the operator only about deleting data" in refreshed_cto
+    assert "Ask the CTO" not in refreshed_cto
+    assert "End each turn with free worker slots filled with ready work and a wake-up armed" in refreshed_cto
+    assert "privately configured worker target" not in refreshed_cto
+
     infra_injected = driver_state.render_injection("# Driver state: infra\n\n## Epic\n- Stream: infra\n", infra_path)
     assert "lu-driver-state render --lane infra" in infra_injected
     assert "lu-driver-state check --lane infra" in infra_injected
@@ -1433,20 +1466,47 @@ def test_cto_pointer_names_cto_lane_and_operator_escalation(
     assert "Ask the operator" not in infra_injected
     assert "privately configured worker target" not in infra_injected
 
-    # Non-epic fallback paths read SESSION_SEAT / SESSION_EPIC and fail closed on invalid selectors.
-    custom_path = tmp_path / "custom" / "DRIVER-STATE.md"
+    # Non-epic fallback paths validate SESSION_EPIC before SESSION_SEAT=cto and fail closed on invalid selectors.
+    custom_path = tmp_path / ".claude" / "custom" / "DRIVER-STATE.md"
+    custom_path.parent.mkdir(parents=True, exist_ok=True)
+    custom_path.write_text("# Custom\n", encoding="utf-8")
     monkeypatch.setenv("SESSION_SEAT", "cto")
+    monkeypatch.setenv("SESSION_EPIC", "infra")
+    custom_infra_with_leak = driver_state.render_injection("# Custom\n", custom_path)
+    assert "lu-driver-state render --lane infra" in custom_infra_with_leak
+    assert "Ask the CTO only about deleting data" in custom_infra_with_leak
+    assert "Ask the operator" not in custom_infra_with_leak
+    monkeypatch.setenv("SESSION_EPIC", "../invalid")
+    custom_invalid_with_leak = driver_state.render_injection("# Custom\n", custom_path)
+    assert "lu-driver-state render --lane <lane>" in custom_invalid_with_leak
+    assert "Ask the CTO only about deleting data" in custom_invalid_with_leak
+    monkeypatch.delenv("SESSION_EPIC", raising=False)
     custom_cto = driver_state.render_injection("# Custom\n", custom_path)
     assert "lu-driver-state render --lane cto" in custom_cto
     assert "Ask the operator only about deleting data" in custom_cto
     monkeypatch.delenv("SESSION_SEAT", raising=False)
-    monkeypatch.setenv("SESSION_EPIC", "../invalid")
-    custom_invalid = driver_state.render_injection("# Custom\n", custom_path)
-    assert "lu-driver-state render --lane <lane>" in custom_invalid
-    assert "Ask the CTO only about deleting data" in custom_invalid
+
+    # Relative vs absolute symlink alias resolves identically (lexical parent, no symlink chase) and loops fail closed.
+    alias = tmp_path / "DRIVER-STATE.md"
+    alias.symlink_to(cto_path)
+    monkeypatch.setenv("SESSION_EPIC", "infra")
+    rel_out = driver_state.render_injection("# Alias\n", Path("DRIVER-STATE.md"))
+    abs_out = driver_state.render_injection("# Alias\n", alias)
+    assert "lu-driver-state render --lane infra" in rel_out
+    assert "lu-driver-state render --lane infra" in abs_out
+    assert "Ask the CTO only about deleting data" in rel_out
+    assert "Ask the CTO only about deleting data" in abs_out
+    loop_dir = tmp_path / ".claude" / "epics-epic" / "loop"
+    loop_dir.mkdir()
+    loop_link = loop_dir / "DRIVER-STATE.md"
+    loop_link.symlink_to(loop_link)
+    monkeypatch.chdir(loop_dir)
+    assert driver_state._epic_from_path(Path("DRIVER-STATE.md")) is None
+    monkeypatch.chdir(tmp_path)
     monkeypatch.delenv("SESSION_EPIC", raising=False)
 
-    # 3. Stop-hook continuation and AGY pretool deny messages follow the seat's escalation target.
+    # 3. Stop-hook continuation and AGY pretool deny messages follow the seat's escalation target,
+    #    including custom-path pointers when SESSION_SEAT=cto leaks alongside SESSION_EPIC=infra.
     monkeypatch.setenv("CLAUDE_PROJECT_DIR", str(tmp_path))
     monkeypatch.setenv("SESSION_HANDOFF_AGENT", "claude-epics")
     monkeypatch.setenv(driver_state.STATE_ENV, str(cto_path))
@@ -1471,23 +1531,26 @@ def test_cto_pointer_names_cto_lane_and_operator_escalation(
     assert "post to the CTO" not in cto_pretool["reason"]
 
     monkeypatch.setenv("SESSION_HANDOFF_AGENT", "claude-infra")
-    monkeypatch.setenv(driver_state.STATE_ENV, str(infra_path))
-    infra_stop = driver_state.cmd_claude_stop_hook(
-        json.dumps(
-            {
-                "session_id": "infra-s1",
-                "cwd": str(tmp_path),
-                "hook_event_name": "Stop",
-                "last_assistant_message": "Should I proceed?",
-            }
+    monkeypatch.setenv("SESSION_SEAT", "cto")
+    monkeypatch.setenv("SESSION_EPIC", "infra")
+    for pointer in (infra_path, custom_path):
+        monkeypatch.setenv(driver_state.STATE_ENV, str(pointer))
+        infra_stop = driver_state.cmd_claude_stop_hook(
+            json.dumps(
+                {
+                    "session_id": f"infra-{pointer.parent.name}",
+                    "cwd": str(tmp_path),
+                    "hook_event_name": "Stop",
+                    "last_assistant_message": "Should I proceed?",
+                }
+            )
         )
-    )
-    assert infra_stop["decision"] == "block"
-    assert "Ask the CTO only about deletes, money, security or rule changes, via Fleet Comms" in infra_stop["reason"]
-    assert "Ask the operator" not in infra_stop["reason"]
-    infra_pretool = driver_state.cmd_agy_pretool_hook(
-        json.dumps({"workspacePaths": [str(tmp_path)], "toolCall": {"name": "ask_question"}})
-    )
-    assert infra_pretool["decision"] == "deny"
-    assert "post to the CTO via Fleet Comms" in infra_pretool["reason"]
-    assert "ask the operator" not in infra_pretool["reason"]
+        assert infra_stop["decision"] == "block"
+        assert "Ask the CTO only about deletes, money, security or rule changes, via Fleet Comms" in infra_stop["reason"]
+        assert "Ask the operator" not in infra_stop["reason"]
+        infra_pretool = driver_state.cmd_agy_pretool_hook(
+            json.dumps({"workspacePaths": [str(tmp_path)], "toolCall": {"name": "ask_question"}})
+        )
+        assert infra_pretool["decision"] == "deny"
+        assert "post to the CTO via Fleet Comms" in infra_pretool["reason"]
+        assert "ask the operator" not in infra_pretool["reason"]
