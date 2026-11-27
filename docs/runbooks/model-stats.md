@@ -422,8 +422,10 @@ comment names (the task record's reviewed head and start must equal the marker's
 id matched, which writes nothing); a reply that contests nothing adds no field. A failed write reports
 `failed: <reason>`; recording the same verdict again while the head stands retries it. A contested label counts as
 `contested`, not as its label. `unlabelled` is the review's P0-P2 count minus its labels (the file-inferred figures
-above cover P0-P1 only); when published blocking rows of more than one run share one task id and PR, their labels
-name no one run and all their findings count as `unlabelled`. `real_precision` is
+above cover P0-P1 only). A label line names the task id, not the run, and the summary rows keep only an id's newest
+run, so a label recorded before that run started (it labels an earlier run of an id dispatched again) counts
+nowhere, and that finding counts as `unlabelled`. An unreadable fleet registry counts no label
+(`coverage.finding_outcomes.registry_unreadable`). `real_precision` is
 `fixed / (fixed + wrong + invented)` with its Wilson interval; a label is the author's word unless a later review
 contested it.
 
