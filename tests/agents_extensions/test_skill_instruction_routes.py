@@ -27,8 +27,8 @@ def test_documented_archive_failure_command_parses_with_real_cli() -> None:
     for placeholder, value in substitutions.items():
         command = command.replace(placeholder, value)
     words = shlex.split(command)
-    assert words[:3] == [".venv/bin/python", "-m", "lu_machinery.orchestration.thread_handoff"]
-    arguments = build_parser().parse_args(words[3:])
+    assert words[:4] == ["$LU_PYTHON", "-I", "-m", "lu_machinery.orchestration.thread_handoff"]
+    arguments = build_parser().parse_args(words[4:])
     assert arguments.action == "archive"
     assert arguments.succeeded is False
     assert arguments.error == substitutions["<actual native failure>"]

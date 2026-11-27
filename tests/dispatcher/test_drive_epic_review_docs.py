@@ -298,7 +298,7 @@ def test_documented_shell_continues_only_same_nonce_wait(tmp_path, scenario, exp
     )
     # Replace only the interpreter boundary; keep the documented shell, parser,
     # flags, stdout capture and continuation logic intact.
-    recipe = recipe.replace('PY="$PRIMARY_REPO/.venv/bin/python"', 'PY="$RECIPE_PY"')
+    recipe = recipe.replace('PY="${LU_PYTHON:?LU_PYTHON is not set}"', 'PY="$RECIPE_PY"')
     helper = tmp_path / "native_boundary.py"
     helper.write_text(
         """import json, os, subprocess, sys
@@ -311,8 +311,8 @@ from lu_machinery.dispatcher import store, worker
 argv = sys.argv[1:]
 if argv[0] == '-c':
     raise SystemExit(subprocess.run([sys.executable, *argv], check=False).returncode)
-assert argv[:2] == ['-m', 'lu_machinery.dispatch']
-del argv[:2]
+assert argv[:3] == ['-I', '-m', 'lu_machinery.dispatch']
+del argv[:3]
 args = dispatch_cli.build_parser().parse_args(argv)
 path = Path(os.environ['RECIPE_CALLS'])
 calls = json.loads(path.read_text()) if path.exists() else []
@@ -522,8 +522,8 @@ from lu_machinery.dispatcher import store, worker
 argv = sys.argv[1:]
 if argv[0] == '-c':
     raise SystemExit(subprocess.run([sys.executable, *argv], check=False).returncode)
-assert argv[:2] == ['-m', 'lu_machinery.dispatch']
-del argv[:2]
+assert argv[:3] == ['-I', '-m', 'lu_machinery.dispatch']
+del argv[:3]
 args = dispatch_cli.build_parser().parse_args(argv)
 assert args.command in ('status', 'wait'), 'recovery must never dispatch'
 root = Path(os.environ['RECIPE_ROOT'])
@@ -568,7 +568,7 @@ raise SystemExit(dispatch_cli.main(argv))
     # Execute the documented initialization, recovery fence and existing loop verbatim;
     # substitute only the interpreter boundary, never initialize REVIEW_NONCE in the test.
     initialization = launch.split("# If requires_silence_timeout", 1)[0]
-    initialization = initialization.replace('PY="$PRIMARY_REPO/.venv/bin/python"', 'PY="$RECIPE_PY"')
+    initialization = initialization.replace('PY="${LU_PYTHON:?LU_PYTHON is not set}"', 'PY="$RECIPE_PY"')
     loop = "while true; do" + launch.split("while true; do", 1)[1]
     env = {key: value for key, value in os.environ.items() if key not in ("REVIEW_NONCE", "PYTHONPATH")}
     result = subprocess.run(

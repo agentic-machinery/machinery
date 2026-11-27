@@ -71,7 +71,7 @@ done
 **Synchronous ask expiry:** its wait omits `--run-nonce`; wait rc 124 returns the active task record
 and becomes wrapper `ok=false`, empty `response`, and `ask-<lane> review dispatch did not complete: status='running'`
 or `status='spawning'`.
-The outer subprocess timeout instead reports `"$LU_PYTHON" -I -m lu_machinery.dispatch wait timed out at process level`
+The outer subprocess timeout instead reports `dispatch.py wait timed out at process level`
 while the original review may still be live. Either signal requires the same lookup and
 original-task wait recovery below; neither is a terminal task-record `timeout`.
 Ask itself does not expose the dispatch nonce (or rc 124 for client expiry). Set `REVIEW_TASK` to the original ask's task ID
