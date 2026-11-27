@@ -31,7 +31,6 @@ Rank follows the catalog; entries at the same rank are peers.
 | critical | 1 | claude-opus-5-5 | claude-opus-5-5 |
 | critical | 1 | claude-opus-5-5-agy | claude-opus-5-5 |
 | critical | 1 | gemini-4-neon-high | gemini-4-neon |
-| critical | 1 | grok-4.7-cursor-fallback | grok-4.7 |
 | high | 1 | openai_frontier_b | gpt-6.2-sol |
 | high | 1 | openai_frontier | gpt-6.2-sol |
 | high | 1 | claude-opus-5-5 | claude-opus-5-5 |
