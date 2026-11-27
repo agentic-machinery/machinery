@@ -956,6 +956,19 @@ _PUBLICATION_SELECTOR = "fleet_repo_selector"
 REPOSITORY_SLUG = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9._-]{1,100}\Z")
 
 
+def _unique_members(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    """A JSON object whose member names repeat is refused (ValueError): the decoder would keep only the last value."""
+    members = dict(pairs)
+    if len(members) != len(pairs):
+        raise ValueError("duplicate JSON object member")
+    return members
+
+
+def _load_line(line: bytes) -> Any:
+    """One ledger or row line, refusing repeated member names (ValueError) and deep nesting (RecursionError)."""
+    return json_depth.loads(line, max_depth=_JSON_MAX_DEPTH, object_pairs_hook=_unique_members)
+
+
 def _selector_ok(receipt: object) -> bool:
     """The optional receipt uses the selector loader's slug grammar and a lowercase SHA-256."""
     if receipt is None:
@@ -1018,7 +1031,7 @@ def _publication_lines(path: Path, counts: Counter[str]) -> list[dict[str, Any]]
     with os.fdopen(fd, "rb") as stream:
         for line in stream:
             try:
-                entry = json_depth.loads(line, max_depth=_JSON_MAX_DEPTH)
+                entry = _load_line(line)
             except (ValueError, RecursionError):
                 entry = None
             if not _publication_ok(entry):
@@ -1047,12 +1060,6 @@ def record_publications(batch_state_dir: Path, entries: Iterable[Mapping[str, An
     Each entry is validated from the exact JSON bytes that will be written.
     TimeoutError when ``wait_s`` passes before the lock is free; OSError when the ledger cannot be written.
     """
-    def unique_members(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
-        members = dict(pairs)
-        if len(members) != len(pairs):
-            raise ValueError("duplicate publication object key")
-        return members
-
     checked = []
     for entry in entries:
         try:
@@ -1061,7 +1068,7 @@ def record_publications(batch_state_dir: Path, entries: Iterable[Mapping[str, An
             if not _count_value(row.get("pr")):
                 raise ValueError("publication PR must be an integer in range")
             line = _line(row)
-            snapshot = json_depth.loads(line, max_depth=_JSON_MAX_DEPTH, object_pairs_hook=unique_members)
+            snapshot = _load_line(line)
         except (TypeError, ValueError, RecursionError) as exc:
             raise ValueError("publication field has the wrong shape") from exc
         if not _publication_ok(snapshot):
@@ -1165,7 +1172,7 @@ def _outcome_lines(path: Path, counts: Counter[str]) -> list[dict[str, Any]]:
     with os.fdopen(fd, "rb") as stream:
         for line in stream:
             try:
-                entry = json_depth.loads(line, max_depth=_JSON_MAX_DEPTH)
+                entry = _load_line(line)
             except (ValueError, RecursionError):
                 entry = None
             if not _outcome_ok(entry):
@@ -1184,9 +1191,9 @@ def record_finding_outcomes(batch_state_dir: Path, entries: Iterable[Mapping[str
                             wait_s: float | None = None) -> int:
     """Append, under ``rows.lock``, each entry the outcome ledger does not hold yet; the count added.
 
-    A label line is one per (review task, finding): the same label and evidence again adds nothing, and a different
-    one raises OutcomeConflict before anything is written. A contest line is one per (review task, finding,
-    contesting task). Every entry is checked from the exact JSON bytes that will be written: one malformed entry
+    A label line is one per (review task, PR, finding): the same label again adds nothing and keeps the first line and
+    its evidence, and another label raises OutcomeConflict before anything is written. A contest line is one per
+    (review task, PR, finding, contesting task). Every entry is checked from the exact JSON bytes that will be written: one malformed entry
     raises ValueError and writes nothing. TimeoutError when ``wait_s`` passes first; OSError when the ledger cannot
     be written.
     """
@@ -1197,23 +1204,22 @@ def record_finding_outcomes(batch_state_dir: Path, entries: Iterable[Mapping[str
             if not _count_value(row.get("pr")):
                 raise ValueError("finding outcome PR must be an integer in range")
             line = _line(row)
-            snapshot = json_depth.loads(line, max_depth=_JSON_MAX_DEPTH)
+            snapshot = _load_line(line)
         except (TypeError, ValueError, RecursionError) as exc:
             raise ValueError("finding outcome field has the wrong shape") from exc
         if not _outcome_ok(snapshot):
             raise ValueError("finding outcome field has the wrong shape")
         checked.append((snapshot, line))
 
-    def key(entry: Mapping[str, Any]) -> tuple[str, ...]:
-        return (entry["kind"], entry["task_id"], entry["finding_id"], entry.get("contested_by") or "")
+    def key(entry: Mapping[str, Any]) -> tuple[str, str, int, str, str]:
+        return (entry["kind"], entry["task_id"], entry["pr"], entry["finding_id"], entry.get("contested_by") or "")
 
     with _locked(batch_state_dir, wait_s) as rows_file:
         path = rows_file.with_name(OUTCOMES_FILE)
         present = {key(e): e for e in _outcome_lines(path, Counter())}
         for snapshot, _ in checked:
             held = present.get(key(snapshot))
-            if held is not None and snapshot["kind"] == "label" and (
-                    held["label"], held["evidence_sha256"]) != (snapshot["label"], snapshot["evidence_sha256"]):
+            if held is not None and snapshot["kind"] == "label" and held["label"] != snapshot["label"]:
                 raise OutcomeConflict(
                     f"finding {snapshot['finding_id']} of {snapshot['task_id']} is already labelled {held['label']}")
         added = 0
@@ -1225,17 +1231,20 @@ def record_finding_outcomes(batch_state_dir: Path, entries: Iterable[Mapping[str
         return added
 
 
-def read_finding_outcomes(batch_state_dir: Path) -> tuple[dict[str, dict[str, str]], set[tuple[str, str]], Counter[str]]:
-    """Each review task's labelled findings (finding id to label), the (review task, finding id) pairs a later review
-    contested, and read counts. A missing ledger gives none: every finding is then unlabelled."""
+def read_finding_outcomes(
+        batch_state_dir: Path) -> tuple[dict[tuple[str, int], dict[str, str]], set[tuple[str, int, str]], Counter[str]]:
+    """The labelled findings (finding id to label) of each (review task, PR) publication, the (review task, PR,
+    finding id) a later review contested, and read counts. A missing ledger gives none: every finding is then
+    unlabelled. The writer binds the PR to the review's own repository and reviewed head, so (task, PR) names one
+    publication."""
     counts: Counter[str] = Counter()
-    labels: dict[str, dict[str, str]] = {}
-    contests: set[tuple[str, str]] = set()
+    labels: dict[tuple[str, int], dict[str, str]] = {}
+    contests: set[tuple[str, int, str]] = set()
     for entry in _outcome_lines(batch_state_dir / ROWS_DIR / OUTCOMES_FILE, counts):
         if entry["kind"] == "label":
-            labels.setdefault(entry["task_id"], {}).setdefault(entry["finding_id"], entry["label"])
+            labels.setdefault((entry["task_id"], entry["pr"]), {}).setdefault(entry["finding_id"], entry["label"])
         else:
-            contests.add((entry["task_id"], entry["finding_id"]))
+            contests.add((entry["task_id"], entry["pr"], entry["finding_id"]))
     return labels, contests, counts
 
 
@@ -1409,7 +1418,7 @@ def read_rows(batch_state_dir: Path) -> tuple[list[dict[str, Any]], Counter[str]
     with os.fdopen(fd, "rb") as stream:
         for line in stream:
             try:
-                row = json_depth.loads(line, max_depth=_JSON_MAX_DEPTH)
+                row = _load_line(line)
             except (ValueError, RecursionError):
                 counts["malformed_lines"] += 1
                 continue

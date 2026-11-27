@@ -888,7 +888,7 @@ function accuracy(data) {
     : `<p class="note">Planted-defect recall: ${num(recall.value * 100)}%</p>`;
   const headText = later
     ? `<p class="note">Changed files were read for ${num(read)} of ${num(later)} blocking reviews the same reviewer later approved; the findings of the rest count as unknown.</p>` : "";
-  if (!items.length) return '<p class="muted">No blocking review of record in this selection.</p>' + recallText;
+  if (!items.length) return '<p class="muted">No blocking review of record in this selection.</p>' + missProxy(data) + recallText;
   return table(["Reviewer", "Blocking reviews", "Blocking replies of unknown publication", "Reviews without finding counts or paths", "Counted P0–P1 findings", "Fixed", "Dismissed", "Open", "Unknown", "Precision", "Interval", "Settled"],
     grouped(items, (r) => [`<tr><td>${named(r)}</td>${cell(r.blocking_reviews)}`
       + `${cell(r.reviews_unknown_publication, r.reviews_unknown_publication ? "warn" : "")}`

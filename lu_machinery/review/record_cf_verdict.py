@@ -3207,16 +3207,13 @@ def _contested_ids(reply: str) -> tuple[str, ...]:
     return tuple(dict.fromkeys(_CONTEST_LINE.findall(text))) if isinstance(text, str) else ()
 
 
-def _blocking_publications(batch_state: Path, number: int, *, repository: str | None = None,
-                           task_id: str | None = None) -> list[dict[str, Any]]:
-    """The ledger's CHANGES_REQUESTED publications on PR ``number`` of one review task and/or one repository, newest
-    first by GitHub's comment time (of two at the same time, the later ledger line first)."""
+def _pr_publications(batch_state: Path, number: int, repository: str) -> list[dict[str, Any]]:
+    """Every ledger publication on PR ``number`` of ``repository``, newest first by GitHub's comment time (of two at
+    the same time, the later ledger line first)."""
     from lu_machinery.api import model_stats_rows
 
     return [entry for entry in model_stats_rows.publications_newest_first(batch_state)
-            if task_id in (None, entry["task_id"]) and entry["pr"] == number
-            and entry["verdict"] == "CHANGES_REQUESTED"
-            and (repository is None or same_repository(entry["repository"], repository))]
+            if entry["pr"] == number and same_repository(entry["repository"], repository)]
 
 
 def record_finding_outcome(
@@ -3237,19 +3234,23 @@ def record_finding_outcome(
         raise RecordError(f"label {label} needs --evidence: one line that shows it")
     if evidence and (len(evidence) > MAX_EVIDENCE_CHARS or any(ch in evidence for ch in "\n\r\x85  ")):
         raise RecordError(f"evidence must be one line of at most {MAX_EVIDENCE_CHARS} characters")
-    _, reply = _task(task_id, task_root)
+    task, reply = _task(task_id, task_root)
     blocking = _blocking_finding_ids(reply)
     if blocking is None:
         raise RecordError("review reply has no structured findings: only code-review-findings.v1 findings take a label")
     if finding_id not in blocking:
         raise RecordError(f"finding {finding_id!r} is not a P0-P1 finding of review {task_id}")
-    published = _blocking_publications(task_root.parent, pr_number, task_id=task_id)
+    repository, reviewed = task.get("repository"), task.get("worktree_base_sha")
+    if not isinstance(repository, str) or not isinstance(reviewed, str) or not SHA.fullmatch(reviewed):
+        raise RecordError(f"review {task_id} names no repository and reviewed head")
+    # Only the review's own publication: its repository, this PR and the head it reviewed.
+    published = [entry for entry in _pr_publications(task_root.parent, pr_number, repository)
+                 if entry["task_id"] == task_id and entry["head"] == reviewed and entry["verdict"] == "CHANGES_REQUESTED"]
     if not published:
-        raise RecordError(f"no published CHANGES_REQUESTED verdict of review {task_id} on PR {pr_number} in the "
-                          f"publication ledger; record the verdict first, or import it: {RECORDER_COMMAND} "
-                          f"import-publications --repository <owner/name> --pr {pr_number}")
-    if len({repository_identity(entry["repository"]) for entry in published}) != 1:
-        raise RecordError(f"review {task_id} is published on PR {pr_number} of more than one repository")
+        raise RecordError(f"no published CHANGES_REQUESTED verdict of review {task_id} on PR {pr_number} of "
+                          f"{repository} at its reviewed head in the publication ledger; record the verdict first, "
+                          f"or import it: {RECORDER_COMMAND} import-publications --repository {repository} "
+                          f"--pr {pr_number}")
     author = os.environ.get("LEARN_UKRAINIAN_DISPATCH_TASK_ID")
     try:
         entry = model_stats_rows.finding_outcome(
@@ -3266,18 +3267,25 @@ def record_finding_outcome(
             "status": "recorded" if added else "already recorded"}
 
 
-def _store_contests(task_root: Path, task_id: str, reply: str, *, repository: str, number: int) -> str | None:
+def _store_contests(task_root: Path, task_id: str, reply: str, *, repository: str, number: int, head: str) -> str | None:
     """Store each ``CONTEST <id>`` line of a just-published review against the PR's previous blocking review of
-    record (the newest other CHANGES_REQUESTED publication on the PR). An id that is no P0-P1 finding of that
-    review is reported unmatched and never stored. None when the reply contests nothing; never raises."""
+    record: the newest other CHANGES_REQUESTED publication on the PR that comes before this review's own publication
+    (by GitHub's comment time, then ledger order), so a rerun after a later round binds the same round. An id that
+    is no P0-P1 finding of that review is reported unmatched and never stored. None when the reply contests nothing;
+    never raises."""
     from lu_machinery.api import model_stats_rows
 
     contested = _contested_ids(reply)
     if not contested:
         return None
     try:
-        previous = [entry for entry in _blocking_publications(task_root.parent, number, repository=repository)
-                    if entry["task_id"] != task_id]
+        entries = _pr_publications(task_root.parent, number, repository)
+        own = next((index for index, entry in enumerate(entries)
+                    if entry["task_id"] == task_id and entry["head"] == head), None)
+        if own is None:
+            return f"not stored: this verdict is not in the publication ledger for PR {number}"
+        previous = [entry for entry in entries[own + 1:]
+                    if entry["verdict"] == "CHANGES_REQUESTED" and entry["task_id"] != task_id]
         if not previous:
             return f"not stored: no earlier blocking review of PR {number} in the publication ledger"
         target = previous[0]["task_id"]
@@ -3867,7 +3875,7 @@ def record(
             fleet_repo_selector=github.selector,
         )
         # A contest needs this verdict in the ledger, so the earlier blocking round it names is told apart from it.
-        contests = (_store_contests(task_root, task_id, reply, repository=github.stored, number=number)
+        contests = (_store_contests(task_root, task_id, reply, repository=github.stored, number=number, head=sha)
                     if publication_marker == "stored" else None)
     result = {
         "pr": number,
