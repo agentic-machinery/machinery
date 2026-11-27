@@ -3209,15 +3209,6 @@ def _contested_ids(reply: str) -> tuple[str, ...]:
     return tuple(dict.fromkeys(_CONTEST_LINE.findall(text))) if isinstance(text, str) else ()
 
 
-def _pr_publications(batch_state: Path, number: int, repository: str) -> list[dict[str, Any]]:
-    """Every ledger publication on PR ``number`` of ``repository``, newest first by GitHub's comment time (of two at
-    the same time, the later ledger line first)."""
-    from lu_machinery.api import model_stats_rows
-
-    return [entry for entry in model_stats_rows.publications_newest_first(batch_state)
-            if entry["pr"] == number and same_repository(entry["repository"], repository)]
-
-
 def record_finding_outcome(
     task_id: str, *, pr_number: int, finding_id: str, label: str, evidence: str | None,
     task_root: Path | None = None, now: datetime | None = None,
@@ -3246,8 +3237,9 @@ def record_finding_outcome(
     if not isinstance(repository, str) or not isinstance(reviewed, str) or not SHA.fullmatch(reviewed):
         raise RecordError(f"review {task_id} names no repository and reviewed head")
     # Only the review's own publication: its repository, this PR and the head it reviewed.
-    published = [entry for entry in _pr_publications(task_root.parent, pr_number, repository)
-                 if entry["task_id"] == task_id and entry["head"] == reviewed and entry["verdict"] == "CHANGES_REQUESTED"]
+    published = [entry for entry in model_stats_rows.read_publications(task_root.parent)[0].get(task_id, [])
+                 if entry["pr"] == pr_number and entry["head"] == reviewed and entry["verdict"] == "CHANGES_REQUESTED"
+                 and same_repository(entry["repository"], repository)]
     if not published:
         raise RecordError(f"no published CHANGES_REQUESTED verdict of review {task_id} on PR {pr_number} of "
                           f"{repository} at its reviewed head in the publication ledger; record the verdict first, "
@@ -3269,33 +3261,68 @@ def record_finding_outcome(
             "status": "recorded" if added else "already recorded"}
 
 
-def _store_contests(task_root: Path, task_id: str, reply: str, *, repository: str, number: int, head: str) -> str | None:
-    """Store each ``CONTEST <id>`` line of a just-published review against the PR's previous blocking review of
-    record: the newest other CHANGES_REQUESTED publication on the PR that comes before this review's own publication
-    (by GitHub's comment time, then ledger order), so a rerun after a later round binds the same round. An id that
-    is no P0-P2 finding of that review is reported unmatched and never stored. None when the reply contests nothing;
-    never raises."""
+def _trusted_publications(
+    comments: Iterable[Mapping[str, Any]], login: str, *, repository: str, number: int,
+    selector: Mapping[str, Any] | None,
+) -> tuple[list[dict[str, Any]], int, int]:
+    """The publication entries of a PR's verdict markers that ``login`` posted with a trusted association and never
+    edited, in the comments' order (GitHub returns them oldest first), and the counts of untrusted and skipped
+    markers. ``record`` and ``import-publications`` trust a marker by this one rule."""
+    entries: list[dict[str, Any]] = []
+    untrusted = skipped = 0
+    for item in comments:
+        body = item.get("body")
+        if not isinstance(body, str) or MARKER_PREFIX not in body:
+            continue
+        association = item.get("author_association")
+        created = item.get("created_at")
+        if (
+            _author_login(item, rest_only=True) != login
+            or not isinstance(association, str)
+            or association not in TRUSTED_ASSOCIATIONS
+            or not isinstance(created, str)
+            or created != item.get("updated_at")
+        ):
+            untrusted += 1
+            continue
+        entry, _ = publication_of(repository, number, item, fleet_repo_selector=selector)
+        if entry is None:
+            skipped += 1
+        else:
+            entries.append(entry)
+    return entries, untrusted, skipped
+
+
+def _store_contests(task_root: Path, task_id: str, reply: str, *, publications: Sequence[Mapping[str, Any]],
+                    head: str) -> str | None:
+    """Store each ``CONTEST <id>`` line of a published review against the PR's previous blocking review of record.
+
+    ``publications`` is the PR's trusted verdict publications read from its comments, oldest first
+    (``_trusted_publications``): the target is the newest other CHANGES_REQUESTED publication before this review's
+    own, so the binding never depends on which markers the local ledger holds, and a rerun or a later
+    ``import-publications`` binds the same round. An id that is no P0-P2 finding of that review is reported
+    unmatched and never stored. None when the reply contests nothing; never raises."""
     from lu_machinery.api import model_stats_rows
 
     contested = _contested_ids(reply)
     if not contested:
         return None
     try:
-        entries = _pr_publications(task_root.parent, number, repository)
-        own = next((index for index, entry in enumerate(entries)
+        own = next((index for index, entry in enumerate(publications)
                     if entry["task_id"] == task_id and entry["head"] == head), None)
         if own is None:
-            return f"not stored: this verdict is not in the publication ledger for PR {number}"
-        previous = [entry for entry in entries[own + 1:]
+            return "not stored: no trusted verdict comment of this review on the PR"
+        previous = [entry for entry in reversed(publications[:own])
                     if entry["verdict"] == "CHANGES_REQUESTED" and entry["task_id"] != task_id]
         if not previous:
-            return f"not stored: no earlier blocking review of PR {number} in the publication ledger"
+            return f"not stored: no earlier blocking verdict of another review on PR {publications[own]['pr']}"
         target = previous[0]["task_id"]
         blocking = _blocking_finding_ids(_task(target, task_root)[1]) or frozenset()
         matched = [finding_id for finding_id in contested if finding_id in blocking]
         moment = datetime.now(UTC).isoformat()
         model_stats_rows.record_finding_outcomes(task_root.parent, [model_stats_rows.finding_outcome(
-            kind="contest", task_id=target, repository=previous[0]["repository"], pr=number, finding_id=finding_id,
+            kind="contest", task_id=target, repository=previous[0]["repository"], pr=previous[0]["pr"],
+            finding_id=finding_id,
             contested_by=task_id, recorded_at=moment) for finding_id in matched], wait_s=model_stats_rows.SETTLEMENT_LOCK_WAIT_S)
     except Exception as exc:  # the verdict is already published; name the failure, never raise past it
         return f"failed: {type(exc).__name__}"
@@ -3385,6 +3412,7 @@ def import_publications(
     adapter = adapter or GitHubAdapter(Path.cwd())
     login = adapter.identity()
     entries: list[dict[str, Any]] = []
+    by_pr: list[list[dict[str, Any]]] = []
     registry = load_fleet_repos()
     for repository, number in sorted(prs):
         # Either baked slug names the row: read it at the active slug, store it under the registry slug.
@@ -3401,32 +3429,30 @@ def import_publications(
             counts["rate_limited"] = 1
             break
         counts["prs_read"] += 1
-        for item in comments:
-            body = item.get("body")
-            if not isinstance(body, str) or MARKER_PREFIX not in body:
-                continue
-            association = item.get("author_association")
-            created = item.get("created_at")
-            if (
-                _author_login(item, rest_only=True) != login
-                or not isinstance(association, str)
-                or association not in TRUSTED_ASSOCIATIONS
-                or not isinstance(created, str)
-                or created != item.get("updated_at")
-            ):
-                counts["markers_untrusted"] += 1
-                continue
-            entry, _ = publication_of(target.repo.github, number, item, fleet_repo_selector=target.selector_receipt())
-            if entry is None:
-                counts["markers_skipped"] += 1
-            else:
-                entries.append(entry)
+        found, untrusted, skipped = _trusted_publications(
+            comments, login, repository=target.repo.github, number=number, selector=target.selector_receipt())
+        counts["markers_untrusted"] += untrusted
+        counts["markers_skipped"] += skipped
+        entries.extend(found)
+        by_pr.append(found)
     counts["markers"] = len(entries)
     if dry_run:
         present = model_stats_rows.publication_keys(batch_state_dir)
         counts["would_add"] = len({model_stats_rows.publication_key(entry) for entry in entries} - present)
-    else:
-        counts["added"] = model_stats_rows.record_publications(batch_state_dir, entries)
+        return counts
+    counts["added"] = model_stats_rows.record_publications(batch_state_dir, entries)
+    # A contest that record() could not store (a review recorded before this release, or a failed run) is bound
+    # from the same comments: the review's reply in the task store says what it contests.
+    counts["contest_replies"] = 0
+    task_store = task_root or tasks_dir()
+    for found in by_pr:
+        for entry in found:
+            try:
+                reply = _task(entry["task_id"], task_store)[1]
+            except RecordError:
+                continue
+            receipt = _store_contests(task_store, entry["task_id"], reply, publications=found, head=entry["head"])
+            counts["contest_replies"] += receipt is not None and receipt.startswith("stored against ")
     return counts
 
 
@@ -3876,9 +3902,9 @@ def record(
             task_root, repository=github.stored, number=number, comment=posted_comment if posted else existing or {},
             fleet_repo_selector=github.selector,
         )
-        # A contest needs this verdict in the ledger, so the earlier blocking round it names is told apart from it.
-        contests = (_store_contests(task_root, task_id, reply, repository=github.stored, number=number, head=sha)
-                    if publication_marker == "stored" else None)
+        # The PR's own verdict comments name the round a contest binds, whatever the local ledger holds.
+        contests = _store_contests(task_root, task_id, reply, head=sha, publications=_trusted_publications(
+            comments, login, repository=github.stored, number=number, selector=github.selector)[0])
     result = {
         "pr": number,
         "head": sha,
