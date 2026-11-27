@@ -35,6 +35,7 @@ selection unchanged. Ambiguous path inference fails closed instead of guessing.
 
 from __future__ import annotations
 
+import math
 import os
 import re
 import shlex
@@ -102,6 +103,13 @@ def _reject_json_constant(token: str) -> object:
     raise ValueError(f"non-JSON constant {token}")
 
 
+def _finite_float(token: str) -> float:
+    value = float(token)
+    if not math.isfinite(value):
+        raise ValueError(f"JSON number {token} is not finite")
+    return value
+
+
 def _bounded_ledger_lines(stream: BinaryIO) -> Iterator[bytes]:
     """Each ledger line of at most the byte limit; a longer line is drained in bounded chunks and skipped."""
     limit = _RECENT_REVIEW_MAX_LINE_BYTES
@@ -116,22 +124,28 @@ def _bounded_ledger_lines(stream: BinaryIO) -> Iterator[bytes]:
 
 
 def _load_ledger_line(line: bytes) -> Any:
-    """One rotation-ledger line as strict JSON: at most 16 levels, no duplicate members, no NaN/Infinity."""
+    """One rotation-ledger line as strict JSON.
+
+    The line must be UTF-8 (both writers emit ASCII JSON), at most 16 levels deep, with no
+    duplicate members, no NaN/Infinity and no number that overflows to infinity (``1e9999``).
+    """
     return json_depth.loads(
-        line,
+        line.decode("utf-8"),
         max_depth=_RECENT_REVIEW_JSON_MAX_DEPTH,
         object_pairs_hook=_reject_duplicate_members,
         parse_constant=_reject_json_constant,
+        parse_float=_finite_float,
     )
 
 
 def _persisted_row_shape(row: Mapping[str, object]) -> bool:
-    """Whether a row's labels have the shape ``model_stats_rows.summary_row`` persists.
+    """Whether a row is a settled code/infra review row as ``model_stats_rows.summary_row`` persists it.
 
-    Every label must already be what the canonical sanitiser would keep. The role must be
-    ``review`` or ``write``. A review class is ``profile/risk`` and any other class has no
-    slash. The status must be settled. A row that fails any of these is skipped instead of
-    being coerced, so it can never supersede an earlier valid row for the same task.
+    Every label must already be what the canonical sanitiser would keep. The role is
+    ``review``; the class is ``profile/risk`` with a code/infra profile and a supported risk,
+    or the ``unknown`` risk the writer records when a task named none; the PR is absent or a
+    positive integer; the status is settled. The caller applies this before supersession, so
+    a row that fails it is skipped and can never replace an earlier valid row.
     """
     from lu_machinery.api import model_stats_rows
 
@@ -144,10 +158,13 @@ def _persisted_row_shape(row: Mapping[str, object]) -> bool:
         row.get(name) is None or (type(row[name]) is str and sanitised[name] == row[name]) for name in optional_labels
     ):
         return False
-    role, row_class = row["role"], str(row["class"])
-    if role not in ("review", "write") or (row_class.count("/") == 1) != (role == "review"):
-        return False
-    return row["status"] not in model_stats_rows.ACTIVE
+    pr = row.get("pr")
+    return (
+        row["role"] == "review"
+        and row["class"] in _CODE_INFRA_REVIEW_CLASSES
+        and (pr is None or (type(pr) is int and pr > 0))
+        and row["status"] not in model_stats_rows.ACTIVE
+    )
 
 
 def _open_regular_in_dir(dir_fd: int, filename: str) -> int | None:
@@ -261,9 +278,9 @@ def read_recent_review_counts(
                         or not _persisted_row_shape(row)
                     ):
                         continue
-                    # Apply last-row-wins across fully validated rows before filtering by
-                    # role or review class so a superseding valid row drops stale credit,
-                    # while a malformed row never replaces an earlier valid one.
+                    # Last row wins only among rows that pass every check above, so a later
+                    # code/infra review row drops stale credit and any other row never
+                    # replaces an earlier valid one.
                     latest_rows[tid] = row
         except OSError:
             return {}
@@ -272,11 +289,6 @@ def read_recent_review_counts(
 
     counts_counter: Counter[str] = Counter()
     for tid, row in latest_rows.items():
-        if row.get("role") != "review":
-            continue
-        row_class = row.get("class")
-        if not isinstance(row_class, str) or row_class not in _CODE_INFRA_REVIEW_CLASSES:
-            continue
         pinned_head = row.get("pinned_head")
         if not isinstance(pinned_head, str):
             continue

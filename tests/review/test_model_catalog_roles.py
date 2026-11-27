@@ -675,7 +675,7 @@ def test_recent_review_counts_reads_published_code_infra_records_and_fails_close
         {"schema": "review-publication.v1", "task_id": "t-future", "repository": repo_slug, "pr": 6, "head": sha_future, "verdict": "APPROVED", "published_at": "2026-12-27T12:00:00Z"},
         # F3: publication for a different head must not match the row.
         {"schema": "review-publication.v1", "task_id": "t-mismatch", "repository": repo_slug, "pr": 7, "head": "9" * 40, "verdict": "APPROVED", "published_at": "2026-11-27T11:00:00Z"},
-        # F3: superseded task whose latest valid row changed role to write.
+        # F3: superseded task whose latest valid review row names another head.
         {"schema": "review-publication.v1", "task_id": "t-superseded", "repository": repo_slug, "pr": 8, "head": sha_superseded, "verdict": "APPROVED", "published_at": "2026-11-27T11:00:00Z"},
         # F3: unclassified review class must not be counted.
         {"schema": "review-publication.v1", "task_id": "t-unclassified", "repository": repo_slug, "pr": 9, "head": sha_unclassified, "verdict": "APPROVED", "published_at": "2026-11-27T11:00:00Z"},
@@ -693,7 +693,7 @@ def test_recent_review_counts_reads_published_code_infra_records_and_fails_close
         make_row(task_id="t-future", role="review", model="claude-opus-5-5", **{"class": "code/high"}, pr=6, pinned_head=sha_future),
         make_row(task_id="t-mismatch", role="review", model="claude-opus-5-5", **{"class": "code/high"}, pr=7, pinned_head=sha_mismatch),
         make_row(task_id="t-superseded", role="review", model="claude-opus-5-5", **{"class": "code/high"}, pr=8, pinned_head=sha_superseded),
-        make_row(task_id="t-superseded", role="write", model="claude-opus-5-5", **{"class": "code"}, pr=8, pinned_head=sha_superseded),
+        make_row(task_id="t-superseded", role="review", model="claude-opus-5-5", **{"class": "code/high"}, pr=8, pinned_head=sha_mismatch),
         make_row(task_id="t-unclassified", role="review", model="claude-opus-5-5", **{"class": "unclassified"}, pr=9, pinned_head=sha_unclassified),
     ]
     (stats / "publications.jsonl").write_text("\n".join(json.dumps(p) for p in pubs) + "\n", encoding="utf-8")
@@ -803,6 +803,10 @@ _ROTATION_VALID_ROW = {
         ({"class": "code"}, "sol", ""),
         ({"role": "write", "class": "code/high"}, "sol", ""),
         ({"status": "running"}, "sol", ""),
+        # A PR of 0, a misspelled risk or a number that overflows to infinity is not a persisted row.
+        ({"pr": 0}, "sol", ""),
+        ({"class": "code/hihg"}, "sol", ""),
+        (', "extra": 1e9999', "sol", ""),
         # Frozen 16-level nesting contract: a depth-17 later row is skipped; depth 16 still supersedes.
         ({"extra": _nested(16)}, "sol", ""),
         ({"extra": _nested(15)}, "grok", ""),
@@ -811,9 +815,9 @@ _ROTATION_VALID_ROW = {
         (', "extra": NaN', "sol", ""),
         # A publication with a duplicate verdict member is unreadable, whichever value comes last.
         ({}, None, ', "verdict": "APPROVED"'),
-        # A valid later row for the same task supersedes, and a valid role change drops review credit.
+        # A valid later review row for the same task supersedes; naming another head drops its credit.
         ({}, "grok", ""),
-        ({"role": "write", "class": "unclassified"}, None, ""),
+        ({"pinned_head": "b" * 40}, None, ""),
     ],
 )
 def test_recent_review_counts_malformed_later_row_never_replaces_valid_row(
