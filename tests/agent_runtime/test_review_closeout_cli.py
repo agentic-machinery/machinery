@@ -323,11 +323,15 @@ def test_resolve_reviewer_cli_excludes_grok_for_grok_adapter_path(tmp_path, monk
     payload = json.loads(proc.stdout)
     assert payload["resolved_risk"] == "critical"
     grok_entries = [entry for entry in payload["trace"] if entry["family"] == "xai"]
-    assert {entry["name"] for entry in grok_entries} == {"grok-4.7-cursor-fallback"}
-    for grok in grok_entries:
-        assert grok["status"] == "excluded"
-        assert "subject exclusion" in grok["reason"]
-        assert "subject seat grok" in grok["reason"]
+    if injected_grok:
+        assert {entry["name"] for entry in grok_entries} == {"grok-4.7-cursor-fallback"}
+        for grok in grok_entries:
+            assert grok["status"] == "excluded"
+            assert "subject exclusion" in grok["reason"]
+            assert "subject seat grok" in grok["reason"]
+    else:
+        # REVIEW-ROTATION-GROK-1127: the critical ladder lists no Grok seat at all.
+        assert grok_entries == []
     assert payload["selected"] is None or payload["selected"]["family"] != "xai"
     selected = payload["selected"]
     assert selected is None or selected["family"] not in {"openai", "xai"}
@@ -1255,8 +1259,8 @@ def test_pr_mode_target_keeps_the_base_name_for_authorship_exclusion(tmp_path, m
 # restoring that spelling in the stdout reproduces the previous digests.
 # The Neon seat replaces the Flash trace row for low and medium risk.
 # NEON-SOLTIER-1120 (2026-11-20) adds Neon as an eligible critical trace row on security paths; Opus stays selected.
-# REVIEW-ROTATION-GROK-1127 (2026-11-27) puts Sol, Opus, Neon and pinned Cursor Grok in one equal peer row at every
-# risk with least-used recent review count and catalog-order tie-break.
+# REVIEW-ROTATION-GROK-1127 (2026-11-27) puts Sol, Opus, Neon and pinned Cursor Grok in one equal peer row below critical
+# (critical keeps Sol, Opus and Neon) with least-used recent review count and catalog-order tie-break.
 @pytest.mark.parametrize(
     "author,risk,path,digest",
     [
@@ -1266,7 +1270,7 @@ def test_pr_mode_target_keeps_the_base_name_for_authorship_exclusion(tmp_path, m
             CURRENT_SOL,
             "low",
             "lu_machinery/agent_runtime/target_admission.py",
-            "fe99c6bc60fa431553664b54f00863bd3e8591f164aefa5d1abec3d86c34b3ab",
+            "04e79645faac3e6081a0fb16d0781a4b03eb6a82c8e0186fe5fe7a0c7932da75",
         ),
     ],
 )

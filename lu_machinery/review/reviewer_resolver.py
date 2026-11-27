@@ -41,7 +41,7 @@ from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from fnmatch import fnmatchcase
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 from lu_machinery.agent_runtime.adapters.acpx import ACPX_PARTICIPANT_CATALOG_TRANSPORTS, ACPX_SUPPORTED_PARTICIPANTS
 from lu_machinery.agent_runtime.agent_identity import resolve_retired_agent_alias
@@ -83,20 +83,50 @@ _CODE_INFRA_REVIEW_CLASSES = frozenset(
 )
 
 
-def _labels_intact(row: Mapping[str, object]) -> bool:
-    """Whether every label already has the persisted shape, so the canonical sanitiser would change none.
+def _reject_duplicate_members(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    members = dict(pairs)
+    if len(members) != len(pairs):
+        raise ValueError("duplicate JSON object member")
+    return members
 
-    A row with a missing, non-string or malformed label is skipped instead of being coerced to
-    ``unknown``, so it can never supersede an earlier valid row for the same task.
+
+def _reject_json_constant(token: str) -> object:
+    raise ValueError(f"non-JSON constant {token}")
+
+
+def _load_ledger_line(line: bytes) -> Any:
+    """One rotation-ledger line as strict JSON: at most 16 levels, no duplicate members, no NaN/Infinity."""
+    return json_depth.loads(
+        line,
+        max_depth=_RECENT_REVIEW_JSON_MAX_DEPTH,
+        object_pairs_hook=_reject_duplicate_members,
+        parse_constant=_reject_json_constant,
+    )
+
+
+def _persisted_row_shape(row: Mapping[str, object]) -> bool:
+    """Whether a row's labels have the shape ``model_stats_rows.summary_row`` persists.
+
+    Every label must already be what the canonical sanitiser would keep. The role must be
+    ``review`` or ``write``. A review class is ``profile/risk`` and any other class has no
+    slash. The status must be settled. A row that fails any of these is skipped instead of
+    being coerced, so it can never supersede an earlier valid row for the same task.
     """
     from lu_machinery.api import model_stats_rows
 
     labels = model_stats_rows._LABEL_FIELDS
     optional_labels = ("author_model", "data_class")
     sanitised = model_stats_rows._sanitised({name: row.get(name) for name in (*labels, *optional_labels)})
-    return all(type(row.get(name)) is str and sanitised[name] == row[name] for name in labels) and all(
+    if not all(type(row.get(name)) is str and sanitised[name] == row[name] for name in labels):
+        return False
+    if not all(
         row.get(name) is None or (type(row[name]) is str and sanitised[name] == row[name]) for name in optional_labels
-    )
+    ):
+        return False
+    role, row_class = row["role"], str(row["class"])
+    if role not in ("review", "write") or (row_class.count("/") == 1) != (role == "review"):
+        return False
+    return row["status"] not in model_stats_rows.ACTIVE
 
 
 def _open_regular_in_dir(dir_fd: int, filename: str) -> int | None:
@@ -168,7 +198,7 @@ def read_recent_review_counts(
             with os.fdopen(pubs_fd, "rb") as stream:
                 for line_index, line in enumerate(stream):
                     try:
-                        entry = json_depth.loads(line, max_depth=_RECENT_REVIEW_JSON_MAX_DEPTH)
+                        entry = _load_ledger_line(line)
                     except (ValueError, RecursionError):
                         continue
                     if not model_stats_rows._publication_ok(entry):
@@ -196,7 +226,7 @@ def read_recent_review_counts(
             with os.fdopen(rows_fd, "rb") as stream:
                 for line in stream:
                     try:
-                        row = json_depth.loads(line, max_depth=_RECENT_REVIEW_JSON_MAX_DEPTH)
+                        row = _load_ledger_line(line)
                     except (ValueError, RecursionError):
                         continue
                     if not isinstance(row, dict) or row.get("schema") != model_stats_rows.ROW_SCHEMA:
@@ -207,7 +237,7 @@ def read_recent_review_counts(
                         or tid not in pubs_by_task
                         or not model_stats_rows.valid_task_id(tid)
                         or not model_stats_rows._well_formed(row)
-                        or not _labels_intact(row)
+                        or not _persisted_row_shape(row)
                     ):
                         continue
                     # Apply last-row-wins across fully validated rows before filtering by
@@ -244,7 +274,7 @@ def read_recent_review_counts(
         )
         if matched is None:
             continue
-        model = str(row["model"])  # a persisted model label, checked by _labels_intact
+        model = str(row["model"])  # a persisted model label, checked by _persisted_row_shape
         counts_counter[resolve_catalog_model_id(model, _MODEL_CATALOG) or model] += 1
 
     return dict(counts_counter)
