@@ -33,6 +33,7 @@ from typing import TYPE_CHECKING, Any
 
 import yaml
 
+from lu_machinery import state_paths
 from lu_machinery.common import json_depth
 
 from .attempt_safe_read import (
@@ -1661,7 +1662,7 @@ def full_review_reads(workspace: Path) -> tuple[list[Path], list[Path]]:
         if common.name == ".git" and corpus.is_dir() and not corpus.is_relative_to(workspace):
             reads.append(corpus.resolve(strict=True))
         hidden = [
-            p for p in (workspace / "batch_state", workspace / ".worktrees", workspace / ".git/worktrees") if p.is_dir()
+            p for p in (state_paths.batch_state_dir(workspace), workspace / ".worktrees", workspace / ".git/worktrees") if p.is_dir()
         ]
         _refuse_special_files((workspace, *reads), hidden)
         return reads, hidden

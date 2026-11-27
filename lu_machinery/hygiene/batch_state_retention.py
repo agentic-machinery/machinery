@@ -21,6 +21,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+from lu_machinery import state_paths
 from lu_machinery.common import json_depth
 from lu_machinery.common.repo_root import state_root
 from lu_machinery.common.task_scratch import mount_points
@@ -55,7 +56,7 @@ class RetentionListError(ValueError):
 
 def default_batch_root() -> Path:
     """The primary checkout's shared batch_state directory."""
-    return state_root() / "batch_state"
+    return state_paths.batch_state_dir(state_root())
 
 
 def load_holds(path: Path) -> list[dict[str, Any]]:

@@ -89,6 +89,17 @@ _GIT_TIMEOUT_SECONDS = 30
 _SKIP_DIRS = frozenset({"__pycache__"})
 _FALLBACK_NAMES = frozenset({"ImportError", "ModuleNotFoundError"})
 _EDGE_KINDS = frozenset({"direct", "parent", "file-load", "runtime"})
+BATCH_STATE_JOIN_ALLOWLIST = frozenset({"lu_machinery/state_paths.py"})
+# Temporary pending entries owned by REBUILD-PLAN-1126 step R4 (cto-201a-r4b-hooks-sol);
+# removed after R4 lands (CTO ruling message_1d49e58193b14169aadb84eb0eaa5135).
+BATCH_STATE_JOIN_R4_PENDING = frozenset(
+    {
+        "lu_machinery/agent_deploy/plan.py",
+        "lu_machinery/host_context.py",
+    }
+)
+_PATH_CTORS = frozenset({"Path", "PurePath", "PosixPath", "PurePosixPath", "WindowsPath", "PureWindowsPath"})
+_OS_PATH_JOIN_NAMES = frozenset({"os.path.join", "posixpath.join", "ntpath.join"})
 
 
 @dataclass(frozen=True)
@@ -622,6 +633,133 @@ def _in_scope(path: str, scope: Sequence[str]) -> bool:
     return False
 
 
+def _is_batch_state_segment(value: str) -> bool:
+    """True when ``value`` is a ``batch_state`` path segment or relative subpath."""
+    return (
+        value == "batch_state"
+        or value.startswith("batch_state/")
+        or "/batch_state/" in value
+        or value.endswith("/batch_state")
+    )
+
+
+def _joined_str_joins_batch_state(node: ast.JoinedStr) -> bool:
+    """True when an f-string directly joins an interpolated expression with ``/batch_state``."""
+    prev_was_expr = False
+    for part in node.values:
+        if isinstance(part, ast.FormattedValue):
+            prev_was_expr = True
+        elif isinstance(part, ast.Constant) and isinstance(part.value, str):
+            text = part.value
+            if prev_was_expr and (text == "/batch_state" or text.startswith("/batch_state/")):
+                return True
+            prev_was_expr = False
+        else:
+            prev_was_expr = False
+    return False
+
+
+def _expr_has_batch_state_segment(expr: ast.AST, bound: frozenset[str]) -> bool:
+    if isinstance(expr, ast.Starred):
+        return _expr_has_batch_state_segment(expr.value, bound)
+    if isinstance(expr, ast.Constant) and isinstance(expr.value, str):
+        return _is_batch_state_segment(expr.value)
+    if isinstance(expr, ast.Name):
+        return expr.id in bound
+    if isinstance(expr, ast.JoinedStr):
+        parts = [
+            part.value for part in expr.values if isinstance(part, ast.Constant) and isinstance(part.value, str)
+        ]
+        joined = "".join(parts)
+        return _is_batch_state_segment(joined)
+    return False
+
+
+def _bound_batch_state_names(tree: ast.AST) -> frozenset[str]:
+    """Simple name bindings to a ``batch_state`` path literal or tuple/list of segments."""
+    bound: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            targets = node.targets
+            value: ast.AST | None = node.value
+        elif isinstance(node, ast.AnnAssign):
+            targets = [node.target]
+            value = node.value
+        else:
+            continue
+        if value is None:
+            continue
+        matched = False
+        if isinstance(value, ast.Constant) and isinstance(value.value, str):
+            matched = _is_batch_state_segment(value.value)
+        elif isinstance(value, (ast.Tuple, ast.List)):
+            matched = any(
+                isinstance(elt, ast.Constant) and isinstance(elt.value, str) and _is_batch_state_segment(elt.value)
+                for elt in value.elts
+            )
+        if matched:
+            for target in targets:
+                if isinstance(target, ast.Name):
+                    bound.add(target.id)
+    return frozenset(bound)
+
+
+def _scan_batch_state_joins(rel: str, source: bytes) -> list[str]:
+    try:
+        tree = ast.parse(source, filename=rel)
+    except (SyntaxError, ValueError):
+        return [f"{rel}: cannot parse Python for batch_state ratchet"]
+    bound = _bound_batch_state_names(tree)
+    lines: set[int] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Div):
+            if _expr_has_batch_state_segment(node.left, bound) or _expr_has_batch_state_segment(node.right, bound):
+                lines.add(node.lineno)
+        elif isinstance(node, ast.JoinedStr) and _joined_str_joins_batch_state(node):
+            lines.add(node.lineno)
+        elif isinstance(node, ast.Call):
+            name = call_name(node.func)
+            leaf = name.split(".")[-1]
+            if (
+                leaf in _PATH_CTORS
+                or name in _OS_PATH_JOIN_NAMES
+                or (isinstance(node.func, ast.Attribute) and node.func.attr == "joinpath")
+            ):
+                if any(_expr_has_batch_state_segment(arg, bound) for arg in node.args):
+                    lines.add(node.lineno)
+            elif isinstance(node.func, ast.Attribute) and node.func.attr == "add_argument":
+                for kw in node.keywords:
+                    if kw.arg == "default" and _expr_has_batch_state_segment(kw.value, bound):
+                        lines.add(node.lineno)
+    return [f"{rel}:{lineno}: batch_state path join outside lu_machinery/state_paths.py" for lineno in sorted(lines)]
+
+
+def batch_state_join_violations(root: Path, targets: Sequence[str] | None = None) -> list[str]:
+    """Forbid joining ``batch_state`` paths anywhere in ``lu_machinery/`` outside ``state_paths.py``."""
+    pkg = _machinery_top()
+    pkg_dir = root / pkg
+    if not pkg_dir.is_dir():
+        return []
+    if targets is None:
+        paths = sorted(
+            path for path in pkg_dir.rglob("*.py") if _SKIP_DIRS.isdisjoint(path.parts) and path.is_file()
+        )
+    else:
+        paths = [
+            path
+            for path in _python_files(root, targets)
+            if path.relative_to(root).parts[:1] == (pkg,)
+        ]
+    sources, fatal = _read_sources(root, paths)
+    violations = list(fatal)
+    allowed = BATCH_STATE_JOIN_ALLOWLIST | BATCH_STATE_JOIN_R4_PENDING
+    for rel, source in sorted(sources.items()):
+        if rel in allowed:
+            continue
+        violations.extend(_scan_batch_state_joins(rel, source))
+    return violations
+
+
 def evaluate(
     root: Path,
     config_path: Path,
@@ -644,6 +782,7 @@ def evaluate(
     violations.extend(compare(current, baseline))
     full_baseline = load_baseline(baseline_path)
     violations.extend(shrink_violations(root, baseline_path, full_baseline))
+    violations.extend(batch_state_join_violations(root, scope))
     return violations
 
 
@@ -1106,9 +1245,22 @@ def main(argv: Sequence[str] | None = None) -> int:
         action="store_true",
         help="Rewrite the baseline from the current census and exit.",
     )
+    parser.add_argument(
+        "--check-state-paths",
+        action="store_true",
+        help="Run only the batch_state path-join ratchet over lu_machinery/.",
+    )
     args = parser.parse_args(argv)
     try:
         root = product_root(args.root.absolute() if args.root is not None else None).resolve()
+        if args.check_state_paths:
+            targets = _normalize_targets(root, args.paths) if args.paths else None
+            violations = batch_state_join_violations(root, _scope(targets))
+            if violations:
+                print("\n".join(violations), file=sys.stderr)
+                return 1
+            print("OK: no batch_state path joins outside lu_machinery/state_paths.py")
+            return 0
         baseline = product_tree_path(*BASELINE_PATH.parts, root=root) if args.baseline is None else (
             args.baseline if args.baseline.is_absolute() else root / args.baseline
         )

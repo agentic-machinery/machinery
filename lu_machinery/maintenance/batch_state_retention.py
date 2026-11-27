@@ -32,6 +32,7 @@ _PACKAGE_DIR = Path(os.path.abspath(__file__)).parents[1]
 for _path in (_PACKAGE_DIR.parent, _PACKAGE_DIR):
     if str(_path) not in sys.path:
         sys.path.insert(0, str(_path))
+from lu_machinery import state_paths
 from lu_machinery.common import json_depth
 from lu_machinery.common.repo_root import state_root
 from lu_machinery.orchestration import worktree_claims
@@ -862,7 +863,7 @@ def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
         report = plan_retention(
-            args.batch_state or state_root() / "batch_state",
+            args.batch_state or state_paths.batch_state_dir(state_root()),
             min_age_days=args.min_age_days,
             apply=args.apply,
         )

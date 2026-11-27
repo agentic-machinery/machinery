@@ -40,11 +40,12 @@ from typing import Any
 
 import yaml
 
+from lu_machinery import state_paths
 from lu_machinery.common.repo_root import machinery_path
 from lu_machinery.review import findings_db, second_seat
 
 TAXONOMY_PATH = machinery_path("schemas/review-taxonomy-v1.yaml")
-MEASUREMENT_DIR = ("batch_state", "review-measurement")
+MEASUREMENT_DIR = state_paths.REVIEW_MEASUREMENT_PARTS
 FILE_MODE = 0o600
 DIRECTORY_MODE = 0o700
 
@@ -89,7 +90,7 @@ class MeasurementError(Exception):
 
 def measurement_dir(repo_root: Path | None = None) -> Path:
     """``batch_state/review-measurement`` of the primary checkout (never a worktree copy)."""
-    return findings_db.batch_root(repo_root).joinpath(*MEASUREMENT_DIR)
+    return state_paths.review_measurement_dir(findings_db.batch_root(repo_root))
 
 
 # --- atomic private files ---------------------------------------------------------------

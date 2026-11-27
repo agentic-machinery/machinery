@@ -31,6 +31,7 @@ import os
 import time
 from pathlib import Path
 
+from lu_machinery import state_paths
 from lu_machinery.common import json_depth
 from lu_machinery.common.repo_root import state_root
 
@@ -51,7 +52,7 @@ def _state_path() -> Path:
     override = os.environ.get(_COOLDOWN_PATH_ENV)
     if override:
         return Path(override)
-    return state_root() / "batch_state" / "gemini_api_cooldown.json"
+    return state_paths.gemini_api_cooldown_path(state_root())
 
 
 def set_api_cooldown(duration_s: int = DEFAULT_COOLDOWN_S) -> float:

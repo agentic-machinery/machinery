@@ -99,6 +99,7 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any
 
+from lu_machinery import state_paths
 from lu_machinery.agent_runtime.sources_read_only import sources_tool_sets
 from lu_machinery.common import json_depth
 from lu_machinery.common.repo_root import StateRootError, product_root, state_root
@@ -278,7 +279,7 @@ _UNSAFE_DIRECTORY = (
     "or is not owned by the current user (#8652)"
 )
 _TIGHTENED_LOG = "receipts-root-permissions.diagnostics.txt"
-_DEFAULT_RECEIPTS_PARTS = ("batch_state", "review-receipts")
+_DEFAULT_RECEIPTS_PARTS = state_paths.REVIEW_RECEIPTS_PARTS
 _DIRECTORY_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 _ATTEMPT_PATHS_CHANGED = "a review attempt path is a symlink, has the wrong type, or is not owned by the current user"
 _UNSAFE_ATTEMPT = f"review attempt refused: {_ATTEMPT_PATHS_CHANGED} (#8652)"
@@ -361,7 +362,7 @@ def _open_receipts_root(root: Path, *, create: bool) -> int:
     except StateRootError:
         # No state anchor, so this cannot be the default root: open it as an explicit one (#100 R16).
         primary_root = None
-    if primary_root is not None and root == primary_root.joinpath(*_DEFAULT_RECEIPTS_PARTS):
+    if primary_root is not None and root == state_paths.review_receipts_dir(primary_root):
         fd = os.open(primary_root, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
         try:
             for name in _DEFAULT_RECEIPTS_PARTS:
@@ -947,7 +948,7 @@ def prepare_review_attempt(
     # The receipts root (default or explicit) is the trust anchor: verified itself, with
     # everything below it walked no-follow. Its ancestors are followed by design.
     if receipts_root is None:
-        base_dir = state_root().joinpath(*_DEFAULT_RECEIPTS_PARTS)
+        base_dir = state_paths.review_receipts_dir(state_root())
     else:
         base_dir = Path(os.path.abspath(receipts_root))
     review_dir = base_dir / review_id

@@ -10,6 +10,7 @@ from pathlib import Path
 # Dual-flavor import: several consumers load this module as top-level
 # ``path_safety`` with only ``scripts/`` on sys.path (test sys.path-hack,
 # build entrypoints) — a hard ``scripts.*`` import breaks that flavor.
+from lu_machinery import state_paths
 from lu_machinery.common.release_layout import LIVE_DATA_PATHS, MANIFEST_NAME, is_release_root
 
 # Unicode categories refused anywhere in a path component, as one class:
@@ -216,7 +217,7 @@ def assert_delete_target(
 
     allowed_roots = [
         resolved_repo_root / ".worktrees",
-        resolved_repo_root / "batch_state" / "tmp",
+        state_paths.batch_state_tmp_dir(resolved_repo_root),
     ]
     tmpdir = os.environ.get("TMPDIR")
     if tmpdir:

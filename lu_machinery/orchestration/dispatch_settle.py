@@ -25,6 +25,7 @@ from typing import Any
 
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from lu_machinery import state_paths
 from lu_machinery.common import github_client, json_depth
 from lu_machinery.common.git_credentials import verification_credentials
 from lu_machinery.common.repo_root import primary_root, state_root
@@ -57,7 +58,7 @@ _MODULE = f"{_PACKAGE}.{Path(__file__).stem}"
 
 def default_task_dir(repo_root: Path | None = None) -> Path:
     root = state_root(repo_root)
-    return root / "batch_state" / "tasks"
+    return state_paths.tasks_dir(root)
 
 
 def _pid_alive(pid: int | None) -> bool:

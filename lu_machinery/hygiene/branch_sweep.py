@@ -34,6 +34,7 @@ from typing import Literal, overload
 
 if __package__ in (None, ""):  # run as a file: put the repository root on sys.path
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from lu_machinery import state_paths
 from lu_machinery.common import github_client, json_depth
 from lu_machinery.common.git_context import UnsafeBranchNameError, sanitized_git_env, validate_plain_branch_name
 from lu_machinery.common.jsonl import jsonl_lines, physical_lines
@@ -65,8 +66,8 @@ _MERGE_SUBJECT_RE = re.compile(r"^Merge pull request #([0-9]+)(?!\w)")
 _SQUASH_SUBJECT_RE = re.compile(r"\(#([0-9]+)\)[ \t\r\n]*$")
 _HTTP_STATUS_RE = re.compile(r"HTTP/\d+(?:\.\d+)?\s+(\d+)")
 _CLOCK_SKEW = timedelta(seconds=10)
-LEDGER_PATH = Path("batch_state") / "branch-archive" / "evidence.jsonl"
-ARCHIVE_DIR = Path("batch_state") / "branch-archive"
+LEDGER_PATH = state_paths.BRANCH_ARCHIVE_LEDGER_REL
+ARCHIVE_DIR = state_paths.BRANCH_ARCHIVE_REL
 RECEIPT_PATH = ARCHIVE_DIR / "stale-local-receipts.jsonl"
 ARCHIVE_LOCK_PATH = ARCHIVE_DIR / "archive.lock"
 DEFAULT_ARCHIVE_AFTER_DAYS = 7
@@ -344,7 +345,7 @@ def _valid(name: str, repo: Path) -> bool:
 
 
 def _task_records(repo: Path) -> list[tuple[Path, dict[str, object]]]:
-    task_dir = reaper.control_plane_root(repo) / "batch_state" / "tasks"
+    task_dir = state_paths.tasks_dir(reaper.control_plane_root(repo))
     records: list[tuple[Path, dict[str, object]]] = []
     with task_archive_lock(task_dir):
         for path in task_dir.glob("*.json"):

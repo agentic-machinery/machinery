@@ -4,11 +4,12 @@ from pathlib import Path
 
 import pytest
 
-from lu_machinery import host_context
+from lu_machinery import host_context, state_paths
 from lu_machinery.api import config, git_hygiene_router
 from lu_machinery.common.repo_root import StateRootError, state_root
 from lu_machinery.control_plane.storage import StoreId, sqlite_path
 from lu_machinery.fleet_comms.paths import default_plane_root
+from lu_machinery.lint import boundary_ratchet
 from lu_machinery.orchestration.merge_queue_keeper import default_keeper_paths
 from lu_machinery.orchestration.task_family.storage import TaskFamilyStorage
 from lu_machinery.orchestration.task_lifecycle import canonical_state_root
@@ -82,3 +83,37 @@ def test_checkout_derived_store_paths_use_state_root_under_layout_matrix(host_la
     monkeypatch.delenv(host_context.CONTEXT_ENV)
     monkeypatch.setenv("LU_STATE_ROOT", str(state))
     assert state_root() == state
+
+
+def test_batch_state_join_outside_state_paths_fails_ratchet(tmp_path):
+    """Defect class: a module joining batch_state outside state_paths.py bypasses the lint ratchet."""
+    clean_tree = tmp_path / "clean"
+    pkg = clean_tree / "lu_machinery"
+    pkg.mkdir(parents=True)
+    (pkg / "state_paths.py").write_text(
+        'from pathlib import Path\ndef tasks(root: Path) -> Path:\n    return root / "batch_state" / "tasks"\n',
+        encoding="utf-8",
+    )
+    (pkg / "consumer.py").write_text(
+        "from lu_machinery import state_paths\ndef loc(root):\n    return state_paths.tasks_dir(root)\n",
+        encoding="utf-8",
+    )
+    assert boundary_ratchet.batch_state_join_violations(clean_tree) == []
+
+    (pkg / "rogue.py").write_text(
+        "import os\n"
+        "from pathlib import Path\n"
+        'def a(root: Path) -> Path:\n    return root / "batch_state" / "split"\n'
+        'def b() -> Path:\n    return Path("batch_state/split")\n'
+        'def c(root: Path) -> Path:\n    return root.joinpath("batch_state", "split")\n'
+        'def d(root: str) -> str:\n    return os.path.join(root, "batch_state", "split")\n'
+        'def e(root: str) -> str:\n    return f"{root}/batch_state/split"\n',
+        encoding="utf-8",
+    )
+    violations = boundary_ratchet.batch_state_join_violations(clean_tree)
+    assert len(violations) == 5
+    assert all(item.startswith("lu_machinery/rogue.py:") for item in violations)
+
+    live_root = Path(state_paths.__file__).resolve().parents[1]
+    assert (live_root / "lu_machinery" / "state_paths.py").is_file()
+    assert boundary_ratchet.batch_state_join_violations(live_root) == []

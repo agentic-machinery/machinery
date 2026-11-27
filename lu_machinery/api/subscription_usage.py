@@ -26,6 +26,7 @@ from pathlib import Path
 from types import ModuleType
 from typing import Any
 
+from lu_machinery import state_paths
 from lu_machinery.agent_runtime.adapters.cursor import (
     probe_cursor_login,
     probe_cursor_provider_windows,
@@ -2362,7 +2363,7 @@ def stop_periodic_refresh(*, join_timeout_s: float = 1.0) -> None:
 
 
 def _routing_budget_state_dir() -> Path:
-    path = state_root() / "batch_state" / "routing_budget"
+    path = state_paths.routing_budget_dir(state_root())
     path.mkdir(parents=True, exist_ok=True)
     return path
 

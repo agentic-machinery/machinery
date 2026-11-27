@@ -48,11 +48,12 @@ from typing import Any
 
 import yaml
 
+from lu_machinery import state_paths
 from lu_machinery.common.repo_root import machinery_path, state_root
 
 PARAMETERS_PATH = machinery_path("config/review_parameters.yaml")
 SCHEMA_VERSION = 5
-DB_DIRECTORY = ("batch_state", "review-findings")
+DB_DIRECTORY = state_paths.REVIEW_FINDINGS_PARTS
 LEVEL_RE = re.compile(r"[a-z0-9][a-z0-9-]{0,31}\Z")
 
 VERDICTS = ("APPROVE", "REVISE", "REJECTED", "FAILED")
@@ -245,7 +246,7 @@ def batch_root(repo_root: Path | None = None) -> Path:
 def db_path(level: str, repo_root: Path | None = None) -> Path:
     if not LEVEL_RE.fullmatch(level):
         raise FindingsDbError(f"level {level!r} is not a level token")
-    return batch_root(repo_root).joinpath(*DB_DIRECTORY, f"{level}.sqlite")
+    return state_paths.review_findings_db(level, batch_root(repo_root))
 
 
 def connect(path: Path) -> sqlite3.Connection:

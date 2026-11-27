@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 
+from lu_machinery import state_paths
 from lu_machinery.ci._location import module_name
 from lu_machinery.common import github_client, json_depth
 from lu_machinery.common.repo_root import product_root, state_root
@@ -355,7 +356,7 @@ def write_membership_cache(report: dict, repository: str, registry: dict, *, roo
     if _audit_refusal(report, repository, registry) or audit.membership_root_results(report, registry) is None:
         return False
     checkout = product_root(root)
-    cache_path = state_root() / "batch_state/issue_stream_audit.json"
+    cache_path = state_paths.issue_stream_audit_path(state_root())
     warnings = [*(report.get("warnings") or ()), *audit.hygiene_warnings(checkout, set(report["open_issue_numbers"]))]
     audit.publish_cache(
         {**report, "warnings": warnings}, registry, cache_path
@@ -447,7 +448,7 @@ def cached_membership(
     issue: dict, repository: str, number: int, registry: dict, parents: dict, *, epic_repository: str,
 ) -> dict:
     """Read shared audit evidence, then apply the canonical validator and resolver."""
-    path = state_root() / "batch_state" / "issue_stream_audit.json"
+    path = state_paths.issue_stream_audit_path(state_root())
     try:
         report = json_depth.loads(path.read_text(encoding="utf-8"), max_depth=512)
     except FileNotFoundError:

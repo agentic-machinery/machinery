@@ -26,7 +26,6 @@ from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-PLAN_DIR_REL = Path("batch_state") / "fleet-comms" / "retention"
 DEFAULT_ARCHIVE_ROOT = Path.home() / "Library" / "Application Support" / "learn-ukrainian" / "retention-archives"
 GATE5_TARGET_DAYS = 7
 
@@ -34,7 +33,10 @@ GATE5_TARGET_DAYS = 7
 _IMPORT_ROOT = str(Path(__file__).resolve().parents[2])
 if _IMPORT_ROOT not in sys.path:
     sys.path.insert(0, _IMPORT_ROOT)
+from lu_machinery import state_paths
 from lu_machinery.common import json_depth
+
+PLAN_DIR_REL = state_paths.FLEET_COMMS_RETENTION_REL
 from lu_machinery.common.repo_root import MachineryConfigError, product_root, state_root
 from lu_machinery.hygiene.lane_disk_retention import (
     scan_dispatch_worktrees,
@@ -352,7 +354,7 @@ def cmd_plan(args: argparse.Namespace) -> int:
         stale_hours=args.stale_hours,
         include_home=args.include_home,
     )
-    plan_dir = Path(args.plan_dir or state_root() / PLAN_DIR_REL)
+    plan_dir = Path(args.plan_dir) if args.plan_dir else state_paths.fleet_comms_retention_dir(state_root())
     path = write_plan(plan, plan_dir)
     observation = record_gate5_observation(
         plan,
@@ -375,7 +377,7 @@ def cmd_plan(args: argparse.Namespace) -> int:
 
 
 def cmd_latest(args: argparse.Namespace) -> int:
-    plan_dir = Path(args.plan_dir or state_root() / PLAN_DIR_REL)
+    plan_dir = Path(args.plan_dir) if args.plan_dir else state_paths.fleet_comms_retention_dir(state_root())
     latest = plan_dir / "latest.json"
     if not latest.is_file():
         sys.stdout.write(

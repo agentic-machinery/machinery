@@ -39,6 +39,7 @@ from typing import Any, TypeGuard
 if __package__ in (None, ""):  # run as a file: put the repository root on sys.path
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+from lu_machinery import state_paths
 from lu_machinery.common import json_depth
 from lu_machinery.common.repo_root import (
     MachineryConfigError,
@@ -614,7 +615,7 @@ def repository_lock_dir(repo_root: Path) -> Path:
     except (MachineryConfigError, OSError, RuntimeError):
         configured_state = None
     if configured_state is not None and not os.path.lexists(configured_state / ".git"):
-        return configured_state / "batch_state" / "locks" / LOCK_DIR_NAME
+        return state_paths.locks_dir(configured_state) / LOCK_DIR_NAME
     proc = _git_probe(["rev-parse", "--path-format=absolute", "--git-common-dir"], cwd=repo_root)
     common_dir = (proc.stdout or "").strip() if proc is not None and proc.returncode == 0 else ""
     if not common_dir:
@@ -651,7 +652,7 @@ def identity_cache_publication_allowed(worktree: Path, tasks_dir: Path) -> bool:
     """
     try:
         public = public_primary_root().resolve(strict=True)
-        if tasks_dir.resolve(strict=True) != public / "batch_state" / "tasks":
+        if tasks_dir.resolve(strict=True) != state_paths.tasks_dir(public):
             return False
         owner = main_checkout_root(worktree.resolve(strict=True)).resolve(strict=True)
         if (public / ".git").is_dir():
@@ -815,7 +816,7 @@ def git_worktree_remove(
             target,
             primary=primary,
             task_id=task_id,
-            tasks_dir=tasks_dir if tasks_dir is not None else primary / "batch_state" / "tasks",
+            tasks_dir=tasks_dir if tasks_dir is not None else state_paths.tasks_dir(primary),
             task_record=task_record,
             repo_root=repo_root,
             extra_files=preserve_files,
@@ -953,7 +954,7 @@ def remove_unclaimed_worktree(
             if tasks_dir is None or lock_dir is None:
                 control_root = control_root if control_root is not None else control_plane_root(repo_root)
             if tasks_dir is None:
-                tasks_dir = control_root / "batch_state" / "tasks"
+                tasks_dir = state_paths.tasks_dir(control_root)
             if lock_dir is None:
                 lock_dir = repository_lock_dir(control_root)
             locks.enter_context(worktree_lock(worktree, lock_dir=lock_dir, timeout_s=lock_timeout_s))
@@ -1358,7 +1359,7 @@ def _cli_attribution(args: argparse.Namespace, worktree: Path, *, repo_root: Pat
             path, creator = new_helper_creator(
                 worktree, repo_root=repo_root, actor=args.actor, source="legacy_attribution", reason=args.reason,
             )
-            tasks_dir = control_root / "batch_state/tasks"
+            tasks_dir = state_paths.tasks_dir(control_root)
             members = helper_borrowers(worktree, repo_root=repo_root, tasks_dir=tasks_dir)
             if not members:
                 raise ValueError("legacy helper attribution requires borrower task records")
@@ -1381,7 +1382,7 @@ def _cli_removal(args: argparse.Namespace, worktree: Path, *, repo_root: Path, c
     # Deferred: containment's git plumbing is only needed by the CLI.
     from lu_machinery.guardrails import worktree_containment
 
-    tasks_dir = control_root / "batch_state" / "tasks"
+    tasks_dir = state_paths.tasks_dir(control_root)
 
     def releasable() -> tuple[bool, str]:
         registered = worktree_containment.registered_worktrees(repo_root)
