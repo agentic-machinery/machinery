@@ -4,9 +4,11 @@ import json
 import logging
 import math
 import re
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from pathlib import Path
 
+from lu_machinery.agent_runtime.attempt_safe_read import AttemptReadError, safe_read_attempt_file
 from lu_machinery.agent_runtime.sources_read_only import sources_tool_sets
 from lu_machinery.common import json_depth
 from lu_machinery.common.jsonl import jsonl_lines
@@ -27,6 +29,8 @@ MODEL_SOURCE = "agy-stream-json"
 
 _BACKGROUND_TERMINATED_RE = re.compile(r"terminating (?P<count>\d+) background task\(s\)")
 _PRINT_TIMEOUT_PARTIAL_RE = re.compile(r"print timeout after \S+ with turn in progress")
+# The model RPC is logged before it returns any conversation stream events.
+_MODEL_REQUEST_RE = re.compile(rb"\bstreamGenerateContent\b")
 # One structured diagnostic line the CLI writes beside the terminal result.
 # Status and code are the provider's own classification, the same role as
 # Claude's api_error_status and Codex's terminal failure message.
@@ -216,6 +220,36 @@ def terminal_result_observer(stdout_path):
     return observed
 
 
+def model_request_observer(argv: list[str]) -> Callable[[], bool] | None:
+    """Observe complete model-request lines appended to this AGY invocation's log."""
+    if "--log-file" not in argv:
+        return None
+    path = Path(argv[argv.index("--log-file") + 1])
+    try:
+        offset = path.stat().st_size
+    except OSError:
+        offset = 0
+    last_size = offset
+
+    def observed() -> bool:
+        nonlocal offset, last_size
+        try:
+            size = path.stat().st_size
+            if size == last_size:
+                return False
+            if size < last_size:
+                offset = 0
+            chunk = safe_read_attempt_file(path, offset=offset)
+        except (OSError, AttemptReadError):
+            return False
+        last_size = size
+        complete, newline, _ = chunk.rpartition(b"\n")
+        offset += len(complete) + len(newline)
+        return _MODEL_REQUEST_RE.search(complete) is not None
+
+    return observed
+
+
 # AGY moves any command still running after its ``WaitMsBeforeAsync`` (at most 10 s) to a background task, and
 # a headless run waits for background tasks only until its ``--print-timeout`` deadline, counted from launch.
 # There agy 1.4.11 exits 0 with the interim reply as a SUCCESS result, no ``finished_reason`` and nothing on
@@ -363,7 +397,6 @@ def _completed_sources_call(event: dict) -> tuple[object, int] | None:
 def conversation_id(log_file: Path) -> str | None:
     """The conversation the AGY log bound, using the adapter's own reader."""
     from lu_machinery.agent_runtime.adapters.agy import _conversation_id_from_log
-    from lu_machinery.agent_runtime.attempt_safe_read import AttemptReadError
 
     try:
         return _conversation_id_from_log(log_file)

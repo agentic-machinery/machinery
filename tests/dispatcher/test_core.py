@@ -585,6 +585,151 @@ def test_run_worker_silence_timeout_kills_silent_subprocess(sandbox):
     assert worker._identity(grandchild) is None
 
 
+def _watch_agy(tmp_path, monkeypatch, mode, tick):
+    from lu_machinery.agent_runtime import watchdog as runtime_watchdog
+    from lu_machinery.dispatcher import watchdog
+    from lu_machinery.dispatcher.providers import agy
+
+    tmp_path.mkdir()
+    monkeypatch.setenv("LU_SCRATCH_ROOT", str(tmp_path))
+    monkeypatch.setattr(agy, "workspace_sources_refusal", lambda *_args: None)
+    monkeypatch.setattr(agy, "has_ambient_sources_config", lambda *_args, **_kwargs: False)
+    monkeypatch.setattr(agy, "_workspace_sources_settings", lambda **_kwargs: None)
+    monkeypatch.setattr(agy_sandbox, "unavailable", lambda: None)
+    monkeypatch.setattr(agy_sandbox, "launcher", lambda _spec, argv: ["sandbox", "--", *argv])
+    stdout, stderr = tmp_path / "stdout", tmp_path / "stderr"
+    stdout.touch()
+    stderr.touch()
+    now = 0
+
+    def advance(log):
+        nonlocal now
+        now += 1
+        if now == 1:
+            stdout.write_bytes(b'{"event":"init","init":{"model":"gemini-4-neon-high"}}\n')
+        return tick(now, log, stdout, stderr)
+
+    clock = SimpleNamespace(monotonic=lambda: now)
+    monkeypatch.setattr(runtime_watchdog, "time", clock)
+    if mode == "manifest-bound":
+        reason = _watch_bound_agy(tmp_path, monkeypatch, stdout, stderr, clock, advance)
+        return reason, now
+
+    prompt = tmp_path / "prompt"
+    prompt.write_text("Test prompt")
+    spec = TaskSpec("watch-agy", "agy", "gemini-4-neon-high", None, mode,
+                    tmp_path, prompt, tmp_path / "result")
+    invocation = agy.build(spec, {})
+    log = Path(invocation.argv[invocation.argv.index("--log-file") + 1])
+    log.parent.mkdir(parents=True, exist_ok=True)
+
+    def wait(timeout):
+        if advance(log):
+            return 0
+        raise subprocess.TimeoutExpired(invocation.argv, timeout)
+
+    monkeypatch.setattr(watchdog, "time", clock)
+    monkeypatch.setattr(watchdog, "_PROCESS_ACTIVITY_POLL_INTERVAL_S", 1)
+    try:
+        watchdog.communicate(
+            SimpleNamespace(wait=wait), invocation, stdout, stderr, hard_timeout=11,
+            silence_timeout=3, initial_response_timeout=2,
+            liveness=watchdog.liveness_paths(spec, invocation), output_sizes=(0, 0),
+        )
+    except watchdog.DeadlineExpired as expired:
+        return expired.kind, now
+    return None, now
+
+
+def _watch_bound_agy(tmp_path, monkeypatch, stdout, stderr, clock, advance):
+    from lu_machinery.agent_runtime import runner
+    from lu_machinery.agent_runtime.adapters.base import InvocationPlan
+    from lu_machinery.agent_runtime.result import ParseResult
+    from lu_machinery.agent_runtime.watchdog import WatchdogState, _emit_line
+
+    log = tmp_path / "agy.log"
+    plan = InvocationPlan(cmd=["agy", "--log-file", str(log)], cwd=tmp_path, liveness_paths=(log,))
+    child = SimpleNamespace(pid=100, returncode=None)
+    child.poll = lambda: child.returncode
+    monkeypatch.setattr(runner, "_spawn_subprocess", lambda *_args, **_kwargs: (child, None, None))
+    monkeypatch.setattr(runner, "_kill_process_tree", lambda _: setattr(child, "returncode", -signal.SIGTERM))
+    monkeypatch.setattr(runner, "_agy_process_group_exited", lambda _: True)
+    monkeypatch.setattr(runner._ChildCwdPin, "start", lambda **_kwargs: None)
+    monkeypatch.setattr(runner.PrimaryTreeWatch, "start", lambda **_kwargs: None)
+
+    def start_watchdog(_child, paths, *, track_process_activity, **_kwargs):
+        state = WatchdogState(0, 0)
+        offsets = {stdout: 0, stderr: 0}
+
+        def sleep(_seconds):
+            if advance(log):
+                child.returncode = 0
+            for path, is_stderr in ((stdout, False), (stderr, True)):
+                with path.open() as stream:
+                    stream.seek(offsets[path])
+                    for line in stream:
+                        _emit_line(state, line, is_stderr=is_stderr)
+                    offsets[path] = stream.tell()
+            if track_process_activity or (paths and log.exists()):
+                state.last_activity, state.observed_io = clock.monotonic(), True
+
+        clock.sleep = sleep
+        return state, []
+
+    monkeypatch.setattr(runner, "time", clock)
+    monkeypatch.setattr(runner, "start_watchdog", start_watchdog)
+    monkeypatch.setattr(runner, "stop_watchdog", lambda *_args, **_kwargs: None)
+    boundary = SimpleNamespace(workspace=tmp_path, verify_seat=lambda *_args: None,
+                               wrap=lambda cmd, _env: (cmd, {}))
+    adapter = SimpleNamespace(liveness_signal_paths=lambda plan: plan.liveness_paths,
+                              parse_response=lambda **_kwargs: ParseResult(ok=False, response=""))
+    outcome = runner._execute_invocation_once(
+        agent_name="agy", adapter=adapter, plan=plan, prompt="Test prompt", mode="read-only", cwd=tmp_path,
+        model="gemini-4-neon-high", task_id="watch-agy", session_id=None, entrypoint="dispatch",
+        hard_timeout=11, stall_timeout=0, stdout_silence_timeout=3, initial_response_timeout=2,
+        tool_config={"review_attempt_boundary": boundary},
+    )
+    return outcome.kill_reason
+
+
+def test_agy_housekeeping_log_lines_do_not_reset_silence(tmp_path, monkeypatch):
+    """Defect: AGY housekeeping keeps a model-silent worker alive until the hard timeout."""
+    from lu_machinery.dispatcher import watchdog
+
+    monkeypatch.setattr(watchdog, "_process_tree_has_activity", lambda *_args: True)
+
+    def housekeeping(now, log, _stdout, stderr):
+        line = b"fetchAvailableModels\n" if now % 2 else b"loadCodeAssist\n"
+        for path in (log, stderr):
+            with path.open("ab") as stream:
+                stream.write(line)
+        return False
+
+    for mode in ("workspace-write", "read-only", "manifest-bound"):
+        assert _watch_agy(tmp_path / mode, monkeypatch, mode, housekeeping) == ("stdout_silence_timeout", 5), mode
+
+
+def test_agy_model_activity_keeps_worker_alive(tmp_path, monkeypatch):
+    """Model requests and tool events keep an AGY run alive past its silence window."""
+    from lu_machinery.dispatcher import watchdog
+
+    monkeypatch.setattr(watchdog, "_process_tree_has_activity", lambda *_args: False)
+
+    def model_and_tool(now, log, stdout, _stderr):
+        if now == 2:
+            log.write_bytes(b"POST /v1internal:streamGenerate")
+        elif now == 3:
+            with log.open("ab") as stream:
+                stream.write(b"Content\n")
+        elif now == 6:
+            with stdout.open("ab") as stream:
+                stream.write(b'{"event":"step_update","step_update":{"state":"DONE","tool_name":"run_command"}}\n')
+        return now == 9
+
+    for mode in ("workspace-write", "read-only", "manifest-bound"):
+        assert _watch_agy(tmp_path / mode, monkeypatch, mode, model_and_tool) == (None, 9), mode
+
+
 def test_provider_process_lingering_after_its_final_result_settles_with_that_result(sandbox, monkeypatch):
     """Defect class: a finished run held open until timeout.
 
