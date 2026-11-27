@@ -3264,45 +3264,62 @@ def record_finding_outcome(
     repository, reviewed = task.get("repository"), task.get("worktree_base_sha")
     if not isinstance(repository, str) or not isinstance(reviewed, str) or not SHA.fullmatch(reviewed):
         raise RecordError(f"review {task_id} names no repository and reviewed head")
+    if task.get("pinned_head") is not None and task["pinned_head"] != reviewed:
+        raise RecordError("reviewed SHA conflicts with pinned head")
+    started_at = model_stats_rows.timestamp(task.get("started_at"))
+    if started_at is None:
+        raise RecordError(f"review {task_id} has no valid start timestamp")
     # A task id can be dispatched again (the older run stays under a stamped name), and the label ledger keys a finding
     # by task id, not by run: label only a review whose id names one run, the one whose reply was read.
     if runs != 1:
         raise RecordError(f"review task id {task_id} names {runs} runs in the task store: a label binds one run")
-    # Only the review's own publication: its repository, this PR and the head it reviewed.
-    published = [entry for entry in model_stats_rows.read_publications(task_root.parent)[0].get(task_id, [])
-                 if entry["pr"] == pr_number and entry["head"] == reviewed and entry["verdict"] == "CHANGES_REQUESTED"
-                 and same_repository(entry["repository"], repository)]
+    # Only the review's own publication: its repository, this PR, the head it reviewed, and posted at or after start.
+    started_floor = started_at.replace(microsecond=0)
+    try:
+        published = [
+            entry for entry in model_stats_rows.read_publications(task_root.parent)[0].get(task_id, [])
+            if entry["pr"] == pr_number and entry["head"] == reviewed and entry["verdict"] == "CHANGES_REQUESTED"
+            and same_repository(entry["repository"], repository)
+            and (pub_at := model_stats_rows.timestamp(entry["published_at"])) is not None
+            and pub_at >= started_floor
+        ]
+    except FleetRepoError as exc:
+        raise RecordError(f"fleet repository registry unavailable: {exc}") from None
     if not published:
         raise RecordError(f"no published CHANGES_REQUESTED verdict of review {task_id} on PR {pr_number} of "
                           f"{repository} at its reviewed head in the publication ledger; record the verdict first, "
                           f"or import it: {RECORDER_COMMAND} import-publications --repository {repository} "
                           f"--pr {pr_number}")
+    attested_model, _ = reviewer_identity(task)
+    reviewer_model = model_stats_rows.model_id(attested_model)
+    if reviewer_model == "unknown":
+        raise RecordError("reviewer model unknown")
     author = os.environ.get("LEARN_UKRAINIAN_DISPATCH_TASK_ID")
     try:
         entry = model_stats_rows.finding_outcome(
             kind="label", task_id=task_id, repository=published[0]["repository"], pr=pr_number,
-            finding_id=finding_id, label=label, evidence=evidence or None,
+            finding_id=finding_id, reviewer_model=reviewer_model, label=label, evidence=evidence or None,
             recorded_by=author if model_stats_rows.valid_task_id(author) else None,
             recorded_at=observed.isoformat())
         added = model_stats_rows.record_finding_outcomes(task_root.parent, [entry])
     except model_stats_rows.OutcomeConflict as exc:
         raise RecordError(f"{exc}: a finding takes one label") from None
-    except (TimeoutError, OSError) as exc:
+    except (FleetRepoError, TimeoutError, OSError) as exc:
         raise RecordError(f"finding-outcome ledger unavailable: {type(exc).__name__}") from None
     return {"task": task_id, "pr": pr_number, "finding": finding_id, "label": label,
-            "status": "recorded" if added else "already recorded"}
+            "reviewer_model": reviewer_model, "status": "recorded" if added else "already recorded"}
 
 
-def _trusted_publications(
+def _pr_verdict_entries(
     comments: Iterable[Mapping[str, Any]], login: str, *, repository: str, number: int,
     selector: Mapping[str, Any] | None,
 ) -> tuple[list[tuple[dict[str, Any], str]], int, int]:
-    """The publication entries of a PR's verdict markers that ``login`` posted with a trusted association and never
+    """The publication entries of a PR's verdict markers that ``login`` posted with a permitted association and never
     edited, each beside its marker's run start, in the comments' order (GitHub returns them oldest first), and the
-    counts of untrusted and skipped markers. ``record`` and ``import-publications`` trust a marker by this one rule.
+    counts of excluded and skipped markers. ``record`` and ``import-publications`` accept a marker by this one rule.
     The start names the run: a task id can be dispatched again, so the id alone never names one reply."""
     entries: list[tuple[dict[str, Any], str]] = []
-    untrusted = skipped = 0
+    excluded = skipped = 0
     for item in comments:
         body = item.get("body")
         if not isinstance(body, str) or MARKER_PREFIX not in body:
@@ -3316,7 +3333,7 @@ def _trusted_publications(
             or not isinstance(created, str)
             or created != item.get("updated_at")
         ):
-            untrusted += 1
+            excluded += 1
             continue
         entry, _ = publication_of(repository, number, item, fleet_repo_selector=selector)
         marker = parse_marker(body)
@@ -3324,15 +3341,15 @@ def _trusted_publications(
             skipped += 1
         else:
             entries.append((entry, marker["started"]))
-    return entries, untrusted, skipped
+    return entries, excluded, skipped
 
 
 def _store_contests(task_root: Path, task_id: str, reply: str, *,
                     publications: Sequence[tuple[Mapping[str, Any], str]], head: str, started: str) -> str | None:
     """Store each ``CONTEST <id>`` line of a published review against the PR's previous blocking review of record.
 
-    ``publications`` is the PR's trusted verdict publications read from its comments, oldest first, each beside its
-    run start (``_trusted_publications``): the previous round is the newest earlier head with any verdict (a round
+    ``publications`` is the PR's verdict entries read from its comments, oldest first, each beside its
+    run start (``_pr_verdict_entries``): the previous round is the newest earlier head with any verdict (a round
     reviews one head; a publication at this review's own head is a sibling seat of the same round), and it must hold
     exactly one CHANGES_REQUESTED review of another task, the target; otherwise the contest is unresolved. The
     binding never depends on which markers the local ledger holds, and a rerun binds the same round. The target's reply is read only from the run that publication names: a task id can be dispatched again,
@@ -3482,9 +3499,9 @@ def import_publications(
             counts["rate_limited"] = 1
             break
         counts["prs_read"] += 1
-        found, untrusted, skipped = _trusted_publications(
+        found, excluded, skipped = _pr_verdict_entries(
             comments, login, repository=target.repo.github, number=number, selector=target.selector_receipt())
-        counts["markers_untrusted"] += untrusted
+        counts["markers_untrusted"] += excluded
         counts["markers_skipped"] += skipped
         entries.extend(entry for entry, _ in found)
     counts["markers"] = len(entries)
@@ -3944,8 +3961,8 @@ def record(
         )
         # The PR's own verdict comments name the round a contest binds, whatever the local ledger holds.
         contests = _store_contests(task_root, task_id, reply, head=sha, started=started,
-                                   publications=_trusted_publications(comments, login, repository=github.stored,
-                                                                      number=number, selector=github.selector)[0])
+                                   publications=_pr_verdict_entries(comments, login, repository=github.stored,
+                                                                    number=number, selector=github.selector)[0])
     result = {
         "pr": number,
         "head": sha,

@@ -1204,7 +1204,7 @@ def test_finding_outcome_verb_refuses_unpublished_unknown_or_nonblocking_finding
     model_stats_rows.record_publications(tmp_path, [model_stats_rows.publication(
         task_id="review-one", repository="owner/repo", pr=43, head="b" * 40, verdict="CHANGES_REQUESTED",
         published_at="2026-09-23T13:00:00Z")])
-    with pytest.raises(recorder.RecordError, match="no published CHANGES_REQUESTED verdict .* at its reviewed head"):
+    with pytest.raises(recorder.RecordError, match=r"no published CHANGES_REQUESTED verdict .* at its reviewed head"):
         recorder.record_finding_outcome("review-one", pr_number=43, finding_id="F1", label="fixed", evidence=None,
                                         task_root=tasks)
     for finding in ("F2", "F9"):
@@ -1217,7 +1217,8 @@ def test_finding_outcome_verb_refuses_unpublished_unknown_or_nonblocking_finding
     with pytest.raises(recorder.RecordError, match="unknown outcome label"):
         label("F1", "dismissed", "a word outside the vocabulary")
     assert _outcomes(tmp_path) == []
-    assert label("F1", "wrong", "scripts/example.py:1 already resets the state")["status"] == "recorded"
+    recorded = label("F1", "wrong", "scripts/example.py:1 already resets the state")
+    assert recorded["status"] == "recorded" and recorded["reviewer_model"] == CURRENT_SOL
     assert label("F1", "wrong", "scripts/example.py:1 already resets the state")["status"] == "already recorded"
     assert label("F1", "wrong", "the reset runs on every call")["status"] == "already recorded"
     with pytest.raises(recorder.RecordError, match="already labelled wrong: a finding takes one label"):
@@ -1225,10 +1226,32 @@ def test_finding_outcome_verb_refuses_unpublished_unknown_or_nonblocking_finding
     [line] = _outcomes(tmp_path)
     assert line == {
         "schema": "review-finding-outcome.v1", "kind": "label", "task_id": "review-one", "repository": "owner/repo",
-        "pr": 42, "finding_id": "F1", "label": "wrong", "recorded_by": "author-task",
+        "pr": 42, "finding_id": "F1", "reviewer_model": CURRENT_SOL, "label": "wrong", "recorded_by": "author-task",
         "evidence_sha256": hashlib.sha256(b"scripts/example.py:1 already resets the state").hexdigest(),
         "recorded_at": line["recorded_at"],
     }
+    # A Cursor Grok review stores its canonical catalog model id (grok-4.7), never the effort variant or display name.
+    write_task(
+        tasks, task_id="review-grok", reply=_blocking_reply(["P1"]), agent="cursor", model="grok-4.7-high",
+        resolved_model="Grok 4.7 256K High", resolved_model_known=True, resolved_model_source="cursor-stream-json",
+    )
+    model_stats_rows.record_publications(tmp_path, [model_stats_rows.publication(
+        task_id="review-grok", repository="owner/repo", pr=42, head=SHA, verdict="CHANGES_REQUESTED",
+        published_at="2026-09-23T13:00:00Z")])
+    grok_result = recorder.record_finding_outcome(
+        "review-grok", pr_number=42, finding_id="F1", label="fixed", evidence=None, task_root=tasks)
+    assert grok_result["status"] == "recorded" and grok_result["reviewer_model"] == "grok-4.7"
+    assert _outcomes(tmp_path)[-1]["reviewer_model"] == "grok-4.7"
+    # A publication posted before the task started (for example an earlier run whose archived record was purged)
+    # cannot authorize a label for this run.
+    write_task(tasks, task_id="review-early", reply=_blocking_reply(["P1"]),
+               started_at="2026-09-23T14:00:00.000001+00:00")
+    model_stats_rows.record_publications(tmp_path, [model_stats_rows.publication(
+        task_id="review-early", repository="owner/repo", pr=42, head=SHA, verdict="CHANGES_REQUESTED",
+        published_at="2026-09-23T13:00:00Z")])
+    with pytest.raises(recorder.RecordError, match="no published CHANGES_REQUESTED verdict of review review-early"):
+        recorder.record_finding_outcome("review-early", pr_number=42, finding_id="F1", label="fixed", evidence=None,
+                                        task_root=tasks)
     # The command line: exit 1 and a reason on refusal, exit 0 and a JSON receipt otherwise.
     from lu_machinery.common import task_store_paths
 
@@ -1253,8 +1276,8 @@ def test_finding_outcome_verb_refuses_unpublished_unknown_or_nonblocking_finding
     write_task(tasks, reply=_blocking_reply(["P2", "P2"]), started_at="2026-09-23T14:00:00.000001+00:00")
     with pytest.raises(recorder.RecordError, match="review task id review-one names 2 runs in the task store"):
         label("F2", "fixed")
-    assert len(_outcomes(tmp_path)) == 1
-    assert set(censuses) == {"review-one", "review-text"}
+    assert len(_outcomes(tmp_path)) == 2
+    assert set(censuses) == {"review-one", "review-grok", "review-early", "review-text"}
 
 
 @pytest.mark.usefixtures('configured_roots', 'recorder_matcher')

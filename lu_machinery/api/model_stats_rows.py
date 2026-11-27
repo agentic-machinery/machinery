@@ -1105,6 +1105,7 @@ def read_publications(batch_state_dir: Path) -> tuple[dict[str, list[dict[str, A
 OUTCOME_SCHEMA = "review-finding-outcome.v1"
 OUTCOMES_FILE = "finding-outcomes.jsonl"
 _FINDING_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,63}\Z")
+_OUTCOME_REVIEWER_MODEL = "reviewer_model"
 _OUTCOME_KEYS = {
     "label": frozenset({"schema", "kind", "task_id", "repository", "pr", "finding_id", "label", "evidence_sha256",
                         "recorded_by", "recorded_at"}),
@@ -1113,12 +1114,24 @@ _OUTCOME_KEYS = {
 }
 
 
-def _outcome_ok(entry: object) -> bool:
+def _outcome_ok(entry: object, *, require_reviewer_model: bool = False) -> bool:
     # Every membership test below reads a string first: a list or object in a damaged line is unhashable.
     if not isinstance(entry, dict):
         return False
     kind = entry.get("kind")
-    if not isinstance(kind, str) or kind not in _OUTCOME_KEYS or entry.keys() != _OUTCOME_KEYS[kind]:
+    if not isinstance(kind, str) or kind not in _OUTCOME_KEYS:
+        return False
+    expected = _OUTCOME_KEYS[kind]
+    if kind == "label":
+        if entry.keys() - {_OUTCOME_REVIEWER_MODEL} != expected:
+            return False
+        if require_reviewer_model and _OUTCOME_REVIEWER_MODEL not in entry:
+            return False
+        if _OUTCOME_REVIEWER_MODEL in entry:
+            reviewer = entry[_OUTCOME_REVIEWER_MODEL]
+            if not isinstance(reviewer, str) or not reviewer or model_label(reviewer, "") != reviewer or reviewer == "unknown":
+                return False
+    elif entry.keys() != expected:
         return False
     pr, repository, finding_id = entry["pr"], entry["repository"], entry["finding_id"]
     if not (entry["schema"] == OUTCOME_SCHEMA and valid_task_id(entry["task_id"])
@@ -1136,19 +1149,22 @@ def _outcome_ok(entry: object) -> bool:
 
 
 def finding_outcome(*, kind: str, task_id: str, repository: str, pr: int, finding_id: str, recorded_at: str,
-                    label: str | None = None, evidence: str | None = None, recorded_by: str | None = None,
-                    contested_by: str | None = None) -> dict[str, Any]:
-    """One outcome-ledger line: the author's ``label`` for one blocking finding of the published review ``task_id``,
-    or a later review's ``contest`` of that label. The evidence line is kept only as its SHA-256: the text stays in the
-    PR and the delta brief. Raises ValueError when a field has the wrong shape, so a malformed line is never written."""
+                    reviewer_model: str | None = None, label: str | None = None, evidence: str | None = None,
+                    recorded_by: str | None = None, contested_by: str | None = None) -> dict[str, Any]:
+    """One outcome-ledger line: the author's ``label`` for one blocking finding of the published review ``task_id``
+    (carrying ``reviewer_model``, the labelled review's concrete model at write time), or a later review's ``contest``
+    of that label. The evidence line is kept only as its SHA-256: the text stays in the PR and the delta brief.
+    Raises ValueError when a field has the wrong shape, so a malformed line is never written."""
     entry: dict[str, Any] = {"schema": OUTCOME_SCHEMA, "kind": kind, "task_id": task_id, "repository": repository,
                              "pr": pr, "finding_id": finding_id, "recorded_at": recorded_at}
     if kind == "label":
-        entry.update(label=label, recorded_by=recorded_by,
+        entry.update(reviewer_model=reviewer_model, label=label, recorded_by=recorded_by,
                      evidence_sha256=None if evidence is None else hashlib.sha256(evidence.encode()).hexdigest())
     else:
+        if reviewer_model is not None:
+            raise ValueError("finding outcome field has the wrong shape")
         entry["contested_by"] = contested_by
-    if not _outcome_ok(entry):
+    if not _outcome_ok(entry, require_reviewer_model=True):
         raise ValueError("finding outcome field has the wrong shape")
     return entry
 
@@ -1184,10 +1200,11 @@ def record_finding_outcomes(batch_state_dir: Path, entries: Iterable[Mapping[str
 
     A label line is one per (review task, repository, PR, finding), the repository by its identity across a transfer:
     the same label again adds nothing and keeps the first line and its evidence, and another label raises
-    OutcomeConflict before anything is written. A contest line is one per (review task, repository, PR, finding,
-    contesting task). Every entry is checked from the exact JSON bytes that will be written: one malformed entry
-    raises ValueError and writes nothing. TimeoutError when ``wait_s`` passes first; OSError when the ledger cannot
-    be written.
+    OutcomeConflict before anything is written. Every newly written label line must carry ``reviewer_model``; existing
+    legacy lines without it are still read so they remain conflict-protected. A contest line is one per (review task,
+    repository, PR, finding, contesting task). Every entry is checked from the exact JSON bytes that will be written:
+    one malformed entry raises ValueError and writes nothing. TimeoutError when ``wait_s`` passes first; OSError when
+    the ledger cannot be written.
     """
     checked = []
     for entry in entries:
@@ -1199,7 +1216,7 @@ def record_finding_outcomes(batch_state_dir: Path, entries: Iterable[Mapping[str
             snapshot = _load_line(line)
         except (TypeError, ValueError, RecursionError) as exc:
             raise ValueError("finding outcome field has the wrong shape") from exc
-        if not _outcome_ok(snapshot):
+        if not _outcome_ok(snapshot, require_reviewer_model=True):
             raise ValueError("finding outcome field has the wrong shape")
         checked.append((snapshot, line))
 
@@ -1224,25 +1241,37 @@ def record_finding_outcomes(batch_state_dir: Path, entries: Iterable[Mapping[str
         return added
 
 
-OutcomeKey = tuple[str, int | str, int]
+OutcomeFindingKey = tuple[str, int | str, int, str]
 
 
 def read_finding_outcomes(batch_state_dir: Path) -> tuple[
-        dict[OutcomeKey, dict[str, tuple[str, datetime]]], set[tuple[str, int | str, int, str]], Counter[str]]:
-    """The labelled findings (finding id to its label and the time it was recorded) of each (review task, repository
-    identity, PR) publication, the (review task, repository identity, PR, finding id) a later review contested, and
-    read counts. A missing ledger gives none: every finding is then unlabelled. A line counts only for the
-    publication it names. FleetRepoError when the fleet registry cannot be read."""
+        dict[OutcomeFindingKey, tuple[str, str, datetime]], dict[OutcomeFindingKey, datetime], Counter[str]]:
+    """The attributed labels (each keyed by (review task, repository identity, PR, finding id) to (reviewer model,
+    label, recorded time)), the earliest contest time of each contested finding, and read counts. A missing ledger
+    gives none. Legacy label lines written without ``reviewer_model`` are not malformed and count in
+    ``unattributed_labels`` without joining another ledger. FleetRepoError when the fleet registry cannot be read."""
     counts: Counter[str] = Counter()
-    labels: dict[OutcomeKey, dict[str, tuple[str, datetime]]] = {}
-    contests: set[tuple[str, int | str, int, str]] = set()
+    labels: dict[OutcomeFindingKey, tuple[str, str, datetime]] = {}
+    seen_labels: set[OutcomeFindingKey] = set()
+    contests: dict[OutcomeFindingKey, datetime] = {}
     for entry in _outcome_lines(batch_state_dir / ROWS_DIR / OUTCOMES_FILE, counts):
-        identity = repository_identity(entry["repository"])
+        finding_key: OutcomeFindingKey = (
+            entry["task_id"], repository_identity(entry["repository"]), entry["pr"], entry["finding_id"],
+        )
+        moment = cast(datetime, timestamp(entry["recorded_at"]))
         if entry["kind"] == "label":
-            labels.setdefault((entry["task_id"], identity, entry["pr"]), {}).setdefault(
-                entry["finding_id"], (entry["label"], cast(datetime, timestamp(entry["recorded_at"]))))
+            if finding_key in seen_labels:
+                continue
+            seen_labels.add(finding_key)
+            reviewer = entry.get(_OUTCOME_REVIEWER_MODEL)
+            if reviewer is None:
+                counts["unattributed_labels"] += 1
+                continue
+            labels[finding_key] = (model_id(reviewer), entry["label"], moment)
         else:
-            contests.add((entry["task_id"], identity, entry["pr"], entry["finding_id"]))
+            previous = contests.get(finding_key)
+            if previous is None or moment < previous:
+                contests[finding_key] = moment
     return labels, contests, counts
 
 
@@ -1404,11 +1433,8 @@ def _well_formed(row: Mapping[str, Any]) -> bool:
     ))
 
 
-def read_rows(batch_state_dir: Path, runs: dict[str, set[datetime | None]] | None = None,
-              ) -> tuple[list[dict[str, Any]], Counter[str]]:
-    """Every task's latest row (a later line of a task id supersedes an earlier one), and read counts. ``runs``, when
-    given, receives each task id's distinct run starts over all its lines: the live writer appends a row per settled
-    run, so a task id dispatched again shows more than one."""
+def read_rows(batch_state_dir: Path) -> tuple[list[dict[str, Any]], Counter[str]]:
+    """Every task's latest row (a later line of a task id supersedes an earlier one), and read counts."""
     counts: Counter[str] = Counter()
     latest: dict[str, dict[str, Any]] = {}
     try:
@@ -1429,8 +1455,6 @@ def read_rows(batch_state_dir: Path, runs: dict[str, set[datetime | None]] | Non
                 continue
             counts["lines"] += 1
             latest[row["task_id"]] = _sanitised(row)
-            if runs is not None:
-                runs.setdefault(row["task_id"], set()).add(timestamp(row.get("started_at")))
     counts["rows"] = len(latest)
     return list(latest.values()), counts
 
