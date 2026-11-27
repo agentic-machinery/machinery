@@ -468,7 +468,10 @@ def _require_absent(tasks_root: Path, task_id: str) -> None:
 def read(task_id: str, nonce: str | None = None, *, missing_ok=False, tasks_root: Path | None = None) -> dict | None:
     """The task's record, hot or archived; ``None`` with ``missing_ok`` only when no record is proven to exist."""
     root = record_path(task_id).parent if tasks_root is None else tasks_root
-    path = locate_task_record(root, task_id)
+    try:
+        path = locate_task_record(root, task_id)
+    except OSError as exc:  # a pathlib whose is_file() raises on an access failure instead of answering False
+        raise TaskRecordError("TASK_RECORD_UNREADABLE") from exc
     if path is None:
         _require_absent(root, task_id)
         if missing_ok:
