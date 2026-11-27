@@ -386,3 +386,105 @@ def test_wheel_only_deployer_isolation_idempotency_and_false_green(release):
         assert snapshot() == tampered
     finally:
         core.write_bytes(blob)
+
+
+def test_claude_seats_do_not_autoload_on_demand_rules(release, tmp_path):
+    """Defect class: large on-demand Markdown rules auto-loading into every Claude session."""
+    scratch, wheel, executable, env = release
+    excluded_md = (
+        "_load-via-api.md",
+        "fleet-role-scorecard.md",
+        "fleet-shared-doctrine.md",
+        "storage-topology.md",
+    )
+
+    with zipfile.ZipFile(wheel) as archive:
+        inventory = json.loads(archive.read("lu_machinery/agent_deploy/release.v1.json"))
+    for name in excluded_md:
+        assert f"rules/{name}" in inventory["claude_autoload_excludes"], name
+        assert "claude" not in inventory["files"][f"rules/{name}"]["targets"], name
+
+    # 1. Scratch CTO workspace (--workspace): only task-scoped-reading.md lands as Markdown in .claude/rules/.
+    workspace = tmp_path / "cto-workspace"
+    claude_src = workspace / "agents_extensions/claude"
+    claude_src.mkdir(parents=True)
+    hooks: dict = {}
+    for requirement in inventory["required_hooks"]["claude"][".claude/settings.json"]:
+        hooks.setdefault(requirement["path"][-1], []).append(
+            {**requirement["group"], "hooks": requirement["hooks"]}
+        )
+    (claude_src / "settings.json").write_text(json.dumps({"hooks": hooks}), encoding="utf-8")
+    (workspace / "agents_extensions/deployment.v1.json").write_text(
+        json.dumps(
+            {
+                "providers": ["claude"],
+                "sources": {"claude": {"path": "agents_extensions/claude", "required": True}},
+                "preserve": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    host = build_host_layout(tmp_path / "cto-binding")
+    host.data["runtime"]["python"] = str(executable)
+    host.write()
+    ws_env = {name: env[name] for name in ("PATH", "HOME", "TMPDIR", "LANG") if name in env}
+    ws_env.update(host.env)
+    ws_env["LU_STATE_ROOT"] = host.data["state_root"]
+    ws_cmd = [str(executable), "-I", "-m", "lu_machinery.agent_deploy", "--workspace", "--project-root", str(workspace)]
+    try:
+        applied = _run(ws_cmd, cwd=tmp_path, env=ws_env)
+        assert applied.returncode == 0, applied.stdout + applied.stderr
+        checked = _run([*ws_cmd, "--check"], cwd=tmp_path, env=ws_env)
+        assert checked.returncode == 0, checked.stdout + checked.stderr
+
+        ws_rules = workspace / ".claude/rules"
+        assert sorted(p.name for p in ws_rules.glob("*.md")) == ["task-scoped-reading.md"]
+        for name in excluded_md:
+            assert not (ws_rules / name).exists(), name
+        selector_text = (ws_rules / "task-scoped-reading.md").read_text(encoding="utf-8")
+        assert "agents_extensions/shared/rules/_load-via-api.md" in selector_text
+        assert "agents_extensions/shared/rules/storage-topology.md" in selector_text
+    finally:
+        for path in sorted(workspace.rglob("*"), reverse=True):
+            if path.is_dir():
+                path.chmod(0o755)
+            elif path.is_file():
+                path.chmod(0o644)
+
+    # 2. Git consumer checkout: Claude excludes the four on-demand Markdown rules while non-Claude seats keep them.
+    consumer, _, deployed, _ = _deploy_consumer(release, "claude-rules-consumer", list(HARNESSES))
+    assert deployed.returncode == 0, deployed.stdout + deployed.stderr
+    assert sorted(p.name for p in (consumer / ".claude/rules").glob("*.md")) == ["task-scoped-reading.md"]
+    for name in excluded_md:
+        assert not (consumer / ".claude/rules" / name).exists(), name
+        for non_claude_dir in (".agent/rules", ".codex/rules", ".cursor/rules"):
+            assert (consumer / non_claude_dir / name).is_file(), (non_claude_dir, name)
+
+    # 3. All five files remain packaged and readable on demand from the installed release.
+    read_script = """
+import json
+from lu_machinery.lib import rules_core
+names = (
+    "agents_extensions/shared/rules/_load-via-api.md",
+    "agents_extensions/shared/rules/fleet-role-scorecard.md",
+    "agents_extensions/shared/rules/fleet-shared-doctrine.md",
+    "agents_extensions/shared/rules/storage-topology.md",
+    "agents_extensions/shared/rules/task-scoped-reading.md",
+)
+out = {}
+for rel in names:
+    p = rules_core.source_path(rel)
+    out[rel] = {"path": str(p.resolve()), "bytes": len(p.read_bytes())}
+driver_sources = list(rules_core.scope_sources("task:driver"))
+out["task:driver"] = driver_sources
+print(json.dumps(out))
+"""
+    probed = _run([str(executable), "-I", "-c", read_script], cwd=scratch, env=env)
+    assert probed.returncode == 0, probed.stdout + probed.stderr
+    data = json.loads(probed.stdout)
+    for name in (*excluded_md, "task-scoped-reading.md"):
+        rel = SHARED + "rules/" + name
+        assert Path(data[rel]["path"]).is_relative_to(executable.parent.parent)
+        assert data[rel]["bytes"] == (REPO / rel).stat().st_size
+    assert "agents_extensions/shared/rules/fleet-shared-doctrine.md" in data["task:driver"]
+    assert "agents_extensions/shared/rules/fleet-role-scorecard.md" in data["task:driver"]

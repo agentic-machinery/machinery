@@ -41,6 +41,13 @@ names `repo-change`, `cli`, `curriculum`, `fresh-build`, `routing`, `driver`,
 `fleet-comms`, `review`, `task-family`, `rollover`, `ukrainian` (in row order).
 `_load-via-api.md` lists the same files for offline reads.
 
+Direct installed-release reads (not auto-loaded into `.claude/rules/`): read
+`agents_extensions/shared/rules/_load-via-api.md` (offline full-reference and
+task-scope index) and `agents_extensions/shared/rules/storage-topology.md`
+(storage tiers and Sources store generations) from the installed release's
+`agents_extensions/shared/rules/` directory beside the `lu_machinery` package
+(resolvable via `lu_machinery.lib.rules_core.source_path(...)`).
+
 The complete Monitor `/api/rules?scope=full&format=markdown` response is available for full
 policy audits, ambiguous cross-cutting tasks, and clients needing the complete
 ruleset. Its hash cache and source order are unchanged. Offline, select these
