@@ -162,7 +162,8 @@ Hard code                 → GPT-6.2 Sol high | Claude Opus 5.5 high | Gemini 4
 Orchestrate stream        → GPT-6.2 Sol high | Claude Opus 5.5 high | Gemini 4 Neon High (exactly one)
 UI / visual product       → Opus/Sol design → K3 or Sol/Opus/Grok implement web/UI code → Opus/Sol first if systems-hard
 UA language                 → fresh-build writer gemini-4-neon-high (AGY); writer alternatives Sol 6.2 / Opus 5.5; review per LANGUAGE-LANES + VESUM/sources
-Security/bug CF             → resolver at `critical`: Sol 6.2, Opus 5.5 or Gemini 4 Neon High outside the author's family (never Grok)
+Security CF                 → resolver at `critical`: Sol 6.2, Opus 5.5 or Gemini 4 Neon High outside the author's family (never Grok)
+Code/bug CF                 → resolver at the change's risk: the review rotation in model-assignment.md (security paths are raised to `critical`)
 Architecture decision       → Opus/Sol advice → designated approval (operator, or Opus 5.5 + Sol 6.2: the non-author's approval when one authored it, both otherwise) → orchestrator integrates
 Recon                     → GPT-6 Luna high (Sol envelope) | Claude Haiku | Gemini 4 Hydrogen (Sol envelope)
 ```
