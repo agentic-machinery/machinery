@@ -986,7 +986,7 @@ def test_catalog_authorizes_no_claude_review_through_cursor():
 # the #10262 explicit AGY review-risk refusals in both configurations, and the #10630
 # capture-driver account; see SPEC.md.
 PINNED_DIGESTS = {
-    "v2-baseline.json.gz": "7526654c31aaf036ef7e0980b0b386c20c8a887619fa6f6915d088474ab3ebf1",
+    "v2-baseline.json.gz": "da7fb1b135b0f5dba5d8f3ee9c84ed8eb69b518b1e9e1c97ec0080d27cd5d931",
     "routing-10263.json.gz": "3385853a0070ab9a2f77e1fb40d9178ce195e44e7fd6b8c8245702ec529b7d16",
     "SHA256SUMS": "4cba22dff8338f75c8ae96b35119c3da2bea3b3d7d6418c49e466ddc0ddf73a8",
     "SPEC.md": "ed7438340b60df7dcf51271dac1b03952fe96617edd249f14aaed1ecb33a0ede",
@@ -1039,7 +1039,7 @@ def assert_frozen_routing_fixture_pinned(root: Path) -> None:
 # The current fixture contains only the expanded catalog and the existing 1432
 # reviewer cases. It was computed with pure resolver calls, without launching workers.
 _V2_BASELINE_PATH = FIXTURE / "v2-baseline.json.gz"
-assert hashlib.sha256(_V2_BASELINE_PATH.read_bytes()).hexdigest() == "7526654c31aaf036ef7e0980b0b386c20c8a887619fa6f6915d088474ab3ebf1"
+assert hashlib.sha256(_V2_BASELINE_PATH.read_bytes()).hexdigest() == "da7fb1b135b0f5dba5d8f3ee9c84ed8eb69b518b1e9e1c97ec0080d27cd5d931"
 _V2_BASELINE = json.loads(gzip.decompress(_V2_BASELINE_PATH.read_bytes()))
 # The Sol 6.2 recapture (2026-11-17) also carries the corrected hramatka Gemma text.
 # The NEON-SOLTIER-1120 recapture (2026-11-20) admits Neon on infra and critical/security review.
