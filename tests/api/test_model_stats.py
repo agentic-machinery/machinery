@@ -971,12 +971,14 @@ _PAGE_SENTENCES = frozenset({
     "most first-round approvals per recorded wall hour, among catalog models "
     "with at least 10 landed tasks and 10 reviewed PRs",
     "not enough data yet",
-    "No finding outcome is recorded. A blocking finding counts as fixed when the author's "
+    "Precision is inferred from files: a blocking finding counts as fixed when the author's "
     "later head changed its file before the same reviewer approved, else dismissed; a file "
     "changed for another reason (another finding, a merge of main) still counts as fixed, and "
     "a fix made in a different file counts as dismissed. Only verdicts the recorder published "
     "count; a blocking reply with no recorded publication (an unpublished run, or one from "
-    "before the publication ledger and not imported) is of unknown publication and left out.",
+    "before the publication ledger and not imported) is of unknown publication and left out. "
+    "Real precision uses the author's recorded label instead (fixed over fixed, wrong and "
+    "invented); a label is the author's word unless a later review contested it.",
     "No planted-defect result is recorded in the summary rows.",
     "This snapshot does not include task ids.",
     "An allowance reading is the whole pool, not the one model. Overlapping tasks are charged "
@@ -2062,6 +2064,211 @@ def test_finding_precision_follows_the_files_the_author_changed_before_the_same_
     assert stats._diff_blocks(output, ["a" * 40]) is None
 
 
+_HEAD_A = "a" * 40
+_HEAD_B = "b" * 40
+_START_A = _at(2)
+_START_B = _at(1.5)
+
+
+def _label(batch_state: Path, task_id: str, pr: int, finding_id: str, label: str, evidence: str | None = None,
+           *, head: str = _HEAD_A, started_at: str = _START_A, reviewer_model: str = "claude-opus-5-5",
+           repository: str = "learn-ukrainian/machinery", recorded_at: str = _at(1)) -> int:
+    """An author label line, as the verdict recorder's finding-outcome verb writes it."""
+    return rows.record_finding_outcomes(batch_state, [rows.finding_outcome(
+        kind="label", task_id=task_id, repository=repository, pr=pr, finding_id=finding_id, head=head,
+        started_at=started_at, reviewer_model=reviewer_model, label=label, evidence=evidence,
+        recorded_by="author-task", recorded_at=recorded_at)])
+
+
+def _contest(batch_state: Path, task_id: str, pr: int, finding_id: str, contested_by: str,
+             *, head: str = _HEAD_A, started_at: str = _START_A, repository: str = "learn-ukrainian/machinery",
+             recorded_at: str = _at(0.5)) -> int:
+    """A contest line, as the verdict recorder writes it when a later review contests a label."""
+    return rows.record_finding_outcomes(batch_state, [rows.finding_outcome(
+        kind="contest", task_id=task_id, repository=repository, pr=pr, finding_id=finding_id, head=head,
+        started_at=started_at, contested_by=contested_by, recorded_at=recorded_at)])
+
+
+def test_finding_outcome_labels_count_per_reviewer_and_a_contest_holds_the_label_out(tmp_path):
+    """Defect class: label stats depending on a rows or publications join, a contested author claim counted as
+    settled, a contest from another run of a reused task id (different head or start) or an unbound legacy contest
+    suppressing an earlier run's label, a future contest or label leaking into an earlier snapshot, a contest on
+    another PR or repository holding out a finding, a contest without a label counted, a legacy line without
+    reviewer_model or run binding rejected as malformed or misattributed, a retired model kept, or a non-catalog
+    model leaking onto the page view. Every expected figure below is counted by hand."""
+    batch_state, _ = _state(tmp_path)
+    # No summary rows and no publications: label stats read only finding-outcomes.jsonl by stored reviewer_model.
+    # Opus: fixed, wrong, invented (contested before NOW), out_of_scope, duplicate; plus one label contested only
+    # after NOW (still counts as fixed at NOW) and one label recorded at NOW (outside [since, NOW)).
+    assert _label(batch_state, "o1-review", 1, "F0", "fixed") == 1
+    assert _label(batch_state, "o1-review", 1, "F1", "wrong", "the guard on line 3 already returns early") == 1
+    assert _label(batch_state, "o1-review", 1, "F2", "invented", "src/c.py has no such function") == 1
+    assert _contest(batch_state, "o1-review", 1, "F2", "o1b-review") == 1
+    assert _label(batch_state, "o2-review", 2, "F0", "out_of_scope", "outside the frozen obligation") == 1
+    assert _label(batch_state, "o2-review", 2, "F1", "duplicate", "same defect as F0") == 1
+    assert _label(batch_state, "o2-review", 2, "F2", "fixed") == 1
+    assert _contest(batch_state, "o2-review", 2, "F2", "o2b-review",
+                    recorded_at=(NOW + timedelta(hours=1)).isoformat()) == 1
+    assert _label(batch_state, "o2-review", 2, "F3", "fixed", recorded_at=NOW.isoformat()) == 1
+    # Contests on another PR, another repository, another run (different head or start of the same task id on the same
+    # PR), or an unlabelled finding never affect PR 1's labels.
+    assert _contest(batch_state, "o1-review", 9, "F0", "o9-review") == 1
+    assert _contest(batch_state, "o1-review", 1, "F1", "o9-review", repository="other/repo") == 1
+    assert _contest(batch_state, "o1-review", 1, "F0", "o1c-review", head=_HEAD_B, started_at=_START_B) == 1
+    assert _contest(batch_state, "o1-review", 1, "F0", "o1d-review", head=_HEAD_A, started_at=_START_B) == 1
+    assert _contest(batch_state, "o2-review", 2, "F9", "o2b-review") == 1
+    # Sol: one wrong inside 7d, one fixed 10 days ago (inside 30d/all, outside 7d).
+    assert _label(batch_state, "s1-review", 3, "F0", "wrong", "already handled", reviewer_model="gpt-6.2-sol") == 1
+    assert _label(batch_state, "s2-review", 4, "F0", "fixed", reviewer_model="gpt-6.2-sol",
+                  recorded_at=(NOW - timedelta(days=10)).isoformat()) == 1
+    # Effort-suffixed Grok selector normalizes to catalog id grok-4.7; retired Kimi is excluded; an uncatalogued
+    # spelling stays concrete in full windows and bounds to "other" on the page view.
+    assert _label(batch_state, "g1-review", 5, "F0", "invented", "no such symbol", reviewer_model="grok-4.7-high") == 1
+    assert _label(batch_state, "k1-review", 6, "F0", "fixed", reviewer_model="kimi-k3") == 1
+    assert _label(batch_state, "u1-review", 7, "F0", "fixed", reviewer_model="custom-reviewer") == 1
+    # Legacy review-finding-outcome.v1 lines without reviewer_model/head/started_at are not malformed, count in
+    # unattributed_labels / unbound_contests, and never suppress bound labels.
+    legacy_label = {
+        "schema": rows.OUTCOME_SCHEMA, "kind": "label", "task_id": "legacy-review",
+        "repository": "agentic-machinery/machinery", "pr": 8, "finding_id": "F1", "label": "fixed",
+        "evidence_sha256": None, "recorded_by": "author-task", "recorded_at": _at(1),
+    }
+    legacy_contest = {
+        "schema": rows.OUTCOME_SCHEMA, "kind": "contest", "task_id": "o1-review",
+        "repository": "agentic-machinery/machinery", "pr": 1, "finding_id": "F0",
+        "contested_by": "legacy-r2", "recorded_at": _at(0.5),
+    }
+    with (batch_state / rows.ROWS_DIR / rows.OUTCOMES_FILE).open("ab") as stream:
+        stream.write(json.dumps(legacy_label).encode() + b"\n" + json.dumps(legacy_contest).encode() + b"\n")
+
+    snapshot = stats.collect(batch_state, tmp_path, NOW, landing=stats.Landing())
+    assert snapshot["coverage"]["finding_outcomes"] == {"lines": 21, "unattributed_labels": 1, "unbound_contests": 1}
+    zero = dict.fromkeys(("fixed", "wrong", "invented", "out_of_scope", "duplicate", "contested"), 0)
+    full_7d = {row["model"]: row for row in snapshot["windows"]["7d"]["reviewer_accuracy"]["labels"]}
+    assert set(full_7d) == {"claude-opus-5-5", "gpt-6.2-sol", "grok-4.7", "custom-reviewer"}
+    assert full_7d["claude-opus-5-5"]["labels"] == {
+        **zero, "fixed": 2, "wrong": 1, "out_of_scope": 1, "duplicate": 1, "contested": 1,
+    }
+    assert full_7d["claude-opus-5-5"]["real_precision"] == stats._rate(2, 3)
+    assert full_7d["gpt-6.2-sol"]["labels"] == {**zero, "wrong": 1}
+    assert full_7d["gpt-6.2-sol"]["real_precision"] == stats._rate(0, 1)
+    assert full_7d["grok-4.7"]["labels"] == {**zero, "invented": 1}
+    assert full_7d["grok-4.7"]["real_precision"] == stats._rate(0, 1)
+    assert full_7d["custom-reviewer"]["labels"] == {**zero, "fixed": 1}
+    assert full_7d["custom-reviewer"]["identity"] == "not_in_catalog"
+
+    page_7d = {row["model"]: row for row in snapshot["page_windows"]["7d"]["reviewer_accuracy"]["labels"]}
+    assert set(page_7d) == {"claude-opus-5-5", "gpt-6.2-sol", "grok-4.7", "other"}
+    assert page_7d["other"]["labels"] == {**zero, "fixed": 1}
+
+    full_30d = {row["model"]: row for row in snapshot["windows"]["30d"]["reviewer_accuracy"]["labels"]}
+    assert full_30d["gpt-6.2-sol"]["labels"] == {**zero, "fixed": 1, "wrong": 1}
+    assert full_30d["gpt-6.2-sol"]["real_precision"] == stats._rate(1, 2)
+    full_all = {row["model"]: row for row in snapshot["windows"]["all"]["reviewer_accuracy"]["labels"]}
+    assert full_all["gpt-6.2-sol"]["labels"] == {**zero, "fixed": 1, "wrong": 1}
+    assert "reviewer_miss_proxy" not in snapshot["windows"]["30d"]
+    assert "reviewer_miss_proxy" not in snapshot["page_windows"]["30d"]
+
+
+def test_finding_outcome_ledger_keeps_one_label_per_finding_and_skips_damaged_lines(tmp_path):
+    """Defect class: a relabel, a same-label retry refused for its new evidence, a repeated contest, a label or
+    contest without required run binding (head and started_at) or reviewer_model, a half-bound line accepted, a
+    legacy line without run binding losing conflict protection or counted as malformed, a self-contest, or a damaged
+    ledger line (including one whose member names repeat) silently changing what the statistics count."""
+    batch_state, _ = _state(tmp_path)
+    assert _label(batch_state, "o1-review", 1, "F0", "fixed") == 1
+    # The same label again adds nothing; another label for the finding is refused and writes nothing.
+    assert _label(batch_state, "o1-review", 1, "F0", "fixed") == 0
+    with pytest.raises(rows.OutcomeConflict):
+        _label(batch_state, "o1-review", 1, "F0", "wrong", "already correct")
+    # A retry with the same label and other evidence is a no-op too: the first line and its evidence stay.
+    assert _label(batch_state, "o1-review", 1, "F0", "fixed", "now with evidence") == 0
+    # The repository's other slug names the same repository: still one label per finding. Another repository's
+    # publication at the same PR number is another key.
+    with pytest.raises(rows.OutcomeConflict):
+        _label(batch_state, "o1-review", 1, "F0", "wrong", "already correct", repository="agentic-machinery/machinery")
+    assert _label(batch_state, "o1-review", 1, "F0", "fixed", repository="agentic-machinery/machinery") == 0
+    assert _label(batch_state, "o1-review", 1, "F0", "wrong", "already correct", repository="other/repo") == 1
+    # Every label but fixed needs its evidence; every new line needs head + started_at; labels need reviewer_model.
+    for label in ("wrong", "invented", "out_of_scope", "duplicate"):
+        with pytest.raises(ValueError, match="wrong shape"):
+            _label(batch_state, "o1-review", 1, "F1", label)
+    for bad_model in (None, "", "unknown", "has space", "../escape"):
+        with pytest.raises(ValueError, match="wrong shape"):
+            rows.finding_outcome(kind="label", task_id="o1-review", repository="learn-ukrainian/machinery", pr=1,
+                                 finding_id="F1", head=_HEAD_A, started_at=_START_A, reviewer_model=bad_model,
+                                 label="fixed", recorded_at=_at(1))
+    for bad_head, bad_start in (
+        (None, _START_A), ("not-a-sha", _START_A), ("a" * 64, _START_A), ("A" * 40, _START_A),
+        (_HEAD_A, None), (_HEAD_A, "not-a-time"),
+    ):
+        with pytest.raises(ValueError, match="wrong shape"):
+            rows.finding_outcome(kind="label", task_id="o1-review", repository="learn-ukrainian/machinery", pr=1,
+                                 finding_id="F1", head=bad_head, started_at=bad_start,
+                                 reviewer_model="claude-opus-5-5", label="fixed", recorded_at=_at(1))
+        with pytest.raises(ValueError, match="wrong shape"):
+            rows.finding_outcome(kind="contest", task_id="o1-review", repository="learn-ukrainian/machinery", pr=1,
+                                 finding_id="F0", head=bad_head, started_at=bad_start, contested_by="o1b-review",
+                                 recorded_at=_at(1))
+    with pytest.raises(ValueError, match="wrong shape"):
+        rows.finding_outcome(kind="contest", task_id="o1-review", repository="learn-ukrainian/machinery", pr=1,
+                             finding_id="F0", head=_HEAD_A, started_at=_START_A, reviewer_model="claude-opus-5-5",
+                             contested_by="o1b-review", recorded_at=_at(1))
+    with pytest.raises(ValueError, match="wrong shape"):
+        _label(batch_state, "o1-review", 1, "F1", "dismissed", "a word outside the vocabulary")
+    with pytest.raises(ValueError, match="wrong shape"):
+        _contest(batch_state, "o1-review", 1, "F0", "o1-review")
+    assert _contest(batch_state, "o1-review", 1, "F0", "o1b-review") == 1
+    assert _contest(batch_state, "o1-review", 1, "F0", "o1b-review") == 0
+    path = batch_state / rows.ROWS_DIR / rows.OUTCOMES_FILE
+    good = path.read_bytes()
+    assert b"already correct" not in good and b"now with evidence" not in good
+    machinery = rows.repository_identity("learn-ukrainian/machinery")
+    # Writing a raw legacy label line without reviewer_model/head/started_at via record_finding_outcomes is refused.
+    first = json.loads(good.splitlines()[0])
+    legacy = {k: v for k, v in first.items() if k not in ("reviewer_model", "head", "started_at")}
+    legacy["finding_id"] = "F9"
+    with pytest.raises(ValueError, match="wrong shape"):
+        rows.record_finding_outcomes(batch_state, [legacy])
+    extra = {**first, "note": "free text"}
+    half_bound = {k: v for k, v in first.items() if k != "started_at"}
+    # A 64-hex head is refused on raw write as well as on read (only 40-hex Git commit SHAs are valid).
+    sha256_head = {**first, "finding_id": "F8", "head": "a" * 64}
+    with pytest.raises(ValueError, match="wrong shape"):
+        rows.record_finding_outcomes(batch_state, [sha256_head])
+    # Unhashable values, half-bound run keys, 64-hex heads, invalid reviewer_model, and wrong types are damaged lines.
+    damaged = [extra, half_bound, sha256_head, {**first, "label": ["fixed"]}, {**first, "kind": {"label": 1}},
+               {**first, "pr": "1"}, {**first, "reviewer_model": "unknown"},
+               {**first, "reviewer_model": ["claude-opus-5-5"]}]
+    # A repeated member name: the decoder would keep "wrong" and hide "fixed".
+    repeated = json.dumps({**first, "finding_id": "F5"})[:-1].encode() + b', "label": "wrong"}'
+    with path.open("ab") as stream:
+        stream.write(json.dumps(legacy).encode() + b"\n" + b"{not json\n"
+                     + b"".join(json.dumps(line).encode() + b"\n" for line in damaged) + repeated + b"\n")
+    labels, contests, counts = rows.read_finding_outcomes(batch_state)
+    t_label = rows.timestamp(_at(1))
+    t_contest = rows.timestamp(_at(0.5))
+    t_start = rows.timestamp(_START_A)
+    assert labels == {
+        ("o1-review", machinery, 1, "F0", _HEAD_A, t_start): ("claude-opus-5-5", "fixed", t_label),
+        ("o1-review", "other/repo", 1, "F0", _HEAD_A, t_start): ("claude-opus-5-5", "wrong", t_label),
+    }
+    assert contests == {("o1-review", machinery, 1, "F0", _HEAD_A, t_start): t_contest}
+    assert counts == {"lines": 4, "unattributed_labels": 1, "malformed_lines": 10}
+    # A writer that finds damaged and legacy lines still keeps one label per finding (legacy F9 recorded at _at(1)
+    # protects a run that started at _START_A = _at(2) <= _at(1)).
+    assert _label(batch_state, "o1-review", 1, "F0", "fixed") == 0
+    assert _label(batch_state, "o1-review", 1, "F9", "fixed") == 0
+    with pytest.raises(rows.OutcomeConflict):
+        _label(batch_state, "o1-review", 1, "F9", "wrong", "already correct")
+    # PR1553-R2-F1: a newer run of the same task id that started AFTER legacy F9 was recorded (_at(0.5) > _at(1))
+    # gets its own run-bound label without conflicting with or being suppressed by the earlier run's legacy line.
+    assert _label(batch_state, "o1-review", 1, "F9", "wrong", "new run finding is wrong",
+                  head=_HEAD_B, started_at=_at(0.5), recorded_at=_at(0.25)) == 1
+    labels_after, _, _ = rows.read_finding_outcomes(batch_state)
+    assert ("o1-review", machinery, 1, "F9", _HEAD_B, rows.timestamp(_at(0.5))) in labels_after
+
+
 def test_author_results_split_by_risk_tier(tmp_path):
     """Defect class: author first-round approval and findings per PR that mix risk tiers, so an author given the
     critical work looks worse than its peers, that take a later round for the first when a window starts mid-PR, or
@@ -2367,6 +2574,8 @@ def test_publication_ledger_writes_only_well_formed_lines_and_trusts_no_damaged_
     assert token_use["by_work"]["review_of_record"]["tokens"] == 18
     assert token_use["waste"]["supplemental_review"]["share"] == 26 / 71
     assert token_use["by_work"]["unclassified_review"]["tokens"] == 27
+    # A label line is read through the registry too: unreadable, the collection counts no label and still answers.
+    assert _label(batch_state, "c-review", 3, "F0", "fixed") == 1
     registry = fleet_repos._CONFIG_PATH.read_text(encoding="utf-8")
     assert "\n    github: agentic-machinery/machinery\n" in registry
     catalog = tmp_path / "fleet_repos.yaml"

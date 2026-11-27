@@ -56,6 +56,7 @@ from lu_machinery.common.git_context import sanitized_git_env
 from lu_machinery.dispatcher.types import NEVER_STARTED, StartRefusal
 from lu_machinery.orchestration.agent_ledger import TASK_FAMILIES
 from lu_machinery.orchestration.fleet_repos import FleetRepo, FleetRepoError, load_fleet_repos, resolve_fleet_repo
+from lu_machinery.review.findings import FINDING_OUTCOME_LABELS
 from lu_machinery.review.language_lane import UKRAINIAN_TASK_FAMILIES
 from lu_machinery.review.model_catalog import (
     MECHANICAL_FAMILIES,
@@ -76,6 +77,7 @@ from .model_stats_rows import (
     fleet_catalog,
     model_catalog_reading,
     path_digest,
+    read_finding_outcomes,
     read_publications,
     read_rows,
     refresh_readings,
@@ -961,6 +963,44 @@ def head_pairs(rows: Iterable[_Row]) -> set[_HeadPair]:
     return pairs
 
 
+# What became of a blocking finding by its author's label (``record_cf_verdict finding-outcome``): the labels, plus a
+# label a later review contested.
+LABEL_OUTCOMES = (*FINDING_OUTCOME_LABELS, "contested")
+
+
+@dataclass(frozen=True)
+class _Outcomes:
+    """The finding-outcome ledger: attributed run-bound labels keyed by (review task, repository identity, PR,
+    finding id, head, started_at) to (reviewer model, label, recorded time), and each run-bound contested finding's
+    earliest contest time."""
+    labels: Mapping[tuple[str, int | str, int, str, str, datetime], tuple[str, str, datetime]] = field(default_factory=dict)
+    contests: Mapping[tuple[str, int | str, int, str, str, datetime], datetime] = field(default_factory=dict)
+
+
+def _label_outcomes(outcomes: _Outcomes, *, since: datetime, until: datetime,
+                    name: Callable[[str], str] = str) -> list[dict[str, Any]]:
+    """Per reviewer model: author outcome labels recorded in ``[since, until)``, counted directly from the label
+    lines' stored ``reviewer_model`` with no join to the rows or publication ledgers. A label contested before
+    ``until`` counts as ``contested``; ``real_precision`` is fixed over fixed plus wrong plus invented."""
+    counts: dict[str, Counter[str]] = defaultdict(Counter)
+    for finding_key, (reviewer_model, label, recorded_at) in outcomes.labels.items():
+        if recorded_at < since or recorded_at >= until or retired_subscription_model(reviewer_model):
+            continue
+        contested_at = outcomes.contests.get(finding_key)
+        bucket = "contested" if contested_at is not None and contested_at < until else label
+        counts[name(reviewer_model)][bucket] += 1
+    out = []
+    for model, tally in sorted(counts.items(), key=lambda item: (-sum(item[1].values()), item[0])):
+        real = tally["fixed"]
+        judged = sum(tally[label] for label in ("fixed", "wrong", "invented"))
+        out.append({
+            "model": model, "identity": identity(model),
+            "labels": {label: tally[label] for label in LABEL_OUTCOMES},
+            "real_precision": _rate(real, judged), "real_precision_ci": _wilson(real, judged),
+        })
+    return out
+
+
 def _finding_outcomes(rows: Iterable[_Row], touched: Mapping[_HeadPair, frozenset[str]],
                       name: Callable[[str], str] = str) -> list[dict[str, Any]]:
     """Per reviewer model: what became of each P0-P1 finding of its blocking reviews of record.
@@ -1811,12 +1851,14 @@ def _charts(models: list[dict[str, Any]], prs: list[dict[str, Any]], rows: list[
         },
         "ukrainian": ukrainian,
         "limits": {
-            "precision": "No finding outcome is recorded. A blocking finding counts as fixed when the author's "
+            "precision": "Precision is inferred from files: a blocking finding counts as fixed when the author's "
                          "later head changed its file before the same reviewer approved, else dismissed; a file "
                          "changed for another reason (another finding, a merge of main) still counts as fixed, and "
                          "a fix made in a different file counts as dismissed. Only verdicts the recorder published "
                          "count; a blocking reply with no recorded publication (an unpublished run, or one from "
-                         "before the publication ledger and not imported) is of unknown publication and left out.",
+                         "before the publication ledger and not imported) is of unknown publication and left out. "
+                         "Real precision uses the author's recorded label instead (fixed over fixed, wrong and "
+                         "invented); a label is the author's word unless a later review contested it.",
             "recall": "No planted-defect result is recorded in the summary rows.",
             "links": "This snapshot does not include task ids.",
             "quota": "An allowance reading is the whole pool, not the one model. Overlapping tasks are charged "
@@ -1837,11 +1879,13 @@ def summarize(rows: Iterable[_Row], fine: _Fine | None = None,
               prs: list[dict[str, Any]] | None = None, *, history: list[_Row] | None = None,
               touched: Mapping[_HeadPair, frozenset[str]] | None = None,
               accuracy_rows: list[_Row] | None = None, reviewer_name: Callable[[str], str] = str,
-              record_prs: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+              record_prs: list[dict[str, Any]] | None = None,
+              label_outcomes: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     """Every figure of one window's rows. ``touched`` is ``scan_touched`` over these rows' head pairs. Reviewer
     accuracy settles findings on ``accuracy_rows`` (default: these rows), whose reviewer ids must be the recorded
     ones, and groups them under ``reviewer_name``. ``record_prs`` is the window's published cohort
-    (``_prs(of_record=True)``; default: these rows')."""
+    (``_prs(of_record=True)``; default: these rows'). ``label_outcomes`` is the window's per-reviewer outcome-label
+    counts (default: none)."""
     selected = list(rows)
     fine = _fine(selected) if fine is None else fine
     prs = _prs(selected) if prs is None else prs
@@ -1856,6 +1900,7 @@ def summarize(rows: Iterable[_Row], fine: _Fine | None = None,
         "first_round_matrix": _matrix(prs),
         "reviewer_accuracy": {"findings": _finding_outcomes(selected if accuracy_rows is None else accuracy_rows,
                                                             touched or {}, reviewer_name),
+                              "labels": [] if label_outcomes is None else label_outcomes,
                               "planted_defect_recall": PLANTED_DEFECT_RECALL},
         "review_levels": _review_levels(selected, models, selected if history is None else history),
         "allowance": _allowance_rows(selected), "charts": _charts(models, prs, known), "records": len(selected),
@@ -1984,6 +2029,11 @@ def collect(batch_state_dir: Path, primary_root: Path, now: datetime | None = No
     until = now or datetime.now(UTC)
     raw_rows, row_counts = read_rows(batch_state_dir)
     publications, publication_counts = read_publications(batch_state_dir)
+    try:
+        labels, contests, outcome_counts = read_finding_outcomes(batch_state_dir)
+        outcomes = _Outcomes(labels, contests)
+    except FleetRepoError:  # an unreadable registry cannot resolve repository identities: fail closed
+        outcomes, outcome_counts = _Outcomes(), Counter({"registry_unreadable": 1})
     catalog = fleet_catalog()
     keys = repository_keys(catalog)
     moments = [m for m in map(_moment, raw_rows) if m]
@@ -2033,8 +2083,9 @@ def collect(batch_state_dir: Path, primary_root: Path, now: datetime | None = No
                                              merged_prs, include_metrics=name in TOKEN_METRIC_WINDOWS)
         if name in TOKEN_METRIC_WINDOWS:
             token_windows[name] = {"rows": token_metrics, "merged_prs": merged_prs}
-        windows[name] = {"window": window, **summarize(selected, fine, prs, history=rows, touched=touched,
-                                                       record_prs=record_prs),
+        windows[name] = {"window": window, **summarize(
+            selected, fine, prs, history=rows, touched=touched, record_prs=record_prs,
+            label_outcomes=_label_outcomes(outcomes, since=rework_since, until=until)),
                          "token_use": token_use,
                          "post_merge_rework_proxy": _post_merge_rework(merge_outcomes, rework_since)}
         # Bound each member of the author id after deriving PR outcomes: a joint author stays joint, never a known model.
@@ -2043,8 +2094,10 @@ def collect(batch_state_dir: Path, primary_root: Path, now: datetime | None = No
               "class": _page_class(pr["class"])} for pr in cohort]
             for cohort in (prs, record_prs))
         page_selected = [row for row in page_rows if since <= row.moment]
-        page_summary = summarize(page_selected, prs=page_prs, record_prs=page_record_prs, history=page_rows,
-                                 touched=touched, accuracy_rows=selected, reviewer_name=_page_model)
+        page_summary = summarize(
+            page_selected, prs=page_prs, record_prs=page_record_prs, history=page_rows,
+            touched=touched, accuracy_rows=selected, reviewer_name=_page_model,
+            label_outcomes=_label_outcomes(outcomes, since=rework_since, until=until, name=_page_model))
         sample_windows[name] = {"window": window, "models": _sample_models(page_summary["models"])}
         page_windows[name] = {"window": window, **page_window(page_summary),
                               "token_use": token_use,
@@ -2072,6 +2125,7 @@ def collect(batch_state_dir: Path, primary_root: Path, now: datetime | None = No
         "worker_allowance": _worker_allowance([row for row in rows if row.moment >= until - timedelta(days=7)]),
         "coverage": {"rows": dict(sorted(row_counts.items())), "landing": landing.to_dict(),
                      "publications": dict(sorted(publication_counts.items())),
+                     "finding_outcomes": dict(sorted(outcome_counts.items())),
                      # Blocked-to-approved head pairs whose changed files were read from a local checkout.
                      "finding_heads": {"pairs": len(pairs), "read": len(touched)}},
     }

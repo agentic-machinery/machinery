@@ -204,8 +204,9 @@ it raised (a timeout inside the collect included), answers 503 and the page show
   totals count in the window that these tiers do not (no published review at all, or a first published review
   before the window) is counted per author in `author_risks[].prs_without_review_of_record`. The author totals
   above still read the parsed replies, so the tiers need not sum to them.
-- **Reviewer accuracy** (`reviewer_accuracy`): per reviewer model, the outcome of every P0-P1 finding of its
-  blocking reviews of record, and the planted-defect recall. See [Reviewer accuracy](#reviewer-accuracy).
+- **Reviewer accuracy** (`reviewer_accuracy`): per reviewer model, the file-inferred outcome of every P0-P1
+  finding of its blocking reviews of record (`findings`), author-labelled finding outcomes (`labels`), and the
+  planted-defect recall. See [Reviewer accuracy](#reviewer-accuracy).
 - **Allowance**: the dispatcher records the task's pool (`claude:<subscription label>`, `codex:a|b`, `gemini`,
   `agy_claude`, `cursor`) and its remaining weekly allowance at start and finish from the Monitor
   routing-budget, or `unknown` when no plan meter funds the seat or no fresh reading exists. Each reading is one
@@ -295,9 +296,8 @@ so differences between columns are on the reviewers' side; choosing a review cla
 confounds inside a class (some authors get the hardest or most security-sensitive work), and a cell below 10 PRs
 is marked low sample.
 
-No record says which reviewer findings were real: the reviewer chooses finding ids afresh in every reply, and
-the verdict recorder links no later round to an earlier finding (it keeps only the P3 residual ids of an
-approval). [Reviewer accuracy](#reviewer-accuracy) estimates it from what the author changed instead.
+Which reviewer findings were real comes from the author's outcome labels where they are recorded, and is
+estimated from what the author changed otherwise (see [Reviewer accuracy](#reviewer-accuracy)).
 
 On 2026-11-16 over all history (parsed reviews of record): with Sol 6.1 as first reviewer, Grok 4.7 PRs were
 approved first time 78% (178 PRs), Sonnet 5.5 68% (164) and Opus 5.5 45% (362); inside infra/critical alone
@@ -308,7 +308,7 @@ blocked first round, 81% of Opus 5.5 PRs were approved on a new head and 1.5% on
 ## Reviewer accuracy
 
 Approval rate and findings per review say how strict a reviewer is, not whether it is right. `reviewer_accuracy`
-adds two measures.
+adds the measures below.
 
 **Finding precision** (`reviewer_accuracy.findings`). A blocking review of record is a review whose
 `CHANGES_REQUESTED` verdict the verdict recorder published on the PR at the row's head, as the
@@ -404,6 +404,47 @@ approved, 2 of 942 were approved on the same head (the recorder refuses such an 
 
 On 2026-11-19 over 30 days (backfilled copy): GPT-6.1 Sol 0.949 (237 settled findings, 157 open), Opus 5.5 0.868
 (91, 28 open), GPT-6.2 Sol 1.0 (3, 35 open, low sample), Grok 4.7 1.0 (7, low sample).
+
+**Outcome labels** (`reviewer_accuracy.labels`). After it records a `CHANGES_REQUESTED` verdict,
+the author labels each P0-P2 finding of that review (every finding that can block it) with
+`record_cf_verdict finding-outcome --task-id <review> --pr <N> --finding <id> --label <label> [--evidence '<line>']`:
+`fixed` (a real error, changed), `wrong` (the code was already correct), `invented` (it cites a file, line,
+symbol or behaviour that does not exist), `out_of_scope` or `duplicate`. Every label except `fixed` needs one line
+of evidence. The verb refuses a finding that is not a P0-P2 finding of the review's structured reply, a review
+with no published `CHANGES_REQUESTED` verdict on that PR at its reviewed head at or after its start in the
+publication ledger, and a review task id that names more than one run record in the task store (a task id can be
+dispatched again; a label line names the task id, not the run). The reply, the run census and the label's time
+are read under the task-store lock that archive and restore moves take. Each label line stores the labelled
+review's reviewed `head`, normalized `started_at`, and canonical `reviewer_model` at write time (attested from the
+review task record), and each contest line stores the target run's validated `head` and normalized `started_at`. One label per finding:
+the same label again is a no-op, and another one is refused. The next review of the PR may contest a label with a
+line `CONTEST <finding-id>: <reason>` in its reply's `overall.explanation`. When `record` publishes that review,
+it binds the PR's previous round from the PR's own verdict comments: the newest earlier head with any verdict
+before this run's comment (a round reviews one head, so a comment at the contesting review's own head is a sibling
+seat of its round, never the round it contests, and a contest never falls back past the previous round). That
+round must hold exactly one `CHANGES_REQUESTED` review of another task, else
+`not stored: unresolved: the previous round at <head> has <n> blocking review(s) of another task`. It reads that
+review's reply only from the run its comment names (the task record's reviewed head and start must equal the
+marker's, else `not stored: unresolved: ...`), stores each contested id that is a P0-P2 finding of that reply and
+reports `outcome_contests` (`stored against <review>: <ids>; unmatched: <ids>`, or `not stored: unmatched: <ids>`
+when no id matched, which writes nothing); a reply that contests nothing adds no field. A failed write reports
+`failed: <reason>`; recording the same verdict again while the head stands retries it.
+
+Per-reviewer label statistics count label lines directly by their stored `reviewer_model` (filtered to the window
+by `recorded_at`), with no join to the rows or publication ledgers. A label contested for the same run (`task_id`,
+repository identity, `pr`, `finding_id`, `head`, `started_at`) before the snapshot time counts as `contested`, not
+as its label; a contest for another run of a reused task id never suppresses an earlier run's label. Legacy lines
+written without `reviewer_model` or run binding (`head` and `started_at`) are accepted as valid lines (legacy
+labels remaining conflict-protected on write), counted in `coverage.finding_outcomes.unattributed_labels` and
+`coverage.finding_outcomes.unbound_contests`, and attributed to no reviewer. An unreadable fleet registry counts no label
+(`coverage.finding_outcomes.registry_unreadable`). `real_precision` is `fixed / (fixed + wrong + invented)` with
+its Wilson interval; a label is the author's word unless a later review contested it.
+
+Both line kinds go to `batch_state/model-stats/finding-outcomes.jsonl` (schema `review-finding-outcome.v1`)
+under the rows lock; the recorder is its one writer. It keeps the evidence only as its SHA-256, never the text: the
+text stays in the PR and the delta brief. A line without the writer's shape is skipped and counted in
+`coverage.finding_outcomes.malformed_lines`. The file sits beside the publication ledger rather than inside it, so a
+reader of an older release never counts these lines as damaged publications.
 
 **Planted-defect recall** (`reviewer_accuracy.planted_defect_recall`) is `unknown` with `missing_input` named: the
 summary rows carry no seeded or known-answer defect result. The frozen known-answer set (`docs/review-eval`) is

@@ -133,12 +133,15 @@ Freeze sections 2 to 4 of the template from round 1; do not edit them. Section 1
 - the acceptance-criterion IDs the fix diff affects;
 - the ledger: every finding id with its disposition and proof, that is its fix evidence, the
   author's decline with file:line or test evidence, or the author's `not_applicable` claim
-  with its proof;
+  with its proof, and the outcome label recorded for each P0-P2 finding with its evidence;
 - targeted same-head output or the relevant CI excerpts, and the checks still pending;
 - the budget state (`round 2 of 3`, or of the budget the repository declares).
 
 The reviewer marks every earlier id `resolved` or `still open: <reason>`, confirms or contests
-each `not_applicable` claim on its evidence ([findings](policy.md#3-findings)), reviews the fix
+each `not_applicable` claim on its evidence ([findings](policy.md#3-findings)), contests an
+outcome label its evidence does not support with a line `CONTEST <finding-id>: <reason>` in
+`overall.explanation` (the verdict recorder stores it against the previous blocking round, and
+the label then counts as contested), reviews the fix
 diff and traces its effects on the frozen acceptance criteria and existing contracts, including
 changed fallbacks, fail-open paths, downstream callers and weakened tests; unchanged code is
 context for those checks. A new blocker names the causal change or unresolved finding id, the

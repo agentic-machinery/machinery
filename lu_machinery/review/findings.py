@@ -18,6 +18,18 @@ from typing import Literal
 Disposition = Literal["in_scope_blocker", "follow_up", "stop_and_escalate"]
 EventKind = Literal["raised", "adjudicated", "applied", "skipped"]
 
+# What the author says became of one blocking (P0-P2) finding of a published review, recorded with
+# ``record_cf_verdict finding-outcome`` and counted per reviewer by the model statistics.
+FINDING_OUTCOME_LABELS: dict[str, str] = {
+    "fixed": "a real error; the author changed the code",
+    "wrong": "the code was already correct",
+    "invented": "the finding cites a file, line, symbol or behaviour that does not exist",
+    "out_of_scope": "outside the change's frozen obligation",
+    "duplicate": "another finding of the same review names the same defect",
+}
+# The labels an author must back with one line of evidence. A fix shows in the next head's diff.
+EVIDENCED_OUTCOME_LABELS = frozenset(FINDING_OUTCOME_LABELS) - {"fixed"}
+
 
 class FindingsLedgerError(RuntimeError):
     """An operation would violate the append-only / explicit-adjudication contract."""

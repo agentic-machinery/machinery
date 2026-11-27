@@ -2071,13 +2071,18 @@ def _task(task_id: str, task_root: Path) -> tuple[dict[str, Any], str]:
 
     A deliberate same-user writer can also replace the record's stored hash.
     """
+    with task_archive_lock(task_root):
+        return _task_in_archive_lock(task_id, task_root)
+
+
+def _task_in_archive_lock(task_id: str, task_root: Path) -> tuple[dict[str, Any], str]:
+    """``_task`` for a caller that already holds ``task_archive_lock(task_root)``."""
     if not REVIEW_TASK_ID.fullmatch(task_id) or ".." in task_id:
         raise RecordError("invalid canonical task identity")
     try:
-        with task_archive_lock(task_root):
-            task_path = _hot_or_archived(task_root, f"{task_id}.json")
-            task = json_depth.loads(task_path.read_text(encoding="utf-8"), max_depth=_JSON_MAX_DEPTH)
-            raw_reply = task_path.with_suffix(".result").read_bytes()
+        task_path = _hot_or_archived(task_root, f"{task_id}.json")
+        task = json_depth.loads(task_path.read_text(encoding="utf-8"), max_depth=_JSON_MAX_DEPTH)
+        raw_reply = task_path.with_suffix(".result").read_bytes()
     except (OSError, ValueError) as exc:
         raise RecordError("review task record or reply unavailable") from exc
     if not isinstance(task, dict):
@@ -3174,6 +3179,273 @@ def _store_publication(
     return "stored"
 
 
+# A later review contests an author's outcome label with this line in its reply's ``overall.explanation``.
+_CONTEST_LINE = re.compile(r"^[ \t]*CONTEST[ \t]+([A-Za-z0-9][A-Za-z0-9._:-]{0,63})[ \t]*:[ \t]*\S", re.MULTILINE)
+MAX_EVIDENCE_CHARS = 500
+# The findings a CHANGES_REQUESTED review blocks with, and so the ones an author labels: every reachable P0-P2
+# finding is an in-scope blocker (review policy section 3); a P3-only reply is published as an approval.
+LABELLED_PRIORITIES = frozenset({"P0", "P1", "P2"})
+
+
+def _structured_reply(reply: str) -> tuple[Mapping[str, Any], Any] | None:
+    """The payload and checked findings of a valid ``code-review-findings.v1`` reply, else None."""
+    try:
+        payload = parse_reviewer_json(reply)
+        _, evidence = checked_findings_payload(payload)
+    except (ContractError, ReviewPublicationError):
+        return None
+    return (payload, evidence) if evidence is not None and isinstance(payload, Mapping) else None
+
+
+def _blocking_finding_ids(reply: str) -> frozenset[str] | None:
+    """The ids of the P0-P2 findings of a structured reply; None when the reply has no structured findings."""
+    structured = _structured_reply(reply)
+    if structured is None:
+        return None
+    return frozenset(finding.finding_id for finding in structured[1].findings
+                     if finding.priority in LABELLED_PRIORITIES)
+
+
+def _contested_ids(reply: str) -> tuple[str, ...]:
+    """The finding ids a structured reply contests: each ``CONTEST <id>: <reason>`` line of its explanation."""
+    structured = _structured_reply(reply)
+    overall = structured[0].get("overall") if structured is not None else None
+    text = overall.get("explanation") if isinstance(overall, Mapping) else None
+    return tuple(dict.fromkeys(_CONTEST_LINE.findall(text))) if isinstance(text, str) else ()
+
+
+def _run_records(task_id: str, task_root: Path) -> int:
+    """How many run records the task store keeps under ``task_id``, hot and archived, by dispatch's naming grammar
+    (a run dispatched again keeps its earlier record under a stamped name). The caller holds
+    ``task_archive_lock(task_root)``, so an archive or restore move cannot shift a record between the two listings.
+    RecordError when a directory is unreadable."""
+    from lu_machinery.orchestration.task_record_store import candidate_task_record_names
+
+    found = 0
+    for directory in (task_root, task_root / ARCHIVE_DIR_NAME):
+        try:
+            names = os.listdir(directory)
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            raise RecordError(f"task store unreadable: {type(exc).__name__}") from None
+        found += len(candidate_task_record_names(task_id, names))
+    return found
+
+
+def _normalized_started(record: Mapping[str, Any]) -> str | None:
+    """``capability_failure.run_started`` with UTC-overflow timestamps returning None instead of raising."""
+    from lu_machinery.review.capability_failure import run_started
+
+    try:
+        return run_started(record)
+    except OverflowError:
+        return None
+
+
+def record_finding_outcome(
+    task_id: str, *, pr_number: int, finding_id: str, label: str, evidence: str | None,
+    task_root: Path | None = None, now: datetime | None = None,
+) -> dict[str, Any]:
+    """Store the author's outcome label for one P0-P2 finding of a review whose CHANGES_REQUESTED verdict the ledger
+    holds on PR ``pr_number``. One label per finding: the same label again is a no-op, another one is refused."""
+    from lu_machinery.api import model_stats_rows
+    from lu_machinery.common.task_store_paths import tasks_dir
+    from lu_machinery.review.findings import EVIDENCED_OUTCOME_LABELS, FINDING_OUTCOME_LABELS
+
+    task_root = task_root or tasks_dir()
+    if label not in FINDING_OUTCOME_LABELS:
+        raise RecordError(f"unknown outcome label {label!r}; use one of: {', '.join(FINDING_OUTCOME_LABELS)}")
+    evidence = evidence.strip() if evidence is not None else None
+    if label in EVIDENCED_OUTCOME_LABELS and not evidence:
+        raise RecordError(f"label {label} needs --evidence: one line that shows it")
+    if evidence and (len(evidence) > MAX_EVIDENCE_CHARS or any(ch in evidence for ch in "\n\r\x85  ")):
+        raise RecordError(f"evidence must be one line of at most {MAX_EVIDENCE_CHARS} characters")
+    # One observation: the reply, the run census and the label's time, under the lock archive and restore moves take.
+    with task_archive_lock(task_root):
+        task, reply = _task_in_archive_lock(task_id, task_root)
+        runs = _run_records(task_id, task_root)
+        observed = now or datetime.now(UTC)
+    blocking = _blocking_finding_ids(reply)
+    if blocking is None:
+        raise RecordError("review reply has no structured findings: only code-review-findings.v1 findings take a label")
+    if finding_id not in blocking:
+        raise RecordError(f"finding {finding_id!r} is not a P0-P2 finding of review {task_id}")
+    repository, reviewed = task.get("repository"), task.get("worktree_base_sha")
+    if not isinstance(repository, str) or not isinstance(reviewed, str) or not SHA.fullmatch(reviewed):
+        raise RecordError(f"review {task_id} names no repository and reviewed head")
+    if task.get("pinned_head") is not None and task["pinned_head"] != reviewed:
+        raise RecordError("reviewed SHA conflicts with pinned head")
+    started = _normalized_started(task)
+    started_at = model_stats_rows.timestamp(started) if started is not None else None
+    if started is None or started_at is None:
+        raise RecordError(f"review {task_id} has no valid start timestamp")
+    # A task id can be dispatched again (the older run stays under a stamped name), and the label ledger keys a finding
+    # by task id, not by run: label only a review whose id names one run, the one whose reply was read.
+    if runs != 1:
+        raise RecordError(f"review task id {task_id} names {runs} runs in the task store: a label binds one run")
+    # Only the review's own publication: its repository, this PR, the head it reviewed, and posted at or after start.
+    started_floor = started_at.replace(microsecond=0)
+    try:
+        published = [
+            entry for entry in model_stats_rows.read_publications(task_root.parent)[0].get(task_id, [])
+            if entry["pr"] == pr_number and entry["head"] == reviewed and entry["verdict"] == "CHANGES_REQUESTED"
+            and same_repository(entry["repository"], repository)
+            and (pub_at := model_stats_rows.timestamp(entry["published_at"])) is not None
+            and pub_at >= started_floor
+        ]
+    except FleetRepoError as exc:
+        raise RecordError(f"fleet repository registry unavailable: {exc}") from None
+    if not published:
+        raise RecordError(f"no published CHANGES_REQUESTED verdict of review {task_id} on PR {pr_number} of "
+                          f"{repository} at its reviewed head in the publication ledger; record the verdict first, "
+                          f"or import it: {RECORDER_COMMAND} import-publications --repository {repository} "
+                          f"--pr {pr_number}")
+    attested_model, _ = reviewer_identity(task)
+    reviewer_model = model_stats_rows.model_id(attested_model)
+    if reviewer_model == "unknown":
+        raise RecordError("reviewer model unknown")
+    author = os.environ.get("LEARN_UKRAINIAN_DISPATCH_TASK_ID")
+    try:
+        entry = model_stats_rows.finding_outcome(
+            kind="label", task_id=task_id, repository=published[0]["repository"], pr=pr_number,
+            finding_id=finding_id, head=reviewed, started_at=started, reviewer_model=reviewer_model, label=label,
+            evidence=evidence or None, recorded_by=author if model_stats_rows.valid_task_id(author) else None,
+            recorded_at=observed.isoformat())
+        added = model_stats_rows.record_finding_outcomes(task_root.parent, [entry])
+    except model_stats_rows.OutcomeConflict as exc:
+        raise RecordError(f"{exc}: a finding takes one label") from None
+    except (FleetRepoError, TimeoutError, OSError) as exc:
+        raise RecordError(f"finding-outcome ledger unavailable: {type(exc).__name__}") from None
+    return {"task": task_id, "pr": pr_number, "finding": finding_id, "label": label,
+            "reviewer_model": reviewer_model, "status": "recorded" if added else "already recorded"}
+
+
+def _pr_verdict_entries(
+    comments: Iterable[Mapping[str, Any]], login: str, *, repository: str, number: int,
+    selector: Mapping[str, Any] | None,
+) -> tuple[list[tuple[dict[str, Any], str]], int, int]:
+    """The publication entries of a PR's verdict markers that ``login`` posted with a permitted association and never
+    edited, each beside its marker's run start, in the comments' order (GitHub returns them oldest first), and the
+    counts of excluded and skipped markers. ``record`` and ``import-publications`` accept a marker by this one rule.
+    The start names the run: a task id can be dispatched again, so the id alone never names one reply."""
+    entries: list[tuple[dict[str, Any], str]] = []
+    excluded = skipped = 0
+    for item in comments:
+        body = item.get("body")
+        if not isinstance(body, str) or MARKER_PREFIX not in body:
+            continue
+        association = item.get("author_association")
+        created = item.get("created_at")
+        if (
+            _author_login(item, rest_only=True) != login
+            or not isinstance(association, str)
+            or association not in TRUSTED_ASSOCIATIONS
+            or not isinstance(created, str)
+            or created != item.get("updated_at")
+        ):
+            excluded += 1
+            continue
+        entry, _ = publication_of(repository, number, item, fleet_repo_selector=selector)
+        marker = parse_marker(body)
+        if entry is None or marker is None:
+            skipped += 1
+        else:
+            entries.append((entry, marker["started"]))
+    return entries, excluded, skipped
+
+
+def _store_contests(task_root: Path, task_id: str, reply: str, *,
+                    publications: Sequence[tuple[Mapping[str, Any], str]], head: str, started: str) -> str | None:
+    """Store each ``CONTEST <id>`` line of a published review against the PR's previous blocking review of record.
+
+    ``publications`` is the PR's verdict entries read from its comments, oldest first, each beside its
+    run start (``_pr_verdict_entries``): the previous round is the newest earlier head with any verdict (a round
+    reviews one head; a publication at this review's own head is a sibling seat of the same round), and it must hold
+    exactly one CHANGES_REQUESTED review of another task, the target; otherwise the contest is unresolved. The
+    binding never depends on which markers the local ledger holds, and a rerun binds the same round. The target's reply is read only from the run that publication names: a task id can be dispatched again,
+    so a task record whose reviewed head or start differs from the marker's is another run, and nothing is stored.
+    An id that is no P0-P2 finding of that reply is reported unmatched and never stored; a reply that matches none
+    stores nothing. None when the reply contests nothing; never raises."""
+    from lu_machinery.api import model_stats_rows
+
+    contested = _contested_ids(reply)
+    if not contested:
+        return None
+    try:
+        own = next((index for index, (entry, run) in enumerate(publications)
+                    if entry["task_id"] == task_id and entry["head"] == head and run == started), None)
+        if own is None:
+            return "not stored: no trusted verdict comment of this run on the PR"
+        # A round reviews one head, and a new round needs a new head: a publication at this review's own head is a
+        # sibling seat of the same round, never the round it contests. The previous round is the newest earlier head
+        # with any verdict; a contest binds only to it, never to an older round past it.
+        earlier = [(entry, run) for entry, run in reversed(publications[:own]) if entry["head"] != head]
+        if not earlier:
+            return f"not stored: no earlier round on PR {publications[own][0]['pr']}"
+        round_head = earlier[0][0]["head"]
+        round_blocking = [(entry, run) for entry, run in earlier
+                          if entry["head"] == round_head and entry["verdict"] == "CHANGES_REQUESTED"]
+        seats = {entry["task_id"] for entry, _ in round_blocking}
+        others = seats - {task_id}
+        if len(others) != 1 or task_id in seats:
+            return (f"not stored: unresolved: the previous round at {round_head[:12]} has {len(others)} blocking "
+                    f"review(s) of another task" + ("; this task id blocked it too" if task_id in seats else ""))
+        target, target_started = round_blocking[0]
+        record, target_reply = _task(target["task_id"], task_root)
+        if record.get("worktree_base_sha") != target["head"] or _normalized_started(record) != target_started:
+            return (f"not stored: unresolved: the task record of {target['task_id']} is not the run published at "
+                    f"{target['head'][:12]}")
+        blocking = _blocking_finding_ids(target_reply) or frozenset()
+        matched = [finding_id for finding_id in contested if finding_id in blocking]
+        unmatched = [finding_id for finding_id in contested if finding_id not in blocking]
+        if not matched:
+            return f"not stored: unmatched: {', '.join(unmatched)}"
+        moment = datetime.now(UTC).isoformat()
+        model_stats_rows.record_finding_outcomes(task_root.parent, [model_stats_rows.finding_outcome(
+            kind="contest", task_id=target["task_id"], repository=target["repository"], pr=target["pr"],
+            finding_id=finding_id, head=target["head"], started_at=target_started, contested_by=task_id,
+            recorded_at=moment) for finding_id in matched],
+            wait_s=model_stats_rows.SETTLEMENT_LOCK_WAIT_S)
+    except Exception as exc:  # the verdict is already published; name the failure, never raise past it
+        return f"failed: {type(exc).__name__}"
+    return (f"stored against {target['task_id']}: {', '.join(matched)}"
+            + (f"; unmatched: {', '.join(unmatched)}" if unmatched else ""))
+
+
+def finding_outcome_main(argv: list[str]) -> int:
+    from lu_machinery.review.findings import FINDING_OUTCOME_LABELS
+
+    parser = argparse.ArgumentParser(
+        prog=f"{RECORDER_COMMAND} finding-outcome",
+        description="Record what became of one blocking (P0-P2) finding of a published CHANGES_REQUESTED review.\n"
+        "The author records one label per finding before the next round; that round's reviewer may contest it\n"
+        "with a line 'CONTEST <finding-id>: <reason>' in its reply's overall.explanation. Labels:\n"
+        + "".join(f"  {name}: {meaning}\n" for name, meaning in FINDING_OUTCOME_LABELS.items())
+        + "The ledger keeps the label and the evidence's SHA-256, never the evidence text.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=f"Examples:\n  {RECORDER_COMMAND} finding-outcome --task-id review-unit --pr 1 --finding F1 --label fixed\n"
+        f"  {RECORDER_COMMAND} finding-outcome --task-id review-unit --pr 1 --finding F2 --label wrong "
+        "--evidence 'tests/x.py::test_y covers the None case'\n"
+        "Outputs: JSON receipt on stdout, status 'recorded' or 'already recorded'.\n"
+        "Exit codes: 0: recorded or already recorded; 1: refused; 2: primary bootstrap refused.",
+    )
+    parser.add_argument("--task-id", required=True, help="Review task whose blocking verdict is published")
+    parser.add_argument("--pr", type=int, required=True, help="PR number the verdict is published on")
+    parser.add_argument("--finding", required=True, help="Id of one P0-P2 finding of that review's reply")
+    parser.add_argument("--label", required=True, choices=tuple(FINDING_OUTCOME_LABELS), help="The finding's outcome")
+    parser.add_argument("--evidence", help="One line backing the label; required for every label but fixed")
+    args = parser.parse_args(argv)
+    try:
+        result = record_finding_outcome(args.task_id, pr_number=args.pr, finding_id=args.finding, label=args.label,
+                                        evidence=args.evidence)
+    except RecordError as exc:
+        print(f"finding outcome refused: {exc}")
+        return 1
+    print(json.dumps(result, sort_keys=True))
+    return 0
+
+
 def import_publications(
     *, days: int, dry_run: bool, task_root: Path | None = None, now: datetime | None = None,
     adapter: GitHubAdapter | None = None, only: tuple[str, int] | None = None,
@@ -3238,26 +3510,11 @@ def import_publications(
             counts["rate_limited"] = 1
             break
         counts["prs_read"] += 1
-        for item in comments:
-            body = item.get("body")
-            if not isinstance(body, str) or MARKER_PREFIX not in body:
-                continue
-            association = item.get("author_association")
-            created = item.get("created_at")
-            if (
-                _author_login(item, rest_only=True) != login
-                or not isinstance(association, str)
-                or association not in TRUSTED_ASSOCIATIONS
-                or not isinstance(created, str)
-                or created != item.get("updated_at")
-            ):
-                counts["markers_untrusted"] += 1
-                continue
-            entry, _ = publication_of(target.repo.github, number, item, fleet_repo_selector=target.selector_receipt())
-            if entry is None:
-                counts["markers_skipped"] += 1
-            else:
-                entries.append(entry)
+        found, excluded, skipped = _pr_verdict_entries(
+            comments, login, repository=target.repo.github, number=number, selector=target.selector_receipt())
+        counts["markers_untrusted"] += excluded
+        counts["markers_skipped"] += skipped
+        entries.extend(entry for entry, _ in found)
     counts["markers"] = len(entries)
     if dry_run:
         present = model_stats_rows.publication_keys(batch_state_dir)
@@ -3713,6 +3970,10 @@ def record(
             task_root, repository=github.stored, number=number, comment=posted_comment if posted else existing or {},
             fleet_repo_selector=github.selector,
         )
+        # The PR's own verdict comments name the round a contest binds, whatever the local ledger holds.
+        contests = _store_contests(task_root, task_id, reply, head=sha, started=started,
+                                   publications=_pr_verdict_entries(comments, login, repository=github.stored,
+                                                                    number=number, selector=github.selector)[0])
     result = {
         "pr": number,
         "head": sha,
@@ -3727,6 +3988,8 @@ def record(
     }
     if residuals:
         result["residuals"] = list(residuals)
+    if contests is not None:
+        result["outcome_contests"] = contests
     if github.selector is not None:
         result["fleet_repo_selector"] = github.selector
     if facts.app_bot_commits:
@@ -4109,6 +4372,8 @@ def main(argv: list[str] | None = None) -> int:
         return republish_withheld_main(argv[1:])
     if argv[:1] == ["import-publications"]:
         return import_publications_main(argv[1:])
+    if argv[:1] == ["finding-outcome"]:
+        return finding_outcome_main(argv[1:])
     if argv[:1] == ["capability-failure"]:
         # The capability failure verb builds on this module, so it is imported only when chosen.
         from lu_machinery.review.capability_failure import main as capability_failure_main
@@ -4134,6 +4399,8 @@ def main(argv: list[str] | None = None) -> int:
         f"  {RECORDER_COMMAND} capability-failure --task-id review-unit --pr 1 "
         "--capability test-execution --authority claude-cto\n"
         "    (classify a finished run that only lacked a capability; see capability-failure --help)\n"
+        f"  {RECORDER_COMMAND} finding-outcome --task-id review-unit --pr 1 --finding F1 --label fixed\n"
+        "    (label one blocking finding of a published review; see finding-outcome --help)\n"
         "Outputs: GitHub review comment and commit status; JSON publication receipt on stdout.\n"
         "Exit codes: 0: recorded; 1: refused or status publication failed; 2: primary bootstrap refused.\nRelated: #9297, #9951",
     )
