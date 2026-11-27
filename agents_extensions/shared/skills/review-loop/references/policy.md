@@ -50,11 +50,11 @@ requires a recorded APPROVE and the other merge gates. The author fixes a break-
 and the same reviewer confirms the fix in one delta round. That is the whole Low budget.
 
 The reviewer's risk is the `--risk` passed to the resolver: `high` or `critical` for a High-tier
-change. At `high`, `medium` and `low` the resolver seats Sol, Opus, Gemini 4 Neon High and pinned
-Cursor Grok 4.7 High as one equal group for code and infra, picking the eligible seat with the
-fewest recent reviews of record (REVIEW-ROTATION-GROK-1127). At `critical` it seats Sol, Opus and
-Gemini 4 Neon High only: critical and security sign-off stay unchanged pending planted-defect data
-(operator decides). For `code` and `infra` reviews the
+change. Seat order and eligibility follow the review rotation in
+[model-assignment](../../../rules/model-assignment.md) (REVIEW-ROTATION-GROK-1127): pinned Cursor
+Grok 4.7 High joins Sol, Opus and Gemini 4 Neon High at `high`, `medium` and `low` only, and
+`critical` seats Sol, Opus or Gemini 4 Neon High: critical and security sign-off stay unchanged
+pending planted-defect data (operator decides). For `code` and `infra` reviews the
 security-path classifier (`lu_machinery/review/security_paths.py`) is a floor: a change touching
 one of its paths, either name of a rename or a deletion included, is reviewed at `critical`
 whatever risk was passed. Nothing lowers that floor.

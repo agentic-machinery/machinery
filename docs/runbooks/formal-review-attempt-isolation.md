@@ -374,8 +374,8 @@ At high and critical risk the automatic bench (`lu_machinery.review.bench_health
 #9394) accepts a single automatic cross-family reviewer for Anthropic-authored
 code (`openai_frontier`) and OpenAI-authored code (`claude-opus-5-5`) under
 #9423 AC-02. Critical admits Sol, Opus and Gemini 4 Neon High for code and infra
-(#9538, NEON-SOLTIER-1120), and high also admits Cursor Grok 4.7 High in the
-resolver's least-used rotation (REVIEW-ROTATION-GROK-1127; see `model-assignment.md`).
+(#9538, NEON-SOLTIER-1120), and high also admits Cursor Grok 4.7 High
+(REVIEW-ROTATION-GROK-1127; the review rotation in `model-assignment.md`).
 So non-Google benches count `gemini-4-neon-high` alongside Sol and Opus, and high
 benches outside xAI and Moonshot also count `grok-4.7-cursor-fallback`; critical
 is limited by the catalog's `critical_review` role (#9583). OpenAI's single Opus seat also depends on
