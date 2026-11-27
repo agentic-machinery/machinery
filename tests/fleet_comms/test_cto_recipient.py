@@ -6,6 +6,7 @@ import io
 import json
 
 import pytest
+import yaml
 
 from lu_machinery.fleet_comms.authority import AuthorityRecipientRefused, AuthorityService, AuthorityServiceError
 from lu_machinery.fleet_comms.cli import EXIT_ERROR, EXIT_OK, main
@@ -178,9 +179,10 @@ def test_declared_external_recipients_are_admitted_and_unknown_names_still_refus
     assert sorted(tuple(row) for row in backlog(plane)) == sorted((name, "queued") for name in external)
 
     # Admission comes from the declared list, not a name in code: without it, the same name is refused.
-    text = agent_identity.ASSIGNMENTS_PATH.read_text(encoding="utf-8")
+    data = yaml.safe_load(agent_identity.ASSIGNMENTS_PATH.read_text(encoding="utf-8"))
+    data["external_recipients"] = []
     stripped = tmp_path / "area_assignments.yaml"
-    stripped.write_text(text.replace("external_recipients:", "unused_external_recipients:"), encoding="utf-8")
+    stripped.write_text(yaml.safe_dump(data), encoding="utf-8")
     monkeypatch.setattr(agent_identity, "ASSIGNMENTS_PATH", stripped)
     with AuthorityService(root=plane) as service:
         for name in external:
@@ -326,3 +328,69 @@ def test_incomplete_roster_proves_no_name_unregistered_and_removes_nothing(
         ("codex", "queued"), ("codex", "queued"), (lane, "queued"), (lane, "queued"),
         (worker, "queued"), (worker, "queued"),
     ])
+
+
+@pytest.mark.parametrize("doubt", ["malformed_area", "task_store_unreadable"])
+def test_partly_unreadable_roster_or_task_store_keeps_mail_queued_through_expire_stale_apply(
+    plane, tasks, monkeypatch, tmp_path, capsys, doubt,
+):
+    """Defect class: a reader that cannot read part of its input answers as if it had, so expire-stale --apply dead-letters live mail (#1567)."""
+    from lu_machinery import agent_identity
+    from lu_machinery.dispatcher import store
+    from lu_machinery.fleet_comms import authority
+
+    # One area holds the only registration of its slot, as a dedicated slot area does.
+    data = yaml.safe_load(agent_identity.ASSIGNMENTS_PATH.read_text(encoding="utf-8"))
+    data["assignments"]["doubt-probe"] = {"driver_agent_type": "codex", "slots": ["codex-doubt-probe"]}
+    roster = tmp_path / "area_assignments.yaml"
+    roster.write_text(yaml.safe_dump(data), encoding="utf-8")
+    monkeypatch.setattr(agent_identity, "ASSIGNMENTS_PATH", roster)
+    worker = tasks("cto-7-i7-worker", "running")
+    victim = "codex-doubt-probe" if doubt == "malformed_area" else worker
+    with AuthorityService(root=plane) as service:
+        service.publish_message(sender="claude-cto", body="b", recipients=(victim,))
+    tasks_dir = tmp_path / "tasks"
+    try:
+        if doubt == "malformed_area":
+            data["assignments"]["doubt-probe"]["slots"] = victim  # a scalar, not a list
+            roster.write_text(yaml.safe_dump(data), encoding="utf-8")
+            assert authority._roster_complete() is False
+        else:
+            tasks_dir.chmod(0o600)  # no search permission: every record stat fails with EACCES
+            with pytest.raises(store.TaskRecordError, match="TASK_RECORD_UNREADABLE"):
+                store.read(worker, missing_ok=True)
+            assert authority._task_standing(worker) == "unknown"
+        applied = run(capsys, "deliveries", "expire-stale", "--root", str(plane), "--apply")
+    finally:
+        tasks_dir.chmod(0o700)
+    assert applied["unreadable_expired"]["deliveries"] == 0
+    with AuthorityService(root=plane) as service:
+        assert dead_letter_reasons(service) == []
+    assert [tuple(row) for row in backlog(plane)] == [(victim, "queued")]
+    assert store.read("cto-0-i0-absent", missing_ok=True) is None  # proven absence still reads as no record
+
+
+def test_unreadable_alias_roster_leaves_an_alias_unverified_never_refused(plane, monkeypatch, tmp_path):
+    """Defect class: a failed alias read answers "canonical", so a minted alias such as cursor-monitor is refused (#1567)."""
+    from lu_machinery import agent_identity
+    from lu_machinery.fleet_comms import authority
+
+    AuthorityService(root=plane).close()  # an existing, empty store
+    roster = tmp_path / "area_assignments.yaml"
+    roster.write_text(agent_identity.ASSIGNMENTS_PATH.read_text(encoding="utf-8"), encoding="utf-8")
+    monkeypatch.setattr(agent_identity, "ASSIGNMENTS_PATH", roster)
+    assert agent_identity.resolve_recipient_alias("cursor-monitor", strict=True) == "cursor"
+    assert authority._roster_complete() is True  # read and cached before the alias read fails
+    roster.chmod(0)
+    try:
+        with pytest.raises(ValueError, match="Cannot read"):
+            agent_identity.resolve_recipient_alias("cursor-monitor", strict=True)
+        # A name no roster can make an alias needs no read.
+        assert [agent_identity.resolve_recipient_alias(name, strict=True) for name in ("eggbot", "codex")] == [
+            "eggbot", "codex",
+        ]
+        snapshot = authority.pending_delivery_snapshot("cursor-monitor", root=plane)
+    finally:
+        roster.chmod(0o600)
+    assert (snapshot["count"], snapshot["reason"]) == (None, "recipient_standing_unverified")
+    assert authority.pending_delivery_snapshot("cursor-monitor", root=plane)["probe"] == "ok"
