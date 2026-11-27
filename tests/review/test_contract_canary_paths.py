@@ -5,6 +5,7 @@
 from lu_machinery.review.contract_canary import CONTRACT_PATHS, touches_contract
 import hashlib
 import json
+import os
 import shlex
 import shutil
 import subprocess
@@ -262,8 +263,11 @@ def test_a_change_outside_the_contract_needs_no_canary(repo) -> None:
 def runner_roots(tmp_path, configured_roots, monkeypatch):
     """A host context with all external orchestration replaced by an argv fake."""
     import sys
+    from lu_machinery import host_context
     from lu_machinery.dispatcher import git as dispatch_git
 
+    monkeypatch.setattr(host_context, "DEFAULT_PATH", tmp_path / "missing-host.v1.json")
+    monkeypatch.delenv(host_context.CONTEXT_ENV, raising=False)
     source = tmp_path / "registered-source"
     source.mkdir()
     home = tmp_path / "home"
@@ -282,6 +286,8 @@ def runner_roots(tmp_path, configured_roots, monkeypatch):
     monkeypatch.setattr(fleet_repos, "load_fleet_repos", lambda *_args, **_kwargs: {"machinery": row})
     monkeypatch.setattr(git_credentials, "load_selector", lambda **_kwargs: git_credentials.SelectorState(
         {"machinery": "example/machinery"}, "d" * 64))
+    monkeypatch.delenv("LU_PRIMARY_REPO_ROOT", raising=False)
+    monkeypatch.delenv("LU_PYTHON", raising=False)
     monkeypatch.setenv("LEARN_UKRAINIAN_PYTHON", sys.executable)
     monkeypatch.delenv("LEARN_UKRAINIAN_DISPATCH_TASK_ID", raising=False)
     # The space check reads the default refuse level and a roomy disk, never the host's.
@@ -443,14 +449,32 @@ def test_runner_failures_cannot_score_green_or_delete_a_live_mount(
 def test_detached_release_canary_uses_configured_product_and_state(
     runner_roots, configured_roots, tmp_path, monkeypatch, capsys,
 ):
-    """Defect class: detached host resolves the Sources server from the machinery checkout."""
+    """Defect class: a release engine's product overlays leak into bound canary children."""
     import sys
 
+    from lu_machinery import host_context
     from lu_machinery.agent_runtime.sources_read_only import SERVER_RELATIVE_PATH, sources_tool_sets
     from lu_machinery.release_cut import Cut
 
     state = tmp_path / "state"
-    state.mkdir()
+    state.mkdir(mode=0o700)
+    binding = tmp_path / "host.v1.json"
+    selector = tmp_path / "live-selector"
+    binding.write_text(json.dumps({
+        "schema": host_context.SCHEMA,
+        "state_root": str(state),
+        "runtime": {"python": sys.executable, "lu_machinery": "1.0", "wheel_sha256": "0" * 64},
+        "repos": {"machinery": str(configured_roots.primary), "public": str(configured_roots.product)},
+        "products": {"course": {"repo": "public", "python": str(tmp_path / "product-python")}},
+        "default_product": "course",
+        "private_tools": {},
+        "cto": {"workspace": str(tmp_path), "starter": str(tmp_path / "starter"), "config_dir": str(tmp_path)},
+        "selector_file": str(selector),
+        "monitor_url": "http://127.0.0.1",
+    }), encoding="utf-8")
+    monkeypatch.setenv(host_context.CONTEXT_ENV, str(binding))
+    monkeypatch.setenv("LEARN_UK_REPO_ROOT", str(tmp_path / "product-overlay"))
+    monkeypatch.setenv("LEARN_UKRAINIAN_PYTHON", str(tmp_path / "product-python"))
     monkeypatch.setenv("LU_STATE_ROOT", str(state))
     monkeypatch.setenv("LEARN_UKRAINIAN_STATE_ROOT", str(state))
     monkeypatch.setenv("LU_TASKS_DIR", str(configured_roots.primary / "batch_state" / "tasks"))
@@ -469,7 +493,25 @@ def test_detached_release_canary_uses_configured_product_and_state(
     assert product == str(configured_roots.product)
     assert sources_tool_sets(Path(product) / SERVER_RELATIVE_PATH)[0]
     assert env["LU_STATE_ROOT"] == str(state)
-    assert canary.main(["run", "--head", "a" * 40, "--dry-run"]) == 0
+    cut.head = "a" * 40
+
+    def run(argv, *, env, **kwargs):
+        assert env["LU_PRIMARY_REPO_ROOT"] == str(configured_roots.primary)
+        assert env["LEARN_UKRAINIAN_PRIMARY_REPO_ROOT"] == str(configured_roots.primary)
+        assert env["LU_FLEET_REPO_SELECTOR_FILE"] == str(selector)
+        assert "LEARN_UK_REPO_ROOT" not in env
+        assert "LEARN_UKRAINIAN_PYTHON" not in env
+        with monkeypatch.context() as child:
+            for key in os.environ.keys() - env.keys():
+                child.delenv(key)
+            for key, value in env.items():
+                child.setenv(key, value)
+            return subprocess.CompletedProcess(argv, canary.main(argv[3:]))
+
+    monkeypatch.setattr(cut, "run", run)
+    assert cut.contract_canary().returncode == 0
+    assert os.environ["LEARN_UKRAINIAN_PYTHON"] == str(tmp_path / "product-python")
+    assert os.environ["LEARN_UK_REPO_ROOT"] == str(tmp_path / "product-overlay")
     output = capsys.readouterr().out
     commands = [line for line in output.splitlines() if line.startswith("systemd-run ")]
     assert len(commands) == len(canary.required_routes())
@@ -478,12 +520,12 @@ def test_detached_release_canary_uses_configured_product_and_state(
         assert f"--setenv=LU_STATE_ROOT={state}" in line
         assert f"--setenv=LU_TASKS_DIR={state / 'batch_state' / 'tasks'}" in line
         assert f"--setenv=LU_PYTHON={sys.executable}" in line
-        assert f"--setenv=LEARN_UKRAINIAN_PYTHON={sys.executable}" in line
-        assert "--setenv=LEARN_UKRAINIAN_STATE_ROOT=" not in line
+        assert f"--setenv=LEARN_UKRAINIAN_STATE_ROOT={state}" in line
+        assert f"--setenv=LU_FLEET_REPO_SELECTOR_FILE={selector}" in line
         unset_arg = next(arg.removeprefix("--property=UnsetEnvironment=")
                          for arg in shlex.split(line.partition(" -I -B -c ")[0])
                          if arg.startswith("--property=UnsetEnvironment="))
-        assert {"LEARN_UKRAINIAN_STATE_ROOT", "LU_PROFILE_PATH", "LU_FLEET_REPO_SELECTOR_FILE",
+        assert {"LEARN_UK_REPO_ROOT", "LEARN_UKRAINIAN_PYTHON", "LU_PROFILE_PATH",
                 "LU_GITHUB_SLUG", "LEARN_UKRAINIAN_GITHUB_SLUG"} <= set(unset_arg.split())
     assert not (configured_roots.primary / "batch_state").exists()
 

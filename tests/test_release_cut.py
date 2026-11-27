@@ -1348,6 +1348,7 @@ def test_publisher_uses_release_interpreter_not_stale_host_python(tmp_path, monk
     state = tmp_path / "state"
     state.mkdir()
     monkeypatch.delenv("LU_FLEET_REPO_SELECTOR_FILE", raising=False)
+    monkeypatch.delenv("LU_REPOS_ROOT", raising=False)
     monkeypatch.delenv("LEARN_UKRAINIAN_PRIMARY_REPO_ROOT", raising=False)
     monkeypatch.delenv("LU_TASKS_DIR", raising=False)
     monkeypatch.setenv("LU_PRIMARY_REPO_ROOT", f"{primary}/")
@@ -1529,7 +1530,8 @@ def test_publisher_uses_release_interpreter_not_stale_host_python(tmp_path, monk
         "import sys\n"
         f"sys.path.insert(0, {str(pkg_parent)!r})\n"
         "from pathlib import Path\n"
-        "from lu_machinery import release_cut\n"
+        "from lu_machinery import host_context, release_cut\n"
+        f"host_context.DEFAULT_PATH = Path({str(tmp_path / 'missing-host.v1.json')!r})\n"
         "from lu_machinery.common.repo_root import configured_github_slug, state_root\n"
         "def stub_open_post_release(probe_cut):\n"
         f"    assert probe_cut.primary.resolve() == Path({str(primary)!r}).resolve()\n"
@@ -1552,6 +1554,8 @@ def test_publisher_uses_release_interpreter_not_stale_host_python(tmp_path, monk
     probe_runner.chmod(0o755)
     emitted_for_probe = resume_command.replace(shlex.quote(str(installed)), shlex.quote(str(probe_runner)), 1)
     clean_shell_env = dict(os.environ)
+    clean_shell_env.pop("LU_HOST_CONTEXT", None)
+    clean_shell_env.pop("LU_PYTHON", None)
     clean_shell_env.pop("LEARN_UKRAINIAN_DISPATCH_TASK_ID", None)
     clean_shell_env.update(
         HOME=str(probe_home), LU_PRIMARY_REPO_ROOT=str(sibling_machinery),

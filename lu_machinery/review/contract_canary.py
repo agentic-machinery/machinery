@@ -30,8 +30,9 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, cast
 
-from lu_machinery import state_paths
+from lu_machinery import host_context, state_paths
 from lu_machinery.common import github_client, json_depth
+from lu_machinery.common.git_credentials import SELECTOR_ENV, repository_registry
 from lu_machinery.common.repo_root import MACHINERY_ENV_VARS, STATE_ROOT_ENV
 
 # The machinery package's directory name, which a change lists its files under, from this module's
@@ -359,6 +360,33 @@ def _invoke(argv: Sequence[str], *, cwd: Path, env: Mapping[str, str], check: bo
     return result
 
 
+def canary_environment(env: Mapping[str, str]) -> dict[str, str] | None:
+    """Project a configured host binding into a canary child's environment."""
+    binding_env = {name: env[name] for name in (host_context.CONTEXT_ENV,) if name in env}
+    try:
+        context = host_context.load_host_context(role="state", env=binding_env)
+    except host_context.HostContextError as exc:
+        if exc.code == "missing_context" and not binding_env:
+            return None
+        raise
+    if not isinstance(context, host_context.HostContext):
+        raise CanaryError("contract canary requires a full host binding")
+    registry = repository_registry(host_context.REGISTRY_PATH)
+    child = dict(env)
+    # The cut engine can have its own product overlay. Check each inherited
+    # setting against the same assertions that the bound child will enforce.
+    for name, value in env.items():
+        try:
+            host_context._assert_legacy(context, {name: value}, registry)
+        except host_context.HostContextError as exc:
+            if exc.code != "legacy_conflict":
+                raise
+            del child[name]
+    child.update(host_context.hook_environment(context))
+    child[SELECTOR_ENV] = str(context.selector_file)
+    return child
+
+
 def _run_steps(
     work: Path, source: Path, repo_key: str, repo: str, head: str, interpreter: Path, routes: Sequence[str],
     hard_timeout: int, env: Mapping[str, str], wheelhouse: str,
@@ -369,8 +397,6 @@ def _run_steps(
     history), and ``run`` removes it once the image is built. With a wheelhouse, the consumer
     venv also finds wheels there; the lock's hashes still decide which bytes install.
     """
-    from lu_machinery.common.git_credentials import SELECTOR_ENV
-
     clone, mount = work / "source", work / "mount"
     python = str(work / "consumer/bin/python")
     url = f"https://github.com/{repo}.git"
@@ -405,8 +431,15 @@ def _run_steps(
     )
     commands = []
     # Passing named context explicitly is necessary: the user manager does not inherit this shell's env.
-    context = ("PATH", "LU_PRODUCT_ROOT", "LU_TASKS_DIR", SELECTOR_ENV,
-               "FLEET_COMMS_ROOT", "LU_GITHUB_CACHE_DIR", *MACHINERY_ENV_VARS)
+    context = (
+        "PATH", host_context.CONTEXT_ENV, "LU_PRODUCT_ROOT", "LEARN_UK_REPO_ROOT",
+        "LU_TASKS_DIR", SELECTOR_ENV, "FLEET_COMMS_ROOT", "LU_GITHUB_CACHE_DIR",
+        "LEARN_UKRAINIAN_BATCH_STATE_DIR", "LEARN_UKRAINIAN_OWNERSHIP_LEDGER",
+        "LEARN_UKRAINIAN_INFRA_PRIVATE_ROOT", "MONITOR_PROJECT_STATE_URL",
+        "LU_MONITOR_LOOPBACK", "MONITOR_API_BASE_URL", "MONITOR_API_URL", "AB_MONITOR_URL",
+        "MONITOR_API_URLS", "AB_MONITOR_URLS", "MONITOR_BASE_URLS", "DELEGATE_MONITOR_API",
+        *MACHINERY_ENV_VARS,
+    )
     unset_context = [key for key in context if not env.get(key)]
     for route in routes:
         model, *account = _RUN_MODELS[route]
@@ -485,25 +518,33 @@ def run(args: argparse.Namespace) -> int:
         # supervise its routes, and the attestation step refuses that before any provider call.
         raise CanaryError(f"--repo {args.repo}: only machinery heads can be canaried; this runner cannot attest "
                           f"the dispatcher of a {repository['key']} head")
-    try:
-        # Read and clone at the row's active slug; a transferred row without a trusted selector fails closed.
-        github = resolve_active_fleet_repo(repository["key"]).active_github
-    except FleetRepoError as exc:
-        raise CanaryError(f"--repo {args.repo}: {exc}") from None
-    env = sanitized_git_env(strip_config_injection=True)
+    inherited = sanitized_git_env(strip_config_injection=True)
+    projected = canary_environment(inherited)
+    env = inherited if projected is None else projected
     env.pop("PYTHONPATH", None)
     env.pop("PYTHONHOME", None)
-    primary = str(primary_root())
-    state = state_root()
-    # Native hooks reserve the compatibility state variable for the Git checkout.
-    env.pop(STATE_ROOT_ENV, None)
+    try:
+        # Read and clone at the row's active slug; a transferred row without a trusted selector fails closed.
+        github = resolve_active_fleet_repo(repository["key"], env=env).active_github
+    except FleetRepoError as exc:
+        raise CanaryError(f"--repo {args.repo}: {exc}") from None
+    state = state_root(env=env)
+    interpreter = project_interpreter(env=env)
+    if projected is None:
+        primary = str(primary_root(env=env))
+        # Native hooks reserve the compatibility state variable for the Git checkout.
+        env.pop(STATE_ROOT_ENV, None)
+        env.update(
+            LU_PRIMARY_REPO_ROOT=primary,
+            LEARN_UKRAINIAN_PRIMARY_REPO_ROOT=primary,
+            LU_PRODUCT_ROOT=str(product_root(env=env)),
+            LU_STATE_ROOT=str(state),
+            LU_PYTHON=str(interpreter),
+            LEARN_UKRAINIAN_PYTHON=str(interpreter),
+        )
     # Keep dispatch, wait, record and score on the same plane, even if the user
     # manager has old root settings or this caller has a task-scoped override.
     env.update(
-        LU_PRIMARY_REPO_ROOT=primary,
-        LEARN_UKRAINIAN_PRIMARY_REPO_ROOT=primary,
-        LU_PRODUCT_ROOT=str(product_root()),
-        LU_STATE_ROOT=str(state),
         LU_TASKS_DIR=str(state_paths.tasks_dir(state)),
     )
     head = args.head
@@ -520,8 +561,6 @@ def run(args: argparse.Namespace) -> int:
     routes = required_routes()
     if set(routes) != set(_RUN_MODELS):
         raise CanaryError("required routes changed; update the supported canary model map before running")
-    interpreter = project_interpreter()
-    env.update(LU_PYTHON=str(interpreter), LEARN_UKRAINIAN_PYTHON=str(interpreter))
     wheelhouse = os.environ.get(WHEELHOUSE_ENV, "")
     if wheelhouse and not (os.path.isabs(wheelhouse) and os.path.isdir(wheelhouse)):
         raise CanaryError(f"{WHEELHOUSE_ENV} must be the absolute path of an existing wheelhouse directory")

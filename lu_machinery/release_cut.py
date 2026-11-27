@@ -1382,10 +1382,13 @@ class Cut:
 
     def contract_canary(self) -> subprocess.CompletedProcess[str]:
         """The candidate's canary orchestration and sealed candidate receipt gate."""
+        from lu_machinery.review.contract_canary import canary_environment
+
         argv: list[str | Path] = [self.host_python, "-m", "lu_machinery.review.contract_canary", "run", "--repo",
                 "machinery", "--head", self.head]
+        env = self.env(PYTHONPATH=str(self.work / "src"))
         return self.run([*argv, "--dry-run"] if self.dry_run else argv, timeout=2400, check=False,
-                        env=self.env(PYTHONPATH=str(self.work / "src")))
+                        env=canary_environment(env) or env)
 
     # Promotion and post-release
 
