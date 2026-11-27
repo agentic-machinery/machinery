@@ -796,7 +796,7 @@ Typical live driver count (names rotate; count is the constraint):
    Recheck live health and headroom at that time before returning it to rotation.
 4. Verify delivery against **git/PR state**, not only task `no_deliverable` flags (#6426 class
    false negatives poison utilization metrics).
-5. Route Cursor coding and code/infra review to `--agent cursor --model grok-4.7-high` (C-5307). Do not send a driver, Ukrainian (except a council or discussion question under the LANGUAGE-LANES RULE amendment), or high/critical final-signoff task there.
+5. Route Cursor coding and code/infra review to `--agent cursor --model grok-4.7-high` (C-5307). Do not send a driver, Ukrainian (except a council or discussion question under the LANGUAGE-LANES RULE amendment), or critical/security final-signoff task there. High-risk and lower code/infra review goes there when the resolver returns the pin (REVIEW-ROTATION-GROK-1127).
 
 **Before every dispatch / CF spend**, read live headroom (do not cache percentages into policy):
 
@@ -815,7 +815,7 @@ df -h /; du -sh "$repo_root/.worktrees"
 | **deepseek** | Latest `deepseek-v4.1-flash` coding through opencode | No private-repository content or secrets; review-of-record and Ukrainian work need measured evidence first; Pro and older retired |
 | **claude** (Sonnet for well-scoped non-security routine work and polished English deliverables; Opus for security-sensitive code; Opus for Ukrainian curriculum) | native Claude CLI implementation as subscription headroom allows (Sonnet 5.5 by default; Opus 5.5 only for complex or security work, operator 2026-10-16; Claude-lane Ukrainian stays Opus 5.5); hard judgment, CF, architecture briefs | don't burn Opus on queue grind |
 | **agy** (Gemini 4 Hydrogen Medium for routine work and Gemini 4 Neon High for hard/security coding and code/infra/Ukrainian review) | Hard/security coding, code/infra review at every risk tier, Ukrainian review, and well-defined implementation tasks; **worker with complete briefs** (#5737) — not self-decomposing micro-PR spray | metered — cost-aware, not absent; complete brief required |
-| **grok-4.7** | `--agent cursor --model grok-4.7-high` for coding and code/infra review; native coding transport, no dispatcher provider | no driver, Ukrainian, advisory, or high/critical final sign-off; grok-4.6 and grok-4.5 stay retired |
+| **grok-4.7** | `--agent cursor --model grok-4.7-high` for coding and code/infra review; native coding transport, no dispatcher provider | no driver, Ukrainian, advisory, or critical/security final sign-off; grok-4.6 and grok-4.5 stay retired |
 | **kimi** (**retired**, OO-58) | no dispatch | catalog refuses every Kimi id; do not substitute |
 | **codex** Sol (1–4 drivers) | Sol drivers and review; Terra 6.1 default routine non-security Codex coder, including `multi_agent_v2` (default author: the C-2903 paragraph at the top of this file); explicit Luna read-only recon/classification and workspace-write bounded implementation under a driver brief; other bounded work under a Sol envelope; Opus / Sol for advice | **throttle the depleted account when near_cap / paused unless its verified operator reset reserve applies**; new Sol work uses b-sub first, then an admitted sub; shed implementation to another admitted lane; code/infra review goes to the resolver's pick |
 
@@ -829,7 +829,7 @@ free disk. **Never convert a timed pause into permanent neglect of that seat.**
 | --- | --- | --- |
 | **Native CLIs** (claude, codex, agy) | default dispatch + ask for those families | Kimi (OO-58) is retired; do not dispatch `--agent kimi`. Grok 4.7 routes through Cursor at `grok-4.7-high` (C-5307), not `--agent grok` |
 | **DeepSeek first-party** (`deepseek` via OpenCode) | latest `deepseek-v4.1-flash` coding; no private-repository content or secrets | Review-of-record and Ukrainian work need measured evidence first; the dispatcher's `--provider openrouter` endpoint uses the US provider allow-list above (#12376), and `lu_machinery/ai_agent_bridge/routing_guard.py` still refuses `openrouter/deepseek` for bridge routing |
-| **Cursor multi-model pin** | `grok-4.7-high` for coding and code/infra review (C-5307) | review of record by a Claude model (D-129, #10464); `auto` as formal CF; driver, Ukrainian, and high/critical final sign-off |
+| **Cursor multi-model pin** | `grok-4.7-high` for coding and code/infra review (C-5307) | review of record by a Claude model (D-129, #10464); `auto` as formal CF; driver, Ukrainian, and critical/security final sign-off |
 
 After merge: run `merge_closeout` and free branch holds so the next free lane can attach (the dispatcher removes each settled task's worktree;
 no multi-GB shielded `lu-review-*` trees — formal CF is direct `ask-*` only).
