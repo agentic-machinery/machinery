@@ -220,9 +220,10 @@ _TASK_TERMINAL_STATUSES = frozenset({
 _LOG = logging.getLogger(__name__)
 
 
-def _roster_sources() -> tuple[Path | None, Path | None, Path | None]:
-    """The assignments and driver-lane files the roster reads, and the profile file that names them.
+def _roster_sources() -> tuple[Path | None, Path | None, Path | None, Path]:
+    """The assignments and driver-lane files the roster reads, the profile file that names them, and the schema.
 
+    The schema is the one the strict assignments read validates against.
     ``None`` for a source whose setting is unusable, and for the profile when none is configured.
     Each source path comes from its own profile read, so a caller compares the sources taken before
     and after its reads (and the profile's identity) to know they belong to one profile version.
@@ -231,6 +232,7 @@ def _roster_sources() -> tuple[Path | None, Path | None, Path | None]:
     from lu_machinery.common import profile, repo_root
     from lu_machinery.common.repo_root import MachineryConfigError
     from lu_machinery.ops import driver_lanes
+    from lu_machinery.orchestration.validate_fleet_taxonomy import ASSIGNMENTS_SCHEMA_PATH
 
     profile_file: Path | None
     try:
@@ -246,10 +248,10 @@ def _roster_sources() -> tuple[Path | None, Path | None, Path | None]:
         lane_data: Path | None = Path(driver_lanes.default_data_path())
     except MachineryConfigError:
         lane_data = None
-    return assignments, lane_data, profile_file
+    return assignments, lane_data, profile_file, Path(ASSIGNMENTS_SCHEMA_PATH)
 
 
-def _roster_identity(sources: tuple[Path | None, Path | None, Path | None]) -> tuple[object, ...]:
+def _roster_identity(sources: tuple[Path | None, ...]) -> tuple[object, ...]:
     """Each roster file's (path, device, inode, ctime, mtime, size), or ``None`` fields when it cannot be stated.
 
     Any write, replacement or permission change moves ctime, so equal identities taken
@@ -287,7 +289,7 @@ def _load_roster() -> tuple[frozenset[str], bool]:
 
     # An unusable profile entry or root setting leaves that roster source unavailable, so the roster is incomplete.
     sources = _roster_sources()
-    assignments, lane_data, _profile_file = sources
+    assignments, lane_data, _profile_file, _schema = sources
     key = _roster_identity(sources)
     cached = _ROSTER_CACHE.get(key)
     if cached is not None:
