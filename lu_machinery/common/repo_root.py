@@ -87,9 +87,8 @@ product files names the product checkout with ``LU_PRODUCT_ROOT`` (a systemd
 API selects it at startup (``scripts.api.config.PRODUCT_ROOT``): served from a release
 snapshot, that is the snapshot itself, never the live checkout.
 
-Shared runtime state is anchored on ``LU_PRIMARY_REPO_ROOT`` (or its alias), never on the
-selected product: kube-dojo's worktrees and the shared dispatch state live in different
-places. The installed package refuses state-dependent use without that anchor.
+Shared runtime state requires a valid host context or an explicit ``LU_STATE_ROOT``.
+Product selection and Git checkout selection are independent of state placement.
 """
 
 from __future__ import annotations
