@@ -471,7 +471,8 @@ def iter_task_records(
     reader needs. A task id re-dispatched after its old record was archived has
     one record in each place; both are yielded because they are two runs. A
     directory that is missing or unreadable yields nothing, and an entry whose type
-    cannot be read is skipped; ``on_error`` receives the path and the error for each,
+    cannot be read, or a link that resolves to no regular file, is skipped;
+    ``on_error`` receives the path and the error for each,
     so a reader that publishes counts can say they are unknown. Only a missing hot
     directory is reported as missing: the first archive run creates the archive, and
     an entry removed during the scan is no record. Readers classify at
@@ -495,6 +496,10 @@ def iter_task_records(
                         try:
                             if entry.is_file():
                                 names.append(entry.name)
+                            elif on_error is not None and entry.is_symlink():
+                                # A link to no regular file (dangling, or to an unmounted store) may name a
+                                # record that cannot be read now. A FIFO or directory itself holds none.
+                                on_error(directory / entry.name, OSError(f"not a regular file: {entry.name}"))
                         except OSError as exc:
                             if on_error is not None and not isinstance(exc, FileNotFoundError):
                                 on_error(directory / entry.name, exc)

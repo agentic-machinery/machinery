@@ -20,6 +20,7 @@ from lu_machinery.common.git_context import validate_plain_branch_name
 from lu_machinery.common.task_store_paths import tasks_dir
 from lu_machinery.dispatcher.types import ReviewAttempt, StartRefusal
 from lu_machinery.orchestration.task_record_store import (
+    ARCHIVE_DIR_NAME,
     NonFiniteRecordValue,
     TaskIdentityMismatch,
     archived_task_record_path,
@@ -593,7 +594,9 @@ def clear_non_finite_fields(record: dict) -> str | None:
 def publish_failed_record(record: dict, path: Path) -> None:
     """Recover a damaged supervisor record as failure, never overwrite another run.
 
-    A deleted record is published again as ``TASK_RECORD_DAMAGED``. A record the writer refuses for a
+    A deleted record is published again as ``TASK_RECORD_DAMAGED``, and so is a record whose content is not
+    a UTF-8 JSON object or an entry that holds no record content (a FIFO, read without blocking), which
+    therefore cannot be another run's; a directory at the path fails the write. A record the writer refuses for a
     non-finite number is published with that field cleared and its ``TASK_RECORD_NON_FINITE`` code as the
     error. Any other read error leaves the record unable to prove it is this run's, and a lock or write error
     leaves the failure unpublished: each is a typed ``TASK_RECORD_IO_ERROR``. A worktree already reaped keeps
@@ -979,10 +982,18 @@ def list_tasks(status: str | None = None, include_archive=False, *, strict=False
 
     def refuse_unlisted(path: Path, exc: OSError) -> None:
         # A strict scan that could not list a directory or type an entry has not seen every record.
-        if not (path == root and isinstance(exc, FileNotFoundError) and _proven_absent(root)):  # no store yet
+        if not (isinstance(exc, FileNotFoundError) and _proven_absent(path)):  # no store or archive yet
             raise ValueError(f"unreadable task record {path}; review attempt reuse cannot be excluded") from None
 
     with task_archive_lock(root) if strict else nullcontext():
+        if strict and include_archive:
+            # The scan reports no missing archive (the first archive run creates it): prove that absence here.
+            try:
+                os.stat(root / ARCHIVE_DIR_NAME)
+            except FileNotFoundError as exc:
+                refuse_unlisted(root / ARCHIVE_DIR_NAME, exc)
+            except OSError:
+                pass  # the scan reports it
         for listed in iter_task_records(root, include_archive=include_archive,
                                         on_error=refuse_unlisted if strict else None):
             if listed in relocated:

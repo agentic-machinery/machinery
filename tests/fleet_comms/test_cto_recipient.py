@@ -333,7 +333,8 @@ def test_incomplete_roster_proves_no_name_unregistered_and_removes_nothing(
 
 @pytest.mark.parametrize("doubt", [
     "malformed_area", "unknown_roster_key", "task_store_unreadable", "record_not_readable", "record_not_utf8",
-    "hot_entry_not_a_file", "dangling_record_link", "dangling_tasks_dir_link", "roster_fifo",
+    "hot_entry_not_a_file", "dangling_record_link", "dangling_tasks_dir_link",
+    pytest.param("roster_fifo", marks=pytest.mark.timeout(60)),  # a blocking read of the FIFO never returns
 ])
 def test_partly_unreadable_roster_or_task_store_keeps_mail_queued_through_expire_stale_apply(
     plane, tasks, monkeypatch, tmp_path, capsys, doubt,
