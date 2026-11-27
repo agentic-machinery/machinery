@@ -12,7 +12,6 @@ never edits the primary checkout or its data.
 from __future__ import annotations
 
 import argparse
-import ast
 import contextlib
 import datetime as dt
 import hashlib
@@ -192,36 +191,14 @@ def _resolved_test_file(checkout: Path, relative: str) -> Path:
     return candidate
 
 
-def _defined_tests(checkout: Path, relative: str) -> set[str] | None:
-    """Qualnames defined in one file, or None when that file is not readable Python.
-
-    None defers the file to pytest collection. A syntax error is a collection
-    result, not a missing test, and must not stop the healthy selections.
-    """
-    candidate = _resolved_test_file(checkout, relative)
-    try:
-        tree = ast.parse(candidate.read_text(encoding="utf-8"))
-    except (OSError, SyntaxError, UnicodeError):
-        return None
-    found: set[str] = set()
-
-    def walk(body: list[ast.stmt], prefix: str) -> None:
-        for node in body:
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                found.add(f"{prefix}{node.name}")
-            elif isinstance(node, ast.ClassDef):
-                walk(node.body, f"{prefix}{node.name}::")
-
-    walk(tree.body, "")
-    return found
-
-
 def load_selection(checkout: Path, expected_sha256: str | None = None) -> tuple[dict, str]:
     """The audited selection from the tested checkout and its digest.
 
-    The expected set is the test definitions that exist in the checkout. A stored
-    ``class_c_merge_group`` count is historical and is not the audit. The pytest
-    child passes the digest the parent validated, so both use the same bytes.
+    The parent checks that each selector names a file in this checkout. Pytest
+    collection decides whether the selector matches a test, including inherited
+    methods, conditionals and aliases. A stored ``class_c_merge_group`` count is
+    historical and is not the audit. The pytest child passes the digest the
+    parent validated, so both use the same bytes.
     """
     selection, digest = _product_json(checkout, SELECTION)
     if expected_sha256 is not None and digest != expected_sha256:
@@ -237,29 +214,19 @@ def load_selection(checkout: Path, expected_sha256: str | None = None) -> tuple[
         raise DataTierError("data-tier selection contains an invalid test file")
     listed = set(files)
     missing: list[str] = []
-    definitions: dict[str, set[str] | None] = {}
     for nodeid in ids:
-        # A hash is resolved by collection, which hashes each item the same way.
+        # A hash has no path. Collection accounts for it, or the run is not clean.
         if _SELECTOR_HASH.fullmatch(nodeid):
             continue
-        base = nodeid.split("[", 1)[0]
-        relative, separator, qualname = base.partition("::")
+        # A bracket on a file-only selector is not the file pytest will report.
+        if "::" not in nodeid and "[" in nodeid:
+            missing.append(nodeid)
+            continue
+        relative, separator, qualname = nodeid.split("[", 1)[0].partition("::")
         if _test_path(relative) is None or relative not in listed or (separator and not qualname):
             missing.append(nodeid)
             continue
-        if relative not in definitions:
-            if not _resolved_test_file(checkout, relative).is_file():
-                definitions[relative] = set()
-            else:
-                definitions[relative] = _defined_tests(checkout, relative)
-        defined = definitions[relative]
-        if defined is None:
-            continue
-        if not separator:
-            if not _resolved_test_file(checkout, relative).is_file():
-                missing.append(nodeid)
-            continue
-        if qualname not in defined:
+        if not _resolved_test_file(checkout, relative).is_file():
             missing.append(nodeid)
     absent_files = [relative for relative in files if not _resolved_test_file(checkout, relative).is_file()]
     if absent_files:
@@ -638,6 +605,7 @@ class SelectionPlugin:
         self.bulk_skipped: list[str] = []
         self.collection_skips: list[tuple[str, str]] = []
         self.collection_errors: list[tuple[str, str]] = []
+        self.accounted: set[str] = set()
 
     def pytest_collectreport(self, report: pytest.CollectReport) -> None:
         if report.failed:
@@ -654,6 +622,12 @@ class SelectionPlugin:
             nodeid = item.nodeid
             key = _key(nodeid)
             file = nodeid.split("::", 1)[0]
+            if nodeid in wanted:
+                self.accounted.add(nodeid)
+            if key in wanted:
+                self.accounted.add(key)
+            if file in wanted:
+                self.accounted.add(file)
             keep = (nodeid in wanted or key in wanted or file in wanted) and (self.only is None or file == self.only)
             if any(item.get_closest_marker(marker) for marker in ("live_network", "live_github", "postgres")):
                 keep = False
@@ -683,12 +657,32 @@ def pytest_child(args: argparse.Namespace) -> int:
     )
     if collection_status not in (0, 1, 5) or (collection_status == 1 and not plugin.collection_errors):
         return int(collection_status)
+    for nodeid, _reason in plugin.collection_skips:
+        plugin.accounted.add(nodeid)
+    error_ids = {nodeid for nodeid, _reason in plugin.collection_errors}
+    for selector in selection["nodeids"]:
+        if selector in plugin.accounted or selector in error_ids:
+            plugin.accounted.add(selector)
+            continue
+        if not selector.startswith("sha256:") and selector.split("::", 1)[0] in error_ids:
+            plugin.accounted.add(selector)
+    unmatched = (
+        []
+        if args.only is not None
+        else [nodeid for nodeid in selection["nodeids"] if nodeid not in plugin.accounted]
+    )
     if (
         not plugin.selected_nodeids
         and not plugin.bulk_skipped
         and not plugin.collection_skips
         and not plugin.collection_errors
     ):
+        if unmatched:
+            shown = ", ".join(unmatched[:20])
+            extra = f" (+{len(unmatched) - 20} more)" if len(unmatched) > 20 else ""
+            raise DataTierError(
+                f"data-tier selection names {len(unmatched)} test(s) absent from collection: {shown}{extra}"
+            )
         raise DataTierError("the audited selection collected no tests")
     if plugin.selected_nodeids:
         status = run_process_group(
@@ -712,7 +706,7 @@ def pytest_child(args: argparse.Namespace) -> int:
     else:
         ET.ElementTree(ET.Element("testsuite")).write(args.junit, encoding="utf-8", xml_declaration=True)
         status = 0
-    if plugin.bulk_skipped or plugin.collection_skips or plugin.collection_errors:
+    if plugin.bulk_skipped or plugin.collection_skips or plugin.collection_errors or unmatched:
         tree = ET.parse(args.junit)
         suite = next(tree.iter("testsuite"))
         for nodeid in plugin.bulk_skipped:
@@ -724,15 +718,21 @@ def pytest_child(args: argparse.Namespace) -> int:
         for nodeid, reason in plugin.collection_errors:
             case = ET.SubElement(suite, "testcase", classname="data_tier", name=safe_text(nodeid))
             ET.SubElement(case, "error", message=reason)
+        for nodeid in unmatched:
+            case = ET.SubElement(suite, "testcase", classname="data_tier", name=safe_text(nodeid))
+            ET.SubElement(case, "error", message="selector matched no collected test")
         skipped = len(plugin.bulk_skipped) + len(plugin.collection_skips)
-        added = skipped + len(plugin.collection_errors)
+        added = skipped + len(plugin.collection_errors) + len(unmatched)
         for element in {tree.getroot(), suite}:
             if element.tag in {"testsuite", "testsuites"}:
                 element.set("tests", str(int(element.get("tests", "0")) + added))
                 element.set("skipped", str(int(element.get("skipped", "0")) + skipped))
-                element.set("errors", str(int(element.get("errors", "0")) + len(plugin.collection_errors)))
+                element.set(
+                    "errors",
+                    str(int(element.get("errors", "0")) + len(plugin.collection_errors) + len(unmatched)),
+                )
         tree.write(args.junit, encoding="utf-8", xml_declaration=True)
-    return status or (1 if plugin.collection_errors else 0)
+    return status or (1 if plugin.collection_errors or unmatched else 0)
 
 
 def read_child_output(path: Path) -> bytes | None:
@@ -1122,7 +1122,7 @@ def run(args: argparse.Namespace) -> int:
                 summary["runner_errors"].append(f"scope cleanup failed: {safe_text(str(error))}")
         if slots is not None and scope_stopped:
             slots.release()
-        if checkout is not None:
+        if checkout is not None and not args.no_report:
             try:
                 reporting_repository = github_repository(checkout)
             except Exception as error:

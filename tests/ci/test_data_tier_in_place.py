@@ -61,7 +61,7 @@ def _write_selection(checkout: Path, payload: dict, source: str) -> None:
 
 
 def test_selection_audit_reads_definitions_from_the_product_tree(tmp_path: Path) -> None:
-    """Defect class: a stored count, a removed definition, or a supported selector the collector already keeps."""
+    """Defect class: a stored count, or a selector whose file is not in the checkout."""
     nodeid = "tests/test_example.py::test_reads_store"
     source = "def test_reads_store():\n    return None\n"
     stale = {"schema": 1, "class_c_merge_group": 127, "nodeids": [nodeid], "files": ["tests/test_example.py"]}
@@ -79,6 +79,25 @@ def test_selection_audit_reads_definitions_from_the_product_tree(tmp_path: Path)
         data_tier.load_selection(tmp_path)
 
     _write_selection(tmp_path, stale, "def test_other():\n    return None\n")
+    assert data_tier.load_selection(tmp_path)[0]["nodeids"] == [nodeid]
+    collected_anyway = (
+        (
+            "class Base:\n    def test_inherited(self):\n        return None\nclass TestChild(Base):\n    pass\n",
+            "tests/test_example.py::TestChild::test_inherited",
+        ),
+        (
+            "if True:\n    def test_conditional():\n        return None\n",
+            "tests/test_example.py::test_conditional",
+        ),
+        (
+            "def test_real():\n    return None\ntest_alias = test_real\n",
+            "tests/test_example.py::test_alias",
+        ),
+    )
+    for source_text, item in collected_anyway:
+        _write_selection(tmp_path, {**stale, "nodeids": [item]}, source_text)
+        assert data_tier.load_selection(tmp_path)[0]["nodeids"] == [item]
+    _write_selection(tmp_path, {**stale, "nodeids": ["tests/test_example.py[missing]"]}, source)
     with pytest.raises(data_tier.DataTierError, match="absent from the product tree"):
         data_tier.load_selection(tmp_path)
 
@@ -485,6 +504,20 @@ def test_child_passes_only_selected_ids_to_two_workers(tmp_path: Path, monkeypat
     assert ignored not in calls[0]
     assert calls[0][calls[0].index("-n") + 1] == "2"
     assert "--require-data" in calls[0]
+    missing = "tests/test_sample.py::test_removed"
+    stale_hash = data_tier._key(missing)
+    monkeypatch.setattr(
+        data_tier,
+        "load_selection",
+        lambda *_args, **_kwargs: (
+            {"nodeids": [selected, missing, stale_hash], "files": ["tests/test_sample.py"], "bulk_nodeids": []},
+            "0" * 64,
+        ),
+    )
+    assert data_tier.pytest_child(args) == 1
+    recorded = junit.read_text(encoding="utf-8")
+    assert missing in recorded
+    assert stale_hash in recorded
 
 
 @pytest.mark.usefixtures('configured_roots', '_no_live_pool')
@@ -981,9 +1014,16 @@ def test_github_failure_is_single_attempt_and_persisted(
 
 @pytest.mark.usefixtures('configured_roots', '_no_live_pool')
 @pytest.mark.reads_content
-def test_clean_run_and_no_report(nightly: SimpleNamespace) -> None:
+def test_clean_run_and_no_report(nightly: SimpleNamespace, monkeypatch: pytest.MonkeyPatch) -> None:
+    def git_command(argv: list[str], **kwargs: object) -> SimpleNamespace:
+        if "get-url" in argv:
+            return SimpleNamespace(stdout="/local/not-a-github-repo\n")
+        return SimpleNamespace(stdout="a" * 40)
+
+    monkeypatch.setattr(data_tier, "command", git_command)
     assert data_tier.run(SimpleNamespace(only=None, no_report=True)) == 0
     assert nightly.reports == []
+    assert nightly.repositories == []
     assert nightly.events == ["stop", "remove"]
 
 
