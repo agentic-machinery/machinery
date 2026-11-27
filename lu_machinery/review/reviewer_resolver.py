@@ -31,7 +31,6 @@ selection unchanged. Ambiguous path inference fails closed instead of guessing.
 
 from __future__ import annotations
 
-import json
 import os
 import re
 import shlex
@@ -45,6 +44,7 @@ from typing import Literal
 
 from lu_machinery.agent_runtime.adapters.acpx import ACPX_PARTICIPANT_CATALOG_TRANSPORTS, ACPX_SUPPORTED_PARTICIPANTS
 from lu_machinery.agent_runtime.agent_identity import resolve_retired_agent_alias
+from lu_machinery.common import json_depth
 from lu_machinery.fleet import credit_lane
 from lu_machinery.fleet.claude_account_lane import ClaudeAccount, bind_snapshot, require_account
 from lu_machinery.review.app_bot_authorship import VERIFIED_APP_BOT
@@ -76,6 +76,7 @@ _SEALED_REVIEW_EXECUTABLE = "agent_runtime.runner:invoke_inter_agent"
 # and a short import spelling (the package directory on ``sys.path``) cannot shorten it.
 _NATIVE_REVIEW_EXECUTABLE = f"{Path(os.path.abspath(__file__)).parents[1].name}/dispatch.py"
 RECENT_REVIEW_WINDOW_DAYS = 7
+_RECENT_REVIEW_JSON_MAX_DEPTH = 16
 _PUBLISHED_VERDICTS = frozenset({"APPROVED", "CHANGES_REQUESTED", "BLOCKED"})
 _RECENT_REVIEW_CACHE: tuple[tuple[str, int, int, int, int, int, int], dict[str, int]] | None = None
 
@@ -155,8 +156,8 @@ def read_recent_review_counts(
     with os.fdopen(fd, "rb") as stream:
         for line in stream:
             try:
-                entry = json.loads(line)
-            except ValueError:
+                entry = json_depth.loads(line, max_depth=_RECENT_REVIEW_JSON_MAX_DEPTH)
+            except (ValueError, RecursionError):
                 continue
             if (
                 not isinstance(entry, dict)
@@ -184,8 +185,8 @@ def read_recent_review_counts(
             if b'"review"' not in line:
                 continue
             try:
-                row = json.loads(line)
-            except ValueError:
+                row = json_depth.loads(line, max_depth=_RECENT_REVIEW_JSON_MAX_DEPTH)
+            except (ValueError, RecursionError):
                 continue
             if not isinstance(row, dict) or row.get("role") != "review":
                 continue
