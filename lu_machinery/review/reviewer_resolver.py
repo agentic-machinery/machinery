@@ -36,12 +36,12 @@ import re
 import shlex
 import stat
 from collections import Counter
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from fnmatch import fnmatchcase
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, BinaryIO, Literal
 
 from lu_machinery.agent_runtime.adapters.acpx import ACPX_PARTICIPANT_CATALOG_TRANSPORTS, ACPX_SUPPORTED_PARTICIPANTS
 from lu_machinery.agent_runtime.agent_identity import resolve_retired_agent_alias
@@ -78,6 +78,10 @@ _NATIVE_REVIEW_EXECUTABLE = f"{Path(os.path.abspath(__file__)).parents[1].name}/
 RECENT_REVIEW_WINDOW_DAYS = 7
 # Frozen input contract for both rotation ledgers: a deeper line is skipped, never parsed.
 _RECENT_REVIEW_JSON_MAX_DEPTH = 16
+# Longest ledger line read whole. A publication is a flat record of short fields, and a
+# summary_row has fixed fields, a sample of at most 200 characters and one 16-hex digest per
+# blocking finding, so written lines stay a few KiB. A longer line is drained and skipped.
+_RECENT_REVIEW_MAX_LINE_BYTES = 1024 * 1024
 _CODE_INFRA_REVIEW_CLASSES = frozenset(
     f"{profile}/{risk}" for profile in VALID_REVIEW_PROFILES for risk in (*VALID_RISKS, "unknown")
 )
@@ -92,6 +96,19 @@ def _reject_duplicate_members(pairs: list[tuple[str, object]]) -> dict[str, obje
 
 def _reject_json_constant(token: str) -> object:
     raise ValueError(f"non-JSON constant {token}")
+
+
+def _bounded_ledger_lines(stream: BinaryIO) -> Iterator[bytes]:
+    """Each ledger line of at most the byte limit; a longer line is drained in bounded chunks and skipped."""
+    limit = _RECENT_REVIEW_MAX_LINE_BYTES
+    while line := stream.readline(limit + 1):
+        if len(line) <= limit:
+            yield line
+            continue
+        while not line.endswith(b"\n"):
+            line = stream.readline(limit + 1)
+            if not line:
+                break
 
 
 def _load_ledger_line(line: bytes) -> Any:
@@ -196,7 +213,7 @@ def read_recent_review_counts(
         pubs_by_task: dict[str, list[tuple[datetime, int, str, int, str]]] = {}
         try:
             with os.fdopen(pubs_fd, "rb") as stream:
-                for line_index, line in enumerate(stream):
+                for line_index, line in enumerate(_bounded_ledger_lines(stream)):
                     try:
                         entry = _load_ledger_line(line)
                     except (ValueError, RecursionError):
@@ -224,7 +241,7 @@ def read_recent_review_counts(
         latest_rows: dict[str, dict[str, object]] = {}
         try:
             with os.fdopen(rows_fd, "rb") as stream:
-                for line in stream:
+                for line in _bounded_ledger_lines(stream):
                     try:
                         row = _load_ledger_line(line)
                     except (ValueError, RecursionError):

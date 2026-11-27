@@ -849,3 +849,40 @@ def test_recent_review_counts_malformed_later_row_never_replaces_valid_row(
         tmp_path, window_days=7, now=datetime(2026, 11, 27, 16, 0, tzinfo=UTC)
     )
     assert counts == {None: {}, "sol": {CURRENT_SOL: 1}, "grok": {"grok-4.7": 1}}[expected]
+
+
+def test_recent_review_counts_skips_oversized_ledger_lines_and_keeps_reading(tmp_path):
+    """Defect class: an unbounded ledger line read whole, or a drained line hiding the records after it."""
+    from datetime import UTC, datetime
+
+    from lu_machinery.review import reviewer_resolver
+
+    limit = reviewer_resolver._RECENT_REVIEW_MAX_LINE_BYTES
+    stats = tmp_path / "model-stats"
+    stats.mkdir()
+    publication = {
+        "schema": "review-publication.v1",
+        "task_id": "t-sol",
+        "repository": "agentic-machinery/machinery",
+        "pr": 1,
+        "head": _ROTATION_SHA,
+        "verdict": "APPROVED",
+        "published_at": "2026-11-26T12:00:00Z",
+    }
+    oversized_publication = {**publication, "pad": "x" * limit}
+    oversized_row = {**_ROTATION_VALID_ROW, "model": "grok-4.7-high", "harness": "cursor", "pad": "x" * limit}
+    # An oversized line first in each ledger, then valid records that must still be read.
+    (stats / "publications.jsonl").write_text(
+        json.dumps(oversized_publication) + "\n" + json.dumps(publication) + "\n", encoding="utf-8"
+    )
+    # A superseding oversized row is skipped, so the earlier valid Sol row keeps its credit.
+    (stats / "rows.jsonl").write_text(
+        json.dumps(oversized_row) + "\n" + json.dumps(_ROTATION_VALID_ROW) + "\n" + json.dumps(oversized_row) + "\n",
+        encoding="utf-8",
+    )
+    now = datetime(2026, 11, 27, 16, 0, tzinfo=UTC)
+    assert reviewer_resolver.read_recent_review_counts(tmp_path, window_days=7, now=now) == {CURRENT_SOL: 1}
+    # An oversized final line with no newline is drained to end of file without failing.
+    with (stats / "rows.jsonl").open("a", encoding="utf-8") as handle:
+        handle.write("x" * (limit + 10))
+    assert reviewer_resolver.read_recent_review_counts(tmp_path, window_days=7, now=now) == {CURRENT_SOL: 1}
