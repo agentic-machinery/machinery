@@ -559,6 +559,180 @@ def test_journal_loopback_ipv6_and_loopback_origins_allowed(
             assert refused.json() == {"detail": "Forbidden", "reason": expected_reason}
 
 
+def test_body_read_guard_accepts_loopback_alias_and_configured_host(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Defect class: the owner's page address (loopback alias or configured forwarded host) is refused."""
+    from starlette.requests import Request
+
+    monkeypatch.setattr(journal_router, "load_fleet_repos", lambda: _FIXTURE_REPOS)
+    cli_payload = {
+        "schema": "journal.v1",
+        "total": 1,
+        "latest_id": 7,
+        "entries": [_sample_entry(7, headline="Visible on owner address")],
+    }
+    cli = _make_fake_cli(tmp_path, stdout=json.dumps(cli_payload))
+    monkeypatch.setenv("LU_DRIVER_STATE_CLI", str(cli))
+
+    # Default (unset or empty LU_MONITOR_ALLOWED_HOSTS): loopback aliases of the bound port pass.
+    for env_value in (None, ""):
+        if env_value is None:
+            monkeypatch.delenv(runtime_router.MONITOR_ALLOWED_HOSTS_ENV, raising=False)
+        else:
+            monkeypatch.setenv(runtime_router.MONITOR_ALLOWED_HOSTS_ENV, env_value)
+        with _build_client(client=("127.0.0.1", 50000), base_url="http://127.0.0.1:8765") as client:
+            for host in ("localhost:8765", "127.0.0.1:8765", "[::1]:8765"):
+                for extra_headers in (
+                    {"Host": host},
+                    {"Host": host, "Origin": f"http://{host}", "Sec-Fetch-Site": "same-origin"},
+                    {"Host": host, "Sec-Fetch-Site": "none"},
+                ):
+                    response = client.get("/api/journal", headers=extra_headers)
+                    assert response.status_code == 200, (env_value, extra_headers, response.text)
+                    assert response.headers["cache-control"] == "no-store"
+                    assert response.json()["entries"][0]["id"] == 7
+
+    # Port-80 loopback aliases omit :80 canonically.
+    monkeypatch.delenv(runtime_router.MONITOR_ALLOWED_HOSTS_ENV, raising=False)
+    for host in (b"localhost", b"127.0.0.1", b"[::1]"):
+        req = Request(
+            {
+                "type": "http",
+                "method": "GET",
+                "scheme": "http",
+                "path": "/api/journal",
+                "query_string": b"",
+                "headers": [(b"host", host), (b"origin", b"http://" + host), (b"sec-fetch-site", b"same-origin")],
+                "server": ("127.0.0.1", 80),
+                "client": ("127.0.0.1", 50000),
+            }
+        )
+        assert runtime_router.local_body_read_access_refusal(req) is None, host
+
+    # Configured forwarded ports and custom hostnames via LU_MONITOR_ALLOWED_HOSTS pass with matching Origin.
+    monkeypatch.setenv(
+        runtime_router.MONITOR_ALLOWED_HOSTS_ENV,
+        "localhost:18765, Monitor.Internal:8765, [fd00::1]:8765, portal.internal:80",
+    )
+    with _build_client(client=("127.0.0.1", 50000), base_url="http://127.0.0.1:8765") as client:
+        for host in ("localhost:18765", "monitor.internal:8765", "[fd00::1]:8765", "portal.internal"):
+            response = client.get(
+                "/api/journal",
+                headers={"Host": host, "Origin": f"http://{host}", "Sec-Fetch-Site": "same-origin"},
+            )
+            assert response.status_code == 200, (host, response.text)
+            assert response.headers["cache-control"] == "no-store"
+            assert response.json()["entries"][0]["id"] == 7
+
+
+def test_body_read_guard_refuses_unlisted_host_and_mismatched_origin(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Defect class: unlisted host, mismatched Origin, forwarding/cross-site bypass, or malformed allowlist config passes guard."""
+    from starlette.requests import Request
+
+    monkeypatch.setattr(journal_router, "load_fleet_repos", lambda: _FIXTURE_REPOS)
+    cli = _make_fake_cli(
+        tmp_path,
+        stdout=json.dumps({"schema": "journal.v1", "total": 1, "latest_id": 9, "entries": [_sample_entry(9)]}),
+    )
+    monkeypatch.setenv("LU_DRIVER_STATE_CLI", str(cli))
+    monkeypatch.setenv(
+        runtime_router.MONITOR_ALLOWED_HOSTS_ENV,
+        "localhost:18765, monitor.internal:8765, portal.internal:80",
+    )
+
+    with _build_client(client=("127.0.0.1", 50000), base_url="http://127.0.0.1:8765") as client:
+        for bad_host in (
+            "evil.example:8765",
+            "localhost:8766",
+            "127.0.0.1:18765",
+            "portal.internal:80",
+            "LOCALHOST:8765",
+        ):
+            resp = client.get("/api/journal", headers={"Host": bad_host})
+            assert resp.status_code == 403, bad_host
+            assert resp.headers["cache-control"] == "no-store"
+            assert resp.json() == {"detail": "Forbidden", "reason": "invalid_host"}
+
+        for host, bad_origin in (
+            ("localhost:8765", "http://127.0.0.1:8765"),
+            ("localhost:18765", "http://localhost:8765"),
+            ("localhost:18765", "https://localhost:18765"),
+            ("monitor.internal:8765", "http://localhost:18765"),
+            ("portal.internal", "http://portal.internal:80"),
+        ):
+            resp = client.get(
+                "/api/journal",
+                headers={"Host": host, "Origin": bad_origin, "Sec-Fetch-Site": "same-origin"},
+            )
+            assert resp.status_code == 403, (host, bad_origin)
+            assert resp.headers["cache-control"] == "no-store"
+            assert resp.json() == {"detail": "Forbidden", "reason": "invalid_origin"}
+
+        for extra_headers, expected_reason in (
+            ({"Host": "localhost:18765", "X-Forwarded-Host": "localhost:18765"}, "forwarding_header_present"),
+            ({"Host": "localhost:18765", "Forwarded": "for=127.0.0.1"}, "forwarding_header_present"),
+            ({"Host": "localhost:18765", "Sec-Fetch-Site": "cross-site"}, "cross_site_request"),
+            ({"Host": "monitor.internal:8765", "Sec-Fetch-Site": "same-site"}, "cross_site_request"),
+        ):
+            resp = client.get("/api/journal", headers=extra_headers)
+            assert resp.status_code == 403, extra_headers
+            assert resp.headers["cache-control"] == "no-store"
+            assert resp.json() == {"detail": "Forbidden", "reason": expected_reason}
+
+    # Non-loopback peer and non-loopback listener remain refused even for a configured host.
+    with _build_client(client=("198.51.100.7", 50000), base_url="http://127.0.0.1:8765") as remote_client:
+        remote_resp = remote_client.get("/api/journal", headers={"Host": "monitor.internal:8765"})
+        assert remote_resp.status_code == 403
+        assert remote_resp.json() == {"detail": "Forbidden", "reason": "non_loopback_peer"}
+
+    non_loopback_listener = Request(
+        {
+            "type": "http",
+            "method": "GET",
+            "scheme": "http",
+            "path": "/api/journal",
+            "query_string": b"",
+            "headers": [(b"host", b"monitor.internal:8765")],
+            "server": ("0.0.0.0", 8765),
+            "client": ("127.0.0.1", 50000),
+        }
+    )
+    assert runtime_router.local_body_read_access_refusal(non_loopback_listener) == "invalid_listener"
+
+    # Malformed LU_MONITOR_ALLOWED_HOSTS fails closed with invalid_allowed_hosts_config.
+    for bad_config in (
+        "   ",
+        ",",
+        "localhost:18765,",
+        "*",
+        "*.example.com",
+        "http://localhost:18765",
+        "localhost:18765/path",
+        "localhost:0",
+        "localhost:65536",
+        "localhost:08765",
+        "localhost:",
+        "::1",
+        "[::1%lo]:8765",
+        "127.0.0.999:8765",
+        "127.1:8765",
+        "0x7f000001:8765",
+        "localhost:18765\nevil.example",
+        "bad host:8765",
+        "monitor.internal.:8765",
+        "good.example:8765, *",
+    ):
+        monkeypatch.setenv(runtime_router.MONITOR_ALLOWED_HOSTS_ENV, bad_config)
+        with _build_client(client=("127.0.0.1", 50000), base_url="http://127.0.0.1:8765") as client:
+            resp = client.get("/api/journal", headers={"Host": "127.0.0.1:8765"})
+            assert resp.status_code == 403, bad_config
+            assert resp.headers["cache-control"] == "no-store"
+            assert resp.json() == {"detail": "Forbidden", "reason": "invalid_allowed_hosts_config"}
+
+
 def test_journal_page_renders_plain_text_markers_and_unavailable_states() -> None:
     """Defect class: journal.html renders HTML from body, auto-moves last-seen, or shows 'no entries' when down."""
     dashboards = Path(journal_router.__file__).with_name("dashboards")

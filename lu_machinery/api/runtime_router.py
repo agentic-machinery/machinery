@@ -1,4 +1,13 @@
-"""Runtime observability API router."""
+"""Runtime observability API router.
+
+Environment variables:
+- ``LU_MONITOR_ALLOWED_HOSTS``: optional comma-separated HTTP ``Host`` authorities
+  (``host`` or ``host:port``) accepted in addition to the loopback aliases of the
+  bound port (``localhost``, ``127.0.0.1``, ``[::1]``) by
+  :func:`local_body_read_access_refusal`. Unset or empty admits only the bound
+  port's loopback aliases; any malformed entry fails closed with
+  ``invalid_allowed_hosts_config``.
+"""
 
 from __future__ import annotations
 
@@ -1411,6 +1420,103 @@ def get_acp_conversation(conversation_id: str, *, ctx: MonitorContext) -> dict[s
 
 
 _ACP_TRANSCRIPT_ALLOWED_FETCH_SITES = frozenset({"same-origin", "none"})
+MONITOR_ALLOWED_HOSTS_ENV = "LU_MONITOR_ALLOWED_HOSTS"
+_LOOPBACK_HOST_ALIASES: tuple[str, ...] = ("localhost", "127.0.0.1", "[::1]")
+_DNS_LABEL_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
+_NUMERIC_HOST_LABEL_RE = re.compile(r"^(?:[0-9]+|0x[0-9a-f]*)$")
+_HTTP_PORT_RE = re.compile(r"^[1-9][0-9]{0,4}$")
+
+
+def _format_http_authority(authority_host: str, port: int | None) -> str:
+    """Format a canonical HTTP Host authority, omitting default port 80 (WHATWG)."""
+    if port is None or port == 80:
+        return authority_host
+    return f"{authority_host}:{port}"
+
+
+def _parse_http_port(raw_port: str) -> int | None:
+    if not _HTTP_PORT_RE.fullmatch(raw_port):
+        return None
+    port = int(raw_port)
+    return port if 1 <= port <= 65535 else None
+
+
+def _parse_configured_allowed_host(entry: str) -> str | None:
+    """Validate and canonicalize one ``LU_MONITOR_ALLOWED_HOSTS`` ``host[:port]`` authority."""
+    if not entry or any(ord(ch) <= 0x20 or ord(ch) >= 0x7F or ch in "/?#@\\%*" for ch in entry):
+        return None
+    port: int | None = None
+    if entry.startswith("["):
+        close = entry.find("]")
+        if close <= 1:
+            return None
+        inner = entry[1:close]
+        rest = entry[close + 1 :]
+        if rest:
+            if not rest.startswith(":"):
+                return None
+            port = _parse_http_port(rest[1:])
+            if port is None:
+                return None
+        try:
+            ipv6 = ipaddress.IPv6Address(inner)
+        except ValueError:
+            return None
+        if ipv6.scope_id is not None:
+            return None
+        authority_host = f"[{_whatwg_ipv6_serialize(ipv6)}]"
+        return _format_http_authority(authority_host, port)
+
+    if "[" in entry or "]" in entry or entry.count(":") > 1:
+        return None
+    if ":" in entry:
+        raw_host, port_str = entry.split(":", 1)
+        port = _parse_http_port(port_str)
+        if port is None:
+            return None
+    else:
+        raw_host = entry
+
+    try:
+        ipv4: ipaddress.IPv4Address | None = ipaddress.IPv4Address(raw_host)
+    except ValueError:
+        ipv4 = None
+    if ipv4 is not None:
+        if raw_host != ipv4.compressed:
+            return None
+        return _format_http_authority(ipv4.compressed, port)
+
+    lowered = raw_host.lower()
+    if not lowered or len(lowered) > 253:
+        return None
+    labels = lowered.split(".")
+    if any(not _DNS_LABEL_RE.fullmatch(label) for label in labels):
+        return None
+    if _NUMERIC_HOST_LABEL_RE.fullmatch(labels[-1]):
+        return None
+    return _format_http_authority(lowered, port)
+
+
+def _configured_allowed_body_read_hosts() -> frozenset[str] | None:
+    """Parse ``LU_MONITOR_ALLOWED_HOSTS``; return ``None`` if any entry is malformed."""
+    raw = os.environ.get(MONITOR_ALLOWED_HOSTS_ENV)
+    if raw is None or raw == "":
+        return frozenset()
+    if any(ord(ch) < 0x20 or ord(ch) >= 0x7F for ch in raw):
+        return None
+    allowed: set[str] = set()
+    for part in raw.split(","):
+        parsed = _parse_configured_allowed_host(part.strip(" "))
+        if parsed is None:
+            return None
+        allowed.add(parsed)
+    return frozenset(allowed)
+
+
+def _loopback_allowed_hosts(listener_host: str, listener_port: int) -> frozenset[str]:
+    """Return canonical loopback HTTP Host authorities for the bound loopback port."""
+    hosts = {listener_host, *_LOOPBACK_HOST_ALIASES}
+    return frozenset(_format_http_authority(host, listener_port) for host in hosts)
 
 
 def _is_loopback_ip(address: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
@@ -1463,15 +1569,15 @@ def _whatwg_ipv6_serialize(address: ipaddress.IPv6Address) -> str:
     return "".join(out)
 
 
-def _bound_acp_listener(request: Request) -> tuple[str, str] | None:
-    """Return ``(expected_host, exact_origin)`` for the local loopback HTTP listener.
+def _bound_acp_listener(request: Request) -> tuple[str, int] | None:
+    """Return ``(authority_host, port)`` for the local loopback HTTP listener.
 
     Reads the accepted connection's local interface and effective port from ASGI
     ``scope["server"]`` (which Uvicorn populates from ``socket.getsockname()``,
     independent of HTTP headers), so alternate loopback ports (such as
     ``launchd_supervisor start --port``) and IPv6 / IPv4-mapped loopback listeners
-    authorize their own exact authority without extra launcher plumbing. Fails
-    closed (returns ``None``) if ``scope["server"]`` is absent, malformed, or
+    authorize their own bound port without extra launcher plumbing. Fails closed
+    (returns ``None``) if ``scope["server"]`` is absent, malformed, or
     non-loopback.
     """
     server = request.scope.get("server")
@@ -1507,10 +1613,7 @@ def _bound_acp_listener(request: Request) -> tuple[str, str] | None:
         authority_host = f"[{_whatwg_ipv6_serialize(address)}]"
     else:
         authority_host = address.compressed
-    if raw_port == 80:
-        return authority_host, f"http://{authority_host}"
-    authority = f"{authority_host}:{raw_port}"
-    return authority, f"http://{authority}"
+    return authority_host, raw_port
 
 
 def local_body_read_access_refusal(request: Request) -> str | None:
@@ -1520,14 +1623,18 @@ def local_body_read_access_refusal(request: Request) -> str | None:
     - the bound ASGI listener in ``scope["server"]`` is a valid loopback HTTP listener,
     - no ``Forwarded`` or ``X-Forwarded-*`` header is present,
     - ``request.client`` is a direct loopback IP,
-    - the request scheme is ``http`` and exactly one raw ``Host`` matches the bound listener,
-    - any ``Origin`` header is singular and equals that exact origin (scheme, host, port), and
+    - the request scheme is ``http``,
+    - ``LU_MONITOR_ALLOWED_HOSTS`` (if set) parses cleanly without malformed entries,
+    - exactly one raw ``Host`` matches either a loopback alias of the bound port
+      (``localhost``, ``127.0.0.1``, ``[::1]``, or the bound listener's canonical
+      loopback authority) or an entry from ``LU_MONITOR_ALLOWED_HOSTS``,
+    - any ``Origin`` header is singular and equals ``http://<accepted Host>``, and
     - any ``Sec-Fetch-Site`` header is singular and in ``{"same-origin", "none"}``.
     """
     listener = _bound_acp_listener(request)
     if listener is None:
         return "invalid_listener"
-    expected_host, expected_origin = listener
+    listener_host, listener_port = listener
 
     hosts: list[str] = []
     origins: list[str] = []
@@ -1558,8 +1665,13 @@ def local_body_read_access_refusal(request: Request) -> str | None:
 
     if request.scope.get("scheme") != "http":
         return "invalid_scheme"
-    if len(hosts) != 1 or hosts[0] != expected_host:
+    configured_hosts = _configured_allowed_body_read_hosts()
+    if configured_hosts is None:
+        return "invalid_allowed_hosts_config"
+    allowed_hosts = _loopback_allowed_hosts(listener_host, listener_port) | configured_hosts
+    if len(hosts) != 1 or hosts[0] not in allowed_hosts:
         return "invalid_host"
+    expected_origin = f"http://{hosts[0]}"
     if len(origins) > 1 or (len(origins) == 1 and origins[0] != expected_origin):
         return "invalid_origin"
     if len(fetch_sites) > 1 or (len(fetch_sites) == 1 and fetch_sites[0] not in _ACP_TRANSCRIPT_ALLOWED_FETCH_SITES):

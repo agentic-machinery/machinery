@@ -713,7 +713,7 @@ def test_acp_transcript_refuses_mismatched_missing_or_duplicate_host(tmp_path, m
 
     for bad_host in (
         "monitor.example",
-        f"localhost:{api_config.API_PORT}",
+        f"localhost:{api_config.API_PORT + 1}",
         f"{api_config.API_HOST}:{api_config.API_PORT + 1}",
         api_config.API_HOST,
     ):
