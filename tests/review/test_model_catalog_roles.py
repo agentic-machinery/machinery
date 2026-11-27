@@ -683,9 +683,9 @@ def test_recent_review_counts_reads_published_code_infra_records_and_fails_close
     rows = [
         make_row(task_id="t-sol", role="review", model=CURRENT_SOL, **{"class": "infra/critical"}, pr=1, pinned_head=sha_sol),
         # F3: damaged later row missing tokens must be rejected by canonical _well_formed, preserving Sol credit.
-        {"schema": "model-stats-row.v1", "task_id": "t-sol", "role": "review", "model": "grok-4.7-high", "class": "infra/critical", "repo": "machinery", "pr": 1, "pinned_head": sha_sol},
+        {"schema": "model-stats-row.v1", "task_id": "t-sol", "role": "review", "model": "grok-4.7", "class": "infra/critical", "repo": "machinery", "pr": 1, "pinned_head": sha_sol},
         # Branch-only review row (pr: None) still matches matching repo + head.
-        make_row(task_id="t-grok", role="review", model="grok-4.7-high", **{"class": "code/high"}, pr=None, pinned_head=sha_grok),
+        make_row(task_id="t-grok", role="review", model="grok-4.7", **{"class": "code/high"}, pr=None, pinned_head=sha_grok),
         make_row(task_id="t-old", role="review", model="claude-opus-5-5", **{"class": "code/medium"}, pr=3, pinned_head=sha_old),
         make_row(task_id="t-uk", role="review", model="gemini-4-neon", **{"class": "ukrainian/high"}, pr=4, pinned_head=sha_uk),
         make_row(task_id="t-unpub", role="review", model="gemini-4-neon", **{"class": "code/high"}, pr=10, pinned_head=sha_sol),
@@ -811,7 +811,7 @@ _ROTATION_VALID_ROW = {
         ({"extra": _nested(16)}, "sol", ""),
         ({"extra": _nested(15)}, "grok", ""),
         # Strict JSON: a duplicate member or a NaN extension makes the later row unreadable, not a replacement.
-        (', "model": "grok-4.7-high"', "sol", ""),
+        (', "model": "grok-4.7"', "sol", ""),
         (', "extra": NaN', "sol", ""),
         # A publication with a duplicate verdict member is unreadable, whichever value comes last.
         ({}, None, ', "verdict": "APPROVED"'),
@@ -839,7 +839,7 @@ def test_recent_review_counts_malformed_later_row_never_replaces_valid_row(
         "verdict": ["APPROVED"] if publication_suffix else "APPROVED",
         "published_at": "2026-11-26T12:00:00Z",
     }
-    superseding = {**_ROTATION_VALID_ROW, "model": "grok-4.7-high", "harness": "cursor"}
+    superseding = {**_ROTATION_VALID_ROW, "model": "grok-4.7", "harness": "cursor"}
     if isinstance(later, dict):
         superseding_line = json.dumps({**superseding, **later})
     else:
@@ -874,7 +874,7 @@ def test_recent_review_counts_skips_oversized_ledger_lines_and_keeps_reading(tmp
         "published_at": "2026-11-26T12:00:00Z",
     }
     oversized_publication = {**publication, "pad": "x" * limit}
-    oversized_row = {**_ROTATION_VALID_ROW, "model": "grok-4.7-high", "harness": "cursor", "pad": "x" * limit}
+    oversized_row = {**_ROTATION_VALID_ROW, "model": "grok-4.7", "harness": "cursor", "pad": "x" * limit}
     # An oversized line first in each ledger, then valid records that must still be read.
     (stats / "publications.jsonl").write_text(
         json.dumps(oversized_publication) + "\n" + json.dumps(publication) + "\n", encoding="utf-8"

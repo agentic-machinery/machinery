@@ -371,16 +371,16 @@ because it governs their own boundary. A Claude Opus worker owns the follow-up
 PR, reviewed by `gpt-6.1-sol`.
 
 At high and critical risk the automatic bench (`lu_machinery.review.bench_health`,
-#9394) accepts a single automatic cross-family reviewer for Anthropic-authored
-code (`openai_frontier`) and OpenAI-authored code (`claude-opus-5-5`) under
-#9423 AC-02. Critical admits Sol, Opus and Gemini 4 Neon High for code and infra
-(#9538, NEON-SOLTIER-1120), and high also admits Cursor Grok 4.7 High
-(REVIEW-ROTATION-GROK-1127; the review rotation in `model-assignment.md`).
-So non-Google benches count `gemini-4-neon-high` alongside Sol and Opus, and high
-benches outside xAI and Moonshot also count `grok-4.7-cursor-fallback`; critical
-is limited by the catalog's `critical_review` role (#9583). OpenAI's single Opus seat also depends on
-Cursor-routed Claude staying unpinned (#9488). These rows display
-`[EXPECTED single seat]` and satisfy the bench minimum. Zero seats or any other
+#9394) lowers the minimum from two eligible cross-family seats to one for
+Anthropic-authored and OpenAI-authored code (`ACCEPTED_SINGLE_SEAT_BENCHES`,
+#9423 AC-02). The allowance is set by author family and risk, not by which seat
+fills it; the seats come from the catalog and the review rotation in
+`model-assignment.md`. Critical counts only `critical_review` seats: Sol, Opus and
+Gemini 4 Neon High (#9538, NEON-SOLTIER-1120, #9583). High also counts Cursor Grok
+4.7 High (`grok-4.7-cursor-fallback`) outside xAI and Moonshot
+(REVIEW-ROTATION-GROK-1127). Cursor never seats Claude, Gemini, DeepSeek or
+Moonshot models as formal reviewers (#9488), so those families count only through
+their native routes. A bench at that minimum displays `[EXPECTED single seat]`. Zero seats or any other
 shortfall below the default two-seat minimum still exits 1; explicit-pin
 reserves never count toward either minimum.
 

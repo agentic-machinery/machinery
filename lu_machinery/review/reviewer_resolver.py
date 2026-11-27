@@ -141,11 +141,13 @@ def _load_ledger_line(line: bytes) -> Any:
 def _persisted_row_shape(row: Mapping[str, object]) -> bool:
     """Whether a row is a settled code/infra review row as ``model_stats_rows.summary_row`` persists it.
 
-    Every label must already be what the canonical sanitiser would keep. The role is
-    ``review``; the class is ``profile/risk`` with a code/infra profile and a supported risk,
-    or the ``unknown`` risk the writer records when a task named none; the PR is absent or a
-    positive integer; the status is settled. The caller applies this before supersession, so
-    a row that fails it is skipped and can never replace an earlier valid row.
+    Every label must already be in the form the writer stores: what the canonical sanitiser
+    keeps, with the model and author model already their own ``model_id`` and the effort
+    lowercase, as ``effective_effort`` writes it. The role is ``review``; the class is
+    ``profile/risk`` with a code/infra profile and a supported risk, or the ``unknown`` risk
+    the writer records when a task named none; the PR is absent or a positive integer; the
+    status is settled. The caller applies this before supersession, so a row that fails it is
+    skipped and can never replace an earlier valid row.
     """
     from lu_machinery.api import model_stats_rows
 
@@ -158,9 +160,12 @@ def _persisted_row_shape(row: Mapping[str, object]) -> bool:
         row.get(name) is None or (type(row[name]) is str and sanitised[name] == row[name]) for name in optional_labels
     ):
         return False
-    pr = row.get("pr")
+    pr, author = row.get("pr"), row.get("author_model")
     return (
-        row["role"] == "review"
+        model_stats_rows.model_id(row["model"]) == row["model"]
+        and (author is None or model_stats_rows.model_id(author) == author)
+        and row["effort"] == str(row["effort"]).lower()
+        and row["role"] == "review"
         and row["class"] in _CODE_INFRA_REVIEW_CLASSES
         and (pr is None or (type(pr) is int and pr > 0))
         and row["status"] not in model_stats_rows.ACTIVE
