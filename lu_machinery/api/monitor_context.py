@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Any
 
 from fastapi import Request
 
+from lu_machinery import state_paths
 from lu_machinery.common.repo_root import (
     configured_primary_root,
     configured_product_root,
@@ -447,7 +448,7 @@ def fixture_context(root: os.PathLike[str] | str) -> MonitorContext:
         project_root=fixture_root,
         live_repo_root=fixture_root,
         dashboards_dir=fixture_root / "dashboards",
-        batch_state_dir=fixture_root / "batch_state",
+        batch_state_dir=state_paths.batch_state_dir(fixture_root),
         curriculum_root=fixture_root / "curriculum" / "l2-uk-en",
         session_streams_db_path=fixture_root / ".agent" / "session-streams" / "v1" / "session-streams.sqlite3",
         backup_dir=fixture_root / "data" / "backups",

@@ -21,6 +21,7 @@ from typing import Any
 
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from lu_machinery import state_paths
 from lu_machinery.common import json_depth
 from lu_machinery.common.github_client import GitHubRateLimited
 from lu_machinery.common.repo_root import MachineryConfigError, configured_github_slug, state_root
@@ -4038,19 +4039,13 @@ def default_keeper_paths(repo_root: Path, repo: str = _DEFAULT_REPO) -> tuple[Pa
     """Keep repository-specific queue locks and state under the durable root."""
     resolved_state = state_root().resolve()
     if _is_default_repo(repo):
-        return (
-            resolved_state / "batch_state/merge_queue_keeper.json",
-            resolved_state / "batch_state/locks/merge_queue_keeper.lock",
-        )
+        return state_paths.merge_queue_keeper_paths(resolved_state)
     norm = normalize_repository(repo)
     repo_part = norm.removeprefix("github.com/")
     if not _REPO_SLUG_RE.fullmatch(repo_part) or ".." in repo_part.split("/"):
         raise KeeperError(f"invalid repository slug for default keeper state path: {repo!r}")
     slug = repo_part.replace("/", "__")
-    return (
-        resolved_state / "batch_state/merge_queue_keeper" / f"{slug}.json",
-        resolved_state / "batch_state/locks" / f"merge_queue_keeper.{slug}.lock",
-    )
+    return state_paths.merge_queue_keeper_paths(resolved_state, slug=slug)
 
 
 @publication_cli(KeeperError)

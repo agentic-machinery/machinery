@@ -17,6 +17,7 @@ from typing import Any
 
 import yaml
 
+from lu_machinery import state_paths
 from lu_machinery.agent_runtime.usage import _iter_usage_records
 from lu_machinery.common import json_depth
 from lu_machinery.common.repo_root import machinery_path, product_root, state_root
@@ -282,7 +283,7 @@ def count_runtime_calls(
     slight superset of the cost window's exact N*24h mtime cutoff.
     """
     counts = unreadable if unreadable is not None else {"files": 0, "lines": 0, "records": 0}
-    directory = usage_dir or state_root() / "batch_state" / "api_usage"
+    directory = usage_dir or state_paths.api_usage_dir(state_root())
     if not directory.exists():
         return 0
     today = (now or datetime.now(UTC)).date()

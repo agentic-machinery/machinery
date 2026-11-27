@@ -25,6 +25,7 @@ import yaml
 if __package__ in (None, ""):  # run as a file: put the repository root on sys.path
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+from lu_machinery import state_paths
 from lu_machinery.agent_runtime.agent_github_identity import resolve_agent_github_identity, revoke_installation_token
 from lu_machinery.common import profile
 from lu_machinery.common.repo_root import StateRootError, machinery_path, state_root
@@ -751,7 +752,7 @@ def worktree_remove(repo: Repository, primary: Path, git: Git, raw: str) -> dict
         try:
             if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", head):
                 return False, reachability_refusal
-            tasks = control_root / "batch_state/tasks"
+            tasks = state_paths.tasks_dir(control_root)
             needles = worktree_claims.worktree_claim_needles(target, target)
             bases = set()
             for state_file in sorted(tasks.iterdir()):
@@ -809,7 +810,7 @@ def worktree_remove(repo: Repository, primary: Path, git: Git, raw: str) -> dict
         owner_task_id=None,
         force=False,
         releasable=releasable,
-        tasks_dir=control_root / "batch_state/tasks",
+        tasks_dir=state_paths.tasks_dir(control_root),
         lock_dir=lock_dir,
         lock_timeout_s=0,
         git_runner=SafeGitRunner(_GIT),

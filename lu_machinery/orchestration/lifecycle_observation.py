@@ -15,6 +15,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from lu_machinery import state_paths
 from lu_machinery.common import json_depth
 from lu_machinery.fleet import ignored_task_output
 from lu_machinery.orchestration import task_lifecycle as tl
@@ -118,7 +119,7 @@ def before_reap(
     primary = tl.canonical_state_root(repo_root)
     records = ignored_task_output.matching_worktree_records(
         worktree,
-        tasks_dir or primary / "batch_state/tasks",
+        tasks_dir or state_paths.tasks_dir(primary),
         repo_root=repo_root,
         publish_cache=False,
     )

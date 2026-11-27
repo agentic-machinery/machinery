@@ -39,6 +39,7 @@ if __package__ in (None, ""):  # run as a file: put the repository root on sys.p
 from lu_machinery.common import json_depth
 from lu_machinery.common.jsonl import jsonl_lines as split_jsonl_lines
 from lu_machinery.common.repo_root import MachineryConfigError
+from lu_machinery.common.task_store_paths import tasks_dir as default_tasks_dir
 from lu_machinery.control_plane.health import authority_collector_payload
 from lu_machinery.control_plane.storage import StoreId, assert_component_supported
 from lu_machinery.control_plane.storage import connect as cp_connect
@@ -445,7 +446,7 @@ def cmd_metrics(args: argparse.Namespace) -> int:
 
 def cmd_bottleneck_metrics(args: argparse.Namespace) -> int:
     """Per-stream lifecycle bottlenecks from task, plane, and GitHub metadata."""
-    tasks_dir = Path(args.tasks_dir).expanduser()
+    tasks_dir = Path(args.tasks_dir).expanduser() if args.tasks_dir else default_tasks_dir()
     plane_db = _resolve_plane_db(args)
     # Always call the collector: it is fail-open per source and refuses to
     # sqlite3.connect-create a missing plane DB (is_file guard inside). Skipping
@@ -1530,8 +1531,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     bottlenecks.add_argument(
         "--tasks-dir",
-        default="batch_state/tasks",
-        help="Delegate task-state directory (default: batch_state/tasks)",
+        default=None,
+        help="Delegate task-state directory (default: configured batch_state/tasks)",
     )
     bottlenecks.add_argument(
         "--root",

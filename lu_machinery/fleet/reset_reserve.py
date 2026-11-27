@@ -8,6 +8,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from lu_machinery import state_paths
 from lu_machinery.api.subscription_usage import get_provider_usage_data, pace_is_deficit
 from lu_machinery.common import json_depth
 from lu_machinery.common.repo_root import state_root
@@ -15,7 +16,7 @@ from lu_machinery.fleet.credit_lane import CAPACITY_VERIFIED
 
 SCHEMA_VERSION = "operator-reset-reserve.v1"
 MAX_PROVIDER_AGE_SECONDS = 15 * 60
-RESERVE_RELATIVE_PATH = Path("batch_state/routing_budget/operator_reset_reserve.json")
+RESERVE_RELATIVE_PATH = state_paths.RESET_RESERVE_REL
 # Account a keeps the historical file, which has no account field. Account b is
 # ``b-sub`` (also ``b`` / ``codex:b``). A reserve relaxes only the account it names.
 _ACCOUNT_A = "sub"
@@ -219,7 +220,7 @@ def load_reset_reserve(
     label = _ACCOUNT_A if account is None else codex_reserve_account(account)
     if not label:
         return unavailable_reserve()
-    path = state_root() / RESERVE_RELATIVE_PATH
+    path = state_paths.reset_reserve_path(state_root())
     try:
         payload = json_depth.loads(path.read_text(encoding="utf-8"), max_depth=512)
     except (OSError, UnicodeError, json.JSONDecodeError):

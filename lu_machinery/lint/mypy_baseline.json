@@ -6713,11 +6713,6 @@
       "message": "Argument 11 to \"git_worktree_remove\" has incompatible type \"**dict[str, SafeGitRunner]\"; expected \"None | float\""
     },
     {
-      "path": "lu_machinery/orchestration/worktree_claims.py",
-      "code": "operator",
-      "message": "Unsupported left operand type for / (\"None\")"
-    },
-    {
       "path": "lu_machinery/orchestration/worktree_git.py",
       "code": "arg-type",
       "message": "Argument 1 to \"resolve_claim_path\" has incompatible type \"Any | None\"; expected \"str\""

@@ -22,6 +22,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from lu_machinery import state_paths
 from lu_machinery.common import json_depth
 from lu_machinery.common.repo_root import MachineryConfigError, primary_root, state_root
 from lu_machinery.common.task_store_paths import tasks_dir as default_tasks_dir
@@ -118,7 +119,7 @@ def read_json(path: Path) -> dict[str, Any] | None:
 
 
 def runs_dir(repo_root: Path) -> Path:
-    return state_root() / "batch_state" / "orchestrator-runs"
+    return state_paths.orchestrator_runs_dir(state_root())
 
 
 def tasks_dir(repo_root: Path) -> Path:
