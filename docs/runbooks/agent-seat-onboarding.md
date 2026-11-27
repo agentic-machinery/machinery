@@ -92,6 +92,7 @@ handoff creates a competing authority.
 - **Live delivery:** the live driver reads and applies its own inbox with
   `.venv/bin/python -I -m lu_machinery.fleet_comms deliveries receive --recipient <slot> --worker-id <slot>`,
   then runs `.venv/bin/python -I -m lu_machinery.fleet_comms deliveries ack <delivery-id> --worker-id <slot> --fence-token <n>`.
+  An empty inbox is a normal answer: `receive` exits 0 with `"delivery": null`, and there is nothing to acknowledge.
   Detached worker processing and a wake signal are not live-consumption proof.
   Continue the required inbox drain in `drive-epic`; do not launch another
   supervisor to wake the current one.

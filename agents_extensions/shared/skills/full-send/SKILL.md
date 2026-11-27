@@ -285,7 +285,7 @@ Then wait for at most 30 minutes, one Bash call per minute (`sleep 60`, then rec
 Use `receive` for worker replies: it claims and reads the body in one call and recovers
 your existing lease if an earlier call's output was lost. Keep the entire output and exit
 code. Never pipe it through `tail`, `head`, `grep`, or a parser that drops fields; never
-hide errors with `|| true`. Exit 1 alone means no reply yet. Exit 3 is a typed error,
+hide errors with `|| true`. Exit 0 with `"delivery": null` means no reply yet. Exit 3 is a typed error,
 not an empty inbox: report it to `claude-cto` and stop dependent work.
 
 ```bash
