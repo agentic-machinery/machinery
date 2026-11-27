@@ -373,7 +373,7 @@ def test_partly_unreadable_roster_or_task_store_keeps_mail_queued_through_expire
             elif doubt == "record_not_readable":
                 hot.chmod(0)  # found by stat, refused at open
             elif doubt == "record_not_utf8":
-                hot.write_bytes(b'{"status": "\xff"}')  # read, but not text
+                hot.write_bytes(b'{"status": "done", "error": "\xff"}')  # a terminal status beside bytes that are not UTF-8
             elif doubt == "dangling_tasks_dir_link":
                 tasks_dir.rename(moved)
                 tasks_dir.symlink_to(tmp_path / "unmounted")

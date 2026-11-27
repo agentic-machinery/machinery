@@ -508,7 +508,7 @@ def read(task_id: str, nonce: str | None = None, *, missing_ok=False, tasks_root
             return None
         raise ValueError("task not found")
     try:
-        text = path.read_text()
+        text = path.read_text(encoding="utf-8")  # records are UTF-8 JSON, whatever the locale
     except OSError as exc:  # access denied, or moved since the lookup: its content was never seen
         raise TaskRecordError("TASK_RECORD_UNREADABLE") from exc
     except UnicodeDecodeError as exc:  # read, but not text
