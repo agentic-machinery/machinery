@@ -233,6 +233,90 @@ def test_settled_task_delivery_left_queued_expires_on_the_next_claim_and_hygiene
         assert service.count_unreadable()["deliveries"] == 0
 
 
+def delivery_snapshot(root):
+    """Every delivery's lease fields and the wake-receipt count: what a claim would change."""
+    with AuthorityService(root=root) as service:
+        conn = service.store.connection
+        rows = conn.execute(
+            """SELECT delivery_id, recipient, state, lease_owner, fence_token, attempt_count
+               FROM authority_deliveries ORDER BY delivery_id"""
+        ).fetchall()
+        receipts = conn.execute("SELECT COUNT(*) FROM authority_wake_receipts").fetchone()[0]
+    return [tuple(row) for row in rows], receipts
+
+
+def import_legacy(service, name, key):
+    """A row queued to ``name`` past admission, as the legacy import (or an incomplete-roster publish) leaves it."""
+    with service._write_transaction():
+        service._publish_message_tx(
+            sender="sre-timers", body="old report", channel=None, targets=None, kind="message",
+            imported_recipients=(name,), imported_source="test-legacy", idempotency_key=key,
+        )
+
+
+@pytest.mark.parametrize("operation", ["receive", "claim"])
+def test_claim_and_receive_refuse_a_recipient_no_drain_reads_and_name_its_open_rows(plane, tasks, capsys, operation):
+    """Defect class: claim or receive for a name no drain reads answers as an empty inbox and hides mail queued to it."""
+    worker = tasks("cto-7-i7-worker", "running")
+    with AuthorityService(root=plane) as service:
+        service.publish_message(sender="claude-cto", body="apply option B", recipients=(worker,))
+        for key in ("epics-1", "epics-2", "epics-3"):
+            import_legacy(service, "epics", key)
+        assert service.claim_next_delivery("epics", "seat-1") is not None  # one leased, never acknowledged
+    tasks(worker, "done")
+    before = delivery_snapshot(plane)
+
+    for name, cause, queued, running in (
+        ("epics", "recipient_not_registered", 2, 1),
+        (" epics ", "recipient_not_registered", 2, 1),
+        ("claude/cto-7b96-i12394-opus-b", "recipient_not_registered", 0, 0),
+        (worker, "recipient_settled", 1, 0),
+    ):
+        refused = run(capsys, "deliveries", operation, "--recipient", name, "--worker-id", "seat-2", expected=EXIT_ERROR)
+        assert refused["error"] == cause
+        assert (refused["recipient"], refused["queued"], refused["running"]) == (name.strip(), queued, running)
+        assert f"{queued} queued and {running} running" in refused["detail"]
+        assert refused["content_included"] is False and "body" not in refused
+    assert delivery_snapshot(plane) == before  # nothing leased, reclaimed or expired
+
+    # Registered and live names still claim.
+    live = tasks("cto-8-i8-live", "running")
+    with AuthorityService(root=plane) as service:
+        service.publish_message(sender="claude-cto", body="b", recipients=(live,))
+    got = run(capsys, "deliveries", operation, "--recipient", live, "--worker-id", live)
+    assert (got["delivery"] if operation == "receive" else got)["recipient"] == live
+    run(capsys, "deliveries", operation, "--recipient", "claude-cto", "--worker-id", "seat-1")
+
+
+def test_unreadable_recipient_refusal_survives_an_unreadable_store_without_leaking_it(tmp_path, tasks, capsys):
+    """Defect class: a store error on the refusal path turns into an empty answer or prints a private path."""
+    root = tmp_path / "private-path-sentinel"
+    root.write_text("not a directory")
+    refused = run(
+        capsys, "deliveries", "receive", "--recipient", "epics", "--worker-id", "epics", "--root", str(root),
+        expected=EXIT_ERROR,
+    )
+    assert (refused["error"], refused["queued"], refused["running"]) == ("recipient_not_registered", None, None)
+    assert "could not be counted" in refused["detail"]
+    assert "private-path-sentinel" not in json.dumps(refused)
+
+
+@pytest.mark.parametrize("doubt", ["roster", "task_status"])
+def test_claim_and_receive_admit_a_recipient_of_unknown_standing(plane, tasks, capsys, monkeypatch, tmp_path, doubt):
+    """Defect class: doubt about a recipient's standing (incomplete roster, damaged task record) refuses and hides mail."""
+    from lu_machinery import agent_identity
+
+    if doubt == "roster":
+        name = "epics"
+        monkeypatch.setattr(agent_identity, "ASSIGNMENTS_PATH", tmp_path / "unavailable")
+    else:
+        name = tasks("cto-9-i9-worker", "paused")
+    with AuthorityService(root=plane) as service:
+        import_legacy(service, name, f"doubt-{doubt}")
+    received = run(capsys, "deliveries", "receive", "--recipient", name, "--worker-id", "seat-1")
+    assert received["delivery"]["recipient"] == name
+
+
 def test_dead_subscription_still_receiving_broadcasts_ends_when_its_task_settles(plane, tasks):
     """Defect class: a settled task stays subscribed, so every broadcast still fans out to it (#594)."""
     worker = tasks("cto-4-i4-worker", "running")

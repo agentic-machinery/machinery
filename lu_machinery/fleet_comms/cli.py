@@ -629,6 +629,68 @@ def _refuse_kimi_recipients(recipients: list[str] | tuple[str, ...]) -> None:
         raise FleetCommsCliError(str(exc)) from exc
 
 
+def _unreadable_recipient_cause(recipient: str) -> tuple[str, str] | None:
+    """``(name, cause)`` when no drain reads this recipient, else ``None``; reads no store.
+
+    Mirrors ``deliveries pending``: a historical alias is not checked, and only
+    a proven standing refuses. An unknown standing (incomplete roster, damaged
+    task record) is admitted, so doubt never hides mail.
+    """
+    from lu_machinery.agent_identity import resolve_recipient_alias
+    from lu_machinery.fleet_comms.authority import (
+        AuthorityRecipientRefused,
+        _nonempty,
+        _recipient_standing,
+        _registered_recipients,
+        _roster_complete,
+    )
+
+    name = _nonempty(recipient, field="recipient")
+    if resolve_recipient_alias(name) != name:
+        return None
+    standing = _recipient_standing(name, _registered_recipients(), _roster_complete())
+    if standing not in {"not_registered", "settled_task"}:
+        return None
+    return name, AuthorityRecipientRefused(name, standing).cause
+
+
+def _refuse_unreadable_recipient(args: argparse.Namespace, name: str, cause: str) -> int:
+    """Refuse claim or receive for a recipient no drain reads, naming its open rows without leasing them.
+
+    A publish under an incomplete roster can still queue rows to such a name,
+    so the refusal counts them (read only) for the operator to act on.
+    """
+    from lu_machinery.control_plane.storage import ControlPlaneError
+    from lu_machinery.fleet_comms.artifacts import ArtifactStoreError
+    from lu_machinery.fleet_comms.authority import AuthorityService, AuthorityServiceError
+
+    counts: dict[str, int | None] = {"queued": None, "running": None}
+    try:
+        with AuthorityService(root=_authority_root(args)) as service:
+            rows = service.store.connection.execute(
+                """SELECT state, COUNT(*) FROM authority_deliveries
+                   WHERE recipient = ? AND state IN ('queued', 'running') GROUP BY state""",
+                (name,),
+            ).fetchall()
+        counts = {"queued": 0, "running": 0}
+        counts.update({str(state): int(count) for state, count in rows})
+        held = f"{counts['queued']} queued and {counts['running']} running deliveries to it are held, not claimed"
+    except (AuthorityServiceError, OSError, sqlite3.Error, PlaneRootAnchorError, ControlPlaneError, ArtifactStoreError):
+        # Storage exceptions may contain private paths or SQL; never echo them.
+        held = "its open deliveries could not be counted"
+    sys.stdout.write(_json_dump({
+        "error": cause,
+        "recipient": name,
+        **counts,
+        "detail": (
+            f"no drain reads {name}; {held}. A dispatched task's recipient is its bare task id. "
+            "deliveries expire-stale counts such rows and --apply dead-letters them."
+        ),
+        "content_included": False,
+    }))
+    return EXIT_ERROR
+
+
 def cmd_deliveries(args: argparse.Namespace) -> int:
     """Expose fenced delivery operations; read and receive return bodies to the lease holder."""
     from lu_machinery.control_plane.storage import ControlPlaneError
@@ -644,6 +706,10 @@ def cmd_deliveries(args: argparse.Namespace) -> int:
     if args.deliveries_command in {"claim", "receive"}:
         _refuse_kimi_recipients((args.recipient,))
     try:
+        if args.deliveries_command in {"claim", "receive"}:
+            refused_recipient = _unreadable_recipient_cause(args.recipient)
+            if refused_recipient is not None:
+                return _refuse_unreadable_recipient(args, *refused_recipient)
         with AuthorityService(root=_authority_root(args)) as service:
             if args.deliveries_command in {"claim", "receive"}:
                 lease = service.claim_next_delivery(
@@ -731,8 +797,8 @@ def _add_deliveries_parser(sub: Any) -> None:
     )
     epilog = (
         "Examples:\n"
-        f"  .venv/bin/python -m {_PACKAGE} deliveries claim --recipient codex --worker-id seat-1\n"
-        f"  .venv/bin/python -m {_PACKAGE} deliveries receive --recipient worker-task --worker-id worker-task\n"
+        f"  .venv/bin/python -m {_PACKAGE} deliveries claim --recipient claude-cto --worker-id seat-1\n"
+        f"  .venv/bin/python -m {_PACKAGE} deliveries receive --recipient <task-id> --worker-id <task-id>\n"
         f"  .venv/bin/python -m {_PACKAGE} deliveries consume DELIVERY --worker-id seat-1 --fence-token 1 --driver-generation gen-1\n"
         f"  .venv/bin/python -m {_PACKAGE} deliveries ack DELIVERY --worker-id seat-1 --fence-token 1\n"
         f"  .venv/bin/python -m {_PACKAGE} deliveries read DELIVERY --worker-id seat-1 --fence-token 1\n"
@@ -764,7 +830,9 @@ def _add_deliveries_parser(sub: Any) -> None:
         "  task's own deliveries (recipient and worker id are the task id).\n"
         "Exit codes: 0 = success, including an empty claim or receive,\n"
         "  1 = status, read, ack or consume named a delivery that does not exist,\n"
-        "  2 = usage error, 3 = operation refused or storage error.\n"
+        "  2 = usage error, 3 = operation refused or storage error. Claim and receive refuse with 3\n"
+        "  a recipient no drain reads (error recipient_not_registered or recipient_settled), with the\n"
+        "  queued and running counts of its open deliveries, which stay unclaimed.\n"
         f"Related: {_PACKAGE}.authority.AuthorityService; channels publish; plane-status."
     )
     deliveries = sub.add_parser(
@@ -799,7 +867,10 @@ def _add_deliveries_parser(sub: Any) -> None:
             help="Authority storage directory (default: FLEET_COMMS_ROOT or shared plane root; e.g. /tmp/test-plane)",
         )
         if name in {"claim", "receive"}:
-            operation.add_argument("--recipient", required=True, help="Exact recipient seat, e.g. codex")
+            operation.add_argument(
+                "--recipient", required=True,
+                help="Exact recipient: a registered slot (e.g. claude-cto) or a live task id",
+            )
             operation.add_argument("--lease-seconds", type=int, default=300, help="Positive lease duration in seconds (default: 300)")
             operation.add_argument("--max-attempts", type=int, default=3, help="Positive delivery attempt limit (default: 3)")
         else:
