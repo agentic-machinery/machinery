@@ -210,7 +210,7 @@
     <p class="note">Compare Neon medium and high on write landings, reviewer approvals and typical runtime. Use the counts and approval intervals before favoring a setting, and compare approvals only for similar review work.</p>
     <div id="neon">Loading…</div></section>
   <section class="wide" id="accuracy-section"><h2>Reviewer accuracy <span class="meta" id="accuracy-meta"></span></h2>
-    <p class="note">Each blocking (P0–P1) finding counts as fixed when the author changed its file before the same reviewer approved, and as dismissed when that reviewer approved with the file unchanged. Higher precision means more of a reviewer's blocking findings led to a change; check the settled count and interval before comparing reviewers. Only verdicts the recorder published count: a blocking reply with no recorded publication is of unknown publication and is left out.</p>
+    <p class="note">Each blocking (P0–P1) finding counts as fixed when the author changed its file before the same reviewer approved, and as dismissed when that reviewer approved with the file unchanged. Higher precision means more of a reviewer's blocking findings led to a change; check the settled count and interval before comparing reviewers. Only verdicts the recorder published count: a blocking reply with no recorded publication is of unknown publication and is left out. The author labels and the miss proxy follow the table.</p>
     <div id="accuracy">Loading…</div></section>
   <section class="wide"><h2>Compare reviewer levels</h2>
     <p class="note">Compare recorded reviewer effort levels by readable results, first-round approval, runtime and usage linked to landings. Look for more readable results and lower time or allowance cost on similar work with enough observations.</p>
@@ -448,6 +448,7 @@ function pickerModels(data) {
       .flatMap((a) => members(a.model)),
     ...(data.first_round_matrix || []).flatMap((c) => [...members(c.author), c.reviewer]),
     ...(data.reviewer_accuracy?.findings || []).map((r) => r.model),
+    ...(data.reviewer_miss_proxy || []).map((r) => r.model),
   ])].sort();
 }
 
@@ -893,7 +894,21 @@ function accuracy(data) {
       + `${cell(r.reviews_unknown_publication, r.reviews_unknown_publication ? "warn" : "")}`
       + `${cell(r.reviews_without_paths, r.reviews_without_paths ? "warn" : "")}${cell(r.blocking_findings)}${cell(r.fixed)}`
       + `${cell(r.dismissed)}${cell(r.open)}${cell(r.unknown, r.unknown ? "warn" : "")}${cell(pct(r.precision))}`
-      + `${cell(ciText(r.precision_ci))}${cell(nOf(r.precision))}</tr>`], 12)) + headText + recallText;
+      + `${cell(ciText(r.precision_ci))}${cell(nOf(r.precision))}</tr>`], 12)) + headText
+    + '<h3>Author labels</h3><p class="note">The author labels each blocking finding: fixed (a real error), wrong (the code was already correct), invented (it cites code or behaviour that does not exist), out of scope or duplicate. A label the next review contested counts as contested. Real precision is fixed over fixed, wrong and invented.</p>'
+    + table(["Reviewer", "Fixed (real)", "Wrong", "Invented", "Out of scope", "Duplicate", "Contested", "Unlabelled", "Real precision", "Interval", "Labelled"],
+      grouped(items, (r) => { const l = r.labels || {}; return [`<tr><td>${named(r)}</td>${cell(num(l.fixed || 0))}`
+        + `${cell(num(l.wrong || 0))}${cell(num(l.invented || 0), l.invented ? "warn" : "")}${cell(num(l.out_of_scope || 0))}`
+        + `${cell(num(l.duplicate || 0))}${cell(num(l.contested || 0))}${cell(num(l.unlabelled || 0))}`
+        + `${cell(pct(r.real_precision))}${cell(ciText(r.real_precision_ci))}${cell(nOf(r.real_precision))}</tr>`]; }, 11))
+    + missProxy(data) + recallText;
+}
+function missProxy(data) {
+  const rows = (data.reviewer_miss_proxy || []).filter((r) => keepModel(r.model)).map((r) =>
+    `<tr><td>${named(r)}</td>${cell(nOf(r.rate))}${cell(num(r.reworked))}${cell(pct(r.rate))}</tr>`);
+  return '<h3>Reviewer miss proxy</h3>' + (rows.length
+    ? table(["Reviewer", "Approved merges observed for 7 days", "Named by a fix or revert", "Miss share"], rows)
+    : '<p class="muted">No approved merge with seven days of follow-up in this selection.</p>');
 }
 // A findings rate counts only PRs with a known findings count, so it carries its own low-sample mark.
 const rateOf = (r) => r && r.value !== null && r.value !== undefined ? `${num(r.value, 2)}${r.low_sample ? LOW : ""}` : "—";

@@ -1139,6 +1139,120 @@ def test_published_verdict_stores_one_local_publication_marker(monkeypatch, tmp_
     }]
 
 
+def _blocking_reply(priorities, explanation="The change breaks a case."):
+    """A ``code-review-findings.v1`` reply with findings F1.. of these priorities (CHANGES_REQUESTED with a P0-P1)."""
+    return json.dumps({
+        "schema_version": "code-review-findings.v1",
+        "overall": {"correctness": "incorrect" if any(p in ("P0", "P1") for p in priorities) else "correct",
+                    "explanation": explanation, "confidence": 0.9},
+        "findings": [{
+            "id": f"F{number}", "title": "A defect", "body": "The change breaks a case.", "priority": priority,
+            "confidence": 0.9, "category": "correctness",
+            "location": {"path": "scripts/example.py", "start_line": number, "end_line": number,
+                         "claim_type": "present"},
+            "verbatim": "value = shared_state", "why_wrong": "The state is not reset.",
+            "smallest_fix": "Rebuild the state for every call.", "sources": ["none"],
+        } for number, priority in enumerate(priorities, start=1)],
+    })
+
+
+def _outcomes(tmp_path):
+    path = tmp_path / "model-stats" / "finding-outcomes.jsonl"
+    return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+
+
+@pytest.mark.usefixtures('configured_roots', 'recorder_matcher')
+@pytest.mark.usefixtures("agent_runtime_roots")
+def test_finding_outcome_verb_refuses_unpublished_unknown_or_nonblocking_findings(monkeypatch, tmp_path, capsys):
+    """Defect class: an outcome label recorded for a finding the statistics cannot attribute to a published blocking
+    review (no publication, an unknown id, a P2 finding, an unstructured reply), without the evidence its label
+    needs, as free text in the ledger, or as a second, different label of one finding."""
+    monkeypatch.setenv("LEARN_UKRAINIAN_DISPATCH_TASK_ID", "author-task")
+    tasks, _comments, _calls = setup_record(monkeypatch, tmp_path)
+    write_task(tasks, reply=_blocking_reply(["P1", "P2"]))
+
+    def label(finding, name, evidence=None):
+        return recorder.record_finding_outcome("review-one", pr_number=42, finding_id=finding, label=name,
+                                               evidence=evidence, task_root=tasks)
+
+    with pytest.raises(recorder.RecordError, match="no published CHANGES_REQUESTED verdict of review review-one"):
+        label("F1", "fixed")
+    assert recorder.record("review-one", pr_number=42, task_root=tasks, lock_root=tmp_path / "locks")["verdict"] == (
+        "CHANGES_REQUESTED")
+    with pytest.raises(recorder.RecordError, match="no published CHANGES_REQUESTED verdict"):
+        recorder.record_finding_outcome("review-one", pr_number=43, finding_id="F1", label="fixed", evidence=None,
+                                        task_root=tasks)
+    for finding in ("F2", "F9"):
+        with pytest.raises(recorder.RecordError, match="is not a P0-P1 finding of review review-one"):
+            label(finding, "fixed")
+    with pytest.raises(recorder.RecordError, match="label wrong needs --evidence"):
+        label("F1", "wrong", "  ")
+    with pytest.raises(recorder.RecordError, match="one line"):
+        label("F1", "wrong", "first line\nsecond line")
+    with pytest.raises(recorder.RecordError, match="unknown outcome label"):
+        label("F1", "dismissed", "a word outside the vocabulary")
+    assert _outcomes(tmp_path) == []
+    assert label("F1", "wrong", "scripts/example.py:1 already resets the state")["status"] == "recorded"
+    assert label("F1", "wrong", "scripts/example.py:1 already resets the state")["status"] == "already recorded"
+    with pytest.raises(recorder.RecordError, match="already labelled wrong: a finding takes one label"):
+        label("F1", "fixed")
+    [line] = _outcomes(tmp_path)
+    assert line == {
+        "schema": "review-finding-outcome.v1", "kind": "label", "task_id": "review-one", "repository": "owner/repo",
+        "pr": 42, "finding_id": "F1", "label": "wrong", "recorded_by": "author-task",
+        "evidence_sha256": hashlib.sha256(b"scripts/example.py:1 already resets the state").hexdigest(),
+        "recorded_at": line["recorded_at"],
+    }
+    # The command line: exit 1 and a reason on refusal, exit 0 and a JSON receipt otherwise.
+    from lu_machinery.common import task_store_paths
+
+    monkeypatch.setattr(task_store_paths, "tasks_dir", lambda *_args, **_kwargs: tasks)
+    assert recorder.main(["finding-outcome", "--task-id", "review-one", "--pr", "42", "--finding", "F2",
+                          "--label", "fixed"]) == 1
+    assert "finding outcome refused: finding 'F2' is not a P0-P1 finding" in capsys.readouterr().out
+    assert recorder.main(["finding-outcome", "--task-id", "review-one", "--pr", "42", "--finding", "F1",
+                          "--label", "wrong", "--evidence", "scripts/example.py:1 already resets the state"]) == 0
+    assert json.loads(capsys.readouterr().out)["status"] == "already recorded"
+    # A reply with no structured findings takes no label.
+    write_task(tasks, task_id="review-text", reply="VERDICT: CHANGES_REQUESTED\nOrdinary reviewer text.\n")
+    with pytest.raises(recorder.RecordError, match="no structured findings"):
+        recorder.record_finding_outcome("review-text", pr_number=42, finding_id="F1", label="fixed", evidence=None,
+                                        task_root=tasks)
+
+
+@pytest.mark.usefixtures('configured_roots', 'recorder_matcher')
+@pytest.mark.usefixtures("agent_runtime_roots")
+def test_record_stores_a_contest_only_against_the_previous_blocking_round(monkeypatch, tmp_path):
+    """Defect class: a CONTEST line bound to another round than the PR's previous blocking review (an older round,
+    the contesting review itself, a tie in GitHub's comment time taken in the wrong order), stored for an id that is
+    no P0-P1 finding of that round, or a reply that contests nothing changing the receipt."""
+    from lu_machinery.review import capability_failure
+
+    tasks, _comments, _calls = setup_record(monkeypatch, tmp_path)
+    monkeypatch.setattr(capability_failure, "require_unclassified", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(recorder, "budget_admission", lambda **_kwargs: {})
+
+    def publish(task_id, reply):
+        write_task(tasks, task_id=task_id, reply=reply)
+        return recorder.record(task_id, pr_number=42, task_root=tasks, lock_root=tmp_path / "locks")
+
+    first = publish("review-one", _blocking_reply(["P1", "P1", "P2"]))
+    assert "outcome_contests" not in first
+    # Every fake comment has the same GitHub time: the later ledger line is the later round.
+    second = publish("review-two", _blocking_reply(
+        ["P1"], "Two labels do not hold.\nCONTEST F2: the reset is still missing\n  CONTEST F3: P2 is no label\n"
+                "CONTEST F9: no such finding\nA prose CONTEST F1: mid-line is no contest"))
+    assert second["outcome_contests"] == "stored against review-one: F2; unmatched: F3, F9"
+    third = publish("review-three", _blocking_reply(["P1"], "CONTEST F1: still open\nCONTEST F2: still open"))
+    assert third["outcome_contests"] == "stored against review-two: F1; unmatched: F2"
+    assert [(line["task_id"], line["finding_id"], line["contested_by"]) for line in _outcomes(tmp_path)] == [
+        ("review-one", "F2", "review-two"), ("review-two", "F1", "review-three")]
+    # A rerun stores nothing twice.
+    assert recorder.record("review-three", pr_number=42, task_root=tasks, lock_root=tmp_path / "locks")[
+        "outcome_contests"] == "stored against review-two: F1; unmatched: F2"
+    assert len(_outcomes(tmp_path)) == 2
+
+
 @pytest.mark.usefixtures('configured_roots', 'recorder_matcher')
 @pytest.mark.usefixtures("agent_runtime_roots")
 def test_unwritable_publication_marker_never_undoes_the_publication(monkeypatch, tmp_path):
