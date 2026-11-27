@@ -376,6 +376,9 @@ jobs:
       - name: Refuse unbounded JSON readers
         run: python -m lu_machinery.lint.json_readers
 
+      - name: Refuse new state path literals
+        run: python -m lu_machinery.lint.state_path_literals
+
       - name: Refuse non-empty CHANGELOG.md Unreleased section
         run: python -m lu_machinery.release_cut check-changelog
 
