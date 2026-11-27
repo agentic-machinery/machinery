@@ -21,12 +21,14 @@ Readers remain stdlib-only; writers load cause and dispatcher support lazily.
 from __future__ import annotations
 
 import atexit
+import errno
 import fcntl
 import json
 import logging
 import math
 import os
 import re
+import stat
 import threading
 from collections.abc import Callable, Iterable, Iterator
 from contextlib import contextmanager
@@ -352,7 +354,7 @@ def is_identical_copy(mismatch: TaskIdentityMismatch) -> bool:
     if named == mismatch.path:
         return False
     try:
-        other = read_task_record(named)
+        other = parse_task_record(named, read_regular_bytes(named))  # a FIFO at the name never blocks the scan
     except (OSError, ValueError):
         return False
     # Compare the JSON texts: dict equality would equate true with 1 and false with 0.
@@ -370,6 +372,26 @@ def misnamed_record_refusal(path: Path) -> str:
 def read_task_record(path: Path) -> dict[str, Any] | None:
     """Read a scan candidate; foreign files are reported, damaged records raise."""
     return parse_task_record(path, path.read_bytes())
+
+
+def read_regular_bytes(path: Path) -> bytes:
+    """``path``'s bytes, opened without blocking.
+
+    An entry that is not a regular file (a FIFO, a directory, a device) raises
+    ``OSError`` before any byte is read (``IsADirectoryError`` for a directory,
+    as ``open()`` reports it), so a reader neither blocks on it nor reads it as a record.
+    """
+    descriptor = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC)
+    try:
+        mode = os.fstat(descriptor).st_mode
+        if not stat.S_ISREG(mode):
+            raise OSError(errno.EISDIR if stat.S_ISDIR(mode) else errno.EINVAL, "not a regular file", str(path))
+        chunks = []
+        while chunk := os.read(descriptor, 1 << 16):
+            chunks.append(chunk)
+    finally:
+        os.close(descriptor)
+    return b"".join(chunks)
 
 
 def task_record_path(tasks_dir: Path, task_id: str) -> Path:
@@ -464,6 +486,7 @@ def task_archive_lock(tasks_dir: Path, *, moving: bool = False) -> Iterator[None
 
 def iter_task_records(
     tasks_dir: Path, *, include_archive: bool, on_error: Callable[[Path, OSError], None] | None = None,
+    report_non_regular: bool = False,
 ) -> Iterator[Path]:
     """Yield candidate JSON paths: the hot directory sorted by name, then the archive.
 
@@ -471,8 +494,9 @@ def iter_task_records(
     reader needs. A task id re-dispatched after its old record was archived has
     one record in each place; both are yielded because they are two runs. A
     directory that is missing or unreadable yields nothing, and an entry whose type
-    cannot be read, or a link that resolves to no regular file, is skipped;
-    ``on_error`` receives the path and the error for each,
+    cannot be read is skipped; ``on_error`` receives the path and the error for each
+    (with ``report_non_regular``, also for every candidate that is not a regular file:
+    a dangling link, a FIFO, a directory, which a strict reader cannot call no record),
     so a reader that publishes counts can say they are unknown. Only a missing hot
     directory is reported as missing: the first archive run creates the archive, and
     an entry removed during the scan is no record. Readers classify at
@@ -496,10 +520,10 @@ def iter_task_records(
                         try:
                             if entry.is_file():
                                 names.append(entry.name)
-                            elif on_error is not None and entry.is_symlink():
-                                # A link to no regular file (dangling, or to an unmounted store) may name a
-                                # record that cannot be read now. A FIFO or directory itself holds none.
-                                on_error(directory / entry.name, OSError(f"not a regular file: {entry.name}"))
+                            elif report_non_regular and on_error is not None:
+                                os.lstat(directory / entry.name)  # removed during the scan: no record
+                                on_error(directory / entry.name,
+                                         OSError(errno.EINVAL, "not a regular file", str(directory / entry.name)))
                         except OSError as exc:
                             if on_error is not None and not isinstance(exc, FileNotFoundError):
                                 on_error(directory / entry.name, exc)
