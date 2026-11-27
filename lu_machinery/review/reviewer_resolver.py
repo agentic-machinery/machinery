@@ -76,45 +76,12 @@ _SEALED_REVIEW_EXECUTABLE = "agent_runtime.runner:invoke_inter_agent"
 # and a short import spelling (the package directory on ``sys.path``) cannot shorten it.
 _NATIVE_REVIEW_EXECUTABLE = f"{Path(os.path.abspath(__file__)).parents[1].name}/dispatch.py"
 RECENT_REVIEW_WINDOW_DAYS = 7
-_RECENT_REVIEW_JSON_MAX_DEPTH = 16
-_PUBLISHED_VERDICTS = frozenset({"APPROVED", "CHANGES_REQUESTED", "BLOCKED"})
 _CODE_INFRA_REVIEW_CLASSES = frozenset(
     f"{profile}/{risk}" for profile in VALID_REVIEW_PROFILES for risk in (*VALID_RISKS, "unknown")
 )
-_PUBLICATION_REPO_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9._-]{1,100}\Z")
-_PUBLICATION_SHA_RE = re.compile(r"[0-9a-f]{40}\Z")
-_RecentReviewCacheKey = tuple[
-    str, int, int, int, int, int, int, int, int, int, int, int, tuple[tuple[str, str], ...]
-]
-_RECENT_REVIEW_CACHE: tuple[_RecentReviewCacheKey, datetime | None, dict[str, int]] | None = None
 
 
-def _parse_utc_timestamp(value: object) -> datetime | None:
-    if not isinstance(value, str) or not value.strip():
-        return None
-    try:
-        parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
-        return (parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)).astimezone(UTC)
-    except (ValueError, OverflowError):
-        return None
-
-
-def _recent_review_repo_keys() -> dict[str, str]:
-    from lu_machinery.orchestration.fleet_repos import load_fleet_repos
-
-    try:
-        repos = load_fleet_repos()
-    except Exception:
-        return {}
-    return {
-        slug.lower(): key
-        for key, repo in repos.items()
-        for slug in repo.slugs
-        if slug.isascii()
-    }
-
-
-def _open_regular_in_dir(dir_fd: int, filename: str) -> tuple[int, os.stat_result] | None:
+def _open_regular_in_dir(dir_fd: int, filename: str) -> int | None:
     try:
         fd = os.open(filename, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=dir_fd)
     except OSError:
@@ -127,7 +94,7 @@ def _open_regular_in_dir(dir_fd: int, filename: str) -> tuple[int, os.stat_resul
     if not stat.S_ISREG(file_stat.st_mode):
         os.close(fd)
         return None
-    return fd, file_stat
+    return fd
 
 
 def read_recent_review_counts(
@@ -140,12 +107,11 @@ def read_recent_review_counts(
 
     Reads ``<batch_state>/model-stats/publications.jsonl`` (the published-verdict
     ledger written by ``record_cf_verdict``) joined with ``rows.jsonl`` over the
-    trailing ``window_days`` ``[now - window_days, now]`` using canonical
-    publication target matching (repository, head SHA, and PR when named on the
-    latest validated row). Missing or unsafe state paths fail closed to ``{}``.
+    trailing ``window_days`` ``[now - window_days, now]`` using the canonical
+    ``model_stats_rows`` validators and target-identity rules (repository, head
+    SHA, and PR when named on the latest valid row). Missing or unsafe state
+    paths fail closed to ``{}``.
     """
-    global _RECENT_REVIEW_CACHE
-
     if isinstance(window_days, bool) or not isinstance(window_days, int) or window_days < 1:
         raise ValueError("window_days must be a positive integer")
     if batch_state_dir is None:
@@ -156,190 +122,114 @@ def read_recent_review_counts(
             batch_state_dir = tasks_dir().parent
         except (MachineryConfigError, OSError):
             return {}
-    stats_dir = batch_state_dir / "model-stats"
+
+    from lu_machinery.api import model_stats_rows
+
+    stats_dir = batch_state_dir / model_stats_rows.ROWS_DIR
     try:
         dir_fd = os.open(stats_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
     except OSError:
         return {}
 
     try:
-        try:
-            dir_stat = os.fstat(dir_fd)
-            pubs_lstat = os.stat("publications.jsonl", dir_fd=dir_fd, follow_symlinks=False)
-            rows_lstat = os.stat("rows.jsonl", dir_fd=dir_fd, follow_symlinks=False)
-        except OSError:
-            return {}
-        if not (stat.S_ISREG(pubs_lstat.st_mode) and stat.S_ISREG(rows_lstat.st_mode)):
-            return {}
-
-        repo_keys = _recent_review_repo_keys()
+        repo_keys = model_stats_rows.repository_keys(model_stats_rows.fleet_catalog())
         if not repo_keys:
             return {}
-        repo_keys_tuple = tuple(sorted(repo_keys.items()))
         reference_now = (
             (now.astimezone(UTC) if now.tzinfo else now.replace(tzinfo=UTC))
             if now is not None
             else datetime.now(UTC)
         )
         cutoff = reference_now - timedelta(days=window_days)
-        probe_key: _RecentReviewCacheKey = (
-            str(stats_dir),
-            dir_stat.st_dev,
-            dir_stat.st_ino,
-            pubs_lstat.st_dev,
-            pubs_lstat.st_ino,
-            pubs_lstat.st_mtime_ns,
-            pubs_lstat.st_size,
-            rows_lstat.st_dev,
-            rows_lstat.st_ino,
-            rows_lstat.st_mtime_ns,
-            rows_lstat.st_size,
-            window_days,
-            repo_keys_tuple,
-        )
-        if now is None and _RECENT_REVIEW_CACHE is not None:
-            cached_key, valid_until, cached_counts = _RECENT_REVIEW_CACHE
-            if cached_key == probe_key and (valid_until is None or reference_now < valid_until):
-                return dict(cached_counts)
 
-        opened_pubs = _open_regular_in_dir(dir_fd, "publications.jsonl")
-        if opened_pubs is None:
+        pubs_fd = _open_regular_in_dir(dir_fd, model_stats_rows.PUBLICATIONS_FILE)
+        if pubs_fd is None:
             return {}
-        pubs_fd, pubs_stat = opened_pubs
         pubs_by_task: dict[str, list[tuple[datetime, int, str, int, str]]] = {}
-        next_boundary: datetime | None = None
         try:
             with os.fdopen(pubs_fd, "rb") as stream:
                 for line_index, line in enumerate(stream):
                     try:
-                        entry = json_depth.loads(line, max_depth=_RECENT_REVIEW_JSON_MAX_DEPTH)
+                        entry = json_depth.loads(line, max_depth=model_stats_rows._JSON_MAX_DEPTH)
                     except (ValueError, RecursionError):
                         continue
-                    if not isinstance(entry, dict) or entry.get("schema") != "review-publication.v1":
+                    if not model_stats_rows._publication_ok(entry):
                         continue
-                    verdict = entry.get("verdict")
-                    tid = entry.get("task_id")
-                    repo = entry.get("repository")
-                    pr = entry.get("pr")
-                    head = entry.get("head")
-                    if (
-                        not isinstance(verdict, str)
-                        or verdict not in _PUBLISHED_VERDICTS
-                        or not isinstance(tid, str)
-                        or not tid.strip()
-                        or not isinstance(repo, str)
-                        or not repo.isascii()
-                        or _PUBLICATION_REPO_RE.fullmatch(repo) is None
-                        or type(pr) is not int
-                        or pr <= 0
-                        or not isinstance(head, str)
-                        or _PUBLICATION_SHA_RE.fullmatch(head) is None
-                    ):
+                    published_at = model_stats_rows.timestamp(entry["published_at"])
+                    # Filter to the trailing window before target matching so a newer
+                    # future-dated publication can never hide an in-window publication.
+                    if published_at is None or not (cutoff <= published_at <= reference_now):
                         continue
-                    published_at = _parse_utc_timestamp(entry.get("published_at"))
-                    if published_at is None:
-                        continue
-                    pubs_by_task.setdefault(tid, []).append((published_at, line_index, repo.lower(), pr, head))
-                    if cutoff <= published_at <= reference_now:
-                        boundary = published_at + timedelta(days=window_days)
-                        if next_boundary is None or boundary < next_boundary:
-                            next_boundary = boundary
-                    elif published_at > reference_now and (
-                        next_boundary is None or published_at < next_boundary
-                    ):
-                        next_boundary = published_at
+                    pubs_by_task.setdefault(entry["task_id"], []).append(
+                        (published_at, line_index, entry["repository"].lower(), entry["pr"], entry["head"])
+                    )
         except OSError:
             return {}
 
-        opened_rows = _open_regular_in_dir(dir_fd, "rows.jsonl")
-        if opened_rows is None:
+        rows_fd = _open_regular_in_dir(dir_fd, model_stats_rows.ROWS_FILE)
+        if rows_fd is None:
             return {}
-        rows_fd, rows_stat = opened_rows
-        actual_key: _RecentReviewCacheKey = (
-            str(stats_dir),
-            dir_stat.st_dev,
-            dir_stat.st_ino,
-            pubs_stat.st_dev,
-            pubs_stat.st_ino,
-            pubs_stat.st_mtime_ns,
-            pubs_stat.st_size,
-            rows_stat.st_dev,
-            rows_stat.st_ino,
-            rows_stat.st_mtime_ns,
-            rows_stat.st_size,
-            window_days,
-            repo_keys_tuple,
-        )
         if not pubs_by_task:
             os.close(rows_fd)
-            if now is None:
-                _RECENT_REVIEW_CACHE = (actual_key, None, {})
             return {}
 
-        latest_rows: dict[str, tuple[str, str, str, str, int | None, str | None]] = {}
+        latest_rows: dict[str, dict[str, object]] = {}
         try:
             with os.fdopen(rows_fd, "rb") as stream:
                 for line in stream:
                     try:
-                        row = json_depth.loads(line, max_depth=_RECENT_REVIEW_JSON_MAX_DEPTH)
+                        row = json_depth.loads(line, max_depth=model_stats_rows._JSON_MAX_DEPTH)
                     except (ValueError, RecursionError):
                         continue
-                    if not isinstance(row, dict) or row.get("schema") != "model-stats-row.v1":
+                    if not isinstance(row, dict) or row.get("schema") != model_stats_rows.ROW_SCHEMA:
                         continue
                     tid = row.get("task_id")
-                    if not isinstance(tid, str) or tid not in pubs_by_task:
-                        continue
-                    role = row.get("role")
-                    row_class = row.get("class")
-                    raw_model = row.get("model")
-                    row_repo = row.get("repo")
-                    row_pr = row.get("pr")
-                    pinned_head = row.get("pinned_head")
                     if (
-                        not isinstance(role, str)
-                        or not isinstance(row_class, str)
-                        or not isinstance(raw_model, str)
-                        or (row_repo is not None and not isinstance(row_repo, str))
-                        or (row_pr is not None and (type(row_pr) is not int or row_pr < 0))
-                        or (
-                            pinned_head is not None
-                            and (not isinstance(pinned_head, str) or _PUBLICATION_SHA_RE.fullmatch(pinned_head) is None)
-                        )
+                        not isinstance(tid, str)
+                        or tid not in pubs_by_task
+                        or not model_stats_rows.valid_task_id(tid)
+                        or not model_stats_rows._well_formed(row)
                     ):
                         continue
-                    # Apply last-row-wins across all validated rows before filtering
-                    # by role or review class so a superseding row drops stale review credit.
-                    latest_rows[tid] = (role, row_class, raw_model, row_repo or "public", row_pr, pinned_head)
+                    # Apply last-row-wins across validated rows before filtering by
+                    # role or review class so a superseding valid row drops stale credit.
+                    latest_rows[tid] = model_stats_rows._sanitised(row)
         except OSError:
             return {}
     finally:
         os.close(dir_fd)
 
     counts_counter: Counter[str] = Counter()
-    for tid, (role, row_class, raw_model, row_repo, row_pr, pinned_head) in latest_rows.items():
-        if role != "review" or row_class not in _CODE_INFRA_REVIEW_CLASSES or pinned_head is None:
+    for tid, row in latest_rows.items():
+        if row.get("role") != "review":
             continue
+        row_class = row.get("class")
+        if not isinstance(row_class, str) or row_class not in _CODE_INFRA_REVIEW_CLASSES:
+            continue
+        pinned_head = row.get("pinned_head")
+        if not isinstance(pinned_head, str):
+            continue
+        row_repo = row.get("repo") or "public"
+        row_pr = row.get("pr")
         entries = sorted(pubs_by_task[tid], key=lambda item: (item[0], item[1]), reverse=True)
-        matched_at = next(
+        matched = next(
             (
-                pub_at
-                for pub_at, _idx, pub_repo, pub_pr, pub_head in entries
-                if pub_head == pinned_head
-                and repo_keys.get(pub_repo) == row_repo
-                and (row_pr is None or row_pr == pub_pr)
+                entry
+                for entry in entries
+                if entry[4] == pinned_head
+                and repo_keys.get(entry[2]) == row_repo
+                and row_pr in (None, entry[3])
             ),
             None,
         )
-        if matched_at is None or not (cutoff <= matched_at <= reference_now):
+        if matched is None:
             continue
-        if raw_model.strip():
+        raw_model = row.get("model")
+        if isinstance(raw_model, str) and raw_model.strip():
             canonical = resolve_catalog_model_id(raw_model, _MODEL_CATALOG) or raw_model.strip()
             counts_counter[canonical] += 1
 
-    counts = dict(counts_counter)
-    if now is None:
-        _RECENT_REVIEW_CACHE = (actual_key, next_boundary, counts)
-    return dict(counts)
+    return dict(counts_counter)
 
 
 def _normalize_recent_review_counts(counts: Mapping[str, int]) -> dict[str, int]:
