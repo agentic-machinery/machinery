@@ -220,11 +220,12 @@ _TASK_TERMINAL_STATUSES = frozenset({
 _LOG = logging.getLogger(__name__)
 
 
-def _roster_sources() -> tuple[Path | None, Path | None, Path | None, Path]:
+def _roster_sources() -> tuple[Path | None, Path | None, Path | None, Path | None]:
     """The assignments and driver-lane files the roster reads, the profile file that names them, and the schema.
 
     The schema is the one the strict assignments read validates against.
-    ``None`` for a source whose setting is unusable, and for the profile when none is configured.
+    ``None`` for a source whose setting is unusable, for the profile when none is configured, and for
+    a schema that cannot be resolved (the strict read then fails too, so the roster is incomplete).
     Each source path comes from its own profile read, so a caller compares the sources taken before
     and after its reads (and the profile's identity) to know they belong to one profile version.
     """
@@ -232,8 +233,14 @@ def _roster_sources() -> tuple[Path | None, Path | None, Path | None, Path]:
     from lu_machinery.common import profile, repo_root
     from lu_machinery.common.repo_root import MachineryConfigError
     from lu_machinery.ops import driver_lanes
-    from lu_machinery.orchestration.validate_fleet_taxonomy import ASSIGNMENTS_SCHEMA_PATH
 
+    schema: Path | None
+    try:
+        from lu_machinery.orchestration.validate_fleet_taxonomy import ASSIGNMENTS_SCHEMA_PATH
+
+        schema = Path(ASSIGNMENTS_SCHEMA_PATH)
+    except Exception:
+        schema = None
     profile_file: Path | None
     try:
         profile_file = profile._configured_profile_path(None) or repo_root.state_root() / profile.PROFILE_REL
@@ -248,7 +255,7 @@ def _roster_sources() -> tuple[Path | None, Path | None, Path | None, Path]:
         lane_data: Path | None = Path(driver_lanes.default_data_path())
     except MachineryConfigError:
         lane_data = None
-    return assignments, lane_data, profile_file, Path(ASSIGNMENTS_SCHEMA_PATH)
+    return assignments, lane_data, profile_file, schema
 
 
 def _roster_identity(sources: tuple[Path | None, ...]) -> tuple[object, ...]:

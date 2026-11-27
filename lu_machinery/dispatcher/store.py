@@ -511,6 +511,8 @@ def read(task_id: str, nonce: str | None = None, *, missing_ok=False, tasks_root
         text = path.read_text()
     except OSError as exc:  # access denied, or moved since the lookup: its content was never seen
         raise TaskRecordError("TASK_RECORD_UNREADABLE") from exc
+    except UnicodeDecodeError as exc:  # read, but not text
+        raise TaskRecordError("TASK_RECORD_DAMAGED") from exc
     try:
         record = json_depth.loads(text, max_depth=_JSON_MAX_DEPTH)
         if not isinstance(record, dict):
