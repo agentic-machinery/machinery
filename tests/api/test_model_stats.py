@@ -2114,8 +2114,8 @@ def test_finding_outcome_labels_count_per_reviewer_and_a_contest_holds_the_label
                      pinned_head="e" * 40, **blocked, **{**sol, "review_author_model": None})
     rows.backfill(tasks, batch_state)
     # Sol's PR 3 review id is dispatched again after its first run was labelled, and blocks at a later head: the rows
-    # keep only its newest run, and the invented label (recorded before that run started) labels the earlier run, so
-    # the newest run's finding counts unlabelled.
+    # keep only its newest run, and the task id now names two runs, so neither its invented label nor its findings
+    # count for either run.
     ledger = batch_state / rows.ROWS_DIR / rows.ROWS_FILE
     [s3] = [line for line in map(json.loads, ledger.read_text().splitlines()) if line["task_id"] == "s3-review"]
     with ledger.open("a") as stream:
@@ -2149,7 +2149,7 @@ def test_finding_outcome_labels_count_per_reviewer_and_a_contest_holds_the_label
                                                       "contested": 1, "unlabelled": 2}
         # The contested invented label is held out: fixed over fixed, wrong and invented is 1 of 2.
         assert found["claude-opus-5-5"]["real_precision"] == stats._rate(1, 2)
-        assert found["gpt-6.1-sol"]["labels"] == {**zero, "wrong": 1, "unlabelled": 2}
+        assert found["gpt-6.1-sol"]["labels"] == {**zero, "wrong": 1, "unlabelled": 1}
         assert found["gpt-6.1-sol"]["real_precision"] == stats._rate(0, 1)
 
 
@@ -2218,9 +2218,9 @@ def test_reviewer_miss_proxy_charges_each_approving_reviewer_of_a_reworked_merge
     # PR 2: Opus approved; nothing names it. PR 3: an Opus approval never published, then reworked: no observation.
     _findings_review(tasks, "m2-review", "correct", [], pr=2, pinned_head="c" * 40, **reviews)
     _findings_review(tasks, "m3-review", "correct", [], pr=3, pinned_head="d" * 40, **reviews)
-    # PR 4: an Opus approval published 19.5 days ago; the task id is then dispatched again for Sol at the same head,
-    # unpublished. The rows keep only the newest (Sol) run, which joins the earlier approval: no observation, though
-    # a fix names PR 4.
+    # PR 4: Opus's approval of the same head is posted only after the task id was dispatched again for Sol, unpublished.
+    # The rows keep only the newest (Sol) run, which joins the earlier approval, and the comment time cannot tell the
+    # runs apart: the task id names two runs, so no observation, though a fix names PR 4.
     _findings_review(tasks, "m4-review", "correct", [], pr=4, pinned_head="e" * 40, **reviews)
     rows.backfill(tasks, batch_state)
     ledger = batch_state / rows.ROWS_DIR / rows.ROWS_FILE
@@ -2230,7 +2230,7 @@ def test_reviewer_miss_proxy_charges_each_approving_reviewer_of_a_reworked_merge
                                  "finished_at": (NOW - 18.9 * day).isoformat()}) + "\n")
     _publish(batch_state, ("m1a-review", 1, "a" * 40, "CHANGES_REQUESTED"), ("m1b-review", 1, "b" * 40, "APPROVED"),
              ("m1c-review", 1, "b" * 40, "APPROVED"), ("m2-review", 2, "c" * 40, "APPROVED"))
-    _publish(batch_state, ("m4-review", 4, "e" * 40, "APPROVED"), published_at=(NOW - 19.5 * day).isoformat())
+    _publish(batch_state, ("m4-review", 4, "e" * 40, "APPROVED"), published_at=(NOW - 18.95 * day).isoformat())
     landing = stats.Landing()
     # Mainline order, newest first, as the landing scan stores it.
     landing.prs["machinery", "7"] = stats._MergedPR("7" * 40, NOW - 13 * day, set(), {"4"}, set())

@@ -1332,7 +1332,18 @@ def test_record_stores_a_contest_only_against_the_previous_blocking_round(monkey
         "outcome_contests"] == "stored against review-five: F1"
     # Round 7 contests round 6, which has two blocking seats: F1 names a finding of each, so nothing is stored.
     assert publish("review-seven", _blocking_reply(["P1"], "CONTEST F1: still open"), "7" * 40)[
-        "outcome_contests"] == f"not stored: unresolved: 2 blocking reviews of the previous round at {'6' * 12}"
+        "outcome_contests"] == f"not stored: unresolved: the previous round at {'6' * 12} has 2 blocking review(s) of another task"
+    # Round 8 approves; round 9 contests F1: the previous round holds no blocking review, so the contest never falls
+    # back past it to round 7.
+    assert publish("review-eight", _blocking_reply([]), "8" * 40)["verdict"] == "APPROVED"
+    assert publish("review-nine", _blocking_reply(["P1"], "CONTEST F1: still open"), "9" * 40)[
+        "outcome_contests"] == f"not stored: unresolved: the previous round at {'8' * 12} has 0 blocking review(s) of another task"
+    # Round 9's task id is dispatched again for round 10 and contests round 9's F1: that is its own task, so it is
+    # unresolved, never an older round.
+    assert publish("review-nine", _blocking_reply(["P1"], "CONTEST F1: still open"), "a" * 40,
+                   started_at="2026-09-23T15:00:00.000001+00:00")["outcome_contests"] == (
+        f"not stored: unresolved: the previous round at {'9' * 12} has 0 blocking review(s) of another task; this task "
+        "id blocked it too")
     assert [(line["task_id"], line["finding_id"], line["contested_by"]) for line in _outcomes(tmp_path)][2:] == [
         ("review-five", "F1", "review-six-b")]
 
