@@ -8,6 +8,8 @@ import sqlite3
 import stat
 import subprocess
 import sys
+import time
+import xml.etree.ElementTree as ET
 from collections.abc import Iterator
 from pathlib import Path
 from types import SimpleNamespace
@@ -1251,6 +1253,28 @@ def test_discarded_non_ascii_file_is_counted_with_its_real_byte_size(tmp_path):
     assert data_tier.discard_run_output(tmp_path) == {"files": 4, "bytes": 4210}
     assert not (tmp_path / "привіт.txt").exists()
     assert not (tmp_path / "data").exists()
+
+
+def test_xml_text_escapes_only_xml10_forbidden_codepoints_in_bounded_time() -> None:
+    """Defect class: overly-large/overlapping regex character range in XML 1.0 sanitizer (machinery-infra#1580)."""
+    allowed = "\t\n\r \ud7ff\ue000\ufffd\U00010000\U0001f600\U0010ffff"
+    assert data_tier._xml_text(allowed) == allowed
+
+    forbidden = "\x00\x08\x0b\x0c\x0e\x1f\ud800\udfff\ufffe\uffff"
+    escaped = data_tier._xml_text(forbidden)
+    assert escaped == (
+        "\\u0000\\u0008\\u000b\\u000c\\u000e\\u001f\\ud800\\udfff\\ufffe\\uffff"
+    )
+    element = ET.Element("testcase", name=escaped)
+    assert ET.fromstring(ET.tostring(element, encoding="utf-8")).attrib["name"] == escaped
+
+    large = "a\x00" * 50_000
+    started = time.perf_counter()
+    sanitized = data_tier._xml_text(large)
+    elapsed = time.perf_counter() - started
+    assert elapsed < 0.5, f"_xml_text took {elapsed:.3f}s on {len(large)}-char input"
+    assert "\x00" not in sanitized
+    assert sanitized.count("\\u0000") == 50_000
 
 
 

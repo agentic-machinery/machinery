@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import time
+
 import pytest
 
 from lu_machinery.api.opsec_scan import scan_response, scan_text
@@ -322,3 +324,51 @@ def test_path_detection_respects_parsed_parts(text: str, token: str | None) -> N
 def test_hash_route_exemption_does_not_hide_filesystem_paths(text: str) -> None:
     findings = scan_text(text, operation="GET /api/opsec", field_path="body.value")
     assert [finding.kind for finding in findings] == ["filesystem-root"], text
+
+
+@pytest.mark.parametrize(
+    ("text", "expected_spans"),
+    [
+        pytest.param(
+            "https://" + "!" * 100_000 + "[bad]/home/fixture",
+            [(100_013, 100_026, "/home/fixture")],
+            id="alert-59-authority",
+        ),
+        pytest.param(
+            "./home" + "." * 100_000 + "/x",
+            [(1, 100_008, "/home" + "." * 100_000 + "/x")],
+            id="alert-60-relative-name-flagged",
+        ),
+        pytest.param(
+            "./home" + "." * 100_000 + "md",
+            [],
+            id="alert-60-relative-name-continued",
+        ),
+        pytest.param("!" * 100_000 + "a", [], id="alert-61-scheme-bang"),
+        pytest.param("A" * 100_000, [], id="alert-61-scheme-alpha"),
+        pytest.param("-" * 50_000 + "@a" + "-" * 50_000, [], id="alert-62-user-at-host"),
+        pytest.param("." * 100_000, [], id="alert-63-ip-candidate"),
+        pytest.param("A" + "A-" * 50_000 + ":80", [], id="alert-64-host-port"),
+        pytest.param(
+            "0" * 100_000 + ".jsonl",
+            [(0, 100_006, "0" * 100_000 + ".jsonl")],
+            id="alert-65-transcript-filename",
+        ),
+        pytest.param(
+            "\u017f" + "0" * 100_000 + "\u0131.jsonl",
+            [(0, 100_008, "\u017f" + "0" * 100_000 + "\u0131.jsonl")],
+            id="alert-65-transcript-unicode-ignorecase-match",
+        ),
+        pytest.param("0" * 100_000 + ".jsonl\u212a", [], id="alert-65-transcript-unicode-right-boundary"),
+        pytest.param("0" * 100_000 + ".jsonl.gz\u0130", [], id="alert-65-transcript-gz-unicode-right-boundary"),
+    ],
+)
+def test_polynomial_redos_patterns_complete_in_bounded_time(
+    text: str, expected_spans: list[tuple[int, int, str]]
+) -> None:
+    """Defect class: polynomial-ReDoS regex backtracking on 100,000-char inputs (machinery-infra#1580)."""
+    started = time.perf_counter()
+    findings = scan_text(text, operation="GET /api/opsec", field_path="body.value")
+    elapsed = time.perf_counter() - started
+    assert elapsed < 0.5, f"scan_text took {elapsed:.3f}s on {len(text)}-char input"
+    assert [(finding.start, finding.end, finding.token) for finding in findings] == expected_spans

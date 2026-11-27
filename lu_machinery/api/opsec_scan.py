@@ -63,7 +63,9 @@ _ISO_DURATION_RE = re.compile(
 # decided by ipaddress.ip_address below; the regex must not become a second,
 # subtly different IP parser.  Bracketed addresses keep an optional port as a
 # single candidate.  Unbracketed IPv4:port is handled by the same parser.
-_IP_CANDIDATE_RE = re.compile(r"(?<![A-Za-z0-9])(?:\[[0-9A-Fa-f:.%]+\](?::[0-9]{1,5})?|[0-9A-Fa-f:.]+)(?![A-Za-z0-9])")
+# Single-class token patterns avoid backtracking on long separator runs.
+_IP_START_RE = re.compile(r"\[|[0-9A-Fa-f:.]+")
+_IP_BRACKET_BODY_RE = re.compile(r"[0-9A-Fa-f:.%]+")
 # A path finding ends where its whitespace-, quote- or angle-bracket-delimited
 # run ends, less trailing prose punctuation and backticks.  Text cannot tell a
 # "," ";" "&" or ")" inside a path component from a separator, so the span
@@ -80,12 +82,11 @@ _JOINED_PATH_SEPARATOR = r"[!,;()](?=(?:\.|%2[eE]){0,2}(?:/|%2[fF])|(?i:file):)"
 _PART_END_RE = re.compile(rf"{_VALUE_SEPARATOR}|{_JOINED_PATH_SEPARATOR}|(?<![A-Za-z0-9])(?=(?i:file):)")
 _AUTHORITY_END_RE = re.compile(rf"[/`]|{_VALUE_SEPARATOR}|{_JOINED_PATH_SEPARATOR}")
 _FILE_AUTHORITY_END_RE = re.compile(r"[/#?`]|[,;](?=(?i:file):)")
-_SCHEME_RE = re.compile(r"[.!+\[:]*(?P<name>[A-Za-z][A-Za-z0-9+.-]*):")
-_AUTHORITY_RE = re.compile(
-    r"(?:[A-Za-z0-9._~!$%&'()*+,;=:-]*@)?"
-    r"(?:\[(?P<literal>[^\[\]]+)\]|[A-Za-z0-9._~!$%&'()*+,;=-]+)"
-    r"(?::[0-9]*)?"
-)
+_SCHEME_PREFIX_CHARS = frozenset(".!+[:")
+_SCHEME_NAME_CHARS = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+.-")
+_USERINFO_RE = re.compile(r"[A-Za-z0-9._~!$%&'()*+,;=:-]*")
+_REG_NAME_RE = re.compile(r"[A-Za-z0-9._~!$%&'()*+,;=-]+")
+_ASCII_DIGITS_RE = re.compile(r"[0-9]*")
 _IPVFUTURE_RE = re.compile(
     r"v[0-9A-Fa-f]+\.[A-Za-z0-9._~!$&'()*+,;=:-]+", re.IGNORECASE
 )
@@ -97,27 +98,23 @@ _ROOT_PREFIX_RE = re.compile(
     "|".join(re.escape(root) for root in BOUNDED_FILESYSTEM_ROOTS)
 )
 _BARE_NAME_RE = re.compile(r"[A-Za-z0-9_-]")
-_RELATIVE_NAME_RE = re.compile(r"[\w~%+@$-]|\.+[\w~%+@$-]")
+_RELATIVE_NAME_CHAR_RE = re.compile(r"[\w~%+@$-]")
 
-_USER_AT_HOST_RE = re.compile(
-    r"(?<![A-Za-z0-9_.-])"
-    r"(?P<token>[A-Za-z0-9_.-]+@[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?(?::[0-9]{1,5})?)"
-    r"(?![A-Za-z0-9_.-])"
-)
+_ASCII_ALPHA = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz")
+_ASCII_DIGITS = frozenset("0123456789")
+_ASCII_ALNUM = _ASCII_ALPHA | _ASCII_DIGITS
+_UNICODE_ASCII_IGNORECASE_EXTRA = frozenset("\u0130\u0131\u017f\u212a")
+_HOST_CHARS = _ASCII_ALNUM | frozenset(".-")
+_USER_HOST_BOUNDARY_CHARS = _HOST_CHARS | frozenset("_")
+_TRANSCRIPT_INITIAL_CHARS = _ASCII_ALNUM | _UNICODE_ASCII_IGNORECASE_EXTRA
+_TRANSCRIPT_BODY_CHARS = _USER_HOST_BOUNDARY_CHARS | _UNICODE_ASCII_IGNORECASE_EXTRA
+_HOST_PORT_LEFT_BLOCK = _USER_HOST_BOUNDARY_CHARS | frozenset("@")
+_HOST_PORT_RIGHT_BLOCK = _ASCII_ALNUM | frozenset("_.%")
 _SSH_ALIAS_RE = re.compile(
     r"(?i)(?<![A-Za-z0-9_.@-])ssh[ \t]+"
     r"(?P<alias>[A-Za-z0-9][A-Za-z0-9._-]*)(?![A-Za-z0-9_.:@-])"
 )
-_HOST_PORT_RE = re.compile(
-    r"(?<![A-Za-z0-9_.@-])"
-    r"(?P<host>[A-Za-z](?:[A-Za-z0-9.-]*[A-Za-z0-9])?):(?P<port>[0-9]{1,5})"
-    r"(?![0-9A-Za-z_.%])"
-)
-_TRANSCRIPT_FILENAME_RE = re.compile(
-    r"(?i)(?<![A-Za-z0-9_.-])"
-    r"(?P<filename>[A-Za-z0-9][A-Za-z0-9_.-]*\.jsonl(?:\.gz)?)"
-    r"(?![A-Za-z0-9_.-])"
-)
+_JSONL_SUFFIX_RE = re.compile(r"\.jsonl(?:\.gz)?", re.IGNORECASE)
 
 _SAFE_FIELD_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_-]*$")
 _SSH_PROSE_WORDS = frozenset(
@@ -405,17 +402,66 @@ def _trim_end(text: str, start: int, end: int) -> int:
 
 def _valid_authority(text: str, start: int, end: int) -> bool:
     """Accept only RFC 3986 authority syntax before treating a URI as remote."""
-    match = _AUTHORITY_RE.fullmatch(text, start, end)
-    if match is None or _BAD_ESCAPE_RE.search(text, start, end):
+    if _BAD_ESCAPE_RE.search(text, start, end):
         return False
-    literal = match.group("literal")
-    if literal is None or _IPVFUTURE_RE.fullmatch(literal):
+    at = text.find("@", start, end)
+    if at >= 0:
+        if _USERINFO_RE.fullmatch(text, start, at) is None:
+            return False
+        host_start = at + 1
+    else:
+        host_start = start
+    if host_start >= end:
+        return False
+    if text[host_start] == "[":
+        closing = text.find("]", host_start + 1, end)
+        if closing <= host_start + 1 or text.find("[", host_start + 1, closing) >= 0:
+            return False
+        if closing + 1 < end and (
+            text[closing + 1] != ":"
+            or _ASCII_DIGITS_RE.fullmatch(text, closing + 2, end) is None
+        ):
+            return False
+        literal = text[host_start + 1 : closing]
+        if _IPVFUTURE_RE.fullmatch(literal):
+            return True
+        try:
+            ipaddress.IPv6Address(literal)
+        except ValueError:
+            return False
         return True
-    try:
-        ipaddress.IPv6Address(literal)
-    except ValueError:
-        return False
-    return True
+    colon = text.find(":", host_start, end)
+    if colon >= 0:
+        if _ASCII_DIGITS_RE.fullmatch(text, colon + 1, end) is None:
+            return False
+        host_end = colon
+    else:
+        host_end = end
+    return host_end > host_start and _REG_NAME_RE.fullmatch(text, host_start, host_end) is not None
+
+
+def _continues_relative_name(text: str, start: int, end: int) -> bool:
+    """Whether ``text[start:end]`` continues a segment name (optionally after dots)."""
+    pos = start
+    while pos < end and text[pos] == ".":
+        pos += 1
+    return pos < end and _RELATIVE_NAME_CHAR_RE.match(text, pos, end) is not None
+
+
+def _match_scheme(text: str, start: int, end: int) -> tuple[int, int, str] | None:
+    """Match an RFC 3986 scheme at ``start`` (after optional delimiter prefix) in O(n)."""
+    pos = start
+    while pos < end and text[pos] in _SCHEME_PREFIX_CHARS:
+        pos += 1
+    if pos >= end or text[pos] not in _ASCII_ALPHA:
+        return None
+    name_start = pos
+    pos += 1
+    while pos < end and text[pos] in _SCHEME_NAME_CHARS:
+        pos += 1
+    if pos < end and text[pos] == ":":
+        return name_start, pos + 1, text[name_start:pos]
+    return None
 
 
 def _markup_parts(text: str, start: int, end: int) -> Iterable[tuple[int, int]]:
@@ -462,7 +508,7 @@ def _path_root(
         after_dot = dot is not None and position >= dot.end()
         if route and not after_dot:
             continue
-        if (dot_relative or after_dot or check_segments) and not _RELATIVE_NAME_RE.match(
+        if (dot_relative or after_dot or check_segments) and not _continues_relative_name(
             text, root.end(), end
         ):
             return position
@@ -500,9 +546,9 @@ def _path_root_in_part(
     """
     api_reference = _API_SEGMENT_RE.match(text, start, end) is not None
     while start < end:
-        scheme = _SCHEME_RE.match(text, start, end)
-        path_start = scheme.end() if scheme is not None else start
-        file_uri = scheme is not None and scheme.group("name").lower() == "file"
+        scheme = _match_scheme(text, start, end)
+        path_start = scheme[1] if scheme is not None else start
+        file_uri = scheme is not None and scheme[2].lower() == "file"
         remote = False
         nested_file = None
         has_authority = scheme is not None and text.startswith("//", path_start, end)
@@ -579,14 +625,14 @@ def _path_root_in_part(
                 if decoded_root is not None and (
                     root is None or decoded_root < len(unquote(text[path_start:root]))
                 ):
-                    return scheme.start("name") if file_uri and scheme is not None else path_start
+                    return scheme[0] if file_uri and scheme is not None else path_start
         if root is not None:
             if (
                 file_uri
                 and scheme is not None
                 and text.count("/", path_start, root) == root - path_start
             ):
-                return scheme.start("name")
+                return scheme[0]
             return root
         if nested_file is not None:
             start = nested_file
@@ -614,14 +660,142 @@ def _filesystem_candidates(text: str) -> Iterable[_Candidate]:
                 break
 
 
-def _is_css_numeric_property(text: str, match: re.Match[str]) -> bool:
+def _is_css_numeric_property(text: str, host: str, start: int) -> bool:
     """Avoid treating CSS declarations as hostname/port values."""
-    if match.group("host").lower() not in _CSS_NUMERIC_PROPERTIES:
+    if host.lower() not in _CSS_NUMERIC_PROPERTIES:
         return False
-    prefix = text[max(0, match.start() - 256) : match.start()]
+    prefix = text[max(0, start - 256) : start]
     if prefix.rfind("{") > prefix.rfind("}"):
         return True
     return re.search(r"\bstyle\s*=", prefix, re.IGNORECASE) is not None
+
+
+def _iter_user_at_host(text: str) -> Iterable[tuple[int, int, str]]:
+    """Yield ``(start, end, token)`` for ``user@host[:port]`` matches in linear time."""
+    n = len(text)
+    cursor = 0
+    search_from = 0
+    while (at := text.find("@", search_from)) >= 0:
+        u_start = at
+        while u_start > cursor and text[u_start - 1] in _USER_HOST_BOUNDARY_CHARS:
+            u_start -= 1
+        if u_start == at or (u_start > 0 and text[u_start - 1] in _USER_HOST_BOUNDARY_CHARS):
+            search_from = at + 1
+            continue
+        h_start = at + 1
+        h_end = h_start
+        while h_end < n and text[h_end] in _HOST_CHARS:
+            h_end += 1
+        if (
+            h_end == h_start
+            or text[h_start] not in _ASCII_ALNUM
+            or text[h_end - 1] not in _ASCII_ALNUM
+            or (h_end < n and text[h_end] in _USER_HOST_BOUNDARY_CHARS)
+        ):
+            search_from = at + 1
+            continue
+        match_end = h_end
+        if h_end < n and text[h_end] == ":":
+            p_end = h_end + 1
+            while p_end < n and p_end - (h_end + 1) <= 5 and text[p_end] in _ASCII_DIGITS:
+                p_end += 1
+            port_len = p_end - (h_end + 1)
+            if 1 <= port_len <= 5 and not (p_end < n and text[p_end] in _USER_HOST_BOUNDARY_CHARS):
+                match_end = p_end
+        yield u_start, match_end, text[u_start:match_end]
+        cursor = match_end
+        search_from = match_end
+
+
+def _iter_ip_candidates(text: str) -> Iterable[tuple[int, int, str]]:
+    """Yield ``(start, end, raw)`` IP/bracketed-IPv6 candidates in linear time."""
+    n = len(text)
+    pos = 0
+    while (match := _IP_START_RE.search(text, pos)) is not None:
+        start = match.start()
+        end = match.end()
+        if text[start] == "[":
+            if start == 0 or text[start - 1] not in _ASCII_ALNUM:
+                body = _IP_BRACKET_BODY_RE.match(text, start + 1)
+                if body is not None and body.end() < n and text[body.end()] == "]":
+                    cand_end = body.end() + 1
+                    if cand_end < n and text[cand_end] == ":":
+                        p_end = cand_end + 1
+                        while p_end < n and p_end - (cand_end + 1) <= 5 and text[p_end] in _ASCII_DIGITS:
+                            p_end += 1
+                        port_len = p_end - (cand_end + 1)
+                        if 1 <= port_len <= 5 and (p_end == n or text[p_end] not in _ASCII_ALNUM):
+                            cand_end = p_end
+                    if cand_end == n or text[cand_end] not in _ASCII_ALNUM:
+                        yield start, cand_end, text[start:cand_end]
+                        pos = cand_end
+                        continue
+            pos = start + 1
+            continue
+        if start > 0 and text[start - 1] in _ASCII_ALNUM:
+            first_dot = text.find(".", start, end)
+            first_colon = text.find(":", start, end)
+            if first_dot < 0 and first_colon < 0:
+                pos = end
+                continue
+            sep = first_dot if first_colon < 0 else (first_colon if first_dot < 0 else min(first_dot, first_colon))
+            start = sep + 1
+            if start >= end:
+                pos = end
+                continue
+        cand_end = end
+        if end < n and text[end] in _ASCII_ALNUM:
+            last_dot = text.rfind(".", start, end)
+            last_colon = text.rfind(":", start, end)
+            cand_end = max(last_dot, last_colon)
+            if cand_end <= start:
+                pos = end
+                continue
+        yield start, cand_end, text[start:cand_end]
+        pos = end
+
+
+def _iter_host_port(text: str) -> Iterable[tuple[int, int, str, str]]:
+    """Yield ``(start, end, host, port)`` for ``host:port`` matches in linear time."""
+    n = len(text)
+    cursor = 0
+    search_from = 0
+    while (colon := text.find(":", search_from)) >= 0:
+        p_end = colon + 1
+        while p_end < n and p_end - (colon + 1) <= 5 and text[p_end] in _ASCII_DIGITS:
+            p_end += 1
+        port_len = p_end - (colon + 1)
+        if not (1 <= port_len <= 5) or (p_end < n and text[p_end] in _HOST_PORT_RIGHT_BLOCK):
+            search_from = colon + 1
+            continue
+        h_start = colon
+        while h_start > cursor and text[h_start - 1] in _HOST_CHARS:
+            h_start -= 1
+        if (
+            h_start == colon
+            or text[h_start] not in _ASCII_ALPHA
+            or text[colon - 1] not in _ASCII_ALNUM
+            or (h_start > 0 and text[h_start - 1] in _HOST_PORT_LEFT_BLOCK)
+        ):
+            search_from = colon + 1
+            continue
+        yield h_start, p_end, text[h_start:colon], text[colon + 1 : p_end]
+        cursor = p_end
+        search_from = p_end
+
+
+def _iter_transcript_filenames(text: str) -> Iterable[tuple[int, int, str]]:
+    """Yield ``(start, end, filename)`` for ``*.jsonl[.gz]`` matches in linear time."""
+    n = len(text)
+    for suffix in _JSONL_SUFFIX_RE.finditer(text):
+        end = suffix.end()
+        if end < n and text[end] in _TRANSCRIPT_BODY_CHARS:
+            continue
+        start = suffix.start()
+        while start > 0 and text[start - 1] in _TRANSCRIPT_BODY_CHARS:
+            start -= 1
+        if start < suffix.start() and text[start] in _TRANSCRIPT_INITIAL_CHARS:
+            yield start, end, text[start:end]
 
 
 def _select_candidates(candidates: Iterable[_Candidate]) -> list[_Candidate]:
@@ -684,35 +858,34 @@ def scan_text(
 
     candidates.extend(_filesystem_candidates(text))
 
-    for match in _USER_AT_HOST_RE.finditer(text):
-        host = match.group("token").rsplit("@", 1)[-1].split(":", 1)[0]
-        if not host.isdigit() and not protected.overlaps(match.start(), match.end()):
-            candidates.append(_Candidate(match.start(), match.end(), "user-at-host", match.group(0), 75))
+    for start, end, token in _iter_user_at_host(text):
+        host = token.rsplit("@", 1)[-1].split(":", 1)[0]
+        if not host.isdigit() and not protected.overlaps(start, end):
+            candidates.append(_Candidate(start, end, "user-at-host", token, 75))
 
-    for match in _IP_CANDIDATE_RE.finditer(text):
-        raw = match.group(0)
+    for start, _end, raw in _iter_ip_candidates(text):
         candidate = raw if raw.startswith("[") else raw.rstrip(".")
-        if not candidate or protected.overlaps(match.start(), match.start() + len(candidate)):
+        if not candidate or protected.overlaps(start, start + len(candidate)):
             continue
         version = _ip_version(candidate)
         if version is not None:
             candidates.append(
                 _Candidate(
-                    match.start(),
-                    match.start() + len(candidate),
+                    start,
+                    start + len(candidate),
                     f"ipv{version}",
                     candidate,
                     70,
                 )
             )
 
-    for match in _HOST_PORT_RE.finditer(text):
+    for start, end, host, port in _iter_host_port(text):
         if (
-            not _is_css_numeric_property(text, match)
-            and 0 < int(match.group("port")) <= 65535
-            and not protected.overlaps(match.start(), match.end())
+            not _is_css_numeric_property(text, host, start)
+            and 0 < int(port) <= 65535
+            and not protected.overlaps(start, end)
         ):
-            candidates.append(_Candidate(match.start(), match.end(), "host-port", match.group(0), 60))
+            candidates.append(_Candidate(start, end, "host-port", text[start:end], 60))
 
     for match in _SSH_ALIAS_RE.finditer(text):
         alias = match.group("alias").rstrip(".")
@@ -721,9 +894,9 @@ def scan_text(
         if alias.lower() not in _SSH_PROSE_WORDS and not protected.overlaps(start, end):
             candidates.append(_Candidate(start, end, "ssh-alias", alias, 50))
 
-    for match in _TRANSCRIPT_FILENAME_RE.finditer(text):
-        if not protected.overlaps(match.start(), match.end()):
-            candidates.append(_Candidate(match.start(), match.end(), "transcript-filename", match.group(0), 40))
+    for start, end, filename in _iter_transcript_filenames(text):
+        if not protected.overlaps(start, end):
+            candidates.append(_Candidate(start, end, "transcript-filename", filename, 40))
 
     # A planted canary is reported in addition to what it overlaps; it never
     # hides a real finding (the canary marks a sweep fixture, not a leak class).
