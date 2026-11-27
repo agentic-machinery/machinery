@@ -2433,7 +2433,7 @@ def _format_decision(item: Decision) -> str:
 def _main_bundles(args: argparse.Namespace) -> int:
     try:
         repo = reaper.resolve_repo_root()
-        if args.restore_bundle:
+        if args.restore_bundle is not None:
             restored = restore_bundle(repo, args.restore_bundle, destination=args.restore_to)
             print(json.dumps({"ok": True, "restored": str(restored)}) if args.json else f"restored: {restored}")
             return 0
@@ -2452,9 +2452,9 @@ def _main_bundles(args: argparse.Namespace) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    if args.age_out_bundles and args.restore_bundle:
+    if args.age_out_bundles and args.restore_bundle is not None:
         build_parser().error("--age-out-bundles and --restore-bundle cannot be combined")
-    if args.age_out_bundles or args.restore_bundle:
+    if args.age_out_bundles or args.restore_bundle is not None:
         return _main_bundles(args)
     token = _ARCHIVE_AFTER_DAYS.set(args.archive_after_days)
     try:

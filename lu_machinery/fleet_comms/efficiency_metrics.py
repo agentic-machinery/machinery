@@ -24,7 +24,7 @@ from typing import Any
 
 from lu_machinery import state_paths
 from lu_machinery.common import json_depth
-from lu_machinery.common.repo_root import StateRootError
+from lu_machinery.common.repo_root import MachineryConfigError
 from lu_machinery.common.task_store_paths import TaskRecordReadRefusal, read_cached_task_record
 from lu_machinery.control_plane.storage import (
     Authority,
@@ -565,7 +565,7 @@ def _default_merge_cache_path() -> Path | None:
         return Path(override).expanduser()
     try:
         return state_paths.pr_merge_cache_path()
-    except StateRootError:
+    except MachineryConfigError:
         return None
 
 
