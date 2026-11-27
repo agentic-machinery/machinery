@@ -31,6 +31,7 @@ import xml.etree.ElementTree as ET
 from collections import Counter
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, cast, get_args
+from urllib.parse import urlsplit
 
 from lu_machinery import state_paths
 from lu_machinery.ci._location import module_name
@@ -80,12 +81,11 @@ ABSOLUTE_PATH = re.compile(r"(?<![A-Za-z0-9])/(?!/)[^\s\]\[),:;]+")
 NETWORK_ADDRESS = re.compile(r"https?://[^\s\]\[),:;]+|(?<!\d)(?:\d{1,3}\.){3}\d{1,3}(?!\d)")
 # owner/name, read from the product checkout's origin. Never a baked slug.
 _REPOSITORY = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
-# Anchored GitHub origin forms. The host is exactly github.com; a suffix or a path is not enough.
-_GITHUB_REMOTE_PATTERNS = (
-    re.compile(r"^https?://(?:[^/@\s]+@)?github\.com/([^/\s]+)/([^/\s]+?)(?:\.git)?/?$", re.IGNORECASE),
-    re.compile(r"^ssh://git@github\.com/([^/\s]+)/([^/\s]+?)(?:\.git)?/?$", re.IGNORECASE),
-    re.compile(r"^git@github\.com:([^/\s]+)/([^/\s]+?)(?:\.git)?/?$", re.IGNORECASE),
-    re.compile(r"^git://github\.com/([^/\s]+)/([^/\s]+?)(?:\.git)?/?$", re.IGNORECASE),
+_GITHUB_HOST = "github.com"
+# SCP-style SSH. ASCII case-folding only, so a dotless i cannot stand in for i.
+_SCP_ORIGIN = re.compile(
+    r"^git@github\.com:(?P<owner>[^/\s]+)/(?P<repo>[^/\s]+)$",
+    re.IGNORECASE | re.ASCII,
 )
 
 
@@ -824,19 +824,52 @@ def run_failed(summary: dict) -> bool:
     )
 
 
+def _github_slug(url: str) -> str | None:
+    """``owner/name`` when ``url`` is a GitHub origin whose host is exactly github.com."""
+    if not url or any(char.isspace() for char in url) or "\\" in url or "?" in url or "#" in url:
+        return None
+    scp = _SCP_ORIGIN.fullmatch(url)
+    if scp is not None:
+        owner, name = scp.group("owner"), scp.group("repo")
+    else:
+        try:
+            parts = urlsplit(url)
+            host = parts.hostname
+            port = parts.port
+        except ValueError:
+            return None
+        if (
+            parts.scheme not in {"https", "ssh"}
+            or parts.query
+            or parts.fragment
+            or host is None
+            or host.lower() != _GITHUB_HOST
+            or port is not None
+            or (parts.scheme == "ssh" and parts.username != "git")
+        ):
+            return None
+        path = parts.path[:-1] if parts.path.endswith("/") else parts.path
+        segments = path.split("/")
+        if len(segments) != 3 or not segments[1] or not segments[2]:
+            return None
+        owner, name = segments[1], segments[2]
+    if name.endswith(".git"):
+        name = name[: -len(".git")]
+    repository = f"{owner}/{name}"
+    if owner in {".", ".."} or name in {".", ".."} or _REPOSITORY.fullmatch(repository) is None:
+        return None
+    return repository
+
+
 def github_repository(checkout: Path) -> str:
     """Owner/name from the product checkout's origin.
 
     The service working directory is not a Git checkout, so reporting cannot ask
-    ``gh`` to discover the repository there.
+    ``gh`` to discover the repository there. The host has to be github.com itself.
     """
     url = command(["git", "remote", "get-url", "origin"], cwd=checkout).stdout.strip()
-    match = next((found for pattern in _GITHUB_REMOTE_PATTERNS if (found := pattern.fullmatch(url))), None)
-    if match is None:
-        raise DataTierError("product origin is not a GitHub owner/name")
-    owner, name = match.group(1), match.group(2)
-    repository = f"{owner}/{name}"
-    if owner in {".", ".."} or name in {".", ".."} or _REPOSITORY.fullmatch(repository) is None:
+    repository = _github_slug(url)
+    if repository is None:
         raise DataTierError("product origin is not a GitHub owner/name")
     return repository
 

@@ -567,10 +567,21 @@ def test_failure_reporting_uses_one_fake_gh_issue_and_clean_comment_once(
     for origin in (
         "https://notgithub.com/example-org/example-product.git",
         "https://evil.example/github.com/example-org/example-product.git",
+        "https://evil.example?@github.com/example-org/example-product.git",
+        "https://evil.example#@github.com/example-org/example-product.git",
+        "https://g\u0131thub.com/example-org/example-product.git",
+        "git@g\u0131thub.com:example-org/example-product.git",
     ):
         subprocess.run([*git, "remote", "set-url", "origin", origin], cwd=checkout, check=True, timeout=30)
         with pytest.raises(data_tier.DataTierError, match="not a GitHub owner/name"):
             data_tier.report(failed, baseline, checkout)
+    subprocess.run(
+        [*git, "remote", "set-url", "origin", "git@github.com:example-org/example-product.git"],
+        cwd=checkout,
+        check=True,
+        timeout=30,
+    )
+    assert data_tier.github_repository(checkout) == "example-org/example-product"
     assert len(json.loads(state.read_text())["calls"]) == calls_before
 
 
