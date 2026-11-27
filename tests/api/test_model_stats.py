@@ -971,13 +971,16 @@ _PAGE_SENTENCES = frozenset({
     "most first-round approvals per recorded wall hour, among catalog models "
     "with at least 10 landed tasks and 10 reviewed PRs",
     "not enough data yet",
-    "No finding outcome is recorded. A blocking finding counts as fixed when the author's "
+    "Precision is inferred from files: a blocking finding counts as fixed when the author's "
     "later head changed its file before the same reviewer approved, else dismissed; a file "
     "changed for another reason (another finding, a merge of main) still counts as fixed, and "
     "a fix made in a different file counts as dismissed. Only verdicts the recorder published "
     "count; a blocking reply with no recorded publication (an unpublished run, or one from "
-    "before the publication ledger and not imported) is of unknown publication and left out.",
-    "No planted-defect result is recorded in the summary rows.",
+    "before the publication ledger and not imported) is of unknown publication and left out. "
+    "Real precision uses the author's recorded label instead (fixed over fixed, wrong and "
+    "invented); a label is the author's word unless a later review contested it.",
+    "No planted-defect result is recorded in the summary rows. The reviewer miss proxy counts "
+    "merged PRs a reviewer approved that a fix or revert named within seven days.",
     "This snapshot does not include task ids.",
     "An allowance reading is the whole pool, not the one model. Overlapping tasks are charged "
     "that pool's net drop once. A cluster shared by more than one model or effort, or one that "
@@ -2036,6 +2039,10 @@ def test_finding_precision_follows_the_files_the_author_changed_before_the_same_
         # PRs 1, 4 and 12 were approved later by Opus at another head; PR 4's blocked head could not be read.
         "reviews_approved_later": 3, "reviews_approved_later_read": 2,
         "precision": stats._rate(2, 3), "precision_ci": stats._wilson(2, 3),
+        # No finding carries an author label: all eight P0-P1 findings of the published blocking reviews are unlabelled.
+        "labels": {"fixed": 0, "wrong": 0, "invented": 0, "out_of_scope": 0, "duplicate": 0, "contested": 0,
+                   "unlabelled": 8},
+        "real_precision": stats._rate(0, 0), "real_precision_ci": stats._wilson(0, 0),
     }
     assert opus["precision"]["low_sample"] and opus["precision"]["n"] == 3
     pilot = {"blocking_reviews": 1, "blocking_findings": 1, "open": 1, "fixed": 0, "dismissed": 0, "unknown": 0,
@@ -2060,6 +2067,137 @@ def test_finding_precision_follows_the_files_the_author_changed_before_the_same_
     output = b"\0".join([b"a" * 40, record, b"b" * 40, b"b" * 40, record, b"real.py", b""])
     assert stats._diff_blocks(output, ["a" * 40, "b" * 40]) == [["b" * 40], ["real.py"]]
     assert stats._diff_blocks(output, ["a" * 40]) is None
+
+
+def _label(batch_state: Path, task_id: str, pr: int, finding_id: str, label: str, evidence: str | None = None) -> int:
+    """An author label line, as the verdict recorder's finding-outcome verb writes it."""
+    return rows.record_finding_outcomes(batch_state, [rows.finding_outcome(
+        kind="label", task_id=task_id, repository="learn-ukrainian/machinery", pr=pr, finding_id=finding_id,
+        label=label, evidence=evidence, recorded_by="author-task", recorded_at=NOW.isoformat())])
+
+
+def _contest(batch_state: Path, task_id: str, pr: int, finding_id: str, contested_by: str) -> int:
+    """A contest line, as the verdict recorder writes it when a later review contests a label."""
+    return rows.record_finding_outcomes(batch_state, [rows.finding_outcome(
+        kind="contest", task_id=task_id, repository="learn-ukrainian/machinery", pr=pr, finding_id=finding_id,
+        contested_by=contested_by, recorded_at=NOW.isoformat())])
+
+
+def test_finding_outcome_labels_count_per_reviewer_and_a_contest_holds_the_label_out(tmp_path):
+    """Defect class: author labels charged to another reviewer than the one whose finding they label, a contested
+    author claim counted as settled, a label on an unpublished review counted, a contest without a label counted, or
+    unlabelled findings miscounted. Every expected figure below is counted by hand."""
+    batch_state, tasks = _state(tmp_path)
+    sol = {"agent": "codex", "model": "gpt-6.1-sol", "resolved_model": "gpt-6.1-sol"}
+    blocked = {"started_at": _at(7), "finished_at": _at(6)}
+    # Opus, PR 1: three P0-P1 findings and one P2. F0 fixed, F1 wrong, F2 invented but contested by the next round.
+    _findings_review(tasks, "o1-review", "incorrect",
+                     [("P1", "src/a.py"), ("P1", "src/b.py"), ("P0", "src/c.py"), ("P2", "src/d.py")],
+                     pr=1, pinned_head="a" * 40, **blocked)
+    # Opus, PR 2: two blocking findings, one labelled out_of_scope, one left unlabelled; a contest of the unlabelled
+    # one has no label to hold out.
+    _findings_review(tasks, "o2-review", "incorrect", [("P1", "src/a.py"), ("P1", "src/b.py")],
+                     pr=2, pinned_head="b" * 40, **blocked)
+    # Sol, PR 3: one blocking finding the author labelled invented, uncontested.
+    _findings_review(tasks, "s3-review", "incorrect", [("P1", "src/a.py")], pr=3, pinned_head="c" * 40,
+                     **blocked, **sol)
+    # Opus, PR 4: a blocking reply never published: its label counts nowhere.
+    _findings_review(tasks, "o4-review", "incorrect", [("P1", "src/a.py")], pr=4, pinned_head="d" * 40, **blocked)
+    rows.backfill(tasks, batch_state)
+    _publish(batch_state, ("o1-review", 1, "a" * 40, "CHANGES_REQUESTED"), ("o2-review", 2, "b" * 40, "CHANGES_REQUESTED"),
+             ("s3-review", 3, "c" * 40, "CHANGES_REQUESTED"))
+    assert _label(batch_state, "o1-review", 1, "F0", "fixed") == 1
+    assert _label(batch_state, "o1-review", 1, "F1", "wrong", "the guard on line 3 already returns early") == 1
+    assert _label(batch_state, "o1-review", 1, "F2", "invented", "src/c.py has no such function") == 1
+    assert _contest(batch_state, "o1-review", 1, "F2", "o1b-review") == 1
+    assert _label(batch_state, "o2-review", 2, "F0", "out_of_scope", "outside the frozen obligation") == 1
+    assert _contest(batch_state, "o2-review", 2, "F1", "o2b-review") == 1
+    assert _label(batch_state, "s3-review", 3, "F0", "invented", "no such call site exists") == 1
+    assert _label(batch_state, "o4-review", 4, "F0", "wrong", "already correct") == 1
+
+    snapshot = stats.collect(batch_state, tmp_path, NOW, landing=stats.Landing())
+    assert snapshot["coverage"]["finding_outcomes"] == {"lines": 8}
+    zero = dict.fromkeys(("fixed", "wrong", "invented", "out_of_scope", "duplicate", "contested", "unlabelled"), 0)
+    for payload in (snapshot["windows"]["7d"], snapshot["page_windows"]["7d"]):
+        found = {row["model"]: row for row in payload["reviewer_accuracy"]["findings"]}
+        assert found["claude-opus-5-5"]["labels"] == {**zero, "fixed": 1, "wrong": 1, "out_of_scope": 1,
+                                                      "contested": 1, "unlabelled": 1}
+        # The contested invented label is held out: fixed over fixed, wrong and invented is 1 of 2.
+        assert found["claude-opus-5-5"]["real_precision"] == stats._rate(1, 2)
+        assert found["gpt-6.1-sol"]["labels"] == {**zero, "invented": 1}
+        assert found["gpt-6.1-sol"]["real_precision"] == stats._rate(0, 1)
+
+
+def test_finding_outcome_ledger_keeps_one_label_per_finding_and_skips_damaged_lines(tmp_path):
+    """Defect class: a relabel, a repeated contest, a label without its required evidence, a self-contest or a
+    damaged ledger line silently changing what the statistics count."""
+    batch_state, _ = _state(tmp_path)
+    assert _label(batch_state, "o1-review", 1, "F0", "fixed") == 1
+    # The same label again adds nothing; another label for the finding is refused and writes nothing.
+    assert _label(batch_state, "o1-review", 1, "F0", "fixed") == 0
+    with pytest.raises(rows.OutcomeConflict):
+        _label(batch_state, "o1-review", 1, "F0", "wrong", "already correct")
+    with pytest.raises(rows.OutcomeConflict):
+        _label(batch_state, "o1-review", 1, "F0", "fixed", "now with evidence")
+    # Every label but fixed needs its evidence; an unknown label and a self-contest are never written.
+    for label in ("wrong", "invented", "out_of_scope", "duplicate"):
+        with pytest.raises(ValueError, match="wrong shape"):
+            _label(batch_state, "o1-review", 1, "F1", label)
+    with pytest.raises(ValueError, match="wrong shape"):
+        _label(batch_state, "o1-review", 1, "F1", "dismissed", "a word outside the vocabulary")
+    with pytest.raises(ValueError, match="wrong shape"):
+        _contest(batch_state, "o1-review", 1, "F0", "o1-review")
+    assert _contest(batch_state, "o1-review", 1, "F0", "o1b-review") == 1
+    assert _contest(batch_state, "o1-review", 1, "F0", "o1b-review") == 0
+    path = batch_state / rows.ROWS_DIR / rows.OUTCOMES_FILE
+    good = path.read_bytes()
+    assert b"already correct" not in good and b"now with evidence" not in good
+    extra = json.loads(good.splitlines()[0])
+    extra["note"] = "free text"
+    # Unhashable values where a label or kind belongs, and a value of the wrong type, are damaged lines too.
+    first = json.loads(good.splitlines()[0])
+    damaged = [extra, {**first, "label": ["fixed"]}, {**first, "kind": {"label": 1}}, {**first, "pr": "1"}]
+    with path.open("ab") as stream:
+        stream.write(b"{not json\n" + b"".join(json.dumps(line).encode() + b"\n" for line in damaged))
+    labels, contests, counts = rows.read_finding_outcomes(batch_state)
+    assert labels == {"o1-review": {"F0": "fixed"}}
+    assert contests == {("o1-review", "F0")}
+    assert counts == {"lines": 2, "malformed_lines": 5}
+    # A writer that finds the damaged lines still keeps one label per finding.
+    assert _label(batch_state, "o1-review", 1, "F0", "fixed") == 0
+
+
+def test_reviewer_miss_proxy_charges_each_approving_reviewer_of_a_reworked_merge(tmp_path):
+    """Defect class: post-merge rework charged to a reviewer who never published an approval of the PR (a blocking
+    reviewer, an unpublished approval), or missed for one who did. Every expected figure below is counted by hand."""
+    batch_state, tasks = _state(tmp_path)
+    sol = {"agent": "codex", "model": "gpt-6.1-sol", "resolved_model": "gpt-6.1-sol"}
+    day = timedelta(days=1)
+    reviews = {"started_at": (NOW - 20 * day).isoformat(), "finished_at": (NOW - 19 * day).isoformat()}
+    # PR 1: Opus and Sol both approved; Sol had blocked first. A fix names PR 1 two days after it merged.
+    _findings_review(tasks, "m1a-review", "incorrect", [("P1", "src/a.py")], pr=1, pinned_head="a" * 40,
+                     **reviews, **sol)
+    _findings_review(tasks, "m1b-review", "correct", [], pr=1, pinned_head="b" * 40, **reviews)
+    _findings_review(tasks, "m1c-review", "correct", [], pr=1, pinned_head="b" * 40, **reviews, **sol)
+    # PR 2: Opus approved; nothing names it. PR 3: an Opus approval never published, then reworked: no observation.
+    _findings_review(tasks, "m2-review", "correct", [], pr=2, pinned_head="c" * 40, **reviews)
+    _findings_review(tasks, "m3-review", "correct", [], pr=3, pinned_head="d" * 40, **reviews)
+    rows.backfill(tasks, batch_state)
+    _publish(batch_state, ("m1a-review", 1, "a" * 40, "CHANGES_REQUESTED"), ("m1b-review", 1, "b" * 40, "APPROVED"),
+             ("m1c-review", 1, "b" * 40, "APPROVED"), ("m2-review", 2, "c" * 40, "APPROVED"))
+    landing = stats.Landing()
+    # Mainline order, newest first, as the landing scan stores it.
+    landing.prs["machinery", "6"] = stats._MergedPR("6" * 40, NOW - 14 * day, set(), {"3"}, set())
+    landing.prs["machinery", "5"] = stats._MergedPR("5" * 40, NOW - 16 * day, set(), {"1"}, set())
+    landing.prs["machinery", "3"] = stats._MergedPR("3" * 40, NOW - 17 * day, set(), set(), set())
+    landing.prs["machinery", "2"] = stats._MergedPR("2" * 40, NOW - 17.5 * day, set(), set(), set())
+    landing.prs["machinery", "1"] = stats._MergedPR("1" * 40, NOW - 18 * day, set(), set(), set())
+    landing.observed_through["machinery"] = NOW
+    snapshot = stats.collect(batch_state, tmp_path, NOW, landing=landing)
+    for key, name in (("windows", str), ("page_windows", str)):
+        proxy = {row["model"]: (row["reworked"], row["rate"]) for row in snapshot[key]["30d"]["reviewer_miss_proxy"]}
+        assert proxy == {name("claude-opus-5-5"): (1, stats._rate(1, 2)), name("gpt-6.1-sol"): (1, stats._rate(1, 1))}
+    assert snapshot["windows"]["7d"]["reviewer_miss_proxy"] == []
 
 
 def test_author_results_split_by_risk_tier(tmp_path):

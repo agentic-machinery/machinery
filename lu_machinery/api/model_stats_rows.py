@@ -17,6 +17,10 @@ Beside the rows, ``publications.jsonl`` is the published-verdict ledger (#902): 
 published on a PR (task id, repository, PR, head, verdict, GitHub's comment time). Its one writer is
 ``record_cf_verdict`` under the same ``rows.lock``; the statistics count a review's verdict only when the ledger
 names it.
+
+``finding-outcomes.jsonl`` is the finding-outcome ledger, under the same lock with the same one writer: one line per
+author label of a blocking finding of a published review (``fixed``, ``wrong``, ``invented``, ``out_of_scope``,
+``duplicate``; the evidence line as its SHA-256 only) and one per later review that contested a label.
 """
 
 from __future__ import annotations
@@ -61,6 +65,7 @@ from lu_machinery.orchestration.fleet_repos import (
     repository_identity,
 )
 from lu_machinery.orchestration.task_record_store import REVIEW_TASK_FLAG_FIELDS, iter_task_records
+from lu_machinery.review.findings import EVIDENCED_OUTCOME_LABELS, FINDING_OUTCOME_LABELS
 from lu_machinery.review.model_catalog import VARIANT_SUFFIX, canonical_model_id, load_model_catalog
 from lu_machinery.review.review_contract import SCHEMA_VERSION, ContractError, parse_reviewer_json
 from lu_machinery.review.verdict_parser import (
@@ -1074,6 +1079,15 @@ def record_publications(batch_state_dir: Path, entries: Iterable[Mapping[str, An
         return added
 
 
+def publications_newest_first(batch_state_dir: Path) -> list[dict[str, Any]]:
+    """Every well-formed ledger line, newest first by GitHub's comment time; of two at the same time, the later line
+    first (the order ``read_publications`` gives within one task)."""
+    lines = _publication_lines(batch_state_dir / ROWS_DIR / PUBLICATIONS_FILE, Counter())
+    order = sorted(enumerate(lines), key=lambda item: (cast(datetime, timestamp(item[1]["published_at"])), item[0]),
+                   reverse=True)
+    return [entry for _, entry in order]
+
+
 def read_publications(batch_state_dir: Path) -> tuple[dict[str, list[dict[str, Any]]], Counter[str]]:
     """Each review task's published verdicts, newest first by GitHub's comment time (of two at the same time, the
     later line first, so a history import appended after a newer publication never comes before it), and read
@@ -1088,6 +1102,141 @@ def read_publications(batch_state_dir: Path) -> tuple[dict[str, list[dict[str, A
     counts["tasks"] = len(by_task)
     return {task: [entry for *_, entry in sorted(found, key=lambda item: item[:2], reverse=True)]
             for task, found in by_task.items()}, counts
+
+
+OUTCOME_SCHEMA = "review-finding-outcome.v1"
+OUTCOMES_FILE = "finding-outcomes.jsonl"
+_FINDING_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,63}\Z")
+_OUTCOME_KEYS = {
+    "label": frozenset({"schema", "kind", "task_id", "repository", "pr", "finding_id", "label", "evidence_sha256",
+                        "recorded_by", "recorded_at"}),
+    "contest": frozenset({"schema", "kind", "task_id", "repository", "pr", "finding_id", "contested_by",
+                          "recorded_at"}),
+}
+
+
+def _outcome_ok(entry: object) -> bool:
+    # Every membership test below reads a string first: a list or object in a damaged line is unhashable.
+    if not isinstance(entry, dict):
+        return False
+    kind = entry.get("kind")
+    if not isinstance(kind, str) or kind not in _OUTCOME_KEYS or entry.keys() != _OUTCOME_KEYS[kind]:
+        return False
+    pr, repository, finding_id = entry["pr"], entry["repository"], entry["finding_id"]
+    if not (entry["schema"] == OUTCOME_SCHEMA and valid_task_id(entry["task_id"])
+            and isinstance(repository, str) and REPOSITORY_SLUG.fullmatch(repository) is not None
+            and _count_value(pr) and pr > 0 and isinstance(finding_id, str) and _FINDING_ID.fullmatch(finding_id)
+            and timestamp(entry["recorded_at"]) is not None):
+        return False
+    if kind == "contest":
+        return valid_task_id(entry["contested_by"]) and entry["contested_by"] != entry["task_id"]
+    evidence, label = entry["evidence_sha256"], entry["label"]
+    return (isinstance(label, str) and label in FINDING_OUTCOME_LABELS
+            and (evidence is None or (isinstance(evidence, str) and _SHA256.fullmatch(evidence) is not None))
+            and (evidence is not None or label not in EVIDENCED_OUTCOME_LABELS)
+            and (entry["recorded_by"] is None or valid_task_id(entry["recorded_by"])))
+
+
+def finding_outcome(*, kind: str, task_id: str, repository: str, pr: int, finding_id: str, recorded_at: str,
+                    label: str | None = None, evidence: str | None = None, recorded_by: str | None = None,
+                    contested_by: str | None = None) -> dict[str, Any]:
+    """One outcome-ledger line: the author's ``label`` for one blocking finding of the published review ``task_id``,
+    or a later review's ``contest`` of that label. The evidence line is kept only as its SHA-256: the text stays in the
+    PR and the delta brief. Raises ValueError when a field has the wrong shape, so a malformed line is never written."""
+    entry: dict[str, Any] = {"schema": OUTCOME_SCHEMA, "kind": kind, "task_id": task_id, "repository": repository,
+                             "pr": pr, "finding_id": finding_id, "recorded_at": recorded_at}
+    if kind == "label":
+        entry.update(label=label, recorded_by=recorded_by,
+                     evidence_sha256=None if evidence is None else hashlib.sha256(evidence.encode()).hexdigest())
+    else:
+        entry["contested_by"] = contested_by
+    if not _outcome_ok(entry):
+        raise ValueError("finding outcome field has the wrong shape")
+    return entry
+
+
+def _outcome_lines(path: Path, counts: Counter[str]) -> list[dict[str, Any]]:
+    try:
+        fd = _open(path, os.O_RDONLY)
+    except FileNotFoundError:
+        counts["missing"] += 1
+        return []
+    entries = []
+    with os.fdopen(fd, "rb") as stream:
+        for line in stream:
+            try:
+                entry = json_depth.loads(line, max_depth=_JSON_MAX_DEPTH)
+            except (ValueError, RecursionError):
+                entry = None
+            if not _outcome_ok(entry):
+                counts["malformed_lines"] += 1
+                continue
+            entries.append(entry)
+    counts["lines"] = len(entries)
+    return entries
+
+
+class OutcomeConflict(ValueError):
+    """The finding already has another label: a finding takes one label."""
+
+
+def record_finding_outcomes(batch_state_dir: Path, entries: Iterable[Mapping[str, Any]],
+                            wait_s: float | None = None) -> int:
+    """Append, under ``rows.lock``, each entry the outcome ledger does not hold yet; the count added.
+
+    A label line is one per (review task, finding): the same label and evidence again adds nothing, and a different
+    one raises OutcomeConflict before anything is written. A contest line is one per (review task, finding,
+    contesting task). Every entry is checked from the exact JSON bytes that will be written: one malformed entry
+    raises ValueError and writes nothing. TimeoutError when ``wait_s`` passes first; OSError when the ledger cannot
+    be written.
+    """
+    checked = []
+    for entry in entries:
+        try:
+            row = dict(entry)
+            if not _count_value(row.get("pr")):
+                raise ValueError("finding outcome PR must be an integer in range")
+            line = _line(row)
+            snapshot = json_depth.loads(line, max_depth=_JSON_MAX_DEPTH)
+        except (TypeError, ValueError, RecursionError) as exc:
+            raise ValueError("finding outcome field has the wrong shape") from exc
+        if not _outcome_ok(snapshot):
+            raise ValueError("finding outcome field has the wrong shape")
+        checked.append((snapshot, line))
+
+    def key(entry: Mapping[str, Any]) -> tuple[str, ...]:
+        return (entry["kind"], entry["task_id"], entry["finding_id"], entry.get("contested_by") or "")
+
+    with _locked(batch_state_dir, wait_s) as rows_file:
+        path = rows_file.with_name(OUTCOMES_FILE)
+        present = {key(e): e for e in _outcome_lines(path, Counter())}
+        for snapshot, _ in checked:
+            held = present.get(key(snapshot))
+            if held is not None and snapshot["kind"] == "label" and (
+                    held["label"], held["evidence_sha256"]) != (snapshot["label"], snapshot["evidence_sha256"]):
+                raise OutcomeConflict(
+                    f"finding {snapshot['finding_id']} of {snapshot['task_id']} is already labelled {held['label']}")
+        added = 0
+        for snapshot, line in checked:
+            if key(snapshot) not in present:
+                _append_line(path, line)
+                present[key(snapshot)] = snapshot
+                added += 1
+        return added
+
+
+def read_finding_outcomes(batch_state_dir: Path) -> tuple[dict[str, dict[str, str]], set[tuple[str, str]], Counter[str]]:
+    """Each review task's labelled findings (finding id to label), the (review task, finding id) pairs a later review
+    contested, and read counts. A missing ledger gives none: every finding is then unlabelled."""
+    counts: Counter[str] = Counter()
+    labels: dict[str, dict[str, str]] = {}
+    contests: set[tuple[str, str]] = set()
+    for entry in _outcome_lines(batch_state_dir / ROWS_DIR / OUTCOMES_FILE, counts):
+        if entry["kind"] == "label":
+            labels.setdefault(entry["task_id"], {}).setdefault(entry["finding_id"], entry["label"])
+        else:
+            contests.add((entry["task_id"], entry["finding_id"]))
+    return labels, contests, counts
 
 
 def refresh_readings() -> None:
