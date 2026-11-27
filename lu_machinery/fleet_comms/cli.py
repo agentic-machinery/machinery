@@ -797,11 +797,11 @@ def _add_deliveries_parser(sub: Any) -> None:
     )
     epilog = (
         "Examples:\n"
-        f"  .venv/bin/python -m {_PACKAGE} deliveries claim --recipient claude-cto --worker-id seat-1\n"
-        f"  .venv/bin/python -m {_PACKAGE} deliveries receive --recipient <task-id> --worker-id <task-id>\n"
-        f"  .venv/bin/python -m {_PACKAGE} deliveries consume DELIVERY --worker-id seat-1 --fence-token 1 --driver-generation gen-1\n"
-        f"  .venv/bin/python -m {_PACKAGE} deliveries ack DELIVERY --worker-id seat-1 --fence-token 1\n"
-        f"  .venv/bin/python -m {_PACKAGE} deliveries read DELIVERY --worker-id seat-1 --fence-token 1\n"
+        f"  <project python> -I -m {_PACKAGE} deliveries claim --recipient claude-cto --worker-id seat-1\n"
+        f"  <project python> -I -m {_PACKAGE} deliveries receive --recipient <task-id> --worker-id <task-id>\n"
+        f"  <project python> -I -m {_PACKAGE} deliveries consume DELIVERY --worker-id seat-1 --fence-token 1 --driver-generation gen-1\n"
+        f"  <project python> -I -m {_PACKAGE} deliveries ack DELIVERY --worker-id seat-1 --fence-token 1\n"
+        f"  <project python> -I -m {_PACKAGE} deliveries read DELIVERY --worker-id seat-1 --fence-token 1\n"
         "Outputs: JSON on stdout; message bodies only from read and receive.\n"
         "  Receive claims and reads in one call: {delivery: {delivery_id, fence_token, sender, body, ...},\n"
         "  content_included: true}.\n"
