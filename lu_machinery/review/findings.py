@@ -18,7 +18,7 @@ from typing import Literal
 Disposition = Literal["in_scope_blocker", "follow_up", "stop_and_escalate"]
 EventKind = Literal["raised", "adjudicated", "applied", "skipped"]
 
-# What the author says became of one blocking (P0-P1) finding of a published review, recorded with
+# What the author says became of one blocking (P0-P2) finding of a published review, recorded with
 # ``record_cf_verdict finding-outcome`` and counted per reviewer by the model statistics.
 FINDING_OUTCOME_LABELS: dict[str, str] = {
     "fixed": "a real error; the author changed the code",

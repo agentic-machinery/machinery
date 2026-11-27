@@ -163,7 +163,7 @@ interpreter does not select the primary checkout's Python modules.
    Give each finding a stable id and a disposition in the ledger ([policy](references/policy.md)).
    Fixes go to the authoring lane (the worker itself when it runs the loop); a driver does not
    patch them in. Once a `CHANGES_REQUESTED` verdict is recorded (step 7), the author labels each
-   of its P0-P1 findings before the next round: `fixed` (a real error, changed), `wrong` (the
+   of its P0-P2 findings before the next round: `fixed` (a real error, changed), `wrong` (the
    code was already correct), `invented` (it cites a file, line, symbol or behaviour that does
    not exist), `out_of_scope` or `duplicate`. Every label except `fixed` needs one line of
    evidence, which also goes in the delta brief. Model stats counts the labels per reviewer.
