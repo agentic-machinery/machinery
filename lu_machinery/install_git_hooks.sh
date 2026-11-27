@@ -29,8 +29,12 @@ installer_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 installer_path="$installer_dir/install_git_hooks.sh"
 # shellcheck source=lu_machinery/lib/project_interpreter.sh
 source "$installer_dir/lib/project_interpreter.sh"
-worktree_root=''
-project_host_context --require-checkout || exit 2
+worktree_root='' main_root=''
+if [[ "$mode" == "install" ]]; then
+    project_host_context --install-hooks || exit 2
+else
+    project_host_context --require-checkout || exit 2
+fi
 repo_root="${worktree_root:?Git hook installer requires a bound checkout}"
 printf -v rendered_python '%q' "$LU_PYTHON"
 tracked_hooks_dir="$repo_root/.githooks"
@@ -181,12 +185,13 @@ if ((${#symlinked[@]} > 0)); then
 fi
 mkdir -p "$hooks_dir"
 
-# 1. Unset core.hooksPath if set to .githooks (leave any other explicit value alone)
-current_hooks_path="$(git -C "$repo_root" config --get core.hooksPath 2>/dev/null || true)"
-if [[ "$current_hooks_path" == ".githooks" ]]; then
-    git -C "$repo_root" config --unset core.hooksPath
-elif [[ -n "$current_hooks_path" ]]; then
-    echo "Found explicit core.hooksPath=$current_hooks_path; leaving untouched"
+# Clear the exact legacy value from the validated primary repository's config.
+config_file="${main_root:?Git hook installer requires a bound primary checkout}/.git/config"
+if git config --file "$config_file" --no-includes --fixed-value --get core.hooksPath .githooks >/dev/null; then
+    git config --file "$config_file" --no-includes --fixed-value --unset core.hooksPath .githooks
+elif [[ $? != 1 ]]; then
+    echo "REFUSED: could not inspect repository-local core.hooksPath" >&2
+    exit 2
 fi
 
 # 2. For every executable hook in .githooks whose name is a git hook name:

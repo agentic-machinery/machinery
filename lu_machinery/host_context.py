@@ -337,7 +337,7 @@ def _git(path: Path, *args: str) -> bytes:
     return result.stdout
 
 
-def _check_repo(path: Path, origins: tuple[str, ...]) -> None:
+def _check_repo(path: Path, origins: tuple[str, ...], *, install_hooks: bool = False) -> None:
     try:
         physical = path.resolve(strict=True) == path
         git_dir = path / ".git"
@@ -351,10 +351,13 @@ def _check_repo(path: Path, origins: tuple[str, ...]) -> None:
     # Listing includes primary worktree config when Git's extension enables it.
     config = _git(path, "config", "--no-includes", "--null", "--list")
     urls = []
+    legacy_hooks_path = False
     for entry in config.removesuffix(b"\0").split(b"\0"):
         key, _, value = entry.partition(b"\n")
         if key == b"remote.origin.url":
             urls.append(value)
+        elif install_hooks and not legacy_hooks_path and entry == b"core.hookspath\n.githooks":
+            legacy_hooks_path = True
         elif not (_SAFE_REPO_CONFIG.fullmatch(key) or (_REMOTE_SELECTION_KEYS.fullmatch(key) and value == b"origin")):
             raise HostContextError("repo_origin_mismatch", "checkout contains unsupported Git config")
     if len(urls) != 1:
@@ -367,6 +370,13 @@ def _check_repo(path: Path, origins: tuple[str, ...]) -> None:
     )
     if layout != b"\n".join([b"true", os.fsencode(path), os.fsencode(git_dir), os.fsencode(git_dir), b""]):
         raise HostContextError("repo_not_primary", "Git must report the bound checkout as its primary work tree")
+
+    if legacy_hooks_path:
+        if (git_dir / "config").is_symlink():
+            raise HostContextError("repo_origin_mismatch", "legacy hooks migration requires physical repository config")
+        local_value = _git(path, "config", "--local", "--no-includes", "--null", "--get-all", "core.hooksPath")
+        if local_value != b".githooks\0":
+            raise HostContextError("repo_origin_mismatch", "legacy hooks path must be in repository-local config")
 
 
 _VERSION_PROBE = (
@@ -427,7 +437,7 @@ def _load_binding(
 
 def _validate_binding(
     context: HostContext, registry: Mapping[str, dict[str, Any]], *,
-    role: str, invocation_repo: str | None = None,
+    role: str, invocation_repo: str | None = None, install_hooks: bool = False,
 ) -> None:
     from lu_machinery.common.git_credentials import canonical_origins
 
@@ -444,7 +454,7 @@ def _validate_binding(
             origins = canonical_origins({"github": row["github"], "transport": row.get("transport", "ssh")})
         except (OSError, ValueError):
             raise HostContextError("invalid_repo_binding", "cannot select the registered repository origin") from None
-        _check_repo(context.repos[key], origins)
+        _check_repo(context.repos[key], origins, install_hooks=install_hooks and key == invocation_repo)
 
     if role == "hook":
         return
@@ -538,6 +548,7 @@ def invocation_checkout(directory: Path) -> tuple[Path, Path] | None:
 
 def load_hook_context(
     directory: Path, *, require_checkout: bool = False, outside_checkout: bool = False,
+    _install_hooks: bool = False,
 ) -> tuple[HostContext, tuple[Path, Path] | None]:
     """Validate the binding and check invocation metadata without deriving authority from it."""
     env = os.environ
@@ -551,13 +562,13 @@ def load_hook_context(
     if outside_checkout and checkout is not None:
         raise HostContextError("invocation_inside_checkout", "workspace must be outside every Git checkout")
     invocation_repo = None
-    if require_checkout:
+    if require_checkout or _install_hooks:
         if checkout is None:
             raise HostContextError("invocation_git_missing", "Git hook requires an invocation checkout")
         invocation_repo = next((key for key, path in context.repos.items() if path == checkout[1]), None)
         if invocation_repo is None:
             raise HostContextError("invocation_repo_unbound", "Git hook checkout is outside the host repository bindings")
-    _validate_binding(context, registry, role="hook", invocation_repo=invocation_repo)
+    _validate_binding(context, registry, role="hook", invocation_repo=invocation_repo, install_hooks=_install_hooks)
     return context, checkout
 
 
@@ -571,11 +582,11 @@ def hook_environment(context: HostContext) -> dict[str, str]:
     }
 
 
-def _shell_context(directory: Path, *, require_checkout: bool, outside_checkout: bool) -> int:
+def _shell_context(directory: Path, *, require_checkout: bool, outside_checkout: bool, install_hooks: bool) -> int:
     """Emit shell assignments only after all required inputs have validated."""
     try:
         context, checkout = load_hook_context(
-            directory, require_checkout=require_checkout, outside_checkout=outside_checkout,
+            directory, require_checkout=require_checkout, outside_checkout=outside_checkout, _install_hooks=install_hooks,
         )
     except HostContextError as exc:
         print(f"HOOK-BOOTSTRAP-FAILED: [{exc.code}] {exc}", file=sys.stderr)
@@ -615,10 +626,14 @@ def main(argv: list[str] | None = None) -> int:
     checkout_mode = parser.add_mutually_exclusive_group()
     checkout_mode.add_argument("--require-checkout", action="store_true", help="require a bound invocation checkout for shell")
     checkout_mode.add_argument("--outside-checkout", action="store_true", help="require a non-Git invocation directory for shell")
+    checkout_mode.add_argument("--install-hooks", action="store_true", help="permit migration of a repository-local .githooks setting")
     args = parser.parse_args(argv)
+    if args.install_hooks and args.command != "shell":
+        parser.error("--install-hooks requires shell")
     if args.command == "shell":
         return _shell_context(
             args.directory, require_checkout=args.require_checkout, outside_checkout=args.outside_checkout,
+            install_hooks=args.install_hooks,
         )
     receipt: dict[str, Any] = {"schema": SCHEMA, "ok": True}
     try:

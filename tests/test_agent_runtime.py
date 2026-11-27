@@ -20,6 +20,8 @@ from unittest.mock import patch
 
 import pytest
 
+from tests.agent_runtime.agy_hook_helpers import bind_registration_runtime as bind_registration_runtime
+from tests.agent_runtime.agy_hook_helpers import registration_host as registration_host
 from tests.agent_runtime.product_roots import agent_runtime_roots, configured_roots  # noqa: F401
 
 
@@ -160,7 +162,7 @@ def test_acpx_pilot_usage_records_strip_sensitive_context(
 
 
 @pytest.fixture
-def valid_agy_hook_files(tmp_path, monkeypatch):
+def valid_agy_hook_files(tmp_path, monkeypatch, bind_registration_runtime):
     from lu_machinery.agent_runtime.agy_hook_config import GUARD_NAME, guard_registration, hook_locations
 
     home = tmp_path / "ordinary-home"
@@ -175,6 +177,7 @@ def valid_agy_hook_files(tmp_path, monkeypatch):
         path.write_text(json.dumps({GUARD_NAME: guard_registration()}), encoding="utf-8")
 
 
+@pytest.mark.usefixtures("bind_registration_runtime")
 @pytest.mark.parametrize("candidate", ["absent_home", "valid_home", "invalid_home", "invalid_workspace", "no_guard"])
 def test_agy_adapter_validates_the_workspace_guard(tmp_path, monkeypatch, candidate):
     """The adapter must enforce the packaged guard in an out-of-tree workspace."""

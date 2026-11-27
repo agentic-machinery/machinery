@@ -18,12 +18,14 @@ from lu_machinery.agent_runtime.tool_config import (
     _load_mcp_config,
     build_mcp_tool_config,
 )
+from tests.agent_runtime.agy_hook_helpers import bind_registration_runtime as bind_registration_runtime
+from tests.agent_runtime.agy_hook_helpers import registration_host as registration_host
 from tests.agent_runtime.product_roots import (  # noqa: F401
     agent_runtime_roots,
     configured_roots,
 )
 
-pytestmark = pytest.mark.usefixtures("agent_runtime_roots")
+pytestmark = pytest.mark.usefixtures("agent_runtime_roots", "bind_registration_runtime")
 
 
 @pytest.fixture(autouse=True)

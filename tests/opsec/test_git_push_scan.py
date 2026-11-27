@@ -27,6 +27,7 @@ from lu_machinery.opsec import git_push
 from lu_machinery.opsec import prepublish as gate
 from lu_machinery.publish import github
 from tests.helpers.product_tree import configured_roots  # noqa: F401
+from tests.host_context.conftest import build_host_layout, installed_hook_env
 from tests.opsec_fixtures import (
     CATALOG,
     MATCHER,
@@ -2822,12 +2823,23 @@ def test_tracked_hook_scans_once_and_refuses_flagged_messages(push_sandbox, pin,
     sha = sandbox.commit(subject + ("\n\n" + TOKEN if flagged else ""))
     _git(sandbox.work, "config", "core.hooksPath", ".githooks")
     before = sandbox.remote_refs()
+    layout = build_host_layout(sandbox.tmp / "tracked-hook-binding")
+    _git(sandbox.root, "remote", "add", "origin", "https://github.com/agentic-machinery/machinery.git")
+    _git(sandbox.work, "remote", "set-url", "origin", "https://github.com/learn-ukrainian/learn-ukrainian.github.io.git")
+    layout.data["repos"].update(machinery=str(sandbox.root), public=str(sandbox.work))
     environment = _env(
-        LU_PRODUCT_ROOT=str(sandbox.root), LEARN_UKRAINIAN_PRIMARY_REPO_ROOT=str(sandbox.root),
-        LEARN_UKRAINIAN_PYTHON=sys.executable,
+        **installed_hook_env(layout),
         **({"GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "core.hooksPath",
             "GIT_CONFIG_VALUE_0": os.devnull} if pin else {}),
     )
+    # These repositories contain no LFS objects. Keep the tracked hook's LFS
+    # call local even though the binding requires a registered origin.
+    binaries = sandbox.tmp / "hook-bin"
+    binaries.mkdir()
+    lfs = binaries / "git-lfs"
+    lfs.write_text("#!/bin/sh\ncat >/dev/null\n", encoding="utf-8")
+    lfs.chmod(0o755)
+    environment["PATH"] = os.pathsep.join((str(binaries), environment["PATH"]))
     # The metadata lookup opts out explicitly; ordinary scanner reads stay pinned.
     assert git_push.Repository(REAL_GIT, environment).text(
         "-C", str(sandbox.work), "rev-parse", "--git-path", "hooks"
@@ -2835,11 +2847,18 @@ def test_tracked_hook_scans_once_and_refuses_flagged_messages(push_sandbox, pin,
     assert git_push.Repository(REAL_GIT, environment, pin_hooks=False).text(
         "-C", str(sandbox.work), "rev-parse", "--git-path", "hooks"
     ).strip() == (os.devnull if pin else ".githooks")
+    installer = machinery_root() / "install_git_hooks.sh"
+    installed = subprocess.run(
+        ["bash", str(installer)], cwd=sandbox.work, env=environment,
+        capture_output=True, text=True, timeout=30,
+    )
+    if installed.returncode:
+        pytest.fail(installed.stderr)
     # Invoke the tracked hook directly for the plain-Git case: the read pin must
     # not disable the entry point being tested. The shim selects its own hook.
     if shim:
         arguments = [str(sandbox.shim), "-c", "core.hooksPath=.githooks",
-                     "push", "origin", "HEAD:refs/heads/feature"]
+                     "push", str(sandbox.remote), "HEAD:refs/heads/feature"]
         data = None
     else:
         arguments = [str(sandbox.work / ".githooks/pre-push"), "origin", str(sandbox.remote)]

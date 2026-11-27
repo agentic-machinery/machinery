@@ -13,6 +13,8 @@ from lu_machinery.agent_runtime.adapters.base import InvocationPlan
 from lu_machinery.agent_runtime.adapters.codex import CodexAdapter
 from lu_machinery.agent_runtime.attempt_safe_read import AttemptReadError, safe_read_attempt_file
 from lu_machinery.agent_runtime.watchdog import tail_liveness_file_for_debug
+from tests.agent_runtime.agy_hook_helpers import bind_registration_runtime as bind_registration_runtime
+from tests.agent_runtime.agy_hook_helpers import registration_host as registration_host
 from tests.agent_runtime.agy_hook_helpers import register_agy_hooks as register_agy_hooks
 from tests.agent_runtime.product_roots import agent_runtime_roots as agent_runtime_roots, configured_roots as configured_roots
 from tests.helpers.codex_exec_stream import completed_stream as completed_stream
@@ -3085,4 +3087,4 @@ def test_declared_catalogue_tool_requires_full_access():
         review_mcp_module.check_review_tool_requirements(brief, "isolated")
     assert "search_resources" in review_mcp_module.check_review_tool_requirements(brief, "full")
 
-pytestmark = [pytest.mark.usefixtures('agent_runtime_roots')]
+pytestmark = [pytest.mark.usefixtures("agent_runtime_roots", "bind_registration_runtime")]

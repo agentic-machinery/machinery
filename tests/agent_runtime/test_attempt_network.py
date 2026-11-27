@@ -24,6 +24,8 @@ from lu_machinery.agent_runtime.attempt_network import (
     validate_answers,
 )
 from lu_machinery.common.repo_root import machinery_path
+from tests.agent_runtime.agy_hook_helpers import bind_registration_runtime as bind_registration_runtime
+from tests.agent_runtime.agy_hook_helpers import registration_host as registration_host
 from tests.agent_runtime.product_roots import agent_runtime_roots, configured_roots  # noqa: F401
 from lu_machinery.dispatcher import cli, git, store, worker
 from lu_machinery.dispatcher.types import TaskSpec
@@ -516,6 +518,7 @@ def test_bound_attempt_runs_only_inside_the_attempt_boundary_with_the_exact_prom
         assert done["result_sha256"] == store.digest(b"review: done\n")
 
 
+@pytest.mark.usefixtures("bind_registration_runtime")
 @pytest.mark.parametrize("agent", ["agy", "codex"])
 def test_runner_executes_attempt_boundary_and_cleans_after_parse(world, tmp_path, monkeypatch, agent):  # noqa: F811
     root, home = world

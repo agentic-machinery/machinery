@@ -10,13 +10,15 @@ import pytest
 from lu_machinery.agent_runtime import runner
 from lu_machinery.agent_runtime.adapters.base import InvocationPlan
 from lu_machinery.agent_runtime.result import AgyAttempt, ParseResult
+from tests.agent_runtime.agy_hook_helpers import bind_registration_runtime as bind_registration_runtime
 from tests.agent_runtime.agy_hook_helpers import register_agy_hooks
+from tests.agent_runtime.agy_hook_helpers import registration_host as registration_host
 from tests.agent_runtime.product_roots import (  # noqa: F401
     agent_runtime_roots,
     configured_roots,
 )
 
-pytestmark = pytest.mark.usefixtures("agent_runtime_roots")
+pytestmark = pytest.mark.usefixtures("agent_runtime_roots", "bind_registration_runtime")
 
 ELIGIBILITY_503 = "Eligibility check failed: UNAVAILABLE (code 503)"
 

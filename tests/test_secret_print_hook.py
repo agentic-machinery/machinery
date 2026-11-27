@@ -4,14 +4,13 @@ from __future__ import annotations
 
 import io
 import json
-import os
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 
 from lu_machinery.common.repo_root import machinery_path
-
 from tests.agents_extensions.test_guard_secret_print import (
     ROUND_FIVE_KEYED,
     ROUND_FIVE_SPELLINGS,
@@ -20,6 +19,8 @@ from tests.agents_extensions.test_guard_secret_print import (
     ROUND_SIX_INVENTORY,
     ROUND_SIX_NEIGHBORS,
 )
+from tests.host_context.conftest import host_layout as host_layout
+from tests.host_context.conftest import installed_hook_env
 
 HARNESS_NAMES = ["claude", "codex", "grok", "kimi", "cursor", "agy", "opencode"]
 ADAPTER = machinery_path("agent_runtime/secret_print_hook.py")
@@ -470,22 +471,12 @@ def test_guard_resolves_from_release_without_product_copy(monkeypatch, capsys, s
 
 
 @pytest.fixture(autouse=True)
-def secret_print_product(tmp_path, monkeypatch):
+def secret_print_product(host_layout, monkeypatch):
     """Select a product checkout that has no guard copy: the adapter must run the release's guard.
 
-    The checkout is also the primary and state root for this test. Both leave the
-    environment when the test ends, so retention can remove the directory.
+    Each layout owns its product, machinery checkout, and detached state.
     """
-    product = tmp_path / "guard-product"
-    product.mkdir()
-    # A primary checkout: the adapter validates its hook context by the shared root rule.
-    # A minimal environment: pytest's PYTEST_CURRENT_TEST can exceed the per-argument limit.
-    git_env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": str(tmp_path), "GIT_CONFIG_NOSYSTEM": "1"}
-    subprocess.run(["git", "init", "-q", str(product)], check=True, capture_output=True, env=git_env)
-    # The hook resolver keeps a configured primary. Point it at this test's checkout and
-    # let monkeypatch remove it with the test: a previous passed test's tmp must not remain
-    # the process primary after retention deletes that directory.
-    for name in ("LU_PRODUCT_ROOT", "LEARN_UKRAINIAN_PRIMARY_REPO_ROOT", "LU_STATE_ROOT"):
-        monkeypatch.setenv(name, str(product))
-        monkeypatch.setitem(NATIVE_ENV, name, str(product))
-    return product
+    for name, value in installed_hook_env(host_layout).items():
+        monkeypatch.setenv(name, value)
+        monkeypatch.setitem(NATIVE_ENV, name, value)
+    return Path(host_layout.data["repos"]["public"])

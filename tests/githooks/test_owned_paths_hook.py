@@ -162,7 +162,13 @@ def _product_repo(
     ):
         assert _git(repo, *args, env=env).returncode == 0
     _bind_product_runtime(repo, python, env)
-    installed = _run(["/usr/bin/bash", str(_installer(python))], cwd=repo, env=env)
+    installer = ["/usr/bin/bash", str(_installer(python))]
+    assert _git(repo, "config", "core.hooksPath", ".other-hooks", env=env).returncode == 0
+    refused = _run(installer, cwd=repo, env=env)
+    hooks_path = _git(repo, "config", "--get", "core.hooksPath", env=env)
+    assert (refused.returncode, hooks_path.stdout.strip()) == (2, ".other-hooks"), refused.stderr
+    assert _git(repo, "config", "core.hooksPath", ".githooks", env=env).returncode == 0
+    installed = _run(installer, cwd=repo, env=env)
     assert installed.returncode == 0, installed.stderr
     assert "pre-commit: installed" in installed.stdout
     delegator = repo / ".git" / "hooks" / "pre-commit"
