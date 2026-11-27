@@ -5,13 +5,11 @@ from __future__ import annotations
 import json
 import sqlite3
 from pathlib import Path
+
 import pytest
 import yaml
+
 from lu_machinery.review import findings_db as db
-
-
-
-
 
 FINDING = {
     "id": "F-01",
@@ -102,7 +100,8 @@ def test_tables_without_a_version_are_refused_not_adopted(tmp_path: Path) -> Non
         db.connect(path)
 
 
-def test_the_path_is_per_level_under_batch_state(tmp_path: Path) -> None:
+def test_the_path_is_per_level_under_batch_state(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("LU_STATE_ROOT", str(tmp_path))
     assert db.db_path("a1", tmp_path) == tmp_path / "batch_state" / "review-findings" / "a1.sqlite"
     with pytest.raises(db.FindingsDbError):
         db.db_path("../a1", tmp_path)

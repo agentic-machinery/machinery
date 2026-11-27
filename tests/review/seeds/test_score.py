@@ -26,15 +26,13 @@ import json
 import sqlite3
 from datetime import date
 from pathlib import Path
+
 import pytest
+
 from lu_machinery.review import findings_db
 from lu_machinery.review.seeds import manifest as sm
 from lu_machinery.review.seeds import score
 from tests.review.seeds.fixtures import SEATS, Env, clean_lesson, finding, linguistic_seed, mechanical_seed
-
-
-
-
 
 TODAY = date(2026, 9, 25)
 NEAR = pytest.approx
@@ -45,7 +43,8 @@ def near(value: float, expected: float) -> bool:
 
 
 @pytest.fixture
-def env(tmp_path: Path) -> Env:
+def env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Env:
+    monkeypatch.setenv("LU_STATE_ROOT", str(tmp_path))
     return Env(tmp_path)
 
 

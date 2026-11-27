@@ -23,7 +23,8 @@ from pathlib import Path
 from typing import Any
 
 from lu_machinery.common import json_depth
-from lu_machinery.common.repo_root import MachineryConfigError, state_root
+from lu_machinery.common.repo_root import MachineryConfigError, primary_root, state_root
+from lu_machinery.common.task_store_paths import tasks_dir as default_tasks_dir
 from lu_machinery.dispatcher.cli import ALIASES, finite_number
 from lu_machinery.orchestration.execution_safe_git import run_git
 from lu_machinery.orchestration.task_record_store import (
@@ -117,11 +118,11 @@ def read_json(path: Path) -> dict[str, Any] | None:
 
 
 def runs_dir(repo_root: Path) -> Path:
-    return repo_root / "batch_state" / "orchestrator-runs"
+    return state_root() / "batch_state" / "orchestrator-runs"
 
 
 def tasks_dir(repo_root: Path) -> Path:
-    return repo_root / "batch_state" / "tasks"
+    return default_tasks_dir()
 
 
 def run_state_path(repo_root: Path, run_id: str) -> Path:
@@ -767,7 +768,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--repo-root",
         type=Path,
         default=None,
-        help="checkout whose batch_state holds the run ledger (default: the shared-state root)",
+        help="checkout used for repository commands (default: configured checkout)",
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -897,13 +898,13 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-    if args.repo_root is None:
-        try:
-            args.repo_root = state_root()
-        except MachineryConfigError as exc:
-            print(json.dumps({"error": str(exc)}))
-            return 1
-    return args.func(args)
+    try:
+        if args.repo_root is None:
+            args.repo_root = primary_root()
+        return args.func(args)
+    except MachineryConfigError as exc:
+        print(json.dumps({"error": str(exc)}))
+        return 1
 
 
 if __name__ == "__main__":

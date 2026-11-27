@@ -8,12 +8,12 @@ from pathlib import Path
 
 from lu_machinery.common.repo_root import (
     MachineryConfigError,
+    configured_host_state_root,
     configured_interpreter,
     configured_primary_root,
     is_configured_state_root,
     resolve_path,
     state_root,
-    state_root_for_checkout,
 )
 from lu_machinery.guardrails.worktree_containment import (
     NotAGitRepositoryError,
@@ -150,7 +150,7 @@ def _resolve_repo_plane_base(repo_root: Path, *, allow_non_git: bool) -> Path:
     if configured_state is not None:
         return configured_state
     try:
-        base = resolve_main_root(repo_root)
+        resolve_main_root(repo_root)
     except NotAGitRepositoryError as exc:
         if not allow_non_git:
             raise PlaneRootAnchorError(
@@ -162,7 +162,7 @@ def _resolve_repo_plane_base(repo_root: Path, *, allow_non_git: bool) -> Path:
                 "non-git fixture."
             ) from exc
         return repo_root.resolve()
-    return state_root_for_checkout(base)
+    return state_root()
 
 
 def local_plane_is_retired(
@@ -182,7 +182,9 @@ def local_plane_is_retired(
         return _retired_marker_present(Path(root).expanduser().resolve())
     env = os.environ.get(ENV_ROOT)
     if env:
-        return _retired_marker_present(Path(env).expanduser().resolve())
+        host_state = configured_host_state_root()
+        path = host_state / DEFAULT_ROOT_REL if host_state is not None else Path(env).expanduser()
+        return _retired_marker_present(path.resolve())
     try:
         base = _resolve_repo_plane_base(repo_root, allow_non_git=False) if repo_root is not None else state_root()
     except (PlaneRootAnchorError, NotAGitRepositoryError, MachineryConfigError, OSError, RuntimeError):
@@ -214,11 +216,11 @@ def default_plane_root(
     1. ``FLEET_COMMS_ROOT`` env override, validated as a dedicated storage root.
     2. ``repo_root`` when the caller names one (the Monitor API's configured state
        root, a fixture): the configured non-Git state root when ``repo_root`` names
-       it, else the primary checkout that owns its shared ``.git`` store (converged
-       onto ``LU_STATE_ROOT`` when configured for this plane).
+       it, or the shared state when the argument is a Git checkout. Explicit
+       non-Git fixture roots require ``allow_non_git=True``.
     3. Otherwise the shared-state anchor, :func:`lu_machinery.common.repo_root.state_root`
-       (``LU_STATE_ROOT`` or ``LU_PRIMARY_REPO_ROOT`` / aliases). Without one the
-       installed package raises ``StateRootError``, which names the variable.
+       (the host binding or ``LU_STATE_ROOT``). Missing state configuration
+       raises ``StateRootError``.
 
     The working directory is never consulted: a command run from another
     repository's checkout (a machinery worktree) once anchored on that
@@ -231,7 +233,8 @@ def default_plane_root(
     try:
         env = os.environ.get(ENV_ROOT)
         if env:
-            root = validate_plane_root(Path(env))
+            host_state = configured_host_state_root()
+            root = validate_plane_root(host_state / DEFAULT_ROOT_REL if host_state is not None else Path(env))
         elif repo_root is None:
             root = validate_plane_root(state_root() / DEFAULT_ROOT_REL)
         else:

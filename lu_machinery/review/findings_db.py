@@ -48,7 +48,7 @@ from typing import Any
 
 import yaml
 
-from lu_machinery.common.repo_root import machinery_path, main_checkout_root, state_root
+from lu_machinery.common.repo_root import machinery_path, state_root
 
 PARAMETERS_PATH = machinery_path("config/review_parameters.yaml")
 SCHEMA_VERSION = 5
@@ -238,8 +238,8 @@ def now_iso(moment: datetime | None = None) -> str:
 
 
 def batch_root(repo_root: Path | None = None) -> Path:
-    """Where ``batch_state`` lives: the primary checkout, never a worktree copy."""
-    return state_root() if repo_root is None else main_checkout_root(Path(repo_root).resolve())
+    """Return the configured durable root for review findings."""
+    return state_root()
 
 
 def db_path(level: str, repo_root: Path | None = None) -> Path:

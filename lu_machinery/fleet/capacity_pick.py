@@ -32,7 +32,6 @@ if __package__ in (None, ""):  # run as a file: put the repository root on sys.p
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from lu_machinery.agent_runtime.agent_identity import RETIRED_AGENT_ALIASES
 from lu_machinery.common import json_depth
-from lu_machinery.common.repo_root import state_root
 from lu_machinery.common.task_store_paths import tasks_dir as default_tasks_dir
 from lu_machinery.fleet import credit_lane
 from lu_machinery.fleet.reset_reserve import (
@@ -337,7 +336,7 @@ def build_lane_rows(
         supplied = (
             reset_reserve
             if reset_reserve is not None
-            else load_reset_reserve(state_root(), codex_info=tagged, account=label)
+            else load_reset_reserve(codex_info=tagged, account=label)
         )
         if codex_reserve_account(supplied) != label:
             return unavailable_reserve()

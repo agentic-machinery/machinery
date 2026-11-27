@@ -21,6 +21,7 @@
 
 # [run]
 tests/host_context/test_host_context.py
+tests/host_context/test_state_paths.py
 tests/common/test_json_depth.py
 tests/lint/test_json_readers.py
 tests/property/test_path_safety_props.py

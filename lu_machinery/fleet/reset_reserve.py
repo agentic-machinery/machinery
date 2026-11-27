@@ -10,7 +10,7 @@ from typing import Any
 
 from lu_machinery.api.subscription_usage import get_provider_usage_data, pace_is_deficit
 from lu_machinery.common import json_depth
-from lu_machinery.common.repo_root import main_checkout_root
+from lu_machinery.common.repo_root import state_root
 from lu_machinery.fleet.credit_lane import CAPACITY_VERIFIED
 
 SCHEMA_VERSION = "operator-reset-reserve.v1"
@@ -202,13 +202,13 @@ def _reserve_entries(payload: dict[str, Any]) -> list[dict[str, Any]] | None:
 
 
 def load_reset_reserve(
-    repo_root: Path,
+    repo_root: Path | None = None,
     *,
     now: datetime | None = None,
     codex_info: dict[str, Any] | None = None,
     account: str | None = None,
 ) -> dict[str, Any]:
-    """Load one account's assertion from the primary checkout and expose its safe fields.
+    """Load one account's assertion from durable state and expose its safe fields.
 
     ``account`` defaults to account a (``sub``). The assertion is never changed
     or consumed. Invalid, absent, expired, or unknown/stale live inventory
@@ -219,7 +219,7 @@ def load_reset_reserve(
     label = _ACCOUNT_A if account is None else codex_reserve_account(account)
     if not label:
         return unavailable_reserve()
-    path = main_checkout_root(Path(repo_root).resolve()) / RESERVE_RELATIVE_PATH
+    path = state_root() / RESERVE_RELATIVE_PATH
     try:
         payload = json_depth.loads(path.read_text(encoding="utf-8"), max_depth=512)
     except (OSError, UnicodeError, json.JSONDecodeError):

@@ -139,6 +139,7 @@ def fleet_comms_primary(pytestconfig: pytest.Config) -> Path:
 def unconfigured_primary(monkeypatch: pytest.MonkeyPatch) -> None:
     """Exercise missing-anchor refusals without the session's private primary."""
     monkeypatch.delenv("LEARN_UKRAINIAN_PRIMARY_REPO_ROOT", raising=False)
+    monkeypatch.delenv("LU_STATE_ROOT", raising=False)
     monkeypatch.delenv("LEARN_UKRAINIAN_STATE_ROOT", raising=False)
 
 
@@ -2039,19 +2040,13 @@ def _retarget_api_batch_state(monkeypatch: pytest.MonkeyPatch, batch_state: Path
     connect into a 500 (``Failed`` is a ``BaseException``, so the orient
     section handler does not catch it).
 
-    ``git_hygiene_router._active_task_ids`` is not this seam: it reads
-    ``project_root / "batch_state" / "tasks"`` (the checkout, via
-    ``live_repo_root``), and only opens task JSON read-only. It never opens
-    the task-cache database. Pointing ``live_repo_root`` at the temp store
-    would detach git-backed API tests from the repo.
-
     ``hramatka_router`` binds ``BATCH_STATE_DIR / "hramatka"`` at import. That
     is the lesson store, not ``tasks/``, and this guard does not watch it.
     """
     monkeypatch.setenv("LEARN_UKRAINIAN_BATCH_STATE_DIR", str(batch_state))
     api_config = _loaded_module("lu_machinery", "api", "config")
     if api_config is not None:
-        monkeypatch.setattr(api_config, "BATCH_STATE_DIR", batch_state)
+        monkeypatch.setitem(vars(api_config), "BATCH_STATE_DIR", batch_state)
     monitor_context = _loaded_module("lu_machinery", "api", "monitor_context")
     if monitor_context is not None:
         monitor_context.production_context.cache_clear()
@@ -2079,7 +2074,7 @@ def _dispatch_task_store_base(tmp_path_factory: pytest.TempPathFactory) -> Path:
 def _isolate_dispatch_task_store(_dispatch_task_store_base: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     """Point the dispatch task store at a per-test directory (#8654).
 
-    The directory is ``<session base>/<n>/tasks``, so ``tasks_dir().parent``
+    The directory is ``<session base>/<n>/batch_state/tasks``, so ``tasks_dir().parent``
     (where delegate writes ``preflight_fast_fail.jsonl``) is also per-test.
     It comes from ``tmp_path_factory``, not the test's ``tmp_path``: an autouse
     fixture that creates a subdirectory of ``tmp_path`` breaks tests that
@@ -2090,8 +2085,11 @@ def _isolate_dispatch_task_store(_dispatch_task_store_base: Path, monkeypatch: p
     ``app.state.ctx.roots.batch_state_dir``, so Monitor requests do not open
     the live ``.task_cache.sqlite3``.
     """
-    isolated = _dispatch_task_store_base / str(next(_DISPATCH_STORE_SEQ)) / "tasks"
+    state = _dispatch_task_store_base / str(next(_DISPATCH_STORE_SEQ))
+    isolated = state / "batch_state" / "tasks"
     isolated.mkdir(parents=True)
+    monkeypatch.setenv("LU_STATE_ROOT", str(state))
+    monkeypatch.delenv("LEARN_UKRAINIAN_STATE_ROOT", raising=False)
     monkeypatch.setenv("LU_TASKS_DIR", str(isolated))
     _retarget_api_batch_state(monkeypatch, isolated.parent)
     return isolated
@@ -3018,6 +3016,7 @@ def pytest_configure(config: pytest.Config) -> None:
     config.add_cleanup(fleet_env.undo)
     fleet_env.setenv("FLEET_COMMS_ROOT", str(config._fleet_comms_root))
     fleet_env.setenv("LEARN_UKRAINIAN_PRIMARY_REPO_ROOT", str(primary))
+    fleet_env.setenv("LU_STATE_ROOT", str(primary))
     fleet_env.delenv("LEARN_UKRAINIAN_STATE_ROOT", raising=False)
     config.addinivalue_line("markers", "reads_content: test reads a controlled content or policy fixture")
     config.pluginmanager.register(

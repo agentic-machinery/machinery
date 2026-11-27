@@ -1444,6 +1444,7 @@ def test_canonical_state_root_and_default_db_converge_for_non_git_state_root(
     assert default_database_path(checkout) == expected_db
     assert default_database_path(worktree) == expected_db
 
-    # An unconfigured non-Git directory is still refused by canonical_state_root.
-    with pytest.raises(SessionStreamDatabaseError):
+    assert canonical_state_root(unconfigured_dir) == state.resolve()
+    monkeypatch.delenv("LU_STATE_ROOT")
+    with pytest.raises(SessionStreamDatabaseError, match="LU_STATE_ROOT"):
         canonical_state_root(unconfigured_dir)

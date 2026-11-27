@@ -675,7 +675,7 @@ def control_plane_root(repo_root: Path) -> Path:
     worktrees (#672 P2.1, :mod:`scripts.orchestration.fleet_repos`). A worktree of an
     allowlisted checkout therefore resolves to that single control-plane root, so a
     remover acting on it reads the records and takes the lock dispatch wrote and holds
-    (#8624). Any other repository is its own control plane. Raises
+    (#8624). An explicitly selected checkout also uses the shared state. Raises
     :class:`ControlPlaneError` when the fleet catalog or repos root cannot be read: a
     caller that mutates must then refuse, since it cannot tell whether the repository
     is a sibling.
@@ -719,7 +719,7 @@ def control_plane_root(repo_root: Path) -> Path:
             or (not (public / ".git").exists() and primary_cfg is None and product_cfg is None)
         ):
             return public
-    return repo
+    return public
 
 
 def owning_repo_root(worktree: Path, *, default: Path) -> Path:

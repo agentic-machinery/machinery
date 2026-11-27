@@ -94,6 +94,7 @@ def world(tmp_path, monkeypatch):
     # primary and also the root that owns the hook, as the checkout was in the product tree.
     monkeypatch.setenv("LU_PRODUCT_ROOT", str(primary))
     monkeypatch.setenv("LEARN_UKRAINIAN_PRIMARY_REPO_ROOT", str(primary))
+    monkeypatch.setenv("LU_STATE_ROOT", str(primary))
     for key in ("PYTHONPATH", "PYTHONHOME", "PYTHONUSERBASE", "PYTHONSTARTUP", "PYTHONINSPECT"):
         monkeypatch.delenv(key, raising=False)
     catalog = {

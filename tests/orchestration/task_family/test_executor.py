@@ -11,12 +11,14 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
+
 import pytest
+
+from lu_machinery.orchestration.task_family import codex_state, executor, git_safety
+from lu_machinery.orchestration.task_family.storage import TaskFamilyStorage
 from tests.helpers.interrupted_checkout import hashes
 from tests.helpers.interrupted_checkout import interrupted_checkout as interrupted_checkout
 from tests.helpers.product_tree import configured_roots as configured_roots
-from lu_machinery.orchestration.task_family import codex_state, executor, git_safety
-from lu_machinery.orchestration.task_family.storage import TaskFamilyStorage
 from tests.orchestration.test_worktree_artifacts import assert_record_only
 
 pytestmark = pytest.mark.usefixtures("configured_roots")
@@ -29,6 +31,7 @@ pytestmark = pytest.mark.usefixtures("configured_roots")
 def test_family_cleanup_interrupted_work_preserves_bytes(interrupted_checkout, status, monkeypatch):
     repo, tree, _tasks, record, result, output = interrupted_checkout
     monkeypatch.setenv("LEARN_UKRAINIAN_PRIMARY_REPO_ROOT", str(repo))
+    monkeypatch.setenv("LU_STATE_ROOT", str(repo))
     monkeypatch.delenv("LEARN_UKRAINIAN_STATE_ROOT", raising=False)
     monkeypatch.setenv("LU_PRODUCT_ROOT", str(repo))
     record.write_text(
@@ -76,7 +79,7 @@ def git(cwd: Path, *args: str) -> str:
     return proc.stdout.strip()
 
 
-def init_repo(tmp_path: Path) -> Path:
+def init_repo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     repo, remote = tmp_path / "repo", tmp_path / "origin.git"
     git(tmp_path, "init", "--initial-branch=main", str(repo))
     git(tmp_path, "init", "--bare", str(remote))
@@ -87,6 +90,7 @@ def init_repo(tmp_path: Path) -> Path:
     git(repo, "commit", "-m", "seed")
     git(repo, "remote", "add", "origin", str(remote))
     git(repo, "push", "-u", "origin", "main")
+    monkeypatch.setenv("LU_STATE_ROOT", str(repo))
     return repo
 
 
@@ -211,8 +215,8 @@ def test_discovers_state_5_and_uses_read_only_production_threads_schema(tmp_path
     assert record.archived is False
 
 
-def test_executor_paths_match_task_family_storage(tmp_path: Path) -> None:
-    repo = init_repo(tmp_path)
+def test_executor_paths_match_task_family_storage(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    repo = init_repo(tmp_path, monkeypatch)
     cleanup_plan = executor.CleanupPlan(
         operation_id=str(uuid4()),
         family_id="path-contract",
@@ -233,8 +237,8 @@ def test_executor_paths_match_task_family_storage(tmp_path: Path) -> None:
     assert executor.receipt_path(repo, cleanup_plan) == storage.receipt_path
 
 
-def test_apply_requires_caller_digest_and_exact_persisted_selection(tmp_path: Path) -> None:
-    repo = init_repo(tmp_path)
+def test_apply_requires_caller_digest_and_exact_persisted_selection(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    repo = init_repo(tmp_path, monkeypatch)
     task_id, other_id = str(uuid4()), str(uuid4())
     db = tmp_path / "state_5.sqlite"
     write_threads(
@@ -271,7 +275,7 @@ def test_apply_requires_caller_digest_and_exact_persisted_selection(tmp_path: Pa
 def test_archive_only_observes_native_archive_and_stops_at_tasks_archived(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    repo = init_repo(tmp_path)
+    repo = init_repo(tmp_path, monkeypatch)
     task_id = str(uuid4())
     db = tmp_path / "state_5.sqlite"
     write_threads(
@@ -314,8 +318,8 @@ def test_archive_only_observes_native_archive_and_stops_at_tasks_archived(
     )
 
 
-def test_advisory_lock_path_is_not_git_lock_but_git_worktree_lock_blocks(tmp_path: Path) -> None:
-    repo = init_repo(tmp_path)
+def test_advisory_lock_path_is_not_git_lock_but_git_worktree_lock_blocks(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    repo = init_repo(tmp_path, monkeypatch)
     worktree = add_worktree(repo, "cleanup/locked")
     git_safety._worktree_lock_path(repo, worktree).parent.mkdir(parents=True, exist_ok=True)
     git_safety._worktree_lock_path(repo, worktree).touch()
@@ -328,7 +332,7 @@ def test_advisory_lock_path_is_not_git_lock_but_git_worktree_lock_blocks(tmp_pat
 
 
 def test_executor_locks_each_resolved_worktree_path_once(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    repo = init_repo(tmp_path)
+    repo = init_repo(tmp_path, monkeypatch)
     shared_worktree = tmp_path / "shared-worktree"
     approved = plan(
         repo,
@@ -356,7 +360,7 @@ def test_executor_locks_each_resolved_worktree_path_once(tmp_path: Path, monkeyp
 def test_github_queries_use_valid_commands_and_normalize_merge_commit(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    repo = init_repo(tmp_path)
+    repo = init_repo(tmp_path, monkeypatch)
     calls: list[list[str]] = []
 
     def fake_gh(args: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
@@ -383,7 +387,7 @@ def test_finish_cleanup_preserves_unrelated_worktree_and_rechecks_pr_before_muta
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.delenv("TMPDIR", raising=False)
-    repo = init_repo(tmp_path)
+    repo = init_repo(tmp_path, monkeypatch)
     target_branch, unrelated_branch = "cleanup/remove", "cleanup/keep"
     remove_worktree, keep_worktree = add_worktree(repo, target_branch), add_worktree(repo, unrelated_branch)
     task_id = str(uuid4())
@@ -431,7 +435,7 @@ def test_branch_delete_crash_resumes_from_verified_bundle_when_branch_is_already
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.delenv("TMPDIR", raising=False)
-    repo = init_repo(tmp_path)
+    repo = init_repo(tmp_path, monkeypatch)
     branch, worktree = "cleanup/resume", add_worktree(repo, "cleanup/resume")
     task_id = str(uuid4())
     db = tmp_path / "state_5.sqlite"
@@ -480,7 +484,7 @@ def test_branch_delete_crash_resumes_from_verified_bundle_when_branch_is_already
 
 
 def test_remote_lookup_failure_blocks_branch_delete(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    repo = init_repo(tmp_path)
+    repo = init_repo(tmp_path, monkeypatch)
     monkeypatch.setattr(
         git_safety, "run_git", lambda *_args, **_kwargs: subprocess.CompletedProcess([], 128, "", "network down")
     )
@@ -492,7 +496,7 @@ def test_runtime_without_eligibility_or_proof_is_preserved_and_blocks(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.delenv("TMPDIR", raising=False)
-    repo = init_repo(tmp_path)
+    repo = init_repo(tmp_path, monkeypatch)
     branch, worktree = "cleanup/runtime", add_worktree(repo, "cleanup/runtime")
     task_id = str(uuid4())
     db = tmp_path / "state_5.sqlite"
@@ -535,7 +539,7 @@ def test_eligible_runtime_is_truthfully_preserved_when_native_retirement_is_unav
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.delenv("TMPDIR", raising=False)
-    repo = init_repo(tmp_path)
+    repo = init_repo(tmp_path, monkeypatch)
     branch, worktree = "cleanup/runtime-deferred", add_worktree(repo, "cleanup/runtime-deferred")
     task_id = str(uuid4())
     db = tmp_path / "state_5.sqlite"
@@ -579,7 +583,7 @@ def test_remove_unclaimed_worktree_refuses_while_a_dispatch_task_claims_it(
 ) -> None:
     """#8610: family cleanup takes delegate's worktree lock and honours an unfinished task claim."""
     monkeypatch.delenv("TMPDIR", raising=False)
-    repo = init_repo(tmp_path)
+    repo = init_repo(tmp_path, monkeypatch)
     worktree = add_worktree(repo, "codex/claimed")
     tasks = repo / "batch_state" / "tasks"
     tasks.mkdir(parents=True)

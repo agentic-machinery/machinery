@@ -23,7 +23,7 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from lu_machinery.common import json_depth
 from lu_machinery.common.github_client import GitHubRateLimited
-from lu_machinery.common.repo_root import MachineryConfigError, configured_github_slug, configured_state_root
+from lu_machinery.common.repo_root import MachineryConfigError, configured_github_slug, state_root
 from lu_machinery.gh_merge_queue_status import extract_pr_number
 from lu_machinery.github_check_rollup import bind_workflow_runs, group_collapsed_by_name, project_check_runs
 from lu_machinery.ops import verify_run as ops_verify_run
@@ -3948,21 +3948,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--state-file",
         type=Path,
         default=None,
-        help=(
-            "Keeper state JSON path (default: under LU_STATE_ROOT when configured—"
-            "per-repo slug for non-default repos on a non-Git state root—"
-            "else <repo-root>/batch_state/merge_queue_keeper.json)."
-        ),
+        help="Keeper state JSON path (default: repository-specific path under the configured state root).",
     )
     parser.add_argument(
         "--lock-file",
         type=Path,
         default=None,
-        help=(
-            "Keeper lock file path (default: under LU_STATE_ROOT/batch_state/locks when configured—"
-            "per-repo slug for non-default repos on a non-Git state root—"
-            "else <repo-root>/batch_state/locks/merge_queue_keeper.lock)."
-        ),
+        help="Keeper lock path (default: repository-specific path under the configured state root).",
     )
     parser.add_argument(
         "--direct-land-repo",
@@ -4043,33 +4035,12 @@ def _is_default_repo(repo: str) -> bool:
 
 
 def default_keeper_paths(repo_root: Path, repo: str = _DEFAULT_REPO) -> tuple[Path, Path]:
-    """Resolve default keeper state and lock paths without mixing repositories.
-
-    In today's layout (no ``LU_STATE_ROOT`` or a Git checkout state root), non-default
-    repositories keep their own ``<repo-root>/batch_state`` state and lock files, while
-    the default product repository converges on ``LU_STATE_ROOT`` when set. Under a
-    dedicated non-Git ``LU_STATE_ROOT``, the default repository uses
-    ``batch_state/merge_queue_keeper.json`` and non-default repositories get distinct
-    per-repository slugged files under ``LU_STATE_ROOT/batch_state/``.
-    """
-    configured_state = configured_state_root()
-    if configured_state is None:
-        state_base = repo_root.resolve()
-        return (
-            state_base / "batch_state/merge_queue_keeper.json",
-            state_base / "batch_state/locks/merge_queue_keeper.lock",
-        )
-    resolved_state = configured_state.resolve()
+    """Keep repository-specific queue locks and state under the durable root."""
+    resolved_state = state_root().resolve()
     if _is_default_repo(repo):
         return (
             resolved_state / "batch_state/merge_queue_keeper.json",
             resolved_state / "batch_state/locks/merge_queue_keeper.lock",
-        )
-    if (resolved_state / ".git").is_dir():
-        state_base = repo_root.resolve()
-        return (
-            state_base / "batch_state/merge_queue_keeper.json",
-            state_base / "batch_state/locks/merge_queue_keeper.lock",
         )
     norm = normalize_repository(repo)
     repo_part = norm.removeprefix("github.com/")

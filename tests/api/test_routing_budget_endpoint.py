@@ -657,7 +657,8 @@ def test_fresh_refresh_evaluates_reserve_from_response_inventory(
     now = datetime(2026, 5, 13, 20, 30, tzinfo=UTC)
     _configure(monkeypatch, tmp_path, [_record("codex (gpt-5.5)", 800.0, now)])
     monkeypatch.setattr(state_router, "get_freshest_lane_usage", lambda: None)
-    monkeypatch.setattr(reset_reserve, "main_checkout_root", lambda _root: tmp_path)
+    monkeypatch.setenv("LU_STATE_ROOT", str(tmp_path))
+    monkeypatch.delenv("LEARN_UKRAINIAN_BATCH_STATE_DIR", raising=False)
     assertion_path = tmp_path / reset_reserve.RESERVE_RELATIVE_PATH
     assertion_path.parent.mkdir(parents=True)
     assertion_path.write_text(

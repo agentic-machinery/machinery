@@ -51,6 +51,7 @@ def test_default_plane_root_anchors_linked_worktree_to_primary(
         encoding="utf-8",
     )
 
+    monkeypatch.setenv("LU_STATE_ROOT", str(primary))
     expected = primary / "batch_state" / "fleet-comms" / "v1"
     assert default_plane_root(repo_root=primary) == expected
     assert default_plane_root(repo_root=worktree) == expected
@@ -63,11 +64,11 @@ def test_default_plane_root_anchors_linked_worktree_to_primary(
     monkeypatch.chdir(rival)
     monkeypatch.setenv(PRIMARY_ROOT_ENV, str(primary))
     assert default_plane_root() == expected
-    monkeypatch.delenv(PRIMARY_ROOT_ENV)
-    with pytest.raises(StateRootError, match=PRIMARY_ROOT_ENV):
+    monkeypatch.delenv("LU_STATE_ROOT")
+    with pytest.raises(StateRootError, match="LU_STATE_ROOT"):
         default_plane_root()
     assert not (rival / "batch_state").exists()
-    monkeypatch.setenv(PRIMARY_ROOT_ENV, str(primary))
+    monkeypatch.setenv("LU_STATE_ROOT", str(primary))
 
     # A dedicated default directory is valid; the checkout itself is never storage.
     assert read_plane_status(repo_root=worktree)["read_only"] is True
@@ -87,11 +88,12 @@ def test_default_plane_root_anchors_linked_worktree_to_primary(
     connect.assert_not_called()
     assert sorted(tmp_path.rglob("*")) == before
 
-    default_primary = tmp_path / "default-primary"
-    (default_primary / ".git").mkdir(parents=True)
+    default_primary = tmp_path / "default-state"
+    default_primary.mkdir()
     computed_default = default_primary / "batch_state" / "fleet-comms" / "v1"
     computed_default.parent.mkdir(parents=True)
     computed_default.symlink_to(alias, target_is_directory=True)
+    monkeypatch.setenv("LU_STATE_ROOT", str(default_primary))
     before = sorted(tmp_path.rglob("*"))
     retired = Mock(side_effect=AssertionError("checkout default reached retired-marker lookup"))
     with monkeypatch.context() as guard:
@@ -102,6 +104,7 @@ def test_default_plane_root_anchors_linked_worktree_to_primary(
     connect.assert_not_called()
     assert sorted(tmp_path.rglob("*")) == before
 
+    monkeypatch.setenv("LU_STATE_ROOT", str(primary))
     loop = tmp_path / "loop"
     loop.symlink_to(loop)
     expected.parent.mkdir(parents=True)
@@ -158,7 +161,8 @@ def test_default_plane_root_refuses_retired_local_marker(
     monkeypatch.delenv("FLEET_COMMS_ROOT", raising=False)
     monkeypatch.delenv("FLEET_COMMS_ALLOW_LOCAL_SHADOW", raising=False)
     primary = tmp_path / "primary"
-    (primary / ".git").mkdir(parents=True)
+    primary.mkdir()
+    monkeypatch.setenv("LU_STATE_ROOT", str(primary))
     plane = primary / "batch_state" / "fleet-comms" / "v1"
     plane.mkdir(parents=True)
     (plane / RETIRED_LOCAL_MARKER).write_text("retired\n", encoding="utf-8")

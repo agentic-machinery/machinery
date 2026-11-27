@@ -593,12 +593,19 @@ def _product_checkout() -> Path | None:
 
 
 def _fleet_plane() -> Path:
-    from lu_machinery.common.repo_root import state_root
+    from lu_machinery.common.repo_root import MachineryConfigError, configured_host_state_root, state_root
     from lu_machinery.fleet_comms.paths import DEFAULT_ROOT_REL
     from lu_machinery.guardrails.worktree_containment import canonicalize
 
     override = os.environ.get("FLEET_COMMS_ROOT")
-    path = Path(override).expanduser() if override else state_root() / DEFAULT_ROOT_REL
+    try:
+        if override:
+            host_state = configured_host_state_root()
+            path = host_state / DEFAULT_ROOT_REL if host_state is not None else Path(override).expanduser()
+        else:
+            path = state_root() / DEFAULT_ROOT_REL
+    except MachineryConfigError as exc:
+        raise Refused("Fleet Comms state is not configured consistently") from exc
     if not path.is_absolute():
         raise Refused("FLEET_COMMS_ROOT is relative; its plane depends on the reader's working directory")
     try:
@@ -616,8 +623,7 @@ def _private_state(checkouts: list[Path]) -> list[Path]:
     candidates = [Path(os.path.realpath(ensure_scratch_root()))]
     with contextlib.suppress(OSError, ValueError):
         candidates.append(Path(os.path.realpath(tasks_dir())))
-    if os.environ.get("FLEET_COMMS_ROOT"):
-        candidates.append(_fleet_plane())
+    candidates.append(_fleet_plane())
     for checkout in checkouts:
         for name in _CHECKOUT_PRIVATE:
             path = checkout / name

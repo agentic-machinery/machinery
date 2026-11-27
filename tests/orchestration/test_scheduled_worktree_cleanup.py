@@ -49,6 +49,7 @@ def test_default_repositories_come_from_configured_roots(tmp_path: Path, monkeyp
     repos = tmp_path / "checkouts"
     repos.mkdir()
     monkeypatch.setenv("LU_REPOS_ROOT", str(repos))
+    monkeypatch.setenv("LU_STATE_ROOT", str(configured_roots.primary))
     local_name = cleanup.load_fleet_repos()["infra-private"].local_name
     # The state root here is the configured primary; neither default may come from it.
     assert cleanup.default_public_repo() == configured_roots.product != configured_roots.primary
@@ -76,20 +77,21 @@ def test_default_repositories_come_from_configured_roots(tmp_path: Path, monkeyp
     monkeypatch.setattr(cleanup, "build_public_summary", lambda *_args: {})
     assert cleanup.main(["--receipt-dir", str(tmp_path / "receipts")]) == 0
     assert seen["git"] == [configured_roots.product, configured_roots.primary, repos / local_name]
-    assert seen["state"] == [cleanup.state_root(), repos / local_name]
+    assert seen["state"] == [cleanup.state_root()]
     assert seen["rollover"] == [Path(root) / ".agent/thread-rollovers/claude" for root in seen["state"]]
     assert cleanup.state_root() != configured_roots.product
-    # The macOS agent's job carries no root settings, so its first checkout is the state root, which
-    # its batch_state and rollover sweeps read from the arguments; the private one is the configured one.
+    # The macOS agent receives the state binding separately from its two checkout arguments.
     import plistlib
 
     from lu_machinery.orchestration import install_worktree_cleanup_launchd as launchd
 
     capsys.readouterr()
     assert launchd.main(["--home", str(tmp_path / "home"), "render"]) == 0
-    arguments = plistlib.loads(capsys.readouterr().out.encode())["ProgramArguments"]
+    plist = plistlib.loads(capsys.readouterr().out.encode())
+    assert plist["EnvironmentVariables"]["LU_STATE_ROOT"] == str(configured_roots.primary)
+    arguments = plist["ProgramArguments"]
     repo_roots = [Path(arguments[i + 1]) for i, word in enumerate(arguments) if word == "--repo-root"]
-    assert repo_roots == [cleanup.state_root().resolve(), (repos / local_name).resolve()]
+    assert repo_roots == [configured_roots.product.resolve(), (repos / local_name).resolve()]
 
 
 @pytest.mark.parametrize("apply", [False, True])
@@ -124,10 +126,7 @@ def test_main_sweeps_sessions_once_and_reports_counts_only(tmp_path: Path, monke
         args.append("--apply")
     assert cleanup.main(args) == 0
     assert len(calls) == 1 and calls[0]["apply"] == apply
-    assert calls[0]["rollover_roots"] == [
-        tmp_path / "first/.agent/thread-rollovers/claude",
-        tmp_path / "second/.agent/thread-rollovers/claude",
-    ]
+    assert calls[0]["rollover_roots"] == [cleanup.state_root() / ".agent/thread-rollovers/claude"]
     summary = json.loads(capsys.readouterr().out)
     assert summary["claude_session_scratch"]["removed" if apply else "would_remove"] == 1
     assert summary["claude_session_scratch"]["reclaimable_bytes"] == 7
@@ -154,7 +153,7 @@ def test_main_nested_lease_json_writes_receipt_and_keeps_scratch(tmp_path: Path,
     session = root / "12345678-1234-1234-1234-123456789abc"
     session.mkdir(parents=True)
     (session / "payload").write_bytes(b"keep")
-    lineage = tmp_path / ".agent/thread-rollovers/claude/lineage"
+    lineage = cleanup.state_root() / ".agent/thread-rollovers/claude/lineage"
     lineage.mkdir(parents=True)
     (lineage / "lease.json").write_text("[" * 10000 + "]" * 10000)
     monkeypatch.setattr(

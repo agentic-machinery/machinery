@@ -565,9 +565,8 @@ def pending_delivery_snapshot(recipient: str, *, root: Path | None = None, limit
             if standing == "unknown":
                 return {**unknown, "reason": "recipient_standing_unverified"}
         plane_root = root
-        if plane_root is None and (override := os.environ.get("FLEET_COMMS_ROOT")):
-            plane_root = Path(override)
-        if plane_root is not None and not plane_root.is_absolute():
+        override = os.environ.get("FLEET_COMMS_ROOT") if root is None else None
+        if (override and not Path(override).is_absolute()) or (plane_root is not None and not plane_root.is_absolute()):
             return {**unknown, "reason": "pending_delivery_store_unavailable"}
         plane_root = validate_plane_root(plane_root) if plane_root is not None else default_plane_root()
         if local_plane_is_retired(root=plane_root):

@@ -20,6 +20,7 @@ from typing import Any
 
 from lu_machinery.common import github_client, json_depth
 from lu_machinery.common.git_context import sanitized_git_env
+from lu_machinery.common.repo_root import state_root
 from lu_machinery.guardrails.worktree_containment import (
     PROTECTED_BRANCHES,
     resolve_main_root,
@@ -145,12 +146,11 @@ def write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
 
 
 def resolve_lock_root(repo_root: Path) -> Path:
-    root = resolve_main_root(repo_root)
-    return root / ".agent" / "task-families" / "locks"
+    return resolve_state_root(repo_root) / "locks"
 
 
 def resolve_state_root(repo_root: Path) -> Path:
-    return resolve_main_root(repo_root) / ".agent" / "task-families"
+    return state_root() / ".agent" / "task-families"
 
 
 def _require_existing_root(root: Path) -> None:
@@ -344,21 +344,21 @@ def is_worktree_locked(repo_root: Path, worktree: Path) -> bool:
 
 
 def active_jobs_or_leases(repo_root: Path, lineage_id: str | None = None) -> list[Path]:
-    state_root = resolve_state_root(repo_root)
+    family_state = resolve_state_root(repo_root)
     entries: list[Path] = []
-    for path in sorted((state_root / "jobs").glob("*")):
+    for path in sorted((family_state / "jobs").glob("*")):
         if not path.is_file() or not STATE_FILE_RE.match(path.name):
             continue
         if lineage_id is not None and lineage_id not in path.name:
             continue
         entries.append(path)
-    for path in sorted((state_root / "leases").glob("*")):
+    for path in sorted((family_state / "leases").glob("*")):
         if not path.is_file() or not STATE_FILE_RE.match(path.name):
             continue
         if lineage_id is not None and lineage_id not in path.name:
             continue
         entries.append(path)
-    for path in sorted(state_root.glob("*/operations/*/state.json")):
+    for path in sorted(family_state.glob("*/operations/*/state.json")):
         if not STATE_FILE_RE.match(path.name):
             continue
         entries.append(path)

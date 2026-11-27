@@ -20,6 +20,8 @@ import uuid
 from collections.abc import Callable
 from pathlib import Path
 
+from lu_machinery.common.repo_root import state_root
+
 PY = sys.executable
 PROBES: dict[str, Callable[[list[str]], tuple[bool, dict]]] = {}
 
@@ -173,7 +175,7 @@ def fleet_authority(_: list[str]) -> tuple[bool, dict]:
     """Open the authority service on the mock plane the way the keeper and inbox wrappers do."""
     from lu_machinery.fleet_comms import authority
 
-    root = Path(product()) / "batch_state" / "fleet-comms" / "v1"
+    root = state_root() / "batch_state" / "fleet-comms" / "v1"
     service = authority.open_authority_service(root)
     names = [
         name
@@ -961,7 +963,7 @@ def tmp_sweep(_: list[str]) -> tuple[bool, dict]:
         "--temp-root",
         str(scratch() / "tmp"),
         "--task-root",
-        str(Path(product()) / "batch_state" / "tasks"),
+        str(state_root() / "batch_state" / "tasks"),
         "--state-dir",
         str(scratch() / "sweep"),
         "--json",
@@ -969,7 +971,7 @@ def tmp_sweep(_: list[str]) -> tuple[bool, dict]:
     retention = module(
         "lu_machinery.hygiene.batch_state_retention",
         "--batch-root",
-        str(Path(product()) / "batch_state"),
+        str(state_root() / "batch_state"),
         "--json",
     )
     try:
@@ -1035,7 +1037,7 @@ def stale_records(_: list[str]) -> tuple[bool, dict]:
     import shutil
 
     tasks = scratch() / "tasks"
-    shutil.copytree(Path(product()) / "batch_state" / "tasks", tasks)
+    shutil.copytree(state_root() / "batch_state" / "tasks", tasks)
     result = module(
         "lu_machinery.orchestration.stale_task_records",
         "archive",

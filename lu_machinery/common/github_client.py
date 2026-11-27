@@ -49,7 +49,7 @@ from typing import Any
 from urllib.parse import quote, quote_plus, urlencode, urlsplit
 
 from lu_machinery.common import github_usage, json_depth
-from lu_machinery.common.repo_root import machinery_path, state_root
+from lu_machinery.common.repo_root import configured_host_state_root, machinery_path, state_root
 
 # Deepest JSON this module reads (json_depth): request and response bodies.
 _JSON_MAX_DEPTH = 512
@@ -1047,7 +1047,7 @@ def _landing_operation(flow):
 def _cache_directory():
     """Use the shared state anchor, or no disk cache when unresolved."""
     override = os.environ.get("LU_GITHUB_CACHE_DIR")
-    if override:
+    if override and configured_host_state_root() is None:
         path = Path(override)
         if path.exists() and not os.access(path, os.W_OK):
             return None

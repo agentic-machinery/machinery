@@ -433,16 +433,10 @@ def test_an_override_authority_failure_never_admits(synthetic_opsec, tmp_path, m
             "github.com/unit/public", [TOKEN], environment={"LU_OPSEC_OVERRIDE": "reason"}, log_path=target / "log"
         )
     assert error.value.indices == {0}
-    # Without a log path, a failure to resolve the primary checkout's audit root is the same refusal.
-    for failure in (OSError("synthetic root failure"), gate.PublishBlocked("synthetic root refusal")):
-
-        def unavailable(failure=failure):
-            raise failure
-
-        monkeypatch.setattr(gate, "_policy_checkout", unavailable)
-        with pytest.raises(gate.PublishBlocked, match=r"OPSEC blocked: .*override was not admitted") as error:
-            gate.check_texts("github.com/unit/public", [TOKEN], environment={gate.OVERRIDE: "reason"})
-        assert error.value.indices == {0}
+    monkeypatch.delenv("LU_STATE_ROOT")
+    with pytest.raises(gate.PublishBlocked, match=r"OPSEC blocked: .*override was not admitted") as error:
+        gate.check_texts("github.com/unit/public", [TOKEN], environment={gate.OVERRIDE: "reason"})
+    assert error.value.indices == {0}
 
 
 RECORDING_OVERRIDE = """import json
@@ -461,10 +455,13 @@ def authorize(destination, blocks, reason, log_path):
 @pytest.mark.usefixtures('github_command_boundary')
 def test_a_valid_private_override_module_is_used_through_the_binding(synthetic_opsec, tmp_path, monkeypatch, capfd):
     monkeypatch.setattr(gate, "_policy_checkout", lambda: tmp_path / "primary")
+    state = tmp_path / "state"
+    state.mkdir()
+    monkeypatch.setenv("LU_STATE_ROOT", str(state))
     install_override(gate.private_tooling(), RECORDING_OVERRIDE)
     env = {gate.OVERRIDE: "synthetic false positive"}
     gate.check_texts("github.com/unit/public", ["clean", TOKEN], environment=env)
-    log = tmp_path / "primary/batch_state/opsec/overrides.jsonl"
+    log = state / "batch_state/opsec/overrides.jsonl"
     assert json.loads(log.read_text()) == [
         "github.com/unit/public",
         [["synthetic-rule", 1]],

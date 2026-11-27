@@ -27,6 +27,7 @@ from pydantic import AfterValidator, BaseModel
 from lu_machinery.common import github_client, json_depth
 from lu_machinery.common.git_context import sanitized_git_env
 from lu_machinery.common.task_store_paths import read_cached_task_record
+from lu_machinery.common.task_store_paths import tasks_dir as default_tasks_dir
 from lu_machinery.orchestration.fleet_repos import FleetRepoError, load_fleet_repos, resolve_active_fleet_repo
 from lu_machinery.orchestration.task_record_store import (
     candidate_task_record_names,
@@ -410,7 +411,7 @@ def _running_ids_in_record(path: Path, tasks_dir: Path) -> tuple[str, ...]:
     return (path.stem, task_id) if isinstance(task_id, str) and task_id else (path.stem,)
 
 
-def _active_task_ids(project_root: Path, candidates: set[str]) -> set[str]:
+def _active_task_ids(tasks_dir: Path, candidates: set[str]) -> set[str]:
     """The ``candidates`` that a running task record in the hot store names.
 
     Dispatch writes a task's record as ``<id>.json`` (``task_record_path``), and a
@@ -420,7 +421,6 @@ def _active_task_ids(project_root: Path, candidates: set[str]) -> set[str]:
     on a store of 15,000 records, and a report is a directory listing and a handful
     of cached record reads instead.
     """
-    tasks_dir = project_root / "batch_state" / "tasks"
     if not candidates:
         return set()
     try:
@@ -446,13 +446,13 @@ def _dispatch_task_ids(path: Path) -> set[str]:
     return ids
 
 
-def _list_worktrees_and_active_ids(project_root: Path) -> tuple[list[dict[str, Any]], set[str]]:
+def _list_worktrees_and_active_ids(project_root: Path, tasks_dir: Path) -> tuple[list[dict[str, Any]], set[str]]:
     worktrees = _list_worktrees(project_root)
     dispatch_ids: set[str] = set()
     for record in worktrees:
         if record.get("path"):
             dispatch_ids |= _dispatch_task_ids(Path(record["path"]))
-    return worktrees, _active_task_ids(project_root, dispatch_ids)
+    return worktrees, _active_task_ids(tasks_dir, dispatch_ids)
 
 
 def _is_protected(
@@ -499,15 +499,16 @@ def _worktree_reason(upstream_gone: bool, fully_merged_to_main: bool, clean: boo
     return ", ".join(reasons)
 
 
-def compute_git_cleanup(project_root: Path | None = None) -> CleanupReport:
+def compute_git_cleanup(project_root: Path | None = None, *, tasks_dir: Path | None = None) -> CleanupReport:
     if project_root is None:
         project_root = resolve_context().roots.live_repo_root
+    records = tasks_dir if tasks_dir is not None else default_tasks_dir()
 
     started = time.perf_counter()
     computed_at = _isoformat_z(datetime.now(UTC))
     # Worktrees, their protection and the ``main`` commit read independently of the branch list.
     with ThreadPoolExecutor(max_workers=2) as pool:
-        worktree_future = pool.submit(_list_worktrees_and_active_ids, project_root)
+        worktree_future = pool.submit(_list_worktrees_and_active_ids, project_root, records)
         main_future = pool.submit(_resolve_main, project_root)
         branches = _list_local_branches(project_root)
         merged = _branches_merged_to_main(branches, project_root, main_future.result())
@@ -888,7 +889,7 @@ def compute_pull_requests(project_root: Path, *, tasks_dir: Path | None = None) 
     monitor context's store, which is not always ``project_root / batch_state``.
     A repository GitHub cannot resolve stays listed as unknown; the rest of the reading survives it.
     """
-    records = tasks_dir if tasks_dir is not None else project_root / "batch_state" / "tasks"
+    records = tasks_dir if tasks_dir is not None else default_tasks_dir()
     observed_at = datetime.now(UTC).isoformat().replace("+00:00", "Z")
     try:
         registry = load_fleet_repos()
@@ -1123,4 +1124,4 @@ def git_cleanup(ctx: MonitorContext = Depends(get_ctx)) -> CleanupReport:
     Served from the last report with its true age (``X-Snapshot-Age-S``);
     ``computed_at`` names when that report was taken.
     """
-    return compute_git_cleanup(ctx.roots.live_repo_root)
+    return compute_git_cleanup(ctx.roots.live_repo_root, tasks_dir=ctx.roots.batch_state_dir / "tasks")

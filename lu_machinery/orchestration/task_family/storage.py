@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from lu_machinery.common import json_depth
+from lu_machinery.common.repo_root import state_root
 
 from .model import LifecycleEvent, LifecycleState, OperationReceipt, TaskFamilyManifest
 from .planner import TaskFamilyPlan, canonical_json, sha256_digest
@@ -116,7 +117,7 @@ class TaskFamilyStorage:
     """Stores runtime state at .agent/task-families/<family>/operations/<operation>/."""
 
     def __init__(self, repo_root: Path, family_id: str, operation_id: str) -> None:
-        self.root = repo_root / ".agent" / "task-families" / family_id / "operations" / operation_id
+        self.root = state_root() / ".agent" / "task-families" / family_id / "operations" / operation_id
 
     @property
     def plan_path(self) -> Path:
