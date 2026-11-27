@@ -331,8 +331,8 @@ def test_incomplete_roster_proves_no_name_unregistered_and_removes_nothing(
 
 
 @pytest.mark.parametrize("doubt", [
-    "malformed_area", "unknown_roster_key", "task_store_unreadable", "hot_entry_not_a_file", "dangling_record_link",
-    "dangling_tasks_dir_link",
+    "malformed_area", "unknown_roster_key", "task_store_unreadable", "record_not_readable", "hot_entry_not_a_file",
+    "dangling_record_link", "dangling_tasks_dir_link",
 ])
 def test_partly_unreadable_roster_or_task_store_keeps_mail_queued_through_expire_stale_apply(
     plane, tasks, monkeypatch, tmp_path, capsys, doubt,
@@ -370,6 +370,8 @@ def test_partly_unreadable_roster_or_task_store_keeps_mail_queued_through_expire
         else:
             if doubt == "task_store_unreadable":
                 tasks_dir.chmod(0o600)  # no search permission: every record stat fails with EACCES
+            elif doubt == "record_not_readable":
+                hot.chmod(0)  # found by stat, refused at open
             elif doubt == "dangling_tasks_dir_link":
                 tasks_dir.rename(moved)
                 tasks_dir.symlink_to(tmp_path / "unmounted")
@@ -385,6 +387,8 @@ def test_partly_unreadable_roster_or_task_store_keeps_mail_queued_through_expire
             assert authority._task_standing(worker) == "unknown"
         applied = run(capsys, "deliveries", "expire-stale", "--root", str(plane), "--apply")
     finally:
+        if doubt == "record_not_readable":
+            hot.chmod(0o600)
         if moved.exists():
             tasks_dir.unlink()
             moved.rename(tasks_dir)
