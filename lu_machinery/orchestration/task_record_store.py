@@ -21,12 +21,14 @@ Readers remain stdlib-only; writers load cause and dispatcher support lazily.
 from __future__ import annotations
 
 import atexit
+import errno
 import fcntl
 import json
 import logging
 import math
 import os
 import re
+import stat
 import threading
 from collections.abc import Callable, Iterable, Iterator
 from contextlib import contextmanager
@@ -352,7 +354,7 @@ def is_identical_copy(mismatch: TaskIdentityMismatch) -> bool:
     if named == mismatch.path:
         return False
     try:
-        other = read_task_record(named)
+        other = parse_task_record(named, read_regular_bytes(named))  # a FIFO at the name never blocks the scan
     except (OSError, ValueError):
         return False
     # Compare the JSON texts: dict equality would equate true with 1 and false with 0.
@@ -369,7 +371,34 @@ def misnamed_record_refusal(path: Path) -> str:
 
 def read_task_record(path: Path) -> dict[str, Any] | None:
     """Read a scan candidate; foreign files are reported, damaged records raise."""
-    return parse_task_record(path, path.read_bytes())
+    return parse_task_record(path, read_regular_bytes(path))
+
+
+def read_regular_bytes(path: Path) -> bytes:
+    """``path``'s bytes, opened without blocking.
+
+    An entry that is not a regular file (a FIFO, a directory, a device) raises
+    ``OSError`` before any byte is read (``IsADirectoryError`` for a directory,
+    as ``open()`` reports it), so a reader neither blocks on it nor reads it as a record.
+    """
+    return _read_regular(path)
+
+
+def _read_regular(path: Path, identity: os.stat_result | None = None) -> bytes:
+    """``read_regular_bytes``; with ``identity``, an opened file that is not that same file raises ``FileNotFoundError``."""
+    descriptor = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC)
+    try:
+        opened = os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode):
+            raise OSError(errno.EISDIR if stat.S_ISDIR(opened.st_mode) else errno.EINVAL, "not a regular file", str(path))
+        if identity is not None and not os.path.samestat(identity, opened):
+            raise FileNotFoundError(errno.ENOENT, "not the observed record file", str(path))
+        chunks = []
+        while chunk := os.read(descriptor, 1 << 16):
+            chunks.append(chunk)
+    finally:
+        os.close(descriptor)
+    return b"".join(chunks)
 
 
 def task_record_path(tasks_dir: Path, task_id: str) -> Path:
@@ -418,7 +447,7 @@ def read_task_record_bytes(path: Path, *, tasks_dir: Path) -> tuple[Path, bytes]
     """Follow the observed file to its exact counterpart if an archive move removes its name."""
     observed = path.stat()
     try:
-        return path, path.read_bytes()
+        return path, read_regular_bytes(path)
     except FileNotFoundError:
         archive = tasks_dir / ARCHIVE_DIR_NAME
         if path.parent == tasks_dir:
@@ -427,10 +456,8 @@ def read_task_record_bytes(path: Path, *, tasks_dir: Path) -> tuple[Path, bytes]
             counterpart = tasks_dir / path.name
         else:
             raise
-        with task_archive_lock(tasks_dir), counterpart.open("rb") as moved:
-            if not os.path.samestat(observed, os.fstat(moved.fileno())):
-                raise
-            return counterpart, moved.read()
+        with task_archive_lock(tasks_dir):
+            return counterpart, _read_regular(counterpart, observed)
 
 
 def read_listed_task_record(path: Path, *, tasks_dir: Path | None = None) -> dict[str, Any] | None:
@@ -464,6 +491,7 @@ def task_archive_lock(tasks_dir: Path, *, moving: bool = False) -> Iterator[None
 
 def iter_task_records(
     tasks_dir: Path, *, include_archive: bool, on_error: Callable[[Path, OSError], None] | None = None,
+    report_non_regular: bool = False,
 ) -> Iterator[Path]:
     """Yield candidate JSON paths: the hot directory sorted by name, then the archive.
 
@@ -471,7 +499,9 @@ def iter_task_records(
     reader needs. A task id re-dispatched after its old record was archived has
     one record in each place; both are yielded because they are two runs. A
     directory that is missing or unreadable yields nothing, and an entry whose type
-    cannot be read is skipped; ``on_error`` receives the path and the error for each,
+    cannot be read is skipped; ``on_error`` receives the path and the error for each
+    (with ``report_non_regular``, also for every candidate that is not a regular file:
+    a dangling link, a FIFO, a directory, which a strict reader cannot call no record),
     so a reader that publishes counts can say they are unknown. Only a missing hot
     directory is reported as missing: the first archive run creates the archive, and
     an entry removed during the scan is no record. Readers classify at
@@ -495,6 +525,10 @@ def iter_task_records(
                         try:
                             if entry.is_file():
                                 names.append(entry.name)
+                            elif report_non_regular and on_error is not None:
+                                os.lstat(directory / entry.name)  # removed during the scan: no record
+                                on_error(directory / entry.name,
+                                         OSError(errno.EINVAL, "not a regular file", str(directory / entry.name)))
                         except OSError as exc:
                             if on_error is not None and not isinstance(exc, FileNotFoundError):
                                 on_error(directory / entry.name, exc)

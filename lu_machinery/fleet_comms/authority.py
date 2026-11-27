@@ -220,24 +220,33 @@ _TASK_TERMINAL_STATUSES = frozenset({
 _LOG = logging.getLogger(__name__)
 
 
-def _load_roster() -> tuple[frozenset[str], bool]:
-    """The durable CTO, registered slots, external recipients and driver lanes, and whether both sources loaded.
+def _roster_sources() -> tuple[Path | None, Path | None, Path | None, Path | None]:
+    """The assignments and driver-lane files the roster reads, the profile file that names them, and the schema.
 
-    Slots come from ``config/area_assignments.yaml`` (the roster every slot
-    reader uses), external drain recipients from that file's
-    ``external_recipients`` list (agents outside the launcher fleet whose inbox
-    an external bridge drains), and lane senders from ``config/driver_lanes.json``
-    (the lanes the context guard hands off). The roster is complete only when the slot
-    roster names at least one slot and the lane file loads with at least one
-    lane; an incomplete roster proves no name unregistered. The result is
-    cached per file identity (path, mtime, size), so every claim does not
-    reparse both files.
+    The schema is the one the strict assignments read validates against.
+    ``None`` for a source whose setting is unusable, for the profile when none is configured, and for
+    a schema that cannot be resolved (the strict read then fails too, so the roster is incomplete).
+    Each source path comes from its own profile read, so a caller compares the sources taken before
+    and after its reads (and the profile's identity) to know they belong to one profile version.
     """
     from lu_machinery import agent_identity
+    from lu_machinery.common import profile, repo_root
     from lu_machinery.common.repo_root import MachineryConfigError
     from lu_machinery.ops import driver_lanes
 
-    # An unusable profile entry or root setting leaves that roster source unavailable, so the roster is incomplete.
+    schema: Path | None
+    try:
+        from lu_machinery.orchestration.validate_fleet_taxonomy import ASSIGNMENTS_SCHEMA_PATH
+
+        schema = Path(ASSIGNMENTS_SCHEMA_PATH)
+    except Exception:
+        schema = None
+    profile_file: Path | None
+    try:
+        profile_file = profile._configured_profile_path(None) or repo_root.state_root() / profile.PROFILE_REL
+    except Exception:
+        profile_file = None
+
     try:
         assignments: Path | None = Path(agent_identity.default_assignments_path())
     except MachineryConfigError:
@@ -246,28 +255,71 @@ def _load_roster() -> tuple[frozenset[str], bool]:
         lane_data: Path | None = Path(driver_lanes.default_data_path())
     except MachineryConfigError:
         lane_data = None
+    return assignments, lane_data, profile_file, schema
+
+
+def _roster_identity(sources: tuple[Path | None, ...]) -> tuple[object, ...]:
+    """Each roster file's (path, device, inode, ctime, mtime, size), or ``None`` fields when it cannot be stated.
+
+    Any write, replacement or permission change moves ctime, so equal identities taken
+    before and after a read prove the read saw one version.
+    """
     key: list[object] = []
-    for path in (assignments, lane_data):
-        identity: tuple[int | None, int | None] = (None, None)
+    for path in sources:
+        fields: tuple[int, ...] | None = None
         if path is not None:
             with contextlib.suppress(OSError):
                 stat = path.stat()
-                identity = (stat.st_mtime_ns, stat.st_size)
-        key.append((str(path), *identity))
-    cached = _ROSTER_CACHE.get(tuple(key))
+                fields = (stat.st_dev, stat.st_ino, stat.st_ctime_ns, stat.st_mtime_ns, stat.st_size)
+        key.append((str(path), fields))
+    return tuple(key)
+
+
+def _load_roster() -> tuple[frozenset[str], bool]:
+    """The durable CTO, registered slots, external recipients and driver lanes, and whether both sources loaded.
+
+    Slots come from ``config/area_assignments.yaml`` (the roster every slot
+    reader uses), external drain recipients from that file's
+    ``external_recipients`` list (agents outside the launcher fleet whose inbox
+    an external bridge drains), and lane senders from ``config/driver_lanes.json``
+    (the lanes the context guard hands off). The roster is complete only when the slot
+    file passes the assignments contract whole and names at least one slot, the
+    external list reads, and the lane file loads with at least one lane; an
+    incomplete roster proves no name unregistered. The result is
+    cached per file identity (path, device, inode, ctime, mtime, size), so every
+    claim does not reparse both files; ctime moves on any rewrite or permission
+    change, so a file that became unreadable is read again. A file whose
+    identity changed while it was read gives an incomplete, uncached roster.
+    """
+    from lu_machinery import agent_identity
+    from lu_machinery.ops import driver_lanes
+
+    # An unusable profile entry or root setting leaves that roster source unavailable, so the roster is incomplete.
+    sources = _roster_sources()
+    assignments, lane_data, _profile_file, _schema = sources
+    key = _roster_identity(sources)
+    cached = _ROSTER_CACHE.get(key)
     if cached is not None:
         return cached
     slots: tuple[str, ...] = ()
     external: tuple[str, ...] = ()
     external_availability: Literal["available", "unavailable"] = "unavailable"
     if assignments is not None:
-        slots = agent_identity._load_registry_slots(assignments)
+        # Strict: a file that fails the assignments contract (one malformed area included) yields no
+        # slots, so the roster is incomplete rather than complete without that area's slots.
+        try:
+            slots = agent_identity._load_registry_slots(assignments, strict=True)
+        except Exception as exc:
+            _LOG.warning("fleet_comms slot roster unreadable: %s", type(exc).__name__)
         external, external_availability = load_external_recipients(assignments)
     lanes: tuple[str, ...] = ()
     if lane_data is not None:
         with contextlib.suppress(Exception):
             lanes = tuple(lane.sender for lane in driver_lanes.load_registry(lane_data).lanes)
     complete = bool(slots) and bool(lanes) and external_availability == "available"
+    # A replacement between the reads, or a profile that now names other files, mixes two versions.
+    changed = _roster_sources() != sources or _roster_identity(sources) != key
+    complete = complete and not changed
     if not complete:
         _LOG.warning(
             "fleet_comms recipient roster incomplete (slots=%d, lanes=%d, external=%s): "
@@ -275,24 +327,30 @@ def _load_roster() -> tuple[frozenset[str], bool]:
             len(slots), len(lanes), external_availability,
         )
     roster = (frozenset({DURABLE_CTO_RECIPIENT, *slots, *external, *lanes}), complete)
-    _ROSTER_CACHE.clear()
-    _ROSTER_CACHE[tuple(key)] = roster
+    if not changed:
+        _ROSTER_CACHE.clear()
+        _ROSTER_CACHE[key] = roster
     return roster
 
 
 def load_external_recipients(
     path: Path,
 ) -> tuple[tuple[str, ...], Literal["available", "unavailable"]]:
-    """Read exact external recipient names, distinguishing an empty list from a failed read."""
+    """Read exact external recipient names, distinguishing an empty list from a failed read.
+
+    The file is read as UTF-8 without blocking and parsed by the fleet-config YAML
+    parser the strict assignments read uses: a FIFO, a directory or any other
+    non-regular entry, a duplicate key, a root that is not a mapping and any
+    construction failure are a failed read.
+    """
     try:
-        import yaml
-    except ImportError:
+        from lu_machinery.orchestration.validate_fleet_taxonomy import load_yaml_mapping_bytes, read_regular_file_bytes
+    except Exception:  # a missing or broken dependency of the reader
         return (), "unavailable"
     try:
-        data = yaml.safe_load(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError, yaml.YAMLError, RecursionError):
-        return (), "unavailable"
-    if not isinstance(data, dict):
+        _, raw = read_regular_file_bytes(path)  # its refusals are ValueErrors
+        data = load_yaml_mapping_bytes(raw, path)  # every parse or construction failure is a ValueError
+    except (OSError, ValueError, RecursionError):
         return (), "unavailable"
     names = data.get("external_recipients", [])
     if not isinstance(names, list) or any(
@@ -317,8 +375,9 @@ def _roster_complete() -> bool:
 def _task_standing(name: str) -> Literal["live", "settled", "unknown"] | None:
     """A dispatch task's standing by its record: live while spawning or running, settled at a terminal status.
 
-    ``None`` when no task record has this id; ``unknown`` when the record cannot
-    be read or its status is missing, not a string or not a known status.
+    ``None`` only when the store proves no task record has this id; ``unknown``
+    when the record or its absence cannot be read (an access failure included)
+    or its status is missing, not a string or not a known status.
     """
     if not _TASK_ID_RE.fullmatch(name) or ".." in name:
         return None
@@ -344,17 +403,19 @@ def _recipient_standing(name: str, registered: frozenset[str], complete: bool) -
     """Whether a drain will read ``name``: the one classifier every admission and removal path uses.
 
     A stored session-CTO name stays readable by its session. ``not_registered``
-    needs a complete roster; ``settled_task`` needs a known terminal status.
+    and ``settled_task`` both need a complete roster (an incomplete one may hold
+    the same name as a registered slot); ``settled_task`` also needs a known
+    terminal status.
     """
     if name in registered or is_session_cto_recipient(name) or _SUPERVISORY_RECIPIENT_RE.fullmatch(name):
         return "registered"
     task = _task_standing(name)
     if task == "live":
         return "live_task"
-    if task == "settled":
-        return "settled_task"
     if task == "unknown" or not complete:
         return "unknown"
+    if task == "settled":
+        return "settled_task"
     return "not_registered"
 
 
@@ -364,7 +425,7 @@ def _require_readable_recipients(names: Iterable[str]) -> None:
     A recipient whose standing is unknown (damaged task record, incomplete
     roster) is admitted and logged: doubt never drops mail.
     """
-    registered, complete = _registered_recipients(), _roster_complete()
+    registered, complete = _load_roster()
     for name in names:
         standing = _recipient_standing(name, registered, complete)
         if standing in {"registered", "live_task"}:
@@ -558,8 +619,22 @@ def pending_delivery_snapshot(recipient: str, *, root: Path | None = None, limit
         from lu_machinery.agent_identity import resolve_recipient_alias
 
         # A historical alias names no roster seat; only a canonical name has a standing to check.
-        if resolve_recipient_alias(recipient) == recipient:
-            standing = _recipient_standing(recipient, *_load_roster())
+        # An alias that cannot be told from a canonical name (roster unreadable, or changed while the
+        # alias was read) is unverified, never refused.
+        sources = _roster_sources()
+        before = _roster_identity(sources)
+        roster = _load_roster()
+        if sources[0] is None:
+            return {**unknown, "reason": "recipient_standing_unverified"}
+        try:
+            # The file the snapshot read, never a path resolved again from the profile.
+            canonical = resolve_recipient_alias(recipient, assignments_path=sources[0], strict=True) == recipient
+        except Exception:
+            return {**unknown, "reason": "recipient_standing_unverified"}
+        if _roster_sources() != sources or _roster_identity(sources) != before:  # changed (even and back) meanwhile
+            return {**unknown, "reason": "recipient_standing_unverified"}
+        if canonical:
+            standing = _recipient_standing(recipient, *roster)
             if standing in {"not_registered", "settled_task"}:
                 return {**unknown, "reason": AuthorityRecipientRefused(recipient, standing).cause}
             if standing == "unknown":
@@ -1861,14 +1936,15 @@ class AuthorityService:
         Nothing is counted while the roster is incomplete (``roster_complete``
         is then false), and no name of unknown standing is counted.
         """
+        roster = _load_roster()  # one roster version for every decision and the reported flag
         counts = {RECIPIENT_NOT_REGISTERED_REASON: 0, RECIPIENT_SETTLED_REASON: 0}
-        for _row, reason in self._unreadable_deliveries_tx(settled_only=False):
+        for _row, reason in self._unreadable_deliveries_tx(roster, settled_only=False):
             counts[reason] += 1
         return {
             "deliveries": sum(counts.values()),
             **counts,
-            "subscriptions": len(self._unreadable_subscriptions_tx(settled_only=False)),
-            "roster_complete": _roster_complete(),
+            "subscriptions": len(self._unreadable_subscriptions_tx(roster, settled_only=False)),
+            "roster_complete": roster[1],
         }
 
     def expire_unreadable(self, *, now: str | None = None) -> dict[str, int]:
@@ -1885,9 +1961,10 @@ class AuthorityService:
         """
         now_value = self._now_string(now)
         with self._write_transaction():
-            ended = len(self._unreadable_subscriptions_tx(settled_only=False))
+            roster = _load_roster()  # read under the write lock: one version for every decision and the flag
+            ended = len(self._unreadable_subscriptions_tx(roster, settled_only=False))
             expired: dict[str, list[str]] = {RECIPIENT_NOT_REGISTERED_REASON: [], RECIPIENT_SETTLED_REASON: []}
-            for row, reason in self._unreadable_deliveries_tx(settled_only=False):
+            for row, reason in self._unreadable_deliveries_tx(roster, settled_only=False):
                 delivery_id = str(row["delivery_id"])
                 self._conn.execute(
                     """UPDATE authority_deliveries
@@ -1903,23 +1980,24 @@ class AuthorityService:
                 )
                 self._dead_letter_delivery_tx(delivery_id, reason_code=reason, notify=False)
                 expired[reason].append(delivery_id)
-            self._end_unreadable_subscriptions_tx(settled_only=False)
+            self._end_unreadable_subscriptions_tx(roster, settled_only=False)
             for reason, ids in expired.items():
                 if ids:
                     self._notify_cleanup_expiry_summary_tx(ids, reason_code=reason)
         counts = {reason: len(ids) for reason, ids in expired.items()}
         return {
             "deliveries": sum(counts.values()), **counts, "subscriptions": ended,
-            "roster_complete": _roster_complete(),
+            "roster_complete": roster[1],
         }
 
-    def _unreadable_deliveries_tx(self, *, settled_only: bool) -> list[tuple[sqlite3.Row, str]]:
+    def _unreadable_deliveries_tx(
+        self, roster: tuple[frozenset[str], bool], *, settled_only: bool,
+    ) -> list[tuple[sqlite3.Row, str]]:
         """Queued or running deliveries whose recipient is a settled task (or, unless ``settled_only``, unregistered).
 
         Empty while the roster is incomplete: no removal on doubt (#594).
         """
-        registered = _registered_recipients()
-        if not _roster_complete():
+        if not roster[1]:
             return []
         rows: list[tuple[sqlite3.Row, str]] = []
         recipients = self._conn.execute(
@@ -1927,7 +2005,7 @@ class AuthorityService:
                WHERE state IN ('queued', 'running') ORDER BY recipient"""
         ).fetchall()
         for item in recipients:
-            reason = self._unreadable_reason(str(item["recipient"]), registered, settled_only=settled_only)
+            reason = self._unreadable_reason(str(item["recipient"]), roster, settled_only=settled_only)
             if reason is None:
                 continue
             rows.extend(
@@ -1941,9 +2019,8 @@ class AuthorityService:
             )
         return rows
 
-    def _unreadable_subscriptions_tx(self, *, settled_only: bool) -> list[str]:
-        registered = _registered_recipients()
-        if not _roster_complete():
+    def _unreadable_subscriptions_tx(self, roster: tuple[frozenset[str], bool], *, settled_only: bool) -> list[str]:
+        if not roster[1]:
             return []
         names = self._conn.execute(
             "SELECT DISTINCT recipient FROM authority_channel_subscribers ORDER BY recipient"
@@ -1951,18 +2028,18 @@ class AuthorityService:
         return [
             str(item["recipient"])
             for item in names
-            if self._unreadable_reason(str(item["recipient"]), registered, settled_only=settled_only) is not None
+            if self._unreadable_reason(str(item["recipient"]), roster, settled_only=settled_only) is not None
         ]
 
-    def _end_unreadable_subscriptions_tx(self, *, settled_only: bool) -> int:
+    def _end_unreadable_subscriptions_tx(self, roster: tuple[frozenset[str], bool], *, settled_only: bool) -> int:
         return sum(
             self._end_subscriptions_tx(name)
-            for name in self._unreadable_subscriptions_tx(settled_only=settled_only)
+            for name in self._unreadable_subscriptions_tx(roster, settled_only=settled_only)
         )
 
     @staticmethod
-    def _unreadable_reason(name: str, registered: frozenset[str], *, settled_only: bool) -> str | None:
-        standing = _recipient_standing(name, registered, _roster_complete())
+    def _unreadable_reason(name: str, roster: tuple[frozenset[str], bool], *, settled_only: bool) -> str | None:
+        standing = _recipient_standing(name, *roster)
         if standing == "settled_task":
             return RECIPIENT_SETTLED_REASON
         if standing == "not_registered" and not settled_only:
@@ -2354,12 +2431,12 @@ class AuthorityService:
         its delivery, and while the roster is incomplete no subscription is
         ended at all (fail closed: nothing is ended on doubt).
         """
-        if not _roster_complete():
+        registered, complete = _load_roster()
+        if not complete:
             return tuple(names)
-        registered = _registered_recipients()
         kept: list[str] = []
         for name in names:
-            standing = _recipient_standing(name, registered, _roster_complete())
+            standing = _recipient_standing(name, registered, complete)
             if standing in {"settled_task", "not_registered"}:
                 self._end_subscriptions_tx(name, channel_id=str(channel_row["channel_id"]))
                 continue
@@ -2557,7 +2634,8 @@ class AuthorityService:
         if cleanup_expired:
             self._notify_cleanup_expiry_summary_tx(cleanup_expired)
         if cleanup_ids is None:
-            for row, reason in self._unreadable_deliveries_tx(settled_only=True):
+            roster = _load_roster()
+            for row, reason in self._unreadable_deliveries_tx(roster, settled_only=True):
                 if self._stored_kimi_delivery(row):
                     continue
                 delivery_id = str(row["delivery_id"])
@@ -2578,7 +2656,7 @@ class AuthorityService:
                     delivery_id, reason_code=reason, session_via_durable_cto=True,
                 )
                 reclaimed += 1
-            self._end_unreadable_subscriptions_tx(settled_only=True)
+            self._end_unreadable_subscriptions_tx(roster, settled_only=True)
         stale = self._conn.execute(
             """SELECT d.delivery_id, d.fence_token, d.attempt_count, d.recipient, d.message_id, m.kind
                FROM authority_deliveries d JOIN comms_messages m USING (message_id)
@@ -2774,7 +2852,7 @@ class AuthorityService:
         if session_via_durable_cto and is_session_cto_recipient(recipient):
             parties: tuple[str, ...] = (DURABLE_CTO_RECIPIENT,)
         elif is_session_cto_recipient(recipient) or _recipient_standing(
-            recipient, _registered_recipients(), _roster_complete()
+            recipient, *_load_roster()
         ) in {"registered", "live_task"}:
             parties = (recipient, DURABLE_CTO_RECIPIENT)
         else:

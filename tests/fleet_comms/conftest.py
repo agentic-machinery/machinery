@@ -55,5 +55,10 @@ def placeholder_seats_registered(monkeypatch: pytest.MonkeyPatch) -> None:
     """
     from lu_machinery.fleet_comms import authority
 
-    real = authority._registered_recipients
-    monkeypatch.setattr(authority, "_registered_recipients", lambda: real() | PLACEHOLDER_SEATS)
+    real = authority._load_roster
+
+    def roster() -> tuple[frozenset[str], bool]:
+        names, complete = real()
+        return names | PLACEHOLDER_SEATS, complete
+
+    monkeypatch.setattr(authority, "_load_roster", roster)

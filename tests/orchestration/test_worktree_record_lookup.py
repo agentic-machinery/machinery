@@ -201,14 +201,19 @@ def test_cached_source_is_still_read_and_unreadable_fails_closed(store, monkeypa
     root, tasks, tree = store
     path = save(tasks, "record.json", {"worktree_path": str(tree)})
     output.resolve_worktree_record(tree, tasks, repo_root=root)
-    original = Path.read_bytes
+    from lu_machinery.orchestration import task_record_store
 
-    def read(candidate):
-        if candidate == path:
-            raise OSError("denied")
-        return original(candidate)
+    def denied(original):
+        def read(candidate):
+            if candidate == path:
+                raise OSError("denied")
+            return original(candidate)
 
-    monkeypatch.setattr(Path, "read_bytes", read)
+        return read
+
+    # The record reader and the replay oracle's Path.read_bytes are both denied.
+    monkeypatch.setattr(task_record_store, "read_regular_bytes", denied(task_record_store.read_regular_bytes))
+    monkeypatch.setattr(Path, "read_bytes", denied(Path.read_bytes))
     replay(tasks, root, [tree])
     assert result(output.resolve_worktree_record, tree, tasks, root) == (
         "ValueError",

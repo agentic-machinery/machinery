@@ -78,6 +78,16 @@ def test_inventory_uses_dispatcher_retention_classification(tmp_path, monkeypatc
             return real_read(self, *args, **kwargs)
 
         monkeypatch.setattr(Path, "read_text", read_text)
+        from lu_machinery.dispatcher import store as dispatch_store
+
+        real_regular = dispatch_store.read_regular_bytes
+
+        def read_regular(candidate):
+            if candidate == path:
+                raise PermissionError("synthetic record read refusal")
+            return real_regular(candidate)
+
+        monkeypatch.setattr(dispatch_store, "read_regular_bytes", read_regular)
     inspected = []
 
     def inspect(_tree, *args):
@@ -272,6 +282,16 @@ def test_retention_refuses_unreadable_durable_record(tmp_path, monkeypatch, dama
         pytest.fail("retention refusal reached Git inspection, push or removal")
 
     monkeypatch.setattr(Path, "read_text", read_text)
+    from lu_machinery.dispatcher import store as dispatch_store
+
+    original_regular = dispatch_store.read_regular_bytes
+
+    def read_regular(candidate):
+        if candidate == path and damage == "unreadable":
+            raise PermissionError("record cannot be read")
+        return original_regular(candidate)
+
+    monkeypatch.setattr(dispatch_store, "read_regular_bytes", read_regular)
     monkeypatch.setattr(git, "_tree_changes", forbidden)
     monkeypatch.setattr(git, "_git", forbidden)
     monkeypatch.setattr(git, "_salvage", forbidden)

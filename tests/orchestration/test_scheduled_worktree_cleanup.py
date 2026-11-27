@@ -1976,14 +1976,16 @@ def test_rescue_report_survives_a_listed_terminal_record_moving(tmp_path, monkey
     archived = tasks / "archive" / hot.name
     archived.parent.mkdir(parents=True)
     hot.write_text(json.dumps({"task_id": "retired", "status": "done"}))
-    read_bytes = Path.read_bytes
+    from lu_machinery.orchestration import task_record_store
+
+    read_bytes = task_record_store.read_regular_bytes
 
     def archive_before_read(path):
         if path == hot and hot.exists():
             hot.rename(archived)
         return read_bytes(path)
 
-    monkeypatch.setattr(Path, "read_bytes", archive_before_read)
+    monkeypatch.setattr(task_record_store, "read_regular_bytes", archive_before_read)
 
     assert cleanup.report_terminal_worktrees(tmp_path) == {"summary": {"candidate": 0}, "tasks": []}
     assert archived.is_file()

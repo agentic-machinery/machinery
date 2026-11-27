@@ -86,6 +86,17 @@ def test_archive_move_does_not_hide_a_damaged_worktree_claim(tmp_path, monkeypat
         return read_bytes(path)
 
     monkeypatch.setattr(Path, "read_bytes", archive_before_read)
+    from lu_machinery.orchestration import task_record_store
+
+    read_regular = task_record_store.read_regular_bytes
+
+    def archive_before_regular_read(path):
+        if path == hot and hot.exists():
+            hot.rename(archived)
+            archived.write_bytes(b'{"task_id": "archived-claim",')
+        return read_regular(path)
+
+    monkeypatch.setattr(task_record_store, "read_regular_bytes", archive_before_regular_read)
 
     assert worktree_claims.active_worktree_claim_refusal(
         worktree, tasks_dir=hot.parent, repo_root=primary,

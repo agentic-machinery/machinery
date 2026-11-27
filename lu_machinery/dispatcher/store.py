@@ -12,6 +12,7 @@ import uuid
 from contextlib import nullcontext
 from datetime import UTC, datetime, timedelta
 from pathlib import Path, PureWindowsPath
+from stat import S_ISDIR, S_ISREG
 from typing import Any
 
 from lu_machinery.common import json_depth
@@ -19,17 +20,21 @@ from lu_machinery.common.git_context import validate_plain_branch_name
 from lu_machinery.common.task_store_paths import tasks_dir
 from lu_machinery.dispatcher.types import ReviewAttempt, StartRefusal
 from lu_machinery.orchestration.task_record_store import (
+    ARCHIVE_DIR_NAME,
     NonFiniteRecordValue,
     TaskIdentityMismatch,
+    archived_task_record_path,
     is_identical_copy,
     iter_task_records,
-    locate_task_record,
+    locate_task_record,  # noqa: F401 - re-exported: dispatcher.checks reads store.locate_task_record
     misnamed_record_refusal,
     parse_task_record,
+    read_regular_bytes,
     read_task_record_bytes,
     record_json,
     relocated_result_file,
     task_archive_lock,
+    task_record_path,
     task_state_lock,
 )
 
@@ -268,19 +273,47 @@ def retention_hold_disposition(record: dict, *, tasks_root: Path | None = None) 
     return None
 
 
+def _read_record_text(path: Path) -> str:
+    """A record file's text, read without blocking and decoded as UTF-8 whatever the locale.
+
+    An open or read failure, or an entry that is not a regular file (a FIFO, a
+    directory, a device), raises ``OSError`` (``FileNotFoundError`` included);
+    bytes that are not UTF-8 raise ``UnicodeDecodeError`` (a ``ValueError``).
+    """
+    return read_regular_bytes(path).decode("utf-8")
+
+
+def _current_record(path: Path) -> dict | None:
+    """The record now at ``path`` for a writer; ``None`` only when no entry is proven to exist there.
+
+    Anything else that cannot be read whole (an access failure, a dangling link,
+    a non-regular entry, bytes that are not UTF-8 JSON) is ``TASK_RECORD_DAMAGED``.
+    """
+    try:
+        current = json_depth.loads(_read_record_text(path), max_depth=_JSON_MAX_DEPTH)
+        if not isinstance(current, dict):
+            raise ValueError("not an object")
+    except FileNotFoundError as exc:
+        try:
+            absent = _proven_absent(path)
+        except TaskRecordError:
+            absent = False
+        if absent:
+            return None
+        raise TaskRecordError("TASK_RECORD_DAMAGED") from exc
+    except (OSError, ValueError, RecursionError) as exc:
+        raise TaskRecordError("TASK_RECORD_DAMAGED") from exc
+    return current
+
+
 def _write(path: Path, record: dict, exclusive: bool = False, *, grant: dict | None = None,
            require_existing: bool = False) -> None:
     # Reentrant: settlement, create and grant_paths already hold this same inode lock.
     with task_state_lock(path):
-        if require_existing and not path.exists():
+        current = _current_record(path) if require_existing or not exclusive else None
+        if require_existing and current is None:
             raise TaskRecordError("TASK_RECORD_DAMAGED")
-        if not exclusive and path.exists():
-            try:
-                current = json_depth.loads(path.read_text(), max_depth=_JSON_MAX_DEPTH)
-                if not isinstance(current, dict):
-                    raise ValueError("not an object")
-            except (OSError, ValueError, RecursionError) as exc:
-                raise TaskRecordError("TASK_RECORD_DAMAGED") from exc
+        if not exclusive and current is not None:
             if current.get("run_nonce") != record.get("run_nonce"):
                 raise TaskRecordError("TASK_RECORD_REPLACED: run nonce mismatch")
             if "owned_path_grants" in current:
@@ -446,28 +479,79 @@ def _worktree_may_exist(path: str | None) -> bool:
     return True
 
 
+def _proven_absent(path: Path) -> bool:
+    """True when ``path`` has no directory entry and its nearest existing ancestor is a reachable directory.
+
+    A dangling link anywhere on the way (the record name, the archive or the
+    tasks directory itself) or an ancestor that cannot be stated proves
+    nothing, so it is ``TASK_RECORD_UNREADABLE``; a tasks directory that does
+    not exist yet below a real directory is an empty store.
+    """
+    probe = path
+    while True:
+        try:
+            os.lstat(probe)
+        except FileNotFoundError:
+            if probe.parent == probe:
+                return True
+            probe = probe.parent
+            continue
+        except OSError as exc:
+            raise TaskRecordError("TASK_RECORD_UNREADABLE") from exc
+        break
+    if probe == path:
+        return False  # an entry exists: a dangling link or one written since the stat
+    try:
+        return S_ISDIR(os.stat(probe).st_mode)
+    except OSError as exc:
+        raise TaskRecordError("TASK_RECORD_UNREADABLE") from exc
+
+
+def _locate_record(tasks_root: Path, task_id: str) -> Path | None:
+    """The hot record, else the archived one; ``None`` only when both are proven absent.
+
+    The archive is consulted only after the hot name is proven absent, so an
+    unusable hot entry never lets an older archived copy answer. Absence needs
+    ``_proven_absent``; an access failure, a non-regular entry, a dangling link
+    or any other error is ``TASK_RECORD_UNREADABLE``. (``locate_task_record``
+    uses ``is_file()``, which on 3.14 answers False on an access failure.)
+    """
+    for candidate in (task_record_path(tasks_root, task_id), archived_task_record_path(tasks_root, task_id)):
+        try:
+            if S_ISREG(os.stat(candidate).st_mode):
+                return candidate
+        except FileNotFoundError:
+            if _proven_absent(candidate):
+                continue
+        except OSError as exc:
+            raise TaskRecordError("TASK_RECORD_UNREADABLE") from exc
+        raise TaskRecordError("TASK_RECORD_UNREADABLE")  # a dangling link, a non-regular entry or no reachable directory
+    return None
+
+
 def read(task_id: str, nonce: str | None = None, *, missing_ok=False, tasks_root: Path | None = None) -> dict | None:
-    path = record_path(task_id)
-    if tasks_root is not None:
-        path = tasks_root / path.name
-    if locate_task_record:
-        path = locate_task_record(path.parent, task_id)
-    elif not path.exists():
-        path = path.parent / "archive" / path.name
-    if path is None or not path.exists():
+    """The task's record, hot or archived; ``None`` with ``missing_ok`` only when no record is proven to exist."""
+    default = record_path(task_id)  # validates the id, whichever store is read
+    path = _locate_record(default.parent if tasks_root is None else tasks_root, task_id)
+    if path is None:
         if missing_ok:
             return None
         raise ValueError("task not found")
     try:
-        record = json_depth.loads(path.read_text(), max_depth=_JSON_MAX_DEPTH)
+        text = _read_record_text(path)  # a non-regular entry since the lookup is an OSError too
+    except OSError as exc:  # access denied, or moved since the lookup: its content was never seen
+        raise TaskRecordError("TASK_RECORD_UNREADABLE") from exc
+    except UnicodeDecodeError as exc:  # read, but not text
+        raise TaskRecordError("TASK_RECORD_DAMAGED") from exc
+    try:
+        record = json_depth.loads(text, max_depth=_JSON_MAX_DEPTH)
         if not isinstance(record, dict):
             raise ValueError("not an object")
-    except (OSError, ValueError, RecursionError) as exc:
+    except (ValueError, RecursionError) as exc:
         raise TaskRecordError("TASK_RECORD_DAMAGED") from exc
     if nonce is not None and record.get("run_nonce") != nonce:
         raise ValueError("run nonce mismatch")
-    if relocated_result_file:
-        record["result_file"] = relocated_result_file(path, record.get("result_file"))
+    record["result_file"] = relocated_result_file(path, record.get("result_file"))
     return record
 
 
@@ -501,17 +585,27 @@ def clear_non_finite_fields(record: dict) -> str | None:
 def publish_failed_record(record: dict, path: Path) -> None:
     """Recover a damaged supervisor record as failure, never overwrite another run.
 
-    A deleted record is published again as ``TASK_RECORD_DAMAGED``. A record the writer refuses for a
+    A record proven absent (``_proven_absent``: no entry, below a reachable directory) is published again
+    as ``TASK_RECORD_DAMAGED``, and so is one whose content is not a UTF-8 JSON object. A record the writer refuses for a
     non-finite number is published with that field cleared and its ``TASK_RECORD_NON_FINITE`` code as the
-    error. Any other read error leaves the record unable to prove it is this run's, and a lock or write error
+    error. Any other read error (a dangling link, whose target may be another run's record, a non-regular
+    entry, an access failure) leaves the record unable to prove it is this run's, and a lock or write error
     leaves the failure unpublished: each is a typed ``TASK_RECORD_IO_ERROR``. A worktree already reaped keeps
     its ``removed`` disposition.
     """
     try:
         with task_state_lock(path):
             try:
-                current = json_depth.loads(path.read_text(), max_depth=_JSON_MAX_DEPTH)
-            except (FileNotFoundError, ValueError, RecursionError):
+                current = json_depth.loads(_read_record_text(path), max_depth=_JSON_MAX_DEPTH)
+            except FileNotFoundError as exc:
+                try:
+                    absent = _proven_absent(path)
+                except TaskRecordError:
+                    absent = False
+                if not absent:
+                    raise exc  # a dangling link or an unreachable directory: TASK_RECORD_IO_ERROR below
+                current = None
+            except (ValueError, RecursionError):  # bytes that are not a UTF-8 JSON document
                 current = None
             if (isinstance(current, dict) and isinstance(current.get("run_nonce"), str)
                     and current["run_nonce"] != record["run_nonce"]):
@@ -884,8 +978,23 @@ def list_tasks(status: str | None = None, include_archive=False, *, strict=False
     root = tasks_dir()
     records = []
     relocated = set()
+
+    def refuse_unlisted(path: Path, exc: OSError) -> None:
+        # A strict scan that could not list a directory or type an entry has not seen every record.
+        if not (isinstance(exc, FileNotFoundError) and _proven_absent(path)):  # no store or archive yet
+            raise ValueError(f"unreadable task record {path}; review attempt reuse cannot be excluded") from None
+
     with task_archive_lock(root) if strict else nullcontext():
-        for listed in iter_task_records(root, include_archive=include_archive):
+        if strict and include_archive:
+            # The scan reports no missing archive (the first archive run creates it): prove that absence here.
+            try:
+                os.stat(root / ARCHIVE_DIR_NAME)
+            except FileNotFoundError as exc:
+                refuse_unlisted(root / ARCHIVE_DIR_NAME, exc)
+            except OSError:
+                pass  # the scan reports it
+        for listed in iter_task_records(root, include_archive=include_archive,
+                                        on_error=refuse_unlisted if strict else None, report_non_regular=strict):
             if listed in relocated:
                 continue
             try:
@@ -898,8 +1007,7 @@ def list_tasks(status: str | None = None, include_archive=False, *, strict=False
                 if record is None or "task_id" not in record:
                     continue
                 if status is None or record.get("status") == status:
-                    if relocated_result_file:
-                        record["result_file"] = relocated_result_file(path, record.get("result_file"))
+                    record["result_file"] = relocated_result_file(path, record.get("result_file"))
                     records.append(record)
             except TaskIdentityMismatch as exc:
                 # An exact copy of the named record is no run of its own; any other misnamed file refuses.

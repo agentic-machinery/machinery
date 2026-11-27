@@ -127,14 +127,14 @@ def test_a_listed_record_follows_its_own_file_across_archive_and_restore(tmp_pat
     hot.write_bytes(legacy)
     for path in (canonical, hot):
         os.utime(path, ns=(1, 1))
-    read_bytes = Path.read_bytes
+    read_bytes = store.read_regular_bytes
 
     def archive_before_read(path):
         if path == hot:
             hot.rename(archived)
         return read_bytes(path)
 
-    monkeypatch.setattr(Path, "read_bytes", archive_before_read)
+    monkeypatch.setattr(store, "read_regular_bytes", archive_before_read)
     assert store.read_task_record_bytes(hot, tasks_dir=tmp_path) == (archived, legacy)
     assert store.locate_task_record(tmp_path, "review") == canonical
 
@@ -143,7 +143,7 @@ def test_a_listed_record_follows_its_own_file_across_archive_and_restore(tmp_pat
             archived.rename(hot)
         return read_bytes(path)
 
-    monkeypatch.setattr(Path, "read_bytes", restore_before_read)
+    monkeypatch.setattr(store, "read_regular_bytes", restore_before_read)
     assert store.read_task_record_bytes(archived, tasks_dir=tmp_path) == (hot, legacy)
 
     hot_canonical = tmp_path / canonical.name
@@ -154,7 +154,7 @@ def test_a_listed_record_follows_its_own_file_across_archive_and_restore(tmp_pat
             hot_canonical.rename(archived.with_name("review.20261119T150000Z.archived.json"))
         return read_bytes(path)
 
-    monkeypatch.setattr(Path, "read_bytes", collide_before_read)
+    monkeypatch.setattr(store, "read_regular_bytes", collide_before_read)
     with pytest.raises(FileNotFoundError):
         store.read_task_record_bytes(hot_canonical, tasks_dir=tmp_path)
 
