@@ -1227,18 +1227,20 @@ def record_finding_outcomes(batch_state_dir: Path, entries: Iterable[Mapping[str
 OutcomeKey = tuple[str, int | str, int]
 
 
-def read_finding_outcomes(
-        batch_state_dir: Path) -> tuple[dict[OutcomeKey, dict[str, str]], set[tuple[str, int | str, int, str]], Counter[str]]:
-    """The labelled findings (finding id to label) of each (review task, repository identity, PR) publication, the
-    (review task, repository identity, PR, finding id) a later review contested, and read counts. A missing ledger
-    gives none: every finding is then unlabelled. A line counts only for the publication it names."""
+def read_finding_outcomes(batch_state_dir: Path) -> tuple[
+        dict[OutcomeKey, dict[str, tuple[str, datetime]]], set[tuple[str, int | str, int, str]], Counter[str]]:
+    """The labelled findings (finding id to its label and the time it was recorded) of each (review task, repository
+    identity, PR) publication, the (review task, repository identity, PR, finding id) a later review contested, and
+    read counts. A missing ledger gives none: every finding is then unlabelled. A line counts only for the
+    publication it names. FleetRepoError when the fleet registry cannot be read."""
     counts: Counter[str] = Counter()
-    labels: dict[OutcomeKey, dict[str, str]] = {}
+    labels: dict[OutcomeKey, dict[str, tuple[str, datetime]]] = {}
     contests: set[tuple[str, int | str, int, str]] = set()
     for entry in _outcome_lines(batch_state_dir / ROWS_DIR / OUTCOMES_FILE, counts):
         identity = repository_identity(entry["repository"])
         if entry["kind"] == "label":
-            labels.setdefault((entry["task_id"], identity, entry["pr"]), {}).setdefault(entry["finding_id"], entry["label"])
+            labels.setdefault((entry["task_id"], identity, entry["pr"]), {}).setdefault(
+                entry["finding_id"], (entry["label"], cast(datetime, timestamp(entry["recorded_at"]))))
         else:
             contests.add((entry["task_id"], identity, entry["pr"], entry["finding_id"]))
     return labels, contests, counts

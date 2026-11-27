@@ -2071,11 +2071,11 @@ def test_finding_precision_follows_the_files_the_author_changed_before_the_same_
 
 
 def _label(batch_state: Path, task_id: str, pr: int, finding_id: str, label: str, evidence: str | None = None,
-           repository: str = "learn-ukrainian/machinery") -> int:
+           repository: str = "learn-ukrainian/machinery", recorded_at: str = NOW.isoformat()) -> int:
     """An author label line, as the verdict recorder's finding-outcome verb writes it."""
     return rows.record_finding_outcomes(batch_state, [rows.finding_outcome(
         kind="label", task_id=task_id, repository=repository, pr=pr, finding_id=finding_id,
-        label=label, evidence=evidence, recorded_by="author-task", recorded_at=NOW.isoformat())])
+        label=label, evidence=evidence, recorded_by="author-task", recorded_at=recorded_at)])
 
 
 def _contest(batch_state: Path, task_id: str, pr: int, finding_id: str, contested_by: str,
@@ -2113,12 +2113,13 @@ def test_finding_outcome_labels_count_per_reviewer_and_a_contest_holds_the_label
     _findings_review(tasks, "s5-review", "incorrect", [("P1", "src/a.py"), ("P0", "src/b.py")], pr=5,
                      pinned_head="e" * 40, **blocked, **{**sol, "review_author_model": None})
     rows.backfill(tasks, batch_state)
-    # Sol's PR 3 review id is dispatched again and blocks at a later head: the rows keep its newest run, two
-    # published runs share its label key, so its invented label names neither run and the finding counts unlabelled.
+    # Sol's PR 3 review id is dispatched again after its first run was labelled, and blocks at a later head: the rows
+    # keep only its newest run, and the invented label (recorded before that run started) labels the earlier run, so
+    # the newest run's finding counts unlabelled.
     ledger = batch_state / rows.ROWS_DIR / rows.ROWS_FILE
     [s3] = [line for line in map(json.loads, ledger.read_text().splitlines()) if line["task_id"] == "s3-review"]
     with ledger.open("a") as stream:
-        stream.write(json.dumps({**s3, "started_at": _at(6.5), "pinned_head": "f" * 40}) + "\n")
+        stream.write(json.dumps({**s3, "started_at": _at(5), "finished_at": _at(4.5), "pinned_head": "f" * 40}) + "\n")
     _publish(batch_state, ("o1-review", 1, "a" * 40, "CHANGES_REQUESTED"), ("o2-review", 2, "b" * 40, "CHANGES_REQUESTED"),
              ("s3-review", 3, "c" * 40, "CHANGES_REQUESTED"), ("s3-review", 3, "f" * 40, "CHANGES_REQUESTED"),
              ("s5-review", 5, "e" * 40, "CHANGES_REQUESTED"))
@@ -2128,7 +2129,7 @@ def test_finding_outcome_labels_count_per_reviewer_and_a_contest_holds_the_label
     assert _contest(batch_state, "o1-review", 1, "F2", "o1b-review") == 1
     assert _label(batch_state, "o2-review", 2, "F0", "out_of_scope", "outside the frozen obligation") == 1
     assert _contest(batch_state, "o2-review", 2, "F1", "o2b-review") == 1
-    assert _label(batch_state, "s3-review", 3, "F0", "invented", "no such call site exists") == 1
+    assert _label(batch_state, "s3-review", 3, "F0", "invented", "no such call site exists", recorded_at=_at(5.5)) == 1
     assert _label(batch_state, "o4-review", 4, "F0", "wrong", "already correct") == 1
     assert _label(batch_state, "s5-review", 5, "F1", "wrong", "the guard already returns early") == 1
     # Lines naming another PR, or another repository at the same PR, than the review's publication: they never label
@@ -2194,7 +2195,7 @@ def test_finding_outcome_ledger_keeps_one_label_per_finding_and_skips_damaged_li
     with path.open("ab") as stream:
         stream.write(b"{not json\n" + b"".join(json.dumps(line).encode() + b"\n" for line in damaged) + repeated + b"\n")
     labels, contests, counts = rows.read_finding_outcomes(batch_state)
-    assert labels == {("o1-review", machinery, 1): {"F0": "fixed"}, ("o1-review", "other/repo", 1): {"F0": "wrong"}}
+    assert labels == {("o1-review", machinery, 1): {"F0": ("fixed", NOW)}, ("o1-review", "other/repo", 1): {"F0": ("wrong", NOW)}}
     assert contests == {("o1-review", machinery, 1, "F0")}
     assert counts == {"lines": 3, "malformed_lines": 6}
     # A writer that finds the damaged lines still keeps one label per finding.
@@ -2539,6 +2540,8 @@ def test_publication_ledger_writes_only_well_formed_lines_and_trusts_no_damaged_
     assert token_use["by_work"]["review_of_record"]["tokens"] == 18
     assert token_use["waste"]["supplemental_review"]["share"] == 26 / 71
     assert token_use["by_work"]["unclassified_review"]["tokens"] == 27
+    # A label line is read through the registry too: unreadable, the collection counts no label and still answers.
+    assert _label(batch_state, "c-review", 3, "F0", "fixed") == 1
     registry = fleet_repos._CONFIG_PATH.read_text(encoding="utf-8")
     assert "\n    github: agentic-machinery/machinery\n" in registry
     catalog = tmp_path / "fleet_repos.yaml"
