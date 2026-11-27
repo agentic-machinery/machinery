@@ -220,11 +220,23 @@ _TASK_TERMINAL_STATUSES = frozenset({
 _LOG = logging.getLogger(__name__)
 
 
-def _roster_sources() -> tuple[Path | None, Path | None]:
-    """The assignments and driver-lane files the roster reads; ``None`` for a source whose setting is unusable."""
+def _roster_sources() -> tuple[Path | None, Path | None, Path | None]:
+    """The assignments and driver-lane files the roster reads, and the profile file that names them.
+
+    ``None`` for a source whose setting is unusable, and for the profile when none is configured.
+    Each source path comes from its own profile read, so a caller compares the sources taken before
+    and after its reads (and the profile's identity) to know they belong to one profile version.
+    """
     from lu_machinery import agent_identity
+    from lu_machinery.common import profile, repo_root
     from lu_machinery.common.repo_root import MachineryConfigError
     from lu_machinery.ops import driver_lanes
+
+    profile_file: Path | None
+    try:
+        profile_file = profile._configured_profile_path(None) or repo_root.state_root() / profile.PROFILE_REL
+    except Exception:
+        profile_file = None
 
     try:
         assignments: Path | None = Path(agent_identity.default_assignments_path())
@@ -234,10 +246,10 @@ def _roster_sources() -> tuple[Path | None, Path | None]:
         lane_data: Path | None = Path(driver_lanes.default_data_path())
     except MachineryConfigError:
         lane_data = None
-    return assignments, lane_data
+    return assignments, lane_data, profile_file
 
 
-def _roster_identity(sources: tuple[Path | None, Path | None]) -> tuple[object, ...]:
+def _roster_identity(sources: tuple[Path | None, Path | None, Path | None]) -> tuple[object, ...]:
     """Each roster file's (path, device, inode, ctime, mtime, size), or ``None`` fields when it cannot be stated.
 
     Any write, replacement or permission change moves ctime, so equal identities taken
@@ -275,7 +287,7 @@ def _load_roster() -> tuple[frozenset[str], bool]:
 
     # An unusable profile entry or root setting leaves that roster source unavailable, so the roster is incomplete.
     sources = _roster_sources()
-    assignments, lane_data = sources
+    assignments, lane_data, _profile_file = sources
     key = _roster_identity(sources)
     cached = _ROSTER_CACHE.get(key)
     if cached is not None:
@@ -296,7 +308,8 @@ def _load_roster() -> tuple[frozenset[str], bool]:
         with contextlib.suppress(Exception):
             lanes = tuple(lane.sender for lane in driver_lanes.load_registry(lane_data).lanes)
     complete = bool(slots) and bool(lanes) and external_availability == "available"
-    changed = _roster_identity(sources) != key  # a replacement between the reads mixes two versions
+    # A replacement between the reads, or a profile that now names other files, mixes two versions.
+    changed = _roster_sources() != sources or _roster_identity(sources) != key
     complete = complete and not changed
     if not complete:
         _LOG.warning(
@@ -597,11 +610,14 @@ def pending_delivery_snapshot(recipient: str, *, root: Path | None = None, limit
         sources = _roster_sources()
         before = _roster_identity(sources)
         roster = _load_roster()
+        if sources[0] is None:
+            return {**unknown, "reason": "recipient_standing_unverified"}
         try:
-            canonical = resolve_recipient_alias(recipient, strict=True) == recipient
+            # The file the snapshot read, never a path resolved again from the profile.
+            canonical = resolve_recipient_alias(recipient, assignments_path=sources[0], strict=True) == recipient
         except Exception:
             return {**unknown, "reason": "recipient_standing_unverified"}
-        if _roster_identity(sources) != before:  # the roster file changed (even and back) during the reads
+        if _roster_sources() != sources or _roster_identity(sources) != before:  # changed (even and back) meanwhile
             return {**unknown, "reason": "recipient_standing_unverified"}
         if canonical:
             standing = _recipient_standing(recipient, *roster)
