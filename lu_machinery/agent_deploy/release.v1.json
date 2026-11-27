@@ -12,7 +12,11 @@
     "rules/operator-expectations.md",
     "rules/fleet-driver-routing.md",
     "rules/core.md",
-    "rules/core-curriculum.md"
+    "rules/core-curriculum.md",
+    "rules/_load-via-api.md",
+    "rules/fleet-role-scorecard.md",
+    "rules/fleet-shared-doctrine.md",
+    "rules/storage-topology.md"
   ],
   "files": {
     "contracts/rollover-registry.md": {
@@ -429,9 +433,6 @@
         "agy": [
           ".agent/rules/_load-via-api.md"
         ],
-        "claude": [
-          ".claude/rules/_load-via-api.md"
-        ],
         "codex": [
           ".codex/rules/_load-via-api.md"
         ],
@@ -621,9 +622,6 @@
         "agy": [
           ".agent/rules/fleet-role-scorecard.md"
         ],
-        "claude": [
-          ".claude/rules/fleet-role-scorecard.md"
-        ],
         "codex": [
           ".codex/rules/fleet-role-scorecard.md"
         ],
@@ -638,9 +636,6 @@
       "targets": {
         "agy": [
           ".agent/rules/fleet-shared-doctrine.md"
-        ],
-        "claude": [
-          ".claude/rules/fleet-shared-doctrine.md"
         ],
         "codex": [
           ".codex/rules/fleet-shared-doctrine.md"
@@ -686,9 +681,6 @@
       "targets": {
         "agy": [
           ".agent/rules/storage-topology.md"
-        ],
-        "claude": [
-          ".claude/rules/storage-topology.md"
         ],
         "codex": [
           ".codex/rules/storage-topology.md"
