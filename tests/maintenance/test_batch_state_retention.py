@@ -702,6 +702,7 @@ def test_stale_pid_temp_does_not_block_or_get_deleted(tmp_path: Path) -> None:
 
 
 def _hygiene_receipt(root: Path, receipt_dir: Path, monkeypatch: pytest.MonkeyPatch) -> dict:
+    monkeypatch.setenv("LU_STATE_ROOT", str(root.parent))
     monkeypatch.setattr(
         scheduled_worktree_cleanup,
         "build_receipt",

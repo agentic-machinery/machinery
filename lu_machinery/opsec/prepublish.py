@@ -542,7 +542,7 @@ def _override_admitted(
 ) -> bool:
     """Whether the private authority admits these policy hits; its refusal becomes PublishBlocked.
 
-    The audit path is under the policy checkout, shared by every
+    The audit path is under the durable state root, shared by every
     worktree and publisher, unless the caller names one. Only a literal True admits;
     any other failure, resolving that path included, admits nothing.
     """
@@ -550,7 +550,9 @@ def _override_admitted(
     import io
 
     try:
-        target = log_path or _policy_checkout() / "batch_state/opsec/overrides.jsonl"
+        from lu_machinery.common.repo_root import state_root
+
+        target = log_path or state_root() / "batch_state/opsec/overrides.jsonl"
         with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
             admitted = authority.authorize(destination, list(blocks), reason, target)
     except authority.OverrideBlocked as exc:

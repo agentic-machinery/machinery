@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any
 
 from lu_machinery import agent_identity
+from lu_machinery.common.task_store_paths import tasks_dir as default_tasks_dir
 from lu_machinery.fleet_comms.authority import AuthorityService, _registered_recipients
 from lu_machinery.fleet_comms.efficiency_metrics import collect_stream_bottleneck_metrics
 from lu_machinery.fleet_comms.message_plane import default_plane_root
@@ -450,18 +451,9 @@ def scan_bottlenecks_at_inbox_checkpoint(
     if rate_limit_seconds < 0:
         raise ValueError("rate_limit_seconds must be non-negative")
     clock = (now or _utc_now()).astimezone(UTC)
-    task_path = tasks_dir or repo_root / "batch_state" / "tasks"
-    plane_path = plane_db or default_plane_root(repo_root=repo_root) / "comms.sqlite3"
-    if session_db is not None:
-        lease_path = session_db
-    else:
-        try:
-            lease_path = default_database_path(repo_root)
-        except Exception as exc:
-            # A missing canonical checkout is equivalent to no live lease for
-            # this best-effort diagnostic; escalation must still proceed.
-            logger.error("bottleneck alerts: cannot resolve session-stream DB: %s", exc)
-            lease_path = repo_root / ".agent" / "session-streams" / "missing.sqlite3"
+    task_path = tasks_dir or default_tasks_dir()
+    plane_path = plane_db or default_plane_root() / "comms.sqlite3"
+    lease_path = session_db if session_db is not None else default_database_path()
 
     authority = AuthorityService(root=plane_path.parent)
     conn = authority.store.connection

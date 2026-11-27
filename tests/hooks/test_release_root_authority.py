@@ -178,6 +178,7 @@ def test_dirt_audit_does_not_select_release_as_default_product(release, product,
         command = shlex.split(native_hook_command("claude-audit-hook"))
         env = {"PATH": "/usr/bin:/bin", "HOME": str(product.parent),
                "LU_PRODUCT_ROOT": str(product),
+               "LU_STATE_ROOT": str(product.parent),
                "LEARN_UKRAINIAN_PRIMARY_REPO_ROOT": str(product),
                "LEARN_UKRAINIAN_PYTHON": str(release.parent / "venv/bin/python"),
                "XDG_STATE_HOME": str(product.parent / "state")}
@@ -711,6 +712,7 @@ def test_codex_entry_audit_child_keeps_the_tree_off_sys_path(product, tmp_path):
             "PATH": os.environ["PATH"],
             "HOME": str(tmp_path),
             "LU_PRODUCT_ROOT": str(product),
+            "LU_STATE_ROOT": str(tmp_path),
             "LEARN_UKRAINIAN_PRIMARY_REPO_ROOT": str(product),
         },
     )
@@ -752,6 +754,7 @@ def test_hook_bootstrap_takes_the_interpreter_only_from_the_configured_primary(r
            "SESSION_HANDOFF_AGENT": "worker"}
     if anchor != "unset":
         env["LEARN_UKRAINIAN_PRIMARY_REPO_ROOT"] = str(product)
+        env["LU_STATE_ROOT"] = str(tmp_path)
     if anchor == "missing-interpreter":
         env["LEARN_UKRAINIAN_PYTHON"] = str(tmp_path / "absent-python")
     if entry == "native-hook":
@@ -829,6 +832,7 @@ def test_hook_driver_without_tmpdir_uses_the_system_temporary_directory(release,
     """Defect class: an ordinary unset TMPDIR refused a driver hook before it ran."""
     env = {"PATH": "/usr/bin:/bin", "HOME": str(tmp_path),
            "LU_PRODUCT_ROOT": str(product),
+           "LU_STATE_ROOT": str(tmp_path),
            "LEARN_UKRAINIAN_PRIMARY_REPO_ROOT": str(product),
            "LEARN_UKRAINIAN_PYTHON": str(release.parent / "venv/bin/python"),
            "LU_DRIVER_STATE_FILE": str(tmp_path / "driver-state"),

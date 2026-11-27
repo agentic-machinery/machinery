@@ -20,6 +20,7 @@ bound_case = closeout_fixtures.bound_case
 @pytest.fixture
 def observation_case(tmp_path, monkeypatch):
     repo = init_repo(tmp_path)
+    monkeypatch.setenv("LU_STATE_ROOT", str(repo))
     monkeypatch.chdir(repo)
     git(repo, "config", "core.excludesFile", str(tmp_path / "excludes"))
     (tmp_path / "excludes").write_text(".agent/\nbatch_state/\n")
@@ -491,6 +492,7 @@ def test_relocated_recovery_receipt_still_verifies(observation_case, tmp_path, m
     )
     relocated = tmp_path / "relocated"
     repo.rename(relocated)
+    monkeypatch.setenv("LU_STATE_ROOT", str(relocated))
     monkeypatch.chdir(relocated)
     data = tl.load_lifecycle(relocated / ledger.relative_to(repo))
     local = data["observation_receipts"][-1]["observation"]["local"]

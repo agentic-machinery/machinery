@@ -57,6 +57,7 @@ except ModuleNotFoundError:  # direct file-path invocation
     from lu_machinery.common.repo_root import product_root
     from lu_machinery.common.safe_unit_install import InstallError, install_unit, open_state_log
 from lu_machinery.common import json_depth
+from lu_machinery.common.task_store_paths import tasks_dir as default_tasks_dir
 
 
 def _machinery_top() -> str:
@@ -502,7 +503,7 @@ def main(argv: list[str] | None = None) -> int:
         "--tasks-dir",
         type=Path,
         default=None,
-        help="dispatch tasks dir for the running-dispatch gate (default: <root>/batch_state/tasks)",
+        help="dispatch tasks dir for the running-dispatch gate (default: configured dispatch task store)",
     )
     parser.add_argument(
         "--state-dir",
@@ -516,7 +517,7 @@ def main(argv: list[str] | None = None) -> int:
     tasks_dir = args.tasks_dir
     if tasks_dir is None:
         try:
-            tasks_dir = _resolve_main_root(repo) / "batch_state" / "tasks"
+            tasks_dir = default_tasks_dir()
         except Exception:
             tasks_dir = None
 

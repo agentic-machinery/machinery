@@ -395,9 +395,7 @@ def produce(
         state_router, "summarize_lane_runtime", lambda lane, **_k: _runtime(lane, lane in case.runtime_blocked)
     )
     if case.reserve:
-        # The producer reads the operator reserve under the configured shared-state root
-        # (state_root(project_root), #93), not under project_root itself: anchor it here.
-        monkeypatch.setattr(state_router, "state_root", lambda *_args, **_kwargs: tmp_path)
+        monkeypatch.setenv("LU_STATE_ROOT", str(tmp_path))
         reserve_path = tmp_path / RESERVE_RELATIVE_PATH
         reserve_path.parent.mkdir(parents=True, exist_ok=True)
         reserve_path.write_text(json.dumps(OPERATOR_RESERVE), encoding="utf-8")

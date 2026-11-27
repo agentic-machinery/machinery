@@ -629,7 +629,7 @@ def test_pushed_head_ancestor_of_origin_main_releases_using_real_local_git(batch
     head = git("rev-parse", "HEAD")
     git("-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "--allow-empty", "-m", "main")
     git("update-ref", "refs/remotes/origin/main", "HEAD")
-    # Ancestry is read from the state anchor, which the installed package no longer derives from __file__.
+    # Landing proof reads Git from the configured checkout even when storage is elsewhere.
     monkeypatch.setenv("LEARN_UKRAINIAN_PRIMARY_REPO_ROOT", str(repo))
 
     def forbid_network(**kwargs):

@@ -28,9 +28,9 @@ import importlib, json, os, subprocess, sys
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
-site, product, primary, scenario = map(str, sys.argv[1:])
+site, product, primary, state, scenario = sys.argv[1:]
 sys.path.insert(0, site)
-product, primary = Path(product), Path(primary)
+product, primary, state = map(Path, (product, primary, state))
 from lu_machinery.common import repo_root as rr
 assert not rr.in_tree_source()
 assert rr.machinery_root() == Path(site) / 'lu_machinery'
@@ -48,12 +48,12 @@ if scenario == 'text':
 elif scenario == 'dispatch':
     with patch.object(wrappers.github_client, 'run', return_value=SimpleNamespace(returncode=0)) as run:
         assert wrappers._run_dispatch(['probe', '--task-id', 'root-probe'], False, product / 'prompt') == 0
-    assert run.call_args.kwargs['cwd'] == primary
+    assert run.call_args.kwargs['cwd'] == state
 elif scenario in ('review_dispatch', 'review_wait'):
     prompt_dir = product / 'prompts'
     prompt_dir.mkdir()
     os.environ['LU_RUNTIME_TMP_ROOT'] = str(prompt_dir)
-    reply = primary / 'reply'
+    reply = state / 'reply'
     reply.write_text('VERDICT: APPROVED\n')
     target = SimpleNamespace(agent='claude', model='unused')
     with patch('lu_machinery.agent_runtime.target_admission.resolve_and_admit', return_value=(target,)), \
@@ -66,9 +66,9 @@ elif scenario in ('review_dispatch', 'review_wait'):
         result = wrappers.run_ask_review_dispatch('claude', 'review', task_id='root-probe')
     assert result['ok'] is True, result
     index = 0 if scenario == 'review_dispatch' else 1
-    assert run.call_args_list[index].kwargs['cwd'] == primary
+    assert run.call_args_list[index].kwargs['cwd'] == state
 elif scenario == 'supervisor':
-    record_path = primary / 'batch_state/tasks/root-probe.json'
+    record_path = state / 'batch_state/tasks/root-probe.json'
     record_path.parent.mkdir(parents=True)
     spec = SimpleNamespace(agent='claude', task_id='root-probe', options={})
     record = {'run_nonce':'nonce', 'admission_hold':{'held':True}}
@@ -79,7 +79,7 @@ elif scenario == 'supervisor':
          patch.object(worker, '_identity', return_value='identity'), \
          patch.object(worker.admission, 'spawn_supervisor', return_value=(process, {})) as spawn:
         worker.start(spec, record, b'prompt', 30)
-    assert spawn.call_args.kwargs['cwd'] == primary
+    assert spawn.call_args.kwargs['cwd'] == state
     process.stdin.write.assert_called_once()
 elif scenario == 'provenance':
     # Give the configured primary real metadata: it still does not identify the wheel.
@@ -98,7 +98,7 @@ elif scenario == 'hooks':
     hooks.parent.mkdir(parents=True)
     chain = tree / 'chain'
     chain.mkdir()
-    registry = primary / 'registry'
+    registry = state / 'registry'
     def fake_git(path, *args, **kwargs):
         if args[:4] == ('config', '--path', '--get', 'core.hooksPath'):
             return str(chain)
@@ -117,18 +117,18 @@ elif scenario == 'hooks':
         proof = product / name
         subprocess.run([str(hooks / name)], cwd=product, check=True,
                        env={**os.environ, 'PATH':str(binaries)+':'+os.defpath, 'ROOT_PROOF':str(proof)})
-        assert proof.read_text().strip() == str(primary)
+        assert proof.read_text().strip() == str(state)
 elif scenario == 'alert':
     # Both the copied package and the real Fleet child own an explicit fixture
     # plane. A package outside the primary venv cannot open its default store.
     from lu_machinery.fleet_comms.authority import AuthorityService
-    plane = primary / 'test-fleet-plane'
+    plane = state / 'test-fleet-plane'
     os.environ['FLEET_COMMS_ROOT'] = str(plane)
     with AuthorityService(root=plane) as service:
         service.create_channel(admission.DISK_ALERT_CHANNEL)
     admission.post_disk_alert('installed layout proof', 'installed-root-proof')
     assert (plane / 'comms.sqlite3').is_file()
-    assert not (primary / 'batch_state/fleet-comms').exists()
+    assert not (state / 'batch_state/fleet-comms').exists()
     assert not (Path(site) / 'batch_state').exists()
 elif scenario == 'drift':
     from lu_machinery.ops import host_stack_drift as drift
@@ -159,7 +159,7 @@ elif scenario == 'interpreter':
     assert rr.project_interpreter() == python
 elif scenario == 'diagnostic':
     from lu_machinery.orchestration import task_record_causes as causes
-    record = primary / 'batch_state/tasks/root-probe.json'
+    record = state / 'batch_state/tasks/root-probe.json'
     record.parent.mkdir(parents=True)
     record.write_text('{}')
     with patch.object(causes, '_diagnostic_line', return_value=b'root proof\n'):
@@ -224,7 +224,7 @@ elif scenario == 'npm_shim':
     assert result.returncode == 0, result.stderr
     assert result.stdout == 'npm-root-proof\n', result.stdout
 elif scenario == 'compatibility_resolvers':
-    assert rr.resolve_repo_root(Path(rr.__file__), 2) == primary
+    assert rr.resolve_repo_root(Path(rr.__file__), 2) == state
     for key in rr.MACHINERY_ENV_VARS:
         os.environ.pop(key, None)
     try:
@@ -286,16 +286,22 @@ def installed_site(tmp_path_factory: pytest.TempPathFactory) -> Path:
 ])
 def test_installed_entry_points_never_use_package_ancestors_as_roots(installed_site, tmp_path, scenario):
     """Defect class: installed package location used as cwd, repository or state anchor."""
-    product, primary = tmp_path / "product", tmp_path / "primary"
+    product, primary, state = (tmp_path / name for name in ("product", "primary", "state"))
     product.mkdir()
+    state.mkdir()
     subprocess.run(["git", "init", "-q", str(primary)], check=True)
     environment = {key: value for key, value in os.environ.items() if key not in (
         "LEARN_UKRAINIAN_STATE_ROOT", "LU_TEST_DISPATCH_HEALTHY_HOST", "FLEET_COMMS_ROOT", "LU_TASKS_DIR",
     ) and not key.startswith("GIT_")}
-    environment.update(LU_PRODUCT_ROOT=str(product), LEARN_UKRAINIAN_PRIMARY_REPO_ROOT=str(primary),
-                       LEARN_UKRAINIAN_PYTHON=sys.executable, PYTHONPATH=str(installed_site))
+    environment.update(
+        LU_PRODUCT_ROOT=str(product),
+        LEARN_UKRAINIAN_PRIMARY_REPO_ROOT=str(primary),
+        LU_STATE_ROOT=str(state),
+        LEARN_UKRAINIAN_PYTHON=sys.executable,
+        PYTHONPATH=str(installed_site),
+    )
     result = subprocess.run(
-        [sys.executable, "-I", "-c", _PROBE, str(installed_site), str(product), str(primary), scenario],
+        [sys.executable, "-I", "-c", _PROBE, str(installed_site), str(product), str(primary), str(state), scenario],
         cwd=tmp_path, env=environment, capture_output=True, text=True, timeout=60,
     )
     assert result.returncode == 0, result.stdout + result.stderr

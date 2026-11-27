@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import secrets
+import shutil
 import stat
 import subprocess
 import time
@@ -50,6 +51,7 @@ from lu_machinery.review.isolation import (
     wrap_argv_with_sandbox,
 )
 from tests.helpers import current_sol
+from tests.host_context.conftest import host_layout as host_layout
 
 CURRENT_SOL = current_sol()
 
@@ -385,13 +387,13 @@ def test_sibling_worktree_shim_and_ambient_reviewer_are_rejected(
 
 
 def test_linux_wrapper_uses_blank_root_exact_binds_and_pid_isolation(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, host_layout,
 ) -> None:
     snap = tmp_path / "snap"
     write = tmp_path / "write"
-    runtime = tmp_path / "runtime"
+    runtime = tmp_path / "trusted-runtime"
     for directory in (snap, write, runtime):
-        directory.mkdir()
+        directory.mkdir(mode=0o700)
     capability = SandboxCapability(
         mechanism="linux-bwrap",
         binary=Path("/usr/bin/bwrap"),
@@ -408,6 +410,27 @@ def test_linux_wrapper_uses_blank_root_exact_binds_and_pid_isolation(
     assert "--proc" not in argv
     assert "/etc" not in argv
     assert any(argv[index : index + 3] == ["--ro-bind", str(runtime), str(runtime)] for index in range(len(argv) - 2))
+
+    if os.uname().sysname != "Linux" or shutil.which("bwrap") is None:
+        return
+    monkeypatch.setattr(os, "environ", {"PATH": os.defpath, **host_layout.env})
+    state = Path(host_layout.data["state_root"])
+    (state / "host-only").write_text("hidden")
+    (snap / "README.md").write_text("visible")
+    sandbox = prepare_host_sandbox(
+        engine="claude", snapshot_root=snap, write_root=write, reject_root=runtime,
+    )
+    command = [
+        "/bin/sh", "-ec",
+        'test "$(stat -c %a "$1")" = 700; test ! -e "$1/host-only"; test ! -e "$2"; '
+        'if touch "$1/new-state" 2>/dev/null; then exit 3; fi; cat "$LU_HOST_CONTEXT"',
+        "state-probe", str(state), str(host_layout.file),
+    ]
+    result = subprocess.run(
+        wrap_argv_with_sandbox(command, sandbox), capture_output=True, text=True, timeout=10, check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == {"schema": "machinery.sandbox-state.v1", "state_root": str(state)}
 
 
 def test_linux_roots_preserve_trusted_merged_usr_and_network_aliases(

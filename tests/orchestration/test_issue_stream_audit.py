@@ -628,6 +628,7 @@ def _configure_audit(root, monkeypatch, *, repository):
         (root / ".git" / entry).mkdir(parents=True, exist_ok=True)
     (root / ".git" / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
     monkeypatch.setenv("LEARN_UKRAINIAN_PRIMARY_REPO_ROOT", str(root))
+    monkeypatch.setenv("LU_STATE_ROOT", str(root))
     monkeypatch.setenv("LU_PRODUCT_ROOT", str(root))
     monkeypatch.setenv("LEARN_UKRAINIAN_GITHUB_SLUG", repository)
     monkeypatch.setattr(issue_stream_audit, "REGISTRY_PATH", root / "scripts/config/issue_streams.yaml")
@@ -819,19 +820,21 @@ def _primary_with_linked_worktree(tmp_path):
     return primary, worktree
 
 
-def test_refresh_sidecars_resolve_to_primary_from_linked_worktree(tmp_path, monkeypatch):
+def test_refresh_sidecars_resolve_to_explicit_state_from_linked_worktree(tmp_path, monkeypatch):
     primary, worktree = _primary_with_linked_worktree(tmp_path)
     monkeypatch.setenv("LEARN_UKRAINIAN_PRIMARY_REPO_ROOT", str(primary))
+    monkeypatch.setenv("LU_STATE_ROOT", str(tmp_path))
 
     state, lock = issue_stream_audit.refresh_sidecar_paths(worktree)
 
-    assert state == primary / "batch_state" / "issue_stream_audit_refresh.json"
-    assert lock == primary / "batch_state" / "issue_stream_audit_refresh.lock"
+    assert state == tmp_path / "batch_state" / "issue_stream_audit_refresh.json"
+    assert lock == tmp_path / "batch_state" / "issue_stream_audit_refresh.lock"
 
 
 def test_refresh_scheduled_from_worktree_leaves_worktree_batch_state_untouched(tmp_path, monkeypatch):
     primary, worktree = _primary_with_linked_worktree(tmp_path)
     monkeypatch.setenv("LEARN_UKRAINIAN_PRIMARY_REPO_ROOT", str(primary))
+    monkeypatch.setenv("LU_STATE_ROOT", str(tmp_path))
     state, lock = issue_stream_audit.refresh_sidecar_paths(worktree)
     monkeypatch.setattr(issue_stream_audit, "refresh_sidecar_paths", lambda root=None: (state, lock))
     monkeypatch.setattr(issue_stream_audit, "_spawn_worker", lambda _run_id: True)
@@ -842,7 +845,8 @@ def test_refresh_scheduled_from_worktree_leaves_worktree_batch_state_untouched(t
     assert scheduled["phase"] == "scheduled"
     assert observed["run_id"] == scheduled["run_id"]
     assert not (worktree / "batch_state").exists()
-    assert sorted(path.name for path in (primary / "batch_state").iterdir()) == [
+    assert not (primary / "batch_state").exists()
+    assert sorted(path.name for path in (tmp_path / "batch_state").iterdir()) == [
         "issue_stream_audit_refresh.json",
         "issue_stream_audit_refresh.lock",
     ]

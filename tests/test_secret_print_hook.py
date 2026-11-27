@@ -485,7 +485,7 @@ def secret_print_product(tmp_path, monkeypatch):
     # The hook resolver keeps a configured primary. Point it at this test's checkout and
     # let monkeypatch remove it with the test: a previous passed test's tmp must not remain
     # the process primary after retention deletes that directory.
-    for name in ("LU_PRODUCT_ROOT", "LEARN_UKRAINIAN_PRIMARY_REPO_ROOT", "LEARN_UKRAINIAN_STATE_ROOT"):
+    for name in ("LU_PRODUCT_ROOT", "LEARN_UKRAINIAN_PRIMARY_REPO_ROOT", "LU_STATE_ROOT"):
         monkeypatch.setenv(name, str(product))
         monkeypatch.setitem(NATIVE_ENV, name, str(product))
     return product

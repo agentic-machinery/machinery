@@ -47,7 +47,7 @@ _MACHINERY = _PACKAGE.partition(".")[0]
 
 
 def default_task_dir(repo_root: Path | None = None) -> Path:
-    return repo_root / "batch_state" / "tasks" if repo_root is not None else tasks_dir()
+    return tasks_dir()
 
 
 @dataclass
@@ -319,7 +319,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--task-dir",
         type=Path,
         default=None,
-        help="Task state directory (default: <repo-root>/batch_state/tasks).",
+        help="Task state directory (default: configured dispatch task store).",
     )
     parser.add_argument(
         "--json",

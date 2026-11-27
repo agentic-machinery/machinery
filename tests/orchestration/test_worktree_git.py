@@ -194,15 +194,16 @@ def _malformed_catalog(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(fleet_repos, "_CONFIG_PATH", bad)
 
 
-def test_control_plane_root_falls_back_to_primary_on_malformed_catalog_yaml(
+def test_control_plane_root_refuses_checkout_fallback_on_malformed_catalog_yaml(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The read-only probes keep working on a malformed catalog instead of crashing."""
+    """An unreadable catalog cannot redirect state probes into a checkout."""
     _public, sibling = _fleet_layout(tmp_path, monkeypatch)
     _malformed_catalog(tmp_path, monkeypatch)
 
-    assert wg.control_plane_root(sibling) == wg.primary_checkout_root(sibling)
+    with pytest.raises(worktree_claims.ControlPlaneError, match="catalog unreadable"):
+        wg.control_plane_root(sibling)
 
 
 # --- Active-task probe --
@@ -216,7 +217,10 @@ def _probe_fixture(repo, monkeypatch, failure, *, status="done", pid=None):
     branch = f"codex/{task_id}"
     worktree = add_worktree(repo, branch, path=repo / ".worktrees" / "dispatch" / "codex" / task_id)
     record = {"task_id": task_id, "worktree_path": str(worktree), "status": status, "pid": pid}
-    task_file = repo / "batch_state" / "tasks" / f"{task_id}.json"
+    state = repo.parent / "state"
+    state.mkdir(mode=0o700)
+    monkeypatch.setenv("LU_STATE_ROOT", str(state))
+    task_file = state / "batch_state" / "tasks" / f"{task_id}.json"
     task_file.parent.mkdir(parents=True, exist_ok=True)
     task_file.write_text(json.dumps(record))
 

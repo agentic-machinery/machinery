@@ -28,24 +28,12 @@ from tests.helpers.product_tree import configured_roots as configured_roots
 CURRENT_SOL = current_sol()
 
 
-def test_canonical_state_root_uses_git_common_directory(configured_roots) -> None:
-    PROJECT_ROOT = configured_roots.primary
-    result = subprocess.run(
-        [
-            "git",
-            "-C",
-            os.fspath(PROJECT_ROOT),
-            "rev-parse",
-            "--path-format=absolute",
-            "--git-common-dir",
-        ],
-        check=True,
-        capture_output=True,
-        text=True,
-        timeout=30
-    )
+def test_canonical_state_root_uses_explicit_state_directory(configured_roots, tmp_path, monkeypatch) -> None:
+    state = tmp_path / "state"
+    state.mkdir()
+    monkeypatch.setenv("LU_STATE_ROOT", str(state))
 
-    assert canonical_state_root(PROJECT_ROOT) == Path(result.stdout.strip()).parent.resolve()
+    assert canonical_state_root(configured_roots.primary) == state
 
 
 @pytest.mark.parametrize("session_id", ["abc-123", "thread_name", "A" * 128])

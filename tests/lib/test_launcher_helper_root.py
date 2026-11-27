@@ -935,7 +935,7 @@ def _stub_tool(tmp: Path, name: str) -> Path:
 def test_installed_release_consumers_serve_only_lu_product_root(tmp_path: Path, consumer: str) -> None:
     """Defect class: an installed release's consumers deriving roots from site-packages (PR 301 F1-F4).
 
-    A product that sets only LU_PRODUCT_ROOT must get a working launch: the agent
+    A product that sets LU_PRODUCT_ROOT must get a working launch: the agent
     shims and the inbox watcher take the interpreter and shared-state anchor the
     launcher resolved, not their own site-packages location (F1); a packaged lane
     wrapper shows help with nothing configured, is an allowlisted scope entry and is
@@ -963,7 +963,10 @@ def test_installed_release_consumers_serve_only_lu_product_root(tmp_path: Path, 
         )
 
     if consumer in _INSTALLED_CONSUMERS:
-        result = run("bash", "-c", _INSTALLED_CONSUMER_PROBE, "bash", str(core), _INSTALLED_CONSUMERS[consumer])
+        state_binding = {"LU_STATE_ROOT": str(tmp)} if consumer == "inbox-watcher" else {}
+        result = run(
+            "bash", "-c", _INSTALLED_CONSUMER_PROBE, "bash", str(core), _INSTALLED_CONSUMERS[consumer], **state_binding,
+        )
         assert result.returncode == 0, (result.stdout, result.stderr)
         expected = {
             "npm-shim": "real-npm --version",

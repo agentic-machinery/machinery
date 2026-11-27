@@ -31,7 +31,7 @@ def roots(tmp_path, monkeypatch):
     subprocess.run(["git", "init", "-q", str(state)], check=True)
     subprocess.run(["git", "init", "-q", str(product)], check=True)
     monkeypatch.setenv("LU_PRODUCT_ROOT", str(product))
-    monkeypatch.setenv("LEARN_UKRAINIAN_PRIMARY_REPO_ROOT", str(state))
+    monkeypatch.setenv("LU_STATE_ROOT", str(state))
     for name in ("LEARN_UKRAINIAN_STATE_ROOT", "LEARN_UKRAINIAN_BATCH_STATE_DIR", "BACKUP_DIR",
                  "LEARN_UK_REPO_ROOT", "AB_DB_PATH", "MONITOR_OCCUPANCY_MARKERS"):
         monkeypatch.delenv(name, raising=False)
@@ -69,7 +69,7 @@ def test_context_keeps_state_stores_out_of_product_and_refreshes_anchor(roots, t
     other = tmp_path / "other-state"
     other.mkdir()
     subprocess.run(["git", "init", "-q", str(other)], check=True)
-    monkeypatch.setenv("LEARN_UKRAINIAN_PRIMARY_REPO_ROOT", str(other))
+    monkeypatch.setenv("LU_STATE_ROOT", str(other))
     fresh = monitor_context.production_context()
     assert fresh is not ctx
     assert fresh.roots.state_root == other
@@ -113,7 +113,7 @@ def test_occupancy_and_rollover_paths_follow_state_at_use_time(roots, monkeypatc
     monkeypatch.setattr(rollover_router.thread_handoff, "rollover_identity_snapshot", lambda root: {"schema_version": 1, "candidate_count": 0, "errors": []})
     rollover_router.collect_rollover_orient_data()
     assert seen == [state]
-    monkeypatch.setenv("LEARN_UKRAINIAN_PRIMARY_REPO_ROOT", str(product))
+    monkeypatch.setenv("LU_STATE_ROOT", str(product))
     assert occupancy_local.markers_root() == product / ".agent/occupancy/markers"
     rollover_router.collect_rollover_orient_data()
     assert seen[-1] == product

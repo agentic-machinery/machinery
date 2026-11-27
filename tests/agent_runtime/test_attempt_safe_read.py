@@ -49,7 +49,7 @@ from lu_machinery.agent_runtime.review_mcp import verify_agy_review_launch
 from lu_machinery.agent_runtime.review_mcp import verify_codex_review_effective_mcp
 from lu_machinery.agent_runtime.review_mcp import verify_review_attempt_paths
 from lu_machinery.agent_runtime.sources_read_only import sources_tool_sets
-from lu_machinery.common.repo_root import resolve_repo_root
+from lu_machinery.common.repo_root import primary_root
 from lu_machinery.common.safe_open import UnsafeEntryError
 from lu_machinery.common.safe_open import safe_open_below
 from tests.agent_runtime.fixtures.product_stand_ins.scripts.review.receipts.ledger import REVIEW_TOOLS as REVIEW_TOOLS
@@ -1131,19 +1131,19 @@ def test_cursor_adapter_refuses_primary_checkout_workspace(tmp_path: Path) -> No
     adapter = CursorAdapter()
     config_file = tmp_path / "custom-mcp.json"
     config_file.write_text('{"mcpServers":{}}\n', encoding="utf-8")
-    primary_root = resolve_repo_root(Path(__file__), 2)
+    checkout = primary_root()
 
     with patch("shutil.which", return_value="/usr/local/bin/cursor-agent"):
         with pytest.raises(RuntimeError, match=r"Cursor review attempt requires a dispatch worktree"):
             adapter.build_invocation(
                 prompt="review content",
                 mode="read-only",
-                cwd=primary_root,
+                cwd=checkout,
                 model=None,
                 task_id="review-cursor-task-primary",
                 session_id=None,
                 tool_config={
-                    "cursor_workspace": str(primary_root),
+                    "cursor_workspace": str(checkout),
                     "mcp_config_path": str(config_file),
                     "strict_mcp_config": True,
                 },

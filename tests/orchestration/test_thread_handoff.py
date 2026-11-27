@@ -11,7 +11,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from lu_machinery.common.repo_root import machinery_path
+from lu_machinery.common.repo_root import StateRootError, machinery_path
 from lu_machinery.lib import session_record
 from lu_machinery.orchestration import claudex_supervisor as cs
 from lu_machinery.orchestration import process_identity
@@ -3036,8 +3036,11 @@ def test_default_runtime_root_is_shared_by_real_linked_worktree(tmp_path: Path, 
     )
 
     monkeypatch.setenv("LEARN_UKRAINIAN_PRIMARY_REPO_ROOT", str(primary))
-    assert th.canonical_state_root(primary) == primary.resolve()
-    assert th.canonical_state_root(linked) == primary.resolve()
+    state = tmp_path / "state"
+    state.mkdir(mode=0o700)
+    monkeypatch.setenv("LU_STATE_ROOT", str(state))
+    assert th.canonical_state_root(primary) == state.resolve()
+    assert th.canonical_state_root(linked) == state.resolve()
     monkeypatch.setattr(th, "gather_snapshot", lambda root, url: sample_snapshot(root))
     monkeypatch.setattr(th, "repo_root_from_file", lambda: linked)
     assert th.main(["prepare", "--active-thread-id", "same-thread"]) == 0
@@ -3059,8 +3062,8 @@ def test_default_runtime_root_is_shared_by_real_linked_worktree(tmp_path: Path, 
     )
     assert linked_state_path == primary_state_path
     assert linked_payload["state_file"] == primary_payload["state_file"]
-    assert (primary / linked_payload["state_file"]).is_file()
-    assert (primary / linked_payload["bootstrap_file"]).is_file()
+    assert (state / linked_payload["state_file"]).is_file()
+    assert (state / linked_payload["bootstrap_file"]).is_file()
     assert not (linked / ".agent").exists()
 
 
@@ -3072,7 +3075,7 @@ def test_canonical_discovery_failure_refuses_fallback_and_explicit_root_is_isola
         "run_command",
         lambda *args, **kwargs: process_identity.CommandResult(128, "", "not a repository"),
     )
-    with pytest.raises(ValueError, match="no shared-state anchor is configured"):
+    with pytest.raises(StateRootError, match="no durable state root configured"):
         th.canonical_state_root(tmp_path)
 
     assert th.resolve_roots(tmp_path) == (tmp_path.resolve(), tmp_path.resolve())

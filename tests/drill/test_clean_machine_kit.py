@@ -85,6 +85,8 @@ def _names(tmp_path: Path) -> dict[str, str]:
     state = world / "stubs" / "state"
     state.mkdir(parents=True)
     (state / "answers.json").write_text("{}")
+    durable_state = world / "state"
+    durable_state.mkdir()
     names = {
         key: str(tmp_path / key)
         for key in (
@@ -100,6 +102,7 @@ def _names(tmp_path: Path) -> dict[str, str]:
     names.update(
         world=str(world),
         stub_state=str(state),
+        state=str(durable_state),
         py=sys.executable,
         base_py=sys.executable,
         sources_url="http://127.0.0.1:9",

@@ -37,6 +37,7 @@ def test_guarded_remove_non_utf8_result_retains_and_reports(interrupted_checkout
     """Corrupt textual receipts fail closed; neither output nor result is lost."""
     repo, tree, _tasks, record, result, output = interrupted_checkout
     monkeypatch.setenv("LEARN_UKRAINIAN_PRIMARY_REPO_ROOT", str(repo))
+    monkeypatch.setenv("LU_STATE_ROOT", str(repo))
     monkeypatch.delenv("LEARN_UKRAINIAN_STATE_ROOT", raising=False)
     monkeypatch.setenv("LU_PRODUCT_ROOT", str(repo))
     result.write_bytes(b"corrupt result\x00\xff")
@@ -75,6 +76,7 @@ def test_missing_tree_caller_matrix(interrupted_checkout, monkeypatch, writer, c
 
     repo, tree, tasks, record, result, output = interrupted_checkout
     monkeypatch.setenv("LEARN_UKRAINIAN_PRIMARY_REPO_ROOT", str(repo))
+    monkeypatch.setenv("LU_STATE_ROOT", str(repo))
     monkeypatch.delenv("LEARN_UKRAINIAN_STATE_ROOT", raising=False)
     monkeypatch.setenv("LU_PRODUCT_ROOT", str(repo))
     # Move, rather than destroy, the registered tree. The caller sees its old
@@ -128,6 +130,7 @@ def test_missing_tree_caller_matrix(interrupted_checkout, monkeypatch, writer, c
 def test_interrupted_caller_preserves_bytes_on_repeated_call(interrupted_checkout, caller, case, capsys, monkeypatch):
     repo, tree, tasks, record, result, output = interrupted_checkout
     monkeypatch.setenv("LEARN_UKRAINIAN_PRIMARY_REPO_ROOT", str(repo))
+    monkeypatch.setenv("LU_STATE_ROOT", str(repo))
     monkeypatch.delenv("LEARN_UKRAINIAN_STATE_ROOT", raising=False)
     monkeypatch.setenv("LU_PRODUCT_ROOT", str(repo))
     status = case if case in {"cancelled", "needs_finalize", "rate_limited"} else "done"

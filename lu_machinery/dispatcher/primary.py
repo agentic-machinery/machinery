@@ -8,6 +8,7 @@ from typing import NoReturn
 
 from lu_machinery.common.repo_root import (
     MachineryConfigError,
+    configured_primary_root,
     in_tree_source,
     machinery_path,
     main_checkout_root,
@@ -40,13 +41,14 @@ def exec_primary(
     chooses which dispatcher code runs. The re-exec uses this process's interpreter under
     ``-I``: the entry puts the primary root on ``sys.path`` itself, so neither the entry's
     directory nor ``PYTHONPATH`` can shadow a module.
-    Installed code validates its configured primary and stays in this process; an unusable
-    or missing one goes to ``refuse`` before any dependency loads. Help needs no operational root.
+    Installed code stays in this process. It validates any configured primary and requires
+    state before dependencies load. Help needs neither root.
     """
     if not in_tree_source():
         # Installed code stays installed; a product checkout cannot select its replacement.
         if not any(arg in {"-h", "--help"} for arg in argv):
             try:
+                configured_primary_root()
                 state_root()
             except MachineryConfigError as exc:  # unset, relative, missing, linked or looping root
                 refuse(str(exc))

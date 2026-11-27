@@ -154,7 +154,7 @@ def test_guard_fails_a_deliberately_leaking_fixture(tmp_path: Path, route: str, 
             existing = production / "existing.jsonl"
             if {route!r} == "default":
                 monkeypatch.delenv("LU_TELEMETRY_EVENTS_DIR", raising=False)
-                monkeypatch.setenv("LEARN_UKRAINIAN_PRIMARY_REPO_ROOT", str(root))
+                monkeypatch.setenv("LU_STATE_ROOT", str(root))
             elif {route!r} == "override":
                 monkeypatch.setenv("LU_TELEMETRY_EVENTS_DIR", str(production))
             else:

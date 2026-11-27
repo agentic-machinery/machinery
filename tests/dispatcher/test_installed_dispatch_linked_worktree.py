@@ -81,6 +81,7 @@ def test_installed_dispatch_from_linked_product_worktree_stays_installed(tmp_pat
         "PYTHONVERBOSE": "1",
         "LEARN_UKRAINIAN_PYTHON": str(python),
         "LEARN_UKRAINIAN_PRIMARY_REPO_ROOT": str(primary),
+        "LU_STATE_ROOT": str(tmp_path),
         "LU_PRODUCT_ROOT": str(linked),
     }
     result = subprocess.run(
@@ -116,11 +117,12 @@ def test_installed_dispatch_from_linked_product_worktree_stays_installed(tmp_pat
     plan = json.loads(result.stdout)
     # The linked worktree's product resolves to its primary checkout, at the planned start.
     assert Path(plan["worktree"]).parents[1] == primary / ".worktrees" / "dispatch"
-    assert Path(plan["record_path"]).parent == primary / "batch_state" / "tasks"
+    assert Path(plan["record_path"]).parent == tmp_path / "batch_state" / "tasks"
     assert plan["start_sha"] == head
     # The dry-run creates nothing.
     assert not (primary / ".worktrees").exists()
     assert not (primary / "batch_state").exists()
+    assert not (tmp_path / "batch_state").exists()
     assert not any(home.iterdir())
     assert _git(primary, "status", "--porcelain") == ""
     assert _git(linked, "status", "--porcelain") == ""

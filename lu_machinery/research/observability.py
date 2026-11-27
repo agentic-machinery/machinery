@@ -41,7 +41,7 @@ from typing import Any, NamedTuple, cast
 import yaml
 
 from lu_machinery.common import json_depth, profile
-from lu_machinery.common.repo_root import github_slug, machinery_path
+from lu_machinery.common.repo_root import github_slug, machinery_path, state_root
 from lu_machinery.orchestration import issue_stream_audit as isa
 from lu_machinery.research import consumption
 from lu_machinery.research import registry as reg
@@ -867,7 +867,7 @@ def build_monitor(
 
     known_ids = registry_view.pop("known_ids", set())
     try:
-        consumption_view = _scan_telemetry(root, window_days, now, known_ids)
+        consumption_view = _scan_telemetry(state_root(), window_days, now, known_ids)
     except Exception as exc:
         logger.warning("research observability: telemetry scan failed (%s)", type(exc).__name__)
         consumption_view = {

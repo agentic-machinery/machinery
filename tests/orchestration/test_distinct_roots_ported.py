@@ -124,7 +124,7 @@ def _configured(layout: dict[str, Path], repo: str) -> dict[str, str]:
     return {
         rr.PRIMARY_ROOT_ENV: str(layout["primary"]),
         rr.GITHUB_SLUG_ENV: CONFIGURED_SLUG,
-        rr.STATE_ROOT_ENV: str(layout["primary"]),
+        rr.LU_STATE_ROOT_ENV: str(layout["primary"]),
         rr.INTERPRETER_ENV: str(layout["python"]),
         rr.PRODUCT_ROOT_ENV: str(layout["product"]),
     }
@@ -246,7 +246,7 @@ def test_api_rules_serves_release_core_and_configured_product_addendum(monkeypat
 # --------------------------------------------------------------------------- AC-02: defaults are today's values
 
 
-def test_unset_configuration_keeps_todays_roots(clean_env, monkeypatch) -> None:
+def test_in_tree_configuration_requires_an_explicit_state_root(clean_env, monkeypatch) -> None:
     unpatched_runtime = Path(rr.__file__).resolve().parents[2]
     assert rr.RUNTIME_ROOT == unpatched_runtime
     # Model the legacy in-tree copy independently of where pytest imported the
@@ -257,11 +257,11 @@ def test_unset_configuration_keeps_todays_roots(clean_env, monkeypatch) -> None:
     # primary has no .venv, run by another checkout's venv, is refused by design), so pin it.
     stand_in = Path(sys.executable)
     monkeypatch.setattr(rr, "project_interpreter", lambda *args, **kwargs: stand_in)
-    derived = rr.machinery_roots()
-    assert derived.interpreter == stand_in
-    assert derived.runtime == unpatched_runtime
+    with pytest.raises(rr.StateRootError, match="no durable state root configured"):
+        rr.machinery_roots()
     monkeypatch.setattr(rr, "RUNTIME_ROOT", REPO)
     primary = rr.main_checkout_root(REPO)
+    monkeypatch.setenv(rr.LU_STATE_ROOT_ENV, str(primary))
     roots = rr.machinery_roots()
     assert roots.interpreter == stand_in
     assert (roots.primary, roots.state, roots.github_slug) == (
@@ -286,7 +286,7 @@ def test_installed_dispatch_without_primary_refuses_reexec(clean_env, monkeypatc
     with pytest.raises(SystemExit) as refused:
         dispatcher_primary.exec_primary(["list"])
     assert refused.value.code == 2
-    assert capsys.readouterr().err.startswith("dispatcher: no shared-state anchor is configured")
+    assert capsys.readouterr().err.startswith("dispatcher: no durable state root configured")
     assert calls == []
 
 

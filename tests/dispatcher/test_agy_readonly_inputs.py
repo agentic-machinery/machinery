@@ -11,11 +11,13 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
 import pytest
+from lu_machinery import host_context
 from lu_machinery.dispatcher import agy_sandbox, cli, git, store, worker
 from lu_machinery.dispatcher.providers import agy as agy_provider
 from tests.helpers.product_tree import configured_roots  # noqa: F401
 from tests.dispatcher.test_providers_b import _github_meta_path
 from lu_machinery.common.repo_root import machinery_root
+from tests.host_context.conftest import host_layout as host_layout
 
 
 
@@ -403,14 +405,23 @@ def test_ro_bind_records_digest(tmp_path, monkeypatch, capsys, configured_roots)
     assert count is None and error == "agy_read_only_boundary: input digest mismatch"
 
 
-def test_read_only_agy_cannot_read_sibling_task_records(tmp_path, monkeypatch, configured_roots):  # noqa: F811
+def test_read_only_agy_cannot_read_sibling_task_records(tmp_path, monkeypatch, configured_roots, host_layout):  # noqa: F811
     """Defect class: the task store exposes sibling records, results, or artifacts."""
     if not _bwrap_usable():
         pytest.skip("needs a usable unprivileged bubblewrap")
     _, worktree = _linked_worktree(tmp_path)
-    tasks = tmp_path / "tasks with spaces"
-    tasks.mkdir()
-    monkeypatch.setenv("LU_TASKS_DIR", str(tasks))
+    state = Path(host_layout.data["state_root"]).rename(tmp_path / "state with spaces")
+    tasks = state / "batch_state/tasks"
+    tasks.mkdir(parents=True)
+    host_layout.data["state_root"] = str(state)
+    host_layout.data["repos"] = {
+        "machinery": str(configured_roots.primary), "public": str(configured_roots.product),
+    }
+    host_layout.data["runtime"]["python"] = os.environ.get("LEARN_UKRAINIAN_PYTHON", str(host_layout.python))
+    host_layout.write()
+    monkeypatch.setenv(host_context.CONTEXT_ENV, str(host_layout.file))
+    for name, value in host_context._state_assertions(state).items():
+        monkeypatch.setenv(name, str(value))
     own = tasks / "agy-mask.inputs" / "packet.txt"
     own.parent.mkdir()
     own.write_text("own packet\n")
@@ -421,6 +432,10 @@ def test_read_only_agy_cannot_read_sibling_task_records(tmp_path, monkeypatch, c
 
     script = (
         'set -eu; '
+        'grep -q "machinery.sandbox-state.v1" "$LU_HOST_CONTEXT"; '
+        f'test "$(stat -c %a {shlex.quote(str(state))})" = 700; '
+        f'if touch {shlex.quote(str(state / "unexpected"))} 2>/dev/null; then exit 3; fi; '
+        f'test ! -e {shlex.quote(str(host_layout.file))}; '
         'test "$(ls -A "$LU_TASKS_DIR")" = agy-mask.inputs; '
         'cat "$LU_TASKS_DIR/agy-mask.inputs/packet.txt" README.md'
     )

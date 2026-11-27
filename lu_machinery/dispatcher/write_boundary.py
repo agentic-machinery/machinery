@@ -37,6 +37,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+from lu_machinery import host_context
 from lu_machinery.ai_agent_bridge.routing_guard import SAVANT_PROVIDER
 from lu_machinery.common import json_depth, test_slots
 from lu_machinery.common.repo_root import (
@@ -593,12 +594,19 @@ def _product_checkout() -> Path | None:
 
 
 def _fleet_plane() -> Path:
-    from lu_machinery.common.repo_root import state_root
+    from lu_machinery.common.repo_root import MachineryConfigError, configured_host_state_root, state_root
     from lu_machinery.fleet_comms.paths import DEFAULT_ROOT_REL
     from lu_machinery.guardrails.worktree_containment import canonicalize
 
     override = os.environ.get("FLEET_COMMS_ROOT")
-    path = Path(override).expanduser() if override else state_root() / DEFAULT_ROOT_REL
+    try:
+        if override:
+            host_state = configured_host_state_root()
+            path = host_state / DEFAULT_ROOT_REL if host_state is not None else Path(override).expanduser()
+        else:
+            path = state_root() / DEFAULT_ROOT_REL
+    except MachineryConfigError as exc:
+        raise Refused("Fleet Comms state is not configured consistently") from exc
     if not path.is_absolute():
         raise Refused("FLEET_COMMS_ROOT is relative; its plane depends on the reader's working directory")
     try:
@@ -616,8 +624,7 @@ def _private_state(checkouts: list[Path]) -> list[Path]:
     candidates = [Path(os.path.realpath(ensure_scratch_root()))]
     with contextlib.suppress(OSError, ValueError):
         candidates.append(Path(os.path.realpath(tasks_dir())))
-    if os.environ.get("FLEET_COMMS_ROOT"):
-        candidates.append(_fleet_plane())
+    candidates.append(_fleet_plane())
     for checkout in checkouts:
         for name in _CHECKOUT_PRIVATE:
             path = checkout / name
@@ -709,7 +716,7 @@ def _home_lower(lower: Path, home: Path, argv: list[str]) -> None:
     for index, arg in enumerate(argv):
         if arg in ("--bind", "--ro-bind"):
             target, directory = Path(argv[index + 2]), Path(argv[index + 1]).is_dir()
-        elif arg == "--tmpfs":
+        elif arg in ("--tmpfs", "--dir"):
             target, directory = Path(argv[index + 1]), True
         else:
             continue
@@ -1586,6 +1593,12 @@ class _Boundary:
         layers = {name: self.base / name for name in layer_names}
         for directory in (boundary, tmp, *layers.values()):
             directory.mkdir(mode=0o700)
+        try:
+            state_context = host_context.project_sandbox_state(boundary) if self.args.snapshot_bytes is None else None
+        except host_context.HostContextError as exc:
+            raise Refused(f"sandbox_host_state_context_invalid: {exc.code}: {exc}") from exc
+        except OSError as exc:
+            raise Refused("sandbox_host_state_context_invalid") from exc
         for name, source in _PROJECTED.items():
             _write_private(boundary / name, source.read_bytes(), 0o500)
         if self.args.snapshot_bytes is not None:
@@ -1657,7 +1670,13 @@ class _Boundary:
                                   and found.is_dir() and found != Path("/")))
         own = task_reads(self.args.task_id)
         base_masks, base_restores = [*_MASKED_ROOTS, *data, home], [*toolchain, *checkouts]
-        private = [path for path in _private_state(checkouts) if not _hidden(path, base_masks, base_restores)]
+        context_path = Path(os.environ.get(host_context.CONTEXT_ENV, str(host_context.DEFAULT_PATH)))
+        sensitive = _private_state(checkouts)
+        for source in (context_path, host_context.DEFAULT_PATH):
+            resolved_context = _resolved(source)
+            if resolved_context is not None and resolved_context.is_file() and resolved_context not in sensitive:
+                sensitive.append(resolved_context)
+        private = [path for path in sensitive if not _hidden(path, base_masks, base_restores)]
         # One emptied directory covers everything below it, including another private path there.
         private = [path for path in private if not any(other != path and other.is_dir() and path.is_relative_to(other)
                                                        for other in private)]
@@ -1683,6 +1702,15 @@ class _Boundary:
         login, login_reads = self._claude_login(home, repository)
         restores += [*([login[1]] if login else []), *login_reads]
         masks = [*base_masks, *private]
+        state_stub = None
+        stub_after_private_masks = False
+        if state_context is not None and state_context.state_root != home:
+            state = state_context.state_root
+            covering_restores = [path for path in base_restores if state.is_relative_to(path)]
+            stub_after_private_masks = any(state.is_relative_to(path) for path in private)
+            if stub_after_private_masks or _hidden(state, base_masks, covering_restores):
+                state_stub = state
+                restores.append(state_stub)
         named_home = Path(os.environ.get("HOME") or Path.home()).absolute()
         # HOME named through a link the view empties (below a data root, a private tmpfs or a checkout's emptied
         # state) stays a link to the overlay. Every bind is at a resolved path, so nothing else is below the name.
@@ -1700,6 +1728,14 @@ class _Boundary:
             probes.append({"op": "create", "path": str(path / f".write-boundary-canary-{nonce}"), "expect_any": ["EROFS"]})
         if not snapshot_only:
             probes.append({"op": "stat", "path": str(self.worktree / ".venv/bin/python"), "expect_any": ["OK"]})
+        if state_context is not None:
+            probes.extend([
+                {"op": "stat", "path": str(state_context.state_root), "expect_any": ["OK"]},
+                {"op": "read_byte", "path": str(state_context.path), "expect_any": ["OK"]},
+                {"op": "write_open", "path": str(state_context.path), "expect_any": ["EROFS"]},
+            ])
+        if state_stub is not None:
+            probes.append({"op": "create", "path": str(state_stub / f".canary-{nonce}"), "expect_any": ["EROFS"]})
         if slot_mounts:
             pool_target = test_slots._default_pool()
             probes.append({"op": "create", "path": str(pool_target / f".canary-{nonce}"), "expect_any": ["EROFS"]})
@@ -1722,10 +1758,18 @@ class _Boundary:
             "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc",
             *(arg for masked in (*_MASKED_ROOTS, *data) for arg in ("--tmpfs", str(masked))),
             "--overlay-src", str(lower), "--overlay", str(layers["home-upper"]), str(layers["home-work"]), str(home),
-            *(arg for path in base_restores for arg in ("--ro-bind", str(path), str(path))),
         ]
+        # A descendant restore needs a mount point, but it does not expose the host state directory.
+        if state_stub is not None and not stub_after_private_masks:
+            argv += ["--perms", "0700", "--tmpfs", str(state_stub)]
+        for path in base_restores:
+            argv += ["--ro-bind", str(path), str(path)]
         for path in private:
             argv += ["--tmpfs", str(path)] if path.is_dir() else ["--ro-bind", "/dev/null", str(path)]
+        if state_stub is not None and stub_after_private_masks:
+            argv += ["--perms", "0700", "--tmpfs", str(state_stub)]
+        if state_context is not None:
+            argv += ["--setenv", host_context.CONTEXT_ENV, str(state_context.path)]
         if login is not None:  # the selected login's private projection; its key file and credential go on top
             argv += ["--bind", str(login[0]), str(login[1])]
         for path in (*own, *login_reads):
@@ -1781,6 +1825,8 @@ class _Boundary:
         if alias is not None:
             argv += ["--symlink", str(home), str(alias)]
         emptied = [path for path in (*data, *private) if path.is_dir() and path != home and path not in restores]
+        if state_stub is not None and state_stub not in emptied:
+            emptied.append(state_stub)
         argv += [arg for path in emptied for arg in ("--remount-ro", str(path))]
         _home_lower(lower, home, argv)
         # Reviews read GitHub through the host's read-only gh relay: the reviewer holds
@@ -1828,6 +1874,8 @@ class _Boundary:
         env = {key: value for key, value in self.args.provider_env.items()
                if key not in {"SSH_AUTH_SOCK", "DBUS_SESSION_BUS_ADDRESS", "XDG_RUNTIME_DIR", "TMUX", "TMUX_PANE"}
                and not _github_credential_variable(key)}
+        # The bwrap argv selects the projection. Never forward the source path.
+        env.pop(host_context.CONTEXT_ENV, None)
         (tmp / "scratch").mkdir(mode=0o700)
         (tmp / "run").mkdir(mode=0o700)
         # The namespace has no DNS or route out; Node's own fetch uses the forwarder's proxy only when told to.

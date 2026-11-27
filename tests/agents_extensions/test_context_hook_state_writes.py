@@ -44,7 +44,8 @@ def hook_case(tmp_path):
         check=True, capture_output=True,
         env={key: value for key, value in os.environ.items() if not key.startswith("GIT_")},
     )
-    record = tmp_path / "record.json"
+    record = project / ".agent" / "sessions" / f"{SESSION}.json"
+    record.parent.mkdir(parents=True)
     record.write_text(
         json.dumps(
             {
@@ -85,10 +86,9 @@ def hook_case(tmp_path):
         {
             "CLAUDE_PROJECT_DIR": str(project),
             "LU_PRODUCT_ROOT": str(project),
-            "LEARN_UKRAINIAN_SESSION_RECORD": str(record),
             "LEARN_UKRAINIAN_PYTHON": sys.executable,
             "LEARN_UKRAINIAN_PRIMARY_REPO_ROOT": str(project),
-            "LEARN_UKRAINIAN_STATE_ROOT": str(project),
+            "LU_STATE_ROOT": str(project),
         }
     )
     payload = json.dumps(
@@ -449,7 +449,7 @@ def test_unknown_usage_never_sets_a_tier_or_demands_a_handoff(hook_case, tmp_pat
     assert state.read_text() == "3 760000\n"
 
     # A fresh status-line figure is live usage even though the transcript has none.
-    record = tmp_path / "record.json"
+    record = project / ".agent" / "sessions" / f"{SESSION}.json"
     data = json.loads(record.read_text())
     data.update(observed_context_used_tokens=770_000, observed_context_used_at_epoch=int(time.time()))
     record.write_text(json.dumps(data))

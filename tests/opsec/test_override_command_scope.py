@@ -139,6 +139,7 @@ def command(sandbox, argv, **extra):
     line = ('export LU_OPSEC_OVERRIDE="$1"; ' if override is not None else "") + 'shift; "$@"; exit $?'
     env = _env(PATH=os.pathsep.join([str(sandbox.shim.parent), str(sandbox.real_git_dir), os.defpath]),
                LU_PRODUCT_ROOT=str(sandbox.root), LEARN_UKRAINIAN_PRIMARY_REPO_ROOT=str(sandbox.root),
+               LU_STATE_ROOT=str(sandbox.root),
                LEARN_UKRAINIAN_PYTHON=sys.executable, **extra)
     return subprocess.run(
         ["bash", "-c", line, "bash", override or "", *argv],
@@ -390,7 +391,7 @@ def test_git_lookups_and_the_callers_hooks_receive_no_override(sandbox, subject)
 def test_merge_readiness_reads_and_the_merge_receive_no_override(synthetic_opsec, monkeypatch, tmp_path):
     """pr-merge: gh reads before the scan, and the write after the override is claimed."""
     monkeypatch.setattr(gate, "catalog", lambda: CATALOG)
-    monkeypatch.setattr(gate, "_policy_checkout", lambda: tmp_path)
+    monkeypatch.setenv("LU_STATE_ROOT", str(tmp_path))
     monkeypatch.delenv("AGENT_NO_MERGE", raising=False)
     head = "a" * 40
     calls = []

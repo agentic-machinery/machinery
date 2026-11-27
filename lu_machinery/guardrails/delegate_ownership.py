@@ -61,7 +61,7 @@ from lu_machinery.common import json_depth
 
 # Anchor ledger + task-state to the PRIMARY checkout (not a worktree copy),
 # matching the task-store path encoding.
-from lu_machinery.common.repo_root import product_root, state_root
+from lu_machinery.common.repo_root import configured_host_state_root, product_root, state_root
 from lu_machinery.common.task_store_paths import tasks_dir
 from lu_machinery.control_plane.storage import StoreId
 from lu_machinery.control_plane.storage import connect as cp_connect
@@ -81,7 +81,12 @@ def default_ledger_path() -> Path:
     idle machine and failed on a busy one.
     """
     override = (os.environ.get(LEDGER_ENV_VAR) or "").strip()
-    return Path(override) if override else state_root() / "batch_state" / "tasks" / "write-ownership.sqlite3"
+    if override:
+        host_state = configured_host_state_root()
+        if host_state is None:
+            return Path(override)
+        return host_state / "batch_state" / "tasks" / "write-ownership.sqlite3"
+    return state_root() / "batch_state" / "tasks" / "write-ownership.sqlite3"
 
 
 def default_task_state_dir() -> Path:

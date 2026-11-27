@@ -68,13 +68,16 @@ def remove(caller, primary, checkout, capsys, monkeypatch):
         public = primary.parent / "public"
         public.mkdir()
         _git(public, "init", "-b", "main")
+        state = primary.parent / "state"
+        state.mkdir()
+        monkeypatch.setenv("LU_STATE_ROOT", str(state))
         record = primary / "batch_state/tasks/done-output.json"
-        public_tasks = public / "batch_state/tasks"
+        public_tasks = state / "batch_state/tasks"
         public_tasks.mkdir(parents=True)
         if record.exists():
             (public_tasks / record.name).write_bytes(record.read_bytes())
         # Real independent metadata and the already-established dispatch lock.
-        with worktree_claims.worktree_lock(checkout, lock_dir=public / ".git" / worktree_claims.LOCK_DIR_NAME):
+        with worktree_claims.worktree_lock(checkout, lock_dir=worktree_claims.repository_lock_dir(state)):
             pass
         monkeypatch.setattr(
             sibling_git,
@@ -111,6 +114,7 @@ def remove(caller, primary, checkout, capsys, monkeypatch):
 @pytest.mark.parametrize("record_exists", [True, False])
 def test_all_removers_preserve_output_or_retain_checkout(tmp_path, monkeypatch, capsys, caller, failure, record_exists):
     primary = _primary(tmp_path)
+    monkeypatch.setenv("LU_STATE_ROOT", str(primary))
     # Exclude via shared Git metadata, covering no-checkout ACP runtimes too.
     with (primary / ".git/info/exclude").open("a") as handle:
         handle.write(".cache/\n")
@@ -145,7 +149,7 @@ def test_all_removers_preserve_output_or_retain_checkout(tmp_path, monkeypatch, 
         assert source.read_bytes() == payload
         return
     assert removed and not checkout.exists()
-    destination = primary.parent / "public" if caller == "sibling" else primary
+    destination = primary.parent / "state" if caller == "sibling" else primary
     record_path = destination / "batch_state/tasks/done-output.json"
     receipt = json.loads(record_path.read_text())["preserved_artifacts"]
     expected = [] if failure == "cap" and receipt["entries_truncated"] else [
@@ -157,6 +161,7 @@ def test_all_removers_preserve_output_or_retain_checkout(tmp_path, monkeypatch, 
 
 def test_active_claim_prevents_preservation_and_removal(tmp_path, monkeypatch):
     primary = _primary(tmp_path)
+    monkeypatch.setenv("LU_STATE_ROOT", str(primary))
     checkout = _linked(primary, "codex/active")
     _record(primary, "active", status="running", worktree_path=str(checkout))
 
@@ -176,6 +181,7 @@ def test_active_claim_prevents_preservation_and_removal(tmp_path, monkeypatch):
 
 def test_raw_removal_checks_preservation_without_adapter(tmp_path, monkeypatch):
     primary = _primary(tmp_path)
+    monkeypatch.setenv("LU_STATE_ROOT", str(primary))
     checkout = _linked(primary, "codex/raw")
     (primary / ".git/info/exclude").write_text(".cache/\n")
     source = checkout / ".cache/report.txt"
@@ -196,8 +202,9 @@ def test_raw_removal_checks_preservation_without_adapter(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize("changed", [True, False])
-def test_retry_after_git_refusal_reuses_identical_or_preserves_changed_output(tmp_path, changed):
+def test_retry_after_git_refusal_reuses_identical_or_preserves_changed_output(tmp_path, changed, monkeypatch):
     primary = _primary(tmp_path)
+    monkeypatch.setenv("LU_STATE_ROOT", str(primary))
     checkout = _linked(primary, "codex/retry-9645")
     (primary / ".git/info/exclude").write_text(".cache/\n")
     source = checkout / ".cache/report.txt"
@@ -232,6 +239,7 @@ def test_retry_after_git_refusal_reuses_identical_or_preserves_changed_output(tm
 
 def test_claims_remove_preserves_old_output_when_task_id_was_redispatched(tmp_path, monkeypatch, capsys):
     primary = _primary(tmp_path)
+    monkeypatch.setenv("LU_STATE_ROOT", str(primary))
     checkout = _linked(primary, "codex/redispatched")
     (primary / ".git/info/exclude").write_text(".cache/\n")
     source = checkout / ".cache/out/page.txt"
@@ -255,6 +263,7 @@ def test_claims_remove_preserves_old_output_when_task_id_was_redispatched(tmp_pa
 
 def test_claims_remove_preserves_earlier_attempt_output_in_reused_checkout(tmp_path, monkeypatch, capsys):
     primary = _primary(tmp_path)
+    monkeypatch.setenv("LU_STATE_ROOT", str(primary))
     checkout = _linked(primary, "codex/reused-output")
     (primary / ".git/info/exclude").write_text(".cache/\n")
     source = checkout / ".cache/out/page.txt"
@@ -295,6 +304,7 @@ def boundary_tree(tmp_path, monkeypatch):
     from tests.orchestration import test_merge_closeout as closeout
 
     repo = closeout.init_repo(tmp_path)
+    monkeypatch.setenv("LU_STATE_ROOT", str(repo))
     with (repo / ".git/info/exclude").open("a") as exclude:
         exclude.write("ignored/\n.cache/\n.pytest_cache/\n.venv/\nnode_modules/\nbatch_state/\n")
     tree = repo / ".worktrees/dispatch/codex/boundary"
@@ -345,6 +355,7 @@ def boundary_remove(boundary, fixture, monkeypatch):
 @pytest.mark.parametrize("caller", CALLERS)
 def test_callers_without_record_argument_honor_keep_intent(tmp_path, monkeypatch, capsys, caller):
     primary = _primary(tmp_path)
+    monkeypatch.setenv("LU_STATE_ROOT", str(primary))
     checkout = _linked(primary, "codex/done-output")
     _record(primary, "done-output", status="done", worktree_path=str(checkout), keep_worktree=True)
     # Non-forced Git removal would succeed even for this ignored file.

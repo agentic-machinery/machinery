@@ -15,8 +15,10 @@ from pathlib import Path
 
 import pytest
 
+from lu_machinery import host_context
 from lu_machinery.common import test_slots
 from lu_machinery.dispatcher import write_boundary
+from tests.host_context.conftest import host_layout as host_layout
 from tests.helpers.product_tree import configured_roots as configured_roots
 from tests.opsec.test_git_push_scan import push_sandbox  # noqa: F401
 
@@ -67,11 +69,30 @@ def _run(primary, script: str, *extra: str) -> tuple[int, dict]:
     return code, json.loads(receipt.read_text())
 
 
-def test_review_runs_named_pytest_with_a_real_shared_slot_and_task_local_interpreter(primary, tmp_path, monkeypatch, capfd):
-    """Defect: a shared-boundary review lacks the project interpreter or cannot acquire a real host slot."""
+def test_review_runs_named_pytest_with_a_real_shared_slot_and_task_local_interpreter(
+    primary, tmp_path, monkeypatch, capfd, host_layout,
+):
+    """A shared-boundary review must resolve state and acquire a real host test slot."""
     repo, worktree, _ = primary
     pool = tmp_path / "host-pool"
+    state_parent = tmp_path / "masked-state"
+    state_parent.mkdir()
+    state_root = Path(host_layout.data["state_root"]).rename(state_parent / "state")
+    monkeypatch.setattr(write_boundary, "_DATA_ROOTS", (*write_boundary._DATA_ROOTS, state_root))
+    toolchain = state_root / "toolchain"
+    toolchain.mkdir()
+    (toolchain / "sentinel").write_text("restored", encoding="utf-8")
+    monkeypatch.setenv("PATH", os.pathsep.join((str(toolchain), os.environ["PATH"])))
+    host_layout.data["state_root"] = str(state_root)
+    host_layout.data["repos"]["public"] = str(repo)
+    host_layout.data["runtime"]["python"] = os.environ.get("LEARN_UKRAINIAN_PYTHON", str(host_layout.python))
+    host_layout.write()
+    monkeypatch.setenv(host_context.CONTEXT_ENV, str(host_layout.file))
+    for name, value in host_context._state_assertions(state_root).items():
+        monkeypatch.setenv(name, str(value))
+    monkeypatch.setenv("LEARN_UKRAINIAN_PRIMARY_REPO_ROOT", host_layout.data["repos"]["machinery"])
     monkeypatch.setenv("LU_PRODUCT_ROOT", str(repo))
+    host_context.load_host_context(role="state")
     monkeypatch.setenv(test_slots.DIR_ENV, str(pool))
     monkeypatch.setenv(test_slots.COUNT_ENV, "1")
     monkeypatch.setenv(test_slots.ENABLE_ENV, "on")
@@ -89,9 +110,20 @@ test_slots.DEFAULT_SCRATCH_ROOT = Path({str(test_slots.DEFAULT_SCRATCH_ROOT)!r})
 pytest_plugins = ["lu_machinery.ci.pytest_dispatch_cap"]
 """)
     (worktree / "test_slot_probe.py").write_text(f"""
+import os
+from pathlib import Path
 from lu_machinery.common import test_slots
+from lu_machinery.common.repo_root import state_root
 
 def test_host_slot():
+    assert state_root() == Path({str(state_root)!r})
+    assert (state_root() / "toolchain" / "sentinel").read_text() == "restored"
+    assert Path(os.environ["LU_HOST_CONTEXT"]) != Path({str(host_layout.file)!r})
+    original = Path({str(host_layout.file)!r})
+    try:
+        assert original.read_bytes() == b""
+    except (FileNotFoundError, PermissionError):
+        pass
     state = test_slots.status()
     assert [(h["task_id"], h["kind"], h["slots"]) for h in state["holders"]] == [("wb-test", "pytest", 1)]
     lock = (test_slots.pool_dir() / "slot-000.lock").stat()

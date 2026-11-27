@@ -427,7 +427,7 @@ def production_context() -> MonitorContext:
         project_root,
         live_repo_root,
         Path(config.DASHBOARDS_DIR),
-        Path(os.environ.get("LEARN_UKRAINIAN_BATCH_STATE_DIR", str(shared_root / "batch_state"))),
+        config.batch_state_path(shared_root),
         curriculum_root,
         default_database_path(shared_root),
         Path(os.environ.get("BACKUP_DIR", str(shared_root / "data" / "backups"))),

@@ -70,8 +70,8 @@ def linked_entry(env, tree, *command):
 
 
 @pytest.mark.parametrize("entry", ENTRIES)
-def test_linked_worktree_entry_validates_the_primary_and_stays_in_place(sandbox, entry):
-    """Both entry points refuse without a configured primary and otherwise run in place, from the caller's directory."""
+def test_linked_worktree_entry_requires_explicit_state_and_stays_in_place(sandbox, entry):
+    """Both entry points require a state binding and resolve the prompt from the caller's worktree."""
     tree = prior_worktree(sandbox, "older-branch")
     primary_entry = sandbox.repo.resolve() / "lu_machinery/dispatch.py"
     primary_entry.write_text("import sys\nprint('primary checkout entry ran')\nsys.exit(3)\n")
@@ -79,7 +79,10 @@ def test_linked_worktree_entry_validates_the_primary_and_stays_in_place(sandbox,
     # A relative --prompt-file that only the linked worktree holds: the run resolves it from the caller's directory.
     (tree / "linked-brief.md").write_text("Brief only in the linked worktree\n")
     assert not (sandbox.repo / "linked-brief.md").exists()
-    ran = linked_entry(sandbox.env, tree, *entry, "dispatch", "--agent", "sol", "--model", "echo",
+    state = sandbox.repo.parent / "state"
+    state.mkdir(mode=0o700)
+    env = {**sandbox.env, "LU_STATE_ROOT": str(state)}
+    ran = linked_entry(env, tree, *entry, "dispatch", "--agent", "sol", "--model", "echo",
                        "--prompt-file", "linked-brief.md", "--dry-run")
     assert ran.returncode == 0, ran.stderr
     assert "primary checkout entry ran" not in ran.stdout
@@ -87,9 +90,12 @@ def test_linked_worktree_entry_validates_the_primary_and_stays_in_place(sandbox,
     assert plan["argv"][2] == "echo"
     assert not sandbox.tasks.exists()
 
-    unanchored = {key: value for key, value in sandbox.env.items() if key != "LEARN_UKRAINIAN_PRIMARY_REPO_ROOT"}
+    unanchored = {
+        key: value for key, value in env.items()
+        if key not in {"LU_STATE_ROOT", "LEARN_UKRAINIAN_STATE_ROOT", "LU_HOST_CONTEXT"}
+    }
     refused = linked_entry(unanchored, tree, *entry, "dispatch", "--agent", "sol", "--model", "echo",
                            "--prompt-file", "linked-brief.md", "--dry-run")
     assert refused.returncode == 2, refused.stdout + refused.stderr
-    assert refused.stderr.startswith("dispatcher: no shared-state anchor is configured")
+    assert refused.stderr.startswith("dispatcher: no durable state root configured")
     assert refused.stdout == ""

@@ -36,6 +36,8 @@ import sqlite3
 import sys
 from pathlib import Path
 
+from lu_machinery.common.repo_root import state_root
+
 KIT = Path(__file__).resolve().parent
 LEMMAS = (
     "мова",
@@ -172,6 +174,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
     root = args.product_root.resolve()
+    tasks = state_root() / "batch_state" / "tasks"
     outputs = {
         "vesum-sample.tsv": "".join(
             "\t".join(row) + "\n"
@@ -184,7 +187,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         + "\n",
         "task-records.json": json.dumps(
-            task_records(root / "batch_state" / "tasks"), indent=1
+            task_records(tasks), indent=1
         )
         + "\n",
     }

@@ -78,7 +78,7 @@ def build_plist(
     runtime = state_dir(home)
     return {
         "Label": LABEL,
-        "EnvironmentVariables": {"PATH": LAUNCHD_PATH},
+        "EnvironmentVariables": {"PATH": LAUNCHD_PATH, "LU_STATE_ROOT": str(state_root())},
         "LowPriorityIO": True,
         "ProcessType": "Background",
         "ProgramArguments": [
@@ -356,10 +356,9 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     try:
-        # The agent's job gets no root settings (its environment is PATH only), so its first
-        # --repo-root carries the state root: batch-state and rollover retention read it from there.
-        public_repo = (args.public_repo or state_root()).expanduser().resolve()
-    except MachineryConfigError as exc:
+        public_repo = (args.public_repo or scheduled_worktree_cleanup.default_public_repo()).expanduser().resolve()
+        state_root()
+    except (MachineryConfigError, FleetRepoError) as exc:
         parser.error(str(exc))
     registry_error = None
     private_repo: Path | None

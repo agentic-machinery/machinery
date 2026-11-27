@@ -106,6 +106,7 @@ def push_sandbox(tmp_path):
                 cwd=cwd or self.work,
                 env=_env(**{
                     "LU_PRODUCT_ROOT": str(self.root), "LEARN_UKRAINIAN_PRIMARY_REPO_ROOT": str(self.root),
+                    "LU_STATE_ROOT": str(self.root),
                     "LEARN_UKRAINIAN_PYTHON": sys.executable, **extra,
                 }),
                 capture_output=True,
@@ -747,9 +748,8 @@ def run_hook(sandbox, monkeypatch, client, *updates, stdin=None, url=None, remot
     """git_push.main in process on hand-written pre-push input; returns (status, caller hook calls)."""
     monkeypatch.setattr(gate, "catalog", lambda: catalog or CATALOG)
     monkeypatch.setattr(gate, "private_tooling", lambda: sandbox.tooling)
-    monkeypatch.setattr(gate, "_policy_checkout", lambda: sandbox.root)
     monkeypatch.chdir(sandbox.work)
-    monkeypatch.setattr(os, "environ", _env(**extra))
+    monkeypatch.setattr(os, "environ", _env(**{"LU_STATE_ROOT": str(sandbox.root), **extra}))
     if stdin is None:
         stdin = "".join(" ".join(record) + "\n" for record in (updates or [update(sandbox)])).encode()
     chained = []

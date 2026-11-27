@@ -20,23 +20,16 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 
 def configure_state_anchor(anchor: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    """Name an unrelated primary checkout as the shared-state anchor (C-4843).
-
-    The standalone lu_machinery checkout no longer derives the public primary from
-    its own location, so the operator's anchor is configured here. It is unrelated
-    to the temporary repositories, as the derived machinery checkout was. Subprocesses
-    inherit it.
-    """
-    anchor.mkdir()
-    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=anchor, check=True, capture_output=True, timeout=30)
-    monkeypatch.setenv(repo_root.PRIMARY_ROOT_ENV, str(anchor))
+    """Give worktree cleanup a state directory that subprocesses also use."""
+    anchor.mkdir(mode=0o700)
+    monkeypatch.setenv(repo_root.LU_STATE_ROOT_ENV, str(anchor))
     monkeypatch.delenv(repo_root.STATE_ROOT_ENV, raising=False)
     return anchor
 
 
 @pytest.fixture(autouse=True)
-def _state_anchor(tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch) -> Path:
-    return configure_state_anchor(tmp_path_factory.mktemp("state-anchor") / "primary", monkeypatch)
+def _state_anchor(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    return configure_state_anchor(tmp_path / "state", monkeypatch)
 
 
 def _git(cwd: Path, *args: str) -> str:
@@ -64,8 +57,8 @@ def _linked(primary: Path, branch: str, path: Path | None = None) -> Path:
     return worktree
 
 
-def _record(primary: Path, task_id: str, **fields: object) -> None:
-    tasks = primary / "batch_state" / "tasks"
+def _record(state: Path, task_id: str, **fields: object) -> None:
+    tasks = state / "batch_state" / "tasks"
     tasks.mkdir(parents=True, exist_ok=True)
     (tasks / f"{task_id}.json").write_text(json.dumps({"task_id": task_id, **fields}), encoding="utf-8")
 
@@ -76,12 +69,12 @@ def _remove(capsys: pytest.CaptureFixture[str], *argv: str) -> tuple[int, str, s
     return code, captured.out, captured.err
 
 
-def test_archive_move_does_not_hide_a_damaged_worktree_claim(tmp_path, monkeypatch):
+def test_archive_move_does_not_hide_a_damaged_worktree_claim(tmp_path, monkeypatch, _state_anchor):
     """Defect class: a listed record moved to the archive is skipped even if damaged."""
     primary = _primary(tmp_path)
     worktree = _linked(primary, "codex/archive-claim")
-    _record(primary, "archived-claim", status="done")
-    hot = primary / "batch_state" / "tasks" / "archived-claim.json"
+    _record(_state_anchor, "archived-claim", status="done")
+    hot = _state_anchor / "batch_state" / "tasks" / "archived-claim.json"
     archived = hot.parent / "archive" / hot.name
     archived.parent.mkdir()
     read_bytes = Path.read_bytes
@@ -99,10 +92,10 @@ def test_archive_move_does_not_hide_a_damaged_worktree_claim(tmp_path, monkeypat
     ) == f"task record {archived} unreadable; refusing worktree removal"
 
 
-def test_removes_an_unclaimed_linked_worktree_and_keeps_its_branch(tmp_path, capsys):
+def test_removes_an_unclaimed_linked_worktree_and_keeps_its_branch(tmp_path, capsys, _state_anchor):
     primary = _primary(tmp_path)
     worktree = _linked(primary, "codex/impl-1")
-    _record(primary, "impl-1", status="done", worktree_path=str(worktree))
+    _record(_state_anchor, "impl-1", status="done", worktree_path=str(worktree))
 
     code, out, err = _remove(capsys, str(worktree))
 
@@ -131,10 +124,10 @@ def test_sibling_removal_without_tmpdir_guards_only_force(tmp_path, monkeypatch,
         assert not worktree.exists()
 
 
-def test_refuses_while_an_unfinished_task_claims_the_worktree(tmp_path, capsys):
+def test_refuses_while_an_unfinished_task_claims_the_worktree(tmp_path, capsys, _state_anchor):
     primary = _primary(tmp_path)
     worktree = _linked(primary, "codex/impl-2")
-    _record(primary, "review-2", status="spawning", worktree_path=str(worktree))
+    _record(_state_anchor, "review-2", status="spawning", worktree_path=str(worktree))
 
     code, out, err = _remove(capsys, str(worktree), "--reason", "wt.sh clean 2")
 
@@ -143,7 +136,7 @@ def test_refuses_while_an_unfinished_task_claims_the_worktree(tmp_path, capsys):
     assert worktree.exists()
 
 
-def test_remove_accepts_helper_creator_record_when_borrowers_terminal(tmp_path, capsys):
+def test_remove_accepts_helper_creator_record_when_borrowers_terminal(tmp_path, capsys, _state_anchor):
     """A helper-created tree with only terminal borrowers must not be retained forever."""
     from lu_machinery.dispatcher.git import create_worktree
 
@@ -152,7 +145,7 @@ def test_remove_accepts_helper_creator_record_when_borrowers_terminal(tmp_path, 
     create_worktree(primary, worktree, "claude/helper-created", _git(primary, "rev-parse", "HEAD"))
     for task_id in ("borrower-one", "borrower-two"):
         _record(
-            primary, task_id, status="done", run_nonce=task_id, worktree_path=str(worktree),
+            _state_anchor, task_id, status="done", run_nonce=task_id, worktree_path=str(worktree),
             worktree_branch="claude/helper-created", worktree_reused=True,
         )
     (worktree / "batch_state").mkdir()
@@ -165,7 +158,7 @@ def test_remove_accepts_helper_creator_record_when_borrowers_terminal(tmp_path, 
     result = json.loads(out)
     assert result["action"] == "removed"
     receipt = result["preserved_artifacts"]
-    preserved = primary / receipt["location"]
+    preserved = _state_anchor / receipt["location"]
     assert (preserved / "batch_state/proof.json").read_bytes() == b'{"proof": true}\n'
     assert (preserved / "report.txt").read_bytes() == b"untracked evidence\n"
     assert receipt["retrieval_proof_sha256"]
@@ -173,7 +166,7 @@ def test_remove_accepts_helper_creator_record_when_borrowers_terminal(tmp_path, 
     assert _git(primary, "branch", "--list", "claude/helper-created")
 
 
-def test_remove_refuses_helper_tree_with_live_borrower(tmp_path, capsys):
+def test_remove_refuses_helper_tree_with_live_borrower(tmp_path, capsys, _state_anchor):
     """Creator attribution must never release a helper tree with a running borrower."""
     from lu_machinery.dispatcher.git import create_worktree
 
@@ -182,7 +175,7 @@ def test_remove_refuses_helper_tree_with_live_borrower(tmp_path, capsys):
     create_worktree(primary, worktree, "claude/helper-live", _git(primary, "rev-parse", "HEAD"))
     for task_id, status in (("finished-borrower", "done"), ("live-borrower", "running")):
         _record(
-            primary, task_id, status=status, run_nonce=task_id, worktree_path=str(worktree),
+            _state_anchor, task_id, status=status, run_nonce=task_id, worktree_path=str(worktree),
             worktree_branch="claude/helper-live", worktree_reused=True,
         )
     (worktree / "report.txt").write_bytes(b"keep live work\n")
@@ -192,10 +185,10 @@ def test_remove_refuses_helper_tree_with_live_borrower(tmp_path, capsys):
     assert code == worktree_claims.EXIT_REFUSED
     assert "live-borrower" in err
     assert (worktree / "report.txt").read_bytes() == b"keep live work\n"
-    assert not (primary / "batch_state/preserved").exists()
+    assert not (_state_anchor / "batch_state/preserved").exists()
 
 
-def _fleet(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, Path]:
+def _fleet(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, state: Path | None = None) -> tuple[Path, Path]:
     """Public primary and its ``infra-private`` sibling checkout beside it (#8624)."""
     public = _primary(tmp_path)
     from lu_machinery.orchestration.fleet_repos import load_fleet_repos
@@ -208,21 +201,21 @@ def _fleet(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, Path]
     (sibling / ".gitignore").write_text(".worktrees/\n", encoding="utf-8")
     _git(sibling, "add", ".gitignore")
     _git(sibling, "commit", "-m", "base")
-    monkeypatch.setattr(worktree_claims, "public_primary_root", lambda: public)
+    if state is None:
+        monkeypatch.setattr(worktree_claims, "public_primary_root", lambda: public)
+    monkeypatch.setenv(repo_root.PRIMARY_ROOT_ENV, str(public))
     return public, sibling
 
 
-def test_control_plane_root_is_the_public_primary_only_for_fleet_siblings(tmp_path, monkeypatch):
-    public, sibling = _fleet(tmp_path, monkeypatch)
+def test_control_plane_root_uses_explicit_state_for_all_checkout_layouts(tmp_path, monkeypatch, _state_anchor):
+    public, sibling = _fleet(tmp_path, monkeypatch, state=_state_anchor)
     linked = _linked(sibling, "codex/impl-cp")
     stranger = tmp_path / "stranger"
     stranger.mkdir()
     _git(stranger, "init", "-b", "main")
 
-    assert worktree_claims.control_plane_root(public) == public.resolve()
-    assert worktree_claims.control_plane_root(sibling) == public.resolve()
-    assert worktree_claims.control_plane_root(linked) == public.resolve()
-    assert worktree_claims.control_plane_root(stranger) == stranger.resolve()
+    for checkout in (public, sibling, linked, stranger):
+        assert worktree_claims.control_plane_root(checkout) == _state_anchor
 
 
 def _malformed_catalog(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -234,16 +227,16 @@ def _malformed_catalog(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(fleet_repos, "_CONFIG_PATH", bad)
 
 
-def test_control_plane_root_raises_control_plane_error_on_malformed_catalog_yaml(tmp_path, monkeypatch):
-    _public, sibling = _fleet(tmp_path, monkeypatch)
+def test_control_plane_root_raises_control_plane_error_on_malformed_catalog_yaml(tmp_path, monkeypatch, _state_anchor):
+    _public, sibling = _fleet(tmp_path, monkeypatch, state=_state_anchor)
     _malformed_catalog(tmp_path, monkeypatch)
 
     with pytest.raises(worktree_claims.ControlPlaneError, match="catalog unreadable"):
         worktree_claims.control_plane_root(sibling)
 
 
-def test_remove_unclaimed_worktree_never_raises_on_malformed_catalog_yaml(tmp_path, monkeypatch):
-    _public, sibling = _fleet(tmp_path, monkeypatch)
+def test_remove_unclaimed_worktree_never_raises_on_malformed_catalog_yaml(tmp_path, monkeypatch, _state_anchor):
+    _public, sibling = _fleet(tmp_path, monkeypatch, state=_state_anchor)
     worktree = _linked(sibling, "codex/impl-sib-badyaml")
     _malformed_catalog(tmp_path, monkeypatch)
 
@@ -256,8 +249,8 @@ def test_remove_unclaimed_worktree_never_raises_on_malformed_catalog_yaml(tmp_pa
     assert worktree.exists()
 
 
-def test_owning_repo_root_follows_the_worktree_pointer_and_defaults_otherwise(tmp_path, monkeypatch):
-    public, sibling = _fleet(tmp_path, monkeypatch)
+def test_owning_repo_root_follows_the_worktree_pointer_and_defaults_otherwise(tmp_path, monkeypatch, _state_anchor):
+    public, sibling = _fleet(tmp_path, monkeypatch, state=_state_anchor)
     linked = _linked(sibling, "codex/impl-own")
 
     assert worktree_claims.owning_repo_root(linked, default=public) == sibling.resolve()
@@ -265,11 +258,11 @@ def test_owning_repo_root_follows_the_worktree_pointer_and_defaults_otherwise(tm
     assert worktree_claims.owning_repo_root(tmp_path / "missing", default=public) == public
 
 
-def test_sibling_repo_worktree_with_a_live_public_claim_is_not_removed(tmp_path, capsys, monkeypatch):
-    """#8624: the CLI reads the claim dispatch wrote on the public primary, not the sibling's own batch_state."""
-    public, sibling = _fleet(tmp_path, monkeypatch)
+def test_sibling_repo_worktree_with_a_live_shared_claim_is_not_removed(tmp_path, capsys, monkeypatch, _state_anchor):
+    """#8624: the CLI reads the shared dispatch claim when operating on a sibling."""
+    public, sibling = _fleet(tmp_path, monkeypatch, state=_state_anchor)
     worktree = _linked(sibling, "codex/impl-sib")
-    _record(public, "review-sib", status="spawning", worktree_path=str(worktree))
+    _record(_state_anchor, "review-sib", status="spawning", worktree_path=str(worktree))
 
     code, out, err = _remove(capsys, str(worktree))
 
@@ -278,10 +271,10 @@ def test_sibling_repo_worktree_with_a_live_public_claim_is_not_removed(tmp_path,
     assert worktree.exists()
 
 
-def test_sibling_repo_worktree_is_removed_once_the_public_claim_is_finished(tmp_path, capsys, monkeypatch):
-    public, sibling = _fleet(tmp_path, monkeypatch)
+def test_sibling_repo_worktree_is_removed_once_the_shared_claim_is_finished(tmp_path, capsys, monkeypatch, _state_anchor):
+    public, sibling = _fleet(tmp_path, monkeypatch, state=_state_anchor)
     worktree = _linked(sibling, "codex/impl-sib-free")
-    _record(public, "impl-sib-free", status="done", worktree_path=str(worktree))
+    _record(_state_anchor, "impl-sib-free", status="done", worktree_path=str(worktree))
 
     code, _out, err = _remove(capsys, str(worktree))
 
@@ -290,8 +283,8 @@ def test_sibling_repo_worktree_is_removed_once_the_public_claim_is_finished(tmp_
     assert _git(sibling, "branch", "--list", "codex/impl-sib-free")
 
 
-def test_unreadable_fleet_catalog_refuses_removal(tmp_path, capsys, monkeypatch):
-    _public, sibling = _fleet(tmp_path, monkeypatch)
+def test_unreadable_fleet_catalog_refuses_removal(tmp_path, capsys, monkeypatch, _state_anchor):
+    _public, sibling = _fleet(tmp_path, monkeypatch, state=_state_anchor)
     worktree = _linked(sibling, "codex/impl-sib-nocat")
 
     def unreadable():
@@ -306,10 +299,10 @@ def test_unreadable_fleet_catalog_refuses_removal(tmp_path, capsys, monkeypatch)
     assert worktree.exists()
 
 
-def test_owner_exemption_covers_only_the_owner_record(tmp_path, capsys):
+def test_owner_exemption_covers_only_the_owner_record(tmp_path, capsys, _state_anchor):
     primary = _primary(tmp_path)
     worktree = _linked(primary, "codex/impl-3")
-    _record(primary, "impl-3", status="failed", run_nonce="owner-run-3", worktree_path=str(worktree), worktree_reused=False)
+    _record(_state_anchor, "impl-3", status="failed", run_nonce="owner-run-3", worktree_path=str(worktree), worktree_reused=False)
 
     code, out, _err = _remove(capsys, str(worktree), "--owner-task-id", "impl-3", "--reason", "rb2 cleanup")
 
@@ -321,14 +314,14 @@ def test_owner_exemption_covers_only_the_owner_record(tmp_path, capsys):
 _DISPATCHER_RECORD = {"schema_version": 2, "worktree_start_sha": "a" * 40, "options": {}, "provider_pgid": None}
 
 
-def test_dispatcher_record_proves_creation_without_the_reused_flag(tmp_path, capsys):
+def test_dispatcher_record_proves_creation_without_the_reused_flag(tmp_path, capsys, _state_anchor):
     """A dispatcher (schema 2) record never writes ``worktree_reused``; its start sha is the proof."""
     primary = _primary(tmp_path)
     worktree = _linked(primary, "claude/impl-5")
     (worktree / ".venv").mkdir()
     (worktree / ".venv" / "ignored").write_text("ignored", encoding="utf-8")
     _record(
-        primary, "impl-5", status="timeout", run_nonce="owner-run-5", worktree_path=str(worktree),
+        _state_anchor, "impl-5", status="timeout", run_nonce="owner-run-5", worktree_path=str(worktree),
         worktree_branch="claude/impl-5", **_DISPATCHER_RECORD,
     )
 
@@ -349,11 +342,11 @@ def test_dispatcher_record_proves_creation_without_the_reused_flag(tmp_path, cap
         {"worktree_reused": True},
     ],
 )
-def test_dispatcher_record_proof_refuses_a_borrowed_or_unproven_checkout(tmp_path, capsys, overrides):
+def test_dispatcher_record_proof_refuses_a_borrowed_or_unproven_checkout(tmp_path, capsys, overrides, _state_anchor):
     primary = _primary(tmp_path)
     worktree = _linked(primary, "claude/impl-6")
     _record(
-        primary, "impl-6", status="timeout", run_nonce="owner-run-6", worktree_path=str(worktree),
+        _state_anchor, "impl-6", status="timeout", run_nonce="owner-run-6", worktree_path=str(worktree),
         **{**_DISPATCHER_RECORD, **overrides},
     )
 
@@ -365,7 +358,7 @@ def test_dispatcher_record_proof_refuses_a_borrowed_or_unproven_checkout(tmp_pat
 
 
 @pytest.mark.parametrize("provider", ["live", "unrecorded"])
-def test_dispatcher_record_removal_waits_for_the_provider_tree_to_end(tmp_path, capsys, provider):
+def test_dispatcher_record_removal_waits_for_the_provider_tree_to_end(tmp_path, capsys, provider, _state_anchor):
     """Live provider processes, or none recorded either way, keep the checkout (#11865 F1)."""
     primary = _primary(tmp_path)
     worktree = _linked(primary, "claude/impl-7")
@@ -377,7 +370,7 @@ def test_dispatcher_record_removal_waits_for_the_provider_tree_to_end(tmp_path, 
         live = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"], start_new_session=True)
         record["provider_pgid"] = os.getpgid(live.pid)
     try:
-        _record(primary, "impl-7", status="timeout", run_nonce="owner-run-7", worktree_path=str(worktree), **record)
+        _record(_state_anchor, "impl-7", status="timeout", run_nonce="owner-run-7", worktree_path=str(worktree), **record)
         code, _out, err = _remove(capsys, str(worktree), "--owner-task-id", "impl-7")
     finally:
         if live is not None:
@@ -389,19 +382,19 @@ def test_dispatcher_record_removal_waits_for_the_provider_tree_to_end(tmp_path, 
     assert worktree.exists()
 
 
-def test_pre_spawn_failure_is_removable_and_unknown_provider_is_still_refused(tmp_path, capsys):
+def test_pre_spawn_failure_is_removable_and_unknown_provider_is_still_refused(tmp_path, capsys, _state_anchor):
     """A task that failed before a provider existed can release its checkout; an unrecorded provider cannot."""
     primary = _primary(tmp_path)
     failed = _linked(primary, "codex/review-pre-spawn")
     unknown = _linked(primary, "codex/review-unknown")
     _record(
-        primary, "review-pre-spawn", run_nonce="pre-spawn-nonce", worktree_path=str(failed),
+        _state_anchor, "review-pre-spawn", run_nonce="pre-spawn-nonce", worktree_path=str(failed),
         schema_version=2, worktree_start_sha="a" * 40, options={}, status="failed",
         returncode_reason="spawn_setup_failed", error="spawn_setup_failed: FileExistsError",
         pid=None, process_start=None,
     )
     _record(
-        primary, "review-unknown", run_nonce="unknown-nonce", worktree_path=str(unknown),
+        _state_anchor, "review-unknown", run_nonce="unknown-nonce", worktree_path=str(unknown),
         schema_version=2, worktree_start_sha="b" * 40, options={}, status="failed",
     )
 
@@ -428,12 +421,12 @@ def test_pre_spawn_failure_is_removable_and_unknown_provider_is_still_refused(tm
         ({"status": "done", "worktree_reused": False, "worktree_path": "/elsewhere"}, "a different worktree_path"),
     ],
 )
-def test_owner_proof_refuses_a_missing_live_reused_or_foreign_record(tmp_path, capsys, owner, refusal):
+def test_owner_proof_refuses_a_missing_live_reused_or_foreign_record(tmp_path, capsys, owner, refusal, _state_anchor):
     primary = _primary(tmp_path)
     worktree = _linked(primary, "codex/impl-4")
     if owner is not None:
         _record(
-            primary,
+            _state_anchor,
             "impl-4",
             **{"run_nonce": "owner-run-4", "worktree_path": str(worktree), **owner},
         )
@@ -445,18 +438,18 @@ def test_owner_proof_refuses_a_missing_live_reused_or_foreign_record(tmp_path, c
     assert worktree.exists()
 
 
-def test_owner_exemption_uses_run_nonce_and_keeps_duplicate_task_id_claim(tmp_path, capsys):
+def test_owner_exemption_uses_run_nonce_and_keeps_duplicate_task_id_claim(tmp_path, capsys, _state_anchor):
     primary = _primary(tmp_path)
     worktree = _linked(primary, "codex/impl-4-duplicate")
     _record(
-        primary,
+        _state_anchor,
         "impl-4",
         status="failed",
         run_nonce="owner-run-4",
         worktree_path=str(worktree),
         worktree_reused=False,
     )
-    duplicate = primary / "batch_state" / "tasks" / "duplicate-record.json"
+    duplicate = _state_anchor / "batch_state" / "tasks" / "duplicate-record.json"
     duplicate.write_text(
         json.dumps(
             {
@@ -476,10 +469,10 @@ def test_owner_exemption_uses_run_nonce_and_keeps_duplicate_task_id_claim(tmp_pa
     assert worktree.exists()
 
 
-def test_owner_exemption_fails_closed_without_run_nonce(tmp_path, capsys):
+def test_owner_exemption_fails_closed_without_run_nonce(tmp_path, capsys, _state_anchor):
     primary = _primary(tmp_path)
     worktree = _linked(primary, "codex/impl-4-no-nonce")
-    _record(primary, "impl-4", status="failed", worktree_path=str(worktree), worktree_reused=False)
+    _record(_state_anchor, "impl-4", status="failed", worktree_path=str(worktree), worktree_reused=False)
 
     code, _out, err = _remove(capsys, str(worktree), "--owner-task-id", "impl-4")
 
@@ -538,11 +531,11 @@ def test_a_timed_out_removal_is_an_error_never_removed(tmp_path, capsys, monkeyp
     assert worktree.exists()
 
 
-def test_refuses_while_dispatch_holds_the_worktree_lock(tmp_path, capsys, monkeypatch):
+def test_refuses_while_dispatch_holds_the_worktree_lock(tmp_path, capsys, monkeypatch, _state_anchor):
     primary = _primary(tmp_path)
     worktree = _linked(primary, "codex/impl-6")
     monkeypatch.setattr(worktree_claims, "DEFAULT_LOCK_TIMEOUT_S", 0.2)
-    _canonical, lock_file = worktree_claims.lock_path(worktree, lock_dir=worktree_claims.repository_lock_dir(primary))
+    _canonical, lock_file = worktree_claims.lock_path(worktree, lock_dir=worktree_claims.repository_lock_dir(_state_anchor))
     lock_file.parent.mkdir(parents=True, exist_ok=True)
     fd = os.open(lock_file, os.O_RDWR | os.O_CREAT, 0o600)
     try:
@@ -556,13 +549,13 @@ def test_refuses_while_dispatch_holds_the_worktree_lock(tmp_path, capsys, monkey
     assert worktree.exists()
 
 
-def test_json_output_reports_every_outcome(tmp_path, capsys):
+def test_json_output_reports_every_outcome(tmp_path, capsys, _state_anchor):
     primary = _primary(tmp_path)
     worktree = _linked(primary, "codex/impl-7")
-    _record(primary, "review-7", status="running", worktree_path=str(worktree))
+    _record(_state_anchor, "review-7", status="running", worktree_path=str(worktree))
 
     refused_code, refused_out, _err = _remove(capsys, str(worktree), "--json")
-    _record(primary, "review-7", status="done", worktree_path=str(worktree))
+    _record(_state_anchor, "review-7", status="done", worktree_path=str(worktree))
     removed_code, removed_out, _err = _remove(capsys, str(worktree), "--json")
 
     assert refused_code == worktree_claims.EXIT_REFUSED
@@ -830,12 +823,12 @@ def test_archived_needs_finalize_record_never_claims_even_for_another_task(tmp_p
 
 
 @pytest.mark.parametrize("record_task_id", ["owner", "different-task"])
-def test_unfinished_owner_record_without_proven_identity_still_claims_worktree(tmp_path, record_task_id):
+def test_unfinished_owner_record_without_proven_identity_still_claims_worktree(tmp_path, record_task_id, _state_anchor):
     """An unfinished owner or mislabelled record still claims without a valid nonce."""
     repo = _primary(tmp_path)
     worktree = _linked(repo, "codex/mislabelled")
-    _record(repo, "owner", status="running", worktree_path=str(worktree))
-    record = repo / "batch_state" / "tasks" / "owner.json"
+    _record(_state_anchor, "owner", status="running", worktree_path=str(worktree))
+    record = _state_anchor / "batch_state" / "tasks" / "owner.json"
     record.write_text(
         json.dumps({"task_id": record_task_id, "status": "running", "worktree_path": str(worktree)}),
         encoding="utf-8",

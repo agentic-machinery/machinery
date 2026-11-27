@@ -28,6 +28,7 @@ if __package__ in (None, ""):  # run as a file: put the repository root on sys.p
 from lu_machinery.agent_runtime.agent_github_identity import resolve_agent_github_identity, revoke_installation_token
 from lu_machinery.common import profile
 from lu_machinery.common.repo_root import StateRootError, machinery_path, state_root
+from lu_machinery.common.repo_root import primary_root as configured_checkout
 from lu_machinery.orchestration import worktree_claims
 from lu_machinery.orchestration.execution_safe_git import LOCAL_COMMANDS, SafeGitRunner
 from lu_machinery.orchestration.execution_safe_git import run_git as safe_git
@@ -103,8 +104,8 @@ def _git_dir(checkout: Path) -> tuple[Path, Path]:
 
 
 def primary_root(source: Path | None = None) -> Path:
-    """Resolve the protected primary (default: the state root) from its marker, never inherited Git state."""
-    _, common = _git_dir(_plain_path(state_root() if source is None else source))
+    """Resolve the protected primary (default: the configured primary checkout) from its marker, never inherited Git state."""
+    _, common = _git_dir(_plain_path(configured_checkout() if source is None else source))
     if common.name != ".git":
         raise Refusal("cannot establish the protected repository")
     return _plain_path(common.parent)
@@ -720,8 +721,8 @@ def worktree_remove(repo: Repository, primary: Path, git: Git, raw: str) -> dict
         raise Refusal("removal requires one registered dispatch worktree beneath the sibling dispatch root")
     # Dispatch already established this shared lock. Do not create public
     # metadata merely to remove a sibling tree.
-    _, primary_common = _git_dir(primary)
-    lock_dir = primary_common / worktree_claims.LOCK_DIR_NAME
+    control_root = state_root()
+    lock_dir = worktree_claims.repository_lock_dir(control_root)
     _, lock_file = worktree_claims.lock_path(target, lock_dir=lock_dir)
     if not lock_file.is_file():
         raise Refusal("dispatch ownership lock is missing; use the existing cleanup workflow")
@@ -750,7 +751,7 @@ def worktree_remove(repo: Repository, primary: Path, git: Git, raw: str) -> dict
         try:
             if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", head):
                 return False, reachability_refusal
-            tasks = primary / "batch_state/tasks"
+            tasks = control_root / "batch_state/tasks"
             needles = worktree_claims.worktree_claim_needles(target, target)
             bases = set()
             for state_file in sorted(tasks.iterdir()):
@@ -804,11 +805,11 @@ def worktree_remove(repo: Repository, primary: Path, git: Git, raw: str) -> dict
         target,
         repo_root=repo.checkout,
         reason="closed sibling maintenance",
-        control_root=primary,
+        control_root=control_root,
         owner_task_id=None,
         force=False,
         releasable=releasable,
-        tasks_dir=primary / "batch_state/tasks",
+        tasks_dir=control_root / "batch_state/tasks",
         lock_dir=lock_dir,
         lock_timeout_s=0,
         git_runner=SafeGitRunner(_GIT),

@@ -249,7 +249,7 @@ def test_reset_reserve_never_lifts_the_owner_avoid():
     assert capacity_pick.build_report(budget, reset_reserve=reserve)["pick_order"][0]["lane"] != "codex"
 
 
-def test_capacity_uses_snapshot_inventory_without_process_cache(monkeypatch, configured_roots):
+def test_capacity_uses_snapshot_inventory_without_process_cache(monkeypatch, configured_roots, tmp_path):
     from lu_machinery.fleet import reset_reserve
 
     now = datetime.now(UTC)
@@ -273,7 +273,8 @@ def test_capacity_uses_snapshot_inventory_without_process_cache(monkeypatch, con
         weekly_resets_at=(now + timedelta(days=3.5)).isoformat(),
         windows={"primary": {"remaining_pct": 12}},
     )
-    path = configured_roots.primary / reset_reserve.RESERVE_RELATIVE_PATH
+    monkeypatch.setenv("LU_STATE_ROOT", str(tmp_path))
+    path = tmp_path / reset_reserve.RESERVE_RELATIVE_PATH
     path.parent.mkdir(parents=True)
     path.write_text(
         json.dumps(

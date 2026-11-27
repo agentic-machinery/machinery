@@ -87,20 +87,10 @@ class PreservationLimit(ValueError):
 
 
 def preservation_root(control_root: Path) -> Path:
-    """Root whose ``batch_state/preserved/`` keeps output preserved from ``control_root``'s worktrees.
+    """Return the shared directory for preserved task output."""
+    from lu_machinery.common.repo_root import state_root
 
-    The public control plane (its primary checkout or its state root) preserves on the
-    machinery state root (:func:`scripts.common.repo_root.state_root`, #12681), so a
-    machinery checkout outside this repository preserves where dispatch keeps state.
-    The two are one directory while the state root must equal the primary. A
-    repository that is its own control plane preserves on itself. An unusable
-    configuration raises its ``ValueError``, so removal refuses.
-    """
-    from lu_machinery.common.repo_root import primary_root, state_root
-
-    state = state_root()
-    public = {os.path.realpath(primary_root()), os.path.realpath(state)}
-    return state if os.path.realpath(control_root) in public else control_root
+    return state_root()
 
 
 def merged_abandon_proof(worktree: Path, creator: Mapping[str, Any], head: str) -> dict[str, Any]:

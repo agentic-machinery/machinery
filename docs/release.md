@@ -612,6 +612,15 @@ ancestor `node_modules`, global ACP packages or npm cache.
 
 ## Consumers
 
+### State configuration for packaged services
+
+Before you install a release that requires an explicit state binding, verify
+the effective configuration of every packaged service that uses durable state.
+Provide a valid machinery host context or set `LU_STATE_ROOT` in the service's
+environment. If you supply both, they must resolve to the same directory.
+Configure state independently of the checkout, including for the Monitor API,
+context guard, and lane relaunch services.
+
 ### Product agent deployment
 
 An enrolled consumer runs the installed deployer with an explicit checkout:
