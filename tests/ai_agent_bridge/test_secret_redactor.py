@@ -295,6 +295,35 @@ def _redaction_seconds(text):
     return time.perf_counter() - started
 
 
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        pytest.param(
+            "PASSWORD='" + "\\'" * 50_000,
+            f"PASSWORD='{REDACTION}",
+            id="alert-66-single-quoted-equals",
+        ),
+        pytest.param(
+            'PASSWORD="' + '\\"' * 50_000,
+            f'PASSWORD="{REDACTION}',
+            id="alert-66-double-quoted",
+        ),
+        pytest.param(
+            "PASSWORD: '" + "''" * 50_000,
+            f"PASSWORD: '{REDACTION}''",
+            id="alert-66-single-quoted-yaml",
+        ),
+    ],
+)
+def test_quoted_assignment_redaction_completes_in_bounded_time(raw, expected):
+    """Defect class: polynomial-ReDoS backtracking in quoted assignment redaction (machinery-infra#1580)."""
+    started = time.perf_counter()
+    redacted = redact_text(raw)
+    elapsed = time.perf_counter() - started
+    assert elapsed < 0.5, f"redact_text took {elapsed:.3f}s on {len(raw)}-char input"
+    assert redacted == expected
+
+
 def test_redact_text_handles_quoted_and_spaced_assignments():
     text = "\n".join(
         [

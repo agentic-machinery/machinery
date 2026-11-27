@@ -22,11 +22,7 @@ _ASSIGNMENT_PREFIX = re.compile(
     rf"(?<!\w)(?P<key_quote>['\"]?)(?P<key>{_KEY_NAME})(?P=key_quote)\s*(?P<separator>[:=])\s*",
     re.IGNORECASE,
 )
-_QUOTED_VALUES = {
-    '"': re.compile(r'"(?:\\[\s\S]|[^"\\])*"'),
-    "'": re.compile(r"'(?:''|[^'])*'"),
-}
-_SINGLE_QUOTED_EQUALS_VALUE = re.compile(r"'(?:\\[\s\S]|''|[^'\\])*'")
+_QUOTED_DELIMITERS = frozenset(('"', "'"))
 _LINE_END = re.compile(r"[\r\n]")
 _PORT_DIGITS = re.compile(r"[0-9]+")
 
@@ -302,6 +298,45 @@ def _redact_jwts(text: str) -> str:
     return "".join(parts)
 
 
+def _scan_quoted_value_end(text: str, start: int, quote: str, *, allow_backslash: bool) -> int | None:
+    """Return the end index after a balanced quoted value at ``start``, or ``None``.
+
+    Single linear pass without regex backtracking: handles backslash escapes for
+    double-quoted values and ``=`` single-quoted values, and ``''`` escapes for
+    single-quoted values.
+    """
+    pos = start + 1
+    end = len(text)
+    if quote == '"':
+        while pos < end:
+            char = text[pos]
+            if char == "\\":
+                if pos + 1 >= end:
+                    return None
+                pos += 2
+            elif char == '"':
+                return pos + 1
+            else:
+                pos += 1
+        return None
+    fallback_end: int | None = None
+    while pos < end:
+        char = text[pos]
+        if allow_backslash and char == "\\":
+            if pos + 1 >= end:
+                return fallback_end
+            pos += 2
+        elif char == "'":
+            if pos + 1 < end and text[pos + 1] == "'":
+                fallback_end = pos + 1
+                pos += 2
+            else:
+                return pos + 1
+        else:
+            pos += 1
+    return fallback_end
+
+
 def _redact_assignments(text: str) -> str:
     parts = []
     cursor = 0
@@ -326,14 +361,13 @@ def _redact_assignments(text: str) -> str:
         start = match.end()
         if start == len(text):
             continue
-        quote = text[start] if text[start] in _QUOTED_VALUES else ""
+        quote = text[start] if text[start] in _QUOTED_DELIMITERS else ""
         if quote:
-            pattern = _QUOTED_VALUES[quote]
-            if quote == "'" and match.group("separator") == "=":
-                pattern = _SINGLE_QUOTED_EQUALS_VALUE
-            value = pattern.match(text, start)
-            end = value.end() if value else len(text)
-            closing = quote if value else ""
+            value_end = _scan_quoted_value_end(
+                text, start, quote, allow_backslash=(quote == '"' or match.group("separator") == "=")
+            )
+            end = value_end if value_end is not None else len(text)
+            closing = quote if value_end is not None else ""
         else:
             newline = _LINE_END.search(text, start)
             end = newline.start() if newline else len(text)

@@ -89,8 +89,6 @@ _SCP_ORIGIN = re.compile(
 )
 # The same digest the collection plugin stores for a node id it cannot name up front.
 _SELECTOR_HASH = re.compile(r"sha256:[0-9a-f]{64}")
-# XML 1.0 Char, so a synthetic JUnit name still parses. ElementTree writes the rest.
-_XML_FORBIDDEN = re.compile("[^\t\n\r\u0020-\ud7ff\ue000-\ufffd\U00010000-\U0010ffff]")
 
 
 class DataTierError(RuntimeError):
@@ -597,9 +595,23 @@ def _key(nodeid: str) -> str:
     return "sha256:" + hashlib.sha256(nodeid.encode()).hexdigest()
 
 
+def _is_xml_char(codepoint: int) -> bool:
+    """XML 1.0 Fifth Edition §2.2 Char production."""
+    return (
+        0x20 <= codepoint <= 0xD7FF
+        or codepoint in (0x9, 0xA, 0xD)
+        or 0xE000 <= codepoint <= 0xFFFD
+        or 0x10000 <= codepoint <= 0x10FFFF
+    )
+
+
 def _xml_text(value: str) -> str:
     """Replace characters XML 1.0 forbids so a synthetic JUnit receipt still parses."""
-    return _XML_FORBIDDEN.sub(lambda match: f"\\u{ord(match.group()):04x}", value)
+    if all(_is_xml_char(ord(char)) for char in value):
+        return value
+    return "".join(
+        char if _is_xml_char(ord(char)) else f"\\u{ord(char):04x}" for char in value
+    )
 
 
 def _requested_file_selector(selector: str, only: str) -> bool:

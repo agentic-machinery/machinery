@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import time
+
 import pytest
 
 from lu_machinery.api.opsec_scan import scan_response, scan_text
@@ -322,3 +324,25 @@ def test_path_detection_respects_parsed_parts(text: str, token: str | None) -> N
 def test_hash_route_exemption_does_not_hide_filesystem_paths(text: str) -> None:
     findings = scan_text(text, operation="GET /api/opsec", field_path="body.value")
     assert [finding.kind for finding in findings] == ["filesystem-root"], text
+
+
+@pytest.mark.parametrize(
+    ("text", "expected_tokens"),
+    [
+        pytest.param("https://" + "!" * 100_000 + "[bad]/home/fixture", ["/home/fixture"], id="alert-59-authority"),
+        pytest.param("./home" + "." * 100_000, ["/home"], id="alert-60-relative-name"),
+        pytest.param("!" * 100_000, [], id="alert-61-scheme-bang"),
+        pytest.param("A" * 100_000, [], id="alert-61-scheme-alpha"),
+        pytest.param("-" * 100_000, [], id="alert-62-user-at-host"),
+        pytest.param("." * 100_000, [], id="alert-63-ip-candidate"),
+        pytest.param("A" + "A-" * 50_000, [], id="alert-64-host-port"),
+        pytest.param("0" * 100_000, [], id="alert-65-transcript-filename"),
+    ],
+)
+def test_polynomial_redos_patterns_complete_in_bounded_time(text: str, expected_tokens: list[str]) -> None:
+    """Defect class: polynomial-ReDoS regex backtracking on 100,000-char inputs (machinery-infra#1580)."""
+    started = time.perf_counter()
+    findings = scan_text(text, operation="GET /api/opsec", field_path="body.value")
+    elapsed = time.perf_counter() - started
+    assert elapsed < 0.5, f"scan_text took {elapsed:.3f}s on {len(text)}-char input"
+    assert [finding.token for finding in findings] == expected_tokens
