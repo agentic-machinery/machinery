@@ -2007,6 +2007,18 @@ def _review_bundle_decisions(repo: Path) -> list[Decision]:
         age_days = max(0, int(now - child.st_mtime) // 86400)
         if age_days < BUNDLE_REVIEW_DAYS:
             continue
+        if not _bundle_name_ok(path.name):
+            listed.append(
+                Decision(
+                    _bundle_archive_locator(path.name),
+                    "review-bundle",
+                    "bundle filename rejected by path validation; retained for manual review; not deleted",
+                    None,
+                    None,
+                    age_days,
+                )
+            )
+            continue
         listed.append(
             Decision(
                 state_paths.branch_archive_rel(path.name).as_posix(),
@@ -2034,25 +2046,39 @@ class AgeOutResult:
 
 
 def _bundle_name_ok(name: str) -> bool:
-    return bool(name) and name == Path(name).name and name.endswith(".bundle") and not name.startswith(".")
+    return (
+        state_paths.is_valid_component(name)
+        and name == Path(name).name
+        and name.endswith(".bundle")
+        and not name.startswith(".")
+    )
 
 
-def _age_out_candidates(directory: Path, *, now: float, min_days: int) -> list[tuple[Path, int, int]]:
-    """Regular ``*.bundle`` files at least ``min_days`` old by mtime: (path, age_days, size)."""
+def _bundle_archive_locator(name: str) -> str:
+    return state_paths.branch_archive_rel(name).as_posix() if state_paths.is_valid_component(name) else name
+
+
+def _age_out_candidates(directory: Path, *, now: float, min_days: int) -> list[tuple[Path, int, int, bool]]:
+    """Regular non-hidden ``*.bundle`` files at least ``min_days`` old: (path, age_days, size, name_valid)."""
     try:
         info = os.lstat(directory)
     except FileNotFoundError:
         return []
     if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
         raise RuntimeError("archive path is not a plain directory")
-    found: list[tuple[Path, int, int]] = []
+    found: list[tuple[Path, int, int, bool]] = []
     for path in sorted(directory.iterdir(), key=lambda item: item.name):
         child = os.lstat(path)
-        if stat.S_ISLNK(child.st_mode) or not stat.S_ISREG(child.st_mode) or not _bundle_name_ok(path.name):
+        if (
+            stat.S_ISLNK(child.st_mode)
+            or not stat.S_ISREG(child.st_mode)
+            or not path.name.endswith(".bundle")
+            or path.name.startswith(".")
+        ):
             continue
         age_days = max(0, int(now - child.st_mtime) // 86400)
         if age_days >= min_days:
-            found.append((path, age_days, child.st_size))
+            found.append((path, age_days, child.st_size, _bundle_name_ok(path.name)))
     return found
 
 
@@ -2217,24 +2243,47 @@ def age_out_bundles(
     if not resolved.available or resolved.path is None:
         reason = f"bulk root unavailable ({resolved.reason}); nothing removed"
         return [
-            AgeOutResult(state_paths.branch_archive_rel(p.name).as_posix(), "retained", reason, a, s)
-            for p, a, s in candidates
+            AgeOutResult(
+                _bundle_archive_locator(p.name),
+                "retained",
+                reason if valid else "bundle filename rejected by path validation; kept local",
+                a,
+                s,
+            )
+            for p, a, s, valid in candidates
         ]
     if not apply:
         return [
-            AgeOutResult(state_paths.branch_archive_rel(p.name).as_posix(), "would-age-out", "dry run", a, s)
-            for p, a, s in candidates
+            AgeOutResult(
+                _bundle_archive_locator(p.name),
+                "would-age-out" if valid else "retained",
+                "dry run" if valid else "bundle filename rejected by path validation; kept local",
+                a,
+                s,
+            )
+            for p, a, s, valid in candidates
         ]
     results: list[AgeOutResult] = []
     with _archive_lock(repo):
         bulk_directory = _bulk_archive_dir(resolved, create=True)
-        for path, age_days, size in candidates:
-            try:
-                results.append(_age_out_one(repo, path, bulk_directory, resolved, min_days=min_days, now=stamp))
-            except (OSError, RuntimeError, subprocess.TimeoutExpired) as exc:
+        for path, age_days, size, valid in candidates:
+            if not valid:
                 results.append(
                     AgeOutResult(
-                        state_paths.branch_archive_rel(path.name).as_posix(),
+                        _bundle_archive_locator(path.name),
+                        "retained",
+                        "bundle filename rejected by path validation; kept local",
+                        age_days,
+                        size,
+                    )
+                )
+                continue
+            try:
+                results.append(_age_out_one(repo, path, bulk_directory, resolved, min_days=min_days, now=stamp))
+            except (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired) as exc:
+                results.append(
+                    AgeOutResult(
+                        _bundle_archive_locator(path.name),
                         "retained",
                         f"kept local: {exc}",
                         age_days,

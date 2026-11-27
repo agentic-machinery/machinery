@@ -36,9 +36,24 @@ BACKUP_ALERTS_REL: Path = Path(BATCH_STATE_DIRNAME, "backups", "alerts")
 BACKUP_LAST_RUN_REL: Path = Path(BATCH_STATE_DIRNAME, "backups", "last-run.json")
 
 
+def is_valid_component(part: str) -> bool:
+    """True when ``part`` is a single safe path component (no separators, NUL, or dot-segments)."""
+    return bool(part) and part not in {".", ".."} and "\x00" not in part and "/" not in part and "\\" not in part
+
+
 def branch_archive_rel(filename: str) -> Path:
     """Return relative ``batch_state/branch-archive/<filename>`` with a validated filename."""
     return BRANCH_ARCHIVE_REL / _validate_component(filename)
+
+
+def batch_state_rel(*parts: str) -> Path:
+    """Return relative ``batch_state/<parts...>`` with validated path segments."""
+    return Path(BATCH_STATE_DIRNAME, *(_validate_component(part) for part in parts))
+
+
+def preserved_rel(*parts: str) -> Path:
+    """Return relative ``batch_state/preserved/<parts...>`` with validated path segments."""
+    return Path(*PRESERVED_PARTS, *(_validate_component(part) for part in parts))
 
 
 def _anchor(root: Path | None) -> Path:
@@ -46,7 +61,7 @@ def _anchor(root: Path | None) -> Path:
 
 
 def _validate_component(part: str) -> str:
-    if not part or part in {".", ".."} or "\x00" in part or "/" in part or "\\" in part:
+    if not is_valid_component(part):
         raise ValueError(f"invalid state path component: {part!r}")
     return part
 
