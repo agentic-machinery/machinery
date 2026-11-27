@@ -55,7 +55,13 @@ from lu_machinery.agent_runtime.model_pause import _newest_claude
 from lu_machinery.common.git_context import sanitized_git_env
 from lu_machinery.dispatcher.types import NEVER_STARTED, StartRefusal
 from lu_machinery.orchestration.agent_ledger import TASK_FAMILIES
-from lu_machinery.orchestration.fleet_repos import FleetRepo, FleetRepoError, load_fleet_repos, resolve_fleet_repo
+from lu_machinery.orchestration.fleet_repos import (
+    FleetRepo,
+    FleetRepoError,
+    load_fleet_repos,
+    repository_identity,
+    resolve_fleet_repo,
+)
 from lu_machinery.review.findings import FINDING_OUTCOME_LABELS
 from lu_machinery.review.language_lane import UKRAINIAN_TASK_FAMILIES
 from lu_machinery.review.model_catalog import (
@@ -460,6 +466,8 @@ class _Row:
     # was published on, or None when no publication of it is recorded: its publication is unknown.
     published: str | None = None
     published_pr: int | None = None
+    # The repository slug that publication names (the outcome ledger joins on it).
+    published_repository: str | None = None
     # The author model a review names, whether or not its row names a PR (``author`` needs the row's own PR).
     review_author: str | None = None
 
@@ -586,6 +594,7 @@ def _rows(raw_rows: Iterable[Mapping[str, Any]], landing: Landing,
             raw=raw,
             published=None if publication is None else str(publication["verdict"]),
             published_pr=None if publication is None else int(publication["pr"]),
+            published_repository=None if publication is None else str(publication["repository"]),
             review_author=review_author,
         )
 
@@ -970,21 +979,21 @@ LABEL_OUTCOMES = (*FINDING_OUTCOME_LABELS, "contested", "unlabelled")
 
 @dataclass(frozen=True)
 class _Outcomes:
-    """The finding-outcome ledger: the labels (finding id to label) of each (review task, PR) publication and the
-    contested (review task, PR, finding id)."""
-    labels: Mapping[tuple[str, int], Mapping[str, str]] = field(default_factory=dict)
-    contests: frozenset[tuple[str, int, str]] = frozenset()
+    """The finding-outcome ledger: the labels (finding id to label) of each (review task, repository identity, PR)
+    publication and the contested (review task, repository identity, PR, finding id)."""
+    labels: Mapping[tuple[str, int | str, int], Mapping[str, str]] = field(default_factory=dict)
+    contests: frozenset[tuple[str, int | str, int, str]] = frozenset()
 
 
 def _label_tally(tally: Counter[str], row: _Row, outcomes: _Outcomes) -> None:
     """Count one published blocking review's P0-P2 findings (every finding that can block) by their author labels,
-    joined on the PR its publication names. The writer admits a label only for a P0-P2 finding of the review's own
+    joined on the repository and PR its publication names. The writer admits a label only for a P0-P2 finding of the review's own
     reply, so the labels never outnumber them; a contested label counts as contested. Unlabelled findings need the
     reply's priority counts."""
-    pr = cast(int, row.published_pr)
-    labels = outcomes.labels.get((row.task_id, pr), {})
+    key = (row.task_id, repository_identity(cast(str, row.published_repository)), cast(int, row.published_pr))
+    labels = outcomes.labels.get(key, {})
     for finding_id, label in labels.items():
-        tally["label:" + ("contested" if (row.task_id, pr, finding_id) in outcomes.contests else label)] += 1
+        tally["label:" + ("contested" if (*key, finding_id) in outcomes.contests else label)] += 1
     priorities = row.review[1] if row.review is not None else None
     if priorities is not None:
         tally["label:unlabelled"] += max(sum(priorities[p] for p in P0_P2) - len(labels), 0)
@@ -1017,7 +1026,8 @@ def _finding_outcomes(rows: Iterable[_Row], touched: Mapping[_HeadPair, frozense
     for row in rows:
         # Labels measure the reviewer alone: a blocking verdict published at the row's head counts whether or not the
         # row names the PR author's model.
-        if row.effort != UNKNOWN_EFFORT and row.published == "CHANGES_REQUESTED" and row.published_pr is not None:
+        if (row.effort != UNKNOWN_EFFORT and row.published == "CHANGES_REQUESTED" and row.published_pr is not None
+                and row.published_repository is not None):
             model = name(row.model)
             efforts[model].add(row.effort)
             _label_tally(counts[model], row, outcomes)
