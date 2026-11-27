@@ -126,11 +126,16 @@ def test_batch_state_join_outside_state_paths_fails_ratchet(tmp_path):
         'def m(root: Path) -> Path:\n    return root / state_paths.BATCH_STATE_DIRNAME / "tasks"\n'
         "def n(root: Path) -> Path:\n    return root / message_plane.DEFAULT_ROOT_REL\n"
         "def o(root: Path) -> Path:\n    return root / C.D\n"
-        'def p(root: Path) -> Path:\n    parts = ("batch_state",) + ("tasks",)\n    return root.joinpath(*parts)\n',
+        'def p(root: Path) -> Path:\n    parts = ("batch_state",) + ("tasks",)\n    return root.joinpath(*parts)\n'
+        'def q(root: str) -> str:\n    return "/".join([root, "batch_state", "split"])\n'
+        'def r(root: str) -> str:\n    return os.sep.join((root, "batch_state"))\n'
+        'def s() -> str:\n    return "/".join(state_paths.TASKS_PARTS)\n'
+        'def t(root: Path) -> Path:\n    return root / (seg := "batch_state")\n'
+        'def u(root: Path) -> Path:\n    for seg in ("batch_state",):\n        return root / seg\n',
         encoding="utf-8",
     )
     violations = boundary_ratchet.batch_state_join_violations(clean_tree)
-    assert len(violations) == 17
+    assert len(violations) == 22
     assert all(item.startswith("lu_machinery/rogue.py:") for item in violations)
 
     empty_tree = tmp_path / "empty"
