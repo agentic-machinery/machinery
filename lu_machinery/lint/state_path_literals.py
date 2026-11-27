@@ -64,6 +64,11 @@ def main() -> int:
             print(f"{path}:{number}: use a path builder from lu_machinery.state_paths")
             violations += 1
 
+    for (relative, line), count in sorted(remaining.items()):
+        if count:
+            print(f"{package / relative}: remove stale state path allowance for {line}")
+            violations += count
+
     print(f"State path literal lint: {violations} violation(s).")
     return int(violations > 0)
 

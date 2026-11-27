@@ -673,6 +673,7 @@ tests/lint/test_lint_prompts.py
 tests/lint/test_lint_test_waits.py
 tests/lint/test_mypy_ratchet.py
 tests/lint/test_orchestrator_track_sparse_worktree.py
+tests/lint/test_state_path_literals.py
 tests/opsec/test_gh_snapshot.py
 tests/opsec/test_git_push_scan.py
 tests/opsec/test_override_command_scope.py

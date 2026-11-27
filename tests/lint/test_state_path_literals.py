@@ -19,8 +19,20 @@ def test_new_store_literals_fail(tmp_path, monkeypatch, capsys):
     tests = tmp_path / "tests"
     tests.mkdir()
     (tests / "fixture.py").write_text(source, encoding="utf-8")
+    legacy_line = 'legacy = root / "batch_state"'
+    legacy_file = package / "legacy.py"
+    monkeypatch.setattr(state_path_literals, "EXISTING_LINES", (("legacy.py", legacy_line),))
+    legacy_file.write_text(legacy_line + "\n", encoding="utf-8")
     assert state_path_literals.main() == 0
     capsys.readouterr()
+
+    legacy_file.unlink()
+    assert state_path_literals.main() == 1
+    assert capsys.readouterr().out.splitlines() == [
+        f"lu_machinery/legacy.py: remove stale state path allowance for {legacy_line}",
+        "State path literal lint: 1 violation(s).",
+    ]
+    monkeypatch.setattr(state_path_literals, "EXISTING_LINES", ())
 
     (package / "caller.py").write_text(source, encoding="utf-8")
     assert state_path_literals.main() == 1
