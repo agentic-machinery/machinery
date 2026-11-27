@@ -2060,39 +2060,16 @@ def _retarget_api_batch_state(monkeypatch: pytest.MonkeyPatch, batch_state: Path
         monkeypatch.setattr(app.state, "ctx", context.with_roots(batch_state_dir=batch_state))
 
 
-@pytest.fixture(scope="session", autouse=True)
-def _no_session_host_binding(tmp_path_factory: pytest.TempPathFactory) -> Generator[None, None, None]:
-    """Keep the whole session, session fixtures included, off the live host binding.
-
-    ``host_context.DEFAULT_PATH`` names a root-owned host file that only some
-    hosts have. A test that sets its own ``LU_STATE_ROOT`` then fails there with
-    ``legacy_conflict`` while CI, which has no such file, passes. The default
-    path here is never created, so the loader reports ``missing_context`` and
-    callers use the legacy settings. An inherited ``LU_HOST_CONTEXT`` is removed
-    for the same reason.
-
-    This uses its own ``MonkeyPatch``: a test that calls ``monkeypatch.undo()``
-    reverts every patch on the shared per-test instance, and must fall back to
-    this absent path, not the live file. Child processes import ``host_context``
-    afresh and do not see either patch.
-    """
-    from lu_machinery import host_context
-
-    with pytest.MonkeyPatch.context() as patch:
-        patch.delenv(host_context.CONTEXT_ENV, raising=False)
-        absent = tmp_path_factory.getbasetemp() / "absent-host-binding" / "host.v1.json"
-        patch.setattr(host_context, "DEFAULT_PATH", absent)
-        yield
-
-
 @pytest.fixture(autouse=True)
-def _isolate_host_binding(_no_session_host_binding: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def _isolate_host_binding(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Give each test its own default host binding path, never created.
 
-    A test that writes a file at ``host_context.DEFAULT_PATH`` cannot leak it to
-    the next test. Nothing is created under ``tmp_path`` (see
-    ``_isolate_runtime_scratch_root``). A test that needs a binding writes its own
-    scratch file and sets ``LU_HOST_CONTEXT``
+    ``pytest_configure`` already keeps the process off the live binding; this
+    per-test path means a test that writes a file at ``host_context.DEFAULT_PATH``
+    cannot leak it to the next test. A test's ``monkeypatch.undo()`` falls back to
+    the ``pytest_configure`` path, never the live file. Nothing is created under
+    ``tmp_path`` (see ``_isolate_runtime_scratch_root``). A test that needs a
+    binding writes its own scratch file and sets ``LU_HOST_CONTEXT``
     (``tests/host_context/conftest.py:build_host_layout``) or patches
     ``DEFAULT_PATH`` itself; both run after this fixture, so they win.
     """
@@ -3056,6 +3033,19 @@ def pytest_configure(config: pytest.Config) -> None:
     config._fleet_comms_primary = primary
     fleet_env = pytest.MonkeyPatch()
     config.add_cleanup(fleet_env.undo)
+    # The host binding file (host_context.DEFAULT_PATH) exists only on bound
+    # hosts, where it must agree with the LU_STATE_ROOT set below or every
+    # loader refuses with legacy_conflict; CI has no such file. Point the
+    # default at a path that is never created, for collection, session
+    # fixtures and tests alike, so the loader reports missing_context as on CI.
+    # This MonkeyPatch is not the per-test one, so a test's monkeypatch.undo()
+    # cannot restore the live path. Child processes still read the live file.
+    from lu_machinery import host_context
+
+    host_binding_dir = tempfile.TemporaryDirectory(prefix="host-binding-")
+    config.add_cleanup(host_binding_dir.cleanup)
+    fleet_env.delenv(host_context.CONTEXT_ENV, raising=False)
+    fleet_env.setattr(host_context, "DEFAULT_PATH", Path(host_binding_dir.name) / "host.v1.json")
     fleet_env.setenv("FLEET_COMMS_ROOT", str(config._fleet_comms_root))
     fleet_env.setenv("LEARN_UKRAINIAN_PRIMARY_REPO_ROOT", str(primary))
     fleet_env.setenv("LU_STATE_ROOT", str(primary))
