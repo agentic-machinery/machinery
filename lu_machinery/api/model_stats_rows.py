@@ -1404,8 +1404,11 @@ def _well_formed(row: Mapping[str, Any]) -> bool:
     ))
 
 
-def read_rows(batch_state_dir: Path) -> tuple[list[dict[str, Any]], Counter[str]]:
-    """Every task's latest row (a later line of a task id supersedes an earlier one), and read counts."""
+def read_rows(batch_state_dir: Path, runs: dict[str, set[datetime | None]] | None = None,
+              ) -> tuple[list[dict[str, Any]], Counter[str]]:
+    """Every task's latest row (a later line of a task id supersedes an earlier one), and read counts. ``runs``, when
+    given, receives each task id's distinct run starts over all its lines: the live writer appends a row per settled
+    run, so a task id dispatched again shows more than one."""
     counts: Counter[str] = Counter()
     latest: dict[str, dict[str, Any]] = {}
     try:
@@ -1426,6 +1429,8 @@ def read_rows(batch_state_dir: Path) -> tuple[list[dict[str, Any]], Counter[str]
                 continue
             counts["lines"] += 1
             latest[row["task_id"]] = _sanitised(row)
+            if runs is not None:
+                runs.setdefault(row["task_id"], set()).add(timestamp(row.get("started_at")))
     counts["rows"] = len(latest)
     return list(latest.values()), counts
 

@@ -469,6 +469,8 @@ class _Row:
     # The repository slug that publication names (the outcome ledger joins on it), and GitHub's time for its comment.
     published_repository: str | None = None
     published_at: datetime | None = None
+    # The task id names more than one run in the rows ledger (it was dispatched again): its publication names no one run.
+    reused: bool = False
     # The author model a review names, whether or not its row names a PR (``author`` needs the row's own PR).
     review_author: str | None = None
 
@@ -989,11 +991,13 @@ class _Outcomes:
 
 
 def _own_publication(row: _Row) -> bool:
-    """Whether the row's publication was posted after the row's run started, so it can be that run's own. The rows
-    keep only a task id's newest run, and the publication join matches task id and head: a verdict an earlier run of
-    a reused id published at the same head joins the newest row too, but comes before that row's start. GitHub's
-    comment time is cut to the second, which only moves it earlier."""
-    return row.started is not None and row.published_at is not None and row.published_at >= row.started
+    """Whether the row's publication is surely its run's own. The rows keep only a task id's newest run, and the
+    publication join matches task id and head, so a verdict an earlier run of a reused id published at the same head
+    joins the newest row too: a task id the rows ledger shows with more than one run (``reused``) names no one run,
+    and counts nowhere rather than for the wrong model. A publication posted before the row's run started is
+    another run's too (GitHub's comment time is cut to the second, which only moves it earlier)."""
+    return (not row.reused and row.started is not None and row.published_at is not None
+            and row.published_at >= row.started)
 
 
 def _label_key(row: _Row) -> tuple[str, int | str, int] | None:
@@ -2083,7 +2087,8 @@ def collect(batch_state_dir: Path, primary_root: Path, now: datetime | None = No
     for reading in (_catalog_models, _known_models, _model_runtime_levels):
         reading.cache_clear()
     until = now or datetime.now(UTC)
-    raw_rows, row_counts = read_rows(batch_state_dir)
+    run_starts: dict[str, set[datetime | None]] = {}
+    raw_rows, row_counts = read_rows(batch_state_dir, runs=run_starts)
     publications, publication_counts = read_publications(batch_state_dir)
     try:
         labels, contests, outcome_counts = read_finding_outcomes(batch_state_dir)
@@ -2094,7 +2099,8 @@ def collect(batch_state_dir: Path, primary_root: Path, now: datetime | None = No
     keys = repository_keys(catalog)
     moments = [m for m in map(_moment, raw_rows) if m]
     first = min(moments, default=until)
-    rows = [row for row in _rows(raw_rows, landing or Landing(), alias_resolver(raw_rows), publications, keys)
+    rows = [replace(row, reused=True) if len(run_starts.get(row.task_id, ())) > 1 else row
+            for row in _rows(raw_rows, landing or Landing(), alias_resolver(raw_rows), publications, keys)
             if row.moment < until]
     all_prs, all_record_prs = _prs(rows), _prs(rows, of_record=True)
     if landing is None:

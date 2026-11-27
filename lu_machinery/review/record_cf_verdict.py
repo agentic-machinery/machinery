@@ -3332,10 +3332,10 @@ def _store_contests(task_root: Path, task_id: str, reply: str, *,
     """Store each ``CONTEST <id>`` line of a published review against the PR's previous blocking review of record.
 
     ``publications`` is the PR's trusted verdict publications read from its comments, oldest first, each beside its
-    run start (``_trusted_publications``): the target is the CHANGES_REQUESTED publication of the newest earlier head
-    (a round reviews one head; a publication at this review's own head is a sibling seat of the same round), and that
-    round must name one blocking review, so the binding never depends on which markers the local ledger holds, and a
-    rerun binds the same round. The target's reply is read only from the run that publication names: a task id can be dispatched again,
+    run start (``_trusted_publications``): the previous round is the newest earlier head with any verdict (a round
+    reviews one head; a publication at this review's own head is a sibling seat of the same round), and it must hold
+    exactly one CHANGES_REQUESTED review of another task, the target; otherwise the contest is unresolved. The
+    binding never depends on which markers the local ledger holds, and a rerun binds the same round. The target's reply is read only from the run that publication names: a task id can be dispatched again,
     so a task record whose reviewed head or start differs from the marker's is another run, and nothing is stored.
     An id that is no P0-P2 finding of that reply is reported unmatched and never stored; a reply that matches none
     stores nothing. None when the reply contests nothing; never raises."""
@@ -3351,17 +3351,20 @@ def _store_contests(task_root: Path, task_id: str, reply: str, *,
         if own is None:
             return "not stored: no trusted verdict comment of this run on the PR"
         # A round reviews one head, and a new round needs a new head: a publication at this review's own head is a
-        # sibling seat of the same round, never the round it contests.
-        previous = [(entry, run) for entry, run in reversed(publications[:own])
-                    if entry["verdict"] == "CHANGES_REQUESTED" and entry["task_id"] != task_id and entry["head"] != head]
-        if not previous:
-            return f"not stored: no earlier blocking verdict of another review on PR {publications[own][0]['pr']}"
-        round_head = previous[0][0]["head"]
-        seats = {entry["task_id"] for entry, _ in previous if entry["head"] == round_head}
-        if len(seats) != 1:
-            return (f"not stored: unresolved: {len(seats)} blocking reviews of the previous round at "
-                    f"{round_head[:12]}")
-        target, target_started = previous[0]
+        # sibling seat of the same round, never the round it contests. The previous round is the newest earlier head
+        # with any verdict; a contest binds only to it, never to an older round past it.
+        earlier = [(entry, run) for entry, run in reversed(publications[:own]) if entry["head"] != head]
+        if not earlier:
+            return f"not stored: no earlier round on PR {publications[own][0]['pr']}"
+        round_head = earlier[0][0]["head"]
+        round_blocking = [(entry, run) for entry, run in earlier
+                          if entry["head"] == round_head and entry["verdict"] == "CHANGES_REQUESTED"]
+        seats = {entry["task_id"] for entry, _ in round_blocking}
+        others = seats - {task_id}
+        if len(others) != 1 or task_id in seats:
+            return (f"not stored: unresolved: the previous round at {round_head[:12]} has {len(others)} blocking "
+                    f"review(s) of another task" + ("; this task id blocked it too" if task_id in seats else ""))
+        target, target_started = round_blocking[0]
         record, target_reply = _task(target["task_id"], task_root)
         if record.get("worktree_base_sha") != target["head"] or run_started(record) != target_started:
             return (f"not stored: unresolved: the task record of {target['task_id']} is not the run published at "
