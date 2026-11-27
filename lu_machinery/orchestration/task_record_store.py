@@ -371,7 +371,7 @@ def misnamed_record_refusal(path: Path) -> str:
 
 def read_task_record(path: Path) -> dict[str, Any] | None:
     """Read a scan candidate; foreign files are reported, damaged records raise."""
-    return parse_task_record(path, path.read_bytes())
+    return parse_task_record(path, read_regular_bytes(path))
 
 
 def read_regular_bytes(path: Path) -> bytes:
@@ -381,11 +381,18 @@ def read_regular_bytes(path: Path) -> bytes:
     ``OSError`` before any byte is read (``IsADirectoryError`` for a directory,
     as ``open()`` reports it), so a reader neither blocks on it nor reads it as a record.
     """
+    return _read_regular(path)
+
+
+def _read_regular(path: Path, identity: os.stat_result | None = None) -> bytes:
+    """``read_regular_bytes``; with ``identity``, an opened file that is not that same file raises ``FileNotFoundError``."""
     descriptor = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC)
     try:
-        mode = os.fstat(descriptor).st_mode
-        if not stat.S_ISREG(mode):
-            raise OSError(errno.EISDIR if stat.S_ISDIR(mode) else errno.EINVAL, "not a regular file", str(path))
+        opened = os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode):
+            raise OSError(errno.EISDIR if stat.S_ISDIR(opened.st_mode) else errno.EINVAL, "not a regular file", str(path))
+        if identity is not None and not os.path.samestat(identity, opened):
+            raise FileNotFoundError(errno.ENOENT, "not the observed record file", str(path))
         chunks = []
         while chunk := os.read(descriptor, 1 << 16):
             chunks.append(chunk)
@@ -440,7 +447,7 @@ def read_task_record_bytes(path: Path, *, tasks_dir: Path) -> tuple[Path, bytes]
     """Follow the observed file to its exact counterpart if an archive move removes its name."""
     observed = path.stat()
     try:
-        return path, path.read_bytes()
+        return path, read_regular_bytes(path)
     except FileNotFoundError:
         archive = tasks_dir / ARCHIVE_DIR_NAME
         if path.parent == tasks_dir:
@@ -449,10 +456,8 @@ def read_task_record_bytes(path: Path, *, tasks_dir: Path) -> tuple[Path, bytes]
             counterpart = tasks_dir / path.name
         else:
             raise
-        with task_archive_lock(tasks_dir), counterpart.open("rb") as moved:
-            if not os.path.samestat(observed, os.fstat(moved.fileno())):
-                raise
-            return counterpart, moved.read()
+        with task_archive_lock(tasks_dir):
+            return counterpart, _read_regular(counterpart, observed)
 
 
 def read_listed_task_record(path: Path, *, tasks_dir: Path | None = None) -> dict[str, Any] | None:

@@ -10,6 +10,7 @@ import pytest
 
 from lu_machinery.dispatcher import cli, ownership, store, worker
 from lu_machinery.dispatcher.types import ReviewAttempt, TaskSpec
+from lu_machinery.orchestration import task_record_store
 from lu_machinery.orchestration.task_record_store import read_task_record
 from lu_machinery.review import record_cf_verdict as recorder
 from lu_machinery.review import review_lineage
@@ -52,7 +53,7 @@ def test_strict_attempt_scan_keeps_a_moved_record_and_its_reply_once(tmp_path, m
         "task_id": "review", "schema_version": 2, "status": "done",
         "review_attempt": binding, "result_file": str(reply),
     }))
-    read_bytes = Path.read_bytes
+    read_bytes = task_record_store.read_regular_bytes
 
     def archive_before_read(path):
         if path == hot and hot.exists():
@@ -60,7 +61,7 @@ def test_strict_attempt_scan_keeps_a_moved_record_and_its_reply_once(tmp_path, m
             reply.rename(archived_reply)
         return read_bytes(path)
 
-    monkeypatch.setattr(Path, "read_bytes", archive_before_read)
+    monkeypatch.setattr(task_record_store, "read_regular_bytes", archive_before_read)
 
     records = store.list_tasks(include_archive=True, strict=True)
     assert [(record["task_id"], record["result_file"]) for record in records] == [("review", str(archived_reply))]

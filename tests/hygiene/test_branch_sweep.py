@@ -278,14 +278,16 @@ def test_branch_sweep_keeps_evidence_from_a_listed_record_moved_to_archive(tmp_p
     archived.parent.mkdir(parents=True)
     state = {"task_id": "retired", "status": "done", "worktree_branch": "codex/retired"}
     hot.write_text(json.dumps(state))
-    read_bytes = Path.read_bytes
+    from lu_machinery.orchestration import task_record_store
+
+    read_bytes = task_record_store.read_regular_bytes
 
     def archive_before_read(path):
         if path == hot and hot.exists():
             hot.rename(archived)
         return read_bytes(path)
 
-    monkeypatch.setattr(Path, "read_bytes", archive_before_read)
+    monkeypatch.setattr(task_record_store, "read_regular_bytes", archive_before_read)
 
     assert sweep._task_records(tmp_path) == [(archived, state)]
 
