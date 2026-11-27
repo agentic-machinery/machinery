@@ -3,18 +3,21 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
+import stat
 import subprocess
 import sys
-from pathlib import Path
-import pytest
-from lu_machinery.ci import data_tier
-import os
-import stat
 from collections.abc import Iterator
+from pathlib import Path
 from types import SimpleNamespace
+
+import pytest
+
+from lu_machinery.ci import data_tier
 from lu_machinery.common import scratch
 from tests.helpers.product_tree import configured_roots as configured_roots
+
 
 def test_selection_and_known_failures_come_from_the_tested_checkout_without_fallback(tmp_path):
     """Defect class: the runner tests a packaged, stale selection instead of the checkout's, or falls back silently."""
@@ -33,6 +36,9 @@ def test_selection_and_known_failures_come_from_the_tested_checkout_without_fall
         encoding="utf-8",
     )
     (ci / "data_tier_known_failures.json").write_text(json.dumps({"known_failures": {nodeid: 7}}), encoding="utf-8")
+    example = tmp_path / "tests" / "test_example.py"
+    example.parent.mkdir()
+    example.write_text("def test_reads_store():\n    return None\n", encoding="utf-8")
 
     selection, digest = data_tier.load_selection(tmp_path)
     assert selection["nodeids"] == [nodeid]
@@ -43,6 +49,69 @@ def test_selection_and_known_failures_come_from_the_tested_checkout_without_fall
     (ci / "data_tier_selection.json").write_text(json.dumps({"schema": 2}), encoding="utf-8")
     with pytest.raises(data_tier.DataTierError, match="schema-1 field"):
         data_tier.load_selection(tmp_path)
+
+
+def _write_selection(checkout: Path, payload: dict, source: str) -> None:
+    ci = checkout / "scripts" / "ci"
+    ci.mkdir(parents=True, exist_ok=True)
+    (ci / "data_tier_selection.json").write_text(json.dumps(payload), encoding="utf-8")
+    example = checkout / "tests" / "test_example.py"
+    example.parent.mkdir(parents=True, exist_ok=True)
+    example.write_text(source, encoding="utf-8")
+
+
+def test_selection_audit_reads_definitions_from_the_product_tree(tmp_path: Path) -> None:
+    """Defect class: the audit trusts a stored class_c count, so a removed definition or a stale count drifts silently."""
+    nodeid = "tests/test_example.py::test_reads_store"
+    source = "def test_reads_store():\n    return None\n"
+    stale = {"schema": 1, "class_c_merge_group": 127, "nodeids": [nodeid], "files": ["tests/test_example.py"]}
+    _write_selection(tmp_path, stale, source)
+    selection, _digest = data_tier.load_selection(tmp_path)
+    assert selection["nodeids"] == [nodeid]
+    assert selection["class_c_merge_group"] == 127
+
+    _write_selection(
+        tmp_path,
+        {**stale, "nodeids": [nodeid, nodeid]},
+        source,
+    )
+    with pytest.raises(data_tier.DataTierError, match="count or uniqueness differs"):
+        data_tier.load_selection(tmp_path)
+
+    _write_selection(tmp_path, stale, "def test_other():\n    return None\n")
+    with pytest.raises(data_tier.DataTierError, match="absent from the product tree"):
+        data_tier.load_selection(tmp_path)
+
+
+def test_selection_audit_rejects_a_link_outside_the_checkout(tmp_path: Path) -> None:
+    """Defect class: a tests/ path that resolves through a file or directory link outside the checkout."""
+    outside = tmp_path / "outside.py"
+    outside.write_text("def test_reads_store():\n    return None\n", encoding="utf-8")
+    checkout = tmp_path / "product"
+    nodeid = "tests/test_example.py::test_reads_store"
+    payload = {"schema": 1, "class_c_merge_group": 1, "nodeids": [nodeid], "files": ["tests/test_example.py"]}
+    ci = checkout / "scripts" / "ci"
+    ci.mkdir(parents=True)
+    (ci / "data_tier_selection.json").write_text(json.dumps(payload), encoding="utf-8")
+    linked = checkout / "tests" / "test_example.py"
+    linked.parent.mkdir(parents=True)
+    linked.symlink_to(outside)
+    with pytest.raises(data_tier.DataTierError, match="resolves outside the tested checkout"):
+        data_tier.load_selection(checkout)
+
+    linked.unlink()
+    outside_dir = tmp_path / "outside-dir"
+    outside_dir.mkdir()
+    (outside_dir / "test_example.py").write_text("def test_reads_store():\n    return None\n", encoding="utf-8")
+    nested = checkout / "tests" / "linked"
+    nested.symlink_to(outside_dir, target_is_directory=True)
+    nested_id = "tests/linked/test_example.py::test_reads_store"
+    (ci / "data_tier_selection.json").write_text(
+        json.dumps({**payload, "nodeids": [nested_id], "files": ["tests/linked/test_example.py"]}),
+        encoding="utf-8",
+    )
+    with pytest.raises(data_tier.DataTierError, match="resolves outside the tested checkout"):
+        data_tier.load_selection(checkout)
 
 
 WRITER = """
@@ -405,6 +474,20 @@ def test_collection_time_data_skip_is_in_junit(tmp_path: Path, monkeypatch: pyte
 def test_failure_reporting_uses_one_fake_gh_issue_and_clean_comment_once(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """Defect classes: gh is run from a non-checkout without a repository; a non-GitHub origin matches a github.com suffix."""
+    checkout = tmp_path / "product"
+    checkout.mkdir()
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    git = ["git", "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid"]
+    subprocess.run([*git, "init", "-q", "-b", "main"], cwd=checkout, check=True, timeout=30)
+    subprocess.run(
+        [*git, "remote", "add", "origin", "https://github.com/example-org/example-product.git"],
+        cwd=checkout,
+        check=True,
+        timeout=30,
+    )
+    monkeypatch.chdir(empty)
     monkeypatch.setattr(data_tier.github_client, "run", subprocess.run)
     executable = tmp_path / "gh"
     state = tmp_path / "state.json"
@@ -415,6 +498,8 @@ def test_failure_reporting_uses_one_fake_gh_issue_and_clean_comment_once(
         f"path = pathlib.Path({str(state)!r})\n"
         "state = json.loads(path.read_text())\n"
         "args = sys.argv[1:]\n"
+        "if '--repo' not in args or args[args.index('--repo') + 1] != 'example-org/example-product':\n"
+        "    sys.exit(4)\n"
         "state['calls'].append(args[:2])\n"
         "if args[:2] == ['issue', 'list']:\n"
         "    print(json.dumps([state['issue']] if state['issue'] else []))\n"
@@ -454,18 +539,18 @@ def test_failure_reporting_uses_one_fake_gh_issue_and_clean_comment_once(
     baseline = {
         "tests/test_citation_resolution_invariant.py::test_published_citations_resolve_invariant[wiki/grammar/b2/academic-writing.md]": 8403
     }
-    assert data_tier.report(failed, baseline).startswith("created")
-    assert data_tier.report(failed, baseline) == "updated issue #77"
+    assert data_tier.report(failed, baseline, checkout).startswith("created")
+    assert data_tier.report(failed, baseline, checkout) == "updated issue #77"
     clean = {**failed, "failed": 0, "passed": 2, "failing_tests": []}
     for errors in (
         {"runner_errors": ["memory guard stopped the run"]},
         {"missing_databases": ["sources.db"]},
     ):
-        assert data_tier.report({**clean, **errors}, baseline) == "updated issue #77"
+        assert data_tier.report({**clean, **errors}, baseline, checkout) == "updated issue #77"
         assert json.loads(state.read_text())["comments"] == []
-    assert data_tier.report(failed, baseline) == "updated issue #77"
-    assert data_tier.report(clean, baseline) == "closed issue #77 after clean run"
-    assert data_tier.report({**clean, "run_key": "run-2"}, baseline) == "no issue change"
+    assert data_tier.report(failed, baseline, checkout) == "updated issue #77"
+    assert data_tier.report(clean, baseline, checkout) == "closed issue #77 after clean run"
+    assert data_tier.report({**clean, "run_key": "run-2"}, baseline, checkout) == "no issue change"
     result = json.loads(state.read_text(encoding="utf-8"))
     assert "known issue #8403" in result["body"]
     assert len(result["comments"]) == 1
@@ -473,11 +558,39 @@ def test_failure_reporting_uses_one_fake_gh_issue_and_clean_comment_once(
     assert result["calls"].count(["issue", "edit"]) == 4
     assert result["issue"]["state"] == "CLOSED"
     assert result["calls"].count(["issue", "close"]) == 1
-    assert data_tier.report({**failed, "run_key": "run-3"}, baseline) == "updated issue #77"
-    assert data_tier.report({**clean, "run_key": "run-4"}, baseline) == "closed issue #77 after clean run"
+    assert data_tier.report({**failed, "run_key": "run-3"}, baseline, checkout) == "updated issue #77"
+    assert data_tier.report({**clean, "run_key": "run-4"}, baseline, checkout) == "closed issue #77 after clean run"
     result = json.loads(state.read_text())
     assert len(result["comments"]) == 2
     assert result["calls"].count(["issue", "create"]) == 1
+    calls_before = len(result["calls"])
+    for origin in (
+        "https://notgithub.com/example-org/example-product.git",
+        "https://evil.example/github.com/example-org/example-product.git",
+        "https://evil.example?@github.com/example-org/example-product.git",
+        "https://evil.example#@github.com/example-org/example-product.git",
+        "https://g\u0131thub.com/example-org/example-product.git",
+        "git@g\u0131thub.com:example-org/example-product.git",
+    ):
+        subprocess.run([*git, "remote", "set-url", "origin", origin], cwd=checkout, check=True, timeout=30)
+        with pytest.raises(data_tier.DataTierError, match="not a GitHub owner/name"):
+            data_tier.report(failed, baseline, checkout)
+    subprocess.run(
+        [*git, "remote", "set-url", "origin", "git@github.com:example-org/example-product.git"],
+        cwd=checkout,
+        check=True,
+        timeout=30,
+    )
+    assert data_tier.github_repository(checkout) == "example-org/example-product"
+    assert len(json.loads(state.read_text())["calls"]) == calls_before
+    accepted = []
+    for origin in (
+        "git@github.com:example-org/example-product/",
+        "git@github.com:example-org/example-product.git/",
+    ):
+        subprocess.run([*git, "remote", "set-url", "origin", origin], cwd=checkout, check=True, timeout=30)
+        accepted.append(data_tier.report(failed, baseline, checkout))
+    assert accepted == ["updated issue #77", "updated issue #77"]
 
 
 @pytest.mark.usefixtures('configured_roots', '_no_live_pool')
@@ -543,6 +656,39 @@ def test_collection_error_keeps_healthy_selected_test_and_junit(
     assert "test_bad.py" in summary["failing_tests"]
 
 
+def _plant_selection_tree(checkout: Path) -> None:
+    """Write the definitions the fixture selection names, so the audit reads this tree."""
+    selection = json.loads((checkout / "scripts" / "ci" / "data_tier_selection.json").read_text(encoding="utf-8"))
+    grouped: dict[str, set[str]] = {}
+    for nodeid in selection["nodeids"]:
+        relative, _separator, qualname = nodeid.split("[", 1)[0].partition("::")
+        grouped.setdefault(relative, set()).add(qualname)
+    for relative in selection["files"]:
+        grouped.setdefault(relative, set())
+    for relative, quals in grouped.items():
+        classes: dict[str, list[str]] = {}
+        functions: list[str] = []
+        for qualname in sorted(quals):
+            if "::" in qualname:
+                class_name, method = qualname.split("::", 1)
+                classes.setdefault(class_name, []).append(method)
+            else:
+                functions.append(qualname)
+        lines = ['"""Selection stub."""', ""]
+        for name in functions:
+            lines.extend([f"def {name}():", "    return None", ""])
+        for class_name, methods in classes.items():
+            lines.append(f"class {class_name}:")
+            for method in methods:
+                lines.extend([f"    def {method}(self):", "        return None"])
+            lines.append("")
+        if len(lines) == 2:
+            lines.append("VALUE = None")
+        path = checkout / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
 @pytest.fixture
 def nightly(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[SimpleNamespace]:
     primary = tmp_path / "primary"
@@ -558,6 +704,7 @@ def nightly(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[SimpleN
         path = checkout / "scripts/ci" / name
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(value, encoding="utf-8")
+    _plant_selection_tree(checkout)
     for argv in (["git", "init", "-q", str(checkout)], ["git", "-C", str(checkout), "add", "."],
                  ["git", "-C", str(checkout), "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-qm", "selection"]):
         subprocess.run(argv, check=True, capture_output=True, timeout=30)
@@ -592,7 +739,7 @@ def nightly(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[SimpleN
 
     monkeypatch.setattr(data_tier, "run_process_group", execute)
 
-    def report(summary: dict, baseline: dict) -> str:
+    def report(summary: dict, baseline: dict, checkout: Path) -> str:
         reports.append(json.loads(json.dumps(summary)))
         return "reported"
 
@@ -764,7 +911,7 @@ def test_github_failure_is_single_attempt_and_persisted(
 ) -> None:
     calls = []
 
-    def report(summary: dict, baseline: dict) -> str:
+    def report(summary: dict, baseline: dict, checkout: Path) -> str:
         calls.append(json.loads(json.dumps(summary)))
         raise data_tier.DataTierError("gh unavailable at /private/gh")
 
