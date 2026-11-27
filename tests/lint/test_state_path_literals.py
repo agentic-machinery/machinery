@@ -6,7 +6,8 @@ from lu_machinery.lint import state_path_literals
 
 
 def test_current_tree_passes(monkeypatch):
-    monkeypatch.chdir(Path(__file__).resolve().parents[2])
+    # CI imports from the built wheel after removing the source package.
+    monkeypatch.chdir(Path(state_path_literals.__file__).resolve().parents[2])
     assert state_path_literals.main() == 0
 
 
