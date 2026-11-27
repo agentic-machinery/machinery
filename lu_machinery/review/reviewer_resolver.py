@@ -31,11 +31,14 @@ selection unchanged. Ambiguous path inference fails closed instead of guessing.
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import shlex
+from collections import Counter
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field, replace
+from datetime import UTC, datetime, timedelta
 from fnmatch import fnmatchcase
 from pathlib import Path
 from typing import Literal
@@ -72,6 +75,155 @@ _SEALED_REVIEW_EXECUTABLE = "agent_runtime.runner:invoke_inter_agent"
 # from this module's unresolved location, so a symlinked package keeps its checkout name
 # and a short import spelling (the package directory on ``sys.path``) cannot shorten it.
 _NATIVE_REVIEW_EXECUTABLE = f"{Path(os.path.abspath(__file__)).parents[1].name}/dispatch.py"
+RECENT_REVIEW_WINDOW_DAYS = 7
+_PUBLISHED_VERDICTS = frozenset({"APPROVED", "CHANGES_REQUESTED", "BLOCKED"})
+_RECENT_REVIEW_CACHE: tuple[tuple[str, int, int, int, int, int, int], dict[str, int]] | None = None
+
+
+def _parse_utc_timestamp(value: object) -> datetime | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+        return (parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)).astimezone(UTC)
+    except (ValueError, OverflowError):
+        return None
+
+
+def _open_readonly_nofollow(path: Path) -> int:
+    return os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+
+
+def read_recent_review_counts(
+    batch_state_dir: Path | None = None,
+    *,
+    window_days: int = RECENT_REVIEW_WINDOW_DAYS,
+    now: datetime | None = None,
+) -> dict[str, int]:
+    """Count recent published code/infra reviews of record per canonical model id.
+
+    Reads ``<batch_state>/model-stats/publications.jsonl`` (the published-verdict
+    ledger written by ``record_cf_verdict``) joined with ``rows.jsonl`` over the
+    trailing ``window_days``. Missing state roots or files return ``{}`` so clean
+    environments and isolated tests fall back cleanly to zero counts.
+    """
+    global _RECENT_REVIEW_CACHE
+
+    if isinstance(window_days, bool) or not isinstance(window_days, int) or window_days < 1:
+        raise ValueError("window_days must be a positive integer")
+    if batch_state_dir is None:
+        from lu_machinery.common.repo_root import MachineryConfigError
+        from lu_machinery.common.task_store_paths import tasks_dir
+
+        try:
+            batch_state_dir = tasks_dir().parent
+        except (MachineryConfigError, OSError):
+            return {}
+    stats_dir = batch_state_dir / "model-stats"
+    pubs_path = stats_dir / "publications.jsonl"
+    rows_path = stats_dir / "rows.jsonl"
+    try:
+        pubs_stat = os.lstat(pubs_path)
+        rows_stat = os.lstat(rows_path)
+    except OSError:
+        return {}
+    reference_now = (
+        (now.astimezone(UTC) if now.tzinfo else now.replace(tzinfo=UTC))
+        if now is not None
+        else datetime.now(UTC)
+    )
+    cutoff = reference_now - timedelta(days=window_days)
+    cache_key: tuple[str, int, int, int, int, int, int] | None = None
+    if now is None:
+        cache_key = (
+            str(pubs_path),
+            pubs_stat.st_mtime_ns,
+            pubs_stat.st_size,
+            rows_stat.st_mtime_ns,
+            rows_stat.st_size,
+            window_days,
+            int(cutoff.timestamp() // 60),
+        )
+        if _RECENT_REVIEW_CACHE is not None and _RECENT_REVIEW_CACHE[0] == cache_key:
+            return dict(_RECENT_REVIEW_CACHE[1])
+
+    recent_tasks: set[str] = set()
+    try:
+        fd = _open_readonly_nofollow(pubs_path)
+    except OSError:
+        return {}
+    with os.fdopen(fd, "rb") as stream:
+        for line in stream:
+            try:
+                entry = json.loads(line)
+            except ValueError:
+                continue
+            if (
+                not isinstance(entry, dict)
+                or entry.get("schema") != "review-publication.v1"
+                or entry.get("verdict") not in _PUBLISHED_VERDICTS
+            ):
+                continue
+            tid = entry.get("task_id")
+            published_at = _parse_utc_timestamp(entry.get("published_at"))
+            if isinstance(tid, str) and tid and published_at is not None and published_at >= cutoff:
+                recent_tasks.add(tid)
+
+    if not recent_tasks:
+        if cache_key is not None:
+            _RECENT_REVIEW_CACHE = (cache_key, {})
+        return {}
+
+    model_by_task: dict[str, str] = {}
+    try:
+        fd = _open_readonly_nofollow(rows_path)
+    except OSError:
+        return {}
+    with os.fdopen(fd, "rb") as stream:
+        for line in stream:
+            if b'"review"' not in line:
+                continue
+            try:
+                row = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(row, dict) or row.get("role") != "review":
+                continue
+            tid = row.get("task_id")
+            if not isinstance(tid, str) or tid not in recent_tasks:
+                continue
+            # Ukrainian content reviews use a separate seat policy and must not
+            # skew code/infra reviewer rotation.
+            if str(row.get("class") or "").casefold().startswith("ukrainian/"):
+                model_by_task.pop(tid, None)
+                continue
+            raw_model = row.get("model")
+            if isinstance(raw_model, str) and raw_model.strip():
+                canonical = resolve_catalog_model_id(raw_model, _MODEL_CATALOG) or raw_model.strip()
+                model_by_task[tid] = canonical
+
+    counts = dict(Counter(model_by_task.values()))
+    if cache_key is not None:
+        _RECENT_REVIEW_CACHE = (cache_key, counts)
+    return dict(counts)
+
+
+def _normalize_recent_review_counts(counts: Mapping[str, int]) -> dict[str, int]:
+    if not isinstance(counts, Mapping):
+        raise ValueError("recent_review_counts must be a mapping")
+    normalized: dict[str, int] = {}
+    for key, value in counts.items():
+        if not isinstance(key, str) or not key.strip():
+            raise ValueError("recent_review_counts keys must be non-empty strings")
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError(f"recent_review_counts[{key!r}] must be a non-negative integer")
+        stripped = key.strip()
+        if stripped in REVIEW_CANDIDATES:
+            model = REVIEW_CANDIDATES[stripped].concrete_model
+        else:
+            model = resolve_catalog_model_id(stripped, _MODEL_CATALOG) or stripped
+        normalized[model] = normalized.get(model, 0) + value
+    return normalized
 
 
 def normalize_review_task_id(task_id: str, *, agent: str = "") -> str:
@@ -1434,6 +1586,7 @@ def resolve_reviewer(
     runtime_state: Mapping[str, object] | None = None,
     excluded_quota_buckets: frozenset[str] = frozenset(),
     review_mode: str = "cross_family",
+    recent_review_counts: Mapping[str, int] | None = None,
 ) -> ReviewerResolution:
     """Apply hard policy then balance the best eligible quality tier.
 
@@ -1453,6 +1606,11 @@ def resolve_reviewer(
     """
     if review_mode not in {"cross_family", "red_team"}:
         raise ValueError("unsupported review mode")
+    review_counts = (
+        _normalize_recent_review_counts(recent_review_counts)
+        if recent_review_counts is not None
+        else ({} if inputs.structural else read_recent_review_counts())
+    )
     resolution_type = RedTeamResolution if review_mode == "red_team" else ReviewerResolution
     if review_mode == "red_team":
         # Its outside-family probes retain whole-branch exclusions, without the new pair partition.
@@ -1687,7 +1845,7 @@ def resolve_reviewer(
     }
 
     for rung_index, rung in enumerate(active_ladder):
-        for candidate in rung:
+        for candidate_index, candidate in enumerate(rung):
             result = _evaluate_candidate(candidate, inputs, author_family=author_family, review_mode=review_mode)
             if result.status == "eligible":
                 eligible_quota_buckets.add(candidate.quota_bucket)
@@ -1715,13 +1873,19 @@ def resolve_reviewer(
                     reason=(f"quota bucket {candidate.quota_bucket!r} is already reserved by an active formal review"),
                 )
             if result.status == "eligible":
+                base_score = selection_key(
+                    candidate,
+                    snapshot=inputs.routing_snapshot,
+                    exact_head=inputs.exact_head,
+                    policy_version=_SCHEDULER_POLICY_VERSION,
+                )
                 result = replace(
                     result,
-                    selection_score=selection_key(
-                        candidate,
-                        snapshot=inputs.routing_snapshot,
-                        exact_head=inputs.exact_head,
-                        policy_version=_SCHEDULER_POLICY_VERSION,
+                    selection_score=(
+                        review_counts.get(candidate.concrete_model, 0),
+                        *base_score[:-1],
+                        rung_index,
+                        candidate_index,
                     ),
                 )
             trace.append(result)
