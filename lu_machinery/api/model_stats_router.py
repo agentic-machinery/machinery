@@ -980,18 +980,39 @@ LABEL_OUTCOMES = (*FINDING_OUTCOME_LABELS, "contested", "unlabelled")
 @dataclass(frozen=True)
 class _Outcomes:
     """The finding-outcome ledger: the labels (finding id to label) of each (review task, repository identity, PR)
-    publication and the contested (review task, repository identity, PR, finding id)."""
+    publication and the contested (review task, repository identity, PR, finding id). ``shared`` holds the keys that
+    blocking publications at more than one head name (``_shared_label_keys``): their labels name no one run."""
     labels: Mapping[tuple[str, int | str, int], Mapping[str, str]] = field(default_factory=dict)
     contests: frozenset[tuple[str, int | str, int, str]] = frozenset()
+    shared: frozenset[tuple[str, int | str, int]] = frozenset()
+
+
+def _label_key(row: _Row) -> tuple[str, int | str, int] | None:
+    """The outcome-ledger key of a row whose blocking verdict was published, else None."""
+    if row.published != "CHANGES_REQUESTED" or row.published_pr is None or row.published_repository is None:
+        return None
+    return row.task_id, repository_identity(row.published_repository), row.published_pr
+
+
+def _shared_label_keys(publications: Mapping[str, Sequence[Mapping[str, Any]]]) -> frozenset[tuple[str, int | str, int]]:
+    """The outcome-ledger keys whose task id has blocking publications at more than one head on that PR. A run
+    reviews one head, so those are runs of a task id dispatched again; a label line names the task id, not the run,
+    and the summary rows keep only an id's newest run, so such a key's labels belong to no one run."""
+    heads: dict[tuple[str, int | str, int], set[str]] = defaultdict(set)
+    for task_id, entries in publications.items():
+        for entry in entries:
+            if entry["verdict"] == "CHANGES_REQUESTED":
+                heads[task_id, repository_identity(entry["repository"]), entry["pr"]].add(entry["head"])
+    return frozenset(key for key, found in heads.items() if len(found) > 1)
 
 
 def _label_tally(tally: Counter[str], row: _Row, outcomes: _Outcomes) -> None:
     """Count one published blocking review's P0-P2 findings (every finding that can block) by their author labels,
     joined on the repository and PR its publication names. The writer admits a label only for a P0-P2 finding of the review's own
-    reply, so the labels never outnumber them; a contested label counts as contested. Unlabelled findings need the
-    reply's priority counts."""
-    key = (row.task_id, repository_identity(cast(str, row.published_repository)), cast(int, row.published_pr))
-    labels = outcomes.labels.get(key, {})
+    reply, so the labels never outnumber them; a contested label counts as contested. A key another run shares
+    counts every finding unlabelled. Unlabelled findings need the reply's priority counts."""
+    key = cast(tuple[str, int | str, int], _label_key(row))
+    labels = {} if key in outcomes.shared else outcomes.labels.get(key, {})
     for finding_id, label in labels.items():
         tally["label:" + ("contested" if (*key, finding_id) in outcomes.contests else label)] += 1
     priorities = row.review[1] if row.review is not None else None
@@ -2063,13 +2084,16 @@ def collect(batch_state_dir: Path, primary_root: Path, now: datetime | None = No
     raw_rows, row_counts = read_rows(batch_state_dir)
     publications, publication_counts = read_publications(batch_state_dir)
     labels, contests, outcome_counts = read_finding_outcomes(batch_state_dir)
-    outcomes = _Outcomes(labels, frozenset(contests))
     catalog = fleet_catalog()
     keys = repository_keys(catalog)
     moments = [m for m in map(_moment, raw_rows) if m]
     first = min(moments, default=until)
     rows = [row for row in _rows(raw_rows, landing or Landing(), alias_resolver(raw_rows), publications, keys)
             if row.moment < until]
+    try:
+        outcomes = _Outcomes(labels, frozenset(contests), _shared_label_keys(publications))
+    except FleetRepoError:  # an unreadable registry joins no row to a publication: no label counts, as none could
+        outcomes = _Outcomes()
     all_prs, all_record_prs = _prs(rows), _prs(rows, of_record=True)
     if landing is None:
         delivery_numbers = {(row.raw.get("repo") or "public", delivery["merge_sha"]): str(delivery["pr"])

@@ -2089,8 +2089,9 @@ def _contest(batch_state: Path, task_id: str, pr: int, finding_id: str, conteste
 def test_finding_outcome_labels_count_per_reviewer_and_a_contest_holds_the_label_out(tmp_path):
     """Defect class: author labels charged to another reviewer, or another PR, than the publication whose finding they
     label, a contested author claim counted as settled, a label on an unpublished review counted, a contest without a
-    label counted, a published review left out because its row names no author model, or unlabelled findings
-    miscounted. Every expected figure below is counted by hand."""
+    label counted, a published review left out because its row names no author model, a label charged to a run of a
+    task id dispatched again (the ledger names the task id, not the run), or unlabelled findings miscounted. Every
+    expected figure below is counted by hand."""
     batch_state, tasks = _state(tmp_path)
     sol = {"agent": "codex", "model": "gpt-6.1-sol", "resolved_model": "gpt-6.1-sol"}
     blocked = {"started_at": _at(7), "finished_at": _at(6)}
@@ -2112,8 +2113,15 @@ def test_finding_outcome_labels_count_per_reviewer_and_a_contest_holds_the_label
     _findings_review(tasks, "s5-review", "incorrect", [("P1", "src/a.py"), ("P0", "src/b.py")], pr=5,
                      pinned_head="e" * 40, **blocked, **{**sol, "review_author_model": None})
     rows.backfill(tasks, batch_state)
+    # Sol's PR 3 review id is dispatched again and blocks at a later head: the rows keep its newest run, two
+    # published runs share its label key, so its invented label names neither run and the finding counts unlabelled.
+    ledger = batch_state / rows.ROWS_DIR / rows.ROWS_FILE
+    [s3] = [line for line in map(json.loads, ledger.read_text().splitlines()) if line["task_id"] == "s3-review"]
+    with ledger.open("a") as stream:
+        stream.write(json.dumps({**s3, "started_at": _at(6.5), "pinned_head": "f" * 40}) + "\n")
     _publish(batch_state, ("o1-review", 1, "a" * 40, "CHANGES_REQUESTED"), ("o2-review", 2, "b" * 40, "CHANGES_REQUESTED"),
-             ("s3-review", 3, "c" * 40, "CHANGES_REQUESTED"), ("s5-review", 5, "e" * 40, "CHANGES_REQUESTED"))
+             ("s3-review", 3, "c" * 40, "CHANGES_REQUESTED"), ("s3-review", 3, "f" * 40, "CHANGES_REQUESTED"),
+             ("s5-review", 5, "e" * 40, "CHANGES_REQUESTED"))
     assert _label(batch_state, "o1-review", 1, "F0", "fixed") == 1
     assert _label(batch_state, "o1-review", 1, "F1", "wrong", "the guard on line 3 already returns early") == 1
     assert _label(batch_state, "o1-review", 1, "F2", "invented", "src/c.py has no such function") == 1
@@ -2140,8 +2148,8 @@ def test_finding_outcome_labels_count_per_reviewer_and_a_contest_holds_the_label
                                                       "contested": 1, "unlabelled": 2}
         # The contested invented label is held out: fixed over fixed, wrong and invented is 1 of 2.
         assert found["claude-opus-5-5"]["real_precision"] == stats._rate(1, 2)
-        assert found["gpt-6.1-sol"]["labels"] == {**zero, "invented": 1, "wrong": 1, "unlabelled": 1}
-        assert found["gpt-6.1-sol"]["real_precision"] == stats._rate(0, 2)
+        assert found["gpt-6.1-sol"]["labels"] == {**zero, "wrong": 1, "unlabelled": 2}
+        assert found["gpt-6.1-sol"]["real_precision"] == stats._rate(0, 1)
 
 
 def test_finding_outcome_ledger_keeps_one_label_per_finding_and_skips_damaged_lines(tmp_path):
