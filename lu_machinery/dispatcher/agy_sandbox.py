@@ -931,12 +931,11 @@ def _venv() -> Path:
     return Path(sys.executable).parent.parent.resolve(strict=True)
 
 
-def _venv_reads() -> list[Path]:
-    """The venv plus the directory of every hop of its ``bin/python`` link chain outside it.
+def _venv_reads(*, aliases: dict[Path, Path] | None = None) -> list[Path]:
+    """The venv and canonical directories needed to resolve its interpreter.
 
-    Read roots are bound canonically, so an intermediate link (a uv venv's ``python`` pointing at a
-    base install's ``python3``, itself a link to ``python3.12``) is reachable only when its
-    directory is bound too.
+    AGY also projects directory links in the installed runtime's executable
+    path. The links expose no host reads beyond these canonical mounts.
     """
     root = _venv()
     reads, link = [root], root / "bin" / "python"
@@ -944,6 +943,14 @@ def _venv_reads() -> list[Path]:
         if not link.is_symlink():
             return reads
         hop = link.parent / os.readlink(link)
+        if aliases is not None and hop.parent != hop.parent.resolve(strict=True):
+            for directory in (*reversed(hop.parent.parents), hop.parent):
+                if directory.is_symlink():
+                    alias = directory.parent.resolve(strict=True) / directory.name
+                    target = directory.resolve(strict=True)
+                    if target in _FORBIDDEN_TOOLCHAIN_ROOTS or not target.is_dir():
+                        raise Refused("agy_hook_interpreter_directory_link_refused")
+                    aliases[alias] = target
         link = hop.parent.resolve(strict=True) / hop.name
         if not link.parent.is_relative_to(root) and link.parent not in reads:
             reads.append(link.parent)
@@ -1504,7 +1511,9 @@ class _Boundary:
         self.relay = SourcesRelay(boundary / "sources.sock", frozenset(readers), env_keep)
         host_file = Path(os.environ.get(host_context.CONTEXT_ENV, str(host_context.DEFAULT_PATH)))
         hook_reads: list[Path] = []
-        if host_file.is_file():
+        interpreter_aliases: dict[Path, Path] = {}
+        has_host_binding = host_file.is_file()
+        if has_host_binding:
             # An editable test install and a wheel both need the release's two packages.
             hook_reads = [
                 Path(__file__).resolve().parents[1],
@@ -1512,11 +1521,12 @@ class _Boundary:
             ]
         sandbox = prepare_host_sandbox(
             engine="agy", snapshot_root=self.worktree, write_root=runtime, reject_root=repository,
-            runtime_reads=[*runtime_files(agy), *_venv_reads(), *hook_reads, *node_reads, *reads,
+            runtime_reads=[*runtime_files(agy), *_venv_reads(aliases=interpreter_aliases if has_host_binding else None), *hook_reads, *node_reads, *reads,
                            *(target for _, target in databases), *sidecars, shared, boundary],
             network_allowed=False,
         )
         hook_env: dict[str, str] = {}
+        hook_runtime_links: list[str] = []
         if sandbox.state_context is not None:
             mounts = [*map(Path, sandbox.read_roots), runtime, *own]
             if artifacts is not None:
@@ -1527,6 +1537,9 @@ class _Boundary:
             configured_python = configured_interpreter()
             if configured_python != Path(sys.executable):
                 raise Refused("agy_hook_interpreter_binding_mismatch")
+            for alias, target in interpreter_aliases.items():
+                if not any(alias.is_relative_to(mount) for mount in mounts):
+                    hook_runtime_links.extend(("--dir", str(alias.parent), "--symlink", str(target), str(alias)))
             hook_env = {
                 "LU_PYTHON": str(configured_python),
                 "LEARN_UKRAINIAN_PYTHON": str(configured_python),
@@ -1566,7 +1579,7 @@ class _Boundary:
                 input_mounts += ["--ro-bind", item["copy"], item["mount"]]
         cwd = self.worktree
         argv = wrap_argv_with_sandbox(inner, sandbox, bwrap_mounts=[
-            *masks, *input_mounts, "--ro-bind", str(boundary / "passwd"), "/etc/passwd",
+            *hook_runtime_links, *masks, *input_mounts, "--ro-bind", str(boundary / "passwd"), "/etc/passwd",
             "--ro-bind", str(boundary / "group"),
             "/etc/group", "--cap-drop", "ALL", "--proc", "/proc", "--chdir", str(cwd),
             # Last: the empty root becomes read-only, leaving the runtime bind as the only writable path.

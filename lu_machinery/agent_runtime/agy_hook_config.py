@@ -171,7 +171,9 @@ def run_native_hook(mode: str) -> int:
         if argv[0] == python and argv[2] == "-m" and importlib.util.find_spec(argv[3]) is None:
             return _refuse_hook(mode, "hook_unavailable", "installed hook module is missing")
         if mode in {GUARD_MODE, "agy-primary-write"}:
-            result = subprocess.run(argv, env=env, check=False)  # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit
+            result = subprocess.run(  # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit
+                argv, env=env, check=False, timeout=GUARD_TIMEOUT_FLOOR - 1,
+            )
             if result.returncode:
                 return _refuse_hook(mode, "hook_exec_failed", "installed guard could not complete")
             return 0
@@ -184,6 +186,8 @@ def run_native_hook(mode: str) -> int:
         if not Path(argv[1]).is_file():
             return _refuse_hook(mode, "hook_unavailable", "installed hook script is missing")
         os.execve("/bin/bash", argv, env)
+    except subprocess.TimeoutExpired:
+        return _refuse_hook(mode, "hook_timeout", "installed guard exceeded its time limit")
     except (ImportError, OSError):
         return _refuse_hook(mode, "hook_exec_failed", "installed hook could not be started")
 

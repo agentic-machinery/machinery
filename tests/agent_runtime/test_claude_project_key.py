@@ -3,18 +3,16 @@
 from __future__ import annotations
 
 import json
-import os
 import re
 import shutil
 import subprocess
-import sys
 from pathlib import Path
 
 import pytest
 
 from lu_machinery.common.repo_root import machinery_path
+from tests.launcher_sandbox import bind_launcher_environment, launcher_environment
 
-ROOT = Path(__file__).resolve().parents[2]
 HOOK = machinery_path("agents_extensions/shared/hooks/post-compact.sh")
 
 def _key(path: str) -> str:
@@ -52,23 +50,11 @@ def _primary_with_worktree(tmp_path: Path) -> tuple[Path, Path]:
     return primary, worktree
 
 
-def _run_hook(worktree: Path, primary: Path, **overrides: str) -> str:
-    environment = {
-        key: value
-        for key, value in os.environ.items()
-        if not key.startswith(("CODEX_", "CLAUDE_", "SESSION_", "GROK_", "GEMINI_", "THREAD_ROLLOVER_"))
-        and key != "LEARN_UKRAINIAN_PIPELINE"
-    }
-    environment.update(
-        CLAUDE_PROJECT_DIR=str(worktree),
-        LEARN_UKRAINIAN_PRIMARY_REPO_ROOT=str(primary),
-        LU_STATE_ROOT=str(primary),
-        SESSION_HANDOFF_AGENT="claude",
-        **overrides,
-    )
+def _run_hook(worktree: Path, environment: dict[str, str], **overrides: str) -> str:
     result = subprocess.run(
         ["bash", str(HOOK)],
-        env=environment,
+        cwd=worktree,
+        env={**environment, **overrides},
         capture_output=True,
         text=True,
         timeout=60,
@@ -83,31 +69,34 @@ def _line(context: str, marker: str) -> str:
 
 
 @pytest.mark.skipif(shutil.which("jq") is None, reason="jq is required by the hook")
-def test_post_compact_uses_the_primary_checkout_venv_with_production_defaults(tmp_path: Path) -> None:
-    # No interpreter override: the shared venv exists only in the primary checkout,
-    # exactly as for a real linked worktree.
+def test_post_compact_uses_the_bound_runtime_from_a_linked_worktree(tmp_path: Path) -> None:
     primary, worktree = _primary_with_worktree(tmp_path)
-    venv_python = primary / ".venv/bin/python"
-    venv_python.parent.mkdir(parents=True)
-    venv_python.symlink_to(sys.executable)
+    assert not (primary / ".venv").exists()
     assert not (worktree / ".venv").exists()
+    state = tmp_path / "durable-state"
+    state.mkdir(mode=0o700)
+    environment = bind_launcher_environment(
+        primary,
+        launcher_environment(
+            tmp_path=tmp_path, CLAUDE_PROJECT_DIR=str(worktree), SESSION_HANDOFF_AGENT="claude",
+            LU_STATE_ROOT=str(state),
+        ),
+    )
 
-    context = _run_hook(worktree, primary)
+    context = _run_hook(worktree, environment)
 
     memory = _line(context, "MEMORY:")
     assert f"/{_key(str(primary.resolve()))}/memory/MEMORY.md" in memory
     assert _key(str(worktree)) not in memory
     # The rollover probe ran the installed ``lu_machinery.orchestration.thread_handoff``
     # (the hook's one module bootstrap, #161) through the shared interpreter against the
-    # primary checkout, which holds no rollover packet.
+    # detached state root, which holds no rollover packet.
     assert "Thread rollover health (read-only): {" in context
     health = json.loads(context.split("Thread rollover health (read-only): ", 1)[1].split("\n  - If a live packet", 1)[0])
     assert health == {"agent": "claude", "status": "none"}
 
-    # The primary root reaches the rollover command (LU asserted this with a stub script in the
-    # primary): the hook's THREAD_ROLLOVER_SCRIPT seam runs a stub through the same interpreter,
-    # and the stub echoes the arguments the hook passed.
+    # Pass the detached state to the same rollover command used by the real hook.
     stub = tmp_path / "rollover-stub.py"
     stub.write_text(ROLLOVER_STUB)
-    stubbed = _line(_run_hook(worktree, primary, THREAD_ROLLOVER_SCRIPT=str(stub)), "Thread rollover health")
-    assert f"rollover-stub --repo-root {primary.resolve()} detect --agent claude" in stubbed
+    stubbed = _line(_run_hook(worktree, environment, THREAD_ROLLOVER_SCRIPT=str(stub)), "Thread rollover health")
+    assert f"rollover-stub --repo-root {state} detect --agent claude" in stubbed

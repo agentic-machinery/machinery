@@ -820,7 +820,7 @@ def build(tree: Tree, inputs: Tree | CommitInputs | None = None, *, workspace: b
             add(".agent", path, Output(blob, 0o644, "fleet", "generated:core"))
         add(".agent", "rules.json", Output(encoded({"exclude": ["core.md", "model-assignment.md", "workflow.md"]}), 0o644, "fleet", "generated:agy-excludes"))
     hook_python = None
-    native_configs = {"claude": ".claude/settings.json", "agy": ".agent/hooks.json", "codex": ".codex/hooks.json"}
+    native_configs = {"claude": ".claude/settings.json", "agy": ".agents/hooks.json", "codex": ".codex/hooks.json"}
     for provider in providers:
         required_configs = inventory["required_hooks"].get(provider, {})
         hook_configs = dict(required_configs)

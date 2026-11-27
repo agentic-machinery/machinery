@@ -30,9 +30,8 @@ def installed_python(tmp_path_factory):
 def hook_world(tmp_path, installed_python):
     env = {**_base_env(), "LEARN_UKRAINIAN_PYTHON": str(installed_python), "TMPDIR": str(tmp_path)}
     repo = _product_repo(tmp_path, env, installed_python)
-    env["LEARN_UKRAINIAN_PRIMARY_REPO_ROOT"] = str(repo)
-    task_env = _task(repo, tmp_path / "tasks", env)
-    record_path = tmp_path / "tasks" / "owned-paths-task.json"
+    task_env = _task(repo, env)
+    record_path = Path(task_env["LU_TASKS_DIR"]) / "owned-paths-task.json"
     return repo, env, task_env, record_path
 
 

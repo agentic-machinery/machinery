@@ -585,9 +585,25 @@ def test_false_green_check_recomposes_without_mutation(consumer, monkeypatch, de
 
 def test_non_idempotency_literal_inventory_and_modes(consumer, monkeypatch):
     """Fresh apply and repeat apply must yield literal paths/bytes/modes and no rewrites."""
+    import shlex
+
+    manifest = descriptor(consumer)
+    manifest["sources"]["agy"] = {"path": "agents_extensions/agy", "required": True}
+    write(consumer, plan.DESCRIPTOR, json.dumps(manifest))
+    guard = {"type": "command", "command": "lu-machinery-hook-v2 agy-secret-print", "timeout": 10}
+    write(consumer, "agents_extensions/agy/hooks.json", json.dumps({
+        "shell-secret-print-guard": {"PreToolUse": [{"matcher": "run_command", "hooks": [guard]}]},
+    }))
+    monkeypatch.setattr(plan, "hook_interpreter", lambda: Path(sys.executable))
     assert invoke(monkeypatch, consumer) == 0
     paths = {p for p in snapshot(consumer) if p.startswith((".claude/", ".codex/", ".agents/", ".agent/", ".gemini/"))}
-    assert paths == EXPECTED
+    assert paths == EXPECTED | {".agents/hooks.json"}
+    hook_settings = json.loads((consumer / ".agents/hooks.json").read_text())
+    command = hook_settings["shell-secret-print-guard"]["PreToolUse"][0]["hooks"][0]["command"]
+    assert command.startswith(
+        f"(exec {shlex.quote(sys.executable)} -I -B -m lu_machinery.agent_runtime.agy_hook_config "
+        "--run-hook agy-secret-print)"
+    )
     assert (consumer / ".codex/memory/MEMORY.md").read_text() == "codex memory\n"
     assert (consumer / ".claude/memory/MEMORY.md").read_text() == "shared memory\n"
     assert (consumer / ".agent/rules/core-part-01.md").read_bytes() == b"---\ntrigger: always_on\ndescription: Binding rules core, part 1 of 1.\n---\n# Fleet core\n"

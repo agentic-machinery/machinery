@@ -3,11 +3,12 @@
 import os
 import sqlite3
 import subprocess
-import sys
 from contextlib import closing
 from pathlib import Path
 
 import pytest
+
+from tests.host_context.conftest import build_host_layout
 
 HOOK = Path(__file__).resolve().parents[2] / 'agents_extensions/shared/hooks/check-agent-inbox.sh'
 
@@ -98,11 +99,9 @@ def test_probe_empty_and_error_results(tmp_path, monkeypatch, capsys, state):
                 "reason": "recipient_not_registered",
             }
 
-        # The installed entry must reach the empty-inbox fast path with only
-        # the configured primary, rather than its own path.
-        subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
-        plane = tmp_path / "plane"
-        plane.mkdir()
+        layout = build_host_layout(tmp_path / "binding")
+        plane = Path(layout.data["state_root"]) / "batch_state/fleet-comms/v1"
+        plane.mkdir(parents=True)
         db = db.replace(plane / db.name) if db.exists() else plane / db.name
         nested = tmp_path / "nested"
         nested.mkdir()
@@ -116,24 +115,18 @@ def test_probe_empty_and_error_results(tmp_path, monkeypatch, capsys, state):
             f"from pathlib import Path\nPath({str(tripwire)!r}).touch()\nraise RuntimeError('branch imported')\n"
         )
         calls = tmp_path / "python-args"
-        interpreter = tmp_path / "python-probe"
-        interpreter.write_text(
-            f"#!{sys.executable}\nimport os, runpy, sys\n"
-            "with open(os.environ['INBOX_PROBE_ARGS'], 'a') as log: log.write(' '.join(sys.argv[1:]) + chr(10))\n"
-            "if sys.argv[1:4] == ['-I', '-m', 'lu_machinery.fleet_comms']:\n"
-            f" bootstrap = {('import runpy, sys; sys.path.insert(0, ' + repr(str(HOOK.parents[3])) + '); runpy.run_module("lu_machinery.fleet_comms", run_name="__main__")')!r}\n"
-            f" os.execv({sys.executable!r}, [{sys.executable!r}, '-I', '-c', bootstrap, *sys.argv[4:]])\n"
-            "else:\n"
-            f" os.execv({sys.executable!r}, [{sys.executable!r}, *sys.argv[1:]])\n"
+        site = next(layout.python.parent.parent.glob("lib/python*/site-packages"))
+        (site / "sitecustomize.py").write_text(
+            "import os, sys\n"
+            "if 'INBOX_PROBE_ARGS' in os.environ:\n"
+            "    with open(os.environ['INBOX_PROBE_ARGS'], 'a') as log:\n"
+            "        log.write(' '.join(sys.orig_argv[1:]) + '\\n')\n"
         )
-        interpreter.chmod(0o755)
         result = subprocess.run(
             ["bash", str(HOOK)], check=False, input="{}", text=True, capture_output=True,
             cwd=nested, env={
                 "PATH": os.environ["PATH"], "HOME": str(tmp_path),
-                "LEARN_UKRAINIAN_PYTHON": str(interpreter),
-                "LEARN_UKRAINIAN_PRIMARY_REPO_ROOT": str(tmp_path),
-                "FLEET_COMMS_ROOT": str(db.parent), "LEARN_UK_HOOK_RECIPIENT": "codex",
+                **layout.env, "LU_PYTHON": str(layout.python), "LEARN_UK_HOOK_RECIPIENT": "codex",
                 "SESSION_HANDOFF_AGENT": "codex-infra",
                 "PYTHONPATH": str(nested), "INBOX_PROBE_ARGS": str(calls),
             }, timeout=15,

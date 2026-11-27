@@ -7,7 +7,6 @@ import os
 import shlex
 import shutil
 import subprocess
-import sys
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
@@ -16,6 +15,7 @@ import pytest
 
 from lu_machinery.common.repo_root import machinery_path, machinery_root
 from tests.helpers.product_tree import configured_roots as configured_roots
+from tests.host_context.conftest import build_host_layout
 
 pytestmark = pytest.mark.usefixtures("configured_roots")
 
@@ -46,6 +46,10 @@ def _run_hook(
         check=True,
         capture_output=True,
         timeout=30,
+    )
+    subprocess.run(
+        ["git", "remote", "set-url", "origin", "https://github.com/learn-ukrainian/learn-ukrainian.github.io.git"],
+        cwd=repo, check=True, capture_output=True, timeout=10,
     )
     canary = repo / "lu_machinery/session_canary"
     canary.mkdir(parents=True)
@@ -83,6 +87,7 @@ def _run_hook(
                 ),
             )
         )
+    shutil.copy2(machinery_path("host_context.py"), repo / "lu_machinery/host_context.py")
     for directory in ("lib", "config"):
         shutil.copytree(machinery_path(directory), repo / "lu_machinery" / directory, ignore=shutil.ignore_patterns("__pycache__"))
     hook = repo / HOOK
@@ -109,68 +114,53 @@ def _run_hook(
     driver_state_cli.write_text(f"#!/bin/sh\nprintf '%s\\n' {shlex.quote(json.dumps([note]))}\n")
     driver_state_cli.chmod(0o755)
 
-    # The hook takes its code from the release the project interpreter imports (#100 R51), so that
-    # interpreter imports this repo's capsule first, then the test's dependencies.
-    venv = tmp_path / "venv"
-    subprocess.run([sys.executable, "-I", "-m", "venv", "--without-pip", str(venv)], check=True)
-    purelib = subprocess.run(
-        [str(venv / "bin/python"), "-I", "-c", "import sysconfig; print(sysconfig.get_path('purelib'))"],
-        check=True, capture_output=True, text=True,
-    ).stdout.strip()
-    dependencies = subprocess.run(
-        [sys.executable, "-I", "-c", "import sysconfig; print(sysconfig.get_path('purelib'))"],
-        check=True, capture_output=True, text=True,
-    ).stdout.strip()
-    Path(purelib, "repo.pth").write_text(f"{repo}\n{dependencies}\n")
+    layout = build_host_layout(tmp_path / "binding")
+    layout.data["repos"]["public"] = str(repo)
+    site = next(layout.python.parent.parent.glob("lib/python*/site-packages"))
+    package = site / "lu_machinery"
+    package.unlink()
+    package.symlink_to(repo / "lu_machinery", target_is_directory=True)
     args_log = tmp_path / "hydrate-args"
     calls_log = tmp_path / "interpreter-calls"
-    wrapper = tmp_path / "interpreter-recorder"
-    wrapper.write_text(
-        "#!/bin/bash\n"
-        f"printf '%s\\n' \"$*\" >> {shlex.quote(str(calls_log))}\n"
-        'original=("$@")\n'
-        'while [ "$#" -gt 0 ]; do\n'
-        '  if [ "$1" = "-m" ]; then\n'
-        f"    printf '%s\\n' \"$*\" >> {shlex.quote(str(args_log))}\n"
-        '    break\n'
-        '  fi\n'
-        '  shift\n'
-        'done\n'
-        'set -- "${original[@]}"\n'
-        f'exec {shlex.quote(str(venv / "bin/python"))} "$@"\n'
+    (site / "sitecustomize.py").write_text(
+        "import os, sys\n"
+        "from pathlib import Path\n"
+        "if 'HOOK_CALLS_LOG' in os.environ:\n"
+        "    args = sys.orig_argv[1:]\n"
+        "    with Path(os.environ['HOOK_CALLS_LOG']).open('a') as stream:\n"
+        "        stream.write(' '.join(args) + '\\n')\n"
+        "    if args[:2] == ['-I', '-c'] and '-m' in args:\n"
+        "        module = args[args.index('-m') + 1:]\n"
+        "        if module[:2] == ['lu_machinery.session_canary.codex_lane', 'hydrate']:\n"
+        "            with Path(os.environ['HOOK_ARGS_LOG']).open('a') as stream:\n"
+        "                stream.write(' '.join(module) + '\\n')\n"
     )
-    wrapper.chmod(0o755)
     environment = {
-        key: value
-        for key, value in os.environ.items()
-        if not key.startswith(("SESSION_", "CODEX_", "GROK_", "GEMINI_", "LU_MONITOR_"))
-        and key not in {"CLAUDE_NON_INTERACTIVE", "LEARN_UKRAINIAN_PIPELINE", "HANDOFF_ISSUE_STREAMS_YAML"}
+        **layout.env,
+        "PATH": os.environ["PATH"],
+        "HOME": str(tmp_path),
+        "CLAUDE_PROJECT_DIR": str(repo),
+        "CODEX_CANONICAL_REPO_ROOT": str(repo),
+        "SESSION_HANDOFF_AGENT": "codex-open-model-data",
+        "SESSION_EPIC": selector,
+        "LU_PYTHON": str(layout.python),
+        "LU_PRODUCT_ROOT": str(repo),
+        "SESSION_BOUNDED_RUNNER": str(machinery_path("agent_runtime/bounded_command.py")),
+        "CODEX_COMPACT_SESSION_START": "1",
+        "PYTHONPATH": f"{repo}{os.pathsep}{ROOT}",
+        "SESSION_STREAM_SESSION_ID": "session-fixture",
+        "SESSION_STREAM_LEASE_ID": "lease-fixture",
+        "SESSION_STREAM_GENERATION": "2",
+        "SESSION_STREAM_FENCING_TOKEN": "7",
+        "SESSION_STREAM_AGENT": "codex",
+        "SESSION_STREAM_HARNESS": "codex-cli",
+        "SESSION_STREAM_INSTANCE_ID": "codex-fixture",
+        "SESSION_STREAM_PROCESS_ID": "1234",
+        "SESSION_STREAM_TASK_ID": "launcher-fixture",
+        "LU_DRIVER_STATE_CLI": str(driver_state_cli),
+        "HOOK_ARGS_LOG": str(args_log),
+        "HOOK_CALLS_LOG": str(calls_log),
     }
-    environment.update(
-        {
-            "CLAUDE_PROJECT_DIR": str(repo),
-            "CODEX_CANONICAL_REPO_ROOT": str(repo),
-            "SESSION_HANDOFF_AGENT": "codex-open-model-data",
-            "SESSION_EPIC": selector,
-            "LEARN_UKRAINIAN_PYTHON": str(wrapper),
-            "LEARN_UKRAINIAN_PRIMARY_REPO_ROOT": str(repo),
-            "LU_STATE_ROOT": str(repo),
-            "LU_PRODUCT_ROOT": str(repo),
-            "SESSION_BOUNDED_RUNNER": str(machinery_path('agent_runtime/bounded_command.py')),
-            "CODEX_COMPACT_SESSION_START": "1",
-            "PYTHONPATH": f"{repo}{os.pathsep}{ROOT}",
-            "SESSION_STREAM_SESSION_ID": "session-fixture",
-            "SESSION_STREAM_LEASE_ID": "lease-fixture",
-            "SESSION_STREAM_GENERATION": "2",
-            "SESSION_STREAM_FENCING_TOKEN": "7",
-            "SESSION_STREAM_AGENT": "codex",
-            "SESSION_STREAM_HARNESS": "codex-cli",
-            "SESSION_STREAM_INSTANCE_ID": "codex-fixture",
-            "SESSION_STREAM_PROCESS_ID": "1234",
-            "SESSION_STREAM_TASK_ID": "launcher-fixture",
-            "LU_DRIVER_STATE_CLI": str(driver_state_cli),
-        }
-    )
     if export_stream:
         environment["SESSION_STREAM_ID"] = stream
     if dispatch_task is not None:
@@ -221,10 +211,12 @@ def _run_hook(
         def log_message(self, *args):
             pass
 
-    server = HTTPServer(("localhost", 0), Monitor)
+    server = HTTPServer(("127.0.0.1", 0), Monitor)
     thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
     thread.start()
-    environment["LU_MONITOR_LOOPBACK"] = f"http://localhost:{server.server_port}"
+    environment["LU_MONITOR_LOOPBACK"] = f"http://127.0.0.1:{server.server_port}"
+    layout.data["monitor_url"] = environment["LU_MONITOR_LOOPBACK"]
+    layout.write()
     try:
         result = subprocess.run(
             ["bash", str(hook)], cwd=repo, env=environment, capture_output=True, text=True, timeout=10

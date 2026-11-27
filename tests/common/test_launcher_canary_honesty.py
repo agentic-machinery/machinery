@@ -55,7 +55,7 @@ def _canary_binding_probe(
         env={
             **launcher_environment(),
             "LC_PROVIDER_CANARY_RAN": "1" if inherited else "0",
-            "LEARN_UKRAINIAN_PYTHON": sys.executable,
+            "LU_PYTHON": sys.executable,
             "LEARN_UKRAINIAN_PRIMARY_REPO_ROOT": str(anchor),
             "LU_PRODUCT_ROOT": str(tmp_path),
         },
@@ -115,6 +115,6 @@ def test_binding_uses_explicit_adapter_execution_report(
             "bash", str(REPO), ran, dry_run, str(tmp_path),
         ],
         capture_output=True, text=True, check=False, timeout=30,
-        env={**launcher_environment(), "LEARN_UKRAINIAN_PYTHON": sys.executable},
+        env={**launcher_environment(), "LU_PYTHON": sys.executable},
     )
     assert f"provider canary: {expected}" in _driver_prompt(result)
