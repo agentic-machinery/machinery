@@ -227,7 +227,6 @@ def launcher_environment(
         "TOOL_TIMING_API_URL": UNREACHABLE_TOOL_TIMING_URL,
         "DELEGATE_MONITOR_API": UNREACHABLE_MONITOR_URL,
         "FLEET_COMMS_ROOT": str(root / "fleet-plane"),
-        "LU_STATE_ROOT": str(root),
         "LU_TASKS_DIR": str(root / "task-store"),
         "LU_GITHUB_CACHE_DIR": str(root / "github-cache"),
         "LU_MODEL_PAUSE_FILE": str(root / "no-model-pause.json"),

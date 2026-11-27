@@ -769,6 +769,7 @@ launcher_exec_command fixture-cli
         "HOME": str(tmp_path / "home"),
         "PATH": f"{cli.parent}{os.pathsep}{launcher_toolchain_path()}",
         "FLEET_COMMS_ROOT": str(plane),
+        "LU_STATE_ROOT": str(tmp_path),
         "LEARN_UKRAINIAN_PYTHON": sys.executable,
         "LEARN_UKRAINIAN_PRIMARY_REPO_ROOT": os.environ["LEARN_UKRAINIAN_PRIMARY_REPO_ROOT"],
         "LU_PRODUCT_ROOT": os.environ["LU_PRODUCT_ROOT"],
