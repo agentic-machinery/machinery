@@ -34,6 +34,7 @@ from __future__ import annotations
 import os
 import re
 import shlex
+import stat
 from collections import Counter
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field, replace
@@ -63,7 +64,6 @@ from lu_machinery.review.reviewer_scheduler import (
     _route_record,
     circuit_exclusion_reason,
     codex_account_key,
-    selection_key,
 )
 from lu_machinery.review.security_paths import effective_review_risk, is_security_sensitive_change
 from lu_machinery.review.subject_seat import prepare_subject_exclusion, subject_exclusion_reason
@@ -78,7 +78,15 @@ _NATIVE_REVIEW_EXECUTABLE = f"{Path(os.path.abspath(__file__)).parents[1].name}/
 RECENT_REVIEW_WINDOW_DAYS = 7
 _RECENT_REVIEW_JSON_MAX_DEPTH = 16
 _PUBLISHED_VERDICTS = frozenset({"APPROVED", "CHANGES_REQUESTED", "BLOCKED"})
-_RECENT_REVIEW_CACHE: tuple[tuple[str, int, int, int, int, int, int], dict[str, int]] | None = None
+_CODE_INFRA_REVIEW_CLASSES = frozenset(
+    f"{profile}/{risk}" for profile in VALID_REVIEW_PROFILES for risk in (*VALID_RISKS, "unknown")
+)
+_PUBLICATION_REPO_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9._-]{1,100}\Z")
+_PUBLICATION_SHA_RE = re.compile(r"[0-9a-f]{40}\Z")
+_RecentReviewCacheKey = tuple[
+    str, int, int, int, int, int, int, int, int, int, int, int, tuple[tuple[str, str], ...]
+]
+_RECENT_REVIEW_CACHE: tuple[_RecentReviewCacheKey, datetime | None, dict[str, int]] | None = None
 
 
 def _parse_utc_timestamp(value: object) -> datetime | None:
@@ -91,8 +99,35 @@ def _parse_utc_timestamp(value: object) -> datetime | None:
         return None
 
 
-def _open_readonly_nofollow(path: Path) -> int:
-    return os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+def _recent_review_repo_keys() -> dict[str, str]:
+    from lu_machinery.orchestration.fleet_repos import load_fleet_repos
+
+    try:
+        repos = load_fleet_repos()
+    except Exception:
+        return {}
+    return {
+        slug.lower(): key
+        for key, repo in repos.items()
+        for slug in repo.slugs
+        if slug.isascii()
+    }
+
+
+def _open_regular_in_dir(dir_fd: int, filename: str) -> tuple[int, os.stat_result] | None:
+    try:
+        fd = os.open(filename, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=dir_fd)
+    except OSError:
+        return None
+    try:
+        file_stat = os.fstat(fd)
+    except OSError:
+        os.close(fd)
+        return None
+    if not stat.S_ISREG(file_stat.st_mode):
+        os.close(fd)
+        return None
+    return fd, file_stat
 
 
 def read_recent_review_counts(
@@ -105,8 +140,9 @@ def read_recent_review_counts(
 
     Reads ``<batch_state>/model-stats/publications.jsonl`` (the published-verdict
     ledger written by ``record_cf_verdict``) joined with ``rows.jsonl`` over the
-    trailing ``window_days``. Missing state roots or files return ``{}`` so clean
-    environments and isolated tests fall back cleanly to zero counts.
+    trailing ``window_days`` ``[now - window_days, now]`` using canonical
+    publication target matching (repository, head SHA, and PR when named on the
+    latest validated row). Missing or unsafe state paths fail closed to ``{}``.
     """
     global _RECENT_REVIEW_CACHE
 
@@ -121,91 +157,188 @@ def read_recent_review_counts(
         except (MachineryConfigError, OSError):
             return {}
     stats_dir = batch_state_dir / "model-stats"
-    pubs_path = stats_dir / "publications.jsonl"
-    rows_path = stats_dir / "rows.jsonl"
     try:
-        pubs_stat = os.lstat(pubs_path)
-        rows_stat = os.lstat(rows_path)
+        dir_fd = os.open(stats_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
     except OSError:
         return {}
-    reference_now = (
-        (now.astimezone(UTC) if now.tzinfo else now.replace(tzinfo=UTC))
-        if now is not None
-        else datetime.now(UTC)
-    )
-    cutoff = reference_now - timedelta(days=window_days)
-    cache_key: tuple[str, int, int, int, int, int, int] | None = None
-    if now is None:
-        cache_key = (
-            str(pubs_path),
+
+    try:
+        try:
+            dir_stat = os.fstat(dir_fd)
+            pubs_lstat = os.stat("publications.jsonl", dir_fd=dir_fd, follow_symlinks=False)
+            rows_lstat = os.stat("rows.jsonl", dir_fd=dir_fd, follow_symlinks=False)
+        except OSError:
+            return {}
+        if not (stat.S_ISREG(pubs_lstat.st_mode) and stat.S_ISREG(rows_lstat.st_mode)):
+            return {}
+
+        repo_keys = _recent_review_repo_keys()
+        if not repo_keys:
+            return {}
+        repo_keys_tuple = tuple(sorted(repo_keys.items()))
+        reference_now = (
+            (now.astimezone(UTC) if now.tzinfo else now.replace(tzinfo=UTC))
+            if now is not None
+            else datetime.now(UTC)
+        )
+        cutoff = reference_now - timedelta(days=window_days)
+        probe_key: _RecentReviewCacheKey = (
+            str(stats_dir),
+            dir_stat.st_dev,
+            dir_stat.st_ino,
+            pubs_lstat.st_dev,
+            pubs_lstat.st_ino,
+            pubs_lstat.st_mtime_ns,
+            pubs_lstat.st_size,
+            rows_lstat.st_dev,
+            rows_lstat.st_ino,
+            rows_lstat.st_mtime_ns,
+            rows_lstat.st_size,
+            window_days,
+            repo_keys_tuple,
+        )
+        if now is None and _RECENT_REVIEW_CACHE is not None:
+            cached_key, valid_until, cached_counts = _RECENT_REVIEW_CACHE
+            if cached_key == probe_key and (valid_until is None or reference_now < valid_until):
+                return dict(cached_counts)
+
+        opened_pubs = _open_regular_in_dir(dir_fd, "publications.jsonl")
+        if opened_pubs is None:
+            return {}
+        pubs_fd, pubs_stat = opened_pubs
+        pubs_by_task: dict[str, list[tuple[datetime, int, str, int, str]]] = {}
+        next_boundary: datetime | None = None
+        try:
+            with os.fdopen(pubs_fd, "rb") as stream:
+                for line_index, line in enumerate(stream):
+                    try:
+                        entry = json_depth.loads(line, max_depth=_RECENT_REVIEW_JSON_MAX_DEPTH)
+                    except (ValueError, RecursionError):
+                        continue
+                    if not isinstance(entry, dict) or entry.get("schema") != "review-publication.v1":
+                        continue
+                    verdict = entry.get("verdict")
+                    tid = entry.get("task_id")
+                    repo = entry.get("repository")
+                    pr = entry.get("pr")
+                    head = entry.get("head")
+                    if (
+                        not isinstance(verdict, str)
+                        or verdict not in _PUBLISHED_VERDICTS
+                        or not isinstance(tid, str)
+                        or not tid.strip()
+                        or not isinstance(repo, str)
+                        or not repo.isascii()
+                        or _PUBLICATION_REPO_RE.fullmatch(repo) is None
+                        or type(pr) is not int
+                        or pr <= 0
+                        or not isinstance(head, str)
+                        or _PUBLICATION_SHA_RE.fullmatch(head) is None
+                    ):
+                        continue
+                    published_at = _parse_utc_timestamp(entry.get("published_at"))
+                    if published_at is None:
+                        continue
+                    pubs_by_task.setdefault(tid, []).append((published_at, line_index, repo.lower(), pr, head))
+                    if cutoff <= published_at <= reference_now:
+                        boundary = published_at + timedelta(days=window_days)
+                        if next_boundary is None or boundary < next_boundary:
+                            next_boundary = boundary
+                    elif published_at > reference_now and (
+                        next_boundary is None or published_at < next_boundary
+                    ):
+                        next_boundary = published_at
+        except OSError:
+            return {}
+
+        opened_rows = _open_regular_in_dir(dir_fd, "rows.jsonl")
+        if opened_rows is None:
+            return {}
+        rows_fd, rows_stat = opened_rows
+        actual_key: _RecentReviewCacheKey = (
+            str(stats_dir),
+            dir_stat.st_dev,
+            dir_stat.st_ino,
+            pubs_stat.st_dev,
+            pubs_stat.st_ino,
             pubs_stat.st_mtime_ns,
             pubs_stat.st_size,
+            rows_stat.st_dev,
+            rows_stat.st_ino,
             rows_stat.st_mtime_ns,
             rows_stat.st_size,
             window_days,
-            int(cutoff.timestamp() // 60),
+            repo_keys_tuple,
         )
-        if _RECENT_REVIEW_CACHE is not None and _RECENT_REVIEW_CACHE[0] == cache_key:
-            return dict(_RECENT_REVIEW_CACHE[1])
+        if not pubs_by_task:
+            os.close(rows_fd)
+            if now is None:
+                _RECENT_REVIEW_CACHE = (actual_key, None, {})
+            return {}
 
-    recent_tasks: set[str] = set()
-    try:
-        fd = _open_readonly_nofollow(pubs_path)
-    except OSError:
-        return {}
-    with os.fdopen(fd, "rb") as stream:
-        for line in stream:
-            try:
-                entry = json_depth.loads(line, max_depth=_RECENT_REVIEW_JSON_MAX_DEPTH)
-            except (ValueError, RecursionError):
-                continue
-            if (
-                not isinstance(entry, dict)
-                or entry.get("schema") != "review-publication.v1"
-                or entry.get("verdict") not in _PUBLISHED_VERDICTS
-            ):
-                continue
-            tid = entry.get("task_id")
-            published_at = _parse_utc_timestamp(entry.get("published_at"))
-            if isinstance(tid, str) and tid and published_at is not None and published_at >= cutoff:
-                recent_tasks.add(tid)
+        latest_rows: dict[str, tuple[str, str, str, str, int | None, str | None]] = {}
+        try:
+            with os.fdopen(rows_fd, "rb") as stream:
+                for line in stream:
+                    try:
+                        row = json_depth.loads(line, max_depth=_RECENT_REVIEW_JSON_MAX_DEPTH)
+                    except (ValueError, RecursionError):
+                        continue
+                    if not isinstance(row, dict) or row.get("schema") != "model-stats-row.v1":
+                        continue
+                    tid = row.get("task_id")
+                    if not isinstance(tid, str) or tid not in pubs_by_task:
+                        continue
+                    role = row.get("role")
+                    row_class = row.get("class")
+                    raw_model = row.get("model")
+                    row_repo = row.get("repo")
+                    row_pr = row.get("pr")
+                    pinned_head = row.get("pinned_head")
+                    if (
+                        not isinstance(role, str)
+                        or not isinstance(row_class, str)
+                        or not isinstance(raw_model, str)
+                        or (row_repo is not None and not isinstance(row_repo, str))
+                        or (row_pr is not None and (type(row_pr) is not int or row_pr < 0))
+                        or (
+                            pinned_head is not None
+                            and (not isinstance(pinned_head, str) or _PUBLICATION_SHA_RE.fullmatch(pinned_head) is None)
+                        )
+                    ):
+                        continue
+                    # Apply last-row-wins across all validated rows before filtering
+                    # by role or review class so a superseding row drops stale review credit.
+                    latest_rows[tid] = (role, row_class, raw_model, row_repo or "public", row_pr, pinned_head)
+        except OSError:
+            return {}
+    finally:
+        os.close(dir_fd)
 
-    if not recent_tasks:
-        if cache_key is not None:
-            _RECENT_REVIEW_CACHE = (cache_key, {})
-        return {}
+    counts_counter: Counter[str] = Counter()
+    for tid, (role, row_class, raw_model, row_repo, row_pr, pinned_head) in latest_rows.items():
+        if role != "review" or row_class not in _CODE_INFRA_REVIEW_CLASSES or pinned_head is None:
+            continue
+        entries = sorted(pubs_by_task[tid], key=lambda item: (item[0], item[1]), reverse=True)
+        matched_at = next(
+            (
+                pub_at
+                for pub_at, _idx, pub_repo, pub_pr, pub_head in entries
+                if pub_head == pinned_head
+                and repo_keys.get(pub_repo) == row_repo
+                and (row_pr is None or row_pr == pub_pr)
+            ),
+            None,
+        )
+        if matched_at is None or not (cutoff <= matched_at <= reference_now):
+            continue
+        if raw_model.strip():
+            canonical = resolve_catalog_model_id(raw_model, _MODEL_CATALOG) or raw_model.strip()
+            counts_counter[canonical] += 1
 
-    model_by_task: dict[str, str] = {}
-    try:
-        fd = _open_readonly_nofollow(rows_path)
-    except OSError:
-        return {}
-    with os.fdopen(fd, "rb") as stream:
-        for line in stream:
-            if b'"review"' not in line:
-                continue
-            try:
-                row = json_depth.loads(line, max_depth=_RECENT_REVIEW_JSON_MAX_DEPTH)
-            except (ValueError, RecursionError):
-                continue
-            if not isinstance(row, dict) or row.get("role") != "review":
-                continue
-            tid = row.get("task_id")
-            if not isinstance(tid, str) or tid not in recent_tasks:
-                continue
-            # Ukrainian content reviews use a separate seat policy and must not
-            # skew code/infra reviewer rotation.
-            if str(row.get("class") or "").casefold().startswith("ukrainian/"):
-                model_by_task.pop(tid, None)
-                continue
-            raw_model = row.get("model")
-            if isinstance(raw_model, str) and raw_model.strip():
-                canonical = resolve_catalog_model_id(raw_model, _MODEL_CATALOG) or raw_model.strip()
-                model_by_task[tid] = canonical
-
-    counts = dict(Counter(model_by_task.values()))
-    if cache_key is not None:
-        _RECENT_REVIEW_CACHE = (cache_key, counts)
+    counts = dict(counts_counter)
+    if now is None:
+        _RECENT_REVIEW_CACHE = (actual_key, next_boundary, counts)
     return dict(counts)
 
 
@@ -1874,17 +2007,10 @@ def resolve_reviewer(
                     reason=(f"quota bucket {candidate.quota_bucket!r} is already reserved by an active formal review"),
                 )
             if result.status == "eligible":
-                base_score = selection_key(
-                    candidate,
-                    snapshot=inputs.routing_snapshot,
-                    exact_head=inputs.exact_head,
-                    policy_version=_SCHEDULER_POLICY_VERSION,
-                )
                 result = replace(
                     result,
                     selection_score=(
                         review_counts.get(candidate.concrete_model, 0),
-                        *base_score[:-1],
                         rung_index,
                         candidate_index,
                     ),
