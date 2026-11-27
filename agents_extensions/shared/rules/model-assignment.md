@@ -222,8 +222,11 @@ The catalog expires after 30 days. Refresh means re-enumerating the live catalog
 official model documentation, checking local bakeoff deltas, updating `reviewed_on`, and running:
 
 ```bash
-"$LU_PYTHON" -I -m lu_machinery.lint.lint_model_catalog
+"$LU_PYTHON" -I -m lu_machinery.lint.lint_model_catalog --catalog lu_machinery/config/model_catalog.yaml
 ```
+
+Run it from the machinery checkout root: `--catalog` makes it validate the catalog you edited,
+not the installed release's copy that `-I` would read by default.
 
 **Upgrade qualification.** Note the upstream version or change and the capabilities
 it affects. Rerun representative cases on the affected route before relying on

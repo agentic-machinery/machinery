@@ -151,9 +151,11 @@ Pull a fresh routing snapshot, then resolve:
 ```bash
 (
   set -eo pipefail
+  # Review shells may export only the legacy alias until plan step R4 (critical-rules.md §2).
+  LU_PYTHON="${LU_PYTHON:-${LEARN_UKRAINIAN_PYTHON:?neither LU_PYTHON nor LEARN_UKRAINIAN_PYTHON is set}}" || exit "$?"
   SNAPSHOT_FILE="$(mktemp)" || exit "$?"
   trap 'rm -f -- "$SNAPSHOT_FILE"' EXIT
-  curl -s 'http://localhost:8765/api/state/routing-budget?fresh_codexbar=true' \
+  curl -fsS 'http://localhost:8765/api/state/routing-budget?fresh_codexbar=true' \
     | "$LU_PYTHON" -I -c 'import json,sys; d=json.load(sys.stdin); print(json.dumps(d.get("lane_health", d)))' \
     > "$SNAPSHOT_FILE" || exit "$?"
 
@@ -178,7 +180,8 @@ that seat and records why on the trace. An unambiguous path such as
 `--subject-seat` or `--subject-family` instead of guessing. Omit all three
 when the change governs no seat; selection stays on the author-family ladder.
 
-If the Monitor API isn't reachable, omit `--routing-snapshot-file` — the
+If the Monitor API isn't reachable or answers with an HTTP error (for example 503 while the
+routing budget warms; the fence then exits non-zero without resolving), omit `--routing-snapshot-file` — the
 resolver is fail-open on health (no signal reads as healthy, so ladder
 order alone decides) but **fail-closed on domain/data-egress**: leaving
 `--data-egress-policy` unset excludes any candidate that requires a

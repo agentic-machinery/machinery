@@ -10,8 +10,12 @@ installed release and the consumer's own extensions to an enrolled consumer.
 
 ### 2. Use Python venv
 **ALWAYS** the prescribed venv interpreter, **NEVER** `python3` or `python` directly.
-- Machinery modules: `"$LU_PYTHON" -I -m lu_machinery.<module>`; `LU_PYTHON` is the installed
-  machinery interpreter the launcher exports (Python >= 3.14, `pyproject.toml`).
+- Machinery modules: `"$LU_PYTHON" -I -m lu_machinery.<module>`; `LU_PYTHON` names the installed
+  machinery interpreter (Python >= 3.14, `pyproject.toml`). Launchers and the dispatcher do not
+  export it everywhere yet: some shells, including read-only review shells, get only the legacy
+  alias `LEARN_UKRAINIAN_PYTHON`. Until plan step R4 exports `LU_PYTHON` everywhere, such a
+  shell first runs
+  `LU_PYTHON="${LU_PYTHON:-${LEARN_UKRAINIAN_PYTHON:?neither LU_PYTHON nor LEARN_UKRAINIAN_PYTHON is set}}"`.
 - Product scripts: `"$LU_PRODUCT_ROOT/.venv/bin/python"`; the product checkout owns its venv.
 
 ### 3. Language Settings
