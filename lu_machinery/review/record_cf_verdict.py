@@ -2071,13 +2071,18 @@ def _task(task_id: str, task_root: Path) -> tuple[dict[str, Any], str]:
 
     A deliberate same-user writer can also replace the record's stored hash.
     """
+    with task_archive_lock(task_root):
+        return _task_in_archive_lock(task_id, task_root)
+
+
+def _task_in_archive_lock(task_id: str, task_root: Path) -> tuple[dict[str, Any], str]:
+    """``_task`` for a caller that already holds ``task_archive_lock(task_root)``."""
     if not REVIEW_TASK_ID.fullmatch(task_id) or ".." in task_id:
         raise RecordError("invalid canonical task identity")
     try:
-        with task_archive_lock(task_root):
-            task_path = _hot_or_archived(task_root, f"{task_id}.json")
-            task = json_depth.loads(task_path.read_text(encoding="utf-8"), max_depth=_JSON_MAX_DEPTH)
-            raw_reply = task_path.with_suffix(".result").read_bytes()
+        task_path = _hot_or_archived(task_root, f"{task_id}.json")
+        task = json_depth.loads(task_path.read_text(encoding="utf-8"), max_depth=_JSON_MAX_DEPTH)
+        raw_reply = task_path.with_suffix(".result").read_bytes()
     except (OSError, ValueError) as exc:
         raise RecordError("review task record or reply unavailable") from exc
     if not isinstance(task, dict):
@@ -3211,8 +3216,9 @@ def _contested_ids(reply: str) -> tuple[str, ...]:
 
 def _run_records(task_id: str, task_root: Path) -> int:
     """How many run records the task store keeps under ``task_id``, hot and archived, by dispatch's naming grammar
-    (a run dispatched again keeps its earlier record under a stamped name). RecordError when a directory is
-    unreadable."""
+    (a run dispatched again keeps its earlier record under a stamped name). The caller holds
+    ``task_archive_lock(task_root)``, so an archive or restore move cannot shift a record between the two listings.
+    RecordError when a directory is unreadable."""
     from lu_machinery.orchestration.task_record_store import candidate_task_record_names
 
     found = 0
@@ -3245,7 +3251,11 @@ def record_finding_outcome(
         raise RecordError(f"label {label} needs --evidence: one line that shows it")
     if evidence and (len(evidence) > MAX_EVIDENCE_CHARS or any(ch in evidence for ch in "\n\r\x85  ")):
         raise RecordError(f"evidence must be one line of at most {MAX_EVIDENCE_CHARS} characters")
-    task, reply = _task(task_id, task_root)
+    # One observation: the reply, the run census and the label's time, under the lock archive and restore moves take.
+    with task_archive_lock(task_root):
+        task, reply = _task_in_archive_lock(task_id, task_root)
+        runs = _run_records(task_id, task_root)
+        observed = now or datetime.now(UTC)
     blocking = _blocking_finding_ids(reply)
     if blocking is None:
         raise RecordError("review reply has no structured findings: only code-review-findings.v1 findings take a label")
@@ -3256,7 +3266,6 @@ def record_finding_outcome(
         raise RecordError(f"review {task_id} names no repository and reviewed head")
     # A task id can be dispatched again (the older run stays under a stamped name), and the label ledger keys a finding
     # by task id, not by run: label only a review whose id names one run, the one whose reply was read.
-    runs = _run_records(task_id, task_root)
     if runs != 1:
         raise RecordError(f"review task id {task_id} names {runs} runs in the task store: a label binds one run")
     # Only the review's own publication: its repository, this PR and the head it reviewed.
@@ -3274,7 +3283,7 @@ def record_finding_outcome(
             kind="label", task_id=task_id, repository=published[0]["repository"], pr=pr_number,
             finding_id=finding_id, label=label, evidence=evidence or None,
             recorded_by=author if model_stats_rows.valid_task_id(author) else None,
-            recorded_at=(now or datetime.now(UTC)).isoformat())
+            recorded_at=observed.isoformat())
         added = model_stats_rows.record_finding_outcomes(task_root.parent, [entry])
     except model_stats_rows.OutcomeConflict as exc:
         raise RecordError(f"{exc}: a finding takes one label") from None
@@ -3323,9 +3332,10 @@ def _store_contests(task_root: Path, task_id: str, reply: str, *,
     """Store each ``CONTEST <id>`` line of a published review against the PR's previous blocking review of record.
 
     ``publications`` is the PR's trusted verdict publications read from its comments, oldest first, each beside its
-    run start (``_trusted_publications``): the target is the newest other CHANGES_REQUESTED publication before this
-    run's own, so the binding never depends on which markers the local ledger holds, and a rerun binds the same
-    round. The target's reply is read only from the run that publication names: a task id can be dispatched again,
+    run start (``_trusted_publications``): the target is the CHANGES_REQUESTED publication of the newest earlier head
+    (a round reviews one head; a publication at this review's own head is a sibling seat of the same round), and that
+    round must name one blocking review, so the binding never depends on which markers the local ledger holds, and a
+    rerun binds the same round. The target's reply is read only from the run that publication names: a task id can be dispatched again,
     so a task record whose reviewed head or start differs from the marker's is another run, and nothing is stored.
     An id that is no P0-P2 finding of that reply is reported unmatched and never stored; a reply that matches none
     stores nothing. None when the reply contests nothing; never raises."""
@@ -3340,10 +3350,17 @@ def _store_contests(task_root: Path, task_id: str, reply: str, *,
                     if entry["task_id"] == task_id and entry["head"] == head and run == started), None)
         if own is None:
             return "not stored: no trusted verdict comment of this run on the PR"
+        # A round reviews one head, and a new round needs a new head: a publication at this review's own head is a
+        # sibling seat of the same round, never the round it contests.
         previous = [(entry, run) for entry, run in reversed(publications[:own])
-                    if entry["verdict"] == "CHANGES_REQUESTED" and entry["task_id"] != task_id]
+                    if entry["verdict"] == "CHANGES_REQUESTED" and entry["task_id"] != task_id and entry["head"] != head]
         if not previous:
             return f"not stored: no earlier blocking verdict of another review on PR {publications[own][0]['pr']}"
+        round_head = previous[0][0]["head"]
+        seats = {entry["task_id"] for entry, _ in previous if entry["head"] == round_head}
+        if len(seats) != 1:
+            return (f"not stored: unresolved: {len(seats)} blocking reviews of the previous round at "
+                    f"{round_head[:12]}")
         target, target_started = previous[0]
         record, target_reply = _task(target["task_id"], task_root)
         if record.get("worktree_base_sha") != target["head"] or run_started(record) != target_started:

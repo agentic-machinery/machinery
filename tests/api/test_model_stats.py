@@ -1908,11 +1908,11 @@ def _findings_review(tasks: Path, task_id: str, correctness: str, findings: list
 
 
 def _publish(batch_state: Path, *published: tuple[str, int, str, str],
-             repository: str = "learn-ukrainian/machinery") -> int:
+             repository: str = "learn-ukrainian/machinery", published_at: str = NOW.isoformat()) -> int:
     """Ledger lines, as the verdict recorder writes them, for (task id, PR, head, verdict) publications."""
     return rows.record_publications(batch_state, [rows.publication(
         task_id=task_id, repository=repository, pr=pr, head=head, verdict=verdict,
-        published_at=NOW.isoformat()) for task_id, pr, head, verdict in published])
+        published_at=published_at) for task_id, pr, head, verdict in published])
 
 
 def test_finding_precision_follows_the_files_the_author_changed_before_the_same_reviewer_approved(
@@ -2204,7 +2204,8 @@ def test_finding_outcome_ledger_keeps_one_label_per_finding_and_skips_damaged_li
 
 def test_reviewer_miss_proxy_charges_each_approving_reviewer_of_a_reworked_merge(tmp_path):
     """Defect class: post-merge rework charged to a reviewer who never published an approval of the PR (a blocking
-    reviewer, an unpublished approval), or missed for one who did. Every expected figure below is counted by hand."""
+    reviewer, an unpublished approval, a later run of a reused task id that joins an earlier run's approval at the
+    same head), or missed for one who did. Every expected figure below is counted by hand."""
     batch_state, tasks = _state(tmp_path)
     sol = {"agent": "codex", "model": "gpt-6.1-sol", "resolved_model": "gpt-6.1-sol"}
     day = timedelta(days=1)
@@ -2217,13 +2218,25 @@ def test_reviewer_miss_proxy_charges_each_approving_reviewer_of_a_reworked_merge
     # PR 2: Opus approved; nothing names it. PR 3: an Opus approval never published, then reworked: no observation.
     _findings_review(tasks, "m2-review", "correct", [], pr=2, pinned_head="c" * 40, **reviews)
     _findings_review(tasks, "m3-review", "correct", [], pr=3, pinned_head="d" * 40, **reviews)
+    # PR 4: an Opus approval published 19.5 days ago; the task id is then dispatched again for Sol at the same head,
+    # unpublished. The rows keep only the newest (Sol) run, which joins the earlier approval: no observation, though
+    # a fix names PR 4.
+    _findings_review(tasks, "m4-review", "correct", [], pr=4, pinned_head="e" * 40, **reviews)
     rows.backfill(tasks, batch_state)
+    ledger = batch_state / rows.ROWS_DIR / rows.ROWS_FILE
+    [m4] = [line for line in map(json.loads, ledger.read_text().splitlines()) if line["task_id"] == "m4-review"]
+    with ledger.open("a") as stream:
+        stream.write(json.dumps({**m4, **sol, "started_at": (NOW - 19 * day).isoformat(),
+                                 "finished_at": (NOW - 18.9 * day).isoformat()}) + "\n")
     _publish(batch_state, ("m1a-review", 1, "a" * 40, "CHANGES_REQUESTED"), ("m1b-review", 1, "b" * 40, "APPROVED"),
              ("m1c-review", 1, "b" * 40, "APPROVED"), ("m2-review", 2, "c" * 40, "APPROVED"))
+    _publish(batch_state, ("m4-review", 4, "e" * 40, "APPROVED"), published_at=(NOW - 19.5 * day).isoformat())
     landing = stats.Landing()
     # Mainline order, newest first, as the landing scan stores it.
+    landing.prs["machinery", "7"] = stats._MergedPR("7" * 40, NOW - 13 * day, set(), {"4"}, set())
     landing.prs["machinery", "6"] = stats._MergedPR("6" * 40, NOW - 14 * day, set(), {"3"}, set())
     landing.prs["machinery", "5"] = stats._MergedPR("5" * 40, NOW - 16 * day, set(), {"1"}, set())
+    landing.prs["machinery", "4"] = stats._MergedPR("4" * 40, NOW - 16.5 * day, set(), set(), set())
     landing.prs["machinery", "3"] = stats._MergedPR("3" * 40, NOW - 17 * day, set(), set(), set())
     landing.prs["machinery", "2"] = stats._MergedPR("2" * 40, NOW - 17.5 * day, set(), set(), set())
     landing.prs["machinery", "1"] = stats._MergedPR("1" * 40, NOW - 18 * day, set(), set(), set())

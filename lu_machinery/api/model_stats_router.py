@@ -466,8 +466,9 @@ class _Row:
     # was published on, or None when no publication of it is recorded: its publication is unknown.
     published: str | None = None
     published_pr: int | None = None
-    # The repository slug that publication names (the outcome ledger joins on it).
+    # The repository slug that publication names (the outcome ledger joins on it), and GitHub's time for its comment.
     published_repository: str | None = None
+    published_at: datetime | None = None
     # The author model a review names, whether or not its row names a PR (``author`` needs the row's own PR).
     review_author: str | None = None
 
@@ -595,6 +596,7 @@ def _rows(raw_rows: Iterable[Mapping[str, Any]], landing: Landing,
             published=None if publication is None else str(publication["verdict"]),
             published_pr=None if publication is None else int(publication["pr"]),
             published_repository=None if publication is None else str(publication["repository"]),
+            published_at=None if publication is None else timestamp(publication["published_at"]),
             review_author=review_author,
         )
 
@@ -986,9 +988,18 @@ class _Outcomes:
     contests: frozenset[tuple[str, int | str, int, str]] = frozenset()
 
 
+def _own_publication(row: _Row) -> bool:
+    """Whether the row's publication was posted after the row's run started, so it can be that run's own. The rows
+    keep only a task id's newest run, and the publication join matches task id and head: a verdict an earlier run of
+    a reused id published at the same head joins the newest row too, but comes before that row's start. GitHub's
+    comment time is cut to the second, which only moves it earlier."""
+    return row.started is not None and row.published_at is not None and row.published_at >= row.started
+
+
 def _label_key(row: _Row) -> tuple[str, int | str, int] | None:
-    """The outcome-ledger key of a row whose blocking verdict was published, else None."""
-    if row.published != "CHANGES_REQUESTED" or row.published_pr is None or row.published_repository is None:
+    """The outcome-ledger key of a row whose own blocking verdict was published, else None."""
+    if (row.published != "CHANGES_REQUESTED" or row.published_pr is None or row.published_repository is None
+            or not _own_publication(row)):
         return None
     return row.task_id, repository_identity(row.published_repository), row.published_pr
 
@@ -1038,8 +1049,7 @@ def _finding_outcomes(rows: Iterable[_Row], touched: Mapping[_HeadPair, frozense
     for row in rows:
         # Labels measure the reviewer alone: a blocking verdict published at the row's head counts whether or not the
         # row names the PR author's model.
-        if (row.effort != UNKNOWN_EFFORT and row.published == "CHANGES_REQUESTED" and row.published_pr is not None
-                and row.published_repository is not None):
+        if row.effort != UNKNOWN_EFFORT and _label_key(row) is not None:
             model = name(row.model)
             efforts[model].add(row.effort)
             _label_tally(counts[model], row, outcomes)
@@ -1188,10 +1198,11 @@ def _merge_outcomes(landing: Landing, rows: Iterable[_Row], record_prs: Iterable
 
 def _reviewer_merge_outcomes(landing: Landing, rows: Iterable[_Row], until: datetime) -> list[tuple[str, datetime, bool]]:
     """The reviewer miss proxy: one observation per reviewer model whose APPROVED verdict the recorder published on a
-    merged PR with a full seven days of follow-up, reworked when a fix or revert named that PR (as for authors)."""
+    merged PR with a full seven days of follow-up, reworked when a fix or revert named that PR (as for authors). Only a
+    row whose publication is its run's own (``_own_publication``) names the approving model."""
     approvers: dict[tuple[str, str], set[str]] = defaultdict(set)
     for row in rows:
-        if row.published == "APPROVED" and row.published_pr is not None:
+        if row.published == "APPROVED" and row.published_pr is not None and _own_publication(row):
             approvers[str(row.raw.get("repo") or "public"), str(row.published_pr)].add(row.model)
     return [(model, eligible_at, had_rework) for key, _, eligible_at, had_rework in _eligible_merges(landing, until)
             for model in sorted(approvers.get(key, ()))]

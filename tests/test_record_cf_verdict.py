@@ -1168,9 +1168,27 @@ def test_finding_outcome_verb_refuses_unpublished_unknown_or_nonblocking_finding
     published blocking verdict (no publication, a publication at another head, an unknown id, a P3 finding, an
     unstructured reply), without the evidence its label needs, as free text in the ledger, as a second, different
     label of one finding, or a same-label retry refused for its new evidence."""
+    import fcntl
+
     monkeypatch.setenv("LEARN_UKRAINIAN_DISPATCH_TASK_ID", "author-task")
     tasks, _comments, _calls = setup_record(monkeypatch, tmp_path)
     write_task(tasks, reply=_blocking_reply(["P2", "P3"]))
+    # The run census shares one observation with the reply read: it runs while the archive lock is held, so an
+    # archive or restore move (which takes that lock exclusively) cannot shift a record between its two listings.
+    census = recorder._run_records
+    censuses = []
+
+    def census_under_archive_lock(task_id, root):
+        fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            with pytest.raises(BlockingIOError):
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        finally:
+            os.close(fd)
+        censuses.append(task_id)
+        return census(task_id, root)
+
+    monkeypatch.setattr(recorder, "_run_records", census_under_archive_lock)
 
     def label(finding, name, evidence=None):
         return recorder.record_finding_outcome("review-one", pr_number=42, finding_id=finding, label=name,
@@ -1236,57 +1254,87 @@ def test_finding_outcome_verb_refuses_unpublished_unknown_or_nonblocking_finding
     with pytest.raises(recorder.RecordError, match="review task id review-one names 2 runs in the task store"):
         label("F2", "fixed")
     assert len(_outcomes(tmp_path)) == 1
+    assert set(censuses) == {"review-one", "review-text"}
 
 
 @pytest.mark.usefixtures('configured_roots', 'recorder_matcher')
 @pytest.mark.usefixtures("agent_runtime_roots")
 def test_record_stores_a_contest_only_against_the_previous_blocking_round(monkeypatch, tmp_path):
     """Defect class: a CONTEST line bound to another round than the PR's previous blocking review (an older round,
-    the contesting review itself, a later round on a rerun, a tie in GitHub's comment time taken in the wrong
-    order, a round whose local publication marker is missing), read from another run's reply than the one that
-    round published (a task id dispatched again), stored for an id that is no P0-P2 finding of that round, a reply
-    whose ids all miss reported as stored, or a reply that contests nothing changing the receipt."""
+    the contesting review itself, a later round on a rerun, a sibling seat of the contesting review's own round, a
+    round of two blocking seats taken as one, a round whose local publication marker is missing), read from another
+    run's reply than the one that round published (a task id dispatched again), stored for an id that is no P0-P2
+    finding of that round, a reply whose ids all miss reported as stored, or a reply that contests nothing changing
+    the receipt."""
+    import dataclasses
+
     from lu_machinery.review import capability_failure
 
     tasks, _comments, _calls = setup_record(monkeypatch, tmp_path)
     monkeypatch.setattr(capability_failure, "require_unclassified", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(recorder, "budget_admission", lambda **_kwargs: {})
+    # Every round reviews its own head: the fake PR head moves to the head each call records.
+    pr_head = {"sha": SHA}
+    fake_json, fake_facts = recorder._run_json, recorder.pr_review_facts
 
-    def publish(task_id, reply):
-        write_task(tasks, task_id=task_id, reply=reply)
+    def moving_json(args, *, input_text=None):
+        out = fake_json(args, input_text=input_text)
+        if isinstance(args, list) and args[:3] == ["gh", "pr", "view"]:
+            return {**out, "headRefOid": pr_head["sha"]}
+        if isinstance(args, list) and args[:3] == ["gh", "pr", "list"]:
+            return [{**item, "headRefOid": pr_head["sha"]} for item in out]
+        return out
+
+    monkeypatch.setattr(recorder, "_run_json", moving_json)
+    monkeypatch.setattr(recorder, "pr_review_facts", lambda *args, **kwargs: dataclasses.replace(
+        fake_facts(*args, **kwargs), head_sha=pr_head["sha"]))
+
+    def rerun(task_id, head):
+        pr_head["sha"] = head
         return recorder.record(task_id, pr_number=42, task_root=tasks, lock_root=tmp_path / "locks")
 
-    first = publish("review-one", _blocking_reply(["P1", "P2", "P3"]))
+    def publish(task_id, reply, head, **updates):
+        write_task(tasks, task_id=task_id, reply=reply, worktree_base_sha=head, **updates)
+        return rerun(task_id, head)
+
+    first = publish("review-one", _blocking_reply(["P1", "P2", "P3"]), "1" * 40)
     assert "outcome_contests" not in first
-    # Every fake comment has the same GitHub time: the later ledger line is the later round.
+    # Every fake comment has the same GitHub time: the PR's comment order is the round order.
     second = publish("review-two", _blocking_reply(
         ["P1"], "Two labels do not hold.\nCONTEST F2: the reset is still missing\n  CONTEST F3: P3 is no label\n"
-                "CONTEST F9: no such finding\nA prose CONTEST F1: mid-line is no contest"))
+                "CONTEST F9: no such finding\nA prose CONTEST F1: mid-line is no contest"), "2" * 40)
     assert second["outcome_contests"] == "stored against review-one: F2; unmatched: F3, F9"
     # Round 2's local marker is lost (a failed store): the PR's own comments still say round 2 came before round 3.
     ledger = tmp_path / "model-stats" / "publications.jsonl"
     ledger.write_text("".join(line + "\n" for line in ledger.read_text().splitlines() if '"review-two"' not in line))
-    third = publish("review-three", _blocking_reply(["P1"], "CONTEST F1: still open\nCONTEST F2: still open"))
+    third = publish("review-three", _blocking_reply(["P1"], "CONTEST F1: still open\nCONTEST F2: still open"), "3" * 40)
     assert third["outcome_contests"] == "stored against review-two: F1; unmatched: F2"
     assert [(line["task_id"], line["finding_id"], line["contested_by"]) for line in _outcomes(tmp_path)] == [
         ("review-one", "F2", "review-two"), ("review-two", "F1", "review-three")]
     # A rerun stores nothing twice, and a rerun of round 2 after round 3 still binds round 1.
-    assert recorder.record("review-three", pr_number=42, task_root=tasks, lock_root=tmp_path / "locks")[
-        "outcome_contests"] == "stored against review-two: F1; unmatched: F2"
-    assert recorder.record("review-two", pr_number=42, task_root=tasks, lock_root=tmp_path / "locks")[
-        "outcome_contests"] == "stored against review-one: F2; unmatched: F3, F9"
+    assert rerun("review-three", "3" * 40)["outcome_contests"] == "stored against review-two: F1; unmatched: F2"
+    assert rerun("review-two", "2" * 40)["outcome_contests"] == "stored against review-one: F2; unmatched: F3, F9"
     assert len(_outcomes(tmp_path)) == 2
     # A reply whose contested ids are all no P0-P2 finding of the previous round stores nothing and says so.
-    assert publish("review-four", _blocking_reply(["P1"], "CONTEST F7: no such finding"))["outcome_contests"] == (
-        "not stored: unmatched: F7")
-    assert len(_outcomes(tmp_path)) == 2
+    assert publish("review-four", _blocking_reply(["P1"], "CONTEST F7: no such finding"), "4" * 40)[
+        "outcome_contests"] == "not stored: unmatched: F7"
     # Round 4's task id is dispatched again at the same head: its task record is now another run than the one its
     # comment published, so a contest of round 4 is unresolved and writes nothing.
-    write_task(tasks, task_id="review-four", reply=_blocking_reply(["P1", "P1"]),
+    write_task(tasks, task_id="review-four", reply=_blocking_reply(["P1", "P1"]), worktree_base_sha="4" * 40,
                started_at="2026-09-23T14:00:00.000001+00:00")
-    assert publish("review-five", _blocking_reply(["P1"], "CONTEST F1: still open"))["outcome_contests"] == (
-        f"not stored: unresolved: the task record of review-four is not the run published at {SHA[:12]}")
+    assert publish("review-five", _blocking_reply(["P1"], "CONTEST F1: still open"), "5" * 40)[
+        "outcome_contests"] == f"not stored: unresolved: the task record of review-four is not the run published at {'4' * 12}"
     assert len(_outcomes(tmp_path)) == 2
+    # Two seats review round 6. The first publishes its rejection before the second records a contest: the sibling
+    # is the same round, so the second seat's contest still binds round 5.
+    publish("review-six-a", _blocking_reply(["P1"]), "6" * 40)
+    assert publish("review-six-b", _blocking_reply(["P1"], "CONTEST F1: still open"), "6" * 40)[
+        "outcome_contests"] == "stored against review-five: F1"
+    # Round 7 contests round 6, which has two blocking seats: F1 names a finding of each, so nothing is stored.
+    assert publish("review-seven", _blocking_reply(["P1"], "CONTEST F1: still open"), "7" * 40)[
+        "outcome_contests"] == f"not stored: unresolved: 2 blocking reviews of the previous round at {'6' * 12}"
+    assert [(line["task_id"], line["finding_id"], line["contested_by"]) for line in _outcomes(tmp_path)][2:] == [
+        ("review-five", "F1", "review-six-b")]
 
 
 @pytest.mark.usefixtures('configured_roots', 'recorder_matcher')
