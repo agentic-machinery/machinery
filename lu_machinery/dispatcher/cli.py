@@ -18,7 +18,7 @@ from typing import get_args
 from lu_machinery import cto_safe_mode
 from lu_machinery.ai_agent_bridge.routing_guard import SAVANT_PROVIDER
 from lu_machinery.common.git_context import validate_plain_branch_name
-from lu_machinery.common.git_credentials import active_slug
+from lu_machinery.common.git_credentials import active_slug, repository_registry
 from lu_machinery.dispatcher import (
     admission,
     agy_sandbox,
@@ -124,7 +124,7 @@ def build_parser() -> argparse.ArgumentParser:
         ("prompt-file", None, "UTF-8 prompt path; '-' reads stdin (one source required)"),
         ("prompt", None, "Literal prompt; '-' reads stdin (one source required)"),
         ("effort", None, "Provider effort, e.g. high (default: high for Savant, otherwise provider default)"),
-        ("repo", None, "fleet_repos.yaml key (default: public primary)"),
+        ("repo", None, "fleet_repos.yaml key, e.g. machinery (required for read-only --pr; otherwise defaults to public primary)"),
         ("base", "origin/main", "Starting Git ref (default: origin/main)"),
         ("branch", None, "Review source or publish branch; unpinned writes require a remote tip, e.g. codex/fix (default: base)"),
         ("pinned-head", None, "Exact review commit (default: branch or base)"),
@@ -207,7 +207,7 @@ def build_parser() -> argparse.ArgumentParser:
              "never included.",
     )
     dispatch.add_argument("--worktree", nargs="?", const="", help="Dispatch path (default: automatic)")
-    dispatch.add_argument("--pr", type=int, help="Reviewed PR number, e.g. 42 (default: none; use --branch for identity)")
+    dispatch.add_argument("--pr", type=int, help="Reviewed PR number, e.g. 42 (read-only requires --repo; default: none)")
     for flag in ("subject-seat", "subject-family"):
         dispatch.add_argument(f"--{flag}", action="append", default=[],
                               help="Excluded review subject, e.g. grok or xai (repeatable; default: none)")
@@ -569,6 +569,10 @@ def _dispatch(args) -> int:
             rules_core.require_core()
         except rules_core.RulesCoreMissing as exc:
             raise ValueError(f"dispatch refused: {exc}; the rules core is required.") from None
+    if args.mode == "read-only" and args.pr is not None and not args.repo:
+        with admission.record_refusal(args, agent, StartRefusal.REVIEW_SETUP):
+            keys = ", ".join(sorted(repository_registry(git._fleet_repos_path())))
+            raise ValueError(f"review_repo_required: --pr requires --repo. Pass a fleet repository key ({keys}).")
     # A CTO seat in safe mode starts no new write work. Read-only diagnosis and advisory binding still run.
     with admission.record_refusal(args, agent, StartRefusal.ELIGIBILITY):
         if args.mode != "read-only" and not args.print_advisory_binding and (
@@ -725,7 +729,7 @@ def _dispatch(args) -> int:
             try:
                 review_pr = _pr(github, args.branch or "", args.pr)
             except RecordError as exc:
-                raise ValueError(f"review admission: {exc}") from None
+                raise ValueError(f"review admission for {github}#{args.pr}: {exc}") from None
             raw_pr_branch = review_pr.get("headRefName")
             if not isinstance(raw_pr_branch, str):
                 raise ValueError("review admission: PR head branch is unavailable")
@@ -847,7 +851,7 @@ def _dispatch(args) -> int:
                     try:
                         current_pr = _pr(github, pr_branch, args.pr)
                     except RecordError as exc:
-                        raise ValueError(f"review admission: {exc}") from None
+                        raise ValueError(f"review admission for {github}#{args.pr}: {exc}") from None
                     if (current_pr.get("headRefOid"), current_pr.get("headRefName")) != (sha, pr_branch):
                         raise ValueError("review admission: PR head changed while resolving the review tier")
         if args.review_mode == "red_team":
