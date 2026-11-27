@@ -42,6 +42,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from lu_machinery import host_context
 from lu_machinery.common import json_depth
 from lu_machinery.common.git_context import GIT_REDIRECT_ENV_KEYS
 from lu_machinery.common.jsonl import jsonl_lines
@@ -1024,6 +1025,7 @@ class SandboxCapability:
     metadata_roots: tuple[str, ...] = ()
     probe_detail: str = ""
     network_allowed: bool = True
+    state_context: host_context.SandboxStateContext | None = None
 
     def public_dict(self) -> dict[str, Any]:
         roots_digest = hashlib.sha256(
@@ -3375,6 +3377,12 @@ def prepare_host_sandbox(
             raise ReviewIsolationError(
                 "sandbox_unavailable:linux_bwrap_missing:install bubblewrap or refuse this engine on this host"
             ) from exc
+        try:
+            state_context = host_context.project_sandbox_state(write)
+        except host_context.HostContextError as exc:
+            raise ReviewIsolationError(f"sandbox_host_state_context_invalid:{exc.code}:{exc}") from exc
+        except OSError as exc:
+            raise ReviewIsolationError("sandbox_host_state_context_invalid") from exc
         probe_ok: Path | None = None
         for candidate in (
             snap / ".review-snapshot-metadata.json",
@@ -3400,6 +3408,7 @@ def prepare_host_sandbox(
             metadata_roots=metadata_roots,
             probe_detail="bwrap_probe_pending",
             network_allowed=network_allowed,
+            state_context=state_context,
         )
         cmd = wrap_argv_with_sandbox(["/bin/cat", str(probe_ok)], provisional)
         allowed = subprocess.run(cmd, capture_output=True, text=True, timeout=5, check=False)
@@ -3470,12 +3479,15 @@ def prepare_host_sandbox(
             metadata_roots=metadata_roots,
             probe_detail="allow_read+deny_host+allow_write+deny_snapshot",
             network_allowed=network_allowed,
+            state_context=state_context,
         )
 
     raise ReviewIsolationError(f"sandbox_unavailable:unsupported_os:{system}")
 
 
-def wrap_argv_with_sandbox(argv: Sequence[str], sandbox: SandboxCapability) -> list[str]:
+def wrap_argv_with_sandbox(
+    argv: Sequence[str], sandbox: SandboxCapability, *, bwrap_mounts: Sequence[str] = (),
+) -> list[str]:
     """Prefix argv with the verified OS sandbox launcher."""
     if not sandbox.verified:
         raise ReviewIsolationError("sandbox_not_verified")
@@ -3515,13 +3527,21 @@ def wrap_argv_with_sandbox(argv: Sequence[str], sandbox: SandboxCapability) -> l
             cmd.append("--unshare-net")
         roots = [Path(root) for root in sandbox.read_roots if root != "/dev"]
         destination_parents: set[Path] = {Path("/tmp"), Path("/proc")}
-        for root in [*roots, Path(write)]:
+        state = sandbox.state_context
+        mounts = [*roots, Path(write)]
+        state_stub = state.state_root if state and not any(state.state_root.is_relative_to(root) for root in mounts) else None
+        if state_stub is not None:
+            destination_parents.add(state_stub)
+        for root in [*mounts, *([state_stub] if state_stub is not None else [])]:
             current = root.parent
             while current != Path("/"):
                 destination_parents.add(current)
                 current = current.parent
         for directory in sorted(destination_parents, key=lambda value: (len(value.parts), str(value))):
-            cmd.extend(["--dir", str(directory)])
+            if directory == state_stub:
+                cmd.extend(["--perms", "0700", "--tmpfs", str(directory)])
+            else:
+                cmd.extend(["--dir", str(directory)])
         for root in roots:
             if str(root) == write:
                 continue
@@ -3535,6 +3555,13 @@ def wrap_argv_with_sandbox(argv: Sequence[str], sandbox: SandboxCapability) -> l
                 "/dev",
             ]
         )
+        if state:
+            cmd.extend(["--ro-bind", str(state.path), str(state.path), "--setenv", host_context.CONTEXT_ENV,
+                        str(state.path)])
+        cmd.extend(bwrap_mounts)
+        if state_stub is not None:
+            # Keep the directory available to the state validator without accepting writes.
+            cmd.extend(["--remount-ro", str(state_stub)])
         cmd.extend(inner)
         return cmd
     raise ReviewIsolationError(f"sandbox_mechanism_unknown:{sandbox.mechanism}")

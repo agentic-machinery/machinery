@@ -22,6 +22,13 @@ pytestmark = pytest.mark.usefixtures("configured_roots")
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 
+@pytest.fixture(autouse=True)
+def _state_anchor(tmp_path, monkeypatch):
+    # These compatibility fixtures explicitly keep state with their test primary.
+    monkeypatch.setenv("LU_STATE_ROOT", str(tmp_path / "primary"))
+    monkeypatch.delenv("LEARN_UKRAINIAN_STATE_ROOT", raising=False)
+
+
 def _git(cwd: Path, *args: str) -> str:
     return subprocess.run(
         ["git", *args], cwd=cwd, check=True, capture_output=True, text=True, timeout=30
@@ -172,7 +179,7 @@ def _fleet(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, Path]
     return public, sibling
 
 
-def test_control_plane_root_is_the_public_primary_only_for_fleet_siblings(tmp_path, monkeypatch):
+def test_control_plane_root_uses_the_explicit_state_binding_for_every_checkout(tmp_path, monkeypatch):
     public, sibling = _fleet(tmp_path, monkeypatch)
     linked = _linked(sibling, "codex/impl-cp")
     stranger = tmp_path / "stranger"
@@ -182,7 +189,7 @@ def test_control_plane_root_is_the_public_primary_only_for_fleet_siblings(tmp_pa
     assert worktree_claims.control_plane_root(public) == public.resolve()
     assert worktree_claims.control_plane_root(sibling) == public.resolve()
     assert worktree_claims.control_plane_root(linked) == public.resolve()
-    assert worktree_claims.control_plane_root(stranger) == stranger.resolve()
+    assert worktree_claims.control_plane_root(stranger) == public.resolve()
 
 
 def _malformed_catalog(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

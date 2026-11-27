@@ -802,10 +802,10 @@ def _has_active_ownership_claim(repo_root: Path, task_id: str | None) -> str | N
         return None
     from lu_machinery.guardrails.delegate_ownership import default_ledger_path
 
-    db_path = default_ledger_path()
-    if not db_path.is_file():
-        return None
     try:
+        db_path = default_ledger_path()
+        if not db_path.is_file() and not (os.environ.get("LEARN_UKRAINIAN_OWNERSHIP_LEDGER") or "").strip():
+            return None
         conn = cp_connect(StoreId.WRITE_OWNERSHIP, path=db_path, read_only=True)
         try:
             cur = conn.cursor()
