@@ -100,7 +100,7 @@ BATCH_STATE_JOIN_R4_PENDING = frozenset(
 )
 _PATH_CTORS = frozenset({"Path", "PurePath", "PosixPath", "PurePosixPath", "WindowsPath", "PureWindowsPath"})
 _OS_PATH_JOIN_NAMES = frozenset({"os.path.join", "posixpath.join", "ntpath.join"})
-_PATH_SEP_MODULES = frozenset({"os", "posixpath", "ntpath"})
+_PATH_SEP_MODULES = frozenset({"os", "os.path", "posixpath", "ntpath"})
 _PATH_SEP_ATTRS = frozenset({"sep", "altsep"})
 _BATCH_STATE_CONST_ATTRS = frozenset(
     {
@@ -759,6 +759,7 @@ def _joined_str_joins_batch_state(
     bound_names: frozenset[str],
     bound_attrs: frozenset[str],
     state_paths_aliases: frozenset[str],
+    sep_names: frozenset[str],
 ) -> bool:
     """True when an f-string directly joins an interpolated expression with ``batch_state``."""
     values = node.values
@@ -778,6 +779,23 @@ def _joined_str_joins_batch_state(
                     next_part.value, bound_names, bound_attrs, state_paths_aliases
                 ):
                     return True
+        elif (
+            isinstance(part, ast.FormattedValue)
+            and idx > 0
+            and idx + 1 < len(values)
+            and _is_path_sep_expr(part.value, sep_names)
+        ):
+            next_part = values[idx + 1]
+            if isinstance(next_part, ast.Constant) and isinstance(next_part.value, str):
+                if (
+                    _is_batch_state_segment(next_part.value)
+                    or next_part.value.startswith("batch_state\\")
+                ):
+                    return True
+            elif isinstance(next_part, ast.FormattedValue) and _expr_has_batch_state_segment(
+                next_part.value, bound_names, bound_attrs, state_paths_aliases
+            ):
+                return True
     return False
 
 
@@ -940,7 +958,7 @@ def _scan_batch_state_joins(rel: str, source: bytes) -> list[str]:
             if _expr_has_batch_state_segment(node.value, names, bound_attrs, sp_aliases):
                 lines.add(node.lineno)
         elif isinstance(node, ast.JoinedStr) and _joined_str_joins_batch_state(
-            node, names, bound_attrs, sp_aliases
+            node, names, bound_attrs, sp_aliases, sep_names
         ):
             lines.add(node.lineno)
         elif isinstance(node, ast.Call):
