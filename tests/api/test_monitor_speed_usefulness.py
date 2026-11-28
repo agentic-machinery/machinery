@@ -206,10 +206,9 @@ assert.match(api({}), /9\.00 this week/);
 for (const reading of [{age_s: 1800}, {freshness: 'stale'}, {freshness: 'unknown'}, {age_s: null}])
   assert.doesNotMatch(api(reading), /42\.00|9\.00/);
 const lastGood = api({freshness: 'stale_last_good', balance_probe_state: 'NEED_KEY'});
-assert.match(lastGood, /42\.00 USD balance/);
-assert.match(lastGood, /\$9\.00 this week \(last good\)/);
+assert.doesNotMatch(lastGood, /42\.00|9\.00/);
+assert.match(lastGood, /unknown; needs an API key/);
 assert.match(lastGood, /Last good reading, 1m old/);
-assert.match(lastGood, /needs an API key/);
 assert.doesNotMatch(lastGood, /STALE_LAST_GOOD|NEED_KEY/);
 assert.match(lastGood, /class="warn">Last good reading/);
 const known = {title: 'Approved change not merged', meaning: 'Held over 30 minutes.', next_step: 'The owner lands it.'};
@@ -258,6 +257,137 @@ assert.match(chipFor([{alertname: 'A', severity: 'info'}, {alertname: 'B', sever
 assert.match(renderAlerts({status: 'ok', heartbeat: true, alerts: [
   {alertname: 'UsagePoolRestored', severity: 'info', title: 'Pool allowance is back'}]}), /No problems firing\./);
 """)
+    models_full_script = _page_script("models.html")
+    _node(
+        _DOM
+        + _machinery_js_prelude()
+        + r"""
+globalThis.document = document;
+const realPerfNow = performance.now.bind(performance);
+const realDateNow = Date.now;
+let monoNow = 10000;
+let fakeNow = Date.parse('2026-11-28T01:00:00Z');
+performance.now = () => monoNow;
+Date.now = () => fakeNow;
+let budgetFetches = 0;
+let poolMode = 'all_fresh';
+globalThis.fetch = async (url) => {
+  const s = String(url);
+  if (s.startsWith('/api/state/routing-budget')) {
+    budgetFetches += 1;
+    const agents = poolMode === 'all_fresh'
+      ? {
+          claude: {freshness: 'fresh', age_s: 899, status: 'ok', stale: false},
+          cursor: {freshness: 'fresh', age_s: 899, status: 'ok', stale: false, provider_windows: {auto: {remaining_pct: 82}, api: {remaining_pct: 64}}},
+        }
+      : poolMode === 'mixed'
+      ? {
+          claude: {freshness: 'fresh', age_s: 60, status: 'ok', stale: false},
+          codex: {freshness: 'stale', age_s: 1200, status: 'ok', stale: true},
+        }
+      : {
+          claude: {freshness: 'stale', age_s: 1200, status: 'ok', stale: true},
+          codex: {freshness: 'unknown', age_s: null, status: 'unknown', stale: false},
+        };
+    return {
+      ok: true,
+      status: 200,
+      headers: {get: () => null},
+      text: async () => JSON.stringify({
+        diagnostics: {stale_threshold_s: 900},
+        agents,
+        api_accounts: {FixtureAPI: {freshness: 'fresh', age_s: 899, total_balance: 55, currency: 'USD', usage_weekly_usd: 12}},
+        subscriptions: {
+          stale_after_s: 900,
+          providers: [{
+            provider: 'claude',
+            label: 'Claude',
+            accounts: [{
+              account: 'Claude a',
+              reading: {status: 'fresh', age_s: 899, read_at: '2026-11-28T00:45:01Z'},
+              weekly: {status: 'ok', left_pct: 73, resets_at: '2099-01-02T03:04:00Z'},
+              pace: {status: 'ok', state: 'reserve', headroom_pct: 14, lasts_to_reset: true},
+              plan: {status: 'ok'},
+            }],
+          }],
+        },
+      }),
+    };
+  }
+  if (s === '/api/runtime/logins') {
+    if (poolMode === 'mixed') return {ok: false, status: 503, headers: {get: () => null}, text: async () => '{}'};
+    return {ok: true, status: 200, headers: {get: () => null}, text: async () => JSON.stringify({state: 'ok', accounts: [{account: 'Claude a', logged_in: true}]})};
+  }
+  return {ok: true, status: 200, headers: {get: () => null}, text: async () => '{}'};
+};
+const models = (() => {
+"""
+        + models_full_script
+        + r"""
+  return {runner, PANELS, renderChips};
+})();
+(async () => {
+  try {
+    await models.runner.loadPanel(models.PANELS[0]);
+    const updateChips = () => { document.getElementById('chips').innerHTML = models.renderChips(models.runner.latest); };
+    updateChips();
+    assert.equal(budgetFetches, 1);
+    const freshHtml = document.getElementById('usage-content').innerHTML;
+    assert.match(freshHtml, /73%/);
+    assert.match(freshHtml, /82% left/);
+    assert.match(freshHtml, /55\.00 USD balance/);
+    const freshChips = document.getElementById('chips').innerHTML;
+    assert.match(freshChips, /<b>73%<\/b> Claude/);
+    assert.match(freshChips, /<b>0<\/b> pools near cap/);
+    assert.doesNotMatch(freshChips, /unknown/);
+
+    // Wall-clock step alone does not expire the monotonic budget clock.
+    fakeNow += 5000;
+    models.PANELS[0].onTick(models.PANELS[0], models.runner.latest, updateChips, fakeNow);
+    assert.equal(budgetFetches, 1);
+    assert.match(document.getElementById('usage-content').innerHTML, /73%/);
+
+    // Monotonic clock advancing 2s crosses the 900s threshold and withdraws all expired figures + chips with zero fetches.
+    monoNow += 2000;
+    models.PANELS[0].onTick(models.PANELS[0], models.runner.latest, updateChips, fakeNow);
+    assert.equal(budgetFetches, 1, 'F3: budget expiry makes zero extra fetches');
+    const expiredHtml = document.getElementById('usage-content').innerHTML;
+    assert.doesNotMatch(expiredHtml, /73%|82% left|64% left|55\.00|12\.00/);
+    const expiredChips = document.getElementById('chips').innerHTML;
+    assert.match(expiredChips, /<b>\?<\/b> Claude/);
+    assert.match(expiredChips, /<b>\?<\/b> pools near cap unknown/);
+    assert.doesNotMatch(expiredChips, /<b>0<\/b> pools near cap/);
+
+    // Rolling monotonic clock back never revives expired figures.
+    monoNow -= 5000;
+    models.PANELS[0].onTick(models.PANELS[0], models.runner.latest, updateChips, fakeNow);
+    assert.doesNotMatch(document.getElementById('usage-content').innerHTML, /73%|55\.00/);
+
+    // F7: Mixed 1 fresh cool pool + 1 stale pool qualifies chip as "0 pools near cap (1 unknown)" with warn tone,
+    // and missing sign-in renders "? sign-in unknown".
+    poolMode = 'mixed';
+    await models.runner.loadPanel(models.PANELS[0]);
+    updateChips();
+    const mixedChips = document.getElementById('chips').innerHTML;
+    assert.match(mixedChips, /chip warn[^>]*><b>0<\/b> pools near cap \(1 unknown\)/);
+    assert.match(mixedChips, /chip warn[^>]*><b>\?<\/b> sign-in unknown/);
+
+    // Non-finite monotonic clock withdraws figures as unknown rather than keeping stale fresh values.
+    poolMode = 'all_fresh';
+    await models.runner.loadPanel(models.PANELS[0]);
+    updateChips();
+    assert.match(document.getElementById('usage-content').innerHTML, /73%/);
+    performance.now = () => Number.NaN;
+    models.PANELS[0].onTick(models.PANELS[0], models.runner.latest, updateChips, fakeNow);
+    assert.doesNotMatch(document.getElementById('usage-content').innerHTML, /73%|82% left|55\.00/);
+    assert.match(document.getElementById('chips').innerHTML, /<b>\?<\/b> pools near cap unknown/);
+  } finally {
+    performance.now = realPerfNow;
+    Date.now = realDateNow;
+  }
+})().catch(err => { console.error(err); process.exitCode = 1; });
+"""
+    )
 
 
 def test_home_comms_collection_errors_are_unavailable_even_when_store_exists():

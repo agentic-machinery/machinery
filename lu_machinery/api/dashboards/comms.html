@@ -43,6 +43,10 @@
   .message-row:hover {
     background: var(--bg);
   }
+  .message-row.is-linked {
+    border-left-color: var(--muted);
+    background: var(--bg);
+  }
   .message-row[aria-current="true"] {
     background: var(--soft);
     border-left-color: var(--link);
@@ -499,7 +503,65 @@ let lastOpenedMessageId = null;
 let currentMessageMeta = new Map();
 let currentThreadAnchorId = null;
 let currentThreadRows = [];
-let initialDeepLinkHandled = false;
+let pendingListFocus = null;
+let listHadFocus = false;
+
+function captureListFocus() {
+  if (typeof document !== "object" || !document) return null;
+  const active = document.activeElement;
+  const container = typeof document.getElementById === "function" ? document.getElementById("messages-content") : null;
+  if (!active || !container || typeof container.contains !== "function" || !container.contains(active)) return null;
+  if (active.dataset?.openMessage) return {type: "message", id: active.dataset.openMessage};
+  if (active.dataset?.retryPanel) return {type: "retry", id: active.dataset.retryPanel};
+  if (typeof active.hasAttribute === "function" && active.hasAttribute("data-clear-filters")) return {type: "clear"};
+  if (active.tagName === "A" && active.textContent) return {type: "pager", label: active.textContent};
+  return {type: "list"};
+}
+
+function focusStableListControl(preferredMessageId = null) {
+  if (typeof document !== "object" || !document || typeof document.getElementById !== "function") return;
+  const container = document.getElementById("messages-content");
+  if (container && typeof container.querySelectorAll === "function") {
+    const buttons = [...container.querySelectorAll("button[data-open-message]")];
+    if (preferredMessageId) {
+      const exact = buttons.find(btn => btn.dataset?.openMessage === preferredMessageId);
+      if (exact && typeof exact.focus === "function") { exact.focus(); return; }
+    }
+    if (buttons.length && typeof buttons[0].focus === "function") { buttons[0].focus(); return; }
+    const retry = container.querySelector?.("button[data-retry-panel]");
+    if (retry && typeof retry.focus === "function") { retry.focus(); return; }
+  }
+  const fallback = document.getElementById("filter-seat") || document.getElementById("main");
+  if (fallback && typeof fallback.focus === "function") fallback.focus();
+}
+
+function restoreListFocus(onError = false) {
+  const saved = pendingListFocus || (onError && listHadFocus ? {type: "retry", id: "messages"} : null);
+  pendingListFocus = null;
+  if (!saved || typeof document !== "object" || !document) return;
+  const container = typeof document.getElementById === "function" ? document.getElementById("messages-content") : null;
+  if (container && typeof container.querySelector === "function") {
+    if (saved.type === "message") {
+      focusStableListControl(saved.id);
+      return;
+    }
+    if (saved.type === "retry") {
+      const btn = [...(container.querySelectorAll?.("button[data-retry-panel]") || [])]
+        .find(node => node.dataset?.retryPanel === saved.id);
+      if (btn && typeof btn.focus === "function") { btn.focus(); return; }
+    }
+    if (saved.type === "clear") {
+      const btn = container.querySelector("[data-clear-filters]");
+      if (btn && typeof btn.focus === "function") { btn.focus(); return; }
+    }
+    if (saved.type === "pager") {
+      const link = [...(container.querySelectorAll?.(".pager a") || [])]
+        .find(node => node.textContent === saved.label);
+      if (link && typeof link.focus === "function") { link.focus(); return; }
+    }
+  }
+  focusStableListControl(null);
+}
 
 function setRangeLabel(textValue) {
   const el = typeof document === "object" && document && typeof document.getElementById === "function"
@@ -508,6 +570,7 @@ function setRangeLabel(textValue) {
 }
 
 function renderMessages(payload) {
+  pendingListFocus = captureListFocus();
   syncAppliedFilters(payload);
   if (!payload || typeof payload !== "object" || LOG_DOWN.has(payload.availability)) {
     setRangeLabel("");
@@ -542,6 +605,7 @@ function renderMessages(payload) {
     setRangeLabel("");
     return notice("Message log unavailable", "messages", "Messages");
   }
+  const linkedMsg = pageQuery().get("msg") || "";
   const nextMeta = new Map();
   const listItems = [];
   for (const group of groups) {
@@ -558,8 +622,9 @@ function renderMessages(payload) {
       + `<span class="msg-state${stateCls ? ` ${stateCls}` : ""}">${escapeHtml(stateText)}</span>`;
     if (group.messageId !== null) {
       const currentAttr = selectedMessageId === group.messageId ? ' aria-current="true"' : "";
+      const linkedCls = !selectedMessageId && linkedMsg === group.messageId ? " is-linked" : "";
       listItems.push(
-        `<li><button type="button" class="message-row" aria-controls="message-reader"`
+        `<li><button type="button" class="message-row${linkedCls}" aria-controls="message-reader"`
         + ` data-open-message="${escapeHtml(group.messageId)}"${currentAttr}>${cells}</button></li>`
       );
     } else {
@@ -700,7 +765,7 @@ function shortTime(value) {
   return formatted && formatted.length >= 16 ? formatted.slice(11, 16) : "—";
 }
 
-function renderThreadItems(anchorId, rows, limit, offset, nextOffset) {
+function renderThreadItems(anchorId, rows, limit, offset, nextOffset, {focusMessageId = null, focusFirst = false} = {}) {
   const box = document.getElementById("message-thread");
   const heading = document.getElementById("message-thread-heading");
   if (heading) {
@@ -708,6 +773,7 @@ function renderThreadItems(anchorId, rows, limit, offset, nextOffset) {
     heading.textContent = `Thread (${rows.length}${suffix})`;
   }
   const list = safeEl("ul", "thread-list");
+  let focusTarget = null;
   for (const row of rows) {
     const item = safeEl("li");
     const isCurrent = row.message_id === selectedMessageId;
@@ -716,6 +782,7 @@ function renderThreadItems(anchorId, rows, limit, offset, nextOffset) {
     const label = `${shortTime(row.created_at)} ${kind}, ${sender}${isCurrent ? " (this)" : ""}`;
     const open = safeEl("button", "retry", label);
     open.type = "button";
+    open.dataset.threadMessage = row.message_id;
     if (isCurrent) open.setAttribute("aria-current", "true");
     open.addEventListener("click", () => {
       selectedMessageId = row.message_id;
@@ -727,9 +794,11 @@ function renderThreadItems(anchorId, rows, limit, offset, nextOffset) {
         created_at: row.created_at,
       };
       renderReaderMeta(row.message_id, rowMeta);
-      renderThreadItems(anchorId, rows, limit, offset, nextOffset);
+      renderThreadItems(anchorId, rows, limit, offset, nextOffset, {focusMessageId: row.message_id});
       loadMessageBody(row.message_id);
     });
+    if (focusMessageId && row.message_id === focusMessageId) focusTarget = open;
+    else if (focusFirst && !focusTarget) focusTarget = open;
     item.appendChild(open);
     list.appendChild(item);
   }
@@ -741,10 +810,12 @@ function renderThreadItems(anchorId, rows, limit, offset, nextOffset) {
     if (!Number.isSafeInteger(position)) continue;
     const button = safeEl("button", "retry", label);
     button.type = "button";
-    button.addEventListener("click", () => loadMessageThread(anchorId, position));
+    button.addEventListener("click", () => loadMessageThread(anchorId, position, {preserveFocus: true}));
+    if (focusFirst && !focusTarget) focusTarget = button;
     nodes.push(button);
   }
   setNodeChildren(box, nodes);
+  if (focusTarget && typeof focusTarget.focus === "function") focusTarget.focus();
 }
 
 async function loadMessageBody(id) {
@@ -781,7 +852,7 @@ async function loadMessageBody(id) {
   rememberStatus("messages", status);
 }
 
-async function loadMessageThread(id, offset = 0) {
+async function loadMessageThread(id, offset = 0, {preserveFocus = false} = {}) {
   const seq = ++messageThreadRequest;
   currentThreadAnchorId = id;
   const box = document.getElementById("message-thread");
@@ -796,7 +867,7 @@ async function loadMessageThread(id, offset = 0) {
     if (seq !== messageThreadRequest) return;
     if (!response.ok || !Array.isArray(payload.messages)) throw new Error("Thread unavailable");
     currentThreadRows = payload.messages;
-    renderThreadItems(id, payload.messages, payload.limit, offset, payload.next_offset);
+    renderThreadItems(id, payload.messages, payload.limit, offset, payload.next_offset, {focusFirst: preserveFocus});
   } catch {
     if (seq === messageThreadRequest) setNodeChildren(box, [safeEl("p", "error", "Thread could not load.")]);
   }
@@ -830,14 +901,7 @@ function closeMessageReader() {
   if (layout && layout.classList && typeof layout.classList.remove === "function") layout.classList.remove("has-selection");
   const reader = document.getElementById("message-reader");
   if (reader) reader.hidden = true;
-  if (returnId && typeof document.querySelectorAll === "function") {
-    for (const btn of document.querySelectorAll("button[data-open-message]")) {
-      if (btn.dataset?.openMessage === returnId && typeof btn.focus === "function") {
-        btn.focus();
-        break;
-      }
-    }
-  }
+  focusStableListControl(returnId);
 }
 
 function bindMessageControls() {
@@ -866,6 +930,10 @@ function bindMessageControls() {
       const disclosure = document.getElementById("health-disclosure");
       if (disclosure) disclosure.open = true;
     }
+  });
+  document.addEventListener("focusin", event => {
+    const container = typeof document.getElementById === "function" ? document.getElementById("messages-content") : null;
+    listHadFocus = Boolean(container && typeof container.contains === "function" && event.target && container.contains(event.target));
   });
   document.addEventListener("keydown", event => {
     if (event.key === "Escape" && selectedMessageId) {
@@ -1199,12 +1267,11 @@ const PANELS = [
     urls: [deliveryUrl()],
     render: renderMessages,
     onData: () => {
+      restoreListFocus();
       if (!seatsLoaded) loadSeatOptions();
-      if (!initialDeepLinkHandled) {
-        initialDeepLinkHandled = true;
-        const linkedMsg = pageQuery().get("msg");
-        if (linkedMsg) openMessage(linkedMsg, {focusHeading: false, updateUrl: false});
-      }
+    },
+    onError: () => {
+      restoreListFocus(true);
     },
   },
   {id: "comms", label: "Delivery health", urls: ["/api/comms/v1/metrics"], render: renderComms},
