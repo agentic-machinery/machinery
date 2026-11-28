@@ -35,6 +35,18 @@
     <p id="milestones-status" class="visually-hidden" aria-live="polite" aria-atomic="true"></p>
     <div id="milestones-content">Loading…</div>
   </section>
+  <section class="wide stacked" id="planning-sections">
+    <div id="planning-top-blockers"><h2 id="top-blockers">Top blockers</h2><p class="muted">Loading…</p></div>
+    <div id="planning-ready-now"><h2 id="ready-now">Ready now</h2><p class="muted">Loading…</p></div>
+    <details id="other-blocked" hidden>
+      <summary id="other-blocked-summary">Blocked issues outside open milestones</summary>
+      <div id="other-blocked-body"></div>
+    </details>
+    <details id="unknown-milestone-blocked" hidden>
+      <summary id="unknown-milestone-blocked-summary">Blocked issues (milestone membership unknown)</summary>
+      <div id="unknown-milestone-blocked-body"></div>
+    </details>
+  </section>
 </main>
 <script src="/machinery.js"></script>
 <script>
@@ -83,6 +95,12 @@ function issueRefLink(ref, currentRepoSlug = null) {
     ? `#${num}` : raw;
   const url = safeHttpUrl(`https://github.com/${slug}/issues/${num}`);
   return url ? `<a href="${escapeHtml(url)}">${escapeHtml(display)}</a>` : escapeHtml(display);
+}
+
+function issueRefRepo(ref) {
+  if (typeof ref !== "string") return null;
+  const match = ISSUE_REF_RE.exec(ref);
+  return match ? match[1].toLowerCase() : null;
 }
 
 function issueJoinKey(repoSlug, number) {
@@ -242,6 +260,22 @@ function isIssueReadyNow(enriched, plan) {
   return enriched.readyStatus === "ready_now" || (Boolean(enriched.key) && plan.readyNowSet.has(enriched.key));
 }
 
+function completeMilestoneRepos(data) {
+  const complete = new Set();
+  if (!data || typeof data !== "object" || data.status === "pending" || data.stale) return complete;
+  const repos = Array.isArray(data.repositories) ? data.repositories : [];
+  for (const repo of repos) {
+    if (!repo || typeof repo !== "object" || repo.private) continue;
+    if (typeof repo.repository !== "string" || !repo.repository) continue;
+    if (repo.status !== "ok" || repo.stale) continue;
+    const milestones = Array.isArray(repo.milestones) ? repo.milestones : null;
+    if (!milestones) continue;
+    const allIssuesComplete = milestones.every(item => item && typeof item === "object" && item.issues_status === "ok");
+    if (allIssuesComplete) complete.add(repo.repository.toLowerCase());
+  }
+  return complete;
+}
+
 function collectMilestones(data, plan, now) {
   const repos = Array.isArray(data?.repositories) ? data.repositories : [];
   const labelRepo = shortRepoMap(repos);
@@ -285,29 +319,37 @@ function collectMilestones(data, plan, now) {
 
       const blockedIssues = [];
       const unblockedIssues = [];
+      let unaccountedCount = 0;
       for (const issue of rawIssues) {
         if (!issue || typeof issue !== "object") continue;
         const key = issueJoinKey(repo.repository, issue.number);
         const blockerInfo = plan.usable && key ? plan.blockedByRef.get(key) : null;
         const readyStatus = plan.usable && key ? plan.readyByRef.get(key) : null;
         const enriched = {issue, key, blockerInfo, readyStatus};
-        if (blockerInfo) blockedIssues.push(enriched);
-        else unblockedIssues.push(enriched);
+        if (blockerInfo) {
+          blockedIssues.push(enriched);
+        } else {
+          unblockedIssues.push(enriched);
+          if (plan.usable && !readyStatus) unaccountedCount += 1;
+        }
       }
 
       // Blocked count cell: fail closed!
       // Private -> always "withheld".
       // Planning unusable (unknown/stale/pending/errored/missing age) -> always "unknown", never 0.
-      // Incomplete issue list with open issues -> "unknown" if 0 observed, else "<n> (partial)".
+      // Incomplete milestone issue list or open issues unaccounted for in planning ->
+      // "unknown" when 0 blockers observed, else "<n> observed" (never an exact 0).
       let blockedCell;
       let blockedCountKnown = null;
+      const incompleteIssues = issuesStatus !== "ok" && (openCount === null || openCount > 0);
+      const incompleteCoverage = incompleteIssues || unaccountedCount > 0;
       if (isPrivate) {
         blockedCell = {text: "withheld", tone: "muted"};
       } else if (!plan.usable) {
         blockedCell = {text: "unknown", tone: "warn"};
-      } else if (issuesStatus !== "ok" && (openCount === null || openCount > 0)) {
-        if (blockedIssues.length > 0 && issuesStatus === "partial") {
-          blockedCell = {text: `${blockedIssues.length} (partial)`, tone: "warn"};
+      } else if (incompleteCoverage) {
+        if (blockedIssues.length > 0 && (!incompleteIssues || issuesStatus === "partial")) {
+          blockedCell = {text: `${blockedIssues.length} observed`, tone: "warn"};
           blockedCountKnown = blockedIssues.length;
         } else {
           blockedCell = {text: "unknown", tone: "warn"};
@@ -347,6 +389,7 @@ function collectMilestones(data, plan, now) {
         issuesStatus,
         blockedIssues,
         unblockedIssues,
+        unaccountedCount,
         blockedCell,
         overdueCell,
         blockedCountKnown,
@@ -439,8 +482,13 @@ function renderMilestoneCard(entry, plan) {
       : plan.status === "pending" ? "planning data is still loading"
       : "planning data is unavailable";
     parts.push(`<p class="warn">Blocker and ready-now status unknown (${escapeHtml(why)}).</p>`);
-  } else if (plan.workers === "unknown") {
-    parts.push('<p class="warn">Worker paths are unavailable; ready-now status is withheld.</p>');
+  } else {
+    if (entry.unaccountedCount > 0) {
+      parts.push(`<p class="warn">${entry.unaccountedCount} open ${entry.unaccountedCount === 1 ? "issue has" : "issues have"} no planning verdict; blocker count is incomplete.</p>`);
+    }
+    if (plan.workers === "unknown") {
+      parts.push('<p class="warn">Worker paths are unavailable; ready-now status is withheld.</p>');
+    }
   }
 
   // Order inside each milestone: Blocked (with blockers), Overdue, Ready now, then the rest.
@@ -557,20 +605,50 @@ function renderReadyNow(plan) {
   return out.join("");
 }
 
-function renderOtherBlocked(plan, shownRefs) {
-  if (!plan.usable) return "";
-  const extra = plan.blockedList.filter(row => row && typeof row.ref === "string" && !shownRefs.has(row.ref.toLowerCase()));
-  if (!extra.length) return "";
-  const rows = extra.map(row => {
+function classifyUnmatchedBlocked(plan, shownRefs, completeRepos) {
+  if (!plan.usable) return {outside: [], unknownMembership: []};
+  const outside = [];
+  const unknownMembership = [];
+  for (const row of plan.blockedList) {
+    if (!row || typeof row.ref !== "string") continue;
+    if (shownRefs.has(row.ref.toLowerCase())) continue;
+    const repo = issueRefRepo(row.ref);
+    if (repo && completeRepos.has(repo)) outside.push(row);
+    else unknownMembership.push(row);
+  }
+  return {outside, unknownMembership};
+}
+
+function renderBlockedRefTable(list) {
+  const rows = list.map(row => {
     const deps = (Array.isArray(row.blocked_by) ? row.blocked_by : []).map(ref => issueRefLink(ref));
     if (isNonNegInt(row.private_blockers) && row.private_blockers > 0) {
       deps.push(`+${row.private_blockers} private`);
     }
     return [td(issueRefLink(row.ref)), td(deps.join(", ") || "—")];
   });
-  return `<details id="other-blocked"><summary>Blocked issues outside open milestones (${extra.length})</summary>`
-    + renderTable(["Issue", "Open dependencies"], rows)
-    + "</details>";
+  return renderTable(["Issue", "Open dependencies"], rows);
+}
+
+function renderOtherBlockedSections(plan, shownRefs, completeRepos) {
+  const {outside, unknownMembership} = classifyUnmatchedBlocked(plan, shownRefs, completeRepos);
+  const out = [];
+  if (outside.length) {
+    out.push(
+      `<details id="other-blocked"><summary>Blocked issues outside open milestones (${outside.length})</summary>`
+      + renderBlockedRefTable(outside)
+      + "</details>"
+    );
+  }
+  if (unknownMembership.length) {
+    out.push(
+      `<details id="unknown-milestone-blocked"><summary>Blocked issues (milestone membership unknown: ${unknownMembership.length})</summary>`
+      + '<p class="warn">Milestone coverage for these repositories is incomplete, stale, or unavailable.</p>'
+      + renderBlockedRefTable(unknownMembership)
+      + "</details>"
+    );
+  }
+  return out.join("");
 }
 
 function renderFreshnessStrip(data, plan) {
@@ -593,14 +671,21 @@ function renderFreshnessStrip(data, plan) {
   return `<p class="${warn ? "warn" : "muted"}">${escapeHtml(notes.join(" "))}</p>`;
 }
 
-function renderMilestones(data, planning = null, now = Date.now(), planningReading = null) {
+function renderMilestonesOverview(data, plan, now) {
   if (!data || typeof data !== "object") {
-    return '<p class="warn">Fleet milestone data is unavailable.</p>';
+    return {
+      html: '<p class="warn">Fleet milestone data is unavailable.</p>',
+      shownRefs: new Set(),
+      completeRepos: new Set(),
+    };
   }
   if (data.status === "pending") {
-    return '<p class="muted">Loading milestones from GitHub…</p>';
+    return {
+      html: '<p class="muted">Loading milestones from GitHub…</p>',
+      shownRefs: new Set(),
+      completeRepos: new Set(),
+    };
   }
-  const plan = analyzePlanning(planning, planningReading, now);
   const {entries, repoProblems, repos} = collectMilestones(data, plan, now);
   const out = [renderFreshnessStrip(data, plan)];
 
@@ -647,50 +732,60 @@ function renderMilestones(data, planning = null, now = Date.now(), planningReadi
       if (row.key) shownRefs.add(row.key);
     }
   }
-  out.push(renderTopBlockers(plan));
-  out.push(renderReadyNow(plan));
-  out.push(renderOtherBlocked(plan, shownRefs));
-  return out.join("");
+  return {
+    html: out.join(""),
+    shownRefs,
+    completeRepos: completeMilestoneRepos(data),
+  };
+}
+
+function renderMilestones(data, planning = null, now = Date.now(), planningReading = null) {
+  const plan = analyzePlanning(planning, planningReading, now);
+  const {html, shownRefs, completeRepos} = renderMilestonesOverview(data, plan, now);
+  return html
+    + renderTopBlockers(plan)
+    + renderReadyNow(plan)
+    + renderOtherBlockedSections(plan, shownRefs, completeRepos);
 }
 
 function renderMilestoneChips(latest, now = Date.now(), planningReading = null) {
   const data = latest?.milestones;
-  if (!data || data.status === "pending") return "";
   const plan = analyzePlanning(latest?.planning, planningReading, now);
-  const {entries, repoProblems, repos} = collectMilestones(data, plan, now);
-  const allReposFailed = !repos.length || repos.every(repo => !repo || (repo.status !== "ok" && repo.status !== "partial"));
   const out = [];
 
   if (!plan.usable) {
     out.push(chip("#top-blockers", "?", "blocked", "warn"));
   } else {
     const blockedTotal = plan.blockedList.length;
-    const isPartial = plan.status === "partial";
-    out.push(chip("#top-blockers", blockedTotal, isPartial ? "blocked (partial)" : "blocked",
-      blockedTotal > 0 ? "bad" : isPartial ? "warn" : ""));
+    const incompleteDeps = plan.status === "partial"
+      || (isNonNegInt(plan.coverage.dependency_unknown) && plan.coverage.dependency_unknown > 0);
+    if (blockedTotal === 0 && incompleteDeps) {
+      out.push(chip("#top-blockers", "?", plan.status === "partial" ? "blocked (partial)" : "blocked (incomplete)", "warn"));
+    } else {
+      const label = plan.status === "partial" ? "blocked (partial)"
+        : incompleteDeps ? "blocked observed"
+        : "blocked";
+      out.push(chip("#top-blockers", blockedTotal, label,
+        blockedTotal > 0 ? "bad" : incompleteDeps ? "warn" : ""));
+    }
   }
 
-  if (allReposFailed) {
-    out.push(chip("#milestones", "?", "open milestones unknown", "warn"));
-  } else {
-    const partial = repoProblems.length > 0;
-    const allPrivate = entries.length > 0 && entries.every(entry => entry.isPrivate);
-    if (allPrivate) {
-      out.push(chip("#milestones", "withheld", "overdue", ""));
+  if (data && data.status !== "pending") {
+    const {entries, repoProblems, repos} = collectMilestones(data, plan, now);
+    const allReposFailed = !repos.length || repos.every(repo => !repo || (repo.status !== "ok" && repo.status !== "partial"));
+    if (allReposFailed) {
+      out.push(chip("#milestones", "?", "open milestones unknown", "warn"));
     } else {
-      const overdue = entries.filter(entry => entry.due.overdue).length;
-      out.push(chip("#milestones", overdue, partial ? "overdue observed" : "overdue",
-        overdue > 0 ? "bad" : partial ? "warn" : ""));
+      const partial = repoProblems.length > 0;
+      const allPrivate = entries.length > 0 && entries.every(entry => entry.isPrivate);
+      if (allPrivate) {
+        out.push(chip("#milestones", "withheld", "overdue", ""));
+      } else {
+        const overdue = entries.filter(entry => entry.due.overdue).length;
+        out.push(chip("#milestones", overdue, partial ? "overdue observed" : "overdue",
+          overdue > 0 ? "bad" : partial ? "warn" : ""));
+      }
     }
-    if (!plan.usable || plan.workers === "unknown") {
-      out.push(chip("#ready-now", "?", "ready now", "warn"));
-    } else {
-      const isPartial = plan.status === "partial" || plan.workers === "partial";
-      out.push(chip("#ready-now", plan.readyNow.length, isPartial ? "ready now (partial)" : "ready now",
-        isPartial ? "warn" : plan.readyNow.length > 0 ? "info" : ""));
-    }
-    out.push(chip("#milestones", entries.length, partial ? "open observed" : "open", partial ? "warn" : ""));
-    return out.join("");
   }
 
   if (!plan.usable || plan.workers === "unknown") {
@@ -700,24 +795,114 @@ function renderMilestoneChips(latest, now = Date.now(), planningReading = null) 
     out.push(chip("#ready-now", plan.readyNow.length, isPartial ? "ready now (partial)" : "ready now",
       isPartial ? "warn" : plan.readyNow.length > 0 ? "info" : ""));
   }
+
+  if (data && data.status !== "pending") {
+    const {entries, repoProblems, repos} = collectMilestones(data, plan, now);
+    const allReposFailed = !repos.length || repos.every(repo => !repo || (repo.status !== "ok" && repo.status !== "partial"));
+    if (!allReposFailed) {
+      const partial = repoProblems.length > 0;
+      out.push(chip("#milestones", entries.length, partial ? "open observed" : "open", partial ? "warn" : ""));
+    }
+  }
+
   return out.join("");
 }
 
 let planningGeneration = 0;
 let planningRetries = 0;
 let latestPlanningReading = null;
+let latestShownRefs = new Set();
+let latestCompleteRepos = new Set();
+let resolvedFragment = null;
 
-function repaintMilestones(now = Date.now()) {
-  if (!runner.latest.milestones) return;
-  const content = document.getElementById("milestones-content");
-  if (content) {
-    content.innerHTML = renderMilestones(runner.latest.milestones, runner.latest.planning, now, latestPlanningReading);
-  }
-  const box = document.getElementById("chips");
-  if (box) box.innerHTML = renderMilestoneChips(runner.latest, now, latestPlanningReading);
+function currentHashId() {
+  if (typeof window !== "object" || !window || !window.location || !window.location.hash) return "";
+  const raw = window.location.hash.slice(1);
+  if (!raw) return "";
+  try { return decodeURIComponent(raw); } catch { return raw; }
 }
 
-function enrichPlanning(isRetry = false) {
+function resolvePendingFragment() {
+  if (typeof document !== "object" || !document || typeof document.getElementById !== "function") return;
+  const id = currentHashId();
+  if (!id || id === resolvedFragment) return;
+  const target = document.getElementById(id);
+  if (!target || target.hidden) return;
+  resolvedFragment = id;
+  updateStickyOffset();
+  if (typeof target.scrollIntoView === "function") {
+    target.scrollIntoView({block: "start"});
+  }
+}
+
+function syncDisclosure(id, summaryText, bodyHtml, visible) {
+  if (typeof document !== "object" || !document || typeof document.getElementById !== "function") return;
+  const details = document.getElementById(id);
+  const summary = document.getElementById(`${id}-summary`);
+  const body = document.getElementById(`${id}-body`);
+  if (!details || !summary || !body) return;
+  details.hidden = !visible;
+  if (!visible) {
+    if (body.innerHTML !== "") body.innerHTML = "";
+    return;
+  }
+  if (summary.textContent !== summaryText) summary.textContent = summaryText;
+  if (body.innerHTML !== bodyHtml) body.innerHTML = bodyHtml;
+}
+
+function updatePlanningDom(now = Date.now()) {
+  if (typeof document !== "object" || !document || typeof document.getElementById !== "function") return;
+  const plan = analyzePlanning(runner.latest.planning ?? null, latestPlanningReading, now);
+  const topEl = document.getElementById("planning-top-blockers");
+  if (topEl) {
+    const html = renderTopBlockers(plan);
+    if (topEl.innerHTML !== html) topEl.innerHTML = html;
+  }
+  const readyEl = document.getElementById("planning-ready-now");
+  if (readyEl) {
+    const html = renderReadyNow(plan);
+    if (readyEl.innerHTML !== html) readyEl.innerHTML = html;
+  }
+  const {outside, unknownMembership} = classifyUnmatchedBlocked(plan, latestShownRefs, latestCompleteRepos);
+  syncDisclosure(
+    "other-blocked",
+    `Blocked issues outside open milestones (${outside.length})`,
+    outside.length ? renderBlockedRefTable(outside) : "",
+    outside.length > 0,
+  );
+  syncDisclosure(
+    "unknown-milestone-blocked",
+    `Blocked issues (milestone membership unknown: ${unknownMembership.length})`,
+    unknownMembership.length
+      ? '<p class="warn">Milestone coverage for these repositories is incomplete, stale, or unavailable.</p>'
+        + renderBlockedRefTable(unknownMembership)
+      : "",
+    unknownMembership.length > 0,
+  );
+  const box = document.getElementById("chips");
+  if (box) {
+    const chipHtml = renderMilestoneChips(runner.latest, now, latestPlanningReading);
+    if (box.innerHTML !== chipHtml) box.innerHTML = chipHtml;
+  }
+  resolvePendingFragment();
+}
+
+function repaintMilestones(now = Date.now()) {
+  if (runner.latest.milestones) {
+    const plan = analyzePlanning(runner.latest.planning ?? null, latestPlanningReading, now);
+    const {html, shownRefs, completeRepos} = renderMilestonesOverview(runner.latest.milestones, plan, now);
+    latestShownRefs = shownRefs;
+    latestCompleteRepos = completeRepos;
+    const content = document.getElementById("milestones-content");
+    if (content && content.innerHTML !== html) content.innerHTML = html;
+  } else {
+    latestShownRefs = new Set();
+    latestCompleteRepos = new Set();
+  }
+  updatePlanningDom(now);
+}
+
+function loadPlanning(isRetry = false) {
   if (!isRetry) planningRetries = 0;
   const gen = ++planningGeneration;
   fetchJson(PLANNING_URL).then(reading => {
@@ -728,7 +913,7 @@ function enrichPlanning(isRetry = false) {
     repaintMilestones(now);
     if (reading.data?.issues?.status === "pending" && planningRetries < Machinery.RETRY_LIMIT) {
       planningRetries += 1;
-      setTimeout(() => { if (gen === planningGeneration) enrichPlanning(true); }, 3000);
+      setTimeout(() => { if (gen === planningGeneration) loadPlanning(true); }, 3000);
     } else {
       planningRetries = 0;
     }
@@ -762,10 +947,22 @@ const PANELS = [{
   id: "milestones",
   label: "Milestones",
   urls: ["/api/milestones"],
-  render: data => renderMilestones(data, runner.latest.planning ?? null, Date.now(), latestPlanningReading),
-  onData: () => enrichPlanning(false),
+  render: data => {
+    const plan = analyzePlanning(runner.latest.planning ?? null, latestPlanningReading, Date.now());
+    const {html, shownRefs, completeRepos} = renderMilestonesOverview(data, plan, Date.now());
+    latestShownRefs = shownRefs;
+    latestCompleteRepos = completeRepos;
+    return html;
+  },
+  onData: () => {
+    updatePlanningDom(Date.now());
+  },
   onTick: expirePlanningIfStale,
-  onError: latest => { planningGeneration += 1; latest.planning = null; latestPlanningReading = null; },
+  onError: () => {
+    latestShownRefs = new Set();
+    latestCompleteRepos = new Set();
+    updatePlanningDom(Date.now());
+  },
   retry: data => data?.status === "pending",
 }];
 
@@ -780,8 +977,14 @@ if (typeof ResizeObserver === "function" && typeof document === "object" && docu
 }
 if (typeof window === "object" && window && typeof window.addEventListener === "function") {
   window.addEventListener("resize", updateStickyOffset);
+  window.addEventListener("hashchange", () => {
+    resolvedFragment = null;
+    resolvePendingFragment();
+  });
 }
 runner.start();
+loadPlanning(false);
+setInterval(() => loadPlanning(false), Machinery.REFRESH_MS);
 </script>
 </body>
 </html>

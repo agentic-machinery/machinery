@@ -488,7 +488,9 @@ table.subs th[colspan] { padding-top: 8px; color: var(--fg); }
 .ms-badge.muted { color: var(--muted); }
 
 #top-blockers,
-#ready-now {
+#ready-now,
+#other-blocked,
+#unknown-milestone-blocked {
   scroll-margin-top: var(--sticky-offset, 96px);
   margin-top: 14px;
 }
@@ -496,7 +498,9 @@ table.subs th[colspan] { padding-top: 8px; color: var(--fg); }
 @media (max-width: 640px) {
   .milestone-card,
   #top-blockers,
-  #ready-now {
+  #ready-now,
+  #other-blocked,
+  #unknown-milestone-blocked {
     scroll-margin-top: 12px;
   }
   header { padding: 8px 10px; }

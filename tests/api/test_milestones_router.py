@@ -553,6 +553,68 @@ const partialChips = renderMilestoneChips({{milestones: data, planning: partialP
 assert.match(partialChips, /<b>\\?<\\/b> ready now/);
 assert.match(partialHtml, /Worker paths are unavailable; ready-now results are withheld/);
 
+// F1: When planning misses a milestone issue (unaccounted in both blocked and ready),
+// 0 observed blockers renders "unknown" (never "0"), and >0 observed renders "<n> observed".
+const missedPlanning = {{
+  issues: {{
+    status: "partial",
+    age_s: 60,
+    workers: "ok",
+    coverage: {{repositories_read: 2, repositories_total: 3, open_issues: 5, dependency_unknown: 0, private_open_issues: 0}},
+    blockers: [],
+    ready: [],
+    ready_now: [],
+    blocked: [],
+  }},
+}};
+const missedHtml = renderMilestones(data, missedPlanning, now);
+assert.equal(summaryCellsFor(missedHtml, "v0.4.0")[1], "unknown", "unaccounted milestone issue must never report 0 blocked");
+assert.match(missedHtml, /no planning verdict; blocker count is incomplete/);
+const missedChips = renderMilestoneChips({{milestones: data, planning: missedPlanning}}, now);
+assert.match(missedChips, /<b>\\?<\\/b> blocked \\(partial\\)/);
+
+const twoIssueData = JSON.parse(JSON.stringify(data));
+twoIssueData.repositories[0].milestones[0].issues.push({{
+  number: 11,
+  title: "Task B missing from planning",
+  url: "https://github.com/fixture/machinery/issues/11",
+  labels: [],
+}});
+const observedHtml = renderMilestones(twoIssueData, partialPlanning, now);
+assert.equal(summaryCellsFor(observedHtml, "v0.4.0")[1], "1 observed");
+
+// F2: Unmatched blockers are classified outside open milestones ONLY when repo milestone & issue coverage is complete.
+const completeWithOutside = {{
+  issues: {{
+    status: "ok", age_s: 30, workers: "ok",
+    coverage: {{repositories_read: 2, repositories_total: 2, open_issues: 3, dependency_unknown: 0, private_open_issues: 0}},
+    blockers: [],
+    ready: [{{ref: "fixture/machinery#10", path_status: "ready_now"}}],
+    ready_now: [{{ref: "fixture/machinery#10"}}],
+    blocked: [{{ref: "fixture/machinery#99", blocked_by: ["fixture/machinery#1"], private_blockers: 0}}],
+  }},
+}};
+const outsideHtml = renderMilestones(data, completeWithOutside, now);
+assert.match(outsideHtml, /Blocked issues outside open milestones \\(1\\)/);
+assert.doesNotMatch(outsideHtml, /milestone membership unknown/);
+
+const partialListData = JSON.parse(JSON.stringify(data));
+partialListData.repositories[0].milestones[0].issues_status = "partial";
+const unknownMembershipHtml = renderMilestones(partialListData, completeWithOutside, now);
+assert.doesNotMatch(unknownMembershipHtml, /Blocked issues outside open milestones/);
+assert.match(unknownMembershipHtml, /Blocked issues \\(milestone membership unknown: 1\\)/);
+
+// F3: Planning sections (Top blockers, Ready now, membership-unknown blockers) still render when milestones are pending or unavailable.
+const pendingWithPlanning = renderMilestones({{status: "pending", repositories: []}}, completeWithOutside, now);
+assert.match(pendingWithPlanning, /<h2 id="top-blockers">Top blockers<\\/h2>/);
+assert.match(pendingWithPlanning, /<h2 id="ready-now">Ready now<\\/h2>/);
+assert.match(pendingWithPlanning, /fixture\\/machinery#10/);
+assert.match(pendingWithPlanning, /Blocked issues \\(milestone membership unknown: 1\\)/);
+const outageWithPlanning = renderMilestones(null, completeWithOutside, now);
+assert.match(outageWithPlanning, /<h2 id="top-blockers">Top blockers<\\/h2>/);
+assert.match(outageWithPlanning, /<h2 id="ready-now">Ready now<\\/h2>/);
+assert.match(outageWithPlanning, /Blocked issues \\(milestone membership unknown: 1\\)/);
+
 // Incomplete milestone issue list with open_issues > 0 never reports 0 blocked even when planning is ok.
 const incompleteData = JSON.parse(JSON.stringify(data));
 incompleteData.repositories[0].milestones[0].issues_status = "unknown";
