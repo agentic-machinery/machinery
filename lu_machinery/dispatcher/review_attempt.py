@@ -154,6 +154,8 @@ def run(spec: Any, record: dict, prompt: str, deadlines: tuple[float, int, int])
             raise ValueError("review_render_record_stale: prompt changed after admission; re-render")
         if access == "full":
             verify_full_review_tree(manifest, workspace)
+        if (refusal := _trace_context_refusal(record, spec.options)) is not None:
+            raise ValueError(refusal)  # before the claim, like the account below: the attempt id stays unspent
         _bind_codex_account(spec)  # before the claim, so a refused account leaves the attempt id unspent
         store.check_review_attempt(binding, claim=True, owner=record["task_id"])
         plan = prepare_review_attempt(
@@ -309,3 +311,14 @@ def _ledger_count(ledger: Any, path: Path) -> int | None:
         return len(ledger.records(path))
     except (OSError, ValueError, ledger.LedgerError):
         return None
+
+
+def _trace_context_refusal(record: dict, options: object) -> str | None:
+    """Why this supervisor's ``TRACEPARENT`` must not reach ``runner.invoke``, or None (TRACETEL-1128 Slice 3).
+
+    The same check the supervisor runs before either launch path (``emit.task_trace_refusal``), repeated at this
+    boundary: the record's and the options' trace agree and the supervisor environment names exactly that span.
+    """
+    from lu_machinery.telemetry import emit
+
+    return emit.task_trace_refusal(record, options, os.environ)

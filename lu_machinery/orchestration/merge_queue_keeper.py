@@ -530,6 +530,20 @@ class GitHub:
                 raise KeeperError("merge_group job page incomplete")
         return list(data["jobs"])
 
+    def attempt_jobs(self, run_id: int, attempt: int) -> list[dict[str, Any]]:
+        """The jobs of exactly one run attempt (GitHub's attempt-specific read); a rerun's are never another's."""
+        data = self.json(Request("read-attempt-jobs", repo=self.repository, number=run_id, attempt=attempt))
+        if (
+            not isinstance(data, dict)
+            or not isinstance(data.get("jobs"), list)
+            or not all(isinstance(job, dict) for job in data["jobs"])
+            or type(data.get("total_count")) is not int
+            or data["total_count"] > 100
+            or data["total_count"] != len(data["jobs"])
+        ):
+            raise KeeperError("merge_group attempt job page incomplete")
+        return list(data["jobs"])
+
     def job_failure(self, job_id: int) -> tuple[list[str], str | None]:
         """Test nodes and the first setup-error line from the one log fetch this call already makes.
 
@@ -2379,6 +2393,7 @@ def _drop_detail(
         raise KeeperError("matching merge_group run has no valid id")
     run_ids = [item["id"] for item in sorted(runs, key=lambda item: item.get("created_at", "")) if type(item.get("id")) is int]
     run_detail = f" Failing merge_group: {run.get('html_url') or run['id']}"
+    _emit_merge_group_result(gh, run)
     try:
         jobs = gh.jobs(run["id"])
     except KeeperError as exc:
@@ -2411,6 +2426,31 @@ def _drop_detail(
         if error:
             setup_errors[name] = error
     return detail, failed, tests, run["id"], run_ids, setup_errors
+
+
+def _emit_merge_group_result(gh: Any, run: Mapping[str, Any]) -> str:
+    """Write the ``merge_group.result`` telemetry event of one failing run attempt (TRACETEL-1128 Slice 3).
+
+    Its jobs come from that attempt's own read. The keeper holds no receipt binding the group's constituent PR
+    heads to the tested candidate, so the event says so (``receipt_state: "missing"``) and keeps the failure at
+    candidate level: the PR whose queue branch names the run is not blamed for it. Never raises.
+    """
+    try:
+        from lu_machinery.telemetry import emit
+
+        key, visibility = emit.fleet_repo_of(gh.repository)
+        jobs: object = None
+        attempt = run.get("run_attempt")
+        if type(run.get("id")) is int and type(attempt) is int and attempt > 0:
+            with contextlib.suppress(KeeperError):
+                jobs = gh.attempt_jobs(run["id"], attempt)
+        if key is None:
+            return "unregistered"
+        event = emit.merge_group_event(repo=key, visibility=visibility, run=run, jobs=jobs,
+                                       jobs_attempt=attempt if jobs is not None else None, receipt=None)
+        return emit.emit_v2(event)
+    except Exception as exc:  # telemetry never changes the diagnosis
+        return f"error: {type(exc).__name__}"
 
 
 def _repeated_failures(failures: Any) -> dict[tuple[str, str], tuple[list[int], list[str]]]:

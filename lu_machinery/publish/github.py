@@ -6076,12 +6076,12 @@ def _parse_args(argv):
             raise argparse.ArgumentTypeError(f"invalid positive ASCII number: {raw!r}")
         return parsed
 
-    for key in ("number",):
+    for key, what in (("number", "issue, PR, run or check-run ID"), ("attempt", "run attempt number (attempt-jobs)")):
         read_parser.add_argument(
             "--" + key,
             type=_parse_positive_number_arg,
             default=argparse.SUPPRESS,
-            help="Positive issue, PR, run or check-run ID; omitted by default",
+            help=f"Positive {what}; omitted by default",
         )
     for key in ("sha", "base", "head", "start", "end", "branch", "cursor", "ref"):
         read_parser.add_argument(
@@ -6168,6 +6168,8 @@ REST_READS = {
     "check-annotations": ("repos/{repo}/check-runs/{number}/annotations", {"number": "number"}),
     "dependabot-alerts": ("repos/{repo}/dependabot/alerts?state=open", {}),
     "jobs": ("repos/{repo}/actions/runs/{number}/jobs", {"number": "number"}),
+    # One run attempt's own jobs: the run-level read lists only the latest attempt's, without naming it.
+    "attempt-jobs": ("repos/{repo}/actions/runs/{number}/attempts/{attempt}/jobs", {"number": "number", "attempt": "number"}),
     "run": ("repos/{repo}/actions/runs/{number}", {"number": "number"}),
     "run-artifacts": ("repos/{repo}/actions/runs/{number}/artifacts", {"number": "number"}),
     "artifact-archive": ("repos/{repo}/actions/artifacts/{number}/zip", {"number": "number"}),
@@ -6427,7 +6429,7 @@ def read(
                 failure.github_result = observation
             raise failure
         return result
-    for key in ("number",):
+    for key in ("number", "attempt"):
         if key in fields and (type(fields[key]) is not int or fields[key] <= 0):
             raise gate.PublishBlocked("OPSEC: invalid read identifier.")
     if operation in REST_COMPAT_READS:

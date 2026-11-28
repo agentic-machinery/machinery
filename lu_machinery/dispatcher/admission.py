@@ -18,8 +18,12 @@ from lu_machinery.orchestration.task_record_store import REVIEW_TASK_FLAG_FIELDS
 
 
 @contextlib.contextmanager
-def record_refusal(args, agent: str, reason: StartRefusal, *, task_id: str | None = None, hold: dict | None = None):
-    """Keep an operational admission refusal while preserving the CLI error and its exit code."""
+def record_refusal(args, agent: str, reason: StartRefusal, *, task_id: str | None = None, hold: dict | None = None,
+                   trace: dict | None = None):
+    """Keep an operational admission refusal while preserving the CLI error and its exit code.
+
+    ``trace`` is the dispatch's trace identity; the refusal record carries it (TRACETEL-1128 Slice 3).
+    """
     try:
         yield
     except (OSError, ValueError, subprocess.SubprocessError) as refusal_exc:
@@ -34,6 +38,7 @@ def record_refusal(args, agent: str, reason: StartRefusal, *, task_id: str | Non
                     hold=hold,
                     detail=str(refusal_exc),
                     admission=admission_record if isinstance(admission_record, dict) else None,
+                    trace=trace,
                 )
             except (OSError, store.TaskRecordError) as exc:
                 logging.getLogger(__name__).warning("could not record pre-start refusal: %s", type(exc).__name__)

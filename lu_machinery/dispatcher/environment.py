@@ -205,6 +205,20 @@ def _safe_resolve(entry: str) -> Path | None:
         return None
 
 
+def _trace_env(options: object) -> dict[str, str]:
+    """The ``TRACEPARENT`` of a provider launched from this environment, naming the task's own span (TRACETEL-1128).
+
+    Never inherited: the environment is built from fixed names. A wrapper that rebuilds its own environment (the
+    read-only AGY sandbox, a bound review's runtime) passes none on: absent, never wrong. A task with no trace identity (dispatched before
+    traces existed) gets none; a malformed one refuses the launch (``ValueError``).
+    """
+    from lu_machinery.telemetry import emit
+
+    if not isinstance(options, dict) or not any(name in options for name in ("trace_id", "span_id")):
+        return {}
+    return {emit.TRACEPARENT_ENV: emit.traceparent(options)}
+
+
 def child_env(spec: TaskSpec) -> dict[str, str]:
     source = os.environ
     if spec.agent == "codex":
@@ -299,6 +313,7 @@ def child_env(spec: TaskSpec) -> dict[str, str]:
         # sandbox builds AGY's own environment from fixed names, so the provider never receives it.
         env["FLEET_COMMS_ROOT"] = fleet
     options = getattr(spec, "options", None)
+    env.update(_trace_env(options))
     orch_stream = options.get("orchestrator_stream") if isinstance(options, dict) else None
     if orch_stream:
         run_nonce = options.get("orchestrator_run_nonce") if isinstance(options, dict) else None

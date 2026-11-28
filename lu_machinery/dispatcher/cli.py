@@ -3,6 +3,7 @@
 import argparse
 import contextlib
 import copy
+import functools
 import json
 import math
 import os
@@ -521,6 +522,15 @@ def _parent_linkage(task_id: str) -> dict:
 
 
 def _dispatch(args) -> int:
+    # One trace identity per dispatch, minted before anything of it exists: every refusal record, the admission hold,
+    # the task record, the supervisor and a provider launched from ``child_env`` carry it. A dispatch started inside a traced run joins that trace
+    # through the TRACEPARENT it inherited; an invalid one refuses (TRACETEL-1128 Slice 3).
+    from lu_machinery.telemetry import emit
+
+    trace = emit.mint_trace()
+    record_refusal = functools.partial(admission.record_refusal, trace=trace)
+    with record_refusal(args, ALIASES.get(args.agent, args.agent), StartRefusal.ELIGIBILITY):
+        emit.join_inbound_trace(trace, os.environ)
     # An orchestrator turn runs as a workspace-write task whose record names its stream; every check
     # treats it as a write task, and its own rules key on that record field (DRIVERS-1122).
     orchestrator_requested = args.mode == "orchestrator"
@@ -531,7 +541,7 @@ def _dispatch(args) -> int:
     if orchestrator_requested or getattr(args, "stream", None) is not None:
         # First, so a flag the mode refuses gets the mode's own typed refusal.
         entry_agent = ALIASES.get(args.agent, args.agent)
-        with admission.record_refusal(args, entry_agent, StartRefusal.ELIGIBILITY):
+        with record_refusal(args, entry_agent, StartRefusal.ELIGIBILITY):
             orchestrator = _orchestrator_entry(args, entry_agent, requested=orchestrator_requested)
             turn_runtime_s, turn_ttl_s = host_admission.turn_timing(args.hard_timeout)
     if binding := store.review_binding(vars(args)):
@@ -564,7 +574,7 @@ def _dispatch(args) -> int:
     from lu_machinery.lib import rules_core
 
     agent = ALIASES.get(args.agent, args.agent)
-    with admission.record_refusal(args, agent, StartRefusal.SETUP):
+    with record_refusal(args, agent, StartRefusal.SETUP):
         try:
             seat = rules_core.require_core()
             if agent == "codex":
@@ -572,11 +582,11 @@ def _dispatch(args) -> int:
         except rules_core.RulesCoreMissing as exc:
             raise ValueError(f"dispatch refused: {exc}; the rules core is required.") from None
     if args.mode == "read-only" and args.pr is not None and not args.repo:
-        with admission.record_refusal(args, agent, StartRefusal.REVIEW_SETUP):
+        with record_refusal(args, agent, StartRefusal.REVIEW_SETUP):
             keys = ", ".join(sorted(repository_registry(git._fleet_repos_path())))
             raise ValueError(f"review_repo_required: --pr requires --repo. Pass a fleet repository key ({keys}).")
     # A CTO seat in safe mode starts no new write work. Read-only diagnosis and advisory binding still run.
-    with admission.record_refusal(args, agent, StartRefusal.ELIGIBILITY):
+    with record_refusal(args, agent, StartRefusal.ELIGIBILITY):
         if args.mode != "read-only" and not args.print_advisory_binding and (
             refusal := cto_safe_mode.refusal("write dispatch", os.environ, args.initiator)
         ):
@@ -609,13 +619,13 @@ def _dispatch(args) -> int:
         from lu_machinery.dispatcher.agy_sandbox import bind_inputs
 
         bound_inputs = bind_inputs(args.input, repo_root=git.resolve_repo(args.repo)[0])
-    with admission.record_refusal(args, agent, StartRefusal.BOUNDARY):
+    with record_refusal(args, agent, StartRefusal.BOUNDARY):
         if args.mode == "read-only" and (refusal := providers.read_only_refusal(agent)):
             raise ValueError(refusal)
     deadlines(vars(args))
     if args.cwd and (args.branch or args.pinned_head or args.worktree is not None):
         raise ValueError("invalid process deadline or conflicting existing-worktree options")
-    with admission.record_refusal(args, agent, StartRefusal.ACCOUNT):
+    with record_refusal(args, agent, StartRefusal.ACCOUNT):
         account_fields = admission.claude_account(agent, args.claude_account)
         args.claude_account = account_fields.get("claude_account", args.claude_account)
         budget = admission.claude_budget(args.claude_account, args.max_budget_usd)
@@ -644,17 +654,18 @@ def _dispatch(args) -> int:
         raise ValueError("task_id_refused: --task-id ends like a dispatcher sidecar file name")
     if store.read(task_id, missing_ok=True) is not None:
         raise ValueError("task id already exists; choose a new task id")
-    with admission.record_refusal(args, agent, StartRefusal.ELIGIBILITY):
+    with record_refusal(args, agent, StartRefusal.ELIGIBILITY):
         linkage = _parent_linkage(task_id)
+        linkage.update(trace)  # the hold publishes its linkage, and the record copies it
         # A turn's child never borrows a tree, its turn's or any other: settlement judges the turn on its own. An
         # inherited turn id counts even when the turn's record is gone or lost its orchestrator key.
         parent = os.environ.get(ownership.TASK_ID_ENV) or ""
         if args.cwd and (linkage.get("parent_stream") is not None or parent.startswith(host_admission.TURN_TASK_PREFIX)):
             raise ValueError("orchestrator_turn_writer_refused: a task an orchestrator turn dispatches cannot borrow "
                              "a tree (--cwd)")
-    with admission.record_refusal(args, agent, StartRefusal.CAPACITY):
+    with record_refusal(args, agent, StartRefusal.CAPACITY):
         host_admission.check_turn_child_cap(linkage)
-    with admission.record_refusal(args, agent, StartRefusal.ELIGIBILITY):
+    with record_refusal(args, agent, StartRefusal.ELIGIBILITY):
         github: str = active_slug(info)[0] if info.get("alternate_github") is not None else info.get("github", "")
     # Absent unless given, so an omitted --read-path leaves every other route's advisory binding unchanged.
     read_paths = getattr(args, "read_path", [])
@@ -684,7 +695,7 @@ def _dispatch(args) -> int:
         raise ValueError("--allow-open-dependency requires --task-card")
     gate_fields: dict[str, object] = {}
     if args.task_card:
-        with admission.record_refusal(args, agent, StartRefusal.ELIGIBILITY):
+        with record_refusal(args, agent, StartRefusal.ELIGIBILITY):
             gate_fields["task_card"] = checks.check_task_card(args.task_card, args.allow_open_dependency, info.get("github"))
     if args.mode != "read-only" and args.owned_path:
         overlap, not_checked = checks.owned_path_overlap(args.owned_path, task_id, info["key"])
@@ -695,21 +706,21 @@ def _dispatch(args) -> int:
             if args.refuse_on_overlap:
                 raise ValueError(f"owned_path_overlap_refused: owned paths overlap live write tasks {', '.join(overlap)}")
         gate_fields.update(owned_path_overlap=overlap, owned_path_overlap_not_checked=not_checked)
-    with admission.record_refusal(args, agent, StartRefusal.CAPACITY):
+    with record_refusal(args, agent, StartRefusal.CAPACITY):
         host_admission.precheck(args.mode, force_reason=args.force_admission)
     role_record = {**vars(args), **account_fields, "prompt_sha256": store.digest(prompt),
                    "repository_id": info.get("github")}
-    with admission.record_refusal(args, agent, StartRefusal.ELIGIBILITY):
+    with record_refusal(args, agent, StartRefusal.ELIGIBILITY):
         trial_fields = checks.check_trial_shadow(agent, args.model, role_record)
     role_record.update(trial_fields)
-    with admission.record_refusal(args, agent, StartRefusal.HEADROOM):
+    with record_refusal(args, agent, StartRefusal.HEADROOM):
         try:
             headroom.check_plan(agent, args.model, role_record,
                                 review=admission.review_typed(vars(args)) or bool(args.risk))
         except headroom.model_pause.ModelPausedRefused as exc:
             raise host_admission.Refused(f"❌ {exc}", 2) from None
         host_admission.check_credit(agent, args.model, args.codex_account)
-    with admission.record_refusal(args, agent, StartRefusal.ELIGIBILITY):
+    with record_refusal(args, agent, StartRefusal.ELIGIBILITY):
         checks.check_model_admission(agent, args.model, args.mode, vars(args), prompt)
         advisory_fields = checks.check_bounded_advisory(args, args.model, repo, prompt)
         advisory_fields.update(checks.check_advisory_role(args, agent, args.model))
@@ -725,7 +736,7 @@ def _dispatch(args) -> int:
         from lu_machinery.review.language_lane import is_ukrainian_review
         from lu_machinery.review.record_cf_verdict import GitHubAdapter, RecordError, _pr, _pr_files_and_tier
 
-        with admission.record_refusal(args, agent, StartRefusal.REVIEW_SETUP):
+        with record_refusal(args, agent, StartRefusal.REVIEW_SETUP):
             if args.cwd:
                 raise ValueError("review admission: --pr cannot borrow an existing worktree (--cwd)")
             try:
@@ -785,6 +796,8 @@ def _dispatch(args) -> int:
     if orchestrator is not None and turn_run_nonce is not None:
         options["orchestrator_stream"] = orchestrator["stream"]
         options["orchestrator_run_nonce"] = turn_run_nonce
+    # The supervisor reads its options back; child_env's TRACEPARENT names this span.
+    options.update(trace)
     if read_paths:
         options["read_paths"] = json.dumps(read_paths, separators=(",", ":"))
     if bound_inputs:
@@ -824,13 +837,13 @@ def _dispatch(args) -> int:
         **fields,
     )
     # An endpoint without access or funds is refused before a worktree or slot is taken.
-    with admission.record_refusal(args, agent, StartRefusal.ELIGIBILITY):
+    with record_refusal(args, agent, StartRefusal.ELIGIBILITY):
         checks.check_private_input(spec, info["key"])
         if agent == "opencode" and (refusal := opencode.endpoint_refusal(
             spec.provider, probe_env(spec), effort=spec.effort, worktree=worktree, repo=None if args.cwd else repo, sha=sha,
         )):
             raise ValueError(refusal)
-    with admission.record_refusal(args, agent, StartRefusal.BOUNDARY):
+    with record_refusal(args, agent, StartRefusal.BOUNDARY):
         if args.mode == "read-only" and (refusal := providers.read_only_refusal(agent, child_env(spec))):
             raise ValueError(refusal)
         if args.mode == "workspace-write" and (refusal := providers.workspace_sources_refusal(spec, child_env(spec))):
@@ -840,7 +853,7 @@ def _dispatch(args) -> int:
             raise ValueError(f"read_only_unenforceable: {refusal}")
     # A bound attempt is admitted before anything exists: its prompt is the exact render of its manifest
     # with these ids, its tools are granted and its pins are the commit's bytes (#12114).
-    with admission.record_refusal(args, agent, StartRefusal.REVIEW_SETUP):
+    with record_refusal(args, agent, StartRefusal.REVIEW_SETUP):
         review_contract = review_attempt.admit(args, prompt, binding, repo, sha) if binding and not args.dry_run else None
         low_tier = False
         if review_pr is not None:
@@ -869,7 +882,7 @@ def _dispatch(args) -> int:
         admission.review_typed(vars(args))
         or any((args.risk, args.review_mode, args.language_lane, args.subject_seat, args.subject_family, args.branch))
     ):
-        with admission.record_refusal(args, agent, StartRefusal.REVIEW_SETUP):
+        with record_refusal(args, agent, StartRefusal.REVIEW_SETUP):
             checks.check_branch_author_families(args, repo, info, sha, args.model, low_tier)
     review = any((args.review_profile, args.language_lane, args.review_author_model, args.risk,
                   args.review_mode, args.pr, args.require_review_verdict, args.subject_seat,
@@ -881,7 +894,7 @@ def _dispatch(args) -> int:
         raise ValueError("--owned-path on a read-only task that is not a review: a task that writes needs "
                          "--mode workspace-write; owned paths on a read-only task only name a review's subjects")
     if args.subject_seat or args.subject_family or (args.mode == "read-only" and args.owned_path):
-        with admission.record_refusal(args, agent, StartRefusal.REVIEW_SETUP):
+        with record_refusal(args, agent, StartRefusal.REVIEW_SETUP):
             exclusion = checks.check_review_subjects(agent, args.model, args.subject_seat, args.subject_family,
                                                     args.owned_path, review=review, repository=github)
         args.subject_seat, args.subject_family = sorted(exclusion.seats), sorted(exclusion.families)
@@ -889,7 +902,7 @@ def _dispatch(args) -> int:
             (args.review_profile or "").strip().casefold() == "ukrainian" or args.language_lane
         ):
             raise ValueError("protected subject scope needs a code-profile review without --language-lane")
-    with admission.record_refusal(args, agent, StartRefusal.CAPACITY):
+    with record_refusal(args, agent, StartRefusal.CAPACITY):
         decision = host_admission.check(
             args.mode, dry_run=args.dry_run, disk_guard=not (args.worktree is not None and (worktree / ".git").exists()),
             force_reason=force_reason,
@@ -901,7 +914,7 @@ def _dispatch(args) -> int:
         # only reads it, writing nothing.
         from lu_machinery.orchestration import dispatch_isolation
 
-        with admission.record_refusal(args, agent, StartRefusal.ELIGIBILITY):
+        with record_refusal(args, agent, StartRefusal.ELIGIBILITY):
             if not (probed := dispatch_isolation.probe_isolation()).ready:
                 raise host_admission.Refused(f"❌ orchestrator_isolation_unavailable: {probed.reason or 'unknown'}; "
                                              "a turn runs only in its own bounded scope", 3)
@@ -920,7 +933,7 @@ def _dispatch(args) -> int:
             plan["orchestrator"] = orchestrator
         print(json.dumps(plan, indent=2))
         return 0
-    with admission.record_refusal(args, agent, StartRefusal.HEADROOM):
+    with record_refusal(args, agent, StartRefusal.HEADROOM):
         try:
             headroom.check_runtime(agent, args.model, codex_account=args.codex_account)
         except headroom.RateLimitedError as exc:
@@ -939,20 +952,20 @@ def _dispatch(args) -> int:
             admission.review_typed(vars(args)) or args.risk or args.review_mode
         ):
             # Keep the budget read and worker.start's attempt publication together across concurrent reviews.
-            with admission.record_refusal(args, agent, StartRefusal.REVIEW_SETUP):
+            with record_refusal(args, agent, StartRefusal.REVIEW_SETUP):
                 stack.enter_context(git.worktree_lock(repo))
                 checks.check_review_budget(args, info, sha)
         launch = {"record": False, "started": False}  # worker.start marks each just before that step
         # A turn's run nonce exists before its lease is claimed, which names it; the hold, record and scope keep it.
         turn = {} if orchestrator is None else {"run_nonce": turn_run_nonce, "turn_ttl_s": turn_ttl_s}
-        with admission.record_refusal(args, agent, StartRefusal.CAPACITY, task_id=task_id):
+        with record_refusal(args, agent, StartRefusal.CAPACITY, task_id=task_id):
             hold = stack.enter_context(host_admission.reserve(
                 task_id, args.mode, decision, agent=agent, force_reason=force_reason,
                 spec=spec,
                 disk_guard=lambda: not (args.worktree is not None and (worktree / ".git").exists()),
                 orchestrator=orchestrator, linkage=linkage, launch=launch, **turn,
             ))
-        with admission.record_refusal(args, agent, StartRefusal.SETUP, task_id=task_id, hold=hold):
+        with record_refusal(args, agent, StartRefusal.SETUP, task_id=task_id, hold=hold):
             if binding:
                 store.check_review_attempt(binding)  # the supervisor claims it (review_attempt.run)
             if not args.cwd:
@@ -992,7 +1005,7 @@ def _dispatch(args) -> int:
             # Attach to a borrowed worktree under the lock its settlement removes it under, so an
             # active record names it before any removal can start.
             with git.worktree_lock(repo) if args.cwd else contextlib.nullcontext():
-                with admission.record_refusal(args, agent, StartRefusal.SETUP, task_id=task_id, hold=hold):
+                with record_refusal(args, agent, StartRefusal.SETUP, task_id=task_id, hold=hold):
                     if args.cwd and not worktree.is_dir():
                         raise ValueError("cwd worktree was removed before the task started")
                     # An orchestrator turn's tree is judged unchanged at its settlement: no other task may write it.

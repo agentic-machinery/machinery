@@ -3179,6 +3179,32 @@ def _store_publication(
     return "stored"
 
 
+def review_round_of(comments: Sequence[Mapping[str, Any]], login: str, sha: str) -> int:
+    """The review round of a verdict at ``sha``: its head's place among the PR's trusted verdict heads, in order.
+
+    Deterministic from the PR's own comments: every distinct reviewed head is one round, so a later verdict at an
+    already reviewed head keeps that head's round.
+    """
+    heads = list(dict.fromkeys(marker["sha"] for _, marker in _trusted_markers(comments, login)))
+    return heads.index(sha) + 1 if sha in heads else len(heads) + 1
+
+
+def _emit_review_round(task: Mapping[str, Any], task_root: Path, *, number: int, sha: str, verdict: str,
+                       comments: Sequence[Mapping[str, Any]], login: str) -> str:
+    """Write the recorded verdict's ``review.round`` telemetry event beside the task store (TRACETEL-1128 Slice 3).
+
+    Bound to the review run, its trace and the reviewed task it names; never raises past the published verdict.
+    """
+    try:
+        from lu_machinery.telemetry import emit
+
+        event = emit.review_round_event(task, pr=number, reviewed_sha=sha, verdict=verdict,
+                                        review_round=review_round_of(comments, login, sha))
+        return emit.emit_v2(event, task_root.parent)
+    except Exception as exc:  # telemetry is best effort: the verdict is already published
+        return f"error: {type(exc).__name__}"
+
+
 # A later review contests an author's outcome label with this line in its reply's ``overall.explanation``.
 _CONTEST_LINE = re.compile(r"^[ \t]*CONTEST[ \t]+([A-Za-z0-9][A-Za-z0-9._:-]{0,63})[ \t]*:[ \t]*\S", re.MULTILINE)
 MAX_EVIDENCE_CHARS = 500
@@ -3970,6 +3996,7 @@ def record(
             task_root, repository=github.stored, number=number, comment=posted_comment if posted else existing or {},
             fleet_repo_selector=github.selector,
         )
+        _emit_review_round(task, task_root, number=number, sha=sha, verdict=verdict, comments=comments, login=login)
         # The PR's own verdict comments name the round a contest binds, whatever the local ledger holds.
         contests = _store_contests(task_root, task_id, reply, head=sha, started=started,
                                    publications=_pr_verdict_entries(comments, login, repository=github.stored,
