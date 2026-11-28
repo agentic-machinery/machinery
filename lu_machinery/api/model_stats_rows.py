@@ -1784,10 +1784,13 @@ def ruff_complete(receipt: Mapping[str, Any]) -> bool:
     return classify_ruff_attempt(receipt) != "missing_or_reused_evidence"
 
 
-def _ruff_rank(receipt: Mapping[str, Any]) -> tuple[bool, str, str]:
-    # Complete beats incomplete; then the later observation; then the line digest, so any order of the same lines
-    # selects the same receipt.
-    return (ruff_complete(receipt), receipt["observed_at"], hashlib.sha256(_line(receipt)).hexdigest())
+def _ruff_rank(receipt: Mapping[str, Any]) -> tuple[bool, bool, int, str, str]:
+    """Complete beats incomplete; then more evidence (a head commit list, then more resolved finding origins), so a
+    later read that lost the comparison never replaces a proved outcome; then the later observation; then the line
+    digest, so any order of the same lines selects the same receipt."""
+    resolved = sum(finding["origin"] != "unresolved" for finding in receipt["findings"] or [])
+    return (ruff_complete(receipt), receipt["head_commits"] is not None, resolved, receipt["observed_at"],
+            hashlib.sha256(_line(receipt)).hexdigest())
 
 
 def ruff_path(batch_state_dir: Path) -> Path:
@@ -1931,19 +1934,32 @@ def added_lines(patch: object) -> set[int] | None:
     return added
 
 
-def finding_origins(annotations: list[Mapping[str, Any]], comparison: Mapping[str, Any] | None) -> list[dict[str, str]]:
-    """Each Ruff annotation as ``{code, origin}``: ``pr`` on a line the pull request added, ``base`` in a file the
-    pull request left alone (when the file list is whole and no Ruff configuration changed), else ``unresolved``.
+def _whole_files(comparison: Mapping[str, Any] | None) -> dict[str, Mapping[str, Any]] | None:
+    """A comparison's files by name, or None unless the list is provably whole (GitHub stops at 300, silently)."""
+    if comparison is None:
+        return None
+    files: dict[str, Mapping[str, Any]] = {item["filename"]: item for item in comparison["files"]
+                                           if isinstance(item, dict) and isinstance(item.get("filename"), str)}
+    return files if len(comparison["files"]) < 300 and len(files) == len(comparison["files"]) else None
 
-    The merge tree's copy of an untouched file is the base's copy, so its findings were already on the base.
+
+def finding_origins(annotations: list[Mapping[str, Any]], comparison: Mapping[str, Any] | None,
+                    base_side: Mapping[str, Any] | None) -> list[dict[str, str]]:
+    """Each Ruff annotation as ``{code, origin}``.
+
+    The CI job lints the pull request's merge with its base, so an annotation's line is a line of the merge tree.
+    ``comparison`` is ``base...head`` (what the pull request changed since the merge-base) and ``base_side`` is
+    ``head...base`` (what the base changed since then). A file the base left alone has the pull request's lines in
+    the merge tree, so a finding on a line the pull request added there is ``pr``. A file the pull request left
+    alone is the base's copy, so its finding is ``base`` (when the file list is whole and no Ruff configuration
+    changed). Anything else, including any file both sides changed, is ``unresolved``.
     """
     files: dict[str, Mapping[str, Any]] = {}
-    whole = False
     if comparison is not None:
         files = {item["filename"]: item for item in comparison["files"]
                  if isinstance(item, dict) and isinstance(item.get("filename"), str)}
-        # GitHub lists at most 300 files of a comparison and says nothing when it stops there.
-        whole = len(comparison["files"]) < 300 and len(files) == len(comparison["files"])
+    whole = _whole_files(comparison) is not None
+    base_changed = _whole_files(base_side)
     config_changed = any(_basename(name) in RUFF_CONFIG_FILES for name in files)
     findings = []
     for annotation in annotations:
@@ -1957,7 +1973,8 @@ def finding_origins(annotations: list[Mapping[str, Any]], comparison: Mapping[st
             changed = files.get(path)
             if changed is None:
                 origin = "base" if whole and not config_changed else "unresolved"
-            elif (lines := added_lines(changed.get("patch"))) is not None and line in lines:
+            elif (base_changed is not None and path not in base_changed
+                  and (lines := added_lines(changed.get("patch"))) is not None and line in lines):
                 origin = "pr"
         findings.append({"code": match[1], "origin": origin})
     return findings
@@ -1993,8 +2010,8 @@ def _diff_size(comparison: Mapping[str, Any] | None) -> int | None:
     if comparison is None:
         return None
     files = comparison["files"]
-    if len(files) >= 300 or not all(isinstance(item, dict) and _count_value(item.get("additions"))
-                                    and _count_value(item.get("deletions")) for item in files):
+    if _whole_files(comparison) is None or not all(_count_value(item.get("additions"))
+                                                   and _count_value(item.get("deletions")) for item in files):
         return None
     total: int = sum(item["additions"] + item["deletions"] for item in files)
     return total
@@ -2154,7 +2171,14 @@ def import_ruff_attempts(batch_state_dir: Path, client: Any, *, repository: str,
                     partial(github_client.compare_commits, client, repository, base_sha, head),
                     "compares_unreadable", interval=False)
             comparison = comparisons.get((base_sha, head)) if base_sha is not None else None
-            done = comparison is not None
+            if base_sha is not None and comparison is None:
+                # A receipt without its comparison would carry less evidence than one an earlier read may have stored:
+                # record nothing for this run now and read it again on the next collection.
+                counts["runs_deferred"] += 1
+                known[str(run_id)] = {"created_at": _utc_iso(created), "done": False, "pr": pr, "base_sha": base_sha,
+                                      "attempts": entry["attempts"] if entry else 0}
+                continue
+            done, deferred, run_receipts = True, False, []
             for attempt in range(1, run["run_attempt"] + 1):
                 jobs = read(partial(github_client.attempt_jobs, client, repository, run_id, attempt),
                             "jobs_unreadable", interval=False)
@@ -2172,7 +2196,17 @@ def import_ruff_attempts(batch_state_dir: Path, client: Any, *, repository: str,
                 if _lint_failed(steps):
                     annotations = read(partial(github_client.check_run_annotations, client, repository, job["id"]),
                                        "annotations_unreadable", interval=False)
-                    findings = None if annotations is None else finding_origins(annotations, comparison)
+                    base_side = None
+                    if base_sha is not None:
+                        if (head, base_sha) not in comparisons:
+                            comparisons[(head, base_sha)] = read(
+                                partial(github_client.compare_commits, client, repository, head, base_sha),
+                                "compares_unreadable", interval=False)
+                        base_side = comparisons[(head, base_sha)]
+                        if base_side is None:
+                            deferred = True
+                            break
+                    findings = None if annotations is None else finding_origins(annotations, comparison, base_side)
                 receipt = {
                     "schema": RUFF_SCHEMA, "repository": repository, "repository_id": repository_id, "pr": pr,
                     "measured_head_sha": head, "check_name": check_name, "check_run_id": job["id"],
@@ -2185,10 +2219,16 @@ def import_ruff_attempts(batch_state_dir: Path, client: Any, *, repository: str,
                     "head_commits": _head_commits(comparison), "diff_size": _diff_size(comparison),
                     "check_version": label(f"{RUFF_SCHEMA}:{workflow}", "unknown"), "observed_at": observed_at,
                 }
-                receipts.append(receipt)
+                run_receipts.append(receipt)
                 done = done and ruff_complete(receipt)
-            known[str(run_id)] = {"created_at": _utc_iso(created), "done": done, "pr": pr, "base_sha": base_sha,
-                                  "attempts": run["run_attempt"]}
+            if deferred:
+                counts["runs_deferred"] += 1
+                known[str(run_id)] = {"created_at": _utc_iso(created), "done": False, "pr": pr, "base_sha": base_sha,
+                                      "attempts": entry["attempts"] if entry else 0}
+                continue
+            receipts.extend(run_receipts)
+            known[str(run_id)] = {"created_at": _utc_iso(created), "done": done and comparison is not None, "pr": pr,
+                                  "base_sha": base_sha, "attempts": run["run_attempt"]}
         intervals = state["incomplete_intervals"]
         for key, item in list(known.items()):
             if cast(datetime, timestamp(item["created_at"])) < revisit_after:

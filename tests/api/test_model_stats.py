@@ -2767,31 +2767,57 @@ def test_red_first_head_is_kept_beside_the_green_head_that_followed_it(tmp_path)
 _PATCH = "@@ -10,2 +10,3 @@\n context\n+import os\n context"
 
 
-@pytest.mark.parametrize(("annotation", "files", "origin"), [
-    ({"path": "lu_machinery/x.py", "start_line": 11, "title": "ruff (F401)"}, [("lu_machinery/x.py", _PATCH)], "pr"),
-    ({"path": "lu_machinery/y.py", "start_line": 3, "title": "Ruff (E501)"}, [("lu_machinery/x.py", _PATCH)], "base"),
-    ({"path": "lu_machinery/x.py", "start_line": 10, "title": "ruff (F401)"}, [("lu_machinery/x.py", _PATCH)],
+@pytest.mark.parametrize(("annotation", "files", "base_files", "origin"), [
+    ({"path": "lu_machinery/x.py", "start_line": 11, "title": "ruff (F401)"}, [("lu_machinery/x.py", _PATCH)], [],
+     "pr"),
+    ({"path": "lu_machinery/y.py", "start_line": 3, "title": "Ruff (E501)"}, [("lu_machinery/x.py", _PATCH)], [],
+     "base"),
+    ({"path": "lu_machinery/y.py", "start_line": 3, "title": "ruff (E501)"}, [("lu_machinery/x.py", _PATCH)],
+     ["lu_machinery/y.py"], "base"),
+    ({"path": "lu_machinery/x.py", "start_line": 10, "title": "ruff (F401)"}, [("lu_machinery/x.py", _PATCH)], [],
      "unresolved"),
+    # The base changed the file too: the merge tree's line numbers are not the pull request's.
+    ({"path": "lu_machinery/x.py", "start_line": 11, "title": "ruff (F401)"}, [("lu_machinery/x.py", _PATCH)],
+     ["lu_machinery/x.py"], "unresolved"),
+    ({"path": "lu_machinery/x.py", "start_line": 11, "title": "ruff (F401)"}, [("lu_machinery/x.py", _PATCH)],
+     None, "unresolved"),
+    ({"path": "lu_machinery/x.py", "start_line": 11, "title": "ruff (F401)"}, [("lu_machinery/x.py", _PATCH)],
+     [f"lu_machinery/f{index}.py" for index in range(300)], "unresolved"),
     ({"path": "lu_machinery/y.py", "start_line": 3, "title": "ruff (E501)"},
-     [("lu_machinery/x.py", _PATCH), ("pyproject.toml", None)], "unresolved"),
+     [("lu_machinery/x.py", _PATCH), ("pyproject.toml", None)], [], "unresolved"),
     ({"path": "lu_machinery/y.py", "start_line": 3, "title": "ruff (E501)"},
-     [(f"lu_machinery/f{index}.py", None) for index in range(300)], "unresolved"),
+     [(f"lu_machinery/f{index}.py", None) for index in range(300)], [], "unresolved"),
     ({"path": "/home/runner/work/lu_machinery/y.py", "start_line": 3, "title": "ruff (E501)"},
-     [("lu_machinery/x.py", _PATCH)], "unresolved"),
-    ({"path": "lu_machinery/x.py", "start_line": 11, "title": "ruff (F401)"}, [("lu_machinery/x.py", None)],
+     [("lu_machinery/x.py", _PATCH)], [], "unresolved"),
+    ({"path": "lu_machinery/x.py", "start_line": 11, "title": "ruff (F401)"}, [("lu_machinery/x.py", None)], [],
      "unresolved"),
-], ids=["added-line", "untouched-file", "unchanged-line", "config-changed", "file-list-capped", "outside-tree",
-        "no-patch"])
-def test_ruff_findings_are_attributed_to_the_pr_only_on_lines_it_added(annotation, files, origin):
-    """Defect class: a Ruff finding blamed on the pull request, or cleared as a base finding, without a whole
-    comparison that proves where it came from (AC-05, AC-06)."""
+], ids=["added-line", "untouched-file", "untouched-file-base-changed", "unchanged-line", "both-changed",
+        "base-side-unread", "base-side-capped", "config-changed", "file-list-capped", "outside-tree", "no-patch"])
+def test_ruff_findings_are_attributed_to_the_pr_only_on_lines_it_added(annotation, files, base_files, origin):
+    """Defect class: a Ruff finding blamed on the pull request, or cleared as a base finding, without whole
+    comparisons that prove where it came from in the merge tree the job linted (AC-05, AC-06)."""
     comparison = {"total_commits": 1, "commits": [{"sha": "1" * 40}],
                   "files": [{"filename": name, "additions": 1, "deletions": 0, "patch": patch}
                             for name, patch in files]}
+    base_side = None if base_files is None else {
+        "total_commits": 1, "commits": [{"sha": "2" * 40}],
+        "files": [{"filename": name, "additions": 1, "deletions": 0, "patch": None} for name in base_files]}
     noise = {"path": ".github", "start_line": 66, "title": ""}  # the step's exit-code annotation, not a finding
-    assert rows.finding_origins([noise, annotation], comparison) == [
+    assert rows.finding_origins([noise, annotation], comparison, base_side) == [
         {"code": annotation["title"].split("(")[1].rstrip(")"), "origin": origin}]
-    assert rows.finding_origins([annotation], None)[0]["origin"] == "unresolved"
+    assert rows.finding_origins([annotation], None, base_side)[0]["origin"] == "unresolved"
+
+
+def test_a_later_receipt_with_less_evidence_never_replaces_a_proved_outcome(tmp_path):
+    """Defect class: a later read of one attempt that lost its comparison (no head commits, unresolved findings)
+    outranking the receipt that proved a PR-introduced failure and its attribution (round 1 F1, AC-01, AC-07)."""
+    batch_state, _ = _state(tmp_path)
+    proved = _failed_lint("pr", observed_at=(NOW - timedelta(hours=3)).isoformat())
+    weaker = _failed_lint("unresolved", head_commits=None, observed_at=(NOW - timedelta(hours=1)).isoformat())
+    assert rows.classify_ruff_attempt(weaker) == "ambiguous_base_or_merge_context" and rows.ruff_complete(weaker)
+    for batch in ([proved, weaker], [weaker, proved]):
+        rows.record_ruff_attempts(batch_state, batch)
+        assert rows.read_ruff_attempts(batch_state)[0] == [proved]
 
 
 class _RuffGitHub:
@@ -2864,6 +2890,9 @@ def test_ruff_collector_reads_forward_every_attempt_and_reports_incomplete_inter
             {"path": "lu_machinery/x.py", "start_line": 2, "title": "ruff (F401)"},
             {"path": ".github", "start_line": 1, "title": ""}],
         f"{root}/compare/{base}...{head_a}": compare, f"{root}/compare/{base}...{head_b}": compare,
+        # What the base changed since the merge-base (the lint ran on the merge): nothing here.
+        f"{root}/compare/{head_a}...{base}": {"total_commits": 0, "commits": [], "files": []},
+        f"{root}/compare/{head_b}...{base}": {"total_commits": 0, "commits": [], "files": []},
         f"{root}/commits/{head_a}/check-runs": {"total_count": 2, "check_runs": [
             _check_run(9001, 501, head_a), _check_run(9002, 501, head_a)]},
         # Head B also carries a rerun of a run created before the pilot: one attempt before it, one after.
@@ -2905,8 +2934,11 @@ def test_ruff_collector_reads_forward_every_attempt_and_reports_incomplete_inter
     # An inventory GitHub cannot prove whole leaves the watermark and is reported as an incomplete interval.
     documents[f"{root}/actions/workflows/ci-gate.yml/runs?inventory"] = {"total_count": 3, "workflow_runs": []}
     later = NOW + timedelta(hours=1)
+    # A revisit that cannot read a run's comparison records nothing for that run (round 1 F1).
+    del documents[f"{root}/compare/{base}...{head_b}"]
     revisit = rows.import_ruff_attempts(batch_state, client, repository=RUFF_REPO, now=later)
-    assert revisit["receipts_observed"] == 2 and revisit["receipts_added"] == 0, revisit
+    assert (revisit["receipts_observed"], revisit["runs_deferred"]) == (0, 1), revisit
+    assert len(rows.read_ruff_attempts(batch_state)[0]) == 5
     state = rows.read_ruff_state(batch_state)
     assert state["watermark"] == NOW.isoformat()
     assert state["incomplete_intervals"] == [
