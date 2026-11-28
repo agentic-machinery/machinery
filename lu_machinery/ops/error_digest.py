@@ -40,12 +40,14 @@ _EGRESS_TIMEOUT_S = 60
 _MICROSECOND = timedelta(microseconds=1)
 _VERSION = "v1"
 _LEDGER = "error-digest-kinds.v1.json"
-_PENDING = ".error-digest-pending.v1.json"
+_PUBLISH_STATE = ".error-digest-publish.v1.json"
 _REPORT_PREFIX = "error-digest-"
 _TOP_KINDS = 10
 _JOURNAL_HEADLINE_LIMIT = 140
 _JOURNAL_BODY_LIMIT = 2000
 _SIGNATURE = re.compile(r"[0-9a-f]{12}")
+_PROPOSAL_KEY = re.compile(r"error-digest:([0-9]{4}-[0-9]{2}-[0-9]{2})(?::[1-9][0-9]*)?")
+_SHA256 = re.compile(r"[0-9a-f]{64}")
 _SEVERITIES = ("error", "warning", "unparsed")
 _TIMESTAMP = re.compile(
     r"(?<!\w)\d{4}-\d\d-\d\d(?:[Tt ]\d\d:\d\d:\d\d(?:[.,]\d+)?(?:[Zz]|[+-]\d\d:?\d\d| UTC)?)?(?!\w)"
@@ -75,6 +77,10 @@ _EMAIL_NAME_PUNCTUATION = frozenset("_.!#$%&'*+/=?^`{|}~-" + "".join(_MARKERS.va
 
 class DigestError(ValueError):
     """A refusal safe to display without source paths or payload text."""
+
+
+class PartialJournalError(DigestError):
+    """A journal window that can no longer be reconstructed."""
 
 
 def _address(match: re.Match[str]) -> str:
@@ -266,7 +272,7 @@ class Digest:
     def collect_journal(self, start: datetime, end: datetime, deadline: float) -> int:
         first, stop = _micros(start), _micros(end)
         if _journal_head(deadline) > first:
-            raise DigestError("journal: partial (head_after_window_start)")
+            raise PartialJournalError("journal: partial (head_after_window_start)")
 
         tagged = set()
         for row in _journal_rows(
@@ -330,7 +336,7 @@ class Digest:
             self.add("journal", (family,), severity, message, literal=unit_failed)
 
         if _journal_head(deadline) > first:
-            raise DigestError("journal: partial (head_moved_into_window)")
+            raise PartialJournalError("journal: partial (head_moved_into_window)")
         self.unproven = {family for family, units in units_seen.items() if units - tagged}
         return entries
 
@@ -470,18 +476,10 @@ def _date_text(value: object) -> bool:
     return isinstance(value, str) and date.fromisoformat(value).isoformat() == value
 
 
-def _load_state(path: Path, *, pending: bool = False) -> dict[str, Any]:
-    """An absent ledger is empty. An invalid ledger or staged proposal blocks egress."""
+def _load_ledger(path: Path) -> dict[str, Any]:
+    """An absent ledger is empty. An invalid ledger blocks proposals."""
     try:
-        value = json_depth.loads(path.read_text(), max_depth=4)
-        records = value["kinds"] if pending else value
-        if pending and (
-            not _date_text(value["day"])
-            or not isinstance(value["body"], str) or not value["body"].strip()
-            or not isinstance(value["sender"], str) or not value["sender"].strip()
-            or not records
-        ):
-            raise ValueError
+        records = json_depth.loads(path.read_text(), max_depth=3)
         if not isinstance(records, dict):
             raise ValueError
         for sig, row in records.items():
@@ -490,18 +488,69 @@ def _load_state(path: Path, *, pending: bool = False) -> dict[str, Any]:
                 or not _date_text(row["first_seen"])
                 or not isinstance(row["template"], str) or not isinstance(row["source"], str)
                 or row["severity"] not in _SEVERITIES
-                or (not pending and (
-                    not _date_text(row["proposal_day"]) or store.parse_utc_timestamp(row["proposed_at"]) is None
-                ))
+                or not _date_text(row["proposal_day"])
+                or store.parse_utc_timestamp(row["proposed_at"]) is None
             ):
                 raise ValueError
     except FileNotFoundError:
         return {}
     except (KeyError, TypeError, ValueError, RecursionError):
-        label = "pending proposal" if pending else "ledger"
-        raise DigestError(f"{label}: unavailable (invalid_state)") from None
-    assert isinstance(value, dict)
-    return value
+        raise DigestError("ledger: unavailable (invalid_state)") from None
+    return records
+
+
+def _valid_attempt_key(key: str) -> bool:
+    match = _PROPOSAL_KEY.fullmatch(key)
+    return match is not None and _date_text(match[1])
+
+
+def _load_publish_state(path: Path) -> dict[str, Any]:
+    try:
+        state = json_depth.loads(path.read_text(), max_depth=4)
+        if not isinstance(state, dict) or not isinstance(state["delivery_unknown"], dict):
+            raise ValueError
+        unknown = state["delivery_unknown"]
+        if any(not _valid_attempt_key(key) or not _SHA256.fullmatch(body) for key, body in unknown.items()):
+            raise ValueError
+        attempt = state["attempt"]
+        if attempt is not None and (
+            not isinstance(attempt, dict) or not _valid_attempt_key(attempt["key"])
+            or attempt["key"] in unknown or not _SHA256.fullmatch(attempt["body_sha256"])
+            or not isinstance(attempt["kinds"], list) or not attempt["kinds"]
+            or not all(_SIGNATURE.fullmatch(sig) for sig in attempt["kinds"])
+        ):
+            raise ValueError
+    except FileNotFoundError:
+        return {"attempt": None, "delivery_unknown": {}}
+    except (KeyError, TypeError, ValueError, RecursionError):
+        raise DigestError("publish state: unavailable (invalid_state)") from None
+    return state
+
+
+def _finish_attempt(state: dict, path: Path, *, delivered: bool) -> None:
+    attempt = state["attempt"]
+    if not delivered:
+        state["delivery_unknown"][attempt["key"]] = attempt["body_sha256"]
+    state["attempt"] = None
+    _write_state(path, _json_bytes(state), replace=True)
+
+
+def _unknown_notes(state: dict, day: date) -> str:
+    if not state:
+        return ""
+    base_key = f"error-digest:{day}"
+    attempts = {
+        int(key.removeprefix(base_key).removeprefix(":") or "0"): body_sha
+        for key, body_sha in state["delivery_unknown"].items()
+        if key == base_key or key.startswith(f"{base_key}:")
+    }
+    if not attempts:
+        return ""
+    latest = max(attempts)
+    return (
+        f"Fleet delivery_unknown for {day} attempt {latest}, body SHA-256 {attempts[latest]}. "
+        f"Uncertain attempts on this day: {len(attempts)}."
+    )
 
 
 def _safe_output(text: str) -> str:
@@ -561,19 +610,20 @@ def _kind_line(kind: dict[str, Any]) -> str:
     return f'- {kind["sig"]} ({kind["count"]}): {_cell(group)} {_cell(kind["severity"])} - {_cell(kind["template"])}'
 
 
-def _journal_summary(report: dict, new_count: int, ledger_error: str) -> tuple[str, str]:
+def _journal_summary(report: dict, new_count: int | None, banner: str) -> tuple[str, str]:
     day = report["day"]
     units = report["journal"]["units"]
     unproven = sum(unit.get("coverage") == "severity unproven" for unit in units)
     totals = report["totals"]
     kinds = report["kinds"]
+    new = f"{new_count} new" if new_count is not None else "new kind count unknown"
     headline = (
         f'Error digest {day}: {totals["error"]} errors, {totals["warning"]} warnings, '
-        f'{len(kinds)} kinds ({new_count} new); {unproven} units unproven'
+        f'{len(kinds)} kinds ({new}); {unproven} units unproven'
     )
     lines = [f"Full table: error-digest-{day}.json", f'Withheld by OPSEC scan: {report["withheld"]}.']
-    if ledger_error:
-        lines.insert(0, ledger_error)
+    if banner:
+        lines.insert(0, banner)
     if report["tasks"]["status"] == "unavailable":
         lines.append("Task counts unavailable.")
     lines.extend(("", "Top kinds"))
@@ -642,27 +692,25 @@ def _backfill_start(day: date, saved: set[date], deadline: float) -> date:
 
 def _collect_for_publish(
     directory: Path, day: date, *, backfill: bool, ledger: dict, ledger_error: str,
-    cli: str, sender: str, deadline: float,
-) -> list[dict[str, Any]]:
+    state: dict, recovered_day: date | None, cli: str, sender: str, deadline: float,
+) -> tuple[list[dict[str, Any]], dict, int | None]:
     saved = _saved_days(directory, day)
-    # A failed window still needs time to post its unavailable status.
-    report_deadline = deadline - _EGRESS_TIMEOUT_S
-    try:
-        start = _backfill_start(day, saved, report_deadline) if backfill else day
-    except DigestError as exc:
-        _post_journal(cli, day, f"Error digest {day}: journal unavailable", str(exc), sender, deadline)
-        raise
+    # Leave time for the last day's Fleet attempt and journal note.
+    report_deadline = deadline - 2 * _EGRESS_TIMEOUT_S
+    start = _backfill_start(day, saved, report_deadline) if backfill else day
     due = {start + timedelta(days=offset) for offset in range((day - start).days + 1)}
     if backfill and saved:
         # The last persisted report may have been followed by a failed journal write.
         due.add(max(saved - {day}, default=day))
+    if recovered_day is not None and recovered_day in saved:
+        due.add(recovered_day)
     candidates: dict[str, dict[str, Any]] = {}
     for current in sorted(saved | due):
         try:
             report = _read_report(persisted_payload(current, directory, deadline=report_deadline), current)
-        except DigestError as exc:
+        except PartialJournalError as exc:
             if current in due:
-                _post_journal(cli, current, f"Error digest {current}: counts unavailable", str(exc), sender, deadline)
+                _post_journal(cli, current, f"Error digest {current}: journal partial", str(exc), sender, deadline)
             raise
         new_count = 0
         for kind in report["kinds"]:
@@ -674,13 +722,17 @@ def _collect_for_publish(
             else:
                 candidates[sig] = {**kind, "first_seen": current.isoformat()}
                 new_count += 1
-        if current in due:
-            headline, body = _journal_summary(report, new_count, ledger_error)
+        count = None if ledger_error else new_count
+        if current in due and current != day:
+            banner = "\n".join(filter(None, (ledger_error, _unknown_notes(state, current))))
+            headline, body = _journal_summary(report, count, banner)
             _post_journal(cli, current, headline, body, sender, deadline)
-    return _rank(list(candidates.values()))
+    # The target is the last day in the collection. Its note includes the
+    # outcome of this invocation's Fleet attempt.
+    return _rank(list(candidates.values())), report, count
 
 
-def _prepare_proposal(day: date, sender: str, kinds: list[dict[str, Any]], max_new: int) -> dict:
+def _prepare_proposal(day: date, kinds: list[dict[str, Any]], max_new: int) -> tuple[str, dict[str, Any]]:
     lines = [f"Error digest {day}. Suggested issues for {len(kinds)} new kinds."]
     if len(kinds) > max_new:
         groups: dict[str, list[int]] = {}
@@ -697,29 +749,21 @@ def _prepare_proposal(day: date, sender: str, kinds: list[dict[str, Any]], max_n
         kinds = kinds[:_TOP_KINDS]
         lines.append("")
     lines.extend(_kind_line(kind) for kind in kinds)
-    return {
-        "day": day.isoformat(),
-        "sender": sender,
-        "body": _safe_output("\n".join(lines)),
-        "kinds": {
-            kind["sig"]: {key: kind[key] for key in ("first_seen", "source", "severity", "template")}
-            for kind in kinds
-        },
+    return _safe_output("\n".join(lines)), {
+        kind["sig"]: {key: kind[key] for key in ("first_seen", "source", "severity", "template")}
+        for kind in kinds
     }
 
 
-def _publish_proposal(proposal: dict, deadline: float) -> None:
+def _publish_proposal(body: str, sender: str, key: str, deadline: float) -> None:
     command = (
         [_command("LU_ERROR_DIGEST_FLEET_CLI")]
         if "LU_ERROR_DIGEST_FLEET_CLI" in os.environ
         else [sys.executable, "-I", "-m", "lu_machinery.fleet_comms"]
     )
-    body = proposal["body"]
-    if _safe_output(body) != body:
-        raise DigestError("pending proposal: refused (egress_changed)")
     _send(
-        [*command, "channel", "publish", "cto", "-", "--sender", proposal["sender"],
-         "--recipient", "claude-cto", "--kind", "proposal", "--idempotency-key", f'error-digest:{proposal["day"]}'],
+        [*command, "channel", "publish", "cto", "-", "--sender", sender,
+         "--recipient", "claude-cto", "--kind", "proposal", "--idempotency-key", key],
         "Fleet publish", deadline, input=body.encode(),
     )
 
@@ -728,7 +772,7 @@ def _publish_run(day: date, directory: Path, sender: str, *, backfill: bool, max
     cli = _command("LU_DRIVER_STATE_CLI")
     deadline = time.monotonic() + _JOURNAL_TIMEOUT_S
     ledger_path = directory / _LEDGER
-    pending_path = directory / _PENDING
+    state_path = directory / _PUBLISH_STATE
     require_not_direct_task_store_path(ledger_path, label="error digest ledger")
     directory.mkdir(parents=True, exist_ok=True)
     directory_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
@@ -738,37 +782,48 @@ def _publish_run(day: date, directory: Path, sender: str, *, backfill: bool, max
         except BlockingIOError:
             raise DigestError("publish: unavailable (another_digest_running)") from None
 
-        ledger, pending, ledger_error = {}, {}, ""
+        ledger, state, ledger_error = {}, {}, ""
         try:
-            ledger = _load_state(ledger_path)
-            pending = _load_state(pending_path, pending=True)
+            ledger = _load_ledger(ledger_path)
+            state = _load_publish_state(state_path)
         except DigestError as exc:
             ledger_error = str(exc)
-        kinds = _collect_for_publish(
+        recovered_day = None
+        if attempt := state.get("attempt"):
+            matched_day = attempt["key"].split(":")[1]
+            recovered_day = date.fromisoformat(matched_day)
+            # The ledger replacement is atomic. If it did not commit, an
+            # interrupted attempt cannot establish delivery and its key is spent.
+            delivered = all(ledger.get(sig, {}).get("proposal_day") == matched_day for sig in attempt["kinds"])
+            _finish_attempt(state, state_path, delivered=delivered)
+        kinds, report, count = _collect_for_publish(
             directory, day, backfill=backfill, ledger=ledger, ledger_error=ledger_error,
-            cli=cli, sender=sender, deadline=deadline,
+            state=state, recovered_day=recovered_day, cli=cli, sender=sender, deadline=deadline,
         )
-        if ledger_error:
-            raise DigestError(ledger_error)
-        if pending and all(
-            ledger.get(sig, {}).get("proposal_day") == pending["day"] for sig in pending["kinds"]
-        ):
-            # A crash after ledger commit can leave the staging file behind.
-            pending_path.unlink()
-            pending = {}
-        if not pending:
-            if not kinds or any(row["proposal_day"] == day.isoformat() for row in ledger.values()):
-                return
-            pending = _prepare_proposal(day, sender, kinds, max_new)
-            # Fleet binds a key to the exact body. A retry across midnight must
-            # finish the staged proposal before it considers newer kinds.
-            _write_state(pending_path, _json_bytes(pending), replace=False)
-        _publish_proposal(pending, deadline)
-        proposed_at = datetime.now(UTC).isoformat()
-        for sig, row in pending["kinds"].items():
-            ledger[sig] = {**row, "proposed_at": proposed_at, "proposal_day": pending["day"]}
-        _write_state(ledger_path, _json_bytes(ledger), replace=True)
-        pending_path.unlink()
+        failure = DigestError(ledger_error) if ledger_error else None
+        if not failure and kinds and not any(row["proposal_day"] == day.isoformat() for row in ledger.values()):
+            body, proposed = _prepare_proposal(day, kinds, max_new)
+            sequence = len(state["delivery_unknown"])
+            key = f"error-digest:{day}:{sequence}" if sequence else f"error-digest:{day}"
+            state["attempt"] = {"key": key, "body_sha256": hashlib.sha256(body.encode()).hexdigest(),
+                                "kinds": list(proposed)}
+            _write_state(state_path, _json_bytes(state), replace=True)
+            try:
+                _publish_proposal(body, sender, key, deadline - _EGRESS_TIMEOUT_S)
+            except DigestError as exc:
+                _finish_attempt(state, state_path, delivered=False)
+                failure = exc
+            else:
+                proposed_at = datetime.now(UTC).isoformat()
+                for sig, row in proposed.items():
+                    ledger[sig] = {**row, "proposed_at": proposed_at, "proposal_day": day.isoformat()}
+                _write_state(ledger_path, _json_bytes(ledger), replace=True)
+                _finish_attempt(state, state_path, delivered=True)
+        banner = "\n".join(filter(None, (ledger_error, _unknown_notes(state, day))))
+        headline, journal_body = _journal_summary(report, count, banner)
+        _post_journal(cli, day, headline, journal_body, sender, deadline)
+        if failure:
+            raise failure
     finally:
         os.close(directory_fd)
 

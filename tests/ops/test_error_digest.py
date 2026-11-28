@@ -1,5 +1,6 @@
 """Exercise the daily report with a journalctl fake and a private task store."""
 
+import hashlib
 import json
 import os
 import subprocess
@@ -190,7 +191,7 @@ else:
     ]
     assert len(args) == 12
     target, key, body = "fleet", args[11], sys.stdin.read()
-    if os.environ.get("DIGEST_FAKE_FLEET_FAIL"):
+    if os.environ.get("DIGEST_FAKE_FLEET_FAIL") == "before_write":
         sys.exit(1)
 path = Path(os.environ["DIGEST_FIXTURE"], target + "-writes.json")
 writes = json.loads(path.read_text()) if path.exists() else {}
@@ -200,6 +201,8 @@ if key in writes:
 else:
     writes[key] = body
     path.write_text(json.dumps(writes))
+if target == "fleet" and os.environ.get("DIGEST_FAKE_FLEET_FAIL") == "after_write":
+    sys.exit(1)
 """
     )
     fake.chmod(0o700)
@@ -216,7 +219,7 @@ else:
 def _publish(directory: Path, day: str = _DAY) -> subprocess.CompletedProcess[str]:
     env = {
         name: os.environ[name] for name in (
-            "PATH", "DIGEST_FIXTURE", "DIGEST_FAKE_FLEET_FAIL", "LU_HOST_CONTEXT",
+            "PATH", "DIGEST_FIXTURE", "DIGEST_FIXTURE_EXIT", "DIGEST_FAKE_FLEET_FAIL", "LU_HOST_CONTEXT",
             "LU_DRIVER_STATE_CLI", "LU_ERROR_DIGEST_FLEET_CLI",
         ) if name in os.environ
     }
@@ -227,9 +230,15 @@ def _publish(directory: Path, day: str = _DAY) -> subprocess.CompletedProcess[st
     )
 
 
-def test_second_run_same_day_adds_no_entry_or_message(journal, destinations):
+def test_second_run_same_day_adds_no_entry_or_message(journal, destinations, monkeypatch):
     """A rerun can duplicate the journal entry or Fleet proposal."""
     directory = journal([_entry(PRIORITY="3"), _entry(PRIORITY="3")])
+    monkeypatch.setenv("DIGEST_FIXTURE_EXIT", "1")
+    failed = _publish(directory)
+    assert failed.returncode == 1
+    assert "journal: unavailable (journalctl_refused)" in failed.stderr
+    assert destinations("journal") == destinations("fleet") == {}
+    monkeypatch.delenv("DIGEST_FIXTURE_EXIT")
     first = _publish(directory)
     assert first.returncode == 0, first.stderr
     notes, proposals = destinations("journal"), destinations("fleet")
@@ -260,25 +269,40 @@ def test_failed_publish_leaves_ledger_unchanged(journal, destinations, monkeypat
     ledger = directory / "error-digest-kinds.v1.json"
     ledger.write_text("{}\n")
     previous = ledger.read_bytes()
-    monkeypatch.setenv("DIGEST_FAKE_FLEET_FAIL", "1")
+    monkeypatch.setenv("DIGEST_FAKE_FLEET_FAIL", "before_write")
     failed = _publish(directory)
     assert failed.returncode == 1
     assert "Fleet publish: unavailable (write_refused)" in failed.stderr
     assert ledger.read_bytes() == previous
     assert destinations("fleet") == {}
-    assert list(destinations("journal")) == [f"error-digest:{_DAY}"]
+    key = f"error-digest:{_DAY}"
+    state = directory / ".error-digest-publish.v1.json"
+    audit = json.loads(state.read_bytes())
+    assert audit["attempt"] is None
+    body_sha = audit["delivery_unknown"][key]
+    assert f"delivery_unknown for {_DAY} attempt 0, body SHA-256 {body_sha}" in destinations("journal")[key]
 
-    # The next successful run must finish the staged proposal with its original
-    # key even after the scheduled day has advanced.
+    # Ambiguous completion after a later publish must still leave the kind
+    # ledger unchanged. Both days' kinds remain eligible under a fresh key.
     next_day = "2025-02-02"
     journal([_entry(PRIORITY="3", MESSAGE="new failure", __REALTIME_TIMESTAMP=str(_START + 86_400_000_000))])
+    monkeypatch.setenv("DIGEST_FAKE_FLEET_FAIL", "after_write")
+    ambiguous = _publish(directory, next_day)
+    assert ambiguous.returncode == 1
+    assert ledger.read_bytes() == previous
+    ambiguous_key = f"error-digest:{next_day}:1"
+    fleet = destinations("fleet")
+    assert list(fleet) == [ambiguous_key]
+    audit = json.loads(state.read_bytes())
+    assert audit["delivery_unknown"][ambiguous_key] == hashlib.sha256(fleet[ambiguous_key].encode()).hexdigest()
+
     monkeypatch.delenv("DIGEST_FAKE_FLEET_FAIL")
-    retry = _publish(directory, next_day)
-    assert retry.returncode == 0, retry.stderr
-    assert sorted(destinations("journal")) == [f"error-digest:{_DAY}", f"error-digest:{next_day}"]
-    assert list(destinations("fleet")) == [f"error-digest:{_DAY}"]
-    kind = digest.signature("journal", "writer.service", "error", "worker failed")
-    assert list(json.loads(ledger.read_bytes())) == [kind]
     next_run = _publish(directory, next_day)
     assert next_run.returncode == 0, next_run.stderr
-    assert sorted(destinations("fleet")) == [f"error-digest:{_DAY}", f"error-digest:{next_day}"]
+    retry_key = f"error-digest:{next_day}:2"
+    assert sorted(destinations("fleet")) == [ambiguous_key, retry_key]
+    assert destinations("fleet")[retry_key] == fleet[ambiguous_key]
+    kind = digest.signature("journal", "writer.service", "error", "worker failed")
+    new_kind = digest.signature("journal", "writer.service", "error", "new failure")
+    assert set(json.loads(ledger.read_bytes())) == {kind, new_kind}
+    assert sorted(destinations("journal")) == [key, f"error-digest:{next_day}"]
