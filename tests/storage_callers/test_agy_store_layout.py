@@ -13,8 +13,9 @@ from lu_machinery.dispatcher import agy_sandbox
 from lu_machinery.lib.readonly_sqlite import open_readonly
 from lu_machinery.storage import generations
 from lu_machinery.storage.wal_permissions import hold_database
+from tests.dispatcher.test_providers_b import _bind_agy_test_host, _github_meta_path
 from tests.helpers.product_tree import configured_roots  # noqa: F401
-from tests.dispatcher.test_providers_b import _github_meta_path
+from tests.host_context.conftest import build_host_layout
 
 
 def _linked_worktree(tmp_path):
@@ -108,9 +109,9 @@ def test_disagreeing_primary_anchors_refuse_before_scratch_or_provider(tmp_path,
 
 @pytest.mark.parametrize("mode", ["legacy", "no_sidecars", "reader", "lifted_writer"])
 def test_real_launch_reads_only_the_selected_store_and_existing_sidecars(tmp_path, mode, monkeypatch, configured_roots):  # noqa: F811
+    _bind_agy_test_host(monkeypatch, build_host_layout(tmp_path / "host"), configured_roots.product)
     worktree, _head = _linked_worktree(tmp_path)
     primary = tmp_path / "repo"
-    monkeypatch.setenv("LEARN_UKRAINIAN_PRIMARY_REPO_ROOT", str(primary))
     (primary / "AGENTS.md").write_text("primary must remain hidden")
     selector = primary / "data" / "sources.db"
     selected = selector

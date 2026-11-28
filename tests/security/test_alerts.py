@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import ast
 import base64
+import json
+import re
+import subprocess
 from collections.abc import Callable, Sequence
 from copy import deepcopy
 from pathlib import Path
@@ -12,14 +15,16 @@ from typing import Any
 import pytest
 import yaml
 
-from lu_machinery.common import git_credentials
+from lu_machinery.common import git_credentials, github_client
 from lu_machinery.common.github_client import Result
+from lu_machinery.opsec import prepublish as gate
 from lu_machinery.orchestration.fleet_repos import (
     FleetRepo,
     FleetRepoError,
     load_fleet_repos,
     resolve_active_fleet_repo,
 )
+from lu_machinery.publish import github as pub
 from lu_machinery.review.model_catalog import CATALOG_PATH
 from lu_machinery.security import alerts as alerts_module
 from lu_machinery.security.alerts import (
@@ -33,6 +38,7 @@ from lu_machinery.security.alerts import (
     scan_fleet_alerts,
     write_prometheus_textfile,
 )
+from tests.opsec_fixtures import CATALOG
 
 _PIN = "0123456789abcdef0123456789abcdef01234567"
 _HEAD = "a" * 40
@@ -1463,3 +1469,638 @@ def test_run_links_bind_either_baked_slug_of_the_scanned_repository(
             "repos/learn-ukrainian/machinery/actions/runs/9/jobs", None,
             allowed_slugs=selected_slugs,
         ) is None
+
+
+def _cf_verdict_comment(
+    sha: str,
+    *,
+    verdict: str = "APPROVED",
+    model: str = "grok-4.7",
+    family: str = "xai",
+    authored_by: str | None = "claude-opus-5-5",
+    review_mode: str | None = None,
+    task_id: str = "cto-test-rv1",
+    started: str = "2026-11-28T16:33:31.303911+00:00",
+    login: str = "fleet-bot",
+    association: str = "MEMBER",
+    created_at: str = "2026-11-28T16:50:35Z",
+    updated_at: str | None = None,
+    comment_id: int = 7242554739,
+) -> dict[str, Any]:
+    """Build a recorder-format cf-verdict comment for code-scanning-dismiss tests."""
+    heading = "### Adversarial red-team review" if review_mode == "red_team" else "### Cross-family review"
+    lines = [heading]
+    if review_mode == "red_team":
+        lines.append("Review mode: red_team")
+    lines.extend(
+        [
+            "Sources MCP calls: 0",
+            f"head: {sha}",
+            f"Reviewer family: {family}",
+            f"VERDICT: {verdict}",
+            f"Reviewer model: {model}",
+            "Review score: absent",
+        ]
+    )
+    if authored_by is not None:
+        lines.append(f"Authored by: {authored_by}")
+    lines.extend(
+        [
+            f"Task id: {task_id}",
+            "",
+            "Findings are held privately.",
+            "",
+        ]
+    )
+    mode_token = f" review_mode={review_mode}" if review_mode else ""
+    lines.append(
+        f"<!-- cf-verdict v1 sha={sha} task={task_id} started={started} "
+        f"verdict={verdict} model={model} family={family}{mode_token} sources_calls=0 -->"
+    )
+    return {
+        "id": comment_id,
+        "user": {"login": login},
+        "author_association": association,
+        "created_at": created_at,
+        "updated_at": updated_at if updated_at is not None else created_at,
+        "body": "\n".join(lines),
+    }
+
+
+def _dismiss_fixture(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    pr_number: int = 1622,
+    alert_number: int = 71,
+    merged: bool = False,
+    pr_state: str = "open",
+    alert_state: str | None = None,
+    instance_ref: str | None = None,
+) -> tuple[dict[str, Any], list[bytes], list[list[str]], Callable[..., subprocess.CompletedProcess[str]], str, dict[str, str]]:
+    """Build an offline GitHub API fixture for code-scanning-dismiss preconditions."""
+    for key in ("LEARN_UKRAINIAN_DISPATCH_TASK_ID", pub.BROKER_ENV, "USER", "LOGNAME"):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setattr(gate, "catalog", lambda: CATALOG)
+
+    head_sha = "e" * 40
+    base_sha = "1" * 40
+    merge_sha = "7" * 40
+    shas = {"head": head_sha, "base": base_sha, "merge": merge_sha}
+    ref = instance_ref or (f"refs/pull/{pr_number}/merge" if not merged else "refs/heads/main")
+    commit_sha = merge_sha
+    path = "lu_machinery/common/json_depth.py"
+    start_line = 86
+    rule_id = "py/polynomial-redos"
+    triage_row = f"| {alert_number} | `{rule_id}` | `{path}:{start_line}` | False positive. Linear unrolled string regex. |"
+    comment = f"Alert #{alert_number} regex is linear on bounded inputs. https://github.com/unit/public/pull/{pr_number}"
+
+    instance: dict[str, Any] = {
+        "state": "open",
+        "ref": ref,
+        "commit_sha": commit_sha,
+        "analysis_key": ".github/workflows/codeql.yml:analyze",
+        "environment": '{"language":"python"}',
+        "category": "/language:python",
+        "location": {"path": path, "start_line": start_line},
+        "message": {"text": "Polynomial regular expression used on uncontrolled data."},
+    }
+    alert: dict[str, Any] = {
+        "number": alert_number,
+        "state": alert_state,
+        "fixed_at": None,
+        "dismissed_at": None,
+        "rule": {"id": rule_id},
+        "tool": {"name": "CodeQL"},
+        "most_recent_instance": deepcopy(instance),
+    }
+    sarif: dict[str, Any] = {
+        "runs": [
+            {
+                "results": [
+                    {
+                        "ruleId": rule_id,
+                        "rule": {"id": rule_id, "index": 0, "toolComponent": {"index": 0}},
+                        "message": {"text": "Polynomial regular expression used on uncontrolled data."},
+                        "properties": {"github/alertNumber": alert_number},
+                        "locations": [
+                            {
+                                "physicalLocation": {
+                                    "artifactLocation": {"uri": path, "index": 0},
+                                    "region": {"startLine": start_line},
+                                }
+                            }
+                        ],
+                        "codeFlows": [{"threadFlows": [{"locations": [{"location": {"message": {"text": "bounded"}}}]}]}],
+                    }
+                ],
+                "tool": {
+                    "driver": {"name": "CodeQL", "semanticVersion": "2.27.6"},
+                    "extensions": [{"name": "queries", "rules": [{"id": rule_id}]}],
+                },
+            }
+        ]
+    }
+    pr_doc: dict[str, Any] = {
+        "number": pr_number,
+        "state": pr_state,
+        "merged": merged,
+        "draft": False,
+        "merge_commit_sha": merge_sha,
+        "html_url": f"https://github.com/unit/public/pull/{pr_number}",
+        "head": {"sha": head_sha, "ref": "feature/triage", "repo": {"full_name": "unit/public"}},
+        "base": {"ref": "main", "sha": base_sha, "repo": {"full_name": "unit/public"}},
+    }
+    encoded_ref = ref.replace("/", "%2F")
+    triage_ref = merge_sha if merged else head_sha
+    documents: dict[str, Any] = {
+        "user": {"login": "fleet-bot"},
+        "git/ref/heads/main": {"ref": "refs/heads/main", "object": {"type": "commit", "sha": merge_sha}},
+        f"pulls/{pr_number}": pr_doc,
+        f"pulls/{pr_number}/files?per_page=100": [
+            [{"filename": pub._DISMISS_TRIAGE_PATH, "status": "modified", "patch": "+" + triage_row}]
+        ],
+        f"contents/{pub._DISMISS_TRIAGE_PATH}?ref={base_sha}": "| Alert | Rule | Reviewed location | Disposition |\n",
+        f"contents/{pub._DISMISS_TRIAGE_PATH}?ref={triage_ref}": triage_row + "\n",
+        f"issues/{pr_number}/comments?per_page=100": [[_cf_verdict_comment(head_sha)]],
+        f"commits/{merge_sha}": {"sha": merge_sha, "parents": [{"sha": base_sha}, {"sha": head_sha}]},
+        f"code-scanning/alerts/{alert_number}": alert,
+        f"code-scanning/alerts/{alert_number}/instances?per_page=100": [[instance]],
+        f"code-scanning/analyses?ref={encoded_ref}&tool_name=CodeQL&per_page=100&page=1": [
+            {
+                "id": 2268797474,
+                "commit_sha": commit_sha,
+                "analysis_key": ".github/workflows/codeql.yml:analyze",
+                "environment": '{"language":"python"}',
+                "category": "/language:python",
+                "error": "",
+            }
+        ],
+        "code-scanning/analyses/2268797474": deepcopy(sarif),
+    }
+    writes: list[bytes] = []
+    calls: list[list[str]] = []
+    root = "repos/unit/public/"
+
+    def sender(argv: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        calls.append(list(argv))
+        method = argv[argv.index("--method") + 1]
+        endpoint = argv[argv.index("--method") + 2]
+        if method == "POST" and endpoint == "graphql":
+            body = json.loads(Path(argv[argv.index("--input") + 1]).read_text(encoding="utf-8"))
+            aliases = re.findall(r"(p\d+):\s*pullRequest\(number:(\d+)\)", body["query"])
+            repo_rows = {alias: documents.get(f"gql_pulls/{int(num)}") for alias, num in aliases}
+            return subprocess.CompletedProcess(argv, 0, json.dumps({"data": {"repository": repo_rows}}), "")
+        if method == "PATCH":
+            assert endpoint == f"{root}code-scanning/alerts/{alert_number}"
+            writes.append(Path(argv[argv.index("--input") + 1]).read_bytes())
+            return subprocess.CompletedProcess(argv, 0, "{}", "")
+        assert method == "GET"
+        if endpoint == "user":
+            if "user" not in documents:
+                return subprocess.CompletedProcess(argv, 1, "", "not found")
+            return subprocess.CompletedProcess(argv, 0, json.dumps(documents["user"]), "")
+        assert endpoint.startswith(root), endpoint
+        suffix = endpoint.removeprefix(root)
+        if suffix == f"code-scanning/alerts/{alert_number}" and writes:
+            payload = json.loads(writes[-1])
+            dismissed = {
+                **documents[suffix],
+                "state": "dismissed",
+                "dismissed_reason": payload["dismissed_reason"],
+                "dismissed_comment": payload["dismissed_comment"],
+            }
+            return subprocess.CompletedProcess(argv, 0, json.dumps(dismissed), "")
+        if suffix not in documents:
+            missing = subprocess.CompletedProcess(argv, 1, "", "not found")
+            missing.github_result = github_client.Result(status=404)  # type: ignore[attr-defined]
+            return missing
+        doc = documents[suffix]
+        return subprocess.CompletedProcess(argv, 0, doc if isinstance(doc, str) else json.dumps(doc), "")
+
+    return documents, writes, calls, sender, comment, shas
+
+
+def test_dismiss_admits_pr_only_alert_with_approved_triage_row(
+    monkeypatch: pytest.MonkeyPatch, synthetic_opsec: Path, tmp_path: Path,
+) -> None:
+    """Defect class: reviewed false positive on an open PR can never be dismissed."""
+    documents, writes, calls, sender, comment, shas = _dismiss_fixture(monkeypatch)
+
+    # Interactive-seat-only restriction stays enforced on the PR-only path before any transport.
+    with pytest.raises(gate.PublishBlocked, match="DISMISSAL_BOUNDARY_REFUSED"):
+        pub.publish(
+            "code-scanning-dismiss",
+            repo="unit/public",
+            number=71,
+            reason="false positive",
+            comment=comment,
+            env={"LEARN_UKRAINIAN_DISPATCH_TASK_ID": "worker-1"},
+            runner=sender,
+        )
+    assert calls == [] and writes == []
+
+    # Denominator case 3: open-PR-only alert (state=None as GitHub returns) + approved open PR head.
+    answer = pub.publish(
+        "code-scanning-dismiss",
+        repo="unit/public",
+        number=71,
+        reason="false positive",
+        comment=comment,
+        runner=sender,
+        capture_output=True,
+        text=True,
+    )
+    assert answer.returncode == 0
+    assert len(writes) == 1
+    assert json.loads(writes[0]) == {
+        "state": "dismissed",
+        "dismissed_reason": "false positive",
+        "dismissed_comment": comment,
+    }
+    assert json.loads(answer.stdout)["state"] == "dismissed"
+    # Final PR re-read must occur immediately before PATCH (after final alert, instance, and comment reads).
+    patch_index = next(i for i, argv in enumerate(calls) if argv[argv.index("--method") + 1] == "PATCH")
+    assert calls[patch_index - 1][:5] == ["gh", "api", "--method", "GET", "repos/unit/public/pulls/1622"]
+
+    # Also admit when alert state is "open", analysis ran directly on head_sha, and a stale closed PR instance exists.
+    writes.clear()
+    documents["code-scanning/alerts/71"]["state"] = "open"
+    pr_instance = documents["code-scanning/alerts/71/instances?per_page=100"][0][0]
+    pr_instance["commit_sha"] = shas["head"]
+    documents["code-scanning/analyses?ref=refs%2Fpull%2F1622%2Fmerge&tool_name=CodeQL&per_page=100&page=1"][0][
+        "commit_sha"
+    ] = shas["head"]
+    stale = deepcopy(pr_instance)
+    stale.update(ref="refs/pull/1620/merge", commit_sha="c" * 40, location={"path": "other.py", "start_line": 1})
+    documents["code-scanning/alerts/71/instances?per_page=100"][0].append(stale)
+    documents["gql_pulls/1620"] = {
+        "number": 1620,
+        "state": "CLOSED",
+        "merged": False,
+        "url": "https://github.com/unit/public/pull/1620",
+    }
+    answer = pub.publish(
+        "code-scanning-dismiss",
+        repo="unit/public",
+        number=71,
+        reason="false positive",
+        comment=comment,
+        runner=sender,
+        capture_output=True,
+        text=True,
+    )
+    assert answer.returncode == 0
+    assert len(writes) == 1
+
+    # Raw-HTTP GitHubClient path (runner=None) works end-to-end on recorded API fixtures.
+    http_writes: list[bytes] = []
+
+    def http_transport(
+        method: str, endpoint: str, _headers: Any, body: bytes | None, _timeout: Any,
+    ) -> github_client.Response:
+        if method == "POST" and endpoint == "graphql":
+            parsed = json.loads((body or b"{}").decode("utf-8"))
+            aliases = re.findall(r"(p\d+):\s*pullRequest\(number:(\d+)\)", parsed["query"])
+            repo_rows = {alias: documents.get(f"gql_pulls/{int(num)}") for alias, num in aliases}
+            return github_client.Response(200, {}, json.dumps({"data": {"repository": repo_rows}}).encode("utf-8"))
+        if method == "PATCH":
+            assert endpoint == "repos/unit/public/code-scanning/alerts/71"
+            assert body is not None
+            http_writes.append(body)
+            return github_client.Response(200, {}, b"{}")
+        assert method == "GET"
+        if endpoint == "user":
+            return github_client.Response(200, {}, json.dumps(documents["user"]).encode("utf-8"))
+        suffix = endpoint.removeprefix("repos/unit/public/")
+        if suffix == "code-scanning/alerts/71" and http_writes:
+            payload = json.loads(http_writes[-1])
+            doc: Any = {
+                **documents[suffix],
+                "state": "dismissed",
+                "dismissed_reason": payload["dismissed_reason"],
+                "dismissed_comment": payload["dismissed_comment"],
+            }
+        elif suffix in {
+            "pulls/1622/files?per_page=100",
+            "issues/1622/comments?per_page=100",
+            "code-scanning/alerts/71/instances?per_page=100",
+        }:
+            doc = documents[suffix][0]
+        else:
+            doc = documents[suffix]
+        raw = doc.encode("utf-8") if isinstance(doc, str) else json.dumps(doc).encode("utf-8")
+        return github_client.Response(200, {}, raw)
+
+    class _RawHttpClient(github_client.GitHubClient):
+        def __init__(self, **kwargs: Any) -> None:
+            kwargs["cache_dir"] = tmp_path / "gh-cache"
+            kwargs["transport"] = http_transport
+            super().__init__(**kwargs)
+
+    monkeypatch.setattr(github_client, "GitHubClient", _RawHttpClient)
+    answer = pub.publish(
+        "code-scanning-dismiss",
+        repo="unit/public",
+        number=71,
+        reason="false positive",
+        comment=comment,
+        runner=None,
+        capture_output=True,
+        text=True,
+    )
+    assert answer.returncode == 0
+    assert len(http_writes) == 1
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "no-row",
+        "moved-unchanged-row",
+        "row-already-on-base-sha",
+        "duplicate-row-on-head",
+        "unapproved-head",
+        "stale-head",
+        "same-family-approval",
+        "red-team-approval",
+        "unattested-author",
+        "forged-reviewer-family",
+        "rejected-head",
+        "edited-verdict",
+        "untrusted-commenter",
+        "closed-unmerged-pr",
+        "draft-pr",
+        "missing-draft-flag",
+        "fork-pr",
+        "missing-head-repo",
+        "missing-base-repo",
+        "stale-analysis-commit",
+        "unreadable-analysis-commit",
+        "alert-already-fixed",
+        "missing-alert-state",
+        "missing-alert-timestamps",
+        "unknown-instance-state",
+        "other-open-pr-instance",
+        "different-pr-linked",
+        "pr-only-alert-with-merged-pr",
+        "pr-head-moved-during-preflight",
+        "pr-base-sha-changed-during-preflight",
+        "pr-draft-missing-on-reread",
+        "pr-head-repo-changed-on-reread",
+        "comments-changed-during-preflight",
+        "unreadable-identity",
+        "unreadable-comments",
+    ],
+)
+def test_dismiss_refuses_pr_only_alert_without_approved_row(
+    monkeypatch: pytest.MonkeyPatch, synthetic_opsec: Path, case: str,
+) -> None:
+    """Defect class: dismissal without reviewed triage."""
+    if case == "pr-only-alert-with-merged-pr":
+        # Denominator case 4: open-PR-only alert cannot be dismissed via a merged PR without a base-branch instance.
+        documents, writes, _, sender, comment, _ = _dismiss_fixture(
+            monkeypatch, merged=True, pr_state="closed", alert_state="open", instance_ref="refs/pull/1625/merge",
+        )
+        documents["gql_pulls/1625"] = {
+            "number": 1625,
+            "state": "OPEN",
+            "merged": False,
+            "url": "https://github.com/unit/public/pull/1625",
+        }
+        with pytest.raises(gate.PublishBlocked, match="DISMISSAL_TRIAGE_REFUSED"):
+            pub.publish("code-scanning-dismiss", repo="unit/public", number=71, reason="false positive", comment=comment, runner=sender)
+        assert writes == []
+        return
+
+    documents, writes, _, sender, comment, shas = _dismiss_fixture(monkeypatch)
+    runner: Callable[..., subprocess.CompletedProcess[str]] = sender
+
+    pr_reads = 0
+    comment_reads = 0
+    if case == "no-row":
+        documents["pulls/1622/files?per_page=100"][0][0]["patch"] = "+Unrelated runbook note."
+    elif case == "moved-unchanged-row":
+        row = documents[f"contents/{pub._DISMISS_TRIAGE_PATH}?ref={shas['head']}"].strip()
+        documents["pulls/1622/files?per_page=100"][0][0]["patch"] = f"+{row}\n-{row}"
+    elif case == "row-already-on-base-sha":
+        row = documents[f"contents/{pub._DISMISS_TRIAGE_PATH}?ref={shas['head']}"].strip()
+        documents[f"contents/{pub._DISMISS_TRIAGE_PATH}?ref={shas['base']}"] += row + "\n"
+    elif case == "duplicate-row-on-head":
+        key = f"contents/{pub._DISMISS_TRIAGE_PATH}?ref={shas['head']}"
+        documents[key] += "71 | `py/polynomial-redos` | `lu_machinery/common/json_depth.py:86` | Real.\n"
+    elif case == "unapproved-head":
+        documents["issues/1622/comments?per_page=100"] = [[]]
+    elif case == "stale-head":
+        documents["issues/1622/comments?per_page=100"] = [[_cf_verdict_comment("9" * 40)]]
+    elif case == "same-family-approval":
+        documents["issues/1622/comments?per_page=100"] = [
+            [_cf_verdict_comment(shas["head"], model="claude-sonnet-5-5", family="anthropic", authored_by="claude-opus-5-5")]
+        ]
+    elif case == "red-team-approval":
+        documents["issues/1622/comments?per_page=100"] = [
+            [
+                _cf_verdict_comment(
+                    shas["head"],
+                    model="claude-opus-5-5",
+                    family="anthropic",
+                    authored_by="claude-opus-5-5",
+                    review_mode="red_team",
+                )
+            ]
+        ]
+    elif case == "unattested-author":
+        documents["issues/1622/comments?per_page=100"] = [[_cf_verdict_comment(shas["head"], authored_by=None)]]
+    elif case == "forged-reviewer-family":
+        documents["issues/1622/comments?per_page=100"] = [
+            [_cf_verdict_comment(shas["head"], model="claude-opus-5-5", family="xai", authored_by="gpt-6.2-sol")]
+        ]
+    elif case == "rejected-head":
+        documents["issues/1622/comments?per_page=100"] = [
+            [
+                _cf_verdict_comment(shas["head"]),
+                _cf_verdict_comment(
+                    shas["head"],
+                    verdict="CHANGES_REQUESTED",
+                    model="gpt-6.2-sol",
+                    family="openai",
+                    task_id="cto-test-rv2",
+                    started="2026-11-28T16:40:00.000000+00:00",
+                    comment_id=7242554740,
+                ),
+            ]
+        ]
+    elif case == "edited-verdict":
+        documents["issues/1622/comments?per_page=100"] = [
+            [_cf_verdict_comment(shas["head"], updated_at="2026-11-28T16:51:00Z")]
+        ]
+    elif case == "untrusted-commenter":
+        documents["issues/1622/comments?per_page=100"] = [
+            [_cf_verdict_comment(shas["head"], login="random-user", association="NONE")]
+        ]
+    elif case == "closed-unmerged-pr":
+        documents["pulls/1622"]["state"] = "closed"
+    elif case == "draft-pr":
+        documents["pulls/1622"]["draft"] = True
+    elif case == "missing-draft-flag":
+        del documents["pulls/1622"]["draft"]
+    elif case == "fork-pr":
+        documents["pulls/1622"]["head"]["repo"]["full_name"] = "forker/public"
+    elif case == "missing-head-repo":
+        del documents["pulls/1622"]["head"]["repo"]
+    elif case == "missing-base-repo":
+        del documents["pulls/1622"]["base"]["repo"]
+    elif case == "stale-analysis-commit":
+        documents[f"commits/{shas['merge']}"]["parents"][1]["sha"] = "9" * 40
+    elif case == "unreadable-analysis-commit":
+        del documents[f"commits/{shas['merge']}"]
+    elif case == "alert-already-fixed":
+        documents["code-scanning/alerts/71"]["state"] = "fixed"
+    elif case == "missing-alert-state":
+        del documents["code-scanning/alerts/71"]["state"]
+    elif case == "missing-alert-timestamps":
+        del documents["code-scanning/alerts/71"]["dismissed_at"]
+    elif case == "unknown-instance-state":
+        unknown_main = deepcopy(documents["code-scanning/alerts/71/instances?per_page=100"][0][0])
+        unknown_main.update(ref="refs/heads/main", state="pending")
+        documents["code-scanning/alerts/71/instances?per_page=100"][0].append(unknown_main)
+    elif case == "other-open-pr-instance":
+        other = deepcopy(documents["code-scanning/alerts/71/instances?per_page=100"][0][0])
+        other["ref"] = "refs/pull/1625/merge"
+        documents["code-scanning/alerts/71/instances?per_page=100"][0].append(other)
+        documents["gql_pulls/1625"] = {
+            "number": 1625,
+            "state": "OPEN",
+            "merged": False,
+            "url": "https://github.com/unit/public/pull/1625",
+        }
+    elif case == "different-pr-linked":
+        documents["code-scanning/alerts/71/instances?per_page=100"][0][0]["ref"] = "refs/pull/1625/merge"
+        documents["gql_pulls/1625"] = {
+            "number": 1625,
+            "state": "OPEN",
+            "merged": False,
+            "url": "https://github.com/unit/public/pull/1625",
+        }
+    elif case in {
+        "pr-head-moved-during-preflight",
+        "pr-base-sha-changed-during-preflight",
+        "pr-draft-missing-on-reread",
+        "pr-head-repo-changed-on-reread",
+    }:
+        def moving_pr(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+            nonlocal pr_reads
+            res = sender(argv, **kwargs)
+            if argv[:5] == ["gh", "api", "--method", "GET", "repos/unit/public/pulls/1622"]:
+                pr_reads += 1
+                if pr_reads == 2:
+                    moved = json.loads(res.stdout)
+                    if case == "pr-head-moved-during-preflight":
+                        moved["head"]["sha"] = "f" * 40
+                    elif case == "pr-base-sha-changed-during-preflight":
+                        moved["base"]["sha"] = "2" * 40
+                    elif case == "pr-draft-missing-on-reread":
+                        del moved["draft"]
+                    else:
+                        moved["head"]["repo"]["full_name"] = "forker/public"
+                    res.stdout = json.dumps(moved)
+            return res
+
+        runner = moving_pr
+    elif case == "comments-changed-during-preflight":
+        def changing_comments(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+            nonlocal comment_reads
+            res = sender(argv, **kwargs)
+            if argv[:5] == ["gh", "api", "--method", "GET", "repos/unit/public/issues/1622/comments?per_page=100"]:
+                comment_reads += 1
+                if comment_reads == 2:
+                    updated = json.loads(res.stdout)
+                    updated[0].append(
+                        _cf_verdict_comment(
+                            shas["head"],
+                            verdict="CHANGES_REQUESTED",
+                            model="gpt-6.2-sol",
+                            family="openai",
+                            task_id="cto-test-rv3",
+                            comment_id=7242554741,
+                        )
+                    )
+                    res.stdout = json.dumps(updated)
+            return res
+
+        runner = changing_comments
+    elif case == "unreadable-identity":
+        del documents["user"]
+    elif case == "unreadable-comments":
+        del documents["issues/1622/comments?per_page=100"]
+
+    with pytest.raises(gate.PublishBlocked, match="DISMISSAL_TRIAGE_REFUSED"):
+        pub.publish(
+            "code-scanning-dismiss",
+            repo="unit/public",
+            number=71,
+            reason="false positive",
+            comment=comment,
+            runner=runner,
+        )
+    assert writes == []
+    if case in {
+        "pr-head-moved-during-preflight",
+        "pr-base-sha-changed-during-preflight",
+        "pr-draft-missing-on-reread",
+        "pr-head-repo-changed-on-reread",
+    }:
+        assert pr_reads == 2
+    if case == "comments-changed-during-preflight":
+        assert comment_reads == 2
+
+
+def test_default_branch_alert_keeps_merged_row_requirement(
+    monkeypatch: pytest.MonkeyPatch, synthetic_opsec: Path,
+) -> None:
+    """Control: default-branch alerts keep the merged triage-row requirement."""
+    # Denominator case 1: default-branch alert + merged triage PR -> admitted.
+    _, writes, _, sender, comment, _ = _dismiss_fixture(
+        monkeypatch, merged=True, pr_state="closed", alert_state="open", instance_ref="refs/heads/main",
+    )
+    answer = pub.publish(
+        "code-scanning-dismiss",
+        repo="unit/public",
+        number=71,
+        reason="false positive",
+        comment=comment,
+        runner=sender,
+        capture_output=True,
+        text=True,
+    )
+    assert answer.returncode == 0
+    assert len(writes) == 1
+
+    # Denominator case 2a: default-branch alert + approved open PR with triage row -> refused.
+    documents, writes, _, sender, comment, _ = _dismiss_fixture(
+        monkeypatch, merged=False, pr_state="open", alert_state="open", instance_ref="refs/heads/main",
+    )
+    with pytest.raises(gate.PublishBlocked, match="DISMISSAL_TRIAGE_REFUSED"):
+        pub.publish(
+            "code-scanning-dismiss",
+            repo="unit/public",
+            number=71,
+            reason="false positive",
+            comment=comment,
+            runner=sender,
+        )
+    assert writes == []
+
+    # Denominator case 2b: alert on BOTH main and the open PR + approved open PR -> still refused.
+    pr_instance = deepcopy(documents["code-scanning/alerts/71/instances?per_page=100"][0][0])
+    pr_instance["ref"] = "refs/pull/1622/merge"
+    documents["code-scanning/alerts/71/instances?per_page=100"][0].append(pr_instance)
+    with pytest.raises(gate.PublishBlocked, match="DISMISSAL_TRIAGE_REFUSED"):
+        pub.publish(
+            "code-scanning-dismiss",
+            repo="unit/public",
+            number=71,
+            reason="false positive",
+            comment=comment,
+            runner=sender,
+        )
+    assert writes == []

@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import shlex
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -870,6 +871,102 @@ def test_consumer_collection_names_the_candidate_interpreter(monkeypatch, tmp_pa
     assert "LU_PYTHON" not in collected[0]
 
 
+def test_product_sandbox_runs_pytest_and_npm_children_with_private_writable_temp(monkeypatch, tmp_path):
+    """Defect class: missing sandbox resources prevent the product checks from running."""
+    if shutil.which("bwrap") is None:
+        pytest.skip("bubblewrap is not installed")
+
+    work = tmp_path / "work"
+    product = work / "product"
+    product.mkdir(parents=True)
+    (work / "tmp").mkdir()
+    # Reproduce a TMPDIR path the scratch plugin cannot trust, even on runners
+    # where the rest of the fixture's ancestry is safe.
+    (work / "tmp").chmod(0o770)
+    (work / "home").mkdir()
+    outside = tmp_path / "outside"
+    outside.write_text("host data")
+    context = tmp_path / "context" / "host.v1.json"
+    context.parent.mkdir()
+    context.write_text("{}")
+    monkeypatch.setattr(host_context, "DEFAULT_PATH", context)
+    probe = product / "tests/test_boundary.py"
+    probe.parent.mkdir()
+    (product / "pytest.ini").write_text("[pytest]\naddopts = -p lu_machinery.common.pytest_scratch\n")
+    probe.write_text(f"""
+import errno
+import os
+from pathlib import Path
+import subprocess
+import sys
+
+
+def test_boundary(capfd):
+    subprocess.run([sys.executable, "-c", "print('captured child')"], check=True, timeout=30)
+    assert capfd.readouterr().out == "captured child\\n"
+    with open("/dev/null", "rb+") as device:
+        assert device.read(1) == b""
+        assert device.write(b"probe") == 5
+    temp = Path(os.environ["TMPDIR"])
+    assert temp.is_relative_to("/dev/shm")
+    (temp / "scratch-probe").write_text("private temp")
+    Path("inside").write_text("sandbox data")
+    for path in (Path({str(outside)!r}), Path("/dev/release-cut-probe")):
+        try:
+            path.write_text("sandbox data")
+        except OSError as error:
+            assert error.errno == errno.EROFS
+        else:
+            raise AssertionError(f"the sandbox wrote outside its work directory: {{path}}")
+    assert not Path({str(context)!r}).exists()
+""")
+    npm_probe = product / "npm-probe.py"
+    npm_probe.write_text("""
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+
+assert sys.argv[1:] == ["run", "--silent", "--if-present=false", "--script-shell=/bin/sh", "agents:deploy"]
+python = os.environ["LU_PYTHON"]
+binding = json.loads(Path(os.environ["LU_HOST_CONTEXT"]).read_text())
+assert python == binding["runtime"]["python"] == binding["products"][binding["default_product"]]["python"]
+assert binding["state_root"] == os.environ["LU_STATE_ROOT"]
+Path(binding["state_root"], "state-probe").touch()
+assert os.environ["npm_config_offline"] == "true"
+cache = Path(os.environ["npm_config_cache"])
+cache.mkdir()
+(cache / "cache-probe").touch()
+with tempfile.TemporaryFile() as scratch:
+    subprocess.run([python, "-c", "print('npm child')"], stdout=scratch, check=True, timeout=30)
+    scratch.seek(0)
+    assert scratch.read() == b"npm child\\n"
+Path("deployed").write_text("npm child")
+""")
+    pin = work / "src/.github/workflows/product-consumer.pin"
+    pin.parent.mkdir(parents=True)
+    pin.write_text("test tests/test_boundary.py\n")
+    interpreter = Path(sys.executable)
+    cut = Cut(work=work, dry_run=True, machinery_remote="", product_remote="", machinery_repo=REPO,
+              product_repo="example/product", host_python=interpreter, primary=tmp_path,
+              alert=False, x_agent="codex/test")
+    cut.built = "0.1.0"
+
+    try:
+        cut.consumer_checks(interpreter, product, (str(interpreter), str(npm_probe)))
+    except CutError as error:
+        pytest.fail(f"{error}\n{(work / 'cut.log').read_text()}")
+
+    assert (product / "inside").read_text() == "sandbox data"
+    assert (product / "deployed").read_text() == "npm child"
+    assert (work / "npm-cache/cache-probe").is_file()
+    assert not list(work.glob("consumer-state-*"))
+    assert outside.read_text() == "host data"
+    assert context.read_text() == "{}"
+
+
 def _simulate_consumer_adoption(monkeypatch, tmp_path, failing_check=None):
     """Run the cut's PR lifecycle against a fixture checkout and recorded external calls."""
     _host(monkeypatch, tmp_path, Path(sys.executable))
@@ -937,21 +1034,27 @@ def _simulate_consumer_adoption(monkeypatch, tmp_path, failing_check=None):
             return real_run(cut, argv, **kwargs)
         delimiter = command.index("--")
         assert command[:delimiter] == [
-            str(sandbox), "--die-with-parent", "--ro-bind", "/", "/", "--bind", str(work), str(work),
+            str(sandbox), "--die-with-parent", "--ro-bind", "/", "/", "--dev", "/dev", "--remount-ro", "/dev",
+            "--perms", "0700", "--tmpfs", "/dev/shm",
+            "--bind", str(work), str(work),
             "--tmpfs", str(context_file.parent), "--remount-ro", str(context_file.parent),
         ]
         consumer = command[delimiter + 1:]
         if consumer[:3] == [str(candidate), "-m", "pytest"]:
             assert hook_test in consumer
+            assert "LU_STATE_ROOT" not in kwargs["env"]
+            assert host_context.CONTEXT_ENV not in kwargs["env"]
             check = "product key tests"
         else:
             assert consumer[:3] == ["fixture-node", "fixture-npm", "run"]
             assert consumer[-1] == "agents:deploy"
+            assert kwargs["env"]["LU_PYTHON"] == str(candidate)
+            binding = Path(kwargs["env"][host_context.CONTEXT_ENV])
+            assert binding.is_relative_to(work)
+            assert Path(kwargs["env"]["LU_STATE_ROOT"]).parent == binding.parent
             check = "Verify Agent Deployment"
         assert kwargs["cwd"] == product
         assert kwargs["env"]["LEARN_UKRAINIAN_PYTHON"] == str(candidate)
-        assert "LU_STATE_ROOT" not in kwargs["env"]
-        assert host_context.CONTEXT_ENV not in kwargs["env"]
         assert 0 < kwargs["timeout"] <= 300
         assert kwargs["kill_group"] is True
         return real_run(cut, [sys.executable, "-I", "-c", f"raise SystemExit({int(check == failing_check)})"], **kwargs)

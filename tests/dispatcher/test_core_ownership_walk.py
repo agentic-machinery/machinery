@@ -520,6 +520,9 @@ def test_delivery_dirty_same_head_cannot_report_pushed_or_unknown(sandbox, remot
         "commits_ahead": 1,
         "worktree_dirty_on_exit": True,
         "worktree_untracked_only_on_exit": False,
+        # Settlement attribution (#1615) comes from the URL recorded at dispatch, not the worktree's origin.
+        "credited_commits": [record["head_sha"]],
+        "credited_commits_reason": "computed",
     }
 
 

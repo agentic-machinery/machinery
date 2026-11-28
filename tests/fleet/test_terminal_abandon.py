@@ -10,6 +10,8 @@ import pytest
 from lu_machinery.common.repo_root import machinery_path
 from lu_machinery.fleet import ignored_task_output as output
 from lu_machinery.orchestration import worktree_git as rw
+from lu_machinery.session_supervisor.remote import envelope_digest
+from tests.epics_monitor_stub import public_lease
 from tests.helpers.product_tree import configured_roots as configured_roots
 from tests.orchestration.test_continuation_worktree_reap import (
     abandon_cohort as abandon_cohort,
@@ -374,10 +376,28 @@ def succession(writer_fixture, monkeypatch):
             monitor["on_call"](monitor["calls"])
         if monitor["error"] is not None:
             raise monitor["error"]
-        return {"stream_id": stream_id, "lease": json.loads(json.dumps(monitor["streams"].get(stream_id)))}
+        # Monitor publishes the envelope only as its lease_digest (machinery-infra#1659).
+        return {"stream_id": stream_id, "lease": public_lease(json.loads(json.dumps(monitor["streams"].get(stream_id))))}
 
     monkeypatch.setattr(remote.RemoteEpicClient, "stream", stream)
     return writer_fixture, monitor
+
+
+def test_custody_receipt_is_proven_only_by_its_recorded_lease_digest(succession):
+    """Defect class: lease takeover by an unauthorized local caller. Monitor publishes the envelope only as its
+    lease_digest, so a receipt from before digests (holder identity only) can no longer be proven current and
+    refuses; it never passes on the public generation and fence alone."""
+    from lu_machinery.fleet.terminal_abandon import Refusal, verify_current_custody
+
+    _, monitor = succession
+    lease = monitor["streams"][MONITOR]
+    receipt = {key: lease[key] for key in ("stream_id", "session_id", "lease_id", "generation", "fencing_token")}
+    receipt["holder"] = {key: lease["holder"][key] for key in ("agent", "harness", "instance_id")}
+    for stale in (receipt, {**receipt, "lease_digest": "0" * 64}, {**receipt, "lease_digest": True}):
+        with pytest.raises(Refusal) as refused:
+            verify_current_custody(stale)
+        assert refused.value.code == "STALE_AUTHORITY"
+    verify_current_custody({**receipt, "lease_digest": envelope_digest(lease)})  # paired control
 
 
 def _files(repo):
@@ -422,6 +442,7 @@ def test_same_stream_successor_records_bound_succession_receipt(succession, caps
             "generation": 4,
             "fencing_token": 17,
             "holder": {"agent": "muse", "harness": "muse-cli", "instance_id": "muse-monitor-1"},
+            "lease_digest": envelope_digest(monitor["streams"][MONITOR]),
         },
         "tree": tree.relative_to(repo).as_posix(),
         "branch": "codex/boundary",

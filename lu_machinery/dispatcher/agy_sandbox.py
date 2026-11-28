@@ -65,7 +65,13 @@ from typing import TYPE_CHECKING
 
 from lu_machinery import host_context
 from lu_machinery.common import json_depth
-from lu_machinery.common.repo_root import configured_interpreter, machinery_path, main_checkout_root, product_root
+from lu_machinery.common.repo_root import (
+    ProductRootError,
+    configured_interpreter,
+    machinery_path,
+    main_checkout_root,
+    product_root,
+)
 from lu_machinery.common.scratch import ensure_scratch_root
 
 if TYPE_CHECKING:
@@ -609,7 +615,20 @@ class SourcesRelay:
     def __init__(self, endpoint: Path, readers: frozenset[str], env: dict[str, str]):
         from lu_machinery.agent_runtime.sources_read_only import SERVER_RELATIVE_PATH
 
-        self.server = [sys.executable, "-I", str(product_root() / SERVER_RELATIVE_PATH)]
+        try:
+            binding = host_context.load_host_context()
+        except host_context.HostContextError as exc:
+            raise Refused(f"sources_host_binding_invalid: {exc.code}") from exc
+        if not isinstance(binding, host_context.HostContext):
+            raise Refused("sources_host_binding_invalid: full host binding required")
+        try:
+            self.checkout = product_root()
+        except ProductRootError as exc:
+            raise Refused("sources_checkout_unavailable: trusted Sources checkout is unavailable") from exc
+        product = binding.products[binding.default_product]
+        if binding.repos[product.repo] != self.checkout:
+            raise Refused("sources_checkout_mismatch: bound product and trusted Sources checkout differ")
+        self.server = [str(product.python), "-I", str(self.checkout / SERVER_RELATIVE_PATH)]
         self.readers, self.env = readers, env
         self.completed = self.failed = 0
         self.tools: dict[str, int] = {}
@@ -655,8 +674,11 @@ class SourcesRelay:
                 connection.close()
                 return
             # Same process group as the launcher, so a killed task takes its servers with it.
-            process = subprocess.Popen(self.server, cwd=product_root(), env=self.env, stdin=subprocess.PIPE,
-                                       stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            # The validated host binding supplies argv and cwd. Client messages only reach stdin.
+            process = subprocess.Popen(  # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit
+                self.server, cwd=self.checkout, env=self.env, stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
             self.processes.append(process)
         # Drain all stderr without retaining unbounded output or blocking the server on a full pipe.
         last_error: list[str] = []
@@ -1509,19 +1531,15 @@ class _Boundary:
                                     refused_networks=github_networks())
         env_keep = {name: os.environ[name] for name in ("PATH", "HOME", "LANG", "TMPDIR") if name in os.environ}
         self.relay = SourcesRelay(boundary / "sources.sock", frozenset(readers), env_keep)
-        host_file = Path(os.environ.get(host_context.CONTEXT_ENV, str(host_context.DEFAULT_PATH)))
-        hook_reads: list[Path] = []
         interpreter_aliases: dict[Path, Path] = {}
-        has_host_binding = host_file.is_file()
-        if has_host_binding:
-            # An editable test install and a wheel both need the release's two packages.
-            hook_reads = [
-                Path(__file__).resolve().parents[1],
-                machinery_path("agents_extensions/shared/hooks/guard-secret-print.py").parents[2],
-            ]
+        # The relay has validated the host binding. Both installs need the release's two packages.
+        hook_reads = [
+            Path(__file__).resolve().parents[1],
+            machinery_path("agents_extensions/shared/hooks/guard-secret-print.py").parents[2],
+        ]
         sandbox = prepare_host_sandbox(
             engine="agy", snapshot_root=self.worktree, write_root=runtime, reject_root=repository,
-            runtime_reads=[*runtime_files(agy), *_venv_reads(aliases=interpreter_aliases if has_host_binding else None), *hook_reads, *node_reads, *reads,
+            runtime_reads=[*runtime_files(agy), *_venv_reads(aliases=interpreter_aliases), *hook_reads, *node_reads, *reads,
                            *(target for _, target in databases), *sidecars, shared, boundary],
             network_allowed=False,
         )

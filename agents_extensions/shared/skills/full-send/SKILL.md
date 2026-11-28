@@ -13,11 +13,15 @@ skill never overrides repository rules or the operator-only list (rules core P6)
 The landing order is `workflow.md` § Merge policy. The hand-off record, proof rules and the
 gate are in [delivery](references/delivery.md).
 
-Recipes run with the primary checkout's interpreter, resolved once
+Recipes run with the bound machinery runtime interpreter (`LU_PYTHON`), resolved once
 ([delivery](references/delivery.md#interpreter)):
 
 ```bash
-PY="$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")/.venv/bin/python"
+if [[ "${LU_PYTHON:-}" != /* || ! -f "$LU_PYTHON" || ! -x "$LU_PYTHON" ]]; then
+  printf '%s\n' 'Error: missing_interpreter_binding: LU_PYTHON must name an absolute executable.' >&2
+  exit 1
+fi
+PY="$LU_PYTHON"
 ```
 
 A dispatched worker runs under `--permission-mode dontAsk`, which denies any command its allowlist

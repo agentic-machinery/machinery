@@ -24,7 +24,7 @@ from lu_machinery.orchestration import dead_worker_state, dispatch_admission
 from lu_machinery.orchestration.issue_stream_audit import load_registry as _load_stream_registry
 from lu_machinery.session_supervisor import remote
 from tests.dispatcher.conftest import await_file, run_git
-from tests.epics_monitor_stub import isolated_monitor_state  # noqa: F401
+from tests.epics_monitor_stub import isolated_monitor_state, public_lease  # noqa: F401
 from tests.helpers.product_tree import configured_roots  # noqa: F401
 
 _STREAMS = _load_stream_registry()
@@ -83,17 +83,18 @@ _LAUNCHED = dict(pid=_DEAD_PID, process_start="boot:1", launch_mode="scope", lau
 
 
 def _lease(state="active", session_state="open", expires_in=600, **fields):
-    """Monitor's projection of one lease on STREAM, as its stream route answers."""
+    """Monitor's projection of one lease on STREAM, as its stream route answers (envelope only as lease_digest)."""
     ttl = fields.get("ttl_seconds", 900)
     expires_dt = datetime.now(UTC) + timedelta(seconds=expires_in)
     heartbeat_dt = expires_dt - timedelta(seconds=ttl if type(ttl) is int else 900)
     expires = expires_dt.isoformat().replace("+00:00", "Z")
     heartbeat = heartbeat_dt.isoformat().replace("+00:00", "Z")
-    return {"stream_id": STREAM, "session_id": "session-1", "lease_id": "lease-1", "generation": 2,
-            "fencing_token": 2, "state": state, "session_state": session_state, "heartbeat_at": heartbeat,
-            "expires_at": expires, "ttl_seconds": 900, "version": 1, "age_seconds": 0,
-            "holder": {"agent": "claude", "harness": "codex-cli", "instance_id": "legacy-1", "task_id": None,
-                       "process_id": 4321, "holder_kind": "process", "host_id": None}, **fields}
+    envelope = {"stream_id": STREAM, "session_id": "session-1", "lease_id": "lease-1", "generation": 2,
+                "fencing_token": 2, "state": state, "session_state": session_state, "heartbeat_at": heartbeat,
+                "expires_at": expires, "ttl_seconds": 900, "version": 1, "age_seconds": 0,
+                "holder": {"agent": "claude", "harness": "codex-cli", "instance_id": "legacy-1", "task_id": None,
+                           "process_id": 4321, "holder_kind": "process", "host_id": None}}
+    return {**public_lease(envelope), **fields}
 
 
 @pytest.fixture
@@ -501,7 +502,9 @@ def test_a_claim_answer_that_is_not_exactly_this_turns_new_lease_starts_nothing(
         calls.append(kwargs)
         if isinstance(answer, BaseException):
             raise answer
-        return None, _answer(nonce, **answer)
+        # The claim answer echoes the envelope the claim chose (machinery-infra#1659: ids are random, not the nonce).
+        return None, _answer(nonce, **{"lease.session_id": kwargs["session_id"], "lease.lease_id": kwargs["lease_id"],
+                                       **answer})
 
     monkeypatch.setattr(remote.RemoteEpicClient, "claim", claim)
     if refused is None:
@@ -512,7 +515,10 @@ def test_a_claim_answer_that_is_not_exactly_this_turns_new_lease_starts_nothing(
             host_admission.claim_turn(STREAM, "turn-1", nonce, agent="claude", ttl_s=3600)
         assert error.value.code == 3
     assert len(calls) == 1  # never retried
-    assert calls[0]["holder"].instance_id == nonce and calls[0]["session_id"] == f"turn-session-{nonce}"
+    assert calls[0]["holder"].instance_id == nonce
+    for name, prefix in (("session_id", "turn-session-"), ("lease_id", "turn-lease-")):
+        minted = calls[0][name]
+        assert minted.startswith(prefix) and nonce not in minted and len(minted) == len(prefix) + 32
 
 
 def test_a_monitor_outage_before_or_after_the_claim_commits_is_unknown(task_store, monitor, monkeypatch):
@@ -537,8 +543,8 @@ def test_a_monitor_outage_before_or_after_the_claim_commits_is_unknown(task_stor
         _reserve("turn-2")
     with pytest.raises(remote.RemoteClaimConflictError, match="turn_lease_uncleared"):
         _legacy_claim(monitor.client)
-    monitor.client.release(stream_id=STREAM, force=True, actor_agent="claude-cto", actor_host_id="host-a",
-                           reason="the lost claim's turn never started")
+    monitor.store.force_release_remote_session(stream_id=STREAM, actor_agent="claude-cto", actor_host_id="host-a",
+                                               reason="the lost claim's turn never started")
     assert _reserve("turn-3")["turn_lease"]["lease"]["holder"]["task_id"] == "turn-3"
     # Before the commit: an unreachable Monitor claims nothing.
     monkeypatch.setenv("LU_MONITOR_LOOPBACK", "http://127.0.0.1:9")
@@ -583,30 +589,31 @@ def test_a_dry_run_reads_a_projection_whose_session_disagrees_with_its_lease_as_
         (_lease(holder={"agent": "claude"}), "orchestrator_lease_unknown"),
         (_lease(generation=True), "orchestrator_lease_unknown"),
         # A released lease decides "free" only with a well-formed identity, fence and holder.
-        (_lease(state="released", session_state="closed", session_id=""), "orchestrator_lease_unknown"),
-        (_lease(state="released", session_state="closed", lease_id=""), "orchestrator_lease_unknown"),
+        (_lease(state="released", session_state="closed", lease_digest=""), "orchestrator_lease_unknown"),
+        (_lease(state="released", session_state="closed", lease_digest="f" * 63), "orchestrator_lease_unknown"),
+        ({key: value for key, value in _lease(state="released", session_state="closed").items()
+          if key != "lease_digest"}, "orchestrator_lease_unknown"),
         (_lease(state="released", session_state="closed", fencing_token=0), "orchestrator_lease_unknown"),
         (_lease(state="released", session_state="closed", generation=-1), "orchestrator_lease_unknown"),
-        (_lease(state="released", session_state="closed", holder={**_lease()["holder"], "process_id": "4321"}),
+        # The status never publishes a holder's pid or instance id: a holder carrying one is not its projection.
+        (_lease(state="released", session_state="closed", holder={**_lease()["holder"], "process_id": 4321}),
          "orchestrator_lease_unknown"),
-        (_lease(state="released", session_state="closed", holder={**_lease()["holder"], "process_id": 0}),
+        (_lease(state="released", session_state="closed", holder={**_lease()["holder"], "instance_id": "legacy-1"}),
          "orchestrator_lease_unknown"),
         (_lease(state="released", session_state="closed", holder={**_lease()["holder"], "holder_kind": "robot"}),
          "orchestrator_lease_unknown"),
         (_lease(holder={**_lease()["holder"], "agent": ""}), "orchestrator_lease_unknown"),
         # An app thread's holder carries a canonical UUID task id and no pid, as Monitor itself requires.
         (_lease(state="released", session_state="closed", holder={**_lease()["holder"], "holder_kind": "app_thread",
-                                                                  "process_id": None, "task_id": None}),
+                                                                  "task_id": None}),
          "orchestrator_lease_unknown"),
         (_lease(state="released", session_state="closed", holder={**_lease()["holder"], "holder_kind": "app_thread",
-                                                                  "process_id": None, "task_id": "turn-1"}),
+                                                                  "task_id": "turn-1"}),
          "orchestrator_lease_unknown"),
         (_lease(state="released", session_state="closed", holder={**_lease()["holder"], "holder_kind": "app_thread",
-                                                                  "process_id": None,
                                                                   "task_id": "0b9a3a9e-6a8e-4f53-9d0c-7d6f1e2a4b5c"}),
          None),
-        (_lease(state="released", session_state="closed", holder={**_lease()["holder"], "process_id": True}),
-         "orchestrator_lease_unknown"),
+        (_lease(state="released", session_state="closed", lease_digest=True), "orchestrator_lease_unknown"),
         (_lease(state="released", session_state="closed", ttl_seconds=True), "orchestrator_lease_unknown"),
         (_lease(state="released", session_state="closed", version=True), "orchestrator_lease_unknown"),
         (_lease(state="released", session_state="closed", age_seconds=True), "orchestrator_lease_unknown"),
@@ -617,9 +624,9 @@ def test_a_dry_run_reads_a_projection_whose_session_disagrees_with_its_lease_as_
         (_lease(state="released", session_state="closed",
                 heartbeat_at=(datetime.now(UTC) - timedelta(seconds=60)).isoformat().replace("+00:00", "Z")),
          "orchestrator_lease_unknown"),  # expiry - heartbeat != ttl_seconds
-        (_lease(state="released", session_state="closed", session_id="bad.example"), "orchestrator_lease_unknown"),
-        (_lease(state="released", session_state="closed", session_id="[redacted]"), "orchestrator_lease_unknown"),
-        (_lease(state="released", session_state="closed", lease_id="bad.example"), "orchestrator_lease_unknown"),
+        (_lease(state="released", session_state="closed", lease_digest="g" * 64), "orchestrator_lease_unknown"),
+        (_lease(state="released", session_state="closed", lease_digest="[redacted]"), "orchestrator_lease_unknown"),
+        (_lease(state="released", session_state="closed", lease_digest="F" * 64), "orchestrator_lease_unknown"),
         (_lease(state="released", session_state="closed", holder={**_lease()["holder"], "host_id": "bad.host"}),
          "orchestrator_lease_unknown"),
         ({**_lease(), "expires_at": "soon"}, "orchestrator_lease_unknown"),
@@ -857,8 +864,8 @@ def test_a_release_is_exact_one_shot_and_fenced_from_a_successor(task_store, mon
         assert host_admission.release_turn(envelope, **exact).startswith("orchestrator_lease_release_unknown")
     assert len(calls) == 1 and "force" not in calls[0]
     assert monitor.client.stream(STREAM)["lease"]["state"] == "active"  # the outage kept it
-    monitor.client.release(stream_id=STREAM, force=True, actor_agent="claude-cto", actor_host_id="host-a",
-                           reason="the turn's scope is proven gone")
+    monitor.store.force_release_remote_session(stream_id=STREAM, actor_agent="claude-cto", actor_host_id="host-a",
+                                               reason="the turn's scope is proven gone")
     store.replace({**hold, "status": "crashed"})
     successor = _legacy_claim(monitor.client)[0]
     before = monitor.store.dump_stream(STREAM)
@@ -1298,9 +1305,11 @@ def test_a_turn_end_to_end_holds_its_lease_links_children_and_never_shares_its_t
     assert record["orchestrator"] == {"stream": STREAM} and record["mode"] == "workspace-write"
     assert record["research_role"] == "driver"  # role policy sees a driving turn, not only authoring
     lease = box.monitor.client.stream(STREAM)["lease"]
-    assert (lease["state"], lease["holder"]["harness"], lease["holder"]["instance_id"], lease["holder"]["task_id"]) == (
-        "active", "dispatch-turn", nonce, "turn-1")
-    assert record["turn_lease"]["lease"]["session_id"] == lease["session_id"]
+    assert (lease["state"], lease["holder"]["harness"], lease["holder"]["task_id"]) == ("active", "dispatch-turn", "turn-1")
+    # Status publishes the envelope only as its digest; the turn record keeps the exact envelope it claimed.
+    assert record["turn_lease"]["lease"]["holder"]["instance_id"] == nonce
+    assert lease["lease_digest"] == remote.envelope_digest(record["turn_lease"]["lease"])
+    assert not {"session_id", "lease_id"} & set(lease) and not {"instance_id", "process_id"} & set(lease["holder"])
     [launch] = [json.loads(line) for line in box.launches.read_text().splitlines()]
     assert (launch["task_id"], launch["run_nonce"], launch["allow_fallback"]) == ("turn-1", nonce, False)
     assert {"--property=RuntimeMaxSec=1200", "--property=TimeoutStopSec=30",
@@ -1338,8 +1347,9 @@ def test_a_turn_end_to_end_holds_its_lease_links_children_and_never_shares_its_t
     # Nor afterwards: the settled turn keeps its stream's lease until an operator releases it.
     assert box.monitor.client.stream(STREAM)["lease"]["state"] == "active"
     assert "orchestrator_stream_leased" in box.turn("turn-3", expected=3).stderr
-    box.monitor.client.release(stream_id=STREAM, force=True, actor_agent="claude-cto", actor_host_id="host-a",
-                               reason="turn-1 scope proven gone")
+    box.monitor.store.force_release_remote_session(
+        stream_id=STREAM, actor_agent="claude-cto", actor_host_id="host-a", reason="turn-1 scope proven gone"
+    )
     assert box.turn("turn-4").stdout.splitlines()[0] == "turn-4"
     _release(box, "turn-4")
 

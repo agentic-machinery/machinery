@@ -20,7 +20,7 @@ import subprocess
 import threading
 import time
 import uuid
-from collections.abc import Awaitable, Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager, nullcontext, suppress
 from dataclasses import dataclass, field
@@ -31,10 +31,9 @@ from urllib.parse import parse_qs
 
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, Response
 from prometheus_client import CollectorRegistry, Counter, Histogram, generate_latest
-from prometheus_client.core import Metric
+from prometheus_client.core import CounterMetricFamily, GaugeMetricFamily, Metric
 from prometheus_client.exposition import CONTENT_TYPE_PLAIN_0_0_4
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
@@ -50,6 +49,7 @@ from lu_machinery.github_check_rollup import group_collapsed_by_name
 from lu_machinery.guardrails import worktree_containment
 from lu_machinery.orientation_packet import PACKET_MAX_BYTES, cap_response, json_bytes
 from lu_machinery.research import registry as reg
+from lu_machinery.telemetry import reader as telemetry_reader
 
 try:
     from lu_machinery.path_safety import _clean_parts  # scripts/ on sys.path (test sys.path-hack)
@@ -1965,6 +1965,48 @@ def _status_class(status_code: int) -> str:
 _METRICS_REFRESH_S = 5.0
 
 
+class PublicTelemetryCollector:
+    """Public-scope ``lu_telemetry_public_*`` series for the shared, unauthenticated scrape.
+
+    Reads only ``events/public/`` and confirmed-public model-stats rows (``telemetry.reader.public_snapshot``),
+    so no private, unclassified or legacy record moves a series. An unknown value is an absent series, never 0;
+    an unreadable log yields no series at all. Private numbers stay off this scrape until plan Slice 4's caller
+    authorization exists.
+    """
+
+    def __init__(self, context: MonitorContext) -> None:
+        self.context = context
+
+    def collect(self) -> Iterator[Metric]:
+        try:
+            snapshot = telemetry_reader.public_snapshot(self.context.roots.batch_state_dir)
+        except Exception as exc:  # an unreadable log never breaks the scrape
+            logging.getLogger(__name__).warning("public telemetry not collected: %s", type(exc).__name__)
+            return
+        for name, value, help_text in (
+            ("events_last_ts", snapshot.events_last_ts, "Unix time of the newest public telemetry event."),
+            ("independent_settlement_last_ts", snapshot.independent_settlement_last_ts,
+             "Unix time of the newest public settlement in the model-stats rows (independent of the event log)."),
+        ):
+            if value is not None:
+                gauge = GaugeMetricFamily(f"lu_telemetry_public_{name}", help_text)
+                gauge.add_metric([], value)
+                yield gauge
+        footprint = GaugeMetricFamily("lu_telemetry_public_footprint_bytes", "Bytes of the public event log.")
+        footprint.add_metric([], snapshot.footprint_bytes)
+        yield footprint
+        if snapshot.emit_errors_total is not None:
+            errors = CounterMetricFamily("lu_telemetry_public_emit_errors", "Public events lost to emitter errors.")
+            errors.add_metric([], snapshot.emit_errors_total)
+            yield errors
+        if snapshot.dropped_events_total is not None:
+            dropped = CounterMetricFamily("lu_telemetry_public_dropped_events", "Public events dropped, by reason.",
+                                          labels=["reason"])
+            for reason, count in snapshot.dropped_events_total.items():
+                dropped.add_metric([reason], count)
+            yield dropped
+
+
 @dataclass(frozen=True, eq=False)
 class _CollectedMetrics:
     families: tuple[Metric, ...]
@@ -2013,6 +2055,7 @@ class PrometheusMetricsMiddleware:
         self._collectors = (
             (CommsCollector(context), False),
             (ModelStatsCollector(context), False),
+            (PublicTelemetryCollector(context), False),
             (self._requests, True),
             (self._errors, True),
             (self._latency, True),
@@ -2076,6 +2119,21 @@ class PrometheusMetricsMiddleware:
             self._errors.labels(**labels).inc()
 
 
+class MonitorBrowserRequestMiddleware:
+    """Apply the browser request guard before any Monitor HTTP route runs."""
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] == "http":
+            refusal = runtime_api.browser_request_access_refusal(Request(scope))
+            if refusal is not None:
+                await runtime_api.monitor_access_refusal_response(refusal)(scope, receive, send)
+                return
+        await self.app(scope, receive, send)
+
+
 def create_app(
     context: MonitorContext,
     *,
@@ -2118,13 +2176,7 @@ def create_app(
     factory_app.state.product = product
     factory_app.state.metrics_snapshot = metrics.snapshot
     install_providers(product)
-    factory_app.add_middleware(
-        CORSMiddleware,
-        allow_origins=["*"],
-        allow_credentials=False,
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
+    factory_app.add_middleware(MonitorBrowserRequestMiddleware)
     factory_app.middleware("http")(resilience_middleware)
     factory_app.middleware("http")(opsec_path_sanitizer_middleware)
     factory_app.add_middleware(metrics.wrap)

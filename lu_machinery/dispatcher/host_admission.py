@@ -260,6 +260,9 @@ TURN_TTL_MARGIN_S = 60
 _TURN_LEASE_FIELDS = frozenset({"stream_id", "session_id", "lease_id", "generation", "fencing_token", "holder",
                                 "expires_at", "ttl_seconds"})
 _HOLDER_FIELDS = ("agent", "harness", "instance_id", "task_id", "process_id", "holder_kind", "host_id")
+# Monitor's status read publishes a holder without its secret identity fields (instance_id, process_id) and the
+# exact envelope only as its lease_digest (epics_router._lease_payload).
+_STATUS_HOLDER_FIELDS = ("agent", "harness", "task_id", "holder_kind", "host_id")
 
 
 def turn_timing(hard_timeout) -> tuple[int, int]:
@@ -345,17 +348,48 @@ def _valid_lease_identity(lease, stream: str) -> bool:
             and _valid_holder(lease.get("holder")))
 
 
-def _valid_projection_lease(lease: object, stream: str, *, match_ttl: bool = True) -> TypeGuard[dict[str, Any]]:
-    """A lease payload as Monitor's projection writes it (epics_router._lease_payload).
+def _valid_status_lease(lease: object, stream: str) -> TypeGuard[dict[str, Any]]:
+    """A lease as Monitor's status read publishes it: public holder fields and the envelope's ``lease_digest``."""
+    from lu_machinery.api.occupancy_sanitize import opaque_host_id
+    from lu_machinery.session_streams.model import HolderKind
 
-    For claim and stored stream projections (``match_ttl=True``), Monitor computes ``expires_at`` by adding
-    ``ttl_seconds`` to ``heartbeat_at``. Release acknowledgements echo default timestamps, so ``match_ttl=False``
-    checks only that ``expires_at`` does not precede ``heartbeat_at``.
+    holder = lease.get("holder") if isinstance(lease, dict) else None
+    digest = lease.get("lease_digest") if isinstance(lease, dict) else None
+    return (isinstance(lease, dict) and lease.get("stream_id") == stream
+            and isinstance(digest, str) and len(digest) == 64 and all(c in "0123456789abcdef" for c in digest)
+            and _positive(lease.get("generation")) and _positive(lease.get("fencing_token"))
+            and isinstance(holder, dict) and set(holder) == set(_STATUS_HOLDER_FIELDS)
+            and _valid_token(holder["agent"]) and _valid_token(holder["harness"])
+            and (holder["task_id"] is None or _valid_token(holder["task_id"]))
+            and (holder["host_id"] is None or (isinstance(holder["host_id"], str) and opaque_host_id(holder["host_id"])))
+            and isinstance(holder["holder_kind"], str) and holder["holder_kind"] in {kind.value for kind in HolderKind}
+            # LeaseHolder.validate's rule for the fields the status still names: an app thread's canonical UUID.
+            and (holder["holder_kind"] != HolderKind.APP_THREAD.value or _canonical_uuid(holder["task_id"]))
+            and _valid_lease_timing(lease, match_ttl=True))
+
+
+def _canonical_uuid(value) -> bool:
+    try:
+        return isinstance(value, str) and str(uuid.UUID(value)) == value.lower()
+    except ValueError:
+        return False
+
+
+def _valid_projection_lease(lease: object, stream: str, *, match_ttl: bool = True) -> TypeGuard[dict[str, Any]]:
+    """A lease payload as Monitor's holder-operation replies write it, envelope included (epics_router._lease_payload).
+
+    For claim answers (``match_ttl=True``), Monitor computes ``expires_at`` by adding ``ttl_seconds`` to
+    ``heartbeat_at``. Release acknowledgements echo default timestamps, so ``match_ttl=False`` checks only that
+    ``expires_at`` does not precede ``heartbeat_at``.
     """
+    return isinstance(lease, dict) and _valid_lease_identity(lease, stream) and _valid_lease_timing(
+        lease, match_ttl=match_ttl)
+
+
+def _valid_lease_timing(lease: dict, *, match_ttl: bool) -> bool:
+    """A lease's states, version, TTL and timestamps as Monitor's projection writes them."""
     from lu_machinery.session_streams.store import MAX_TTL_SECONDS
 
-    if not isinstance(lease, dict) or not _valid_lease_identity(lease, stream):
-        return False
     state, session = lease.get("state"), lease.get("session_state")
     heartbeat = store.parse_utc_timestamp(lease.get("heartbeat_at"))
     expires = store.parse_utc_timestamp(lease.get("expires_at"))
@@ -400,7 +434,9 @@ def claim_turn(stream: str, task_id: str, run_nonce: str, *, agent: str, ttl_s: 
     from lu_machinery.session_supervisor.remote import RemoteClaimConflictError, RemoteEpicClient
 
     holder = _turn_holder(agent, task_id, run_nonce)
-    session_id, lease_id = f"turn-session-{run_nonce}", f"turn-lease-{run_nonce}"
+    # Random, never derived from the run nonce (task listings publish it): these ids are what no other reader can
+    # rebuild, and only the hold's TURN_LEASE_KEY envelope keeps them.
+    session_id, lease_id = f"turn-session-{uuid.uuid4().hex}", f"turn-lease-{uuid.uuid4().hex}"
     try:
         from lu_machinery.session_streams.model import HolderKind, LeaseHolder
 
@@ -604,7 +640,7 @@ def turn_lease_probe(stream):
     if lease is None:  # the projection's explicit "no lease", which has no session either
         return None if response["session_state"] is None else (
             "orchestrator_lease_unknown: the Monitor answer names a session but no lease")
-    if not (_valid_projection_lease(lease, stream) and response["session_state"] == lease["session_state"]):
+    if not (_valid_status_lease(lease, stream) and response["session_state"] == lease["session_state"]):
         return "orchestrator_lease_unknown: the Monitor lease is malformed or its states disagree"
     state = lease["state"]
     if state == "released":

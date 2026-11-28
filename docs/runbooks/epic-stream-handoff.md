@@ -114,6 +114,9 @@ idle and unpinned app evidence; an unknown state preserves it.
    Operator takeover (predecessor did not hand off) is launcher `--force`,
    which calls `session_supervisor release --force` then claims a **new**
    session. Live drivers must not pass `--force` or `handoff-claim`.
+   Force release runs only on the Monitor host: the CLI writes Monitor's own
+   lease store with the operator receipt, and refuses where that store is
+   absent. Monitor's HTTP release route refuses any `force` request (403).
 
    ```bash
    ./start-codex-driver.sh --epic infra --force

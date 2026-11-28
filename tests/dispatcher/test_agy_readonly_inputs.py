@@ -13,11 +13,10 @@ from unittest.mock import Mock
 
 import pytest
 
-from lu_machinery import host_context
 from lu_machinery.common.repo_root import machinery_root
 from lu_machinery.dispatcher import agy_sandbox, cli, git, store, worker
 from lu_machinery.dispatcher.providers import agy as agy_provider
-from tests.dispatcher.test_providers_b import _github_meta_path
+from tests.dispatcher.test_providers_b import _bind_agy_test_host, _github_meta_path
 from tests.helpers.product_tree import configured_roots  # noqa: F401
 from tests.host_context.conftest import host_layout as host_layout
 
@@ -291,7 +290,7 @@ def test_refuses_unusable_input_before_spawn(tmp_path, monkeypatch, capsys):
     assert not tasks.exists() or not list(tasks.glob("*.json"))
 
 
-def test_ro_bind_records_digest(tmp_path, monkeypatch, capsys, configured_roots):  # noqa: F811
+def test_ro_bind_records_digest(tmp_path, monkeypatch, capsys, configured_roots, host_layout):  # noqa: F811
     """Defect class: the host directory is mounted, the mount is writable, or the digest is not the file bytes."""
     if not _bwrap_usable():
         pytest.skip("needs a usable unprivileged bubblewrap")
@@ -355,8 +354,7 @@ def test_ro_bind_records_digest(tmp_path, monkeypatch, capsys, configured_roots)
 
     # The dispatch half replaced the bubblewrap check. Restore it before the real mount.
     monkeypatch.undo()
-    monkeypatch.setenv("LU_PRODUCT_ROOT", str(configured_roots.product))
-    monkeypatch.setenv("LEARN_UKRAINIAN_PRIMARY_REPO_ROOT", str(configured_roots.primary))
+    _bind_agy_test_host(monkeypatch, host_layout, configured_roots.product)
     repo, worktree = _linked_worktree(tmp_path)
     bound = agy_sandbox.bind_inputs([str(packet)], repo_root=repo)
     mount = f"{agy_sandbox.INPUT_MOUNT}/0"
@@ -410,19 +408,8 @@ def test_read_only_agy_cannot_read_sibling_task_records(tmp_path, monkeypatch, c
     _, worktree = _linked_worktree(tmp_path)
     state = Path(host_layout.data["state_root"]).rename(tmp_path / "state with spaces")
     tasks = state / "batch_state/tasks"
-    tasks.mkdir(parents=True)
     host_layout.data["state_root"] = str(state)
-    host_layout.data["repos"] = {
-        "machinery": str(configured_roots.primary), "public": str(configured_roots.product),
-    }
-    host_layout.data["runtime"]["python"] = sys.executable
-    monkeypatch.setenv("LU_PYTHON", sys.executable)
-    monkeypatch.setenv("LEARN_UKRAINIAN_PYTHON", sys.executable)
-    monkeypatch.setenv("LU_PRODUCT_ROOT", str(configured_roots.product))
-    host_layout.write()
-    monkeypatch.setenv(host_context.CONTEXT_ENV, str(host_layout.file))
-    for name, value in host_context._state_assertions(state).items():
-        monkeypatch.setenv(name, str(value))
+    _bind_agy_test_host(monkeypatch, host_layout, configured_roots.product)
     own = tasks / "agy-mask.inputs" / "packet.txt"
     own.parent.mkdir()
     own.write_text("own packet\n")
@@ -445,7 +432,7 @@ def test_read_only_agy_cannot_read_sibling_task_records(tmp_path, monkeypatch, c
         'test "$(ls -A "$LU_TASKS_DIR")" = agy-mask.inputs; '
         f'test "$LU_PYTHON" = {shlex.quote(sys.executable)}; '
         'test "$LU_PYTHON" = "$LEARN_UKRAINIAN_PYTHON"; '
-        f'test "$LU_PRODUCT_ROOT" = {shlex.quote(str(configured_roots.product))}; '
+        f'test "$LU_PRODUCT_ROOT" = {shlex.quote(host_layout.data["repos"]["public"])}; '
         f'allowed=$(printf %s {payload} | {hook}); '
         f'printf "%s\\n" "$allowed" | grep -q {allow_decision}; '
         f'denied=$(printf %s {payload} | env -u LU_HOST_CONTEXT {hook}); '
@@ -458,15 +445,14 @@ def test_read_only_agy_cannot_read_sibling_task_records(tmp_path, monkeypatch, c
     assert run.stdout == "own packet\nreviewed\n"
 
 
-def test_read_only_agy_writes_only_its_own_task_artifacts(tmp_path, monkeypatch, configured_roots):  # noqa: F811
+def test_read_only_agy_writes_only_its_own_task_artifacts(tmp_path, monkeypatch, configured_roots, host_layout):  # noqa: F811
     """Defect class: a read-only AGY report is lost with the scratch because its own ``.artifacts`` is read-only,
     or the grant reaches further: another task's artifacts, the task store or the checkout become writable."""
     if not _bwrap_usable():
         pytest.skip("needs a usable unprivileged bubblewrap")
     _, worktree = _linked_worktree(tmp_path)
-    tasks = tmp_path / "tasks"
-    tasks.mkdir()
-    monkeypatch.setenv("LU_TASKS_DIR", str(tasks))
+    _bind_agy_test_host(monkeypatch, host_layout, configured_roots.product)
+    tasks = Path(os.environ["LU_TASKS_DIR"])
     task_id = "agy-art"
     (tasks / f"{task_id}.json").write_text(json.dumps(
         {"task_id": task_id, "mode": "read-only", "status": "running", "run_nonce": "2" * 32}))

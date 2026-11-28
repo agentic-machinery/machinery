@@ -20,9 +20,10 @@ from lu_machinery.dispatcher.types import Invocation, ParsedResult, TaskSpec
 from tests.dispatcher.conftest import await_file as await_file
 from tests.dispatcher.conftest import prior_worktree as prior_worktree
 from tests.dispatcher.conftest import run_git as run_git
-from tests.dispatcher.test_providers_b import _bwrap_usable, _github_meta_path
+from tests.dispatcher.test_providers_b import _bind_agy_test_host, _bwrap_usable, _github_meta_path
 from tests.dispatcher.test_site_deps_node import _write_fake_toolchain
 from tests.helpers.product_tree import configured_roots as configured_roots
+from tests.host_context.conftest import build_host_layout
 
 PROOF_DIR = "LU_SENSE_PROOF_DIR"
 SENTINEL = "/fixture/sense-proofs"
@@ -688,8 +689,11 @@ def test_agy_sandbox_node_toolchain_reads_admits_bin_and_modules_and_refuses_uns
 
 
 @pytest.mark.skipif(not _bwrap_usable(), reason="needs a usable unprivileged bubblewrap")
-def test_agy_sandbox_exposes_pinned_node_toolchain_read_only_and_refuses_missing_pin(tmp_path: Path):
+def test_agy_sandbox_exposes_pinned_node_toolchain_read_only_and_refuses_missing_pin(
+    tmp_path: Path, monkeypatch, configured_roots,
+):
     """Defect class: read-only AGY bubblewrap sandbox hiding /opt/lu-node or failing to put pinned Node on PATH."""
+    _bind_agy_test_host(monkeypatch, build_host_layout(tmp_path / "host"), configured_roots.product)
     repo = tmp_path / "repo"
     repo.mkdir()
     run_git(repo, "init", "-q", "-b", "main")
@@ -726,7 +730,6 @@ def test_agy_sandbox_exposes_pinned_node_toolchain_read_only_and_refuses_missing
         env = {
             **os.environ,
             "AGY_APP_DATA_DIR": str(app),
-            "LEARN_UKRAINIAN_PRIMARY_REPO_ROOT": str(repo),
             "PATH": _github_meta_path(tmp_path),
             site_deps.NODE_TOOLCHAIN_DIRS_ENV: toolchain_env,
         }

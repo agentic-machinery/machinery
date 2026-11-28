@@ -8,9 +8,11 @@ One read-only collector joins two durable sources:
   together with the merged delivery a task recorded itself.
 
 One refresh computes every window (24 hours, 7, 30, 90 days and all) and the ISO-week buckets; the route serves a
-window of that snapshot and ``ModelStatsCollector`` exposes the same snapshot on the Monitor's ``/metrics``.
-``/metrics`` keeps the four longer windows for its existing model stats and exports token gauges at 24 hours
-and seven days. ``view=page`` serves
+window of that snapshot. ``ModelStatsCollector`` exposes a second, public-scope snapshot on the Monitor's shared,
+unauthenticated ``/metrics``: the same collection over confirmed-public rows only (a row of a private or
+unclassified repository, or with a declared data class, is left out, fail closed) and merges of public
+repositories only. ``/metrics`` keeps the four longer windows for its model stats and exports token gauges at
+24 hours and seven days. ``view=page`` serves
 the same figures without the per-class tree and without reply text. ``view=samples`` serves that reply text
 alone, and the page asks for it on its own. Every figure
 splits by the concrete model id and the effective effort. Unknown effort is shown separately from model totals.
@@ -28,6 +30,10 @@ additions plus deletions at merge: 0–100, 101–1,000, over 1,000, or unknown 
 ``post_merge_rework_proxy`` counts attributed merges named by a fix or revert in the same repository over the
 next seven days of local history. A merge enters the selected window when its seven-day follow-up ends.
 ``no_deliverable_causes`` counts each no-deliverable task once, using its recorded cause when available.
+
+``ruff_quality`` (#1615) is report-only: per-model CI Ruff results from the collector's local ledgers
+(``import-ruff-attempts``), never a GitHub read and never a gate, served on ``view=full`` only (the dashboard
+projection is unchanged). It is described at ``ruff_quality``.
 """
 
 from __future__ import annotations
@@ -63,15 +69,18 @@ from lu_machinery.review.model_catalog import (
     VALID_REVIEW_PROFILES,
     VALID_RISKS,
 )
+from lu_machinery.telemetry.emit import record_visibility
 
 from . import planning
 from .model_stats_rows import (
     NATIVE_ALIASES,
     NO_DELIVERABLE_CAUSES,
     POOLS,
+    RUFF_BUCKETS,
     UNKNOWN_EFFORT,
     UNPARSED_REASONS,
     VERDICTS,
+    classify_ruff_attempt,
     comparison_effort,
     current_catalog_model_ids,
     fleet_catalog,
@@ -80,6 +89,8 @@ from .model_stats_rows import (
     read_finding_outcomes,
     read_publications,
     read_rows,
+    read_ruff_attempts,
+    read_ruff_state,
     refresh_readings,
     repository_keys,
     retired_subscription_model,
@@ -2019,11 +2030,14 @@ def _weeks(groups: _Weeks) -> list[dict[str, Any]]:
 
 
 def collect(batch_state_dir: Path, primary_root: Path, now: datetime | None = None, *,
-            landing: Landing | None = None) -> dict[str, Any]:
+            landing: Landing | None = None, public_only: bool = False) -> dict[str, Any]:
     """One snapshot: every window and the ISO-week buckets, from the summary rows, the publication ledger, one landing
     scan and one read of the files changed between blocked and approved review heads.
 
     The catalogs are read afresh for each collection: no reading of an earlier one, failed or valid, is reused.
+    ``public_only`` keeps only confirmed-public rows (written with ``visibility`` "public" and still public under
+    ``telemetry.emit.record_visibility``; a row written before that field existed is left out) and merges of public
+    repositories: the scope the shared, unauthenticated ``/metrics`` may show.
     """
     refresh_readings()
     for reading in (_catalog_models, _known_models, _model_runtime_levels):
@@ -2038,6 +2052,10 @@ def collect(batch_state_dir: Path, primary_root: Path, now: datetime | None = No
         outcomes, outcome_counts = _Outcomes(), Counter({"registry_unreadable": 1})
     catalog = fleet_catalog()
     keys = repository_keys(catalog)
+    public_keys = frozenset(key for key, repo in (catalog or {}).items() if repo.authorized_visibility == "public")
+    if public_only:
+        raw_rows = [raw for raw in raw_rows
+                    if catalog and raw.get("visibility") == "public" and record_visibility(raw, catalog) == "public"]
     moments = [m for m in map(_moment, raw_rows) if m]
     first = min(moments, default=until)
     rows = [row for row in _rows(raw_rows, landing or Landing(), alias_resolver(raw_rows), publications, keys)
@@ -2057,7 +2075,8 @@ def collect(batch_state_dir: Path, primary_root: Path, now: datetime | None = No
     # Token spend covers every recorded model and effort, including historical routes absent from today's tables.
     token_rows = rows
     token_work = _token_work(token_rows)
-    merge_times = [pr.at for pr in landing.prs.values() if pr.at < until]
+    merge_times = [pr.at for (repo, _number), pr in landing.prs.items()
+                   if pr.at < until and (not public_only or repo in public_keys)]
     read_repositories = landing.repositories["read"]
     complete_landing = read_repositories > 0 and read_repositories == landing.repositories.total()
     rows = [replace(row, author=None, review_author=None)
@@ -2117,6 +2136,7 @@ def collect(batch_state_dir: Path, primary_root: Path, now: datetime | None = No
     return {
         "schema_version": SCHEMA_VERSION,
         "observed_at": datetime.now(UTC).isoformat(),
+        "ruff_quality": ruff_quality(batch_state_dir, raw_rows),
         "low_sample_below": LOW_SAMPLE,
         "first_record": first.isoformat() if moments else None,
         "windows": windows,
@@ -2133,12 +2153,144 @@ def collect(batch_state_dir: Path, primary_root: Path, now: datetime | None = No
     }
 
 
+_RUFF_SIZE_BANDS = ((100, "0-100"), (1000, "101-1000"))
+
+
+def _size_band(size: object) -> str:
+    if type(size) is not int:
+        return "unknown"
+    return next((name for top, name in _RUFF_SIZE_BANDS if size <= top), "over-1000")
+
+
+def _credit_index(rows: Iterable[Mapping[str, Any]]) -> dict[tuple[str, str], set[tuple[str, str, str]]]:
+    """``(repository, commit)`` to every ``(task_id, model, class)`` that credited it at settlement.
+
+    Only a row bound to the whole settlement identity credits anything: repository, writer task, run nonce, a model
+    the runtime observed (``resolved_model_known is True``) and the dispatcher-computed credited set. A hook record,
+    an ``X-Agent`` trailer or a requested model is never authorship proof.
+    """
+    index: dict[tuple[str, str], set[tuple[str, str, str]]] = defaultdict(set)
+    for row in rows:
+        commits, model, repository = row.get("credited_commits"), row.get("resolved_model"), row.get("repository")
+        if (not isinstance(commits, list) or row.get("resolved_model_known") is not True
+                or not isinstance(model, str) or model == "unknown" or not isinstance(repository, str)
+                or not isinstance(row.get("run_nonce"), str) or not isinstance(row.get("task_id"), str)):
+            continue
+        for sha in commits:
+            index[(repository, sha)].add((row["task_id"], model, str(row.get("class") or "unclassified")))
+    return index
+
+
+def _head_credit(receipt: Mapping[str, Any], index: Mapping[tuple[str, str], set[tuple[str, str, str]]]
+                 ) -> tuple[str, str | None, str]:
+    """``(attribution, model, task_family)``: ``model`` only when every commit of ``base..head`` is credited and all
+    crediting tasks share one runtime-observed model; ``joint`` for two or more models; otherwise ``unknown``."""
+    commits = receipt.get("head_commits")
+    if not commits:
+        return "unknown", None, "unknown"
+    credit: set[tuple[str, str, str]] = set()
+    for sha in commits:
+        found = index.get((receipt["repository"], sha))
+        if not found:
+            return "unknown", None, "unknown"
+        credit |= found
+    models = {model for _, model, _ in credit}
+    families = {family for _, _, family in credit}
+    family = families.pop() if len(families) == 1 else "mixed"
+    if len(models) == 1:
+        return "model", models.pop(), family
+    return "joint", None, family
+
+
+def _review_risks(rows: Iterable[Mapping[str, Any]]) -> dict[tuple[str, int], str]:
+    """The review risk of each PR's reviews (``profile/risk`` class); ``mixed`` when its reviews disagree."""
+    risks: dict[tuple[str, int], set[str]] = defaultdict(set)
+    for row in rows:
+        task_class = row.get("class")
+        if (row.get("role") == "review" and isinstance(row.get("repository"), str) and type(row.get("pr")) is int
+                and isinstance(task_class, str) and task_class.count("/") == 1):
+            risks[(row["repository"], row["pr"])].add(task_class.split("/", 1)[1])
+    return {key: values.pop() if len(values) == 1 else "mixed" for key, values in risks.items()}
+
+
+def _bucket_counts() -> dict[str, int]:
+    return dict.fromkeys(RUFF_BUCKETS, 0)
+
+
+def _code_failure_rate(buckets: Mapping[str, int]) -> dict[str, int]:
+    # Only attempts with a proven lint outcome enter the rate; every other bucket is reported beside it.
+    return {"numerator": buckets["ruff_code_failure"],
+            "denominator": buckets["ruff_code_failure"] + buckets["ruff_pass"]}
+
+
+def ruff_quality(batch_state_dir: Path, rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    """Report-only per-model CI Ruff results, from local ledgers only.
+
+    Each stable attempt identity resolves to one winning receipt (``read_ruff_attempts``), classifies into one
+    ``RUFF_BUCKETS`` bucket, and counts when its immutable start time is at or after the frozen
+    ``pilot_window_start``. A head is credited to a model only through settled tasks' dispatcher-computed credited
+    commits; ``joint`` and ``unknown`` heads stay out of every model's rate and are counted on their own. The
+    ``ruff_code_failure_rate`` of a model is code failures over code failures plus passes; cancelled, infrastructure,
+    missing-evidence, guard, base-only and ambiguous attempts are reported beside it, never inside it.
+    """
+    receipts, counts = read_ruff_attempts(batch_state_dir)
+    try:
+        state = read_ruff_state(batch_state_dir)
+        state_reading = "absent" if state is None else "ok"
+    except (OSError, ValueError, RecursionError):
+        state, state_reading = None, "malformed"
+    pilot = timestamp(state["pilot_window_start"]) if state else None
+    index = _credit_index(rows)
+    risks = _review_risks(rows)
+    totals, groups = _bucket_counts(), {"joint": _bucket_counts(), "unknown": _bucket_counts()}
+    models: dict[str, dict[str, int]] = defaultdict(_bucket_counts)
+    keyed: dict[tuple[str, ...], dict[str, int]] = defaultdict(_bucket_counts)
+    attribution: Counter[str] = Counter({"model": 0, "joint": 0, "unknown": 0})
+    for receipt in receipts:
+        started = timestamp(receipt["started_at"])
+        if pilot is None or started is None:
+            counts["untimed_or_no_pilot"] += 1
+            continue
+        if started < pilot:
+            counts["before_pilot"] += 1
+            continue
+        bucket = classify_ruff_attempt(receipt)
+        kind, model, family = _head_credit(receipt, index)
+        totals[bucket] += 1
+        attribution[kind] += 1
+        (models[model] if model is not None else groups[kind])[bucket] += 1
+        keyed[(receipt["repository"], family, risks.get((receipt["repository"], receipt["pr"]), "unknown"),
+               _size_band(receipt["diff_size"]), str(receipt["check_version"]), kind, model or kind)][bucket] += 1
+    denominator = sum(totals.values())
+    return {
+        "report_only": True,
+        "state": state_reading,
+        "pilot_window_start": state["pilot_window_start"] if state else None,
+        "watermark": state["watermark"] if state else None,
+        "incomplete_intervals": list(state["incomplete_intervals"]) if state else [],
+        "denominator": denominator,
+        "buckets": totals,
+        "attribution": dict(attribution),
+        "ruff_code_failure_rate": _code_failure_rate(
+            {name: sum(group[name] for group in models.values()) for name in RUFF_BUCKETS}),
+        "models": [{"model": name, "attempts": sum(group.values()), "buckets": group,
+                    "ruff_code_failure_rate": _code_failure_rate(group)} for name, group in sorted(models.items())],
+        "joint": {"attempts": sum(groups["joint"].values()), "buckets": groups["joint"]},
+        "unknown": {"attempts": sum(groups["unknown"].values()), "buckets": groups["unknown"]},
+        "by_key": [{"repository": key[0], "task_family": key[1], "risk": key[2], "diff_size": key[3],
+                    "check_version": key[4], "attribution": key[5], "model": key[6] if key[5] == "model" else None,
+                    "attempts": sum(group.values()), "buckets": group}
+                   for key, group in sorted(keyed.items())],
+        "coverage": dict(sorted(counts.items())),
+    }
+
+
 def _cache_key(ctx: MonitorContext) -> str:
     return ctx_scoped_ttl_key(ctx, "model-stats", SCHEMA_VERSION)
 
 
-def _compute(ctx: MonitorContext) -> Callable[[], dict[str, Any]]:
-    return lambda: collect(ctx.roots.batch_state_dir, ctx.roots.live_repo_root)
+def _compute(ctx: MonitorContext, *, public_only: bool = False) -> Callable[[], dict[str, Any]]:
+    return lambda: collect(ctx.roots.batch_state_dir, ctx.roots.live_repo_root, public_only=public_only)
 
 
 _log = logging.getLogger(__name__)
@@ -2170,12 +2322,15 @@ def _refresh_off_loop(key: str, compute: Callable[[], dict[str, Any]]) -> None:
     threading.Thread(target=run, name="model-stats-refresh", daemon=True).start()
 
 
-def cached_snapshot(ctx: MonitorContext) -> tuple[dict[str, Any], float] | None:
-    """The stored snapshot and its age; starts the single-flight refresh when absent or older than 300 s."""
-    key = _cache_key(ctx)
+def cached_snapshot(ctx: MonitorContext, *, public_only: bool = False) -> tuple[dict[str, Any], float] | None:
+    """The stored snapshot and its age; starts the single-flight refresh when absent or older than 300 s.
+
+    ``public_only`` reads the separate public-scope snapshot that ``/metrics`` shows.
+    """
+    key = ctx_scoped_ttl_key(ctx, "model-stats-public", SCHEMA_VERSION) if public_only else _cache_key(ctx)
     stored = cache_get_stored(key)
     if stored is None or stored[1] >= REFRESH_SECONDS:
-        _refresh_off_loop(key, _compute(ctx))
+        _refresh_off_loop(key, _compute(ctx, public_only=public_only))
     return None if stored is None else (cast(dict[str, Any], stored[0]), stored[1])
 
 
@@ -2258,6 +2413,8 @@ async def model_stats(
     if view == "page":
         window_key = "page_windows"
         del body["weeks"]
+        # The dashboard projection keeps its closed label set; the report-only Ruff figures are view=full (#1615).
+        body.pop("ruff_quality", None)
         coverage = body["coverage"]
         body["coverage"] = {**coverage, "landing": _page_landing(coverage["landing"])}
     payload = {**body, **snapshot[window_key][window], "status": "ok", "age_seconds": round(age, 1)}
@@ -2282,14 +2439,17 @@ def _gauge(name: str, help_text: str, labels: list[str]) -> GaugeMetricFamily:
 
 
 class ModelStatsCollector:
-    """Expose the route's cached snapshot on ``/metrics``; a scrape never computes, it only schedules a refresh."""
+    """Expose the public-scope snapshot on the shared ``/metrics``; a scrape never computes, it only schedules a refresh.
+
+    Only confirmed-public settlements feed it, so a private or unclassified settlement never moves a series.
+    """
 
     def __init__(self, context: MonitorContext) -> None:
         self.context = context
 
     def collect(self) -> Iterator[GaugeMetricFamily]:
         try:
-            stored = cached_snapshot(self.context)
+            stored = cached_snapshot(self.context, public_only=True)
         except Exception:  # an unusable context never breaks the scrape
             stored = None
         health = GaugeMetricFamily("lu_model_stats_collection_success", "Whether a model-stats snapshot exists.")
