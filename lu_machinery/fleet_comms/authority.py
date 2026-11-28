@@ -419,15 +419,18 @@ def _load_recipient_roster() -> _RecipientRoster:
 def _recipient_standing(name: str, roster: _RecipientRoster) -> RecipientStanding:
     """Whether a drain will read ``name``: the one classifier every admission and removal path uses.
 
-    A verified historical alias is readable under its stored name, even when
-    its bare provider does not have a registered inbox. An unreadable or changed
-    alias source leaves standing unknown.
+    Registered names and dedicated supervisory and session inboxes already
+    have a drain. For other names, a verified alias is readable under its
+    stored name, even if its bare provider has no registered inbox. An
+    unreadable or changed alias source leaves these names unverified.
 
-    A stored session-CTO name stays readable by its session. ``not_registered``
-    and ``settled_task`` both need a complete roster (an incomplete one may hold
-    the same name as a registered slot); ``settled_task`` also needs a known
-    terminal status.
+    ``not_registered`` and ``settled_task`` both need a complete roster (an
+    incomplete one may hold the same name as a registered slot).
+    ``settled_task`` also needs a known terminal status.
     """
+    if name in roster.registered or is_session_cto_recipient(name) or _SUPERVISORY_RECIPIENT_RE.fullmatch(name):
+        return "registered"
+
     from lu_machinery.agent_identity import resolve_recipient_alias
 
     assignments = roster.sources[0]
@@ -439,12 +442,7 @@ def _recipient_standing(name: str, roster: _RecipientRoster) -> RecipientStandin
         return "unknown"
     if _roster_sources() != roster.sources or _roster_identity(roster.sources) != roster.identity:
         return "unknown"
-    if (
-        resolved != name
-        or name in roster.registered
-        or is_session_cto_recipient(name)
-        or _SUPERVISORY_RECIPIENT_RE.fullmatch(name)
-    ):
+    if resolved != name:
         return "registered"
     task = _task_standing(name)
     if task == "live":
