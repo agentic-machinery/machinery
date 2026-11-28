@@ -2005,6 +2005,149 @@ def _merge_observation(result, *observations):
     return result
 
 
+# Forward-only, off-request CI attempt reads (#1615). The model-stats collector calls these from its scheduled
+# subcommand, never from a Monitor request. Every read is a current (``fresh``) conditional request; an error, a
+# stale answer, a malformed page or a collection that cannot be proven whole raises ``GitHubIncompleteRead`` with a
+# typed reason, so a caller records an incomplete interval instead of a silently truncated one. Check runs are read
+# with ``filter=all`` (GitHub's default ``latest`` hides same-head reruns), and no reader searches the 1,000-result
+# ``actions/runs`` backfill: the run inventory is the CI workflow's own runs created since a watermark.
+INVENTORY_RESULT_CAP = 1000
+
+
+class GitHubIncompleteRead(RuntimeError):
+    """A forward-only read that could not be proven current and whole; ``reason`` is a short typed code."""
+
+    def __init__(self, reason: str):
+        super().__init__(reason)
+        self.reason = reason
+
+
+def _current(client, endpoint, *, timeout):
+    result = client.request("GET", endpoint, timeout=timeout, fresh=True)
+    if result.error or result.stale:
+        raise GitHubIncompleteRead(result.error or "github_stale_answer")
+    return result
+
+
+def counted_collection(client, endpoint, key, *, timeout=30) -> list:
+    """Every record of a ``{total_count, key: [...]}`` collection, proven whole (``_counted_pages``)."""
+    result = _counted_pages(client, endpoint, key, incomplete="github_collection_incomplete", timeout=timeout,
+                            fresh=True)
+    if result.error or result.stale:
+        raise GitHubIncompleteRead(result.error or "github_stale_answer")
+    rows: list = result.value[key]
+    return rows
+
+
+def _iso_time(raw):
+    from datetime import datetime
+
+    if not isinstance(raw, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else None
+
+
+def pulls_updated_since(client, repo, since, *, timeout=30) -> list[dict]:
+    """Pull requests updated at or after ``since`` (an aware datetime), newest first, de-duplicated by number.
+
+    The walk is complete when it reaches a pull request updated before ``since`` or the last page. A pull request
+    updated during the walk can move to an already read page; its update is after this read started, so the next
+    read (from this read's start) sees it.
+    """
+    endpoint = f"repos/{repo}/pulls?state=all&sort=updated&direction=desc&per_page=100"
+    found: dict[int, dict] = {}
+    for _ in range(100):
+        result = _current(client, endpoint, timeout=timeout)
+        page = result.value
+        if not isinstance(page, list):
+            raise GitHubIncompleteRead("github_pulls_malformed")
+        for row in page:
+            updated = _iso_time(row.get("updated_at")) if isinstance(row, dict) else None
+            if updated is None or type(row.get("number")) is not int:
+                raise GitHubIncompleteRead("github_pulls_malformed")
+            if updated < since:
+                return list(found.values())
+            found.setdefault(row["number"], row)
+        following = next_link(result.headers)
+        if not following:
+            return list(found.values())
+        endpoint = following
+    raise GitHubIncompleteRead("github_pagination_limit")
+
+
+def workflow_runs_created_since(client, repo, workflow, since, *, timeout=30) -> list[dict]:
+    """Every ``pull_request`` run of one workflow created at or after ``since``; refuses a capped inventory."""
+    stamp = since.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    endpoint = (f"repos/{repo}/actions/workflows/{quote(workflow, safe='')}/runs?event=pull_request"
+                f"&created={quote('>=' + stamp, safe='')}&per_page=100")
+    rows = counted_collection(client, endpoint, "workflow_runs", timeout=timeout)
+    if len(rows) >= INVENTORY_RESULT_CAP:
+        raise GitHubIncompleteRead("github_run_inventory_capped")
+    return rows
+
+
+def workflow_run(client, repo, run_id, *, timeout=30) -> dict:
+    value = _current(client, f"repos/{repo}/actions/runs/{int(run_id)}", timeout=timeout).value
+    if not isinstance(value, dict) or value.get("id") != run_id or type(value.get("run_attempt")) is not int:
+        raise GitHubIncompleteRead("github_run_malformed")
+    return value
+
+
+def attempt_jobs(client, repo, run_id, attempt, *, timeout=30) -> list[dict]:
+    """The jobs, with their steps, of one attempt of one workflow run."""
+    return counted_collection(client, f"repos/{repo}/actions/runs/{int(run_id)}/attempts/{int(attempt)}/jobs"
+                                      "?per_page=100", "jobs", timeout=timeout)
+
+
+def check_runs_all(client, repo, sha, *, timeout=30) -> list[dict]:
+    """Every check run on a commit, reruns included (``filter=all``)."""
+    if not re.fullmatch(r"[0-9a-f]{40}", str(sha)):
+        raise ValueError("check runs need a full commit SHA")
+    return counted_collection(client, f"repos/{repo}/commits/{sha}/check-runs?filter=all&per_page=100",
+                              "check_runs", timeout=timeout)
+
+
+def check_run_annotations(client, repo, check_run_id, *, timeout=30) -> list[dict]:
+    """Every annotation of a check run, proven against the check run's own ``annotations_count``."""
+    run = _current(client, f"repos/{repo}/check-runs/{int(check_run_id)}", timeout=timeout).value
+    output = run.get("output") if isinstance(run, dict) else None
+    expected = output.get("annotations_count") if isinstance(output, dict) else None
+    if type(expected) is not int or expected < 0:
+        raise GitHubIncompleteRead("github_annotations_uncounted")
+    endpoint = f"repos/{repo}/check-runs/{int(check_run_id)}/annotations?per_page=100"
+    rows: list = []
+    for _ in range(100):
+        result = _current(client, endpoint, timeout=timeout)
+        if not isinstance(result.value, list) or not all(isinstance(row, dict) for row in result.value):
+            raise GitHubIncompleteRead("github_annotations_malformed")
+        rows.extend(result.value)
+        following = next_link(result.headers)
+        if not following:
+            break
+        endpoint = following
+    else:
+        raise GitHubIncompleteRead("github_pagination_limit")
+    if len(rows) != expected:
+        raise GitHubIncompleteRead("github_annotations_incomplete")
+    return rows
+
+
+def compare_commits(client, repo, base, head, *, timeout=30) -> dict:
+    """``base...head``: its commits (complete only when GitHub returned ``total_commits`` of them) and files."""
+    for sha in (base, head):
+        if not re.fullmatch(r"[0-9a-f]{40}", str(sha)):
+            raise ValueError("a comparison needs full commit SHAs")
+    value = _current(client, f"repos/{repo}/compare/{base}...{head}", timeout=timeout).value
+    if (not isinstance(value, dict) or not isinstance(value.get("commits"), list)
+            or not isinstance(value.get("files"), list) or type(value.get("total_commits")) is not int):
+        raise GitHubIncompleteRead("github_compare_malformed")
+    return value
+
+
 def _project(row, kind):
     value = dict(row)
     for old, new in {

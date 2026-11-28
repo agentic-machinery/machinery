@@ -14,6 +14,7 @@ from pathlib import Path
 import pytest
 
 from lu_machinery.common.repo_root import machinery_path, machinery_root
+from tests.epics_monitor_stub import public_lease
 from tests.helpers.product_tree import configured_roots as configured_roots
 from tests.host_context.conftest import build_host_layout
 
@@ -174,9 +175,10 @@ def _run_hook(
         )
         + "\n"
     )
+    # Monitor publishes the launcher's envelope only as its lease_digest (machinery-infra#1659).
     snapshot = {
         "stream_id": stream,
-        "lease": {
+        "lease": public_lease({
             "stream_id": stream,
             "session_id": "session-fixture",
             "lease_id": "lease-fixture",
@@ -194,7 +196,7 @@ def _run_hook(
             "state": "active",
             "session_state": "open",
             "expires_at": "2099-01-01T00:00:00Z",
-        },
+        }),
         "digest": {"stream_id": stream, "limit": 1, "pinned": [], "recent": [], "high_water_entry_id": 0},
     }
     requests: list[str] = []

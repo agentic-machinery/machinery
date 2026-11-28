@@ -36,8 +36,11 @@ execute it verbatim:
 
 ```bash
 set -euo pipefail
-PRIMARY_REPO="$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")"
-PY="$PRIMARY_REPO/.venv/bin/python"
+if [[ "${LU_PYTHON:-}" != /* || ! -f "$LU_PYTHON" || ! -x "$LU_PYTHON" ]]; then
+  printf '%s\n' 'Error: missing_interpreter_binding: LU_PYTHON must name an absolute executable.' >&2
+  exit 1
+fi
+PY="$LU_PYTHON"
 
 # If requires_silence_timeout is true, set SILENCE_TIMEOUT_SECONDS from current
 # seat/runtime guidance and add --silence-timeout "$SILENCE_TIMEOUT_SECONDS".
@@ -76,7 +79,7 @@ The outer subprocess timeout instead reports `dispatch.py wait timed out at proc
 while the original review may still be live. Either signal requires the same lookup and
 original-task wait recovery below; neither is a terminal task-record `timeout`.
 Ask itself does not expose the dispatch nonce (or rc 124 for client expiry). Set `REVIEW_TASK` to the original ask's task ID
-and `PRIMARY_REPO`/`PY` as above; query the live task record via `.venv/bin/python -m lu_machinery.dispatch status`:
+and `PY` as above; query the live task record via `"$PY" -m lu_machinery.dispatch status`:
 
 ```bash
 set -euo pipefail
@@ -148,7 +151,7 @@ read-only dispatch (#8703; [accepted wording](../../review-loop/references/brief
    included verbatim in the brief. That section alone defines the literal reply lines and
    how a structured findings request refers to the canonical schema.
 8. **Reliability checklist** — the `brief_section` printed by
-   `.venv/bin/python -P -m lu_machinery.review.closeout_cli --state-file <file> checklist --base origin/<base> --head <sha> --repo-root .`
+   `"$PY" -P -m lu_machinery.review.closeout_cli --state-file <file> checklist --base origin/<base> --head <sha> --repo-root .`
    for this round's exact head, verbatim: the checklist items the diff triggers, the owner of
    every area it touches, and the rule that judge inputs are read from the merge-base
    ([`review-loop` brief](../../review-loop/references/brief.md#judge-inputs-come-from-the-merge-base)).

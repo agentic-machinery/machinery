@@ -39,21 +39,30 @@ def _valid_stream_id(stream_id: str) -> str:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-_STATUS_TOKEN_FIELDS = ("session_id", "holder_agent", "holder_harness", "holder_instance_id")
+# A holder's identity in its lease envelope. Monitor never serves the envelope's random lease_id; these are
+# withheld too, as defense in depth, like the epics lease projection (machinery-infra#1659).
+_HOLDER_IDENTITY_FIELDS = ("session_id", "holder_instance_id", "holder_process_id")
+# The holder labels that stay public pass the epics API's token rule.
+_HOLDER_LABEL_FIELDS = ("holder_agent", "holder_harness")
 
 
-def _safe_status(status: dict[str, Any]) -> dict[str, Any]:
-    """Project a handoff diagnosis through the same token rule as the epics API.
+def _public_status(status: dict[str, Any]) -> dict[str, Any]:
+    """Withhold the holder's identity and project its labels through the epics token rule.
 
-    ``reason`` quotes the holder, so it is withheld whenever a holder field is.
+    ``reason`` quotes the holder's labels, so it is withheld whenever a label is.
     """
-    safe = dict(status)
-    for field in _STATUS_TOKEN_FIELDS:
-        if safe[field] is not None:
-            safe[field] = _response_token(safe[field])
-    if any(safe[field] != status[field] for field in _STATUS_TOKEN_FIELDS):
-        safe["reason"] = "[redacted]"
-    return safe
+    public = {key: value for key, value in status.items() if key not in _HOLDER_IDENTITY_FIELDS}
+    for field in _HOLDER_LABEL_FIELDS:
+        if public[field] is not None:
+            public[field] = _response_token(public[field])
+    if any(public[field] != status[field] for field in _HOLDER_LABEL_FIELDS):
+        public["reason"] = "[redacted]"
+    return public
+
+
+def _public_entry(entry: Any) -> dict[str, Any]:
+    """The epics API's safe entry projection, without the writer's session id."""
+    return {**_safe_entry(entry_as_dict(entry)), "session_id": "[redacted]"}
 
 
 def _store_health(ctx: MonitorContext) -> dict[str, Any]:
@@ -106,7 +115,7 @@ def session_stream_status(
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except Exception as exc:  # pragma: no cover - defensive API boundary
         raise HTTPException(status_code=500, detail="status_failed") from exc
-    return _safe_status(status.as_dict())
+    return _public_status(status.as_dict())
 
 
 @router.get("/v1/digest/{stream_id:path}")
@@ -126,8 +135,8 @@ def session_stream_digest(
     return {
         "stream_id": stream_id,
         "limit": limit,
-        "pinned": [_safe_entry(entry_as_dict(e)) for e in digest.pinned],
-        "recent": [_safe_entry(entry_as_dict(e)) for e in digest.recent],
+        "pinned": [_public_entry(e) for e in digest.pinned],
+        "recent": [_public_entry(e) for e in digest.recent],
         "pinned_count": len(digest.pinned),
         "recent_count": len(digest.recent),
     }

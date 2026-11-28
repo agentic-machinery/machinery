@@ -42,17 +42,20 @@ before round 1 and before every further round.
 policy's quick red-team pass, with `--risk low` and break-it findings only. Other tiers continue
 below.
 
-Recipes run with the primary checkout's interpreter, resolved once
+Recipes run with the bound machinery runtime interpreter (`LU_PYTHON`), resolved once
 ([delivery](../full-send/references/delivery.md#interpreter)):
 
 ```bash
-PRIMARY_REPO="$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")"
-PY="$PRIMARY_REPO/.venv/bin/python"
+if [[ "${LU_PYTHON:-}" != /* || ! -f "$LU_PYTHON" || ! -x "$LU_PYTHON" ]]; then
+  printf '%s\n' 'Error: missing_interpreter_binding: LU_PYTHON must name an absolute executable.' >&2
+  exit 1
+fi
+PY="$LU_PYTHON"
 ```
 
-Invoke the recorder by its absolute primary-checkout path below. This applies current
-recorder rules even when the caller's branch predates a recorder fix. Resolving only the
-interpreter does not select the primary checkout's Python modules.
+Invoke the recorder with that interpreter below. This applies the bound runtime's
+recorder even when the caller's branch predates a recorder fix. The target checkout's
+interpreter does not provide these modules.
 
 ## Steps
 

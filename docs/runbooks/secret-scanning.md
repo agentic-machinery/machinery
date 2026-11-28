@@ -439,10 +439,13 @@ and [file permissions](https://codeql.github.com/codeql-query-help/python/py-ove
 
 ### Scanned code-scanning dismissal
 
-An interactive seat can use the closed publisher verb after a merged PR has
-reviewed the alert. Workers and reviewers are refused before any transport,
-including direct Python publisher calls. The worker broker, reviewer relay
-and raw `gh api` write guard do not admit this verb.
+An interactive seat can use the closed publisher verb after reviewed triage of
+the alert: a merged same-repository PR for default-branch alerts, or an open
+same-repository PR whose exact head carries a recorded cross-family `APPROVE`
+when the alert's active open instances exist only on that open PR. Workers and
+reviewers are refused before any transport, including direct Python publisher
+calls. The worker broker, reviewer relay and raw `gh api` write guard do not
+admit this verb.
 
 ```sh
 .venv/bin/python -m lu_machinery.publish code-scanning-dismiss \
@@ -451,7 +454,9 @@ and raw `gh api` write guard do not admit this verb.
 ```
 
 The comment must name `Alert #N`, explain that alert, and include exactly one
-canonical same-repository merged PR link. Its explanation must include a letter beyond the alert identifier and link.
+canonical same-repository PR link (merged for default-branch alerts; open and
+exact-head cross-family approved for open-PR-only alerts). Its explanation must
+include a letter beyond the alert identifier and link.
 Its final text passes the common OPSEC scanner and verdict-marker guard, then the same text is frozen into the
 request. Supported reasons are `false positive`, `won't fix` and `used in tests`.
 Issue-close reasons are separate.
@@ -463,17 +468,44 @@ and `path:line`. The final cell contains the written rationale, starting with
 `False positive.` or `Won't fix.` as appropriate. `used in tests` requires a
 false-positive row whose location is under `tests/`.
 
-Before sending, the publisher retrieves that file at the PR's merge SHA and
-at the base branch's current resolved head, explicitly in `refs/heads/` so a
-same-named tag cannot select the triage. The alert's current triage row
-must be byte-identical to the reviewed row; removal or reclassification
-refuses the write. Duplicate rows also count when padded with whitespace or
-written without optional outer table pipes. Except for the closed-PR merge-ref rule above, the publisher checks the alert and every open branch instance, and compares their SARIF
-rule, location, messages and flow evidence with the analysis at the triage
-merge. Analysis-local indexes are resolved before comparison. Missing analysis,
-unknown evidence or drift refuses the write. If a later change moves a location
-or changes a flow, the alert needs fresh reviewed triage. A final preflight
-re-read rejects alert, instance or current-triage-head changes during validation.
+For a **default-branch alert** (merged PR path), before sending, the publisher
+retrieves that file at the PR's merge SHA and at the base branch's current
+resolved head, explicitly in `refs/heads/` so a same-named tag cannot select
+the triage. The alert's current triage row must be byte-identical to the
+reviewed row; removal or reclassification refuses the write. Duplicate rows
+also count when padded with whitespace or written without optional outer table
+pipes. Except for the closed-PR merge-ref rule above, the publisher checks the
+alert (`state == "open"`) and every open branch instance, and compares their
+SARIF rule, location, messages and flow evidence with the analysis at the
+triage merge. Analysis-local indexes are resolved before comparison. Missing
+analysis, unknown evidence or drift refuses the write. If a later change moves
+a location or changes a flow, the alert needs fresh reviewed triage. A final
+preflight re-read rejects alert, instance or current-triage-head changes during
+validation.
+
+For an **open-PR-only alert** (open PR path), the linked PR must be explicitly
+open, unmerged, non-draft (`draft: false`), and same-repository (both `head.repo`
+and `base.repo` matching the target repository). Every instance state must be
+in GitHub's supported set (`open`, `dismissed`, `fixed`), and every active open
+instance (ignoring only verified closed or merged `refs/pull/<n>/merge` refs)
+must lie on that linked PR's `refs/pull/<pr>/merge` ref; any open instance on
+the default branch, another branch or another open PR refuses and requires the
+merged-PR path. The alert must explicitly carry `state` (`null` as GitHub
+returns for PR-only alerts, or `"open"`), `dismissed_at: null`, and
+`fixed_at: null`. The publisher reads this runbook at the PR's immutable
+`head.sha` and `base.sha` (verifying the row was absent at `base.sha`, added by
+the PR diff, and uniquely present with no duplicate or contradicting row at
+`head.sha`), and verifies an unedited recorded cross-family `APPROVE` from the
+trusted recorder login for that exact `head.sha` (concrete attested author
+families distinct from the reviewer's family; `red_team`, same-family,
+stale-head, unattested-author or rejected heads are refused). Each open
+instance on `refs/pull/<pr>/merge` must match the row's `path:line`, have an
+analyzed commit bound to `head.sha` (either `head.sha` directly or a two-parent
+PR merge commit whose second parent is `head.sha`), and match the analysis's
+SARIF rule and location. A final preflight re-read rejects alert, instance,
+comment, or skipped-PR changes, then re-validates the PR's identity,
+same-repository head/base, `base.sha`, `head.sha`, and non-draft open state
+immediately before sending the PATCH.
 
 The only mutation is one PATCH of the numbered alert with `state=dismissed`,
 its reason and the scanned comment. The publisher reports success only after

@@ -102,7 +102,7 @@ def _current_custody(lease: Any, stream: str) -> dict[str, Any]:
     lease does. A local PID never proves a remote lease expired, so Monitor is the
     sole authority and any unavailable or malformed answer refuses. Read only.
     """
-    from lu_machinery.session_supervisor.remote import RemoteEpicClient
+    from lu_machinery.session_supervisor.remote import RemoteEpicClient, lease_digest
 
     if lease.stream_id != stream:
         raise Refusal("CROSS_STREAM", "caller's stream custody is not the creator's canonical stream")
@@ -118,32 +118,40 @@ def _current_custody(lease: Any, stream: str) -> dict[str, Any]:
             "harness": lease.holder.harness,
             "instance_id": lease.holder.instance_id,
         },
+        # Receipts keep only the holder identity, so they also keep the exact envelope's digest: the one
+        # lease fact Monitor's status still publishes for a later custody recheck.
+        "lease_digest": lease_digest(lease),
     }
 
 
 def verify_current_custody(expected: dict[str, Any]) -> None:
     """Revalidate writer or receipt custody against Monitor without acquiring a lease."""
     from lu_machinery.session_streams.model import parse_timestamp
-    from lu_machinery.session_supervisor.remote import RemoteEpicClient, RemoteSupervisorError
+    from lu_machinery.session_supervisor.remote import RemoteEpicClient, RemoteSupervisorError, envelope_digest
 
     stream = expected["stream_id"]
+    # Monitor publishes only the digest of the exact envelope. A writer proof is the envelope itself; a receipt
+    # keeps the digest it recorded (a receipt from before digests can no longer be proven, so it refuses).
+    digest = expected.get("lease_digest")
+    if digest is None:
+        try:
+            digest = envelope_digest(expected)
+        except (KeyError, TypeError, ValueError):
+            raise Refusal("STALE_AUTHORITY", "custody proof names no exact lease envelope or digest") from None
+    if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+        raise Refusal("STALE_AUTHORITY", "custody proof lease digest is malformed")
     try:
         response = RemoteEpicClient().stream(stream, digest_limit=1)
     except RemoteSupervisorError:
         raise Refusal("AUTHORITY_UNKNOWN", "Monitor stream custody probe unavailable") from None
     current = response.get("lease")
-    observed = {key: current.get(key) for key in expected} if isinstance(current, dict) else {}
-    # Receipts retain only the holder identity. Writer envelopes also bind the
-    # process fields, so compare every holder field present in the expected proof.
-    if isinstance(observed.get("holder"), dict) and isinstance(expected.get("holder"), dict):
-        observed["holder"] = {key: observed["holder"].get(key) for key in expected["holder"]}
     if (
         response.get("stream_id") != stream
         or not isinstance(current, dict)
+        or current.get("stream_id") != stream
         or current.get("state") != "active"
         or current.get("session_state") not in ("open", "rolling")
-        # Canonical JSON keeps int, bool and null distinct.
-        or json.dumps(observed, sort_keys=True) != json.dumps(expected, sort_keys=True)
+        or current.get("lease_digest") != digest
     ):
         raise Refusal("STALE_AUTHORITY", "caller's lease is not the stream's current active custody")
     try:

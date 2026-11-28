@@ -6,14 +6,17 @@ and check.
 
 ## Interpreter
 
-Linked dispatch worktrees have no `.venv` of their own. Resolve the primary checkout's
-interpreter once per shell, as drive-epic §6 does
+A target checkout's `.venv` may not provide `lu_machinery`. Resolve the bound machinery
+runtime interpreter (`LU_PYTHON`) once per shell, as drive-epic §6 does
 ([review-merge-cleanup](../../drive-epic/references/review-merge-cleanup.md)), and run every
 recipe in the delivery skills with `"$PY"`:
 
 ```bash
-PRIMARY_REPO="$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")"
-PY="$PRIMARY_REPO/.venv/bin/python"
+if [[ "${LU_PYTHON:-}" != /* || ! -f "$LU_PYTHON" || ! -x "$LU_PYTHON" ]]; then
+  printf '%s\n' 'Error: missing_interpreter_binding: LU_PYTHON must name an absolute executable.' >&2
+  exit 1
+fi
+PY="$LU_PYTHON"
 ```
 
 ## Hand-off record

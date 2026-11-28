@@ -588,10 +588,11 @@ def test_acp_transcript_refuses_foreign_origin_and_omits_credentialed_cors(tmp_p
     )
     assert runtime_router._acp_transcript_access_refusal(dup_fetch_site) == "cross_site_request"
 
-    # Other Monitor routes keep non-credentialed CORS (no Access-Control-Allow-Credentials).
+    # Monitor routes share the browser request boundary.
     for other_path in ("/api/runtime/acp/conversations", "/api/runtime/acp/conversations/transcript"):
         other = local.get(other_path, headers={"Origin": "https://viewer.example"})
-        assert other.headers.get("access-control-allow-origin") == "*"
+        assert other.status_code == 403
+        assert "access-control-allow-origin" not in other.headers
         assert "access-control-allow-credentials" not in other.headers
 
 
@@ -651,17 +652,16 @@ def test_acp_transcript_refuses_foreign_origin_across_path_spellings(tmp_path, m
     url = "/api/runtime/acp/conversations/conv-guarded/transcript"
     foreign_headers = {"Origin": "https://evil.example"}
 
-    # Trailing-slash spellings never serve a transcript (404 on Monitor's router; 307->403 where redirect_slashes fires).
+    # The browser request boundary runs before route matching or redirects.
     for trailing_path in (f"{url}/", "/api/runtime/acp/conversations/conv-guarded/x/../transcript/"):
         for follow in (False, True):
             resp = local.get(trailing_path, headers=foreign_headers, follow_redirects=follow)
-            assert resp.status_code == 404, (trailing_path, follow)
+            assert resp.status_code == 403, (trailing_path, follow)
             assert "guarded transcript body" not in resp.text
             assert "access-control-allow-credentials" not in resp.headers
 
-    # Slash-redirected %0a/ exercises Starlette redirect_slashes: both the 307 and followed 403 return no transcript.
     redirect_resp = local.get(f"{url}%0a/", headers=foreign_headers, follow_redirects=False)
-    assert redirect_resp.status_code == 307
+    assert redirect_resp.status_code == 403
     assert "guarded transcript body" not in redirect_resp.text
     assert "access-control-allow-credentials" not in redirect_resp.headers
 
@@ -681,23 +681,25 @@ def test_acp_transcript_refuses_foreign_origin_across_path_spellings(tmp_path, m
         assert "access-control-allow-credentials" not in resp.headers
 
     # Unnormalized dot-segments, trailing slash, and decoded newline sent directly at the ASGI layer yield no transcript.
-    for raw_path, expected_status in (
-        (f"{url}/", 404),
-        ("/api/runtime/acp/conversations/conv-guarded/./transcript", 404),
-        ("/api/runtime/acp/conversations/other/../conv-guarded/transcript", 403),
-        (f"{url}\n", 403),
+    for raw_path in (
+        f"{url}/",
+        "/api/runtime/acp/conversations/conv-guarded/./transcript",
+        "/api/runtime/acp/conversations/other/../conv-guarded/transcript",
+        f"{url}\n",
     ):
         status_code, resp_headers, body_text = _run_raw_asgi_get(raw_path, origin="https://evil.example")
-        assert status_code == expected_status, (raw_path, status_code)
+        assert status_code == 403, (raw_path, status_code)
         assert "guarded transcript body" not in body_text
         assert "access-control-allow-credentials" not in resp_headers
 
-    # Preflight OPTIONS never emits credentialed CORS or transcript content.
+    # Cross-origin preflights are refused without a CORS grant.
     for preflight_path in (url, f"{url}/"):
         preflight = local.options(
             preflight_path,
             headers={"Origin": "https://evil.example", "Access-Control-Request-Method": "GET"},
         )
+        assert preflight.status_code == 403
+        assert "access-control-allow-origin" not in preflight.headers
         assert "guarded transcript body" not in preflight.text
         assert "access-control-allow-credentials" not in preflight.headers
 

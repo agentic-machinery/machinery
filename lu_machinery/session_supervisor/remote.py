@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import urllib.error
@@ -308,31 +309,9 @@ class RemoteEpicClient:
             },
         )
 
-    def release(
-        self,
-        lease: Lease | None = None,
-        *,
-        stream_id: str | None = None,
-        force: bool = False,
-        actor_agent: str | None = None,
-        actor_host_id: str | None = None,
-        reason: str | None = None,
-    ) -> dict[str, Any]:
-        if force:
-            if not stream_id:
-                raise RemoteSupervisorError("--force requires --stream")
-            payload: dict[str, Any] = {
-                "force": True,
-                "actor_agent": actor_agent,
-                "actor_host_id": actor_host_id,
-                "reason": reason,
-            }
-        else:
-            if lease is None:
-                raise RemoteSupervisorError("release requires the exact lease envelope")
-            stream_id = lease.stream_id
-            payload = self._lease_payload(lease)
-        return self._request("POST", f"/api/epics/v1/{stream_id}/release", payload)
+    def release(self, lease: Lease) -> dict[str, Any]:
+        """Release the exact lease envelope; force release is never an HTTP operation (see session_supervisor)."""
+        return self._request("POST", f"/api/epics/v1/{lease.stream_id}/release", self._lease_payload(lease))
 
     def stream(self, stream_id: str, *, digest_limit: int = 20) -> dict[str, Any]:
         query = urlencode({"limit": digest_limit})
@@ -348,3 +327,31 @@ class RemoteEpicClient:
         if not isinstance(digest, dict):
             raise RemoteSupervisorError("Monitor response omitted its digest")
         return _digest_from_payload(digest)
+
+
+# The exact envelope Monitor's holder operations match (store.release_remote_session, _require_current_lease).
+LEASE_ENVELOPE_FIELDS = ("stream_id", "session_id", "lease_id", "generation", "fencing_token")
+LEASE_HOLDER_FIELDS = ("agent", "harness", "instance_id", "task_id", "process_id", "holder_kind", "host_id")
+_LEASE_DIGEST_DOMAIN = b"remote-epic-lease-digest.v1\0"
+
+
+def envelope_digest(envelope: Mapping[str, Any]) -> str:
+    """SHA-256 of an exact lease envelope, in the shape ``RemoteEpicClient._lease_payload`` writes.
+
+    Monitor's status, listing and conflict answers publish this ``lease_digest`` instead of the envelope, so a
+    holder can prove "this is my lease" while no reader can rebuild the envelope and act as that holder.
+    Canonical JSON keeps int, bool and null distinct. KeyError or TypeError when a field is missing or the
+    holder is not a mapping; ValueError when a value cannot be encoded.
+    """
+    holder = envelope["holder"]
+    if not isinstance(holder, Mapping):
+        raise TypeError("lease holder is not an object")
+    canonical = {name: envelope[name] for name in LEASE_ENVELOPE_FIELDS}
+    canonical["holder"] = {name: holder[name] for name in LEASE_HOLDER_FIELDS}
+    text = json.dumps(canonical, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False)
+    return hashlib.sha256(_LEASE_DIGEST_DOMAIN + text.encode("utf-8")).hexdigest()
+
+
+def lease_digest(lease: Lease) -> str:
+    """The ``lease_digest`` Monitor publishes for ``lease``."""
+    return envelope_digest(RemoteEpicClient._lease_payload(lease))

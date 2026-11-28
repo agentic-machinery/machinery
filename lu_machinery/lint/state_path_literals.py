@@ -10,7 +10,6 @@ STORE_LITERAL = re.compile(r"""(?P<quote>["'])batch_state(?:/[^\s"']*)?(?P=quote
 # Existing spellings from the R2b migration. Each entry permits one occurrence
 # of this exact line in this file. Remove entries as their callers move.
 EXISTING_LINES = (
-    ('agent_deploy/plan.py', 'records = "batch_state/agent-deploy"'),
     ('agent_runtime/attempt_boundary.py', 'if destination.startswith("batch_state/"):'),
     ('agent_runtime/attempt_boundary.py', 'for name in (*AGY_WORKSPACE_CONFIG_DIRS, ".git", ".worktrees", "batch_state"):'),
     ('agent_runtime/bounded_advisory.py', '_FORBIDDEN_ROOTS = frozenset({".git", ".worktrees", ".venv", "node_modules", "batch_state"})'),
@@ -32,7 +31,6 @@ EXISTING_LINES = (
     ('fleet/regenerable_output.py', 'if not candidate_relative.is_relative_to("batch_state/preserved"):'),
     ('fleet/terminal_abandon.py', '"{path: \'batch_state/...\', sha256: \'<64-hex-digest>\'}. Patches must equal git diff\\n"'),
     ('fleet_comms/artifacts.py', '"batch_state", sources.batch_state_dir, state,'),
-    ('host_context.py', 'batch = root / "batch_state"'),
     ('hygiene/batch_state_retention.py', 'if len(parts) < 2 or parts[0] != "batch_state" or any(part in {"..", "."} for part in parts):'),
     ('hygiene/batch_state_retention.py', 'if origin.name in EXCLUDED or origin.parent.name != "batch_state":'),
     ('hygiene/batch_state_retention.py', 'or expiry.utcoffset().total_seconds() != 0 or path.parent.name != "batch_state"'),

@@ -251,7 +251,7 @@ def test_router_rejects_live_holder_force_without_actor_and_opsec_body(tmp_path:
     )
     assert competing.status_code == 409
     assert (
-        client.post("/api/epics/v1/epic:7178/release", json={"force": True}).status_code == 400
+        client.post("/api/epics/v1/epic:7178/release", json={"force": True}).status_code == 403
     )  # allow-hardcoded-epic: remote lifecycle route fixture
 
     bad = client.post(
@@ -280,8 +280,71 @@ def test_router_live_claim_conflict_names_holder_and_expiry(tmp_path: Path, monk
     )
     assert competing.status_code == 409
     assert "current holder=codex/codex-cli" in competing.text
-    assert "instance_id=api-instance" in competing.text
+    assert f"lease_digest={client.get('/api/epics/v1/epic:7178').json()['lease']['lease_digest']}" in competing.text
+    assert "api-instance" not in competing.text and "instance_id" not in competing.text
     assert "expires_at=" in competing.text
+
+
+_HOLDER_SECRETS = ("api-session", "api-lease", "api-instance")
+
+
+def _assert_no_holder_secrets(lease: dict) -> None:
+    assert not {"session_id", "lease_id"} & set(lease), lease
+    assert not {"instance_id", "process_id"} & set(lease["holder"]), lease
+    assert len(lease["lease_digest"]) == 64
+
+
+def test_status_never_lets_a_reader_rebuild_and_use_the_holders_lease(tmp_path: Path, monkeypatch) -> None:
+    """Defect class: lease takeover by an unauthorized local caller. Any loopback process reads stream status;
+    when status, listing or a 409 published the holder's exact envelope, the reader could renew, hand off or
+    release that holder's lease. Status carries lease_digest instead; holder operations still match exactly."""
+    from lu_machinery.session_supervisor.remote import envelope_digest
+
+    client, store = _client_and_store(tmp_path, monkeypatch)
+    claimed = _claim(client)["lease"]
+    assert claimed["session_id"] == "api-session"  # the claimer's own reply keeps the envelope it chose
+    assert claimed["lease_digest"] == envelope_digest(claimed)
+    # The holder writes an entry, so status and listing also publish entries the holder's session wrote.
+    written = client.post(
+        "/api/epics/v1/epic:7178/handoff",
+        json={**claimed, "type": "state", "body": "working", "idempotency_key": "holder-1"},
+    )
+    assert written.status_code == 200 and written.json()["entry"]["session_id"] == "[redacted]"
+
+    status_body = client.get("/api/epics/v1/epic:7178").json()
+    status = status_body["lease"]
+    listed = next(row for row in client.get("/api/epics/v1").json()["streams"] if row["stream_id"] == "epic:7178")
+    assert status_body["digest"]["recent"][-1]["body"] == "working" and listed["last_state"]["body"] == "working"
+    competing = client.post(
+        "/api/epics/v1/epic:7178/claim",
+        json={"session_id": "s2", "lease_id": "l2", "lineage_id": "x", "agent": "gemini", "harness": "agy",
+              "instance_id": "other", "process_id": 5678},
+    )
+    assert competing.status_code == 409
+    for lease in (status, listed["lease"]):
+        _assert_no_holder_secrets(lease)
+        assert lease["lease_digest"] == claimed["lease_digest"]
+        assert (lease["generation"], lease["fencing_token"]) == (claimed["generation"], claimed["fencing_token"])
+    for body in (json.dumps(status_body), json.dumps(listed), competing.text):
+        assert not any(secret in body for secret in _HOLDER_SECRETS), body
+
+    # The strongest reader: it also knows the holder's instance id and pid from elsewhere and guesses the ids.
+    rebuilt = {
+        **status,
+        "session_id": "turn-session-api-instance",
+        "lease_id": "turn-lease-api-instance",
+        "holder": {**status["holder"], "instance_id": "api-instance", "process_id": 1234},
+    }
+    before = store.dump_stream("epic:7178")
+    assert client.post("/api/epics/v1/epic:7178/heartbeat", json=rebuilt).status_code == 409
+    handoff = {**rebuilt, "type": "state", "body": "taken", "idempotency_key": "rebuilt-1"}
+    assert client.post("/api/epics/v1/epic:7178/handoff", json=handoff).status_code == 409
+    assert client.post("/api/epics/v1/epic:7178/release", json=rebuilt).status_code == 409
+    assert store.dump_stream("epic:7178") == before
+    # Paired control: the holder's exact envelope still renews and releases its lease.
+    assert client.post("/api/epics/v1/epic:7178/heartbeat", json=claimed).status_code == 200
+    released = client.post("/api/epics/v1/epic:7178/release", json=claimed)
+    assert released.status_code == 200 and released.json()["lease"]["lease_id"] == "api-lease"
 
 
 @pytest.mark.parametrize("turn_first", [True, False])
@@ -379,20 +442,30 @@ def test_router_claim_invariant_failures_are_logged_and_not_store_unavailable(
     assert any(record.exc_info for record in caplog.records)
 
 
-def test_router_force_release_requires_and_records_actor(tmp_path: Path, monkeypatch) -> None:
-    client = _client(tmp_path, monkeypatch)
-    _claim(client)
+@pytest.mark.parametrize("force", [True, False, "true"])
+def test_router_refuses_force_release_so_a_local_caller_cannot_take_over_a_lease(
+    tmp_path: Path, monkeypatch, force: object
+) -> None:
+    """Defect class: lease takeover by an unauthorized local caller. Any loopback process could post an asserted
+    operator identity and force-release another holder's live lease; force release is operator-only, on the
+    Monitor host's store through the session supervisor CLI."""
+    client, store = _client_and_store(tmp_path, monkeypatch)
+    lease = _claim(client)["lease"]
+    before = store.dump_stream("epic:7178")
     response = client.post(
         "/api/epics/v1/epic:7178/release",
         json={
-            "force": True,
+            **lease,
+            "force": force,
             "actor_agent": "operator",
             "actor_host_id": "operator-host",
             "reason": "operator recovery",
         },
     )
-    assert response.status_code == 200
-    assert response.json()["outcome"] == "force_released"
+    assert response.status_code == 403
+    assert response.json()["detail"] == epics_router.FORCE_RELEASE_REFUSAL
+    assert store.dump_stream("epic:7178") == before
+    assert client.get("/api/epics/v1/epic:7178").json()["lease"]["state"] == "active"
 
 
 def test_router_rejects_shared_stream_aliases(tmp_path: Path, monkeypatch) -> None:
@@ -404,8 +477,7 @@ def test_router_rejects_shared_stream_aliases(tmp_path: Path, monkeypatch) -> No
     assert response.status_code == 400
 
 
-def test_router_redacts_legacy_uri_references(tmp_path: Path, monkeypatch) -> None:
-    client = _client(tmp_path, monkeypatch)
+def test_router_redacts_legacy_uri_references() -> None:
     payload = {
         "entry_id": 1,
         "stream": "epic:7178",
@@ -627,6 +699,9 @@ def test_epics_graph_store_lease_and_decision_passthrough(tmp_path: Path, monkey
     assert "epic:7919" in epics_by_id  # allow-hardcoded-epic: store passthrough check
     epic_7919 = epics_by_id["epic:7919"]  # allow-hardcoded-epic: store passthrough check
     assert epic_7919["lease"] is not None
+    _assert_no_holder_secrets(epic_7919["lease"])
+    assert epic_7919["lease"]["lease_digest"] == lease["lease_digest"]
+    assert not any(secret in json.dumps(epic_7919) for secret in _HOLDER_SECRETS)  # entries included
     assert epic_7919["last_state"]["body"] == "working on graph"
     assert epic_7919["last_decision"]["body"] == "design approved"
 

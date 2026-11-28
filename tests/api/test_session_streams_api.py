@@ -61,6 +61,29 @@ def test_session_stream_status_and_digest_for_harness() -> None:
         assert "recent" in dig.json()
 
 
+def test_session_stream_status_and_digest_withhold_holder_identity(tmp_path: Path) -> None:
+    """Defect class: lease takeover by an unauthorized local caller. Any loopback process reads these routes; they
+    served the live holder's session id, instance id and pid beside the epics status (machinery-infra#1659)."""
+    from lu_machinery.session_streams.model import EntryType, LeaseHolder
+
+    ctx = fixture_context(tmp_path)
+    store = ctx.stores.session_streams_store
+    holder = LeaseHolder("codex", "codex-cli", "inst-hidden", process_id=48151, task_id="task-hidden")
+    lease, _ = store.claim_remote_session(
+        stream_id="epic:4707", holder=holder, lineage_id="lineage-1", ttl_seconds=900,
+        session_id="session-hidden", lease_id="lease-hidden",
+    )
+    store.append_entry(lease, entry_type=EntryType.STATE, body="working", idempotency_key="state-1")
+    client = _client(ctx)
+
+    status = client.get("/api/session-streams/v1/status/epic:4707")
+    digest = client.get("/api/session-streams/v1/digest/epic:4707")
+    assert status.status_code == 200 and digest.status_code == 200
+    assert status.json()["holder_agent"] == "codex" and digest.json()["recent"][-1]["body"] == "working"
+    for body in (status.text, digest.text):
+        assert not any(value in body for value in ("session-hidden", "lease-hidden", "inst-hidden", "48151")), body
+
+
 def test_session_stream_status_rejects_bad_id() -> None:
     client = _client()
     r = client.get("/api/session-streams/v1/status/not-an-epic")

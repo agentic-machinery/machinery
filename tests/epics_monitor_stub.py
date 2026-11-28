@@ -10,16 +10,34 @@ from contextlib import asynccontextmanager, contextmanager
 from dataclasses import replace
 from pathlib import Path
 from threading import Thread
+from typing import TYPE_CHECKING, Any
 from urllib.request import urlopen
 
 import pytest
-import uvicorn
-from fastapi import FastAPI
 
-from lu_machinery.api.main import create_app
-from lu_machinery.api.monitor_context import fixture_context
-from lu_machinery.api.product_contribution import ProductContribution
-from lu_machinery.session_streams.store import SessionStreamStore
+from lu_machinery.session_supervisor.remote import envelope_digest
+
+if TYPE_CHECKING:
+    from fastapi import FastAPI
+
+    from lu_machinery.session_streams.store import SessionStreamStore
+
+
+def public_lease(lease: Any) -> Any:
+    """``lease`` (an exact envelope plus state fields) as Monitor's status read publishes it.
+
+    Fakes that answer ``RemoteEpicClient.stream`` keep the full envelope, so a test can still model "another
+    lease" by changing ``session_id``, and answer with this projection (epics_router._lease_payload): no
+    ``session_id``, ``lease_id``, ``holder.instance_id`` or ``holder.process_id``, plus ``lease_digest``.
+    """
+    if not isinstance(lease, dict):
+        return lease
+    public = {key: value for key, value in lease.items() if key not in ("session_id", "lease_id")}
+    holder = lease.get("holder")
+    if isinstance(holder, dict):
+        public["holder"] = {key: value for key, value in holder.items() if key not in ("instance_id", "process_id")}
+    public["lease_digest"] = envelope_digest(lease)
+    return public
 
 
 @asynccontextmanager
@@ -40,6 +58,11 @@ def epics_app_for_store(
     rest of the production stack) actually runs — the prior bare-FastAPI
     bypass was #7494 item 4.8a.
     """
+    # The Monitor app is imported only when a stub is built, so ``public_lease`` stays importable alone.
+    from lu_machinery.api.main import create_app
+    from lu_machinery.api.monitor_context import fixture_context
+    from lu_machinery.api.product_contribution import ProductContribution
+
     ctx = fixture_context(root)
     if live_repo_root is not None:
         ctx = ctx.with_roots(live_repo_root=Path(live_repo_root))
@@ -55,6 +78,8 @@ def epics_monitor_stub(store: SessionStreamStore) -> Iterator[str]:
     this wrapper adds a real socket so launcher subprocesses cannot bypass the
     remote lifecycle client with an in-process test adapter.
     """
+    import uvicorn
+
     app = epics_app_for_store(store, store.database.path.parent)
 
     with socket.socket() as probe:

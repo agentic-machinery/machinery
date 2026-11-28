@@ -15,6 +15,10 @@ The deliberate `deliveries expire-stale --apply` cleanup records its dead letter
 with reason `expired_by_cleanup`; no window, lifetime failure total or alert
 gauge counts them, and the fleet authority-health window ignores them too. A
 genuine `deadline_expired` row, even in the same cleanup batch, still counts.
+The fleet authority-health window (`/api/fleet/health` and the authority health
+in `/api/fleet/overview`) also ignores `recipient_settled`, the expected cleanup
+of mail to a settled task. The failure windows, lifetime totals and alert gauges
+still count `recipient_settled`, and raw dead-letter totals include both reasons.
 Only state `failed` counts in the two failure measures; expired/dead-lettered
 rows remain represented by the separate dead-letter measure.
 
