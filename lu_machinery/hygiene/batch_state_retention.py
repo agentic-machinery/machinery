@@ -25,6 +25,7 @@ from lu_machinery import state_paths
 from lu_machinery.common import json_depth
 from lu_machinery.common.repo_root import state_root
 from lu_machinery.common.task_scratch import mount_points
+from lu_machinery.orchestration.execution_safe_git import safe_git_env
 
 # Deepest JSON this module reads (json_depth): batch-state scratch expiry metadata.
 _JSON_MAX_DEPTH = 128
@@ -110,12 +111,31 @@ def scratch_expiry(
         holds = load_holds(RETENTION_LIST)
         if any(hold["parts"][0] == origin.name for hold in holds):
             return None, "expiry_held"
+        root = origin.parent.parent
+        env = safe_git_env()
+        env.update(LC_ALL="C", GIT_DISCOVERY_ACROSS_FILESYSTEM="1")
         tracked = subprocess.run(
-            ["git", "-C", str(origin.parent.parent), "ls-files", "-z", "--",
-             f":(literal){state_paths.batch_state_rel(origin.name).as_posix()}"], capture_output=True, check=True, timeout=15,
+            ["git", "-c", "core.fsmonitor=false", "-C", str(root), "ls-files", "-z", "--",
+             f":(literal){state_paths.batch_state_rel(origin.name).as_posix()}"],
+            env=env, capture_output=True, check=False, timeout=15,
         )
-        if tracked.stdout:
-            return None, "expiry_tracked"
+        if tracked.returncode == 0:
+            return (None, "expiry_tracked") if tracked.stdout else (metadata, None)
+        if (
+            tracked.returncode != 128 or tracked.stdout
+            or tracked.stderr != b"fatal: not a git repository (or any of the parent directories): .git\n"
+            or root != state_root()
+            or root.resolve(strict=True) != root
+            or not stat.S_ISDIR(root.lstat().st_mode)
+        ):
+            return None, "expiry_proof_unknown"
+        # Git can emit the same error for a broken checkout marker.
+        for ancestor in (root, *root.parents):
+            try:
+                (ancestor / ".git").lstat()
+            except FileNotFoundError:
+                continue
+            return None, "expiry_proof_unknown"
         return metadata, None
     except (OSError, ValueError, OverflowError, RecursionError, subprocess.SubprocessError):
         return None, "expiry_proof_unknown"

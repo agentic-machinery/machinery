@@ -14,7 +14,7 @@ import pytest
 
 from lu_machinery.hygiene import batch_state_retention as retention
 from lu_machinery.hygiene import tmp_sweep
-from tests.helpers.product_tree import configured_roots  # noqa: F401
+from tests.helpers.product_tree import configured_roots as configured_roots
 
 pytestmark = pytest.mark.usefixtures("configured_roots")
 
@@ -127,11 +127,10 @@ def test_cli_json_table_and_errors(batch, tmp_path, capsys):
 
 
 @pytest.fixture
-def expiry_box(tmp_path, monkeypatch, isolated_state_home):
-    """Real batch-state scratch, Git index, task record and quarantine; only host probes are isolated."""
+def scratch_box(tmp_path, monkeypatch, isolated_state_home, configured_roots):
+    """Real batch-state scratch, task record and quarantine with isolated liveness."""
     repo = tmp_path / "repo"
     repo.mkdir()
-    subprocess.run(["git", "init", "-q", str(repo)], check=True, timeout=30)
     root = repo / "batch_state"
     root.mkdir()
     tasks = root / "tasks"
@@ -145,17 +144,60 @@ def expiry_box(tmp_path, monkeypatch, isolated_state_home):
     marker = entry / ".scratch-expiry.json"
     marker.write_text(json.dumps(metadata))
     holds = holds_file(tmp_path, [])
+    monkeypatch.setenv("LU_STATE_ROOT", str(repo))
+    monkeypatch.setenv("LU_PRODUCT_ROOT", str(configured_roots.primary))
     monkeypatch.setattr(retention, "RETENTION_LIST", holds)
     monkeypatch.setattr(tmp_sweep, "time", SimpleNamespace(time=lambda: clock.now))
     monkeypatch.setattr(tmp_sweep, "process_snapshot", lambda: ([], True))
-    monkeypatch.setattr(tmp_sweep, "registered_worktrees", lambda _: set())
     monkeypatch.setattr(tmp_sweep, "protected_roots", lambda: set())
 
     def run(apply=False):
-        return tmp_sweep.sweep(temp_root=root, repo_root=repo, task_root=tasks, batch_state=True, apply=apply)
+        return tmp_sweep.sweep(temp_root=root, task_root=tasks, batch_state=True, apply=apply)
 
     return SimpleNamespace(repo=repo, root=root, entry=entry, task=task, clock=clock, metadata=metadata,
                            marker=marker, holds=holds, run=run)
+
+
+@pytest.fixture
+def expiry_box(scratch_box):
+    subprocess.run(["git", "init", "-q", str(scratch_box.repo)], check=True, timeout=30)
+    return scratch_box
+
+
+def test_expired_scratch_is_purged_on_configured_non_git_root(scratch_box, tmp_path, monkeypatch):
+    b = scratch_box
+    held = make(b.root, "held-scratch", 10)
+    (held / retention.EXPIRY_FILE).write_text(json.dumps(b.metadata))
+    b.holds.write_text(json.dumps({
+        "schema": retention.SCHEMA,
+        "holds": [{"path": f"batch_state/{held.name}", "reason": "evidence"}],
+    }))
+    active = make(b.root, "active-scratch", 10)
+    (active / retention.EXPIRY_FILE).write_text(json.dumps({**b.metadata, "owner": "active-owner"}))
+    (b.task.parent / "active-owner.json").write_text(json.dumps({"task_id": "active-owner", "status": "running"}))
+
+    rows = {row["name"]: row for row in b.run()["rows"]}
+    assert (rows[b.entry.name]["decision"], rows[b.entry.name]["reason"]) == ("would_reap", "expired_scratch")
+    assert rows[held.name]["reason"] == "expiry_held"
+    assert rows[active.name]["reason"] == "task_not_settled"
+
+    alias = tmp_path / "alias"
+    alias.symlink_to(b.repo, target_is_directory=True)
+    for root in (alias, b.root / ".."):
+        monkeypatch.setenv("LU_STATE_ROOT", str(root))
+        result = retention.scratch_expiry(b.entry, origin=root / "batch_state" / b.entry.name, now=b.clock.now)
+        assert result == (None, "expiry_proof_unknown")
+    monkeypatch.setenv("LU_STATE_ROOT", str(b.repo))
+
+    assert b.run(True)["quarantined_entries"] == 1
+    assert not b.entry.exists()
+    quarantine = next(b.root.glob(tmp_sweep.QUARANTINE_PREFIX + "*")) / b.entry.name
+    assert (quarantine / "deep/file").is_file()
+    b.clock.now += 8 * DAY
+    purged = b.run(True)
+    assert purged["purged_entries"] == 1 and purged["errors"] == 0
+    assert not quarantine.exists()
+    assert all((entry / "deep/file").read_bytes() == b"x" * 8192 for entry in (held, active))
 
 
 def test_expired_scratch_is_recoverable_then_purged_without_name_inference(expiry_box):
@@ -219,6 +261,8 @@ def test_expiry_never_releases_unknown_live_held_or_tracked_state(expiry_box, mo
     result = b.run(True)
     row = next(row for row in result["rows"] if row["name"] == b.entry.name)
     assert row["decision"] == "preserve", row
+    if case == "tracked":
+        assert row["reason"] == "expiry_tracked"
     assert (b.entry / "deep/file").read_bytes() == b"x" * 8192
     assert not list(b.root.glob(tmp_sweep.QUARANTINE_PREFIX + "*"))
 
