@@ -251,7 +251,7 @@ def test_router_rejects_live_holder_force_without_actor_and_opsec_body(tmp_path:
     )
     assert competing.status_code == 409
     assert (
-        client.post("/api/epics/v1/epic:7178/release", json={"force": True}).status_code == 400
+        client.post("/api/epics/v1/epic:7178/release", json={"force": True}).status_code == 403
     )  # allow-hardcoded-epic: remote lifecycle route fixture
 
     bad = client.post(
@@ -379,20 +379,30 @@ def test_router_claim_invariant_failures_are_logged_and_not_store_unavailable(
     assert any(record.exc_info for record in caplog.records)
 
 
-def test_router_force_release_requires_and_records_actor(tmp_path: Path, monkeypatch) -> None:
-    client = _client(tmp_path, monkeypatch)
-    _claim(client)
+@pytest.mark.parametrize("force", [True, False, "true"])
+def test_router_refuses_force_release_so_a_local_caller_cannot_take_over_a_lease(
+    tmp_path: Path, monkeypatch, force: object
+) -> None:
+    """Defect class: lease takeover by an unauthorized local caller. Any loopback process could post an asserted
+    operator identity and force-release another holder's live lease; force release is operator-only, on the
+    Monitor host's store through the session supervisor CLI."""
+    client, store = _client_and_store(tmp_path, monkeypatch)
+    lease = _claim(client)["lease"]
+    before = store.dump_stream("epic:7178")
     response = client.post(
         "/api/epics/v1/epic:7178/release",
         json={
-            "force": True,
+            **lease,
+            "force": force,
             "actor_agent": "operator",
             "actor_host_id": "operator-host",
             "reason": "operator recovery",
         },
     )
-    assert response.status_code == 200
-    assert response.json()["outcome"] == "force_released"
+    assert response.status_code == 403
+    assert response.json()["detail"] == epics_router.FORCE_RELEASE_REFUSAL
+    assert store.dump_stream("epic:7178") == before
+    assert client.get("/api/epics/v1/epic:7178").json()["lease"]["state"] == "active"
 
 
 def test_router_rejects_shared_stream_aliases(tmp_path: Path, monkeypatch) -> None:
@@ -404,8 +414,7 @@ def test_router_rejects_shared_stream_aliases(tmp_path: Path, monkeypatch) -> No
     assert response.status_code == 400
 
 
-def test_router_redacts_legacy_uri_references(tmp_path: Path, monkeypatch) -> None:
-    client = _client(tmp_path, monkeypatch)
+def test_router_redacts_legacy_uri_references() -> None:
     payload = {
         "entry_id": 1,
         "stream": "epic:7178",

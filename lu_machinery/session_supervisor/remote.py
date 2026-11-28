@@ -308,31 +308,9 @@ class RemoteEpicClient:
             },
         )
 
-    def release(
-        self,
-        lease: Lease | None = None,
-        *,
-        stream_id: str | None = None,
-        force: bool = False,
-        actor_agent: str | None = None,
-        actor_host_id: str | None = None,
-        reason: str | None = None,
-    ) -> dict[str, Any]:
-        if force:
-            if not stream_id:
-                raise RemoteSupervisorError("--force requires --stream")
-            payload: dict[str, Any] = {
-                "force": True,
-                "actor_agent": actor_agent,
-                "actor_host_id": actor_host_id,
-                "reason": reason,
-            }
-        else:
-            if lease is None:
-                raise RemoteSupervisorError("release requires the exact lease envelope")
-            stream_id = lease.stream_id
-            payload = self._lease_payload(lease)
-        return self._request("POST", f"/api/epics/v1/{stream_id}/release", payload)
+    def release(self, lease: Lease) -> dict[str, Any]:
+        """Release the exact lease envelope; force release is never an HTTP operation (see session_supervisor)."""
+        return self._request("POST", f"/api/epics/v1/{lease.stream_id}/release", self._lease_payload(lease))
 
     def stream(self, stream_id: str, *, digest_limit: int = 20) -> dict[str, Any]:
         query = urlencode({"limit": digest_limit})

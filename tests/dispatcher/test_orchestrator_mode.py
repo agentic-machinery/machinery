@@ -537,8 +537,8 @@ def test_a_monitor_outage_before_or_after_the_claim_commits_is_unknown(task_stor
         _reserve("turn-2")
     with pytest.raises(remote.RemoteClaimConflictError, match="turn_lease_uncleared"):
         _legacy_claim(monitor.client)
-    monitor.client.release(stream_id=STREAM, force=True, actor_agent="claude-cto", actor_host_id="host-a",
-                           reason="the lost claim's turn never started")
+    monitor.store.force_release_remote_session(stream_id=STREAM, actor_agent="claude-cto", actor_host_id="host-a",
+                                               reason="the lost claim's turn never started")
     assert _reserve("turn-3")["turn_lease"]["lease"]["holder"]["task_id"] == "turn-3"
     # Before the commit: an unreachable Monitor claims nothing.
     monkeypatch.setenv("LU_MONITOR_LOOPBACK", "http://127.0.0.1:9")
@@ -857,8 +857,8 @@ def test_a_release_is_exact_one_shot_and_fenced_from_a_successor(task_store, mon
         assert host_admission.release_turn(envelope, **exact).startswith("orchestrator_lease_release_unknown")
     assert len(calls) == 1 and "force" not in calls[0]
     assert monitor.client.stream(STREAM)["lease"]["state"] == "active"  # the outage kept it
-    monitor.client.release(stream_id=STREAM, force=True, actor_agent="claude-cto", actor_host_id="host-a",
-                           reason="the turn's scope is proven gone")
+    monitor.store.force_release_remote_session(stream_id=STREAM, actor_agent="claude-cto", actor_host_id="host-a",
+                                               reason="the turn's scope is proven gone")
     store.replace({**hold, "status": "crashed"})
     successor = _legacy_claim(monitor.client)[0]
     before = monitor.store.dump_stream(STREAM)
@@ -1338,8 +1338,9 @@ def test_a_turn_end_to_end_holds_its_lease_links_children_and_never_shares_its_t
     # Nor afterwards: the settled turn keeps its stream's lease until an operator releases it.
     assert box.monitor.client.stream(STREAM)["lease"]["state"] == "active"
     assert "orchestrator_stream_leased" in box.turn("turn-3", expected=3).stderr
-    box.monitor.client.release(stream_id=STREAM, force=True, actor_agent="claude-cto", actor_host_id="host-a",
-                               reason="turn-1 scope proven gone")
+    box.monitor.store.force_release_remote_session(
+        stream_id=STREAM, actor_agent="claude-cto", actor_host_id="host-a", reason="turn-1 scope proven gone"
+    )
     assert box.turn("turn-4").stdout.splitlines()[0] == "turn-4"
     _release(box, "turn-4")
 

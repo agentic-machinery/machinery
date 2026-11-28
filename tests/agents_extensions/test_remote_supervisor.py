@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import urllib.error
+import urllib.request
 from pathlib import Path
 
 import pytest
@@ -197,6 +198,73 @@ def test_local_flag_warns_and_keeps_stdout_as_one_json_document(tmp_path: Path, 
     output = capsys.readouterr()
     assert "LOCAL-ONLY LEASE — not visible to the fleet" in output.err
     json.loads(output.out)
+
+
+_FORCE_ARGV = [
+    "release", "--role", "driver", "--force", "--stream", "epic:7178",  # allow-hardcoded-epic: CLI fixture
+    "--actor-agent", "operator", "--actor-host-id", "operator-host", "--reason", "operator recovery",
+]
+
+
+def _no_http(monkeypatch) -> None:
+    def refuse(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("force release must never be an HTTP request")
+
+    monkeypatch.setattr(urllib.request, "urlopen", refuse)
+
+
+def test_force_release_cli_writes_the_monitor_host_store_with_an_operator_receipt(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """Defect class: lease takeover by an unauthorized local caller. Monitor's HTTP route refuses force release,
+    so the operator CLI must still release the live lease, on the Monitor host's own store, attributed."""
+    from lu_machinery.session_streams import db
+    from lu_machinery.session_streams.db import SessionStreamDatabase
+    from lu_machinery.session_streams.store import SessionStreamStore
+
+    path = tmp_path / "monitor" / "session-streams.sqlite3"
+    path.parent.mkdir()
+    store = SessionStreamStore(SessionStreamDatabase(path))
+    store.claim_remote_session(
+        stream_id="epic:7178",
+        holder=LeaseHolder("codex", "codex-cli", "live-holder", process_id=1234, host_id="holder-host"),
+        lineage_id="live-lineage",
+        ttl_seconds=900,
+        session_id="live-session",
+        lease_id="live-lease",
+    )
+    monkeypatch.setattr(db, "default_database_path", lambda repo_root=None: path)
+    _no_http(monkeypatch)
+
+    assert main(_FORCE_ARGV) == 0
+    assert json.loads(capsys.readouterr().out) == {
+        "action": "release", "outcome": "force_released", "stream_id": "epic:7178", "generation": 1,
+    }
+    dump = store.dump_stream("epic:7178")
+    assert dump["lease"]["state"] == "released"
+    event = dump["lease_events"][-1]
+    assert event["event_type"] == "force_closed"
+    assert json.loads(event["proof_json"])["actor"] == {"agent": "operator", "host_id": "operator-host"}
+
+
+@pytest.mark.parametrize("case", ["store_absent", "local", "raw_host_id"])
+def test_force_release_cli_fails_closed_off_the_monitor_host(tmp_path: Path, monkeypatch, capsys, case) -> None:
+    """Defect class: lease takeover by an unauthorized local caller. Without Monitor's store the CLI refuses,
+    never creating a store or falling back to HTTP; a --local store or a raw host name is never a receipt."""
+    from lu_machinery.session_streams import db
+
+    path = tmp_path / "absent" / "session-streams.sqlite3"
+    monkeypatch.setattr(db, "default_database_path", lambda repo_root=None: path)
+    _no_http(monkeypatch)
+    argv = list(_FORCE_ARGV)
+    if case == "local":
+        argv = ["--local", "--db", str(tmp_path / "local.sqlite3"), *argv]
+    elif case == "raw_host_id":
+        argv[argv.index("operator-host")] = "203.0.113.7"
+
+    assert main(argv) == 4
+    assert "session-supervisor: --force" in capsys.readouterr().err
+    assert not path.exists()
 
 
 @pytest.mark.parametrize("mismatch", ["fencing_token", "session_id", "released", "missing"])
