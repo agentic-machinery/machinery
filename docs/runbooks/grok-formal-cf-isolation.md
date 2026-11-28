@@ -27,8 +27,9 @@ eligibility for resolver-selected review.
   or tests the reviewer needs. See the [review brief capability table](../../agents_extensions/shared/skills/review-loop/references/brief.md#commands-a-read-only-reviewer-can-run).
 - Record the exact reviewed head and concrete model, family and transport.
   Follow `review-loop` and the same-head CI gate before landing.
-- Cursor Grok stays off Ukrainian language seats. Security final sign-off stays
-  with Opus 5.5 or Sol 6.2.
+- The resolver can select the attested Cursor pin for code or infra review at
+  every risk, including critical and security paths. Ukrainian review uses its
+  own profile.
 
 The retired sealed path supplies no current isolation or review receipt guarantee.
 See [model assignment](../../agents_extensions/shared/rules/model-assignment.md)

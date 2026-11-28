@@ -53,13 +53,7 @@ def test_denominator_admission_and_independence(profile, risk, author, health):
         assert resolution.selected.route != "cursor"
     if author == CURRENT_SOL:
         assert resolution.selected.family != "openai"
-    # REVIEW-ROTATION-GROK-1127: pinned Cursor Grok sits in the equal peer row at low, medium and
-    # high; critical (final sign-off) stays Sol, Opus and Neon, so Grok never enters its ladder.
     assert GROK_SEAT in REVIEW_CANDIDATES
-    if risk == "critical":
-        assert all(item.family != "xai" and item.name != GROK_SEAT for item in resolution.trace)
-        assert resolution.selected.family != "xai"
-        return
     grok_trace = [item for item in resolution.trace if item.name == GROK_SEAT]
     assert len(grok_trace) == 1
     if author in {"grok-4.7", "composer-2.5", "cursor:auto"} or health == "cursor_dark":
@@ -69,15 +63,9 @@ def test_denominator_admission_and_independence(profile, risk, author, health):
 
 
 @pytest.mark.parametrize("risk", RISKS)
-def test_no_cursor_grok_fallback_when_opus_unavailable(risk):
-    # REVIEW-ROTATION-GROK-1127: below critical, pinned Cursor Grok fills in when Claude and AGY are
-    # unavailable, and fails closed only when Cursor is unavailable too. Critical has no Grok fallback.
+def test_cursor_grok_fills_in_when_opus_and_neon_are_unavailable(risk):
     snapshot = {"claude": "unhealthy", "agy": "unhealthy"}
     result = resolve_reviewer(ResolverInputs(author_model=CURRENT_SOL, risk=risk, routing_snapshot=snapshot, claude_account=HOST_ACCOUNT))
-    if risk == "critical":
-        assert result.selected is None
-        assert all(item.family != "xai" for item in result.trace)
-        return
     assert result.selected is not None and result.selected.name == GROK_SEAT
     all_down = resolve_reviewer(
         ResolverInputs(
@@ -96,40 +84,32 @@ def test_cursor_grok_refuses_subject_seats_and_families(risk, subject):
     inputs = ResolverInputs(author_model=CURRENT_SOL, risk=risk, **subject, claude_account=HOST_ACCOUNT)
     result = resolve_reviewer(inputs)
     assert result.selected.family != "xai"
-    if risk == "critical":
-        # Critical holds no Grok seat at all.
-        assert all(item.family != "xai" for item in result.trace)
-        return
     grok = next(item for item in result.trace if item.name == GROK_SEAT)
     assert grok.status == "excluded"
     assert "subject exclusion" in grok.reason
 
 
 def test_grok_never_reviews_its_own_adapter():
-    result = resolve_reviewer(ResolverInputs(author_model=CURRENT_SOL, risk="critical", owned_paths=("lu_machinery/agent_runtime/adapters/grok_build.py",), claude_account=HOST_ACCOUNT))
-    assert result.selected.name == "claude-opus-5-5"
-    assert all(item.family != "xai" and item.name not in GROK_SEATS for item in result.trace)
-    # The adapter is a security path: a high request is raised to critical, which holds no Grok seat.
-    high = resolve_reviewer(ResolverInputs(author_model=CURRENT_SOL, risk="high", owned_paths=("lu_machinery/agent_runtime/adapters/grok_build.py",), claude_account=HOST_ACCOUNT))
-    assert high.resolved_risk == "critical"
-    assert high.selected.family != "xai"
-    assert all(item.family != "xai" and item.name not in GROK_SEATS for item in high.trace)
+    for risk in ("high", "critical"):
+        result = resolve_reviewer(ResolverInputs(
+            author_model=CURRENT_SOL, risk=risk, owned_paths=("lu_machinery/agent_runtime/adapters/grok_build.py",),
+            claude_account=HOST_ACCOUNT,
+        ))
+        assert result.resolved_risk == "critical"
+        assert result.selected.name == "claude-opus-5-5"
+        grok = next(item for item in result.trace if item.name == GROK_SEAT)
+        assert grok.status == "excluded"
+        assert "subject exclusion" in grok.reason
 
 
 @pytest.mark.parametrize("profile", ["code", "infra"])
 @pytest.mark.parametrize("risk", RISKS)
 @pytest.mark.parametrize("name", GROK_SEATS)
-def test_explicit_grok_pin_retains_the_final_signoff_risk_floor(profile, risk, name):
-    # REVIEW-ROTATION-GROK-1127: pinned Cursor Grok is admitted at low, medium and high; the
-    # critical final-signoff floor still refuses it.
+def test_explicit_grok_pin_is_admitted_at_every_risk(profile, risk, name):
     inputs = ResolverInputs(author_model=CURRENT_SOL, risk=risk, review_profile=profile,
                             routing_snapshot={"cursor": "healthy"}, claude_account=HOST_ACCOUNT)
     pinned = resolve_reviewer(replace(inputs, pinned_candidate=name, pressure_override_reason="admission probe"))
-    if risk == "critical":
-        assert pinned.selected is None
-        assert "failed a hard eligibility gate" in pinned.fail_closed_reason
-    else:
-        assert pinned.selected is not None and pinned.selected.name == name
+    assert pinned.selected is not None and pinned.selected.name == name
     assert name in REVIEW_CANDIDATES
 
 
@@ -141,17 +121,12 @@ def test_closeout_cli_fails_closed_without_a_cursor_grok_fallback(tmp_path, caps
         code = closeout_cli.main(["--state-file", str(state), "resolve-reviewer", "--author-model", CURRENT_SOL, "--review-profile", "code", "--owned-path", "site/src/app.ts", "--risk", risk, "--routing-snapshot-file", str(snapshot)])
         return code, json.loads(capsys.readouterr().out)
 
-    # Critical final sign-off has no Cursor Grok fallback (REVIEW-ROTATION-GROK-1127 keeps it Sol, Opus, Neon).
-    code, payload = resolve("critical")
-    assert code == 1
-    assert payload["selected"] is None
-    assert all(entry["family"] != "xai" for entry in payload["trace"])
-    # At high, pinned Cursor Grok fills in, and the CLI fails closed only when Cursor is down too.
-    code, payload = resolve("high")
-    assert code == 0
-    assert payload["selected"]["name"] == GROK_SEAT
+    for risk in ("high", "critical"):
+        code, payload = resolve(risk)
+        assert code == 0
+        assert payload["selected"]["name"] == GROK_SEAT
     snapshot.write_text(json.dumps({"claude": "unhealthy", "agy": "unhealthy", "cursor": "unhealthy"}))
-    code_down, payload_down = resolve("high")
+    code_down, payload_down = resolve("critical")
     assert code_down == 1
     assert payload_down["selected"] is None
 
@@ -161,20 +136,16 @@ def _catalog():
 
 
 @pytest.mark.parametrize("risk", RISKS)
-def test_catalog_lists_no_cursor_grok_after_opus(risk):
+def test_catalog_lists_cursor_grok_in_the_first_rung(risk):
     catalog = load_model_catalog()
     first_rung = catalog["review_ladders"][risk][0]
     peers = ["openai_frontier_b", "openai_frontier", "claude-opus-5-5", "claude-opus-5-5-agy", "gemini-4-neon-high"]
-    # Grok joins the equal peer row below critical; critical final sign-off stays Sol, Opus and Neon.
-    assert first_rung == (peers if risk == "critical" else [*peers, GROK_SEAT])
-    if risk == "critical":
-        ladder = [name for rung in catalog["review_ladders"][risk] for name in rung]
-        assert all(name not in ladder for name in GROK_SEATS)
+    assert first_rung == [*peers, GROK_SEAT]
     for name in GROK_SEATS:
         assert catalog["review_candidates"][name]["transport"] == "cursor"
     grok = catalog["models"]["grok-4.7"]
     assert (grok["lifecycle"], grok["transports"], grok["roles"]) == (
-        "active", ["native_grok", "cursor"], ["coding", "standard_review"],
+        "active", ["native_grok", "cursor"], ["coding", "standard_review", "critical_review"],
     )
     validate_catalog(_catalog())
 
@@ -188,7 +159,7 @@ def test_catalog_refuses_a_cursor_review_pin_outside_policy(model):
         validate_catalog(catalog)
 
 
-def test_catalog_refuses_grok_critical_review_role_escalation():
+def test_catalog_refuses_a_grok_route_role_missing_from_the_model():
     catalog = _catalog()
     catalog["review_candidates"][GROK_SEAT] = {
         "model_id": "grok-4.7", "route": "cursor", "transport": "cursor",
@@ -285,8 +256,8 @@ def _record(monkeypatch, tmp_path, *, resolved_model, families=frozenset({"anthr
 
 
 @pytest.mark.usefixtures("_publishing")
-def test_runtime_reported_grok_high_receipt_is_accepted_after_restoration(monkeypatch, tmp_path):
-    result, comments = _record(monkeypatch, tmp_path, resolved_model="Grok 4.7 256K High")
+def test_runtime_reported_grok_high_receipt_is_accepted_at_critical(monkeypatch, tmp_path):
+    result, comments = _record(monkeypatch, tmp_path, resolved_model="Grok 4.7 256K High", review_risk="critical")
     assert result["comment"] == "posted"
     assert "model=grok-4.7 family=xai" in comments[0]["body"]
 
@@ -298,7 +269,7 @@ def test_runtime_reported_grok_high_receipt_is_accepted_after_restoration(monkey
 )
 def test_a_grok_receipt_that_is_not_the_pinned_high_variant_is_refused(monkeypatch, tmp_path, resolved_model):
     with pytest.raises(recorder.RecordError, match="reviewer model unknown"):
-        _record(monkeypatch, tmp_path, resolved_model=resolved_model)
+        _record(monkeypatch, tmp_path, resolved_model=resolved_model, review_risk="critical")
 
 
 @pytest.mark.usefixtures("_publishing")
