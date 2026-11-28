@@ -530,7 +530,8 @@ const privateOnly = {{
 const privateChips = renderMilestoneChips({{milestones: privateOnly, planning: null}}, now);
 assert.match(privateChips, /<b>withheld<\\/b> overdue/);
 
-// Partial planning shows values AND "partial: N of M repos", while private stays "withheld".
+// Partial planning withholds Planning-derived milestone counts (even when every listed issue has a
+// verdict) while keeping the blocked rows visible, "partial: N of M repos", and milestone-only counts.
 const partialPlanning = {{
   issues: {{
     status: "partial",
@@ -545,13 +546,47 @@ const partialPlanning = {{
 }};
 const partialHtml = renderMilestones(data, partialPlanning, now);
 assert.match(partialHtml, /partial: 2 of 3 repos/);
-assert.equal(summaryCellsFor(partialHtml, "v0.4.0")[1], "1");
+assert.equal(summaryCellsFor(partialHtml, "v0.4.0")[1], "unknown");
+assert.equal(summaryCellsFor(partialHtml, "v0.4.0")[4], "2");
+assert.match(partialHtml, /<h4>Blocked \\(count unknown\\)<\\/h4>/);
+assert.match(partialHtml, /#10/);
 assert.equal(summaryCellsFor(partialHtml, "Private milestone")[1], "withheld");
 assert.equal(summaryCellsFor(partialHtml, "Private milestone")[2], "withheld");
 // Workers unknown -> ready-now fails closed (never 0 ready now).
 const partialChips = renderMilestoneChips({{milestones: data, planning: partialPlanning}}, now);
 assert.match(partialChips, /<b>unknown<\\/b> ready now/);
 assert.match(partialHtml, /Worker paths are unavailable; ready-now results are withheld/);
+// Same rule for ok Planning with unresolved dependencies (or missing dependency_unknown) across
+// Blocked, Ready now, Other open and Overdue remainder headings, while milestone-only counts stay.
+const overdueIncomplete = JSON.parse(JSON.stringify(data));
+overdueIncomplete.repositories[0].milestones[0].due_on = "2030-01-05T00:00:00Z";
+overdueIncomplete.repositories[0].milestones[0].issues.push({{
+  number: 11, title: "Task B", url: "https://github.com/fixture/machinery/issues/11", labels: [],
+}});
+const partialBoth = {{
+  issues: {{
+    status: "partial", age_s: 30, workers: "ok",
+    coverage: {{repositories_read: 1, repositories_total: 2, open_issues: 2, dependency_unknown: 0, private_open_issues: 0}},
+    blockers: [],
+    ready: [{{ref: "fixture/machinery#11", path_status: "ready_now"}}],
+    ready_now: [{{ref: "fixture/machinery#11"}}],
+    blocked: [{{ref: "fixture/machinery#10", blocked_by: ["fixture/machinery#1"], private_blockers: 0}}],
+  }},
+}};
+const partialCardHtml = renderMilestones(data, partialBoth, now);
+assert.equal(summaryCellsFor(partialCardHtml, "v0.4.0")[1], "unknown");
+assert.match(partialCardHtml, /<h4>Blocked \\(count unknown\\)<\\/h4>/);
+const partialOverdueHtml = renderMilestones(overdueIncomplete, partialBoth, now);
+assert.equal(summaryCellsFor(partialOverdueHtml, "v0.4.0")[1], "unknown");
+assert.equal(summaryCellsFor(partialOverdueHtml, "v0.4.0")[2], "2");
+assert.match(partialOverdueHtml, /<h4>Overdue \\(count unknown\\)<\\/h4>/);
+const depUnknownBoth = JSON.parse(JSON.stringify(partialBoth));
+depUnknownBoth.issues.status = "ok";
+depUnknownBoth.issues.coverage.dependency_unknown = 1;
+const depUnknownHtml = renderMilestones(overdueIncomplete, depUnknownBoth, now);
+assert.equal(summaryCellsFor(depUnknownHtml, "v0.4.0")[1], "unknown");
+assert.match(depUnknownHtml, /<h4>Blocked \\(count unknown\\)<\\/h4>/);
+assert.match(depUnknownHtml, /<h4>Overdue \\(count unknown\\)<\\/h4>/);
 
 // F1: When planning misses a milestone issue (unaccounted in both blocked and ready),
 // 0 observed blockers renders "unknown" (never "0"), and >0 observed renders "<n> observed".
@@ -921,5 +956,39 @@ repaintMilestones(now);
 assert.doesNotMatch(els["milestones-content"].innerHTML, /STALE/);
 expireSnapshotsIfStale(null, runner.latest, null, now + 30000);
 assert.match(els["milestones-content"].innerHTML, /STALE/);
+
+// Monotonic clock advancing between reads in one repaint never splits overview/cards from chips or Planning.
+const origPerfNow = performance.now.bind(performance);
+try {{
+  let monoTick = 1000.0;
+  performance.now = () => {{ const current = monoTick; monoTick += 0.6; return current; }};
+  const edgeMs = JSON.parse(JSON.stringify(data));
+  edgeMs.age_seconds = 419.999;
+  edgeMs.repositories[0].age_seconds = 419.999;
+  runner.latest.milestones = edgeMs;
+  runner.latest.planning = completeWithOutside;
+  latestMilestoneReading = {{data: edgeMs, ageHeader: "419.999", boundHeader: "420", state: "fresh", receivedAt: now, receivedMono: 1000.0}};
+  latestPlanningReading = {{data: completeWithOutside, receivedAt: now, receivedMono: 1000.0}};
+  repaintMilestones(now);
+  const contentStale = /STALE/.test(els["milestones-content"].innerHTML);
+  const chipsStale = /open \\(stale\\)/.test(els["chips"].innerHTML);
+  assert.equal(contentStale, chipsStale, "milestones overview and header chips share one freshness sample");
+
+  monoTick = 2000.0;
+  const edgePlan = JSON.parse(JSON.stringify(completeWithOutside));
+  edgePlan.issues.age_s = 419.9995;
+  runner.latest.milestones = data;
+  runner.latest.planning = edgePlan;
+  latestMilestoneReading = {{data, ageHeader: "30", boundHeader: "420", state: "fresh", receivedAt: now, receivedMono: 2000.0}};
+  latestPlanningReading = {{data: edgePlan, receivedAt: now, receivedMono: 2000.0}};
+  repaintMilestones(now);
+  const cardReady = /Ready now \\(1\\)/.test(els["milestones-content"].innerHTML);
+  const readyStale = /Planning data is stale/.test(els["planning-ready-now"].innerHTML);
+  const chipReady = /<b>1<\\/b> ready now/.test(els["chips"].innerHTML);
+  assert.notEqual(cardReady, readyStale, "cards and Ready now section share one Planning sample");
+  assert.equal(cardReady, chipReady, "cards and header chips share one Planning sample");
+}} finally {{
+  performance.now = origPerfNow;
+}}
 """
     _run_milestones_node(body)
