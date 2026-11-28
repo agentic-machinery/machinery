@@ -135,8 +135,10 @@ guarded remover.
 - Read the provider's full docs (`llms-full.txt` or equivalent) before the first paid call and put its request and response rules in the brief.
 - Binding facts and rulings for a worker go in its brief or in a successor task, unless they answer a question it asked; a message to a live worker is only such an answer, because workers may never read other mid-task messages.
 - Get a PR's branch with `gh pr view <PR> --json headRefName` in the same script that writes the brief.
-- Before dispatching an author onto an existing branch or PR, resolve the reviewer at the change's risk as though
-  the new author's family had already committed to that branch, and pick an author that still leaves an eligible review seat.
+- Before dispatching an author onto an existing branch or PR, work out at the change's risk the full review plan the
+  branch will need once the new author's family has committed to it, including both seats of a mixed-family pair, and
+  pick an author only when every seat of that plan is eligible. A resolver preview that only adds the new author's
+  family can return a different plan, so it does not settle this.
 
 Record each new in-flight task with `lu-driver-state add --lane cto --kind inflight`, its
 owner and done condition. Attach its task ID with `link <id> task <task-id>` and record the
