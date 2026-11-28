@@ -1366,3 +1366,236 @@ def test_cto_workspace_start_holds_start_lock_and_admits_its_supervised_successo
     assert record.with_suffix(".lock").read_text().split() == ["held", "descendant=3"]
     argv, _env = _recorded(record)
     assert argv[-2:] == ["--append-system-prompt", role.rstrip("\n")]
+
+
+def test_cto_pointer_names_cto_lane_and_operator_escalation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Defect class: the CTO pointer sends escalations to the CTO itself and renders the wrong lane."""
+    from lu_machinery import driver_state
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("SESSION_SEAT", raising=False)
+    monkeypatch.delenv("SESSION_EPIC", raising=False)
+    monkeypatch.delenv(driver_state.STATE_ENV, raising=False)
+    monkeypatch.delenv(driver_state.MIN_WORKERS_ENV, raising=False)
+
+    # 1. Template generation: CTO keeps .claude/epics-epic/DRIVER-STATE.md and the epics lease,
+    #    renders one managed block with --lane cto, operator escalation, and no fixed worker-target wording.
+    assert driver_state.main(["init", "--epic", "epics"]) == 0
+    cto_path = tmp_path / ".claude" / "epics-epic" / "DRIVER-STATE.md"
+    assert cto_path.is_file()
+    cto_template = cto_path.read_text(encoding="utf-8")
+    assert cto_template.startswith(driver_state.MANAGED_BEGIN + "\n")
+    assert cto_template.endswith(driver_state.MANAGED_END + "\n")
+    assert "- Stream: epics" in cto_template
+    assert "- Seat: cto (the launcher owns the epics lease)" in cto_template
+    assert "lu-driver-state render --lane cto" in cto_template
+    assert "lu-driver-state check --lane cto" in cto_template
+    assert "--lane epics" not in cto_template
+    assert "Ask the operator only about deleting data" in cto_template
+    assert "Ask the CTO" not in cto_template
+    assert "Post it through Fleet Comms" not in cto_template
+    assert "End each turn with free worker slots filled with ready work and a wake-up armed" in cto_template
+    assert "privately configured worker target" not in cto_template
+    assert "LU_DRIVER_MIN_WORKERS" not in cto_template
+
+    # Lane driver template keeps its own lane and CTO escalation even if SESSION_SEAT=cto leaks.
+    monkeypatch.setenv("SESSION_SEAT", "cto")
+    assert driver_state.main(["init", "--epic", "infra"]) == 0
+    infra_path = tmp_path / ".claude" / "infra-epic" / "DRIVER-STATE.md"
+    assert infra_path.is_file()
+    infra_template = infra_path.read_text(encoding="utf-8")
+    assert infra_template.startswith(driver_state.MANAGED_BEGIN + "\n")
+    assert infra_template.endswith(driver_state.MANAGED_END + "\n")
+    assert "- Stream: infra" in infra_template
+    assert "- Seat: driver (one per stream; the launcher owns the lease)" in infra_template
+    assert "lu-driver-state render --lane infra" in infra_template
+    assert "lu-driver-state check --lane infra" in infra_template
+    assert "Ask the CTO only about deleting data" in infra_template
+    assert "Post it through Fleet Comms" in infra_template
+    assert "Ask the operator" not in infra_template
+    assert "End each turn with free worker slots filled with ready work and a wake-up armed" in infra_template
+    assert "privately configured worker target" not in infra_template
+
+    # 2. Managed-block replacement: content inside the fixed marker lines is replaced wholesale from
+    #    the resolved seat identity; text outside the markers is never parsed or rewritten.
+    monkeypatch.delenv("SESSION_SEAT", raising=False)
+    top_note = "  Top custom note (untouched)\n\n"
+    bottom_note = (
+        "\n## Pinned notes\n"
+        "- Keep provider fact (inline `" + driver_state.MANAGED_BEGIN + "` mention stays prose)\n"
+        "## Standing decision **policy**\n"
+        "- User note outside markers stays untouched\n"
+        "```text\n"
+        "unclosed fence outside markers\n"
+    )
+    # Cross-seat copied managed block (CTO template injected on infra, and infra template injected on CTO).
+    infra_from_cto = driver_state.render_injection(top_note + cto_template + bottom_note, infra_path)
+    assert infra_from_cto.count(driver_state.MANAGED_BEGIN) == 2  # 1 marker line + 1 inline prose mention
+    assert infra_from_cto.count(driver_state.MANAGED_END) == 1
+    assert "- Stream: infra" in infra_from_cto
+    assert "- Seat: driver (one per stream; the launcher owns the lease)" in infra_from_cto
+    assert "lu-driver-state render --lane infra" in infra_from_cto
+    assert "lu-driver-state check --lane infra" in infra_from_cto
+    assert "--lane cto" not in infra_from_cto
+    assert "Ask the CTO only about deleting data" in infra_from_cto
+    assert "Ask the operator" not in infra_from_cto
+    assert top_note + driver_state.MANAGED_BEGIN in infra_from_cto
+    assert driver_state.MANAGED_END + "\n" + bottom_note.rstrip("\r\n") in infra_from_cto
+
+    cto_from_infra = driver_state.render_injection(infra_template + bottom_note, cto_path)
+    assert "- Stream: epics" in cto_from_infra
+    assert "- Seat: cto (the launcher owns the epics lease)" in cto_from_infra
+    assert "lu-driver-state render --lane cto" in cto_from_infra
+    assert "lu-driver-state check --lane cto" in cto_from_infra
+    assert "--lane infra" not in cto_from_infra
+    assert "Ask the operator only about deleting data" in cto_from_infra
+    assert "Ask the CTO" not in cto_from_infra
+    assert "User note outside markers stays untouched" in cto_from_infra
+    assert "unclosed fence outside markers" in cto_from_infra
+    # Re-injecting the rendered body is idempotent.
+    body_only = cto_from_infra.split("\n\n", 1)[1]
+    assert driver_state.render_injection(body_only, cto_path) == cto_from_infra
+
+    # 3. Fallback injection on pointers without markers: adds the managed block once at the top
+    #    (before any unclosed fence, HTML comment, or formatted heading) and leaves the rest as is.
+    unmarked = (
+        "# Legacy pointer\n\n"
+        "## Standing decision **policy**\n"
+        "- Untouched legacy body\n"
+        "<!-- unclosed html comment\n"
+    )
+    cto_unmarked = driver_state.render_injection(unmarked, cto_path)
+    cto_unmarked_body = cto_unmarked.split("\n\n", 1)[1]
+    assert cto_unmarked_body.startswith(driver_state.MANAGED_BEGIN + "\n")
+    assert cto_unmarked_body.endswith("\n\n" + unmarked.rstrip("\r\n"))
+    assert cto_unmarked_body.index("Ask the operator only about deleting data") < cto_unmarked_body.index("<!-- unclosed html comment")
+    assert "lu-driver-state render --lane cto" in cto_unmarked
+    assert "lu-driver-state check --lane cto" in cto_unmarked
+    assert "- Untouched legacy body" in cto_unmarked
+
+    infra_unmarked = driver_state.render_injection("# Driver state: infra\n\n## Pinned\n- note\n", infra_path)
+    infra_unmarked_body = infra_unmarked.split("\n\n", 1)[1]
+    assert infra_unmarked_body.startswith(driver_state.MANAGED_BEGIN + "\n")
+    assert infra_unmarked_body.endswith("\n\n# Driver state: infra\n\n## Pinned\n- note")
+    assert "lu-driver-state render --lane infra" in infra_unmarked
+    assert "Ask the CTO only about deleting data" in infra_unmarked
+    assert "Ask the operator" not in infra_unmarked
+
+    # 4. Malformed marker arrangements fail closed with a typed ManagedBlockError / gate failure.
+    monkeypatch.setenv("CLAUDE_PROJECT_DIR", str(tmp_path))
+    monkeypatch.setenv("SESSION_HANDOFF_AGENT", "claude-epics")
+    monkeypatch.setenv(driver_state.STATE_ENV, str(cto_path))
+    for bad_text in (
+        f"{driver_state.MANAGED_BEGIN}\nunclosed\n",
+        f"orphan\n{driver_state.MANAGED_END}\n",
+        f"{driver_state.MANAGED_END}\n{driver_state.MANAGED_BEGIN}\n",
+        f"{cto_template}\n{cto_template}",
+    ):
+        with pytest.raises(driver_state.ManagedBlockError, match="malformed managed driver-state markers"):
+            driver_state.render_injection(bad_text, cto_path)
+    cto_path.write_text(f"{driver_state.MANAGED_BEGIN}\nunclosed\n", encoding="utf-8")
+    bad_hook = driver_state.cmd_claude_hook(
+        json.dumps({"hook_event_name": "UserPromptSubmit", "session_id": "bad-markers", "cwd": str(tmp_path)})
+    )
+    assert "DRIVER-GATE-FAILED: malformed managed driver-state markers" in bad_hook["hookSpecificOutput"]["additionalContext"]
+    failure_file = cto_path.parent / "stop-counters" / "stop-claude-bad-markers.failure.json"
+    assert json.loads(failure_file.read_text(encoding="utf-8"))["code"] == "invalid_managed_block"
+    cto_path.write_text(cto_template, encoding="utf-8")
+
+    # 5. Non-epic fallback paths validate SESSION_EPIC before SESSION_SEAT=cto and fail closed on invalid selectors.
+    custom_path = tmp_path / ".claude" / "custom" / "DRIVER-STATE.md"
+    custom_path.parent.mkdir(parents=True, exist_ok=True)
+    custom_path.write_text("# Custom\n", encoding="utf-8")
+    monkeypatch.setenv("SESSION_SEAT", "cto")
+    monkeypatch.setenv("SESSION_EPIC", "infra")
+    custom_infra_with_leak = driver_state.render_injection("# Custom\n", custom_path)
+    assert "lu-driver-state render --lane infra" in custom_infra_with_leak
+    assert "Ask the CTO only about deleting data" in custom_infra_with_leak
+    assert "Ask the operator" not in custom_infra_with_leak
+    monkeypatch.setenv("SESSION_EPIC", "../invalid")
+    custom_invalid_with_leak = driver_state.render_injection("# Custom\n", custom_path)
+    assert "lu-driver-state render --lane <lane>" in custom_invalid_with_leak
+    assert "Ask the CTO only about deleting data" in custom_invalid_with_leak
+    assert "Ask the operator" not in custom_invalid_with_leak
+    monkeypatch.delenv("SESSION_EPIC", raising=False)
+    custom_cto = driver_state.render_injection("# Custom\n", custom_path)
+    assert "lu-driver-state render --lane cto" in custom_cto
+    assert "Ask the operator only about deleting data" in custom_cto
+    monkeypatch.delenv("SESSION_SEAT", raising=False)
+
+    # 6. Bare relative vs absolute paths match inside canonical epic dirs and on symlink aliases/loops.
+    monkeypatch.chdir(cto_path.parent)
+    bare_cto = driver_state.render_injection("# Driver state: epics\n", Path("DRIVER-STATE.md"))
+    abs_cto = driver_state.render_injection("# Driver state: epics\n", cto_path)
+    assert bare_cto == abs_cto
+    assert "lu-driver-state render --lane cto" in bare_cto
+    assert "Ask the operator only about deleting data" in bare_cto
+    monkeypatch.chdir(tmp_path)
+
+    alias = tmp_path / "DRIVER-STATE.md"
+    alias.symlink_to(cto_path)
+    monkeypatch.setenv("SESSION_EPIC", "infra")
+    rel_out = driver_state.render_injection("# Alias\n", Path("DRIVER-STATE.md"))
+    abs_out = driver_state.render_injection("# Alias\n", alias)
+    assert rel_out == abs_out
+    assert "lu-driver-state render --lane infra" in rel_out
+    assert "Ask the CTO only about deleting data" in rel_out
+    loop_dir = tmp_path / ".claude" / "epics-epic" / "loop"
+    loop_dir.mkdir()
+    loop_link = loop_dir / "DRIVER-STATE.md"
+    loop_link.symlink_to(loop_link)
+    monkeypatch.chdir(loop_dir)
+    assert driver_state._epic_from_path(Path("DRIVER-STATE.md")) is None
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("SESSION_EPIC", raising=False)
+
+    # 7. Stop-hook continuation and AGY pretool deny messages follow the seat's escalation target,
+    #    including custom-path pointers when SESSION_SEAT=cto leaks alongside SESSION_EPIC=infra.
+    monkeypatch.setenv("SESSION_HANDOFF_AGENT", "claude-epics")
+    monkeypatch.setenv(driver_state.STATE_ENV, str(cto_path))
+    cto_stop = driver_state.cmd_claude_stop_hook(
+        json.dumps(
+            {
+                "session_id": "cto-s1",
+                "cwd": str(tmp_path),
+                "hook_event_name": "Stop",
+                "last_assistant_message": "Should I proceed?",
+            }
+        )
+    )
+    assert cto_stop["decision"] == "block"
+    assert "Ask the operator only about deletes, money, security or rule changes" in cto_stop["reason"]
+    assert "Ask the CTO" not in cto_stop["reason"]
+    cto_pretool = driver_state.cmd_agy_pretool_hook(
+        json.dumps({"workspacePaths": [str(tmp_path)], "toolCall": {"name": "ask_question"}})
+    )
+    assert cto_pretool["decision"] == "deny"
+    assert "ask the operator" in cto_pretool["reason"]
+    assert "post to the CTO" not in cto_pretool["reason"]
+
+    monkeypatch.setenv("SESSION_HANDOFF_AGENT", "claude-infra")
+    monkeypatch.setenv("SESSION_SEAT", "cto")
+    monkeypatch.setenv("SESSION_EPIC", "infra")
+    for pointer in (infra_path, custom_path):
+        monkeypatch.setenv(driver_state.STATE_ENV, str(pointer))
+        infra_stop = driver_state.cmd_claude_stop_hook(
+            json.dumps(
+                {
+                    "session_id": f"infra-{pointer.parent.name}",
+                    "cwd": str(tmp_path),
+                    "hook_event_name": "Stop",
+                    "last_assistant_message": "Should I proceed?",
+                }
+            )
+        )
+        assert infra_stop["decision"] == "block"
+        assert "Ask the CTO only about deletes, money, security or rule changes, via Fleet Comms" in infra_stop["reason"]
+        assert "Ask the operator" not in infra_stop["reason"]
+        infra_pretool = driver_state.cmd_agy_pretool_hook(
+            json.dumps({"workspacePaths": [str(tmp_path)], "toolCall": {"name": "ask_question"}})
+        )
+        assert infra_pretool["decision"] == "deny"
+        assert "post to the CTO via Fleet Comms" in infra_pretool["reason"]
+        assert "ask the operator" not in infra_pretool["reason"]
