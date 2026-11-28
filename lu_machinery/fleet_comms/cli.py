@@ -650,8 +650,8 @@ def _refuse_unreadable_recipient(args: argparse.Namespace) -> int | None:
         return None
     name = " ".join(str(args.recipient or "").split())
     detail = (
-        f"no drain reads {name}; check with deliveries pending --recipient {shlex.quote(name)} "
-        + "or deliveries expire-stale (--apply dead-letters held rows). "
+        f"no drain reads {name}; check recipient standing with "
+        + f"deliveries pending --recipient {shlex.quote(name)}. "
         + "A dispatched task's recipient is its bare task id."
     )
     sys.stdout.write(_json_dump({

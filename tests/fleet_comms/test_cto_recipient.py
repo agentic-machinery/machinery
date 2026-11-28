@@ -636,6 +636,7 @@ def test_claim_receive_refuse_only_what_pending_reports(
             assert refused["recipient"] == stored_name
             assert refused["content_included"] is False
             assert f"deliveries pending --recipient {stored_name}" in refused["detail"]
+            assert "expire-stale" not in refused["detail"]
             assert "queued" not in refused and "running" not in refused
             assert _store_snapshot(plane) == before
             # Refusal never opens, initializes, or writes a store.
