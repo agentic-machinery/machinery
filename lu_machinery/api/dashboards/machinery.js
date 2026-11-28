@@ -624,6 +624,12 @@
         if (!target && rebuilt.length && focusState.chipIndex >= 0) {
           target = rebuilt[Math.min(focusState.chipIndex, rebuilt.length - 1)] || null;
         }
+        if (!target && typeof document === "object" && document && typeof document.getElementById === "function") {
+          const retry = document.getElementById("refresh-retry");
+          target = (retry && !retry.hidden ? retry : null)
+            || document.getElementById("theme-toggle")
+            || document.getElementById("main");
+        }
         if (target && typeof target.focus === "function") {
           try { target.focus({preventScroll: true}); } catch { target.focus(); }
         }

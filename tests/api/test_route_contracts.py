@@ -704,6 +704,18 @@ assert.match(M.prChips(unknownTotalPrs).join(''), /<b>1<\/b> open PRs observed Â
     let seatsMode = 'unavailable';
     let deliveriesStatus = 200;
     let metricsDeadCount = 0;
+    let metricsStatus = 200;
+    let discussionsMode = 'unavailable';
+    let discussionsFetches = 0;
+    const discDisclosureEl = document.getElementById('discussions-disclosure');
+    discDisclosureEl.open = false;
+    discDisclosureEl.dataset = {};
+    const discListeners = {};
+    discDisclosureEl.addEventListener = (type, fn) => { discListeners[type] = fn; };
+    const discListEl = document.getElementById('discussions-list');
+    discListEl.children = [];
+    discListEl.replaceChildren = function (...nodes) { this.children = nodes; };
+    discListEl.appendChild = function (node) { this.children.push(node); };
     const messagesContentEl = document.getElementById('messages-content');
     const setListRows = ids => {
       listButtons.length = 0;
@@ -785,11 +797,24 @@ assert.match(M.prChips(unknownTotalPrs).join(''), /<b>1<\/b> open PRs observed Â
         return Promise.resolve({ok: true, status: 200, text: async () => JSON.stringify(payload), headers: {get: () => null}});
       }
       if (url === '/api/comms/v1/metrics') {
+        if (metricsStatus !== 200) {
+          return Promise.resolve({ok: false, status: metricsStatus, text: async () => '{}', headers: {get: () => null}});
+        }
         const payload = {
           source: 'authority', store: {reachable: true},
           deliveries: {queued: 1},
           failure_windows: {'24h': {dead_letters: {total: metricsDeadCount}, failed_deliveries: {total: 2}, failed_jobs: {total: 0}}},
         };
+        return Promise.resolve({ok: true, status: 200, text: async () => JSON.stringify(payload), headers: {get: () => null}});
+      }
+      if (url.startsWith('/api/fleet/acp/conversations')) {
+        discussionsFetches += 1;
+        if (discussionsMode === 'malformed') {
+          return Promise.resolve({ok: true, status: 200, text: async () => '{bad json', headers: {get: () => null}});
+        }
+        const payload = discussionsMode === 'available'
+          ? {availability: 'available', conversations: [{conversation_id: 'conv-1', participants: ['cto', 'driver'], current_state: 'open', rounds_completed: 1, rounds_requested: 1}]}
+          : {availability: 'unavailable', conversations: []};
         return Promise.resolve({ok: true, status: 200, text: async () => JSON.stringify(payload), headers: {get: () => null}});
       }
       if (url.startsWith('/api/fleet/deliveries') && deliveriesStatus === 422) {
@@ -927,6 +952,17 @@ assert.match(M.prChips(unknownTotalPrs).join(''), /<b>1<\/b> open PRs observed Â
       await timers[0]();
       assert.equal(document.activeElement.dataset.chipKey, 'failed', 'F6: changed chip refresh restores focus to exact #health shortcut');
       assert.deepEqual(focusedTargets, ['chip:failed']);
+      // PR1569-F6: HTTP 503/504 metrics failure keeps all 3 keyed shortcuts mounted with '?' counts and keeps focus.
+      metricsStatus = 503;
+      focusedTargets.length = 0;
+      await timers[0]();
+      assert.equal(chipNodes.length, 3, 'F6: metrics 503 keeps all 3 keyed shortcuts rendered');
+      assert.equal(document.activeElement.dataset.chipKey, 'failed', 'F6: focus stays on failed chip during 503');
+      assert.match(chipsEl.innerHTML, /<b>\?<\/b> queued/);
+      metricsStatus = 200;
+      focusedTargets.length = 0;
+      await timers[0]();
+      assert.equal(document.activeElement.dataset.chipKey, 'failed', 'F6: focus stays on failed chip after metrics recovery');
 
       // F1: Seat filter recovers on refresh after initial HTTP 200 unavailable roster AND loads even when deliveries returns 422.
       assert.deepEqual(filterSeatEl.options.map(o => o.value), [''], 'F1: unavailable roster keeps only All seats');
@@ -937,6 +973,35 @@ assert.match(M.prChips(unknownTotalPrs).join(''), /<b>1<\/b> open PRs observed Â
       assert.deepEqual(filterSeatEl.options.map(o => o.value), ['', 'cto', 'driver'],
         'F1: seat filter refreshes after roster recovery even when /api/fleet/deliveries returns 422');
       deliveriesStatus = 200;
+
+      // F1: Discussions disclosure does not latch or announce "Loaded 0 discussions" on unavailable or malformed HTTP 200.
+      discDisclosureEl.open = true;
+      discListeners.toggle();
+      await new Promise(resolve => setImmediate(resolve));
+      await new Promise(resolve => setImmediate(resolve));
+      assert.equal(discussionsFetches, 1);
+      assert.equal(document.getElementById('discussions-status').textContent, 'Discussions list unavailable.');
+      discDisclosureEl.open = false;
+      discussionsMode = 'malformed';
+      discDisclosureEl.open = true;
+      discListeners.toggle();
+      await new Promise(resolve => setImmediate(resolve));
+      await new Promise(resolve => setImmediate(resolve));
+      assert.equal(discussionsFetches, 2, 'F1: unavailable HTTP 200 stayed retryable on reopen');
+      assert.equal(document.getElementById('discussions-status').textContent, 'Discussions list unavailable.');
+      discDisclosureEl.open = false;
+      discussionsMode = 'available';
+      discDisclosureEl.open = true;
+      discListeners.toggle();
+      await new Promise(resolve => setImmediate(resolve));
+      await new Promise(resolve => setImmediate(resolve));
+      assert.equal(discussionsFetches, 3, 'F1: malformed HTTP 200 stayed retryable on reopen');
+      assert.equal(document.getElementById('discussions-status').textContent, 'Loaded 1 discussion.');
+      discDisclosureEl.open = false;
+      discDisclosureEl.open = true;
+      discListeners.toggle();
+      await new Promise(resolve => setImmediate(resolve));
+      assert.equal(discussionsFetches, 3, 'F1: valid available response latches until explicit refresh');
     } finally {
       globalThis.setInterval = originalInterval;
       globalThis.fetch = fetchPanel;
