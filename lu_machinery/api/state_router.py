@@ -846,7 +846,8 @@ def _apply_pool_pace(records: Mapping[str, Any], pool_pace: Mapping[str, Any], w
     """
     if pool_pace.get("source") != "ok":
         return
-    pool_ages = pool_pace.get("pool_ages") if isinstance(pool_pace.get("pool_ages"), Mapping) else {}
+    raw_pool_ages = pool_pace.get("pool_ages")
+    pool_ages: Mapping[str, Any] = raw_pool_ages if isinstance(raw_pool_ages, Mapping) else {}
     for lane, record in records.items():
         pool = _LANE_POOLS.get(lane)
         verdict = pool_pace["pools"].get(pool) if pool else None
