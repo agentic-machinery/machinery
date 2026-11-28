@@ -76,6 +76,7 @@ from lu_machinery.review.verdict_parser import (
     unsupported_verdict_tokens,
 )
 from lu_machinery.secret_redactor import redact_text
+from lu_machinery.telemetry.emit import record_visibility
 
 # Deepest JSON this module reads (json_depth): its own model-stats rows.
 _JSON_MAX_DEPTH = 128
@@ -483,6 +484,15 @@ def _fleet_repo_visibility() -> tuple[frozenset[str], dict[str, str], str | None
 
 
 @lru_cache(maxsize=1)
+def _visibility_registry() -> Mapping[str, FleetRepo] | None:
+    """The fleet registry for row visibility; None when unreadable, so every row is private (fail closed)."""
+    try:
+        return load_fleet_repos()
+    except Exception:
+        return None
+
+
+@lru_cache(maxsize=1)
 def _public_data_classes() -> frozenset[str]:
     """Exact catalogued public data classes (``store: true``); fail closed to empty when unreadable."""
     catalog = model_catalog_reading()
@@ -849,6 +859,9 @@ def summary_row(path: Path, record: Mapping[str, Any], source_mtime_ns: int | No
         "allowance": None if refusal else _allowance(record),
         "review": review,
         "repo": repo,
+        # Classified from the raw record before ``repo`` defaults to "public" or a conflicting declaration is
+        # dropped (one classifier with the telemetry events): the shared /metrics reads only "public" rows.
+        "visibility": record_visibility(record, _visibility_registry() or {}),
         # The GitHub owner/name the task ran on, so a reader can bind a publication without a fleet catalog.
         "repository": repository if isinstance(repository, str) and REPOSITORY_SLUG.fullmatch(repository) else None,
         "data_class": None if raw_class is None else label(raw_class),
@@ -1347,6 +1360,7 @@ def refresh_readings() -> None:
     model_catalog_reading.cache_clear()
     retired_subscription_model.cache_clear()
     _fleet_repo_visibility.cache_clear()
+    _visibility_registry.cache_clear()
     _public_data_classes.cache_clear()
     clear_repository_cache()
 

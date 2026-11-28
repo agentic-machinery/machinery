@@ -240,3 +240,18 @@ def batch_state_tmp_dir(root: Path | None = None) -> Path:
 
 def telemetry_events_dir(root: Path | None = None) -> Path:
     return batch_state_path("telemetry", "events", root=root)
+
+
+TELEMETRY_SCOPES: tuple[str, ...] = ("public", "private")
+
+
+def telemetry_events_in(batch_state: Path) -> Path:
+    """``<batch_state>/telemetry/events`` for an explicit batch-state directory (the task store's parent)."""
+    return Path(batch_state) / "telemetry" / "events"
+
+
+def telemetry_scope_dir(batch_state: Path, scope: str) -> Path:
+    """``<batch_state>/telemetry/events/<scope>``: one visibility partition of the telemetry-event.v2 log."""
+    if scope not in TELEMETRY_SCOPES:
+        raise ValueError(f"invalid telemetry scope: {scope!r}")
+    return telemetry_events_in(batch_state) / scope

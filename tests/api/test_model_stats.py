@@ -513,7 +513,7 @@ def test_per_model_figures_survive_settlement_backfill_and_retention(tmp_path, m
     ]
     assert [r["status"] for r in token_use["top_tasks"]] == ["no_deliverable", "done", "done"]
     ctx = fixture_context(tmp_path)
-    monkeypatch.setattr(stats, "cached_snapshot", lambda _ctx: (snapshot, 1.0))
+    monkeypatch.setattr(stats, "cached_snapshot", lambda _ctx, **_scope: (snapshot, 1.0))
     registry = CollectorRegistry()
     registry.register(stats.ModelStatsCollector(ctx))
     for window in ("7d", "24h"):
@@ -860,7 +860,7 @@ def test_route_rows_and_metrics_carry_no_prompt_body_path_or_account(tmp_path, m
     rows.backfill(tasks, batch_state)
     snapshot = stats.collect(batch_state, tmp_path, NOW, landing=stats.Landing())
     ctx = SimpleNamespace(roots=SimpleNamespace(batch_state_dir=batch_state, live_repo_root=tmp_path))
-    monkeypatch.setattr(stats, "cached_snapshot", lambda _ctx: (snapshot, 1.0))
+    monkeypatch.setattr(stats, "cached_snapshot", lambda _ctx, **_scope: (snapshot, 1.0))
     registry = CollectorRegistry()
     registry.register(stats.ModelStatsCollector(ctx))
 
@@ -884,7 +884,7 @@ def test_pr_reviewed_for_two_author_models_exports_other_on_metrics(tmp_path, mo
     rows.backfill(tasks, batch_state)
     snapshot = stats.collect(batch_state, tmp_path, NOW, landing=stats.Landing())
     ctx = SimpleNamespace(roots=SimpleNamespace(batch_state_dir=batch_state, live_repo_root=tmp_path))
-    monkeypatch.setattr(stats, "cached_snapshot", lambda _ctx: (snapshot, 1.0))
+    monkeypatch.setattr(stats, "cached_snapshot", lambda _ctx, **_scope: (snapshot, 1.0))
     registry = CollectorRegistry()
     registry.register(stats.ModelStatsCollector(ctx))
 
