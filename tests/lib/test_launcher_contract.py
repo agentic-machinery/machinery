@@ -1264,34 +1264,50 @@ def test_cto_wrapper_start_builds_cto_prompt_not_lane_driver_prompt(tmp_path: Pa
 def test_launcher_passes_single_system_prompt_with_core_then_role(tmp_path: Path) -> None:
     """#1589 defect class: a second --append-system-prompt silently drops the rules core, since
     Claude Code keeps only the last addition. Native Claude, the CTO wrapper's role and Codex on
-    Claude Code each pass one inline addition: the core, then the caller's additions in order,
-    whatever form the caller used (inline, =, file, file=). A one-value option's value is kept."""
+    Claude Code each pass one inline addition, the core then the caller's text, in the caller's
+    own argument slot. Every shape the launcher cannot merge safely refuses before any lease."""
     role = "You are the operator-appointed CTO AND cross-epic lead."
     role_file = tmp_path / "role.txt"
-    role_file.write_text("File role.\n", encoding="utf-8")
+    role_file.write_text(role, encoding="utf-8")
     argv_file = tmp_path / "argv"
-    cases = (
-        (("start-claude-cto.sh", "--epic", "epics", "--model", "claude-opus-5-5", "KICK", "--",
-          "--dangerously-skip-permissions", "--append-system-prompt", role), [role]),
-        (("start-claude.sh", "--", "--append-system-prompt=One.", "--name", "--append-system-prompt",
-          "--append-system-prompt-file", str(role_file), f"--append-system-prompt-file={role_file}"),
-         ["One.", "File role.\n", "File role.\n"]),
-        (("start-codex.sh", "--harness", "claude-code", "--", "--append-system-prompt", role), [role]),
-    )
-    for args, additions in cases:
+    cto = ("start-claude-cto.sh", "--epic", "epics", "--model", "claude-opus-5-5", "KICK", "--")
+    for args, flag in (
+        ((*cto, "--dangerously-skip-permissions", "--append-system-prompt", role), b"--append-system-prompt"),
+        (("start-claude.sh", "--", "-c", f"--append-system-prompt={role}", "--resume"), b"--append-system-prompt="),
+        (("start-codex.sh", "--harness", "claude-code", "--", "--append-system-prompt", role), b"--append-system-prompt"),
+    ):
+        argv_file.unlink(missing_ok=True)
         result = run_launcher(*args, env={"LAUNCHER_DRY_RUN_ARGV_FILE": str(argv_file)})
         assert result.returncode == 0, result.stdout + result.stderr
         core_bytes = int(re.search(r"launcher: rules core seat=\S+ bytes=(\d+)", result.stdout).group(1))
         argv = argv_file.read_bytes().removesuffix(b"\0").split(b"\0")
-        assert argv[0] == b"claude", args
-        values = [argv[i + 1] for i, arg in enumerate(argv) if arg == b"--append-system-prompt" and argv[i - 1] != b"--name"]
-        assert len(values) == 1, (args, values)
-        assert not [arg for arg in argv if arg.startswith((b"--append-system-prompt=", b"--append-system-prompt-file"))]
-        core, rest = values[0][:core_bytes], values[0][core_bytes:]
+        additions = [arg for arg in argv if arg.startswith(b"--append-system-prompt")]
+        assert argv[0] == b"claude" and len(additions) == 1, (args, [arg[:40] for arg in additions])
+        assert additions[0] == flag or (flag.endswith(b"=") and additions[0].startswith(flag)), args
+        value = argv[argv.index(flag) + 1] if flag == b"--append-system-prompt" else additions[0][len(flag):]
+        core = value[:core_bytes]
         assert core.startswith(b"<rules-core ") and core.rstrip().endswith(b"</rules-core>"), args
-        assert rest == "".join(f"\n\n{addition}" for addition in additions).encode(), args
-        if "--name" in args:
-            assert argv[argv.index(b"--name") + 1] == b"--append-system-prompt"
+        assert value[core_bytes:] == b"\n\n" + role.encode(), args
+        # The caller's arguments around its addition keep their places.
+        caller = [arg.encode() for arg in args[args.index("--") + 1:]]
+        slot = next(index for index, arg in enumerate(caller) if arg.startswith(b"--append-system-prompt"))
+        at, width = argv.index(additions[0]), 2 if flag == b"--append-system-prompt" else 1
+        assert argv[at - slot:at] == caller[:slot], args
+        assert argv[at + width:at + len(caller) - slot] == caller[slot + width:], args
+    for extra, reason in (
+        (("--append-system-prompt-file", str(role_file)), "is not supported"),
+        ((f"--append-system-prompt-file={role_file}",), "is not supported"),
+        (("--append-system-prompt", "one", "--append-system-prompt=two"), "at most one"),
+        (("--name", "--append-system-prompt", role), "may take it as its value"),
+        (("--tools", "--append-system-prompt", role), "may take it as its value"),
+        (("--append-system-prompt", role, "--", "question"), "literal --"),
+        (("--append-system-prompt",), "requires a value"),
+        (("--append-system-prompt", "x" * 100_000), "argument limit"),
+    ):
+        argv_file.unlink(missing_ok=True)
+        result = run_launcher(*cto, *extra, env={"LAUNCHER_DRY_RUN_ARGV_FILE": str(argv_file)})
+        assert result.returncode == 2 and reason in result.stderr, (extra, result.stderr)
+        assert "would claim lease" not in result.stdout and not argv_file.exists(), extra
 
 
 def test_fleet_cold_clause_keeps_lane_drivers_on_drive_epic(tmp_path: Path) -> None:

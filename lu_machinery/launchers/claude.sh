@@ -60,9 +60,9 @@ launcher_adapter_exec() {
   if [ -n "${LC_EFFORT:-}" ]; then
     cmd+=(--effort "$LC_EFFORT")
   fi
-  # CLAUDE.md autoload does not carry the rules core; append it to the system
-  # prompt as the one addition, with any caller additions after it.
-  launcher_claude_system_prompt merge
+  # CLAUDE.md autoload does not carry the rules core; launcher_main put it in
+  # the one system-prompt addition (launcher_claude_system_prompt).
+  [ "${LC_CLAUDE_SYSTEM_PROMPT_READY:-0}" = 1 ] || { launcher_error 'system-prompt addition not prepared.'; exit 1; }
   cmd+=(${LC_CLAUDE_SYSTEM_PROMPT_ARGS[@]+"${LC_CLAUDE_SYSTEM_PROMPT_ARGS[@]}"})
   cmd+=("${LC_FORWARD_ARGS[@]}")
   if [ "$LC_DRY_RUN" = 1 ]; then printf 'LAUNCHER_DRY_RUN=1: credential_source=%s\nwould exec ' "$LC_AUTH_SOURCE"; launcher_print_argv "${cmd[@]}"; printf '\n'; return 0; fi

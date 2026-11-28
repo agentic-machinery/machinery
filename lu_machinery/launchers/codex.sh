@@ -219,8 +219,8 @@ launcher_adapter_exec() {
     fi
   else
     cmd=(claude --model "$LC_MODEL")
-    # One system-prompt addition: the core, then any caller additions.
-    launcher_claude_system_prompt merge
+    # The one system-prompt addition, core first (launcher_claude_system_prompt).
+    [ "${LC_CLAUDE_SYSTEM_PROMPT_READY:-0}" = 1 ] || { launcher_error 'system-prompt addition not prepared.'; exit 1; }
     cmd+=(${LC_CLAUDE_SYSTEM_PROMPT_ARGS[@]+"${LC_CLAUDE_SYSTEM_PROMPT_ARGS[@]}"})
   fi
   cmd+=("${LC_FORWARD_ARGS[@]}")
