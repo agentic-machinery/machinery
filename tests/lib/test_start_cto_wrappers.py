@@ -1419,19 +1419,24 @@ def test_cto_pointer_names_cto_lane_and_operator_escalation(
     assert "privately configured worker target" not in infra_template
 
     # 2. Managed-block replacement: content inside the fixed marker lines is replaced wholesale from
-    #    the resolved seat identity; text outside the markers is never parsed or rewritten.
+    #    the resolved seat identity; text outside the markers is preserved verbatim (including CRLF
+    #    and outer blank lines) and never parsed or rewritten; managed instructions stay top-level
+    #    even when an unclosed backtick or tilde fence precedes the markers.
+    from markdown_it import MarkdownIt
+
     monkeypatch.delenv("SESSION_SEAT", raising=False)
-    top_note = "  Top custom note (untouched)\n\n"
+    top_note = "\r\n  Top custom note (untouched)\r\n\r\n"
     bottom_note = (
-        "\n## Pinned notes\n"
-        "- Keep provider fact (inline `" + driver_state.MANAGED_BEGIN + "` mention stays prose)\n"
-        "## Standing decision **policy**\n"
-        "- User note outside markers stays untouched\n"
-        "```text\n"
-        "unclosed fence outside markers\n"
+        "\r\n## Pinned notes\r\n"
+        "- Keep provider fact (inline `" + driver_state.MANAGED_BEGIN + "` mention stays prose)\r\n"
+        "## Standing decision **policy**\r\n"
+        "- User note outside markers stays untouched\r\n"
+        "```text\r\n"
+        "unclosed fence outside markers\r\n\r\n"
     )
     # Cross-seat copied managed block (CTO template injected on infra, and infra template injected on CTO).
     infra_from_cto = driver_state.render_injection(top_note + cto_template + bottom_note, infra_path)
+    infra_from_cto_body = infra_from_cto.split("\n\n", 1)[1]
     assert infra_from_cto.count(driver_state.MANAGED_BEGIN) == 2  # 1 marker line + 1 inline prose mention
     assert infra_from_cto.count(driver_state.MANAGED_END) == 1
     assert "- Stream: infra" in infra_from_cto
@@ -1441,10 +1446,43 @@ def test_cto_pointer_names_cto_lane_and_operator_escalation(
     assert "--lane cto" not in infra_from_cto
     assert "Ask the CTO only about deleting data" in infra_from_cto
     assert "Ask the operator" not in infra_from_cto
-    assert top_note + driver_state.MANAGED_BEGIN in infra_from_cto
-    assert driver_state.MANAGED_END + "\n" + bottom_note.rstrip("\r\n") in infra_from_cto
+    assert infra_from_cto_body.startswith(driver_state.MANAGED_BEGIN + "\n")
+    assert infra_from_cto_body.endswith(driver_state.MANAGED_END + "\n\n" + top_note + bottom_note)
+    assert driver_state.render_injection(infra_from_cto_body, infra_path) == infra_from_cto
+
+    # Both injection hooks preserve internal and outer CRLFs verbatim when reading from disk.
+    monkeypatch.setenv("CLAUDE_PROJECT_DIR", str(tmp_path))
+    monkeypatch.setenv("SESSION_HANDOFF_AGENT", "claude-infra")
+    monkeypatch.setenv(driver_state.STATE_ENV, str(infra_path))
+    with infra_path.open("w", encoding="utf-8", newline="") as handle:
+        handle.write(top_note + cto_template + bottom_note)
+    claude_crlf = driver_state.cmd_claude_hook(
+        json.dumps({"hook_event_name": "UserPromptSubmit", "session_id": "crlf", "cwd": str(tmp_path)})
+    )
+    assert claude_crlf["hookSpecificOutput"]["additionalContext"] == infra_from_cto
+    agy_crlf = driver_state.cmd_agy_hook(json.dumps({"conversationId": "crlf", "workspacePaths": [str(tmp_path)]}))
+    assert agy_crlf["injectSteps"][0]["ephemeralMessage"] == infra_from_cto
+    infra_path.write_text(infra_template, encoding="utf-8")
+
+    # Unclosed backtick or tilde fence before the markers cannot swallow the managed block.
+    for fence_prefix in ("```python\nunclosed backtick fence\n", "~~~text\nunclosed tilde fence\n"):
+        fenced_out = driver_state.render_injection(fence_prefix + infra_template + bottom_note, cto_path)
+        fenced_body = fenced_out.split("\n\n", 1)[1]
+        assert fenced_body.startswith(driver_state.MANAGED_BEGIN + "\n")
+        assert fenced_body.endswith(driver_state.MANAGED_END + "\n\n" + fence_prefix + bottom_note)
+        tokens = MarkdownIt().parse(fenced_body)
+        headings = [
+            tokens[idx + 1].content
+            for idx, tok in enumerate(tokens)
+            if tok.type == "heading_open" and tok.level == 0 and tok.tag == "h2"
+        ]
+        assert driver_state.POLICY_TITLE in headings
+        assert not any(
+            tok.type == "fence" and "Ask the operator only about deleting data" in tok.content for tok in tokens
+        )
 
     cto_from_infra = driver_state.render_injection(infra_template + bottom_note, cto_path)
+    cto_from_infra_body = cto_from_infra.split("\n\n", 1)[1]
     assert "- Stream: epics" in cto_from_infra
     assert "- Seat: cto (the launcher owns the epics lease)" in cto_from_infra
     assert "lu-driver-state render --lane cto" in cto_from_infra
@@ -1452,39 +1490,39 @@ def test_cto_pointer_names_cto_lane_and_operator_escalation(
     assert "--lane infra" not in cto_from_infra
     assert "Ask the operator only about deleting data" in cto_from_infra
     assert "Ask the CTO" not in cto_from_infra
-    assert "User note outside markers stays untouched" in cto_from_infra
-    assert "unclosed fence outside markers" in cto_from_infra
-    # Re-injecting the rendered body is idempotent.
-    body_only = cto_from_infra.split("\n\n", 1)[1]
-    assert driver_state.render_injection(body_only, cto_path) == cto_from_infra
+    assert cto_from_infra_body.endswith(driver_state.MANAGED_END + "\n" + bottom_note)
+    assert driver_state.render_injection(cto_from_infra_body, cto_path) == cto_from_infra
 
-    # 3. Fallback injection on pointers without markers: adds the managed block once at the top
-    #    (before any unclosed fence, HTML comment, or formatted heading) and leaves the rest as is.
-    unmarked = (
-        "# Legacy pointer\n\n"
-        "## Standing decision **policy**\n"
-        "- Untouched legacy body\n"
+    # 3. Fallback injection on pointers without markers: adds the managed block once at the top,
+    #    grants the managed block explicit authority in the envelope over retained legacy text,
+    #    and preserves the unmarked text verbatim (including blank lines and whitespace-only files).
+    legacy_epics_template = (
+        "# Driver state: epics\n\n## Epic\n- Stream: epics\n"
+        "- Seat: driver (one per stream; the launcher owns the lease)\n\n"
+        "## Database authority\n"
+        "- First run `lu-driver-state render --lane epics`, then `lu-driver-state check --lane epics` on startup.\n\n"
+        "## Standing decision policy\n"
+        "- Ask the CTO only about deleting data. Post it through Fleet Comms and start the final message with `CTO-ESCALATION:`.\n"
+        "- End every turn with the privately configured worker target met and a wake-up armed.\n"
         "<!-- unclosed html comment\n"
     )
-    cto_unmarked = driver_state.render_injection(unmarked, cto_path)
-    cto_unmarked_body = cto_unmarked.split("\n\n", 1)[1]
+    cto_unmarked = driver_state.render_injection(legacy_epics_template, cto_path)
+    cto_preamble, cto_unmarked_body = cto_unmarked.split("\n\n", 1)
+    assert "managed block below is authoritative for stream, seat, database lane, escalation" in cto_preamble
+    assert "non-authoritative reference only" in cto_preamble
+    assert "lu-driver-state render --lane cto" in cto_preamble
     assert cto_unmarked_body.startswith(driver_state.MANAGED_BEGIN + "\n")
-    assert cto_unmarked_body.endswith("\n\n" + unmarked.rstrip("\r\n"))
+    assert cto_unmarked_body.endswith(driver_state.MANAGED_END + "\n\n" + legacy_epics_template)
     assert cto_unmarked_body.index("Ask the operator only about deleting data") < cto_unmarked_body.index("<!-- unclosed html comment")
-    assert "lu-driver-state render --lane cto" in cto_unmarked
-    assert "lu-driver-state check --lane cto" in cto_unmarked
-    assert "- Untouched legacy body" in cto_unmarked
+    assert driver_state.render_injection(cto_unmarked_body, cto_path) == cto_unmarked
 
-    infra_unmarked = driver_state.render_injection("# Driver state: infra\n\n## Pinned\n- note\n", infra_path)
-    infra_unmarked_body = infra_unmarked.split("\n\n", 1)[1]
-    assert infra_unmarked_body.startswith(driver_state.MANAGED_BEGIN + "\n")
-    assert infra_unmarked_body.endswith("\n\n# Driver state: infra\n\n## Pinned\n- note")
-    assert "lu-driver-state render --lane infra" in infra_unmarked
-    assert "Ask the CTO only about deleting data" in infra_unmarked
-    assert "Ask the operator" not in infra_unmarked
+    for exact_unmarked in ("\n\nnote\n\n", "   \r\n"):
+        unmarked_out = driver_state.render_injection(exact_unmarked, infra_path)
+        unmarked_body = unmarked_out.split("\n\n", 1)[1]
+        assert unmarked_body.endswith(driver_state.MANAGED_END + "\n\n" + exact_unmarked)
+        assert driver_state.render_injection(unmarked_body, infra_path) == unmarked_out
 
     # 4. Malformed marker arrangements fail closed with a typed ManagedBlockError / gate failure.
-    monkeypatch.setenv("CLAUDE_PROJECT_DIR", str(tmp_path))
     monkeypatch.setenv("SESSION_HANDOFF_AGENT", "claude-epics")
     monkeypatch.setenv(driver_state.STATE_ENV, str(cto_path))
     for bad_text in (
@@ -1501,10 +1539,47 @@ def test_cto_pointer_names_cto_lane_and_operator_escalation(
     )
     assert "DRIVER-GATE-FAILED: malformed managed driver-state markers" in bad_hook["hookSpecificOutput"]["additionalContext"]
     failure_file = cto_path.parent / "stop-counters" / "stop-claude-bad-markers.failure.json"
-    assert json.loads(failure_file.read_text(encoding="utf-8"))["code"] == "invalid_managed_block"
+    failure_record = json.loads(failure_file.read_text(encoding="utf-8"))
+    assert isinstance(failure_record, dict)
+    assert failure_record["code"] == "invalid_managed_block"
     cto_path.write_text(cto_template, encoding="utf-8")
 
-    # 5. Non-epic fallback paths validate SESSION_EPIC before SESSION_SEAT=cto and fail closed on invalid selectors.
+    # 5. Invalid -epic directory selectors fail closed before consulting env; genuinely custom paths
+    #    validate SESSION_EPIC before SESSION_SEAT=cto and fail closed on invalid selectors.
+    invalid_epic_path = tmp_path / ".claude" / "Infra-epic" / "DRIVER-STATE.md"
+    invalid_epic_path.parent.mkdir(parents=True, exist_ok=True)
+    invalid_epic_path.write_text("# Invalid epic dir\n", encoding="utf-8")
+    monkeypatch.setenv("SESSION_SEAT", "cto")
+    for env_epic in (None, "infra", "epics"):
+        if env_epic is None:
+            monkeypatch.delenv("SESSION_EPIC", raising=False)
+        else:
+            monkeypatch.setenv("SESSION_EPIC", env_epic)
+        invalid_dir_out = driver_state.render_injection("# Invalid epic dir\n", invalid_epic_path)
+        assert "lu-driver-state render --lane <lane>" in invalid_dir_out
+        assert "Ask the CTO only about deleting data" in invalid_dir_out
+        assert "Ask the operator" not in invalid_dir_out
+        monkeypatch.setenv(driver_state.STATE_ENV, str(invalid_epic_path))
+        invalid_dir_stop = driver_state.cmd_claude_stop_hook(
+            json.dumps(
+                {
+                    "session_id": f"invalid-dir-{env_epic or 'unset'}",
+                    "cwd": str(tmp_path),
+                    "hook_event_name": "Stop",
+                    "last_assistant_message": "Should I proceed?",
+                }
+            )
+        )
+        assert invalid_dir_stop["decision"] == "block"
+        assert "Ask the CTO only about deletes, money, security or rule changes, via Fleet Comms" in invalid_dir_stop["reason"]
+        assert "Ask the operator" not in invalid_dir_stop["reason"]
+        invalid_dir_pretool = driver_state.cmd_agy_pretool_hook(
+            json.dumps({"workspacePaths": [str(tmp_path)], "toolCall": {"name": "ask_question"}})
+        )
+        assert invalid_dir_pretool["decision"] == "deny"
+        assert "post to the CTO via Fleet Comms" in invalid_dir_pretool["reason"]
+        assert "ask the operator" not in invalid_dir_pretool["reason"]
+
     custom_path = tmp_path / ".claude" / "custom" / "DRIVER-STATE.md"
     custom_path.parent.mkdir(parents=True, exist_ok=True)
     custom_path.write_text("# Custom\n", encoding="utf-8")

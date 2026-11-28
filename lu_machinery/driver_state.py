@@ -203,7 +203,11 @@ def render_template(epic: str) -> str:
 
 
 def _epic_from_path(path: Path) -> str | None:
-    """Extract a validated epic selector from the pointer path's anchored lexical parent directory."""
+    """Extract a validated epic selector from the pointer path's anchored lexical parent directory.
+
+    Returns ``None`` when the parent directory is not an ``<epic>-epic`` directory.
+    Raises ``ValueError`` when an ``<epic>-epic`` directory carries an invalid selector.
+    """
     try:
         parent = Path(os.path.abspath(path)).parent.name
     except OSError:
@@ -211,16 +215,16 @@ def _epic_from_path(path: Path) -> str | None:
     if not parent.endswith("-epic"):
         return None
     epic = parent.removesuffix("-epic")
-    try:
-        validate_epic(epic)
-    except ValueError:
-        return None
+    validate_epic(epic)
     return epic
 
 
 def _seat_context(path: Path) -> tuple[str | None, bool, str | None]:
     """Resolve ``(epic, is_cto, state_lane)`` from ``path`` first, then ``SESSION_EPIC``, then ``SESSION_SEAT``."""
-    epic = _epic_from_path(path)
+    try:
+        epic = _epic_from_path(path)
+    except ValueError:
+        return None, False, None
     if epic is not None:
         is_cto = epic == CTO_EPIC
         return epic, is_cto, (CTO_STATE_LANE if is_cto else epic)
@@ -276,7 +280,8 @@ def _state_root(path: Path) -> Path:
 
 
 def _read_state(path: Path) -> str:
-    return path.read_text(encoding="utf-8")
+    with path.open("r", encoding="utf-8", newline="") as handle:
+        return handle.read()
 
 
 def _section(text: str, title: str) -> list[str]:
@@ -295,13 +300,16 @@ def _split_lines_keepends(text: str) -> list[str]:
 
 
 def _apply_managed_block(text: str, block: str) -> str:
-    """Replace one ordered BEGIN/END marker line pair wholesale, or prepend ``block`` when unmarked."""
+    """Emit ``block`` at top level with one ordered marker pair replaced wholesale, or prepended when unmarked.
+
+    Text outside the markers (or the entire body of an unmarked pointer) is preserved verbatim
+    without parsing, trimming, or line-ending translation.
+    """
     lines = _split_lines_keepends(text)
     begins = [index for index, line in enumerate(lines) if line.rstrip("\r\n") == MANAGED_BEGIN]
     ends = [index for index, line in enumerate(lines) if line.rstrip("\r\n") == MANAGED_END]
     if not begins and not ends:
-        remainder = text.lstrip("\r\n")
-        return f"{block}\n\n{remainder}" if remainder.strip() else block
+        return f"{block}\n\n{text}" if text else block
     if len(begins) != 1 or len(ends) != 1 or begins[0] >= ends[0]:
         raise ManagedBlockError(
             "DRIVER-GATE-FAILED: malformed managed driver-state markers; "
@@ -312,17 +320,22 @@ def _apply_managed_block(text: str, block: str) -> str:
     after = "".join(lines[end + 1 :])
     end_line = lines[end]
     end_nl = end_line[len(end_line.rstrip("\r\n")) :]
-    replacement = block + (end_nl if after else "")
-    return before + replacement + after
+    if not before:
+        return block + end_nl + after
+    return f"{block}\n\n{before}{after}"
 
 
 def render_injection(text: str, path: Path) -> str:
     epic, is_cto, state_lane = _seat_context(path)
     block = render_managed_block(epic=epic, is_cto=is_cto, state_lane=state_lane)
-    rendered = _apply_managed_block(text, block).strip("\r\n")
+    rendered = _apply_managed_block(text, block)
     lane = state_lane or "<lane>"
     message = (
         "PINNED DRIVER STATE (pinned facts only; re-injected every model call). "
+        "The managed block below is authoritative for stream, seat, database lane, escalation, "
+        "and standing decision policy; any retained pointer text outside the managed markers "
+        "(including legacy unmarked pointer text) is non-authoritative reference only and never "
+        "overrides the managed block. "
         "Task state, goals, decisions and handoffs live in the driver-state database: "
         f"run `lu-driver-state render --lane {lane}` and `lu-driver-state check --lane {lane}` "
         "first and record every goal, decision and handoff there "
