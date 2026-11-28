@@ -11,6 +11,7 @@ import signal
 import subprocess
 import sys
 import time
+import tomllib
 from contextlib import suppress
 from datetime import timedelta
 from pathlib import Path
@@ -1324,6 +1325,177 @@ def test_launcher_passes_single_system_prompt_with_core_then_role(tmp_path: Path
         result = run_launcher(*cto, *extra, env={"LAUNCHER_DRY_RUN_ARGV_FILE": str(argv_file)})
         assert result.returncode == 2 and "refusing to launch" in result.stderr, (extra[0][:40], result.stderr)
         assert "would claim lease" not in result.stdout and not argv_file.exists(), extra[0][:40]
+
+
+def test_codex_keeps_core_before_caller_developer_instructions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Defect: a caller developer_instructions setting replaces the rules core (sibling of #1559).
+
+    Both the native Codex launcher and dispatcher runtime_context merge a single provable
+    developer_instructions setting in place as core, a blank line, then the caller's text
+    (TOML-encoded), keep main's argv for unprovable shapes, and refuse missing-value or
+    over-limit settings before any side effect."""
+    from lu_machinery.dispatcher import runtime_context
+    from lu_machinery.dispatcher.types import Invocation, TaskSpec
+    from lu_machinery.lib import rules_core
+
+    def _dev_settings(argv: list[str]) -> list[tuple[int, str, str]]:
+        found: list[tuple[int, str, str]] = []
+        for idx, arg in enumerate(argv):
+            if arg in ("-c", "--config") and idx + 1 < len(argv):
+                payload = argv[idx + 1]
+                key = payload.split("=", 1)[0].strip()
+                if key == "developer_instructions" or key.startswith("developer_instructions."):
+                    found.append((idx + 1, "", payload))
+            else:
+                for pfx in ("--config=", "-c=", "-c"):
+                    if arg.startswith(pfx) and len(arg) > len(pfx):
+                        payload = arg[len(pfx):]
+                        key = payload.split("=", 1)[0].strip()
+                        if key == "developer_instructions" or key.startswith("developer_instructions."):
+                            found.append((idx, pfx, payload))
+                        break
+        return found
+
+    role = 'You are the CTO.\nStay "in" scope.'
+    argv_file = tmp_path / "argv"
+    cto = ("start-codex-cto.sh", "--epic", "epics", "KICK", "--")
+    cto_core_toml_bytes = 0
+    for args, expected_role, expected_prefix in (
+        ((*cto, "--search", "-c", f"developer_instructions={rules_core.toml_basic_string(role)}", "--no-alt-screen"), role, ""),
+        (("start-codex.sh", "--", "--config", "developer_instructions=Raw caller text", "--search"), "Raw caller text", ""),
+        (("start-codex.sh", "--", f"--config=developer_instructions={rules_core.toml_basic_string(role)}"), role, "--config="),
+        (("start-codex.sh", "--", "-c=developer_instructions='Literal \\n text'"), r"Literal \n text", "-c="),
+        (("start-codex.sh", "--", "-cdeveloper_instructions=Attached short"), "Attached short", "-c"),
+        (("start-codex.sh", "--", "-c", "developer_instructions="), "", ""),
+        (("start-codex-driver.sh", "--epic", "devops", "-c", "developer_instructions=Driver role", "Driver task"), "Driver role", ""),
+    ):
+        argv_file.unlink(missing_ok=True)
+        result = run_launcher(*args, env={"LAUNCHER_DRY_RUN_ARGV_FILE": str(argv_file)})
+        assert result.returncode == 0, result.stdout + result.stderr
+        core_bytes = int(re.search(r"launcher: rules core seat=\S+ bytes=(\d+)", result.stdout).group(1))
+        would_exec = result.stdout.split("would exec ", 1)[1]
+        assert f"rules-core\\ seat=core\\ bytes={core_bytes}" in would_exec or f"rules-core seat=core bytes={core_bytes}" in would_exec, args
+        assert '<rules-core seat="core"' not in result.stdout
+        argv = [arg.decode("utf-8") for arg in argv_file.read_bytes().removesuffix(b"\0").split(b"\0")]
+        assert argv[0] == "codex", args
+        settings = _dev_settings(argv)
+        assert len(settings) == 1, (args, settings)
+        slot_idx, pfx, payload = settings[0]
+        assert pfx == expected_prefix, args
+        decoded = tomllib.loads(payload)["developer_instructions"]
+        core_part = decoded.encode("utf-8")[:core_bytes].decode("utf-8")
+        assert core_part.startswith("<rules-core ") and core_part.rstrip().endswith("</rules-core>"), args
+        assert decoded[len(core_part):] == "\n\n" + expected_role, args
+        if args[0] == "start-codex-cto.sh":
+            cto_core_toml_bytes = len(rules_core.toml_basic_string(core_part).encode("utf-8"))
+        # Caller arguments around the rewritten slot keep their exact places.
+        if "--" in args:
+            caller = list(args[args.index("--") + 1:])
+            rel = next(
+                i for i, a in enumerate(caller)
+                if "developer_instructions" in a
+            )
+            flag_rel = rel - 1 if expected_prefix == "" else rel
+            flag_at = slot_idx - 1 if expected_prefix == "" else slot_idx
+            width = 2 if expected_prefix == "" else 1
+            assert argv[flag_at - flag_rel:flag_at] == caller[:flag_rel], args
+            assert argv[flag_at + width:flag_at + width + len(caller) - flag_rel - width] == caller[flag_rel + width:], args
+
+    # Unprovable shapes keep main's argv: core first, then caller arguments verbatim.
+    for extra in (
+        ("-c", "developer_instructions=one", "-c", "developer_instructions=two"),
+        ("-p", "-c", "developer_instructions=role"),
+        ("--enable", "-cdeveloper_instructions=role"),
+        ("-c", "-c", "developer_instructions=role"),
+        ("--unknown-opt", "-c", "developer_instructions=role"),
+        ("-c", "developer_instructions=role", "--", "question"),
+        ("--", "-c", "developer_instructions=role"),
+        ("-c", "developer_instructions=123"),
+        ("-c", "developer_instructions.sub=x"),
+    ):
+        argv_file.unlink(missing_ok=True)
+        result = run_launcher(*cto, *extra, env={"LAUNCHER_DRY_RUN_ARGV_FILE": str(argv_file)})
+        assert result.returncode == 0, (extra, result.stdout + result.stderr)
+        argv = [arg.decode("utf-8") for arg in argv_file.read_bytes().removesuffix(b"\0").split(b"\0")]
+        first_c = next(
+            i for i, a in enumerate(argv[:-1])
+            if a == "-c" and argv[i + 1].startswith("developer_instructions=")
+        )
+        core_val = tomllib.loads(argv[first_c + 1])["developer_instructions"]
+        assert core_val.startswith("<rules-core ") and core_val.rstrip().endswith("</rules-core>"), extra
+        caller = list(extra)
+        assert any(argv[at:at + len(caller)] == caller for at in range(len(argv))), extra
+
+    # Provable missing value and over-limit slots refuse with exit 2 before lease/exec.
+    page_limit = os.sysconf("SC_PAGE_SIZE") * 32
+    # Joined slot at exact MAX_ARG_STRLEN: "--config=developer_instructions=" (32)
+    # + core TOML (cto_core_toml_bytes, includes quotes) + "\\n\\n" (4) + filler == page_limit.
+    joined_boundary_filler = "x" * (page_limit - len("--config=developer_instructions=") - cto_core_toml_bytes - 4)
+    for extra in (
+        ("-c", "developer_instructions"),
+        ("--config=developer_instructions",),
+        ("-cdeveloper_instructions",),
+        ("-c", "developer_instructions=" + "x" * 100_000),
+        (f"--config=developer_instructions={joined_boundary_filler}",),
+    ):
+        argv_file.unlink(missing_ok=True)
+        result = run_launcher(*cto, *extra, env={"LAUNCHER_DRY_RUN_ARGV_FILE": str(argv_file)})
+        assert result.returncode == 2 and "refusing to launch" in result.stderr, (extra[0][:40], result.stderr)
+        assert "would claim lease" not in result.stdout and not argv_file.exists(), extra[0][:40]
+
+    # Dispatcher runtime_context.build enforces the same ruling C contract for Codex workers.
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+    brief = tmp_path / "brief.md"
+    brief.write_bytes(b"Do the task.\n")
+    spec = TaskSpec("codex-core", "codex", CURRENT_SOL, "high", "workspace-write", worktree, brief, tmp_path / "final")
+    expected_core = rules_core.core_block(rules_core.resolve_seat())
+    base_argv = ["codex", "exec", "--json", "-C", str(worktree), "-m", CURRENT_SOL, "--dangerously-bypass-approvals-and-sandbox"]
+
+    def _make_stub_provider(extra_args: list[str]):
+        class _StubProvider:
+            @staticmethod
+            def build(_spec: TaskSpec, env: dict[str, str]) -> Invocation:
+                return Invocation([*base_argv, *extra_args], b"Do the task.\n", env, tmp_path / "final")
+
+        return _StubProvider
+
+    for extra, expected_role, expected_prefix in (
+        (["-c", f"developer_instructions={rules_core.toml_basic_string(role)}"], role, ""),
+        (["--config=developer_instructions=Worker raw"], "Worker raw", "--config="),
+    ):
+        provider = _make_stub_provider(extra)
+        monkeypatch.setattr(runtime_context.providers, "load", lambda _agent, _p=provider: _p)
+        inv = runtime_context.build(spec, {})
+        settings = _dev_settings(inv.argv)
+        assert len(settings) == 1, (extra, settings)
+        assert settings[0][1] == expected_prefix
+        assert tomllib.loads(settings[0][2])["developer_instructions"] == f"{expected_core}\n\n{expected_role}"
+
+    for extra in (
+        ["-c", "developer_instructions=one", "-c", "developer_instructions=two"],
+        ["-p", "-c", "developer_instructions=role"],
+        ["--", "-c", "developer_instructions=role"],
+        ["-c", "developer_instructions=123"],
+    ):
+        provider = _make_stub_provider(extra)
+        monkeypatch.setattr(runtime_context.providers, "load", lambda _agent, _p=provider: _p)
+        inv = runtime_context.build(spec, {})
+        assert inv.argv[:len(base_argv) + len(extra)] == [*base_argv, *extra]
+        assert inv.argv[-2] == "-c"
+        assert tomllib.loads(inv.argv[-1])["developer_instructions"] == expected_core
+
+    for extra in (
+        ["-c", "developer_instructions"],
+        ["--config=developer_instructions"],
+        ["-c", "developer_instructions=" + "x" * 100_000],
+    ):
+        provider = _make_stub_provider(extra)
+        monkeypatch.setattr(runtime_context.providers, "load", lambda _agent, _p=provider: _p)
+        with pytest.raises(ValueError, match="refusing to launch"):
+            runtime_context.build(spec, {})
 
 
 def test_fleet_cold_clause_keeps_lane_drivers_on_drive_epic(tmp_path: Path) -> None:
