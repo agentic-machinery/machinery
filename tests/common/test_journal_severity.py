@@ -20,7 +20,9 @@ def test_multiline_record_counts_once():
     journal entry under journald's syslog-level prefix.
     """
     raw = json.loads(machinery_path("api/logging.json").read_text(encoding="utf-8"))
-    spec = raw["formatters"]["default"]
+    formatters = raw.get("formatters") if type(raw) is dict else None
+    spec = formatters.get("default") if type(formatters) is dict else None
+    assert type(spec) is dict
     assert spec["()"] == "lu_machinery.common.journal_severity.JournalSeverityFormatter"
     formatter = logging.config.DictConfigurator({"version": 1}).configure_formatter(copy.deepcopy(spec))
     assert isinstance(formatter, JournalSeverityFormatter)
