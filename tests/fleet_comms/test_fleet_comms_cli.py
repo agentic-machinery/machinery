@@ -130,15 +130,25 @@ def test_plane_status_cli_root_flag(tmp_path: Path, monkeypatch: pytest.MonkeyPa
                 argv.append(action.option_strings[0])
             argv.append("1" if action.type is int else "fixture")
         entrypoints.append((argv, parser.get_default("func").__name__))
-    assert len(entrypoints) == 30
+    assert len(entrypoints) == 31
     for argv, handler_name in entrypoints:
         handler = Mock(side_effect=AssertionError("unsafe root reached command handler"))
         with monkeypatch.context() as guard:
             guard.setattr(f"lu_machinery.fleet_comms.cli.{handler_name}", handler)
             assert main([*argv, "--root", str(checkout)]) == EXIT_ERROR
         output = capsys.readouterr()
-        assert output.out == ""
-        assert output.err == "plane_root_is_git_checkout\n"
+        if handler_name == "cmd_fleet_exchange":
+            assert output.err == ""
+            assert json.loads(output.out) == {
+                "content_included": False,
+                "error": "plane_root_is_git_checkout",
+                "read_only": True,
+                "response_schema_version": "comms.v2",
+                "source": "authority",
+            }
+        else:
+            assert output.out == ""
+            assert output.err == "plane_root_is_git_checkout\n"
         handler.assert_not_called()
     assert sorted(checkout.rglob("*")) == before
 

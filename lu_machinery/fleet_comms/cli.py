@@ -430,6 +430,32 @@ def cmd_fleet_help(_args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def cmd_fleet_exchange(args: argparse.Namespace) -> int:
+    """Read body-free delivery and reply rows for one recipient since a UTC timestamp."""
+    from lu_machinery.fleet_comms.exchange_rows import (
+        ExchangeRowsError,
+        dump_exchange_json,
+        exchange_error_payload,
+        read_exchange_rows,
+    )
+
+    raw_root = args.root
+    if raw_root is not None and not str(raw_root).strip():
+        sys.stdout.write(dump_exchange_json(exchange_error_payload("plane_root_unresolvable")))
+        return EXIT_ERROR
+    try:
+        payload = read_exchange_rows(
+            args.recipient,
+            args.since,
+            root=Path(raw_root) if raw_root is not None else None,
+        )
+    except ExchangeRowsError as exc:
+        sys.stdout.write(dump_exchange_json(exchange_error_payload(exc.code)))
+        return EXIT_ERROR
+    sys.stdout.write(dump_exchange_json(payload))
+    return EXIT_OK
+
+
 def _resolve_plane_db(args: argparse.Namespace) -> Path:
     root = Path(args.root).expanduser() if getattr(args, "root", None) else default_plane_root()
     return validate_plane_root(root) / "comms.sqlite3"
@@ -1444,6 +1470,47 @@ def build_parser() -> argparse.ArgumentParser:
     fleet_help = fleet_sub.add_parser("help", help="Map Truth and Eyes")
     fleet_help.set_defaults(func=cmd_fleet_help)
 
+    fleet_exchange = fleet_sub.add_parser(
+        "exchange",
+        help="Read body-free delivery and reply rows for one recipient since a UTC timestamp",
+        description=(
+            "Return typed delivery and reply rows for one recipient since a UTC timestamp,\n"
+            "normalized through AuthorityService without writes, claims, or message bodies.\n"
+            "Use for host checks and read-only delivery/reply inspection; never to claim or ack."
+        ),
+        epilog=(
+            "Examples:\n"
+            f"  <project python> -I -m {_PACKAGE} fleet exchange --recipient claude-cto --since 2026-11-28T00:00:00Z\n"
+            f"  <project python> -I -m {_PACKAGE} fleet exchange --recipient bot-slot --since 2026-11-28T00:00:00Z --root /path/to/plane\n"
+            "Outputs: JSON on stdout with deliveries, replies, counts, and per-row ok/error codes;\n"
+            "  content_included is always false. Opens the authority store read-only via\n"
+            "  ArtifactStore.open_readonly (mode=ro + PRAGMA query_only=ON), matching the other\n"
+            "  Fleet Comms read commands: no database writes, migrations, claims, or lease changes.\n"
+            "  SQLite may create standard WAL coordination files (-shm/-wal) beside the store;\n"
+            "  a store directory the caller cannot write fails closed with a typed error.\n"
+            "Exit codes: 0 = report produced (inspect per-row ok/error and error_count),\n"
+            "  2 = usage error, 3 = invalid --recipient/--since or store/schema unavailable.\n"
+            f"Related: {_PACKAGE}.exchange_rows; {_PACKAGE}.authority.AuthorityService; deliveries pending."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    fleet_exchange.add_argument(
+        "--recipient",
+        required=True,
+        help="Exact recipient identity whose deliveries and replies to read, e.g. claude-cto",
+    )
+    fleet_exchange.add_argument(
+        "--since",
+        required=True,
+        help="Inclusive UTC ISO-8601 lower bound for delivery created_at, e.g. 2026-11-28T00:00:00Z",
+    )
+    fleet_exchange.add_argument(
+        "--root",
+        default=None,
+        help="Authority plane storage root (default: FLEET_COMMS_ROOT or shared plane root)",
+    )
+    fleet_exchange.set_defaults(func=cmd_fleet_exchange, _exchange_json_errors=True)
+
     formal = sub.add_parser(
         "formal-job",
         help="Formal review job get (RO, historical history)",
@@ -1742,19 +1809,39 @@ def main(argv: list[str] | None = None) -> int:
     if func is None:
         parser.print_help(sys.stderr)
         return EXIT_USAGE
+    exchange_json_errors = bool(getattr(args, "_exchange_json_errors", False))
     try:
         if getattr(args, "root", None):
             validate_plane_root(Path(args.root))
         return int(func(args))
-    except MachineryConfigError as exc:
-        sys.stderr.write(str(exc) + "\n")
-        return EXIT_USAGE
+    except (PlaneRootAnchorError, MachineryConfigError, ValueError) as exc:
+        if exchange_json_errors:
+            from lu_machinery.fleet_comms.exchange_rows import (
+                dump_exchange_json,
+                exchange_error_payload,
+                plane_root_error_code,
+            )
+
+            sys.stdout.write(dump_exchange_json(exchange_error_payload(plane_root_error_code(exc))))
+            return EXIT_ERROR
+        if isinstance(exc, MachineryConfigError):
+            sys.stderr.write(str(exc) + "\n")
+            return EXIT_USAGE
+        if isinstance(exc, PlaneRootAnchorError):
+            # #7172: notebook plane-status must fail closed with the retire message,
+            # not a raw traceback (cli-help-standard).
+            sys.stderr.write(str(exc) + "\n")
+            return EXIT_ERROR
+        raise
     except FleetCommsCliError as exc:
-        sys.stderr.write(str(exc) + "\n")
-        return EXIT_ERROR
-    except PlaneRootAnchorError as exc:
-        # #7172: notebook plane-status must fail closed with the retire message,
-        # not a raw traceback (cli-help-standard).
+        if exchange_json_errors:
+            from lu_machinery.fleet_comms.exchange_rows import (
+                dump_exchange_json,
+                exchange_error_payload,
+            )
+
+            sys.stdout.write(dump_exchange_json(exchange_error_payload(str(exc) or "exchange_store_unavailable")))
+            return EXIT_ERROR
         sys.stderr.write(str(exc) + "\n")
         return EXIT_ERROR
 
