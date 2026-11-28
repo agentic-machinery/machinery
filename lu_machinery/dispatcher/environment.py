@@ -206,9 +206,10 @@ def _safe_resolve(entry: str) -> Path | None:
 
 
 def _trace_env(options: object) -> dict[str, str]:
-    """The provider's ``TRACEPARENT``, naming the task's own span (TRACETEL-1128 Slice 3).
+    """The ``TRACEPARENT`` of a provider launched from this environment, naming the task's own span (TRACETEL-1128).
 
-    Never inherited: the environment is built from fixed names. A task with no trace identity (dispatched before
+    Never inherited: the environment is built from fixed names. A wrapper that rebuilds its own environment (the
+    read-only AGY sandbox, a bound review's runtime) passes none on: absent, never wrong. A task with no trace identity (dispatched before
     traces existed) gets none; a malformed one refuses the launch (``ValueError``).
     """
     from lu_machinery.telemetry import emit

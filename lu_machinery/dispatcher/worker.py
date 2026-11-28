@@ -2145,6 +2145,14 @@ def _supervisor_trace_env(record: dict) -> dict[str, str]:
     return env
 
 
+def _trace_refusal(record: dict, spec: TaskSpec) -> str | None:
+    """One trace check before either launch path: the record's identity, its options copy and this supervisor's
+    ``TRACEPARENT`` agree, or the task has none at all (TRACETEL-1128 Slice 3)."""
+    from lu_machinery.telemetry import emit
+
+    return emit.task_trace_refusal(record, spec.options, os.environ)
+
+
 def _provider_env(spec: TaskSpec) -> dict[str, str]:
     """Mark the trusted Claude launch before build; supervise always wraps it before Popen."""
     env = child_env(spec)
@@ -2331,6 +2339,10 @@ def supervise(path: Path, options: dict | None = None, hard_timeout: float | Non
         except headroom.RateLimitedError as exc:
             status, error = "rate_limited", str(exc)
             start_refusal = StartRefusal.HEADROOM
+            return
+        if (refusal := _trace_refusal(record, spec)) is not None:
+            status, error = "failed", refusal
+            start_refusal = StartRefusal.SETUP
             return
         if record.get("review_attempt"):
             # A bound formal attempt runs only inside the agent runtime's attempt boundary, with the rendered

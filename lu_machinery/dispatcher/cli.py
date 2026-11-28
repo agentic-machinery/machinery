@@ -523,7 +523,7 @@ def _parent_linkage(task_id: str) -> dict:
 
 def _dispatch(args) -> int:
     # One trace identity per dispatch, minted before anything of it exists: every refusal record, the admission hold,
-    # the task record and the provider environment carry it. A dispatch started inside a traced run joins that trace
+    # the task record, the supervisor and a provider launched from ``child_env`` carry it. A dispatch started inside a traced run joins that trace
     # through the TRACEPARENT it inherited; an invalid one refuses (TRACETEL-1128 Slice 3).
     from lu_machinery.telemetry import emit
 
@@ -796,7 +796,7 @@ def _dispatch(args) -> int:
     if orchestrator is not None and turn_run_nonce is not None:
         options["orchestrator_stream"] = orchestrator["stream"]
         options["orchestrator_run_nonce"] = turn_run_nonce
-    # The supervisor reads its options back; the provider environment's TRACEPARENT names this span.
+    # The supervisor reads its options back; child_env's TRACEPARENT names this span.
     options.update(trace)
     if read_paths:
         options["read_paths"] = json.dumps(read_paths, separators=(",", ":"))

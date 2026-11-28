@@ -7,6 +7,7 @@ no attempt-specific join) and passes with the change.
 from __future__ import annotations
 
 import json
+import os
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -92,6 +93,12 @@ def test_fresh_refusal_id_record_carries_trace_identity(batch_state: Path, tmp_p
     assert emit.trace_of(by_request["task-bare"]) is not None  # a caller with none still gets a valid one
     assert all(emit.trace_of(event) is not None for event in _events(batch_state))
 
+    # A child that joined a (possibly private) parent's trace keeps that linkage on its record only.
+    store.record_admission_refusal("task-child", "claude", {"repo": "pub"}, StartRefusal.SETUP,
+                                   trace={**TRACE, "parent_span_id": OTHER["span_id"]})
+    child = [e for e in _events(batch_state) if e["span_id"] == TRACE["span_id"] and e["trace_id"] is None]
+    assert len(child) == 1
+
 
 @pytest.mark.parametrize("value", [
     "", "garbage", "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7",
@@ -119,8 +126,16 @@ def test_invalid_traceparent_is_refused_at_every_boundary(batch_state: Path, mon
     supervisor = worker._supervisor_trace_env(dict(TRACE))
     assert supervisor["TRACEPARENT"] == f"00-{TRACE['trace_id']}-{TRACE['span_id']}-01"
     assert "TRACEPARENT" not in worker._supervisor_trace_env({})
-    assert review_attempt._trace_context_refusal(dict(TRACE)) is not None
-    assert review_attempt._trace_context_refusal({}) is not None
+    assert review_attempt._trace_context_refusal(dict(TRACE), dict(TRACE)) is not None
+    assert review_attempt._trace_context_refusal({}, {}) is not None
+    monkeypatch.setenv("TRACEPARENT", f"00-{TRACE['trace_id']}-{TRACE['span_id']}-01")
+    for record, options in (({"trace_id": "xyz", "span_id": TRACE["span_id"]}, dict(TRACE)),  # malformed copy
+                            (dict(TRACE), dict(OTHER)), (dict(TRACE), {}), ({"trace_id": TRACE["trace_id"]}, {})):
+        assert "trace_context_invalid" in (emit.task_trace_refusal(record, options, {"TRACEPARENT": ""}) or "")
+        assert "trace_context_invalid" in (emit.task_trace_refusal(record, options, dict(os.environ))
+                                           or "")
+    assert emit.task_trace_refusal(dict(TRACE), dict(TRACE), {"TRACEPARENT": supervisor["TRACEPARENT"]}) is None
+    assert emit.task_trace_refusal({}, {}, {}) is None  # a task dispatched before traces existed
     with pytest.raises(ValueError, match="trace_context_invalid"):
         environment._trace_env({"trace_id": TRACE["trace_id"], "span_id": value})
 
@@ -133,7 +148,7 @@ def test_valid_traceparent_joins_the_parent_trace_and_reaches_the_provider(monke
     assert trace == {"trace_id": OTHER["trace_id"], "span_id": own_span, "parent_span_id": OTHER["span_id"]}
     assert environment._trace_env(trace) == {"TRACEPARENT": f"00-{OTHER['trace_id']}-{own_span}-01"}
     monkeypatch.setenv("TRACEPARENT", f"00-{OTHER['trace_id']}-{own_span}-01")
-    assert review_attempt._trace_context_refusal(trace) is None
+    assert review_attempt._trace_context_refusal(trace, dict(trace)) is None
 
 
 def _run(**overrides) -> dict:
@@ -141,14 +156,21 @@ def _run(**overrides) -> dict:
             **overrides}
 
 
-def _jobs(run_id: int = 9001, attempt: int = 1, conclusion: str = "success") -> list[dict]:
-    return [{"id": 1, "run_id": run_id, "run_attempt": attempt, "conclusion": conclusion},
-            {"id": 2, "run_id": run_id, "run_attempt": attempt, "conclusion": "success"}]
+def _jobs(run_id: int = 9001, attempt: int = 1, conclusion: str = "success", head: str = HEAD) -> list[dict]:
+    return [{"id": 1, "run_id": run_id, "run_attempt": attempt, "head_sha": head, "conclusion": conclusion},
+            {"id": 2, "run_id": run_id, "run_attempt": attempt, "head_sha": head, "conclusion": "success"}]
+
+
+MERGE = "d" * 40  # the merge commit a pull-request run checks out
+
+
+def _owner(trace: dict, pr: int = 7, head: str = HEAD, **extra) -> dict:
+    return {**trace, "pr": pr, "head_sha": head, **extra}
 
 
 def _ci(**kwargs) -> dict:
     values = {"repo": "pub", "visibility": "public", "pr": 7, "pr_head_sha": HEAD, "runs": [_run()],
-              "jobs": _jobs(), "owners": [TRACE], "now": NOW, **kwargs}
+              "tested_sha": MERGE, "jobs": _jobs(), "owners": [_owner(TRACE)], "now": NOW, **kwargs}
     event = emit.ci_result_event(**values)
     assert emit.validate_event(event) is None
     return event
@@ -157,17 +179,24 @@ def _ci(**kwargs) -> dict:
 def test_rebase_does_not_attach_old_ci_to_the_new_head() -> None:
     """Defect class: after a rebase or push, the old head's green run is joined to the PR's new head."""
     event = _ci(runs=[_run(head_sha=OLD_HEAD)])
-    assert (event["ci_binding"], event["conclusion"], event["tested_sha"]) == ("stale_head", "unknown", OLD_HEAD)
+    assert (event["ci_binding"], event["conclusion"], event["pr_head_sha"]) == ("stale_head", "unknown", HEAD)
     exact = _ci()
-    assert (exact["ci_binding"], exact["conclusion"], exact["tested_sha"]) == ("exact", "success", HEAD)
+    assert (exact["ci_binding"], exact["conclusion"], exact["pr_head_sha"], exact["tested_sha"]) == (
+        "exact", "success", HEAD, MERGE)  # the tested merge commit, never the PR head copied over
     assert (exact["run_id"], exact["run_attempt"]) == (9001, 1)
+    untested = _ci(tested_sha=None)
+    assert (untested["ci_binding"], untested["tested_sha"]) == ("ambiguous", None)
+    other_head_jobs = _ci(jobs=_jobs(head=OLD_HEAD))
+    assert other_head_jobs["ci_binding"] == "ambiguous"
+    stale_owner = _ci(owners=[_owner(OTHER, head=OLD_HEAD)])  # owned the PR before the push: not this head's owner
+    assert (stale_owner["ownership"], stale_owner.get("trace_id")) == ("unknown", None)
 
 
 def test_rerun_attempt_two_joins_only_its_own_attempt_jobs(batch_state: Path) -> None:
     """Defect class: a rerun (run_attempt 2) is judged by run-level jobs instead of that attempt's own jobs."""
     rerun = _run(run_attempt=2, conclusion="failure")
     stale = _ci(runs=[rerun], jobs=_jobs(attempt=1))
-    assert (stale["ci_binding"], stale["conclusion"]) == ("ambiguous", "unknown")
+    assert (stale["ci_binding"], stale.get("failed_jobs")) == ("ambiguous", None)
     own = _ci(runs=[rerun], jobs=_jobs(attempt=2, conclusion="failure"))
     assert (own["ci_binding"], own["conclusion"], own["run_attempt"], own["failed_jobs"]) == ("exact", "failure", 2, 1)
 
@@ -178,11 +207,11 @@ def test_rerun_attempt_two_joins_only_its_own_attempt_jobs(batch_state: Path) ->
 
         def jobs(self, run_id: int) -> list[dict]:
             calls.append(("run", run_id, None))
-            return _jobs(run_id, attempt=1)
+            return _jobs(run_id, attempt=1, head=CANDIDATE)
 
         def attempt_jobs(self, run_id: int, attempt: int) -> list[dict]:
             calls.append(("attempt", run_id, attempt))
-            return _jobs(run_id, attempt=attempt, conclusion="failure")
+            return _jobs(run_id, attempt=attempt, conclusion="failure", head=CANDIDATE)
 
     group_run = _run(id=9002, run_attempt=2, head_sha=CANDIDATE, conclusion="failure")
     assert merge_queue_keeper._emit_merge_group_result(FakeGitHub(), group_run) == "written"
@@ -194,37 +223,56 @@ def test_rerun_attempt_two_joins_only_its_own_attempt_jobs(batch_state: Path) ->
 
 def test_multi_pr_merge_group_records_pr_head_receipt_and_span_links() -> None:
     """Defect class: a multi-PR merge-group event has no PR-head-to-tested-SHA receipt or no span links."""
-    receipt = [{"pr": 5, "head_sha": OLD_HEAD}, {"pr": 7, "head_sha": HEAD}]
-    owners = {5: [OTHER], 7: [TRACE]}
-    event = emit.merge_group_event(repo="pub", visibility="public", run=_run(id=9003, head_sha=CANDIDATE),
-                                   jobs=_jobs(9003), receipt=receipt, owners_by_pr=owners, now=NOW)
+    entries = [{"pr": 5, "head_sha": OLD_HEAD}, {"pr": 7, "head_sha": HEAD}]
+    receipt = {"tested_sha": CANDIDATE, "entries": entries}
+    third = {"trace_id": "1" * 32, "span_id": "2" * 16}
+    owners = [_owner(OTHER, pr=5, head=OLD_HEAD), _owner(TRACE), _owner(third, head=OLD_HEAD),  # PR 7's old head
+              _owner({"trace_id": "3" * 32, "span_id": "4" * 16}, pr=5, head=OLD_HEAD, parent_task_id="private-1")]
+    run = _run(id=9003, head_sha=CANDIDATE)
+    event = emit.merge_group_event(repo="pub", visibility="public", run=run, jobs=_jobs(9003, head=CANDIDATE),
+                                   receipt=receipt, owners=owners, now=NOW)
     assert emit.validate_event(event) is None
-    assert (event["tested_sha"], event["receipt_state"], event["receipts"]) == (CANDIDATE, "recorded", receipt)
+    assert (event["tested_sha"], event["receipt_state"], event["receipts"]) == (CANDIDATE, "recorded", entries)
     assert event["span_links"] == [{**OTHER, "pr": 5, "head_sha": OLD_HEAD}, {**TRACE, "pr": 7, "head_sha": HEAD}]
-    unproven = emit.merge_group_event(repo="pub", visibility="public", run=_run(id=9003, head_sha=CANDIDATE),
-                                      jobs=_jobs(9003), receipt=None, owners_by_pr=owners, now=NOW)
-    assert (unproven["receipt_state"], unproven["receipts"], unproven["span_links"]) == ("missing", None, None)
-    assert emit.validate_event(unproven) is None
+    private = emit.merge_group_event(repo="priv", visibility="private", run=run, jobs=_jobs(9003, head=CANDIDATE),
+                                     receipt=receipt, owners=owners, now=NOW)
+    assert len(private["span_links"]) == 3  # the inherited owner links only in the private scope
+    for bad in (None, {"tested_sha": OLD_HEAD, "entries": entries}, {"tested_sha": CANDIDATE, "entries": [
+            *entries, {"pr": 7, "head_sha": OLD_HEAD}]}):
+        unproven = emit.merge_group_event(repo="pub", visibility="public", run=run, jobs=_jobs(9003, head=CANDIDATE),
+                                          receipt=bad, owners=owners, now=NOW)
+        assert (unproven["receipts"], unproven["span_links"]) == (None, None)
+        assert unproven["receipt_state"] == ("mismatch" if bad and bad["tested_sha"] == OLD_HEAD else "missing")
+        assert emit.validate_event(unproven) is None
 
 
 def test_unattributable_group_failure_is_not_blamed_on_one_pr(batch_state: Path) -> None:
     """Defect class: a merge-group failure that evidence cannot pin on one PR is attributed to one PR."""
     failing = _run(id=9004, head_sha=CANDIDATE, conclusion="failure")
-    jobs = _jobs(9004, conclusion="failure")
+    jobs = _jobs(9004, conclusion="failure", head=CANDIDATE)
     group = [{"pr": 5, "head_sha": OLD_HEAD}, {"pr": 7, "head_sha": HEAD}]
-    multi = emit.merge_group_event(repo="pub", visibility="public", run=failing, jobs=jobs, receipt=group, now=NOW)
+
+    def event(receipt: object, job_rows: object = jobs) -> dict:
+        built = emit.merge_group_event(repo="pub", visibility="public", run=failing, jobs=job_rows, receipt=receipt,
+                                       now=NOW)
+        assert emit.validate_event(built) is None
+        return built
+
+    multi = event({"tested_sha": CANDIDATE, "entries": group})
     assert (multi["attribution"], multi["blamed_pr"]) == ("candidate_only", None)
-    unbound = emit.merge_group_event(repo="pub", visibility="public", run=failing, jobs=_jobs(1, conclusion="failure"),
-                                     receipt=group[1:], now=NOW)
+    unbound = event({"tested_sha": CANDIDATE, "entries": group[1:]}, _jobs(1, conclusion="failure", head=CANDIDATE))
     assert (unbound["attribution"], unbound["blamed_pr"]) == ("candidate_only", None)
-    solo = emit.merge_group_event(repo="pub", visibility="public", run=failing, jobs=jobs, receipt=group[1:], now=NOW)
+    foreign = event({"tested_sha": OLD_HEAD, "entries": group[1:]})  # a singleton receipt of another candidate
+    assert (foreign["attribution"], foreign["blamed_pr"], foreign["receipt_state"]) == ("candidate_only", None,
+                                                                                      "mismatch")
+    solo = event({"tested_sha": CANDIDATE, "entries": group[1:]})
     assert (solo["attribution"], solo["blamed_pr"]) == ("pr", 7)
 
     class FakeGitHub:  # the keeper's queue branch names PR 7, but it holds no receipt of the group's members
         repository = "example-org/pub"
 
         def attempt_jobs(self, run_id: int, attempt: int) -> list[dict]:
-            return _jobs(run_id, attempt=attempt, conclusion="failure")
+            return _jobs(run_id, attempt=attempt, conclusion="failure", head=CANDIDATE)
 
     merge_queue_keeper._emit_merge_group_result(FakeGitHub(), {**failing, "head_branch": "gh-readonly-queue/main/pr-7-x"})
     (event,) = _events(batch_state)
@@ -233,7 +281,7 @@ def test_unattributable_group_failure_is_not_blamed_on_one_pr(batch_state: Path)
 
 def test_ownership_transfer_cancellation_and_missing_or_ambiguous_ci_are_explicit() -> None:
     """Defect class: an ownership transfer, a cancelled run, or missing/ambiguous CI is reported as a plain result."""
-    transferred = _ci(owners=[OTHER, TRACE])
+    transferred = _ci(owners=[_owner(OTHER), _owner(TRACE)])
     assert (transferred["ownership"], transferred.get("trace_id")) == ("transferred", None)
     assert [link["trace_id"] for link in transferred["span_links"]] == [OTHER["trace_id"], TRACE["trace_id"]]
     assert _ci(owners=[])["ownership"] == "unknown"
@@ -243,11 +291,23 @@ def test_ownership_transfer_cancellation_and_missing_or_ambiguous_ci_are_explici
 
     cancelled = _ci(runs=[_run(conclusion="cancelled")])
     assert (cancelled["ci_binding"], cancelled["conclusion"]) == ("exact", "cancelled")
+    for unread in (None, []):  # the cancellation stays visible when that attempt's jobs cannot be read
+        assert (_ci(runs=[_run(conclusion="cancelled")], jobs=unread)["ci_binding"],
+                _ci(runs=[_run(conclusion="cancelled")], jobs=unread)["conclusion"]) == ("ambiguous", "cancelled")
+        group = emit.merge_group_event(repo="pub", visibility="public", jobs=unread, receipt=None, now=NOW,
+                                       run=_run(id=9006, head_sha=CANDIDATE, conclusion="cancelled"))
+        assert (group["ci_binding"], group["conclusion"], group["attribution"]) == ("ambiguous", "cancelled",
+                                                                                    "candidate_only")
     assert _ci(runs=[_run(status="in_progress", conclusion=None)])["conclusion"] == "pending"
 
     missing = _ci(runs=[])
     assert (missing["ci_binding"], missing["conclusion"]) == ("missing", "missing")
     ambiguous = _ci(runs=[_run(), _run(id=9005)])
     assert (ambiguous["ci_binding"], ambiguous["conclusion"]) == ("ambiguous", "unknown")
-    unread = _ci(jobs=None)
-    assert (unread["ci_binding"], unread["conclusion"]) == ("ambiguous", "unknown")
+    assert (_ci(runs=[_run(id=[1])])["ci_binding"], _ci(runs=[_run(id=[1])])["conclusion"]) == ("ambiguous",
+                                                                                                "unknown")
+    odd_jobs = _ci(jobs=[{**_jobs()[0], "conclusion": ["failure"]}])  # malformed JSON never raises
+    assert (odd_jobs["ci_binding"], odd_jobs["failed_jobs"]) == ("exact", 0)
+    odd_group = emit.merge_group_event(repo="pub", visibility="public", jobs=None, receipt=None, now=NOW,
+                                       run={**_run(id=[1], head_sha=CANDIDATE)})
+    assert emit.validate_event(odd_group) is None and odd_group["run_id"] is None
