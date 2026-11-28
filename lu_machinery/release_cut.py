@@ -1430,7 +1430,10 @@ class Cut:
         bwrap = shutil.which("bwrap")
         if bwrap is None:
             raise CutError("product runtime sandbox requires bubblewrap")
-        boundary: list[str | Path] = ["--die-with-parent", "--ro-bind", "/", "/", "--bind", self.work, self.work]
+        boundary: list[str | Path] = [
+            "--die-with-parent", "--ro-bind", "/", "/", "--dev", "/dev", "--remount-ro", "/dev",
+            "--bind", self.work, self.work,
+        ]
         default_context_dir = host_context.DEFAULT_PATH.parent
         if default_context_dir.exists():
             boundary += ["--tmpfs", default_context_dir, "--remount-ro", default_context_dir]

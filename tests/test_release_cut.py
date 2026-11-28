@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import shlex
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -870,6 +871,65 @@ def test_consumer_collection_names_the_candidate_interpreter(monkeypatch, tmp_pa
     assert "LU_PYTHON" not in collected[0]
 
 
+def test_product_runtime_sandbox_child_can_use_dev_null(monkeypatch, tmp_path):
+    """Defect class: the runtime boundary hides device nodes needed by pytest capture and shells."""
+    if shutil.which("bwrap") is None:
+        pytest.skip("bubblewrap is not installed")
+
+    work = tmp_path / "work"
+    product = work / "product"
+    product.mkdir(parents=True)
+    (work / "tmp").mkdir()
+    (work / "home").mkdir()
+    outside = tmp_path / "outside"
+    outside.write_text("host data")
+    context = tmp_path / "context" / "host.v1.json"
+    context.parent.mkdir()
+    context.write_text("{}")
+    monkeypatch.setattr(host_context, "DEFAULT_PATH", context)
+    probe = product / "tests/test_boundary.py"
+    probe.parent.mkdir()
+    probe.write_text(f"""
+import errno
+from pathlib import Path
+
+
+def test_boundary():
+    with open("/dev/null", "rb+") as device:
+        assert device.read(1) == b""
+        assert device.write(b"probe") == 5
+    Path("inside").write_text("sandbox data")
+    for path in (Path({str(outside)!r}), Path("/dev/shm/release-cut-probe")):
+        try:
+            path.write_text("sandbox data")
+        except OSError as error:
+            assert error.errno == errno.EROFS
+        else:
+            raise AssertionError(f"the sandbox wrote outside its work directory: {{path}}")
+    assert not Path({str(context)!r}).exists()
+
+
+if __name__ == "__main__":
+    test_boundary()
+""")
+    pin = work / "src/.github/workflows/product-consumer.pin"
+    pin.parent.mkdir(parents=True)
+    pin.write_text("test tests/test_boundary.py\n")
+    interpreter = Path(sys.executable)
+    cut = Cut(work=work, dry_run=True, machinery_remote="", product_remote="", machinery_repo=REPO,
+              product_repo="example/product", host_python=interpreter, primary=tmp_path,
+              alert=False, x_agent="codex/test")
+
+    try:
+        cut.consumer_checks(interpreter, product, (str(interpreter), str(probe)))
+    except CutError as error:
+        pytest.fail(f"{error}\n{(work / 'cut.log').read_text()}")
+
+    assert (product / "inside").read_text() == "sandbox data"
+    assert outside.read_text() == "host data"
+    assert context.read_text() == "{}"
+
+
 def _simulate_consumer_adoption(monkeypatch, tmp_path, failing_check=None):
     """Run the cut's PR lifecycle against a fixture checkout and recorded external calls."""
     _host(monkeypatch, tmp_path, Path(sys.executable))
@@ -937,7 +997,8 @@ def _simulate_consumer_adoption(monkeypatch, tmp_path, failing_check=None):
             return real_run(cut, argv, **kwargs)
         delimiter = command.index("--")
         assert command[:delimiter] == [
-            str(sandbox), "--die-with-parent", "--ro-bind", "/", "/", "--bind", str(work), str(work),
+            str(sandbox), "--die-with-parent", "--ro-bind", "/", "/", "--dev", "/dev", "--remount-ro", "/dev",
+            "--bind", str(work), str(work),
             "--tmpfs", str(context_file.parent), "--remount-ro", str(context_file.parent),
         ]
         consumer = command[delimiter + 1:]
