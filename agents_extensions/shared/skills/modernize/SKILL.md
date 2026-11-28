@@ -26,20 +26,23 @@ Use a dispatch worktree; treat changes already in another worktree as their owne
 
    ```bash
    git fetch origin
-   gh pr view "$PR" --json state,title,body,baseRefName,headRefName,headRefOid,mergeable,statusCheckRollup,reviews,closingIssuesReferences
+   BASE_SHA="$(git rev-parse "origin/$BASE")"
    OLD_HEAD="$(git rev-parse "origin/$BRANCH")"
-   MERGE_BASE="$(git merge-base "origin/$BASE" "$OLD_HEAD")"
+   gh pr view "$PR" --json state,title,body,baseRefName,headRefName,headRefOid,mergeable,statusCheckRollup,reviews,closingIssuesReferences
+   MERGE_BASE="$(git merge-base "$BASE_SHA" "$OLD_HEAD")"
    ```
 
-   Use the PR's actual base, not an assumed one. Record state, head, merge-base, checks and
-   reviews.
+   The base and branch names are known before that fetch. `BASE_SHA` and `OLD_HEAD` are
+   taken immediately after it, before any other command. Use those SHAs for the later log
+   and range-diff; do not read `origin/$BASE` again. Record state, head, merge-base, checks
+   and reviews.
 2. **State the original goal in one sentence**, from the title, body, linked issue, commits,
    review threads and the full diff.
 3. **Inspect what changed on the base since it diverged**, beyond overlapping lines:
 
    ```bash
    git diff --name-only "$MERGE_BASE" "$OLD_HEAD"
-   git log --oneline "$MERGE_BASE..origin/$BASE" -- $(git diff --name-only "$MERGE_BASE" "$OLD_HEAD")
+   git log --oneline "$MERGE_BASE..$BASE_SHA" -- $(git diff --name-only "$MERGE_BASE" "$OLD_HEAD")
    gh pr list --state all --search "<symptom or path>"
    ```
 
@@ -47,8 +50,8 @@ Use a dispatch worktree; treat changes already in another worktree as their owne
    Was the touched code deleted or simplified on purpose? Would landing it restore old
    behaviour or create a second way to do the same thing? Is the benefit still worth its cost?
 4. **Choose one verdict before pushing anything:**
-   - **MODERNIZE** — the goal is still useful and the shape is right. Rebase onto the fetched
-     base in a fresh branch at the recorded head, resolving conflicts by the current intent and
+   - **MODERNIZE** — the goal is still useful and the shape is right. Rebase onto `$BASE_SHA`
+     in a fresh branch at the recorded head, resolving conflicts by the current intent and
      the base's newer invariants. If a conflict exposes a design disagreement, stop and
      reconsider the verdict.
    - **REWORK** — the goal is valid but the shape is wrong. Write the smallest credible rework
@@ -59,7 +62,7 @@ Use a dispatch worktree; treat changes already in another worktree as their owne
    recorded:
 
    ```bash
-   git range-diff "$MERGE_BASE..$OLD_HEAD" "origin/$BASE..HEAD"
+   git range-diff "$MERGE_BASE..$OLD_HEAD" "$BASE_SHA..HEAD"
    git push --force-with-lease="refs/heads/$BRANCH:$OLD_HEAD" origin "HEAD:refs/heads/$BRANCH"
    ```
 
