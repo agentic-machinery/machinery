@@ -1,13 +1,15 @@
-"""Count journal and dispatcher errors for a completed UTC day, locally."""
+"""Summarize completed UTC days and publish redacted error digests."""
 
 from __future__ import annotations
 
 import argparse
+import fcntl
 import hashlib
 import ipaddress
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -34,8 +36,18 @@ _DAY_FIELDS = f"PRIORITY,_TRANSPORT,{_UNIT_FIELDS},MESSAGE,MESSAGE_ID"
 # SD_MESSAGE_UNIT_FAILED describes a failed start job and can accompany this record.
 _UNIT_FAILURE = "d9b373ed55a64feb8242e02dbe79a49c"
 _JOURNAL_TIMEOUT_S = 300
+_EGRESS_TIMEOUT_S = 60
 _MICROSECOND = timedelta(microseconds=1)
 _VERSION = "v1"
+_LEDGER = "error-digest-kinds.v1.json"
+_PUBLISH_STATE = ".error-digest-publish.v1.json"
+_REPORT_PREFIX = "error-digest-"
+_TOP_KINDS = 10
+_JOURNAL_HEADLINE_LIMIT = 140
+_JOURNAL_BODY_LIMIT = 2000
+_SIGNATURE = re.compile(r"[0-9a-f]{12}")
+_PROPOSAL_KEY = re.compile(r"error-digest:([0-9]{4}-[0-9]{2}-[0-9]{2})(?::[1-9][0-9]*)?")
+_SHA256 = re.compile(r"[0-9a-f]{64}")
 _SEVERITIES = ("error", "warning", "unparsed")
 _TIMESTAMP = re.compile(
     r"(?<!\w)\d{4}-\d\d-\d\d(?:[Tt ]\d\d:\d\d:\d\d(?:[.,]\d+)?(?:[Zz]|[+-]\d\d:?\d\d| UTC)?)?(?!\w)"
@@ -65,6 +77,10 @@ _EMAIL_NAME_PUNCTUATION = frozenset("_.!#$%&'*+/=?^`{|}~-" + "".join(_MARKERS.va
 
 class DigestError(ValueError):
     """A refusal safe to display without source paths or payload text."""
+
+
+class PartialJournalError(DigestError):
+    """A journal window that can no longer be reconstructed."""
 
 
 def _address(match: re.Match[str]) -> str:
@@ -253,11 +269,10 @@ class Digest:
         self.withheld += int(withheld)
         self.kinds[source, group, severity, template] += 1
 
-    def collect_journal(self, start: datetime, end: datetime) -> int:
-        deadline = time.monotonic() + _JOURNAL_TIMEOUT_S
+    def collect_journal(self, start: datetime, end: datetime, deadline: float) -> int:
         first, stop = _micros(start), _micros(end)
         if _journal_head(deadline) > first:
-            raise DigestError("journal: partial (head_after_window_start)")
+            raise PartialJournalError("journal: partial (head_after_window_start)")
 
         tagged = set()
         for row in _journal_rows(
@@ -321,7 +336,7 @@ class Digest:
             self.add("journal", (family,), severity, message, literal=unit_failed)
 
         if _journal_head(deadline) > first:
-            raise DigestError("journal: partial (head_moved_into_window)")
+            raise PartialJournalError("journal: partial (head_moved_into_window)")
         self.unproven = {family for family, units in units_seen.items() if units - tagged}
         return entries
 
@@ -392,7 +407,7 @@ class Digest:
         }
 
 
-def build_report(day: date) -> dict[str, Any]:
+def build_report(day: date, *, deadline: float | None = None) -> dict[str, Any]:
     start = datetime(day.year, day.month, day.day, tzinfo=UTC)
     end = start + timedelta(days=1)
     task_store_error = None
@@ -404,61 +419,464 @@ def build_report(day: date) -> dict[str, Any]:
     digest = Digest(records)
     if task_store_error:
         digest.add("digest", (), "error", f"digest/task-store-unreadable/{task_store_error}", literal=True)
-    journal_entries = digest.collect_journal(start, end)
+    if deadline is None:
+        deadline = time.monotonic() + _JOURNAL_TIMEOUT_S
+    journal_entries = digest.collect_journal(start, end, deadline)
     tasks_settled = None if task_store_error else digest.collect_tasks(records, start, end)
     return digest.report(day, journal_entries, tasks_settled)
 
 
-def persisted_payload(day: date, directory: Path) -> bytes:
-    path = directory / f"error-digest-{day.isoformat()}.json"
+def _report_path(directory: Path, day: date) -> Path:
+    return directory / f"{_REPORT_PREFIX}{day.isoformat()}.json"
+
+
+def persisted_payload(day: date, directory: Path, *, deadline: float | None = None) -> bytes:
+    path = _report_path(directory, day)
     require_not_direct_task_store_path(path, label="error digest")
     try:
         return path.read_bytes()
     except FileNotFoundError:
         pass
-    payload = json.dumps(build_report(day), sort_keys=True, indent=2).encode() + b"\n"
+    payload = _json_bytes(build_report(day, deadline=deadline))
     if scan_text(payload.decode()):
         raise DigestError("report: refused (opsec_scan)")
     directory.mkdir(parents=True, exist_ok=True)
-    descriptor, temporary_path = mkstemp(dir=directory, prefix=".error-digest-")
+    _write_state(path, payload, replace=False)
+    return path.read_bytes()
+
+
+def _json_bytes(value: dict) -> bytes:
+    return json.dumps(value, sort_keys=True, indent=2).encode() + b"\n"
+
+
+def _write_state(path: Path, payload: bytes, *, replace: bool) -> None:
+    require_not_direct_task_store_path(path, label="error digest")
+    descriptor, temporary_path = mkstemp(dir=path.parent, prefix=".error-digest-")
     try:
         with os.fdopen(descriptor, "wb") as temporary:
             temporary.write(payload)
             temporary.flush()
             os.fsync(temporary.fileno())
-        with suppress(FileExistsError):
-            os.link(temporary_path, path)
+        if replace:
+            os.replace(temporary_path, path)
+        else:
+            with suppress(FileExistsError):
+                os.link(temporary_path, path)
+        directory_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
     finally:
-        os.unlink(temporary_path)
-    return path.read_bytes()
+        with suppress(FileNotFoundError):
+            os.unlink(temporary_path)
+
+
+def _date_text(value: object) -> bool:
+    return isinstance(value, str) and date.fromisoformat(value).isoformat() == value
+
+
+def _load_ledger(path: Path) -> dict[str, Any]:
+    """An absent ledger is empty. An invalid ledger blocks proposals."""
+    try:
+        records = json_depth.loads(path.read_text(), max_depth=3)
+        if not isinstance(records, dict):
+            raise ValueError
+        for sig, row in records.items():
+            if (
+                not _SIGNATURE.fullmatch(sig) or not isinstance(row, dict)
+                or not _date_text(row["first_seen"])
+                or not isinstance(row["template"], str) or not isinstance(row["source"], str)
+                or row["severity"] not in _SEVERITIES
+                or not _date_text(row["proposal_day"])
+                or store.parse_utc_timestamp(row["proposed_at"]) is None
+            ):
+                raise ValueError
+    except FileNotFoundError:
+        return {}
+    except (KeyError, TypeError, ValueError, RecursionError):
+        raise DigestError("ledger: unavailable (invalid_state)") from None
+    return records
+
+
+def _valid_attempt_key(key: str) -> bool:
+    match = _PROPOSAL_KEY.fullmatch(key)
+    return match is not None and _date_text(match[1])
+
+
+def _load_publish_state(path: Path) -> dict[str, Any]:
+    try:
+        state = json_depth.loads(path.read_text(), max_depth=4)
+        if not isinstance(state, dict) or not isinstance(state["delivery_unknown"], dict):
+            raise ValueError
+        unknown = state["delivery_unknown"]
+        if any(not _valid_attempt_key(key) or not _SHA256.fullmatch(body) for key, body in unknown.items()):
+            raise ValueError
+        attempt = state["attempt"]
+        if attempt is not None and (
+            not isinstance(attempt, dict) or not _valid_attempt_key(attempt["key"])
+            or attempt["key"] in unknown or not _SHA256.fullmatch(attempt["body_sha256"])
+            or not isinstance(attempt["kinds"], list) or not attempt["kinds"]
+            or not all(_SIGNATURE.fullmatch(sig) for sig in attempt["kinds"])
+        ):
+            raise ValueError
+    except FileNotFoundError:
+        return {"attempt": None, "delivery_unknown": {}}
+    except (KeyError, TypeError, ValueError, RecursionError):
+        raise DigestError("publish state: unavailable (invalid_state)") from None
+    return state
+
+
+def _finish_attempt(state: dict, path: Path, *, delivered: bool) -> None:
+    attempt = state["attempt"]
+    if not delivered:
+        state["delivery_unknown"][attempt["key"]] = attempt["body_sha256"]
+    state["attempt"] = None
+    _write_state(path, _json_bytes(state), replace=True)
+
+
+def _unknown_notes(state: dict, day: date) -> str:
+    if not state:
+        return ""
+    base_key = f"error-digest:{day}"
+    attempts = {
+        int(key.removeprefix(base_key).removeprefix(":") or "0"): body_sha
+        for key, body_sha in state["delivery_unknown"].items()
+        if key == base_key or key.startswith(f"{base_key}:")
+    }
+    if not attempts:
+        return ""
+    latest = max(attempts)
+    return (
+        f"Fleet delivery_unknown for {day} attempt {latest}, body SHA-256 {attempts[latest]}. "
+        f"Uncertain attempts on this day: {len(attempts)}."
+    )
+
+
+def _safe_output(text: str) -> str:
+    clean = redact_text(text) or ""
+    if scan_text(clean):
+        raise DigestError("egress: refused (opsec_scan)")
+    return clean
+
+
+def _command(setting: str) -> str:
+    value = os.environ.get(setting, "")
+    if (
+        value and value.strip() == value
+        and not any(ord(ch) < 32 or ord(ch) == 127 for ch in value)
+        and (resolved := shutil.which(value))
+    ):
+        return resolved
+    raise DigestError(f"egress: unavailable ({setting}_missing_or_invalid)")
+
+
+def _send(command: list[str], target: str, deadline: float, **kwargs: Any) -> None:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise DigestError(f"{target}: unavailable (timeout)")
+    try:
+        # Only the configured executables receive fixed argv and scanned data.
+        subprocess.run(  # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit
+            command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True,
+            timeout=min(_EGRESS_TIMEOUT_S, remaining), **kwargs,
+        )
+    except subprocess.TimeoutExpired:
+        raise DigestError(f"{target}: unavailable (timeout)") from None
+    except (OSError, ValueError, subprocess.CalledProcessError):
+        raise DigestError(f"{target}: unavailable (write_refused)") from None
+
+
+def _post_journal(cli: str, day: date, headline: str, body: str, sender: str, deadline: float) -> None:
+    _send(
+        [cli, "journal", "add", "--project", "fleet", "--type", "note",
+         "--headline", _safe_output(headline)[:_JOURNAL_HEADLINE_LIMIT],
+         "--body", _safe_output(body)[:_JOURNAL_BODY_LIMIT],
+         "--source-key", f"error-digest:{day}"],
+        "journal write", deadline, env=dict(os.environ, LU_INBOX_WORKER=sender), stdin=subprocess.DEVNULL,
+    )
+
+
+def _cell(value: str) -> str:
+    return " ".join(value.replace("\0", " ").split()).replace("|", r"\|")
+
+
+def _rank(kinds: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return sorted(kinds, key=lambda kind: (-kind["count"], kind["sig"]))
+
+
+def _kind_line(kind: dict[str, Any]) -> str:
+    group = " / ".join(kind["group"]) or kind["source"]
+    return f'- {kind["sig"]} ({kind["count"]}): {_cell(group)} {_cell(kind["severity"])} - {_cell(kind["template"])}'
+
+
+def _journal_summary(report: dict, new_count: int | None, banner: str) -> tuple[str, str]:
+    day = report["day"]
+    units = report["journal"]["units"]
+    unproven = sum(unit.get("coverage") == "severity unproven" for unit in units)
+    totals = report["totals"]
+    kinds = report["kinds"]
+    new = f"{new_count} new" if new_count is not None else "new kind count unknown"
+    headline = (
+        f'Error digest {day}: {totals["error"]} errors, {totals["warning"]} warnings, '
+        f'{len(kinds)} kinds ({new}); {unproven} units unproven'
+    )
+    lines = [f"Full table: error-digest-{day}.json", f'Withheld by OPSEC scan: {report["withheld"]}.']
+    if banner:
+        lines.insert(0, banner)
+    if report["tasks"]["status"] == "unavailable":
+        lines.append("Task counts unavailable.")
+    lines.extend(("", "Top kinds"))
+    for kind in _rank(kinds)[:_TOP_KINDS]:
+        line = _kind_line(kind)
+        # Reserve space for the counts table even when templates are long.
+        if len("\n".join([*lines, line])) > _JOURNAL_BODY_LIMIT * 3 // 4:
+            break
+        lines.append(line)
+    lines.extend(("", "| Unit or worker | Errors | Warnings | Unparsed | Coverage |", "| --- | ---: | ---: | ---: | --- |"))
+    rows = [(unit["family"], unit) for unit in units]
+    rows.extend((f'{worker["agent"]} / {worker["model"]}', worker) for worker in report["tasks"].get("workers", []))
+    for label, row in rows:
+        columns = [str(row.get(severity, "-")) for severity in _SEVERITIES]
+        line = f'| {_cell(label)} | {" | ".join(columns)} | {row.get("coverage", "-")} |'
+        if len("\n".join([*lines, line])) > _JOURNAL_BODY_LIMIT:
+            break
+        lines.append(line)
+    return headline, "\n".join(lines)
+
+
+def _read_report(payload: bytes, day: date) -> dict:
+    try:
+        report = json_depth.loads(payload.decode(), max_depth=8)
+        if report["schema"] != f"error-digest.{_VERSION}" or report["day"] != day.isoformat():
+            raise ValueError
+        if not isinstance(report["kinds"], list):
+            raise ValueError
+        for kind in report["kinds"]:
+            if (
+                not _SIGNATURE.fullmatch(kind["sig"]) or kind["severity"] not in _SEVERITIES
+                or not isinstance(kind["group"], list) or not all(isinstance(part, str) for part in kind["group"])
+                or not isinstance(kind["source"], str) or not isinstance(kind["template"], str)
+                or type(kind["count"]) is not int or kind["count"] < 1
+            ):
+                raise ValueError
+    except (KeyError, TypeError, ValueError, RecursionError):
+        raise DigestError("report: refused (invalid_state)") from None
+    assert isinstance(report, dict)
+    return report
+
+
+def _saved_days(directory: Path, day: date) -> set[date]:
+    days = set()
+    for path in directory.glob(f"{_REPORT_PREFIX}????-??-??.json"):
+        with suppress(ValueError):
+            value = date.fromisoformat(path.stem.removeprefix(_REPORT_PREFIX))
+            if date.min < value <= day and path == _report_path(directory, value):
+                days.add(value)
+    return days
+
+
+def _backfill_start(day: date, saved: set[date], deadline: float) -> date:
+    previous = max(saved - {day}, default=None)
+    if day in saved and previous is None:
+        return day
+    if previous == day - timedelta(days=1):
+        return previous
+    try:
+        start = datetime(1970, 1, 1, tzinfo=UTC) + timedelta(microseconds=_journal_head(deadline))
+        first_full_day = start.date() + timedelta(days=int(start.time() != datetime.min.time()))
+    except OverflowError:
+        raise DigestError("journal: unavailable (invalid_realtime_timestamp)") from None
+    return min(day, max(first_full_day, previous or first_full_day))
+
+
+def _collect_for_publish(
+    directory: Path, day: date, *, backfill: bool, ledger: dict, ledger_error: str,
+    state: dict, recovered_day: date | None, cli: str, sender: str, deadline: float,
+) -> tuple[list[dict[str, Any]], dict, int | None]:
+    saved = _saved_days(directory, day)
+    # Leave time for the last day's Fleet attempt and journal note.
+    report_deadline = deadline - 2 * _EGRESS_TIMEOUT_S
+    start = _backfill_start(day, saved, report_deadline) if backfill else day
+    due = {start + timedelta(days=offset) for offset in range((day - start).days + 1)}
+    if backfill and saved:
+        # The last persisted report may have been followed by a failed journal write.
+        due.add(max(saved - {day}, default=day))
+    if recovered_day is not None and recovered_day in saved:
+        due.add(recovered_day)
+    candidates: dict[str, dict[str, Any]] = {}
+    for current in sorted(saved | due):
+        try:
+            report = _read_report(persisted_payload(current, directory, deadline=report_deadline), current)
+        except PartialJournalError as exc:
+            if current in due:
+                _post_journal(cli, current, f"Error digest {current}: journal partial", str(exc), sender, deadline)
+            raise
+        report_day = current.isoformat()
+        new_sigs = set()
+        for kind in report["kinds"]:
+            sig = kind["sig"]
+            if known := ledger.get(sig):
+                # A Fleet success can precede a failed journal write. The
+                # ledger preserves the original day for the retried note.
+                if known["first_seen"] == report_day:
+                    new_sigs.add(sig)
+                continue
+            if sig in candidates:
+                candidates[sig]["count"] += kind["count"]
+            else:
+                candidates[sig] = {**kind, "first_seen": report_day}
+                new_sigs.add(sig)
+        count = None if ledger_error else len(new_sigs)
+        if current in due and current != day:
+            banner = "\n".join(filter(None, (ledger_error, _unknown_notes(state, current))))
+            headline, body = _journal_summary(report, count, banner)
+            _post_journal(cli, current, headline, body, sender, deadline)
+    # The target is the last day in the collection. Its note includes the
+    # outcome of this invocation's Fleet attempt.
+    return _rank(list(candidates.values())), report, count
+
+
+def _prepare_proposal(day: date, kinds: list[dict[str, Any]], max_new: int) -> tuple[str, dict[str, Any]]:
+    lines = [f"Error digest {day}. Suggested issues for {len(kinds)} new kinds."]
+    if len(kinds) > max_new:
+        groups: dict[str, list[int]] = {}
+        for kind in kinds:
+            group = " / ".join(kind["group"]) or kind["source"]
+            counts = groups.setdefault(group, [0, 0])
+            counts[0] += 1
+            counts[1] += kind["count"]
+        lines = [f"Error digest {day}. Normaliser miss: {len(kinds)} new kinds. Top {_TOP_KINDS} suggested issues.", ""]
+        lines.extend(
+            f"- {_cell(group)}: {distinct} new kinds, {occurrences} occurrences"
+            for group, (distinct, occurrences) in sorted(groups.items())
+        )
+        kinds = kinds[:_TOP_KINDS]
+        lines.append("")
+    lines.extend(_kind_line(kind) for kind in kinds)
+    return _safe_output("\n".join(lines)), {
+        kind["sig"]: {key: kind[key] for key in ("first_seen", "source", "severity", "template")}
+        for kind in kinds
+    }
+
+
+def _publish_proposal(body: str, sender: str, key: str, deadline: float) -> None:
+    command = (
+        [_command("LU_ERROR_DIGEST_FLEET_CLI")]
+        if "LU_ERROR_DIGEST_FLEET_CLI" in os.environ
+        else [sys.executable, "-I", "-m", "lu_machinery.fleet_comms"]
+    )
+    _send(
+        [*command, "channel", "publish", "cto", "-", "--sender", sender,
+         "--recipient", "claude-cto", "--kind", "proposal", "--idempotency-key", key],
+        "Fleet publish", deadline, input=body.encode(),
+    )
+
+
+def _publish_run(day: date, directory: Path, sender: str, *, backfill: bool, max_new: int) -> None:
+    cli = _command("LU_DRIVER_STATE_CLI")
+    deadline = time.monotonic() + _JOURNAL_TIMEOUT_S
+    ledger_path = directory / _LEDGER
+    state_path = directory / _PUBLISH_STATE
+    require_not_direct_task_store_path(ledger_path, label="error digest ledger")
+    directory.mkdir(parents=True, exist_ok=True)
+    directory_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        try:
+            fcntl.flock(directory_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise DigestError("publish: unavailable (another_digest_running)") from None
+
+        ledger, state, ledger_error = {}, {}, ""
+        try:
+            ledger = _load_ledger(ledger_path)
+            state = _load_publish_state(state_path)
+        except DigestError as exc:
+            ledger_error = str(exc)
+        recovered_day = None
+        if attempt := state.get("attempt"):
+            matched_day = attempt["key"].split(":")[1]
+            recovered_day = date.fromisoformat(matched_day)
+            # The ledger replacement is atomic. If it did not commit, an
+            # interrupted attempt cannot establish delivery and its key is spent.
+            delivered = all(ledger.get(sig, {}).get("proposal_day") == matched_day for sig in attempt["kinds"])
+            _finish_attempt(state, state_path, delivered=delivered)
+        kinds, report, count = _collect_for_publish(
+            directory, day, backfill=backfill, ledger=ledger, ledger_error=ledger_error,
+            state=state, recovered_day=recovered_day, cli=cli, sender=sender, deadline=deadline,
+        )
+        failure = DigestError(ledger_error) if ledger_error else None
+        if not failure and kinds and not any(row["proposal_day"] == day.isoformat() for row in ledger.values()):
+            body, proposed = _prepare_proposal(day, kinds, max_new)
+            sequence = len(state["delivery_unknown"])
+            key = f"error-digest:{day}:{sequence}" if sequence else f"error-digest:{day}"
+            state["attempt"] = {"key": key, "body_sha256": hashlib.sha256(body.encode()).hexdigest(),
+                                "kinds": list(proposed)}
+            _write_state(state_path, _json_bytes(state), replace=True)
+            try:
+                _publish_proposal(body, sender, key, deadline - _EGRESS_TIMEOUT_S)
+            except DigestError as exc:
+                _finish_attempt(state, state_path, delivered=False)
+                failure = exc
+            else:
+                proposed_at = datetime.now(UTC).isoformat()
+                for sig, row in proposed.items():
+                    ledger[sig] = {**row, "proposed_at": proposed_at, "proposal_day": day.isoformat()}
+                _write_state(ledger_path, _json_bytes(ledger), replace=True)
+                _finish_attempt(state, state_path, delivered=True)
+        banner = "\n".join(filter(None, (ledger_error, _unknown_notes(state, day))))
+        headline, journal_body = _journal_summary(report, count, banner)
+        _post_journal(cli, day, headline, journal_body, sender, deadline)
+        if failure:
+            raise failure
+    finally:
+        os.close(directory_fd)
 
 
 def main(argv: list[str] | None = None) -> int:
     today = datetime.now(UTC).date()
     parser = argparse.ArgumentParser(
         description="Persist redacted journal and dispatcher counts for a completed UTC day.\n"
-                    "Use this command to prepare or replay a local daily report.",
+                    "Use --publish from the daily service to write journal notes and propose new kinds.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="Examples:\n"
                "  .venv/bin/python -m lu_machinery.ops.error_digest\n"
-               "  .venv/bin/python -m lu_machinery.ops.error_digest --day 2025-02-01 --report-dir ./reports\n"
-               "Outputs: error-digest-<UTC day>.json in the report directory.\n"
-               "Exit codes: 0 = report ready, 1 = journal or report unavailable, 2 = invalid usage.\n"
+               "  .venv/bin/python -m lu_machinery.ops.error_digest --publish --sender devops\n"
+               "Outputs: error-digest-<UTC day>.json in the report directory. Publication uses "
+               "LU_DRIVER_STATE_CLI, sends at most one Fleet proposal and updates the ledger after delivery.\n"
+               "ERROR_DIGEST_MAX_NEW sets the overflow threshold (default: 20). "
+               "LU_ERROR_DIGEST_FLEET_CLI can select an alternate Fleet CLI executable.\n"
+               "Exit codes: 0 = report ready, 1 = preparation or publication failed, 2 = invalid usage.\n"
                "Related: lu_machinery.orchestration.issue_quality_report.",
     )
-    parser.add_argument("--day", type=date.fromisoformat, default=today - timedelta(days=1),
-                        help="UTC day, YYYY-MM-DD (default: yesterday)")
+    parser.add_argument("--day", type=date.fromisoformat,
+                        help="UTC day, e.g. 2025-02-01 (default: yesterday, with backfill when publishing)")
     parser.add_argument("--report-dir", type=Path,
                         help="directory path, for example ./reports (default: configured state reports)")
+    parser.add_argument("--publish", action="store_true",
+                        help="post digest notes and propose new kinds (default: persist only)")
+    parser.add_argument("--sender", default="devops",
+                        help="journal author and Fleet sender seat (default: devops)")
     args = parser.parse_args(argv)
-    if not date.min < args.day < today:
+    day = args.day or today - timedelta(days=1)
+    if not date.min < day < today:
         parser.error("--day must be a completed, representable UTC day")
     try:
-        persisted_payload(args.day, args.report_dir or state_paths.reports_dir())
+        directory = args.report_dir or state_paths.reports_dir()
+        if args.publish:
+            try:
+                max_new = int(os.environ.get("ERROR_DIGEST_MAX_NEW", "20"))
+                if max_new < 1:
+                    raise ValueError
+            except ValueError:
+                raise DigestError("publish: refused (invalid_ERROR_DIGEST_MAX_NEW)") from None
+            _publish_run(day, directory, args.sender, backfill=args.day is None, max_new=max_new)
+        else:
+            persisted_payload(day, directory)
     except DigestError as exc:
         print(f"error digest: {exc}", file=sys.stderr)
         return 1
-    except (OSError, ValueError):
+    except (KeyError, OSError, TypeError, ValueError):
         print("error digest: report unavailable (state_or_io_error)", file=sys.stderr)
         return 1
     return 0
