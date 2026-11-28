@@ -387,12 +387,12 @@ def invalid_findings_block(response: str, *, stated: str | None = None) -> str |
 
 # These are declarations by the reviewer about its own unfinished work, not
 # general uses of "incomplete" in findings about the code under review.
-# A declaration starts a line or follows [.!?:] or a table cell's |, after blanks (rendered inline code or HTML leaves
-# them) and one opening ( [ or |. No catastrophic backtracking: the lead-in is possessive and stays on its line, and the
+# A declaration starts a line (a table cell is its own line) or follows [.!?:], after blanks (rendered inline code or
+# HTML leaves them) and one opening ( or [. No catastrophic backtracking: the lead-in is possessive and stays on its line, and the
 # repeated units are literal words split by \s+, which no word can match, so no span matches two ways (200k chars:
 # <100 ms).
 _INCOMPLETE_REVIEW_RE = re.compile(  # nosemgrep: python.lang.security.audit.regex_dos
-    r"(?:^|[.!?:|]\s)[^\S\n]*+[(\[|]?+[^\S\n]*+(?:(?:however|unfortunately),?\s+)?(?:"
+    r"(?:^|[.!?:]\s)[^\S\n]*+[(\[]?+[^\S\n]*+(?:(?:however|unfortunately),?\s+)?(?:"
     r"(?:I|we)\s+(?:(?:could|can|did|have)\s+not|cannot|couldn't|can't|didn't|haven't|"
     r"(?:am|are|was|were)\s+unable\s+to)\s+"
     r"(?:finish(?:ed)?|complete(?:d)?)\s+(?:(?:the|this|my|our|full|entire)\s+)*"
@@ -402,11 +402,12 @@ _INCOMPLETE_REVIEW_RE = re.compile(  # nosemgrep: python.lang.security.audit.reg
     r"(?:did\s+not|didn't|has\s+not|hasn't)\s+(?:finish(?:ed)?|complete(?:d)?))\b)",
     re.IGNORECASE | re.MULTILINE,
 )
-# Reviewer prose is read as the text a reader sees: Markdown is rendered, then this reads the HTML.
-_HTML_LINE_TAGS = frozenset({
-    "address", "article", "aside", "br", "dd", "details", "div", "dl", "dt", "figcaption", "figure", "footer",
-    "h1", "h2", "h3", "h4", "h5", "h6", "header", "hr", "li", "main", "nav", "ol", "p", "section", "summary",
-    "table", "td", "th", "tr", "ul",
+# Reviewer prose is read as the text a reader sees: Markdown (with GFM tables, so each cell is its own prose) is
+# rendered, then this reads the HTML. These phrasing elements flow inside a line; every other element, known or not,
+# ends one, so an unlisted block element cannot join two lines into one sentence.
+_HTML_INLINE_TAGS = frozenset({
+    "a", "abbr", "b", "bdi", "bdo", "cite", "code", "data", "del", "dfn", "em", "i", "img", "ins", "kbd", "mark",
+    "q", "s", "samp", "small", "span", "strong", "sub", "sup", "time", "u", "var", "wbr",
 })
 # Text in a closed one of these is an example or not shown, as in a Markdown code span or block quote.
 _HTML_EXAMPLE_TAGS = frozenset({"blockquote", "code", "kbd", "pre", "samp", "script", "style", "template"})
@@ -417,7 +418,7 @@ class _VisibleText(HTMLParser):
 
     An image is read as its alt text, which a reader who cannot load it sees instead.
 
-    Block elements and line breaks end a line. An unclosed example element hides nothing.
+    Every element but inline formatting ends a line. An unclosed example element hides nothing.
     """
 
     def __init__(self) -> None:
@@ -426,7 +427,7 @@ class _VisibleText(HTMLParser):
         self.examples: list[tuple[str, int]] = []
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-        if tag in _HTML_LINE_TAGS:
+        if tag not in _HTML_INLINE_TAGS:
             self.parts.append("\n")
         if tag in _HTML_EXAMPLE_TAGS:
             self.examples.append((tag, len(self.parts)))
@@ -440,7 +441,7 @@ class _VisibleText(HTMLParser):
                 del self.examples[depth:]
                 self.parts.append(" " if tag in {"code", "kbd", "samp"} else "\n")
                 break
-        if tag in _HTML_LINE_TAGS:
+        if tag not in _HTML_INLINE_TAGS:
             self.parts.append("\n")
 
     def handle_data(self, data: str) -> None:
@@ -479,7 +480,7 @@ def _completion_prose(response: str) -> list[str]:
     from markdown_it.renderer import RendererHTML
 
     visible = _without_inline_json(_without_code_fences(response, keep_unclosed=False))
-    markdown = MarkdownIt("commonmark")
+    markdown = MarkdownIt("commonmark").enable("table")
     renderer = RendererHTML()
     prose = []
     for token in markdown.parse(visible):
