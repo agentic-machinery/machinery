@@ -46,7 +46,11 @@ _TOP_KINDS = 10
 _JOURNAL_HEADLINE_LIMIT = 140
 _JOURNAL_BODY_LIMIT = 2000
 _SIGNATURE = re.compile(r"[0-9a-f]{12}")
-_PROPOSAL_KEY = re.compile(r"error-digest:([0-9]{4}-[0-9]{2}-[0-9]{2})")
+# One Fleet key per proposal day. The v2 prefix keeps these keys apart from the
+# keys the v1 digest spent, which Fleet may already hold with another payload.
+_PROPOSAL_KEY = re.compile(r"error-digest:v2:([0-9]{4}-[0-9]{2}-[0-9]{2})")
+_KIND_FIELDS = frozenset({"first_seen", "source", "severity", "template"})
+_LEDGER_FIELDS = _KIND_FIELDS | {"proposed_at", "proposal_day"}
 _SEVERITIES = ("error", "warning", "unparsed")
 _TIMESTAMP = re.compile(
     r"(?<!\w)\d{4}-\d\d-\d\d(?:[Tt ]\d\d:\d\d:\d\d(?:[.,]\d+)?(?:[Zz]|[+-]\d\d:?\d\d| UTC)?)?(?!\w)"
@@ -475,10 +479,29 @@ def _date_text(value: object) -> bool:
     return isinstance(value, str) and date.fromisoformat(value).isoformat() == value
 
 
-def _ledger_row(row: object, *, proposed: bool) -> bool:
+def _utf8_text(value: object, *, required: bool = False) -> bool:
+    """A string that encodes as UTF-8; a JSON string can hold a lone surrogate."""
+    if not isinstance(value, str) or (required and not value):
+        return False
+    try:
+        value.encode()
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
+def _valid_sender(value: object) -> bool:
     return (
-        isinstance(row, dict) and _date_text(row["first_seen"])
-        and isinstance(row["template"], str) and isinstance(row["source"], str)
+        isinstance(value, str) and _utf8_text(value, required=True) and value == value.strip()
+        and not any(ord(ch) < 32 or ord(ch) == 127 for ch in value)
+    )
+
+
+def _ledger_row(row: object, *, proposed: bool) -> bool:
+    """A kind row exactly as the publisher writes it, pending (``proposed=False``) or recorded."""
+    return (
+        isinstance(row, dict) and set(row) == (_LEDGER_FIELDS if proposed else _KIND_FIELDS)
+        and _date_text(row["first_seen"]) and _utf8_text(row["template"]) and _utf8_text(row["source"])
         and row["severity"] in _SEVERITIES
         and (not proposed or (
             _date_text(row["proposal_day"]) and store.parse_utc_timestamp(row["proposed_at"]) is not None
@@ -509,14 +532,6 @@ def _attempt_day(key: object) -> str:
     return match[1]
 
 
-def _utf8_text(value: object) -> bool:
-    """A non-empty string that encodes as UTF-8; a JSON string can hold a lone surrogate."""
-    try:
-        return isinstance(value, str) and bool(value.encode())
-    except UnicodeEncodeError:
-        return False
-
-
 def _load_publish_state(path: Path) -> dict[str, Any]:
     """The pending proposal, kept until Fleet returns its receipt and the ledger records it."""
     try:
@@ -524,17 +539,22 @@ def _load_publish_state(path: Path) -> dict[str, Any]:
         if not isinstance(state, dict) or set(state) != {"attempt"}:
             raise ValueError
         attempt = state["attempt"]
-        if attempt is not None and (
-            not isinstance(attempt, dict) or set(attempt) != {"key", "sender", "body", "proposed"}
-            or not _attempt_day(attempt["key"])
-            or not _utf8_text(attempt["sender"]) or not _utf8_text(attempt["body"])
-            or not isinstance(attempt["proposed"], dict) or not attempt["proposed"]
-            or not all(
-                _SIGNATURE.fullmatch(sig) and _ledger_row(row, proposed=False)
-                for sig, row in attempt["proposed"].items()
-            )
-        ):
-            raise ValueError
+        if attempt is not None:
+            if not isinstance(attempt, dict) or set(attempt) != {"key", "sender", "body", "proposed"}:
+                raise ValueError
+            day = _attempt_day(attempt["key"])
+            if not date.min < date.fromisoformat(day) < datetime.now(UTC).date():
+                raise ValueError
+            proposed = attempt["proposed"]
+            if (
+                not _valid_sender(attempt["sender"]) or not _utf8_text(attempt["body"], required=True)
+                or not isinstance(proposed, dict) or not proposed
+                or not all(
+                    _SIGNATURE.fullmatch(sig) and _ledger_row(row, proposed=False) and row["first_seen"] <= day
+                    for sig, row in proposed.items()
+                )
+            ):
+                raise ValueError
     except FileNotFoundError:
         return {"attempt": None}
     except (KeyError, TypeError, ValueError, RecursionError):
@@ -550,6 +570,10 @@ def _deliver(state: dict, state_path: Path, ledger: dict, ledger_path: Path, dea
     """
     attempt = state["attempt"]
     try:
+        # A stored body crosses the same egress boundary as a fresh one, and its
+        # bytes are bound to the key, so a body the scan would change is refused.
+        if _safe_output(attempt["body"]) != attempt["body"]:
+            raise DigestError("egress: refused (opsec_scan)")
         _publish_proposal(attempt["body"], attempt["sender"], attempt["key"], deadline - _EGRESS_TIMEOUT_S)
     except DigestError as exc:
         return exc
@@ -830,7 +854,7 @@ def _publish_run(day: date, directory: Path, sender: str, *, backfill: bool, max
         )
         if not failure and kinds and not any(row["proposal_day"] == day.isoformat() for row in ledger.values()):
             body, proposed = _prepare_proposal(day, kinds, max_new)
-            state["attempt"] = {"key": f"error-digest:{day}", "sender": sender, "body": body, "proposed": proposed}
+            state["attempt"] = {"key": f"error-digest:v2:{day}", "sender": sender, "body": body, "proposed": proposed}
             _write_state(state_path, _json_bytes(state), replace=True)
             failure = _deliver(state, state_path, ledger, ledger_path, deadline)
         banner = "\n".join(filter(None, (ledger_error, _pending_note(state))))
@@ -868,6 +892,8 @@ def main(argv: list[str] | None = None) -> int:
                         help="journal author and Fleet sender seat (default: devops)")
     args = parser.parse_args(argv)
     day = args.day or today - timedelta(days=1)
+    if not _valid_sender(args.sender):
+        parser.error("--sender must be a name without surrounding spaces or control characters")
     if not date.min < day < today:
         parser.error("--day must be a completed, representable UTC day")
     try:

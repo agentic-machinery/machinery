@@ -1072,7 +1072,7 @@ class AuthorityService:
             raise AuthorityServiceError("message_not_found")
         delivery_rows = self._conn.execute(
             """SELECT delivery_id FROM authority_deliveries
-               WHERE message_id = ? ORDER BY delivery_id ASC""",
+               WHERE message_id = ? ORDER BY recipient ASC, delivery_id ASC""",
             (mid,),
         ).fetchall()
         artifact_id = row["body_artifact_id"]
@@ -2253,29 +2253,16 @@ class AuthorityService:
         live_delivery = deliver and imported_source is None and imported_delivery_state is None
         channel_row = self._require_channel_tx(channel) if channel is not None else None
         subscriber_fanout = imported_recipients is None and targets is None and channel_row is not None
+        explicit_recipients: tuple[str, ...] = ()
         if imported_recipients is not None:
             # Historical records keep the recipients they were written with.
-            recipients_norm = _normalize_recipients(imported_recipients)
-        elif targets is None and channel_row is not None:
-            subscriber_rows = self._conn.execute(
-                """SELECT recipient FROM authority_channel_subscribers
-                   WHERE channel_id = ? AND recipient != ? ORDER BY recipient ASC""",
-                (str(channel_row["channel_id"]), sender_name),
-            ).fetchall()
-            durable = (_durable_subscriber(str(row["recipient"]), sender_name) for row in subscriber_rows)
-            recipients_norm = _normalize_recipients(
-                target.recipient for target in _admitted_subscribers(name for name in durable if name)
+            explicit_recipients = _normalize_recipients(imported_recipients)
+        elif not subscriber_fanout:
+            explicit_recipients = _normalize_recipients(
+                require_admitted(target).recipient for target in targets or ()
             )
-            if deliver:
-                recipients_norm = self._readable_subscribers_tx(channel_row, recipients_norm)
-        else:
-            recipients_norm = _normalize_recipients(require_admitted(target).recipient for target in targets or ())
-            _refuse_session_cto_recipients(recipients_norm)
-        supervisory_inbox = len(recipients_norm) == 1 and bool(_SUPERVISORY_RECIPIENT_RE.fullmatch(recipients_norm[0]))
-        if live_delivery and kind_name == _SUPERVISORY_REQUEST_KIND and not supervisory_inbox:
-            raise AuthorityServiceError("supervisory_recipient_required")
+            _refuse_session_cto_recipients(explicit_recipients)
         requested_revisions = self._normalize_context_revisions(context_revisions, None)
-        revisions = self._normalize_context_revisions(context_revisions, channel_row)
         provenance_data = _safe_json_mapping(provenance)
         deadline = self._normalize_deadline(deadline_at)
         creation = self._normalize_created_at(created_at)
@@ -2287,30 +2274,63 @@ class AuthorityService:
             stored_deadline = _iso(_parse_iso(creation, field="created_at") + timedelta(days=7))
         body_bytes = body.encode("utf-8")
         body_sha = _sha256_bytes(body_bytes)
-        payload = {
+        caller_fields = {
             "sender": sender_name,
             "body_sha256": body_sha,
             "channel_id": str(channel_row["channel_id"]) if channel_row is not None else None,
-            "recipients": list(recipients_norm),
             "kind": kind_name,
             "conversation_id": conversation_id or "",
             "thread_id": thread_id or "",
             "in_reply_to": in_reply_to or "",
             "correlation_id": correlation_id or "",
             "provenance": provenance_data,
-            "context_revisions": revisions,
             "deadline_at": deadline or "",
             "imported_source": imported_source or "",
         }
-        # The key binds what the caller asked for. The channel's current context
-        # revision and its subscribers are store state that can change after a
-        # commit, so they stay out of the digest: a retry after a crash returns the
-        # original receipt (#1620). Rows written before then hold the digest of the
-        # whole payload, which still matches while that state is unchanged.
+        # The key binds what the caller asked for (#1620). The channel's current
+        # context revision and subscribers, and a recipient's standing, are store
+        # state that can change after a commit, so a retry after a crash finds its
+        # receipt before any of them is read. The format tag keeps this digest
+        # disjoint from the whole-payload digest that rows written earlier hold.
         request = {
-            **payload,
-            "recipients": None if subscriber_fanout else payload["recipients"],
+            **caller_fields,
+            "digest_format": "caller-request.v1",
+            "recipients": None if subscriber_fanout else list(explicit_recipients),
             "context_revisions": requested_revisions,
+            "deliver": deliver,
+        }
+        payload_sha = _sha256_json(request)
+        for namespace in ("message", "message:reclassified-request"):
+            row = self._conn.execute(
+                """SELECT payload_sha256, subject_id FROM authority_idempotency
+                   WHERE namespace = ? AND idempotency_key = ?""",
+                (namespace, key),
+            ).fetchone()
+            if row is not None and str(row["payload_sha256"]) == payload_sha:
+                return self.get_message(str(row["subject_id"]))
+
+        recipients_norm = explicit_recipients
+        if subscriber_fanout and channel_row is not None:
+            subscriber_rows = self._conn.execute(
+                """SELECT recipient FROM authority_channel_subscribers
+                   WHERE channel_id = ? AND recipient != ? ORDER BY recipient ASC""",
+                (str(channel_row["channel_id"]), sender_name),
+            ).fetchall()
+            durable = (_durable_subscriber(str(row["recipient"]), sender_name) for row in subscriber_rows)
+            recipients_norm = _normalize_recipients(
+                target.recipient for target in _admitted_subscribers(name for name in durable if name)
+            )
+            if deliver:
+                recipients_norm = self._readable_subscribers_tx(channel_row, recipients_norm)
+        supervisory_inbox = len(recipients_norm) == 1 and bool(_SUPERVISORY_RECIPIENT_RE.fullmatch(recipients_norm[0]))
+        if live_delivery and kind_name == _SUPERVISORY_REQUEST_KIND and not supervisory_inbox:
+            raise AuthorityServiceError("supervisory_recipient_required")
+        revisions = self._normalize_context_revisions(context_revisions, channel_row)
+        # The whole-payload digest that rows written before #1620 hold.
+        payload = {
+            **caller_fields,
+            "recipients": list(recipients_norm),
+            "context_revisions": revisions,
         }
         namespace = "message"
         if live_delivery and kind_name == "request" and len(recipients_norm) == 1 and not supervisory_inbox:
@@ -2326,15 +2346,13 @@ class AuthorityService:
                 (key, *misrouted),
             ).fetchone() is not None:
                 namespace = "message:reclassified-request"
-        payload_sha = _sha256_json(request)
         existing_id = self._check_idempotency_tx(
             namespace, key, payload_sha, legacy_sha256=_sha256_json(payload)
         )
         if existing_id is not None:
             return self.get_message(existing_id)
-        if live_delivery and imported_recipients is None and not subscriber_fanout:
-            # A retry of a committed message returns its receipt above even when a
-            # recipient has since become unreadable; only a new message is refused.
+        if live_delivery and not subscriber_fanout:
+            # Only a new message to an unreadable recipient is refused.
             _require_readable_recipients(recipients_norm)
 
         mid = message_id or new_id("message")
@@ -2414,7 +2432,6 @@ class AuthorityService:
                 creation,
             ),
         )
-        delivery_ids: list[str] = []
         for recipient in recipients_norm if deliver else ():
             delivery_id = new_id("authority-delivery")
             delivery_state = imported_delivery_state or "queued"
@@ -2437,29 +2454,13 @@ class AuthorityService:
                     completed_at,
                 ),
             )
-            delivery_ids.append(delivery_id)
             if emit_wakes and delivery_state == "queued":
                 self._record_wake_receipt_tx(
                     delivery_id, recipient, 0, state="emitted", now=creation
                 )
         self._insert_idempotency_tx(namespace, key, payload_sha, mid)
-        return AuthorityMessage(
-            message_id=mid,
-            conversation_id=conversation,
-            in_reply_to=in_reply_to,
-            channel_id=str(channel_row["channel_id"]) if channel_row is not None else None,
-            thread_id=thread,
-            correlation_id=correlation_id,
-            sender=sender_name,
-            recipient=recipient_value,
-            kind=kind_name,
-            body_artifact_id=artifact.artifact_id,
-            content_sha256=body_sha,
-            context_revisions=revisions,
-            provenance=provenance_data,
-            created_at=creation,
-            delivery_ids=tuple(delivery_ids),
-        )
+        # One receipt shape for the first publish and every retry.
+        return self.get_message(mid)
 
     def _readable_subscribers_tx(self, channel_row: sqlite3.Row, names: Sequence[str]) -> tuple[str, ...]:
         """Fan-out targets a drain reads; end the subscription of a settled task or unregistered name.
