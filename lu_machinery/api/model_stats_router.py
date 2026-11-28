@@ -28,6 +28,10 @@ additions plus deletions at merge: 0–100, 101–1,000, over 1,000, or unknown 
 ``post_merge_rework_proxy`` counts attributed merges named by a fix or revert in the same repository over the
 next seven days of local history. A merge enters the selected window when its seven-day follow-up ends.
 ``no_deliverable_causes`` counts each no-deliverable task once, using its recorded cause when available.
+
+``ruff_quality`` (#1615) is report-only: per-model CI Ruff results from the collector's local ledgers
+(``import-ruff-attempts``), never a GitHub read and never a gate, served on ``view=full`` only (the dashboard
+projection is unchanged). It is described at ``ruff_quality``.
 """
 
 from __future__ import annotations
@@ -69,9 +73,11 @@ from .model_stats_rows import (
     NATIVE_ALIASES,
     NO_DELIVERABLE_CAUSES,
     POOLS,
+    RUFF_BUCKETS,
     UNKNOWN_EFFORT,
     UNPARSED_REASONS,
     VERDICTS,
+    classify_ruff_attempt,
     comparison_effort,
     current_catalog_model_ids,
     fleet_catalog,
@@ -80,6 +86,8 @@ from .model_stats_rows import (
     read_finding_outcomes,
     read_publications,
     read_rows,
+    read_ruff_attempts,
+    read_ruff_state,
     refresh_readings,
     repository_keys,
     retired_subscription_model,
@@ -2115,6 +2123,7 @@ def collect(batch_state_dir: Path, primary_root: Path, now: datetime | None = No
     return {
         "schema_version": SCHEMA_VERSION,
         "observed_at": datetime.now(UTC).isoformat(),
+        "ruff_quality": ruff_quality(batch_state_dir, raw_rows),
         "low_sample_below": LOW_SAMPLE,
         "first_record": first.isoformat() if moments else None,
         "windows": windows,
@@ -2128,6 +2137,138 @@ def collect(batch_state_dir: Path, primary_root: Path, now: datetime | None = No
                      "finding_outcomes": dict(sorted(outcome_counts.items())),
                      # Blocked-to-approved head pairs whose changed files were read from a local checkout.
                      "finding_heads": {"pairs": len(pairs), "read": len(touched)}},
+    }
+
+
+_RUFF_SIZE_BANDS = ((100, "0-100"), (1000, "101-1000"))
+
+
+def _size_band(size: object) -> str:
+    if type(size) is not int:
+        return "unknown"
+    return next((name for top, name in _RUFF_SIZE_BANDS if size <= top), "over-1000")
+
+
+def _credit_index(rows: Iterable[Mapping[str, Any]]) -> dict[tuple[str, str], set[tuple[str, str, str]]]:
+    """``(repository, commit)`` to every ``(task_id, model, class)`` that credited it at settlement.
+
+    Only a row bound to the whole settlement identity credits anything: repository, writer task, run nonce, a model
+    the runtime observed (``resolved_model_known is True``) and the dispatcher-computed credited set. A hook record,
+    an ``X-Agent`` trailer or a requested model is never authorship proof.
+    """
+    index: dict[tuple[str, str], set[tuple[str, str, str]]] = defaultdict(set)
+    for row in rows:
+        commits, model, repository = row.get("credited_commits"), row.get("resolved_model"), row.get("repository")
+        if (not isinstance(commits, list) or row.get("resolved_model_known") is not True
+                or not isinstance(model, str) or model == "unknown" or not isinstance(repository, str)
+                or not isinstance(row.get("run_nonce"), str) or not isinstance(row.get("task_id"), str)):
+            continue
+        for sha in commits:
+            index[(repository, sha)].add((row["task_id"], model, str(row.get("class") or "unclassified")))
+    return index
+
+
+def _head_credit(receipt: Mapping[str, Any], index: Mapping[tuple[str, str], set[tuple[str, str, str]]]
+                 ) -> tuple[str, str | None, str]:
+    """``(attribution, model, task_family)``: ``model`` only when every commit of ``base..head`` is credited and all
+    crediting tasks share one runtime-observed model; ``joint`` for two or more models; otherwise ``unknown``."""
+    commits = receipt.get("head_commits")
+    if not commits:
+        return "unknown", None, "unknown"
+    credit: set[tuple[str, str, str]] = set()
+    for sha in commits:
+        found = index.get((receipt["repository"], sha))
+        if not found:
+            return "unknown", None, "unknown"
+        credit |= found
+    models = {model for _, model, _ in credit}
+    families = {family for _, _, family in credit}
+    family = families.pop() if len(families) == 1 else "mixed"
+    if len(models) == 1:
+        return "model", models.pop(), family
+    return "joint", None, family
+
+
+def _review_risks(rows: Iterable[Mapping[str, Any]]) -> dict[tuple[str, int], str]:
+    """The review risk of each PR's reviews (``profile/risk`` class); ``mixed`` when its reviews disagree."""
+    risks: dict[tuple[str, int], set[str]] = defaultdict(set)
+    for row in rows:
+        task_class = row.get("class")
+        if (row.get("role") == "review" and isinstance(row.get("repository"), str) and type(row.get("pr")) is int
+                and isinstance(task_class, str) and task_class.count("/") == 1):
+            risks[(row["repository"], row["pr"])].add(task_class.split("/", 1)[1])
+    return {key: values.pop() if len(values) == 1 else "mixed" for key, values in risks.items()}
+
+
+def _bucket_counts() -> dict[str, int]:
+    return dict.fromkeys(RUFF_BUCKETS, 0)
+
+
+def _code_failure_rate(buckets: Mapping[str, int]) -> dict[str, int]:
+    # Only attempts with a proven lint outcome enter the rate; every other bucket is reported beside it.
+    return {"numerator": buckets["ruff_code_failure"],
+            "denominator": buckets["ruff_code_failure"] + buckets["ruff_pass"]}
+
+
+def ruff_quality(batch_state_dir: Path, rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    """Report-only per-model CI Ruff results, from local ledgers only.
+
+    Each stable attempt identity resolves to one winning receipt (``read_ruff_attempts``), classifies into one
+    ``RUFF_BUCKETS`` bucket, and counts when its immutable start time is at or after the frozen
+    ``pilot_window_start``. A head is credited to a model only through settled tasks' dispatcher-computed credited
+    commits; ``joint`` and ``unknown`` heads stay out of every model's rate and are counted on their own. The
+    ``ruff_code_failure_rate`` of a model is code failures over code failures plus passes; cancelled, infrastructure,
+    missing-evidence, guard, base-only and ambiguous attempts are reported beside it, never inside it.
+    """
+    receipts, counts = read_ruff_attempts(batch_state_dir)
+    try:
+        state = read_ruff_state(batch_state_dir)
+        state_reading = "absent" if state is None else "ok"
+    except (OSError, ValueError, RecursionError):
+        state, state_reading = None, "malformed"
+    pilot = timestamp(state["pilot_window_start"]) if state else None
+    index = _credit_index(rows)
+    risks = _review_risks(rows)
+    totals, groups = _bucket_counts(), {"joint": _bucket_counts(), "unknown": _bucket_counts()}
+    models: dict[str, dict[str, int]] = defaultdict(_bucket_counts)
+    keyed: dict[tuple[str, ...], dict[str, int]] = defaultdict(_bucket_counts)
+    attribution: Counter[str] = Counter({"model": 0, "joint": 0, "unknown": 0})
+    for receipt in receipts:
+        started = timestamp(receipt["started_at"])
+        if pilot is None or started is None:
+            counts["untimed_or_no_pilot"] += 1
+            continue
+        if started < pilot:
+            counts["before_pilot"] += 1
+            continue
+        bucket = classify_ruff_attempt(receipt)
+        kind, model, family = _head_credit(receipt, index)
+        totals[bucket] += 1
+        attribution[kind] += 1
+        (models[model] if model is not None else groups[kind])[bucket] += 1
+        keyed[(receipt["repository"], family, risks.get((receipt["repository"], receipt["pr"]), "unknown"),
+               _size_band(receipt["diff_size"]), str(receipt["check_version"]), kind, model or kind)][bucket] += 1
+    denominator = sum(totals.values())
+    return {
+        "report_only": True,
+        "state": state_reading,
+        "pilot_window_start": state["pilot_window_start"] if state else None,
+        "watermark": state["watermark"] if state else None,
+        "incomplete_intervals": list(state["incomplete_intervals"]) if state else [],
+        "denominator": denominator,
+        "buckets": totals,
+        "attribution": dict(attribution),
+        "ruff_code_failure_rate": _code_failure_rate(
+            {name: sum(group[name] for group in models.values()) for name in RUFF_BUCKETS}),
+        "models": [{"model": name, "attempts": sum(group.values()), "buckets": group,
+                    "ruff_code_failure_rate": _code_failure_rate(group)} for name, group in sorted(models.items())],
+        "joint": {"attempts": sum(groups["joint"].values()), "buckets": groups["joint"]},
+        "unknown": {"attempts": sum(groups["unknown"].values()), "buckets": groups["unknown"]},
+        "by_key": [{"repository": key[0], "task_family": key[1], "risk": key[2], "diff_size": key[3],
+                    "check_version": key[4], "attribution": key[5], "model": key[6] if key[5] == "model" else None,
+                    "attempts": sum(group.values()), "buckets": group}
+                   for key, group in sorted(keyed.items())],
+        "coverage": dict(sorted(counts.items())),
     }
 
 
@@ -2256,6 +2397,8 @@ async def model_stats(
     if view == "page":
         window_key = "page_windows"
         del body["weeks"]
+        # The dashboard projection keeps its closed label set; the report-only Ruff figures are view=full (#1615).
+        body.pop("ruff_quality", None)
         coverage = body["coverage"]
         body["coverage"] = {**coverage, "landing": _page_landing(coverage["landing"])}
     payload = {**body, **snapshot[window_key][window], "status": "ok", "age_seconds": round(age, 1)}

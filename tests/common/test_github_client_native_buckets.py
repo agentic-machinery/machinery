@@ -1366,3 +1366,75 @@ def test_issue_create_label_flag_remains_supported(tmp_path):
     )
     assert res.returncode == 0
     assert calls == [("POST", "repos/o/r/issues", {"title": "t", "body": "b", "labels": ["bug", "infra"]})]
+
+
+# Forward-only CI attempt reads (#1615). Approved by claude-cto for issue #1615 (AC-02).
+def _attempt_client(tmp_path, pages):
+    """A client over ``pages``: ``{path: [(body, next path or None), ...]}``, served in order per path."""
+    sent = []
+
+    def transport(method, endpoint, headers, body, timeout):
+        sent.append(endpoint)
+        parts = endpoint.removeprefix("https://api.github.com/").split("?", 1)
+        queue = pages[parts[0]]
+        value, following = queue.pop(0) if len(queue) > 1 else queue[0]
+        extra = {"Link": f'<https://api.github.com/{following}>; rel="next"'} if following else {}
+        return gh.Response(200, {"X-RateLimit-Remaining": "4000", "X-RateLimit-Reset": "9000", **extra},
+                           json.dumps(value).encode())
+
+    client = gh.GitHubClient(cache_dir=tmp_path, transport=transport, clock=lambda: NOW,
+                             env={"GH_HOST": "github.com", "GH_TOKEN": "fixture-token"})
+    return client, sent
+
+
+def test_attempt_reads_prove_whole_collections_and_ask_for_every_rerun(tmp_path):
+    """Defect class: a CI attempt read that silently truncates (a short counted page, an uncounted annotation
+    list, a capped run inventory) or asks GitHub for only the latest check run per name."""
+    from datetime import UTC, datetime
+
+    head = "a" * 40
+    rows = [{"id": 1, "name": "Ruff"}, {"id": 2, "name": "Ruff"}]
+    client, sent = _attempt_client(tmp_path, {
+        f"repos/o/r/commits/{head}/check-runs": [({"total_count": 2, "check_runs": rows}, None)]})
+    assert gh.check_runs_all(client, "o/r", head) == rows
+    assert sent == [f"repos/o/r/commits/{head}/check-runs?filter=all&per_page=100"]
+
+    client, _ = _attempt_client(tmp_path / "short", {
+        f"repos/o/r/commits/{head}/check-runs": [({"total_count": 3, "check_runs": rows}, None)]})
+    with pytest.raises(gh.GitHubIncompleteRead, match="github_collection_incomplete"):
+        gh.check_runs_all(client, "o/r", head)
+
+    client, _ = _attempt_client(tmp_path / "annotations", {
+        "repos/o/r/check-runs/5": [({"output": {"annotations_count": 2}}, None)],
+        "repos/o/r/check-runs/5/annotations": [([{"path": "a.py"}], None)]})
+    with pytest.raises(gh.GitHubIncompleteRead, match="github_annotations_incomplete"):
+        gh.check_run_annotations(client, "o/r", 5)
+
+    since = datetime(2026, 11, 20, tzinfo=UTC)
+    runs = [{"id": index} for index in range(1, 101)]
+    pages = [({"total_count": 1000, "workflow_runs": [{"id": page * 100 + row["id"]} for row in runs]},
+              f"repos/o/r/actions/workflows/ci.yml/runs?page={page + 2}" if page < 9 else None)
+             for page in range(10)]
+    client, sent = _attempt_client(tmp_path / "inventory", {"repos/o/r/actions/workflows/ci.yml/runs": pages})
+    with pytest.raises(gh.GitHubIncompleteRead, match="github_run_inventory_capped"):
+        gh.workflow_runs_created_since(client, "o/r", "ci.yml", since)
+    assert sent[0] == ("repos/o/r/actions/workflows/ci.yml/runs?event=pull_request"
+                       "&created=%3E%3D2026-11-20T00%3A00%3A00Z&per_page=100")
+
+
+def test_updated_pull_walk_stops_at_the_watermark_and_refuses_malformed_pages(tmp_path):
+    """Defect class: an updated-pull-request walk that stops early, runs past the watermark, or trusts a page it
+    cannot read."""
+    from datetime import UTC, datetime
+
+    since = datetime(2026, 11, 20, tzinfo=UTC)
+    newer = [{"number": 9, "updated_at": "2026-11-22T00:00:00Z"}, {"number": 8, "updated_at": "2026-11-21T00:00:00Z"}]
+    older = [{"number": 8, "updated_at": "2026-11-21T00:00:00Z"}, {"number": 2, "updated_at": "2026-11-01T00:00:00Z"},
+             {"number": 1, "updated_at": "2026-10-01T00:00:00Z"}]
+    client, sent = _attempt_client(tmp_path, {"repos/o/r/pulls": [
+        (newer, "repos/o/r/pulls?page=2"), (older, None)]})
+    assert [pull["number"] for pull in gh.pulls_updated_since(client, "o/r", since)] == [9, 8]
+    assert sent[0] == "repos/o/r/pulls?state=all&sort=updated&direction=desc&per_page=100" and len(sent) == 2
+    client, _ = _attempt_client(tmp_path / "bad", {"repos/o/r/pulls": [([{"number": 3}], None)]})
+    with pytest.raises(gh.GitHubIncompleteRead, match="github_pulls_malformed"):
+        gh.pulls_updated_since(client, "o/r", since)

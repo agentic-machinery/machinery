@@ -894,3 +894,31 @@ def test_dispatch_refuses_a_non_finite_numeric_option_at_parse_time(flag, value,
 
 
 pytestmark = pytest.mark.usefixtures("configured_roots")
+
+
+@pytest.mark.parametrize("case", ["captured", "read-failed", "no-remote", "read-only"])
+def test_write_records_store_start_refs_or_none_and_never_guess(monkeypatch, case):
+    """Defect class: a write record without proof of the remote's branch tips at task start reaching settlement
+    with something that looks like that proof, so another branch's commits get credited (#1615, AC-09, AC-12).
+    Approved by claude-cto for issue #1615."""
+    from lu_machinery.dispatcher import git
+
+    tips = ["a" * 40, "b" * 40]
+    calls = []
+
+    def read(task_id, remote):
+        calls.append((task_id, remote))
+        if case == "read-failed":
+            raise ValueError("remote branch advertisement is malformed")
+        return list(tips)
+
+    monkeypatch.setattr(git, "task_start_remote_refs", read)
+    record = {"task_id": "writer", "mode": "read-only" if case == "read-only" else "workspace-write",
+              "worktree_remote_url": None if case == "no-remote" else "https://github.com/org/repo.git"}
+    store.capture_task_start_remote_refs(record)
+    expected = {"captured": tips, "read-failed": None, "no-remote": None}
+    if case == "read-only":
+        assert "task_start_remote_refs" not in record and not calls
+    else:
+        assert record["task_start_remote_refs"] == expected[case]
+        assert calls == ([] if case == "no-remote" else [("writer", "https://github.com/org/repo.git")])

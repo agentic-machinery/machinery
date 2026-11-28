@@ -19,7 +19,9 @@ import json
 import sqlite3
 import subprocess
 import time
-from contextlib import closing
+from contextlib import closing, contextmanager
+from functools import partial
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
@@ -300,3 +302,94 @@ def test_rest_pr_identity_matches_both_transferred_repository_slugs(monkeypatch)
     assert not git._same_repo_pr(pr, moved.alternate_github)
     pr["head"]["repo"]["full_name"] = "fork-owner/fork-repo"
     assert not git._same_repo_pr(pr, REPO)
+
+
+# Settlement attribution (#1615): the dispatcher's own credited-commit computation, from remote objects only.
+# Approved by claude-cto for issue #1615 (AC-08, AC-09, AC-11, AC-12).
+def _run_git(cwd, *args):
+    done = subprocess.run(["git", "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+                           "-c", "commit.gpgsign=false", "-C", str(cwd), *args], capture_output=True, text=True)
+    assert done.returncode == 0, done.stderr
+    return done.stdout.strip()
+
+
+def _publish(bare, work, source, branch):
+    """Set the bare origin's ``branch`` to ``source`` of the writer clone (the origin fetches; nothing pushes)."""
+    _run_git(bare, "fetch", "-q", str(work), f"+{source}:refs/heads/{branch}")
+
+
+def _new_commit(work, message):
+    _run_git(work, "commit", "--allow-empty", "-q", "-m", message)
+    return _run_git(work, "rev-parse", "HEAD")
+
+
+@pytest.fixture
+def origin(tmp_path, monkeypatch):
+    """A bare origin and a writer clone; the verifier's private namespace fetches from the bare origin."""
+    bare, work = tmp_path / "origin.git", tmp_path / "work"
+    subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(bare)], check=True)
+    subprocess.run(["git", "clone", "-q", str(bare), str(work)], check=True, capture_output=True)
+
+    @contextmanager
+    def private_remote(task_id, url):
+        assert url == str(bare)
+        namespace = tmp_path / f"ns-{task_id}-{len(list(tmp_path.glob('ns-*')))}"
+        namespace.mkdir()
+        run = partial(git._verification_git, namespace, git_dir=namespace)
+        run("init", "--bare", "--template=")
+        run("config", "remote.origin.url", str(bare))
+        yield run, namespace
+
+    monkeypatch.setattr(git, "_private_remote_git", private_remote)
+    return bare, work
+
+
+def test_settlement_credits_only_commits_no_start_branch_or_main_holds(origin):
+    """Defect class: a task credited with commits it imported from main, merged from another unmerged branch, or
+    inherited from a takeover predecessor (AC-08, AC-09, AC-11)."""
+    bare, work = origin
+    _new_commit(work, "main base")
+    _publish(bare, work, "HEAD", "main")
+    _run_git(work, "switch", "-q", "-c", "other")
+    foreign = _new_commit(work, "another task's unmerged work")
+    _publish(bare, work, "other", "other")
+    _run_git(work, "switch", "-q", "-c", "pred", "main")
+    predecessor = _new_commit(work, "takeover predecessor work")
+    _publish(bare, work, "pred", "pred")
+    refs = git.task_start_remote_refs("successor", str(bare))
+    assert refs == sorted(_run_git(work, "rev-parse", name) for name in ("main", "other", "pred"))
+    # After the start: main moves on, and the successor merges main and the other branch into its own work.
+    _run_git(work, "switch", "-q", "main")
+    imported = _new_commit(work, "main moved on")
+    _publish(bare, work, "main", "main")
+    _run_git(work, "switch", "-q", "-c", "task", predecessor)
+    own = [_new_commit(work, "successor work")]
+    _run_git(work, "merge", "-q", "--no-edit", "main")
+    own.append(_run_git(work, "rev-parse", "HEAD"))
+    _run_git(work, "merge", "-q", "--no-edit", "other")
+    own.append(_run_git(work, "rev-parse", "HEAD"))
+    own.append(_new_commit(work, "more successor work"))
+    _publish(bare, work, "task", "task")
+    head = own[-1]
+    record = {"task_id": "successor", "task_start_remote_refs": refs, "worktree_remote_url": str(bare),
+              "worktree_start_sha": predecessor, "worktree_base_ref": "origin/main"}
+    credited, reason = git.credited_commits(record, head)
+    assert reason == "computed" and credited == sorted(own)
+    assert not {imported, foreign, predecessor} & set(credited)
+    # Fail closed: no start refs, or a head the remote does not have, credits nothing.
+    assert git.credited_commits({**record, "task_start_remote_refs": None}, head) == (
+        None, "task_start_remote_refs_absent")
+    unpushed = _new_commit(work, "never pushed")
+    assert git.credited_commits(record, unpushed)[0] is None
+    # Settlement records the set beside the delivery it observes, from the same snapshot.
+    spec = SimpleNamespace(worktree=work, mode="workspace-write")
+    _run_git(work, "reset", "-q", "--hard", head)
+    delivery = git.snapshot_delivery(spec, {**record, "worktree_branch": "task", "publish_branch": None,
+                                            "worktree_base_sha": predecessor})
+    assert (delivery["head_sha"], delivery["push_state"]) == (head, "pushed")
+    assert (delivery["credited_commits"], delivery["credited_commits_reason"]) == (sorted(own), "computed")
+    legacy = git.snapshot_delivery(spec, {key: value for key, value in record.items()
+                                          if key != "task_start_remote_refs"}
+                                   | {"worktree_branch": "task", "publish_branch": None,
+                                      "worktree_base_sha": predecessor})
+    assert "credited_commits" not in legacy
