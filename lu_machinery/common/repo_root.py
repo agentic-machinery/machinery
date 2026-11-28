@@ -41,9 +41,13 @@ GitHub slug               the plane owner's consumer profile,   ``learn-ukrainia
 state root                host context or ``LU_STATE_ROOT``     required (holds ``batch_state/``)
                           (``LEARN_UKRAINIAN_STATE_ROOT``)
 rules directory (policy)  none: installed release                ``agents_extensions/shared/rules`` beside the package
-interpreter               ``LU_PYTHON``                         :func:`project_interpreter`'s resolution order
-                          (``LEARN_UKRAINIAN_PYTHON``)
+interpreter               ``LU_PYTHON``                         :func:`project_interpreter`'s resolution order;
+                          (``LEARN_UKRAINIAN_PYTHON``)          under a host binding absent or ``runtime.python``
 ========================  ====================================  =================================================
+
+Under a host binding the interpreter variable names the machinery runtime only: the binding
+refuses any other value. Product-side work takes ``products[default_product].python`` from
+the binding itself, never from this variable.
 
 Each ``LU_*`` name is the primary name; its ``LEARN_UKRAINIAN_*`` alias is still read, so a
 host configured before the rename keeps working unchanged. Both set to different values
