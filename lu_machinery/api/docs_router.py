@@ -375,17 +375,6 @@ def _page_url(request: Request, limit: int, offset: int) -> str:
     return f"{quote(request.scope['path'])}?{query}"
 
 
-def _previous_page(total: int, limit: int, offset: int) -> tuple[int, int] | None:
-    """The ``(limit, offset)`` of the page before ``offset``; it never repeats a row of the current one."""
-    if offset == 0:
-        return None
-    if offset >= total:  # past the end: back to the last page of the walk from the start
-        return limit, max(0, total - 1) // limit * limit
-    if offset < limit:  # fewer rows than a page lie before: exactly those
-        return offset, 0
-    return limit, offset - limit
-
-
 def collect_artifacts(
     *,
     class_filter: str | None = None,
@@ -591,12 +580,17 @@ def serve_artifact(
     if full_path.is_dir():
         if request.url.path.startswith("/artifacts") and format != "json":
             return _artifacts_page(request, resolved_ctx)
+        # One fixed grid of pages: "previous" and "next" then never skip, repeat or resize a page.
+        if offset % limit:
+            raise HTTPException(status_code=422, detail="offset must be a multiple of limit")
         listing = _directory_listing(path, root_key, root_path, remainder, limit=limit, offset=offset)
-        previous = _previous_page(listing["total"], limit, offset)
+        last = max(0, listing["total"] - 1) // limit * limit
+        # Past the end, "previous" is the last page that has rows.
+        previous = min(offset - limit, last) if offset else None
         following = offset + limit if offset + limit < listing["total"] else None
         return {
             **listing,
-            "previous": None if previous is None else _page_url(request, *previous),
+            "previous": None if previous is None else _page_url(request, limit, previous),
             "next": None if following is None else _page_url(request, limit, following),
         }
 

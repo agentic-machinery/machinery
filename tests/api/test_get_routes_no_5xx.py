@@ -367,12 +367,20 @@ def test_artifacts_listing_is_paginated(tmp_path: Path) -> None:
         for later, earlier in zip(pages[:0:-1], pages[-2::-1], strict=True):
             assert client.get(later["previous"]).json()["items"] == earlier["items"]
 
-    # Unaligned and past-end offsets: "previous" ends where the page starts, or at the walk's last page.
-    for offset, start, count in ((1, 0, 1), (2, 0, 2), (4, 1, 3), (len(names), 204, 1), (999, 204, 1)):
-        at = client.get(f"/files/docs/reports?limit=3&offset={offset}").json()
-        back = client.get(at["previous"]).json()
-        assert (back["offset"], back["items_count"]) == (start, count), offset
-        assert [item["name"] for item in back["items"]] == names[start:start + count], offset
+    # Pages sit on one grid: "previous" then "next" restores the same page at the same size.
+    middle = client.get("/files/docs/reports?limit=3&offset=6").json()
+    restored = client.get(client.get(middle["previous"]).json()["next"]).json()
+    assert restored == middle
+    # Past the end, aligned: "previous" is the last page with rows (205 rows end at offset 204).
+    for offset in (207, 999):
+        beyond = client.get(f"/files/docs/reports?limit=3&offset={offset}").json()
+        back = client.get(beyond["previous"]).json()
+        assert (beyond["items_count"], beyond["next"], back["offset"]) == (0, None, 204), offset
+        assert [item["name"] for item in back["items"]] == names[204:], offset
+    # An offset off the grid is refused with its reason, never served as a page of another size.
+    for query in ("limit=3&offset=1", "limit=3&offset=4", "offset=1"):
+        refused = client.get(f"/files/docs/reports?{query}")
+        assert (refused.status_code, refused.json()["detail"]) == (422, "offset must be a multiple of limit"), query
 
     for query in (f"limit={docs_router.LISTING_PAGE_MAX + 1}", "limit=0", "offset=-1"):
         assert client.get(f"/files/docs/reports?{query}").status_code == 422, query
