@@ -87,14 +87,23 @@ The selected section supplies every reply instruction, including where to put th
 
 Every code or infra brief includes this **Reply format** section. It is the reply contract
 `verify_review` and the verdict recorder both accept. The reply is one JSON object and
-nothing else. The object matches
+nothing else, except for the security sign-off below. The object matches
 [`lu_machinery/schemas/code-review-findings.v1.schema.json`](../../../../../lu_machinery/schemas/code-review-findings.v1.schema.json)
 as the merge-base holds it ([judge inputs](#judge-inputs-come-from-the-merge-base)); `verify_review`
 and the recorder validate against the installed release's copy. The reviewer uses that file's field names, required fields,
 allowed values and nested definitions, and adds none. `overall` includes `correctness`,
 `explanation` and `confidence`. Each finding includes `confidence` and `verbatim` with the
 schema's other required fields. `overall.correctness` is `correct` to approve, `incorrect`
-to request changes, and `uncertain` for `BLOCKED`.
+to request changes, and `uncertain` for `BLOCKED`. A finding with category `security`
+blocks at every priority, so a reply that approves never carries one.
+
+**Security sign-off.** A critical review (a security path, critical risk or the `security`
+profile) approves only with a sign-off, and so does any approval after another review of the
+PR raised a security finding. The reply is then this envelope: line 1 `VERDICT: APPROVE`,
+line 2 `SCORE: <n>/10`, then exactly one line `SECURITY_VERDICT: PASS`, then the same object
+in one `json` fence, with nothing after the fence. Never write the words security verdict
+anywhere else in the reply, the explanation included; call it the sign-off line. Only a
+`critical_review` seat signs off; the recorder refuses any other form of the approval.
 
 The brief carries this repository-relative schema path, or an exact shape generated from
 that file. It never carries a hand-written schema copy or asks for the format by name
@@ -118,7 +127,7 @@ The recorder's extension and the permitted capabilities are defined by
 already allows it.
 
 Ids are stable: a later round reuses `F1` rather than renaming it. Paths are
-repository-relative with line suffixes. A `SCORE` line is not part of this reply. The
+repository-relative with line suffixes. Outside the sign-off envelope, a `SCORE` line is not part of this reply. The
 council's anchored rubric
 ([decision report](../../drive-epic/references/decision-report.md#council-optional-independent-panel),
 "Findings and score") never gates a merge. The recorder stores a score when a reply still
