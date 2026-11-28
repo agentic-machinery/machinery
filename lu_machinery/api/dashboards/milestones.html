@@ -12,8 +12,8 @@
 <header>
   <div class="header-top">
     <div class="title">
-      <h1>Milestones and progress</h1>
-      <p class="purpose">Open milestones and issue progress across fleet repositories.</p>
+      <h1>Milestones</h1>
+      <p class="purpose">Open milestones, due state, progress, blockers, and ready issues across fleet repositories.</p>
     </div>
     <div class="header-utils">
       <nav class="sites" id="machinery-sites" aria-label="Sites"></nav>
@@ -30,8 +30,8 @@
   </div>
 </header>
 <main id="main" tabindex="-1">
-  <section class="wide" id="milestones">
-    <h2>Milestones and progress <span class="age" id="milestones-age">Loading…</span></h2>
+  <section class="wide stacked" id="milestones">
+    <h2>At a glance <span class="age" id="milestones-age">Loading…</span></h2>
     <p id="milestones-status" class="visually-hidden" aria-live="polite" aria-atomic="true"></p>
     <div id="milestones-content">Loading…</div>
   </section>
@@ -39,54 +39,688 @@
 <script src="/machinery.js"></script>
 <script>
 "use strict";
-const {escapeHtml, safeHttpUrl, createPanelRunner} = Machinery;
+const {
+  escapeHtml, safeHttpUrl, toDate, span, labelled, td, text, chip,
+  fetchJson, snapshotClockStamp, createPanelRunner,
+} = Machinery;
 
-function renderMilestones(data) {
-  if (data.status === "pending") return '<p class="muted">Loading milestones from GitHub…</p>';
-  const repos = Array.isArray(data.repositories) ? data.repositories : [];
-  const age = value => Number.isFinite(value) ? `${Math.ceil(value)}s` : "unknown";
-  const expanded = new Set([...document.querySelectorAll("#milestones details[open]")].map(item => item.dataset.milestone));
-  const out = [`<p class="${data.stale ? "warn" : "muted"}">${data.stale ? "Stale. " : ""}${escapeHtml(data.freshness || "")} Private repositories show counts only.</p>`];
-  for (const repo of repos) {
-    out.push(`<h3>${escapeHtml(repo.repository)} · data age ${age(repo.age_seconds)}${repo.stale ? " · STALE" : ""}</h3>`);
-    if (repo.status !== "ok") out.push(`<p class="warn">${escapeHtml(repo.reason || "Milestone data unknown")}</p>`);
-    const milestones = Array.isArray(repo.milestones) ? repo.milestones : [];
-    if (!milestones.length && repo.status === "ok") out.push('<p class="muted">No open milestones.</p>');
-    for (const [index, item] of milestones.entries()) {
-      const name = repo.private ? "Private milestone" : escapeHtml(item.title);
-      const percent = Number.isFinite(item.percent_complete) ? `${item.percent_complete}%` : "unknown";
-      const counts = `${item.open_issues ?? "?"} open · ${item.closed_issues ?? "?"} closed · ${percent} complete`;
-      const key = `${repo.repository}:${item.number ?? index}`;
-      out.push(`<details data-milestone="${escapeHtml(key)}"${expanded.has(key) ? " open" : ""}><summary>${name} · ${escapeHtml(counts)}</summary>`);
-      if (Number.isFinite(item.percent_complete)) out.push(`<progress max="100" value="${item.percent_complete}" aria-label="${name} completion">${percent}</progress>`);
-      if (!repo.private) {
-        out.push(`<p>${escapeHtml(item.description_first_line || "")}</p><p class="muted">Due ${escapeHtml(item.due_on ? item.due_on.slice(0, 10) : "not set")}</p>`);
-        const issues = Array.isArray(item.issues) ? item.issues : [];
-        if (item.issues_status !== "ok") out.push('<p class="warn">Open issue list is incomplete or unavailable.</p>');
-        else if (!issues.length) out.push('<p class="muted">No open issues.</p>');
-        if (issues.length) out.push('<table><thead><tr><th scope="col">Issue</th><th scope="col">Labels</th></tr></thead><tbody>');
-        for (const issue of issues) {
-          const safe = safeHttpUrl(issue.url);
-          const link = safe
-            ? `<a href="${escapeHtml(safe)}">#${escapeHtml(issue.number)} ${escapeHtml(issue.title)}</a>`
-            : `#${escapeHtml(issue.number)} ${escapeHtml(issue.title)}`;
-          const labels = (Array.isArray(issue.labels) ? issue.labels : []).map(escapeHtml).join(", ");
-          out.push(`<tr><td>${link}</td><td>${labels}</td></tr>`);
-        }
-        if (issues.length) out.push('</tbody></table>');
-      }
-      out.push('</details>');
+const PLANNING_URL = "/api/fleet/model-stats/planning";
+const PLANNING_STALE_AFTER_S = 420;
+const DAY_MS = 86400000;
+const SLUG_RE = /^[A-Za-z0-9][A-Za-z0-9_.-]*\/[A-Za-z0-9][A-Za-z0-9_.-]*$/;
+const ISSUE_REF_RE = /^([A-Za-z0-9][A-Za-z0-9_.-]*\/[A-Za-z0-9][A-Za-z0-9_.-]*)#([1-9][0-9]*)$/;
+
+function isNonNegInt(value) {
+  return typeof value === "number" && Number.isInteger(value) && value >= 0;
+}
+
+function isFiniteNonNeg(value) {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0;
+}
+
+function renderTable(headers, rows, numericCols = []) {
+  const numSet = new Set(numericCols);
+  const head = headers
+    .map((h, i) => `<th scope="col"${numSet.has(i) ? ' class="num"' : ""}>${escapeHtml(h)}</th>`)
+    .join("");
+  const body = rows.map(cells => `<tr>${labelled(cells, headers)}</tr>`).join("");
+  return `<table><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table>`;
+}
+
+function milestoneClosedUrl(slug, number) {
+  if (typeof slug !== "string" || !SLUG_RE.test(slug)) return null;
+  if (!Number.isInteger(number) || number <= 0) return null;
+  return safeHttpUrl(`https://github.com/${slug}/milestone/${number}?closed=1`);
+}
+
+function issueRefLink(ref, currentRepoSlug = null) {
+  if (ref === null || ref === undefined) return "Private issue";
+  const raw = String(ref);
+  const match = ISSUE_REF_RE.exec(raw);
+  if (!match) return escapeHtml(raw);
+  const [, slug, num] = match;
+  const display = currentRepoSlug && slug.toLowerCase() === currentRepoSlug.toLowerCase()
+    ? `#${num}` : raw;
+  const url = safeHttpUrl(`https://github.com/${slug}/issues/${num}`);
+  return url ? `<a href="${escapeHtml(url)}">${escapeHtml(display)}</a>` : escapeHtml(display);
+}
+
+function issueJoinKey(repoSlug, number) {
+  if (typeof repoSlug !== "string" || !repoSlug || !Number.isInteger(number) || number <= 0) return null;
+  return `${repoSlug.toLowerCase()}#${number}`;
+}
+
+function planningAgeSeconds(planning, reading = null, now = Date.now()) {
+  const issues = planning && typeof planning === "object" ? planning.issues : null;
+  const baseAge = issues && isFiniteNonNeg(issues.age_s) ? issues.age_s : null;
+  if (baseAge === null) return null;
+  if (!reading) return baseAge;
+  if (typeof reading.receivedMono === "number") {
+    if (!Number.isFinite(reading.receivedMono)) return null;
+    const monoNow = snapshotClockStamp();
+    if (typeof monoNow !== "number" || !Number.isFinite(monoNow)) return null;
+    const elapsed = Math.max(0, (monoNow - reading.receivedMono) / 1000);
+    const held = typeof reading._heldElapsedS === "number" && Number.isFinite(reading._heldElapsedS)
+      ? Math.max(reading._heldElapsedS, elapsed) : elapsed;
+    reading._heldElapsedS = held;
+    return baseAge + held;
+  }
+  if (typeof reading.receivedAt === "number") {
+    if (!Number.isFinite(reading.receivedAt) || typeof now !== "number" || !Number.isFinite(now)) return null;
+    const elapsed = Math.max(0, (now - reading.receivedAt) / 1000);
+    const held = typeof reading._heldElapsedS === "number" && Number.isFinite(reading._heldElapsedS)
+      ? Math.max(reading._heldElapsedS, elapsed) : elapsed;
+    reading._heldElapsedS = held;
+    return baseAge + held;
+  }
+  return baseAge;
+}
+
+function analyzePlanning(planning, reading = null, now = Date.now()) {
+  if (!planning || typeof planning !== "object" || !planning.issues || typeof planning.issues !== "object") {
+    return {
+      usable: false, status: "unknown", ageS: null, workers: "unknown", coverage: {},
+      blockedByRef: new Map(), readyByRef: new Map(), readyNowSet: new Set(),
+      blockers: [], readyNow: [], blockedList: [], partialNote: null,
+    };
+  }
+  const issues = planning.issues;
+  const rawStatus = typeof issues.status === "string" ? issues.status : "unknown";
+  const ageS = planningAgeSeconds(planning, reading, now);
+  const brokenClock = reading !== null && issues.age_s !== undefined && ageS === null;
+  const invalidAge = issues.age_s !== undefined && !isFiniteNonNeg(issues.age_s);
+  const expired = ageS !== null && ageS > PLANNING_STALE_AFTER_S;
+  const status = rawStatus === "pending" ? "pending"
+    : (rawStatus === "stale" || expired) ? "stale"
+    : (brokenClock || invalidAge) ? "unknown"
+    : (rawStatus === "ok" || rawStatus === "partial") ? rawStatus
+    : "unknown";
+  const usable = status === "ok" || status === "partial";
+  const coverage = issues.coverage && typeof issues.coverage === "object" ? issues.coverage : {};
+  const workers = usable && typeof issues.workers === "string" ? issues.workers : "unknown";
+  const blockedByRef = new Map();
+  const readyByRef = new Map();
+  const readyNowSet = new Set();
+  const blockedList = usable && Array.isArray(issues.blocked) ? issues.blocked : [];
+  if (usable) {
+    for (const row of blockedList) {
+      if (!row || typeof row.ref !== "string") continue;
+      blockedByRef.set(row.ref.toLowerCase(), {
+        ref: row.ref,
+        blocked_by: Array.isArray(row.blocked_by) ? row.blocked_by : [],
+        private_blockers: isNonNegInt(row.private_blockers) ? row.private_blockers : 0,
+      });
+    }
+    for (const row of Array.isArray(issues.ready) ? issues.ready : []) {
+      if (!row || typeof row.ref !== "string") continue;
+      readyByRef.set(row.ref.toLowerCase(), typeof row.path_status === "string" ? row.path_status : "ready");
+    }
+    for (const row of Array.isArray(issues.ready_now) ? issues.ready_now : []) {
+      if (!row || typeof row.ref !== "string") continue;
+      readyNowSet.add(row.ref.toLowerCase());
     }
   }
-  if (!repos.length) out.push('<p class="warn">Fleet milestone data is unavailable.</p>');
+  let partialNote = null;
+  if (status === "partial") {
+    const read = coverage.repositories_read;
+    const total = coverage.repositories_total;
+    partialNote = isNonNegInt(read) && isNonNegInt(total)
+      ? `partial: ${read} of ${total} repos`
+      : "partial";
+  }
+  return {
+    usable,
+    status,
+    ageS,
+    workers,
+    coverage,
+    blockedByRef,
+    readyByRef,
+    readyNowSet,
+    blockers: usable && Array.isArray(issues.blockers) ? issues.blockers : [],
+    readyNow: usable && workers !== "unknown" && Array.isArray(issues.ready_now) ? issues.ready_now : [],
+    blockedList,
+    partialNote,
+  };
+}
+
+function shortRepoMap(repos) {
+  const counts = new Map();
+  for (const repo of repos) {
+    if (!repo || repo.private || typeof repo.repository !== "string" || !repo.repository) continue;
+    const short = repo.repository.includes("/") ? repo.repository.split("/").pop() : repo.repository;
+    counts.set(short.toLowerCase(), (counts.get(short.toLowerCase()) || 0) + 1);
+  }
+  return slug => {
+    if (typeof slug !== "string" || !slug) return "(unknown repo)";
+    const short = slug.includes("/") ? slug.split("/").pop() : slug;
+    return (counts.get(short.toLowerCase()) || 0) > 1 ? slug : short;
+  };
+}
+
+function anchorSlug(label) {
+  const cleaned = String(label || "repo").toLowerCase().replace(/[^a-z0-9_-]+/g, "-").replace(/^-+|-+$/g, "");
+  return cleaned || "repo";
+}
+
+function dueDisplay(dueOn, now) {
+  const dueDate = toDate(dueOn);
+  if (!dueDate) return {bucket: 2, dueMs: null, overdue: false, label: "—", tone: "muted", detail: "no due date"};
+  const dueMs = dueDate.getTime();
+  const iso = dueDate.toISOString().slice(0, 10);
+  const diffMs = dueMs - now;
+  if (diffMs < 0) {
+    const days = Math.floor(Math.abs(diffMs) / DAY_MS);
+    const spanText = days >= 1 ? `${days} d` : "<1 d";
+    return {
+      bucket: 0, dueMs, overdue: true,
+      label: `OVERDUE ${spanText}`, tone: "bad",
+      detail: `OVERDUE ${spanText} (due ${iso})`,
+    };
+  }
+  const days = Math.ceil(diffMs / DAY_MS);
+  const suffix = days === 0 ? "today" : `${days} d`;
+  return {
+    bucket: 1, dueMs, overdue: false,
+    label: `${iso} · ${suffix}`, tone: days <= 7 ? "warn" : "",
+    detail: `due ${iso} (${suffix})`,
+  };
+}
+
+function formatPercent(value) {
+  if (typeof value !== "number" || !Number.isFinite(value)) return null;
+  const clamped = Math.max(0, Math.min(100, value));
+  return Math.round(clamped * 10) / 10;
+}
+
+function progressMarkup(item, titlePlain, compact = false) {
+  const open = isNonNegInt(item.open_issues) ? item.open_issues : null;
+  const closed = isNonNegInt(item.closed_issues) ? item.closed_issues : null;
+  const total = open !== null && closed !== null ? open + closed : null;
+  const pct = formatPercent(item.percent_complete);
+  const pctText = pct !== null ? `${pct}%` : "unknown";
+  const countsText = total !== null
+    ? (compact ? `${closed}/${total} (${pctText})` : `${closed} of ${total} closed (${pctText})`)
+    : `${pctText} complete`;
+  const bar = pct !== null
+    ? `<progress class="ms-progress" max="100" value="${pct}" aria-label="${escapeHtml(titlePlain)} completion">${escapeHtml(pctText)}</progress>`
+    : "";
+  return `<span class="milestone-progress">${bar}<span>${escapeHtml(countsText)}</span></span>`;
+}
+
+function collectMilestones(data, plan, now) {
+  const repos = Array.isArray(data?.repositories) ? data.repositories : [];
+  const labelRepo = shortRepoMap(repos);
+  const entries = [];
+  const repoProblems = [];
+  const usedAnchors = new Set();
+
+  for (const repo of repos) {
+    if (!repo || typeof repo !== "object") continue;
+    const isPrivate = Boolean(repo.private);
+    const repoLabel = isPrivate ? "(private)" : labelRepo(repo.repository);
+    if (repo.status !== "ok" || repo.stale) {
+      repoProblems.push({
+        repoLabel,
+        status: repo.status || "unknown",
+        reason: repo.status !== "ok" ? (repo.reason || "milestone data unknown") : "milestone snapshot is stale",
+        stale: Boolean(repo.stale),
+      });
+    }
+    const milestones = Array.isArray(repo.milestones) ? repo.milestones : [];
+    for (const [index, item] of milestones.entries()) {
+      if (!item || typeof item !== "object") continue;
+      const titlePlain = isPrivate ? "Private milestone" : String(item.title || "(untitled milestone)");
+      const due = isPrivate ? dueDisplay(null, now) : dueDisplay(item.due_on, now);
+      const pct = formatPercent(item.percent_complete);
+      const number = !isPrivate && Number.isInteger(item.number) && item.number > 0 ? item.number : null;
+      let anchorId = null;
+      if (!isPrivate) {
+        const base = `ms-${anchorSlug(repoLabel)}-${number ?? index}`;
+        let candidate = base;
+        let suffix = 2;
+        while (usedAnchors.has(candidate)) {
+          candidate = `${base}-${suffix++}`;
+        }
+        usedAnchors.add(candidate);
+        anchorId = candidate;
+      }
+      const rawIssues = !isPrivate && Array.isArray(item.issues) ? item.issues : [];
+      const issuesStatus = isPrivate ? "withheld" : String(item.issues_status || "unknown");
+      const openCount = isNonNegInt(item.open_issues) ? item.open_issues : null;
+      const closedCount = isNonNegInt(item.closed_issues) ? item.closed_issues : null;
+
+      const blockedIssues = [];
+      const unblockedIssues = [];
+      for (const issue of rawIssues) {
+        if (!issue || typeof issue !== "object") continue;
+        const key = issueJoinKey(repo.repository, issue.number);
+        const blockerInfo = plan.usable && key ? plan.blockedByRef.get(key) : null;
+        const readyStatus = plan.usable && key ? plan.readyByRef.get(key) : null;
+        const enriched = {issue, key, blockerInfo, readyStatus};
+        if (blockerInfo) blockedIssues.push(enriched);
+        else unblockedIssues.push(enriched);
+      }
+
+      // Blocked count cell: fail closed!
+      // Private -> always "withheld".
+      // Planning unusable (unknown/stale/pending/errored) -> always "unknown", never 0.
+      // Incomplete issue list with open issues -> "unknown" if 0 observed, else "<n> (partial)".
+      let blockedCell;
+      let blockedCountKnown = null;
+      if (isPrivate) {
+        blockedCell = {text: "withheld", tone: "muted"};
+      } else if (!plan.usable) {
+        blockedCell = {text: "unknown", tone: "warn"};
+      } else if (issuesStatus !== "ok" && (openCount === null || openCount > 0)) {
+        if (blockedIssues.length > 0 && issuesStatus === "partial") {
+          blockedCell = {text: `${blockedIssues.length} (partial)`, tone: "warn"};
+          blockedCountKnown = blockedIssues.length;
+        } else {
+          blockedCell = {text: "unknown", tone: "warn"};
+        }
+      } else {
+        blockedCountKnown = blockedIssues.length;
+        blockedCell = {
+          text: String(blockedIssues.length),
+          tone: blockedIssues.length > 0 ? "bad" : "",
+        };
+      }
+
+      entries.push({
+        isPrivate,
+        repoSlug: isPrivate ? null : (typeof repo.repository === "string" ? repo.repository : null),
+        repoLabel,
+        repoStale: Boolean(repo.stale),
+        number,
+        anchorId,
+        titlePlain,
+        description: isPrivate ? "" : String(item.description_first_line || ""),
+        due,
+        pct,
+        openCount,
+        closedCount,
+        issuesStatus,
+        blockedIssues,
+        unblockedIssues,
+        blockedCell,
+        blockedCountKnown,
+        item,
+      });
+    }
+  }
+
+  entries.sort((a, b) => {
+    if (a.due.bucket !== b.due.bucket) return a.due.bucket - b.due.bucket;
+    if (a.due.bucket < 2 && a.due.dueMs !== b.due.dueMs) return a.due.dueMs - b.due.dueMs;
+    const aPct = a.pct === null ? -1 : a.pct;
+    const bPct = b.pct === null ? -1 : b.pct;
+    if (aPct !== bPct) return bPct - aPct;
+    return a.repoLabel.localeCompare(b.repoLabel)
+      || a.titlePlain.localeCompare(b.titlePlain)
+      || (a.number ?? 0) - (b.number ?? 0);
+  });
+
+  return {entries, repoProblems, repos};
+}
+
+function readyStatusBadge(readyStatus, plan) {
+  if (!plan.usable) return "";
+  if (readyStatus === "ready_now") return '<span class="ms-badge ok">Ready now</span>';
+  if (readyStatus === "path_conflicts") return '<span class="ms-badge warn">Path conflict</span>';
+  if (readyStatus === "scope_unknown") return '<span class="ms-badge muted">Scope unknown</span>';
+  if (readyStatus === "worker_scope_unknown") return '<span class="ms-badge warn">Ready · worker paths unknown</span>';
+  if (readyStatus) return `<span class="ms-badge ok">Ready</span>`;
+  return plan.status === "partial"
+    ? '<span class="ms-badge muted">Status unknown (partial)</span>'
+    : '<span class="ms-badge muted">Deps unknown</span>';
+}
+
+function renderIssueLabels(labels) {
+  const list = Array.isArray(labels) ? labels.filter(label => typeof label === "string" && label) : [];
+  if (!list.length) return '<span class="muted">—</span>';
+  return list.map(label => `<span class="ms-badge muted">${escapeHtml(label)}</span>`).join(" ");
+}
+
+function renderIssueTitleLink(issue) {
+  const safe = safeHttpUrl(issue.url);
+  const label = `#${issue.number ?? "?"} ${issue.title || ""}`;
+  return safe
+    ? `<a href="${escapeHtml(safe)}">${escapeHtml(label)}</a>`
+    : escapeHtml(label);
+}
+
+function renderMilestoneCard(entry, plan) {
+  const closedUrl = milestoneClosedUrl(entry.repoSlug, entry.number);
+  const closedLink = closedUrl
+    ? `<a class="ms-closed-link" href="${escapeHtml(closedUrl)}">Closed issues on GitHub</a>`
+    : "";
+  const dueClass = entry.due.tone ? ` class="${entry.due.tone}"` : "";
+  const parts = [
+    `<article class="milestone-card" id="${escapeHtml(entry.anchorId)}">`,
+    `<div class="milestone-head">`,
+    `<h3>${escapeHtml(entry.titlePlain)} <span class="muted">· ${escapeHtml(entry.repoLabel)} · </span><span${dueClass}>${escapeHtml(entry.due.detail)}</span></h3>`,
+    closedLink,
+    `</div>`,
+    `<div class="milestone-progress-row">${progressMarkup(entry.item, entry.titlePlain, false)}</div>`,
+  ];
+  if (entry.description) {
+    parts.push(`<p class="muted">${escapeHtml(entry.description)}</p>`);
+  }
+  if (entry.issuesStatus !== "ok") {
+    parts.push('<p class="warn">Open issue list is incomplete or unavailable.</p>');
+  }
+  if (!plan.usable) {
+    const why = plan.status === "stale" ? "planning snapshot is stale"
+      : plan.status === "pending" ? "planning data is still loading"
+      : "planning data is unavailable";
+    parts.push(`<p class="warn">Blocker status unknown (${escapeHtml(why)}).</p>`);
+  }
+
+  if (plan.usable && entry.blockedIssues.length) {
+    const rows = entry.blockedIssues.map(({issue, blockerInfo}) => {
+      const depLinks = blockerInfo.blocked_by.map(ref => issueRefLink(ref, entry.repoSlug));
+      if (blockerInfo.private_blockers > 0) {
+        depLinks.push(`+${blockerInfo.private_blockers} private`);
+      }
+      const depHtml = depLinks.length
+        ? `<span class="bad">Blocked</span> by ${depLinks.join(", ")}`
+        : '<span class="bad">Blocked</span>';
+      return [
+        td(renderIssueTitleLink(issue)),
+        td(depHtml),
+        td(renderIssueLabels(issue.labels)),
+      ];
+    });
+    parts.push(`<h4>Blocked (${entry.blockedIssues.length})</h4>`);
+    parts.push(renderTable(["Issue", "Blocked by", "Labels"], rows));
+  }
+
+  if (entry.unblockedIssues.length) {
+    const heading = plan.usable ? `Open (${entry.unblockedIssues.length})` : `Open issues (${entry.unblockedIssues.length})`;
+    const rows = entry.unblockedIssues.map(({issue, readyStatus}) => [
+      td(renderIssueTitleLink(issue)),
+      td(plan.usable ? readyStatusBadge(readyStatus, plan) : '<span class="warn">unknown</span>'),
+      td(renderIssueLabels(issue.labels)),
+    ]);
+    parts.push(`<h4>${heading}</h4>`);
+    parts.push(renderTable(["Issue", "Status", "Labels"], rows));
+  } else if (entry.issuesStatus === "ok" && !entry.blockedIssues.length) {
+    parts.push('<p class="muted">No open issues.</p>');
+  }
+
+  parts.push("</article>");
+  return parts.join("");
+}
+
+function renderTopBlockers(plan) {
+  const out = ['<h2 id="top-blockers">Top blockers</h2>'];
+  if (!plan.usable) {
+    const reason = plan.status === "pending" ? "Planning data is loading."
+      : plan.status === "stale" ? "Planning data is stale; blocker rankings are unknown."
+      : "Planning data is unavailable; blocker rankings are unknown.";
+    out.push(`<p class="warn">${escapeHtml(reason)}</p>`);
+    return out.join("");
+  }
+  if (plan.partialNote) {
+    out.push(`<p class="warn">Planning coverage is ${escapeHtml(plan.partialNote)}.</p>`);
+  }
+  if (!plan.blockers.length) {
+    out.push('<p class="muted">No ranked blockers in the current snapshot.</p>');
+    return out.join("");
+  }
+  const rows = plan.blockers.map(row => {
+    const total = isNonNegInt(row.total) ? row.total : "?";
+    const direct = isNonNegInt(row.direct) ? row.direct : "?";
+    return [
+      td(issueRefLink(row.ref)),
+      td(`unblocks ${escapeHtml(total)} (direct ${escapeHtml(direct)})`, "num"),
+    ];
+  });
+  out.push(renderTable(["Issue", "Impact"], rows, [1]));
   return out.join("");
 }
 
-const PANELS = [
-  {id: "milestones", label: "Milestones", urls: ["/api/milestones"], render: renderMilestones, retry: data => data.status === "pending"},
-];
+function renderReadyNow(plan) {
+  const out = ['<h2 id="ready-now">Ready now</h2>'];
+  if (!plan.usable) {
+    const reason = plan.status === "pending" ? "Planning data is loading."
+      : plan.status === "stale" ? "Planning data is stale; ready-now issues are unknown."
+      : "Planning data is unavailable; ready-now issues are unknown.";
+    out.push(`<p class="warn">${escapeHtml(reason)}</p>`);
+    return out.join("");
+  }
+  if (plan.workers === "unknown") {
+    out.push('<p class="warn">Worker paths are unavailable; ready-now results are withheld.</p>');
+    return out.join("");
+  }
+  const notes = [];
+  if (plan.partialNote) notes.push(`Planning coverage is ${plan.partialNote}.`);
+  if (plan.workers === "partial") notes.push("Some worker paths are unknown; affected ready-now results are withheld.");
+  if (isNonNegInt(plan.coverage.path_conflicts) && plan.coverage.path_conflicts > 0) {
+    notes.push(`${plan.coverage.path_conflicts} ready cards overlap a live worker.`);
+  }
+  if (isNonNegInt(plan.coverage.scope_unknown) && plan.coverage.scope_unknown > 0) {
+    notes.push(`${plan.coverage.scope_unknown} ready cards have no comparable scope paths.`);
+  }
+  if (notes.length) out.push(`<p class="warn">${escapeHtml(notes.join(" "))}</p>`);
+  if (!plan.readyNow.length) {
+    out.push('<p class="muted">No public issues with closed dependencies and clear paths in the current snapshot.</p>');
+    return out.join("");
+  }
+  const rows = plan.readyNow.map(row => [td(issueRefLink(row.ref))]);
+  out.push(renderTable(["Issue"], rows));
+  return out.join("");
+}
 
-const runner = createPanelRunner({panels: PANELS});
+function renderOtherBlocked(plan, shownRefs) {
+  if (!plan.usable) return "";
+  const extra = plan.blockedList.filter(row => row && typeof row.ref === "string" && !shownRefs.has(row.ref.toLowerCase()));
+  if (!extra.length) return "";
+  const rows = extra.map(row => {
+    const deps = (Array.isArray(row.blocked_by) ? row.blocked_by : []).map(ref => issueRefLink(ref));
+    if (isNonNegInt(row.private_blockers) && row.private_blockers > 0) {
+      deps.push(`+${row.private_blockers} private`);
+    }
+    return [td(issueRefLink(row.ref)), td(deps.join(", ") || "—")];
+  });
+  return `<details id="other-blocked"><summary>Blocked issues outside open milestones (${extra.length})</summary>`
+    + renderTable(["Issue", "Open dependencies"], rows)
+    + "</details>";
+}
+
+function renderFreshnessStrip(data, plan) {
+  const dataAge = isFiniteNonNeg(data?.age_seconds) ? span(data.age_seconds) : "unknown";
+  const dataPart = `data ${dataAge}${data?.stale ? " STALE" : ""}`;
+  let planPart;
+  if (plan.status === "pending") planPart = "planning loading…";
+  else if (plan.status === "stale") planPart = `planning ${plan.ageS !== null ? span(plan.ageS) : "age unknown"} STALE`;
+  else if (plan.status === "unknown") planPart = "planning unknown";
+  else if (plan.status === "partial") planPart = `planning ${plan.ageS !== null ? span(plan.ageS) : "age unknown"} (${plan.partialNote})`;
+  else planPart = `planning ${plan.ageS !== null ? span(plan.ageS) : "age unknown"}`;
+
+  const warn = Boolean(data?.stale) || plan.status !== "ok";
+  const notes = [`${dataPart}, ${planPart}.`];
+  if (plan.usable && isNonNegInt(plan.coverage.dependency_unknown) && plan.coverage.dependency_unknown > 0) {
+    notes.push(`${plan.coverage.dependency_unknown} open issues have unresolved dependencies.`);
+  }
+  if (plan.coverage.private_open_issues) notes.push("Private issue details are withheld.");
+  notes.push("Private repositories show counts only.");
+  return `<p class="${warn ? "warn" : "muted"}">${escapeHtml(notes.join(" "))}</p>`;
+}
+
+function renderMilestones(data, planning = null, now = Date.now(), planningReading = null) {
+  if (!data || typeof data !== "object") {
+    return '<p class="warn">Fleet milestone data is unavailable.</p>';
+  }
+  if (data.status === "pending") {
+    return '<p class="muted">Loading milestones from GitHub…</p>';
+  }
+  const plan = analyzePlanning(planning, planningReading, now);
+  const {entries, repoProblems, repos} = collectMilestones(data, plan, now);
+  const out = [renderFreshnessStrip(data, plan)];
+
+  for (const problem of repoProblems) {
+    out.push(
+      `<p class="warn">${escapeHtml(problem.repoLabel)}: ${escapeHtml(String(problem.reason).replaceAll("_", " "))}`
+      + `${problem.stale ? " · STALE" : ""}.</p>`
+    );
+  }
+
+  if (!repos.length) {
+    out.push('<p class="warn">Fleet milestone data is unavailable.</p>');
+  } else if (!entries.length) {
+    if (!repoProblems.length) out.push('<p class="muted">No open milestones.</p>');
+  } else {
+    const summaryRows = entries.map(entry => {
+      const nameCell = entry.isPrivate
+        ? td(escapeHtml(entry.titlePlain))
+        : td(`<a href="#${escapeHtml(entry.anchorId)}">${escapeHtml(entry.titlePlain)}</a>`);
+      return [
+        nameCell,
+        text(entry.repoLabel, entry.isPrivate ? "muted" : ""),
+        text(entry.due.label, entry.due.tone),
+        td(progressMarkup(entry.item, entry.titlePlain, true)),
+        text(entry.openCount === null ? "?" : String(entry.openCount), "num"),
+        text(entry.closedCount === null ? "?" : String(entry.closedCount), "num"),
+        text(entry.blockedCell.text, `num${entry.blockedCell.tone ? ` ${entry.blockedCell.tone}` : ""}`),
+      ];
+    });
+    out.push(renderTable(["Milestone", "Repo", "Due", "Progress", "Open", "Closed", "Blocked"], summaryRows, [4, 5, 6]));
+
+    const publicEntries = entries.filter(entry => !entry.isPrivate);
+    if (publicEntries.length) {
+      out.push("<h2>Milestone details</h2>");
+      for (const entry of publicEntries) {
+        out.push(renderMilestoneCard(entry, plan));
+      }
+    }
+  }
+
+  const shownRefs = new Set();
+  for (const entry of entries) {
+    for (const row of entry.blockedIssues) {
+      if (row.key) shownRefs.add(row.key);
+    }
+  }
+  out.push(renderTopBlockers(plan));
+  out.push(renderReadyNow(plan));
+  out.push(renderOtherBlocked(plan, shownRefs));
+  return out.join("");
+}
+
+function renderMilestoneChips(latest, now = Date.now(), planningReading = null) {
+  const data = latest?.milestones;
+  if (!data || data.status === "pending") return "";
+  const plan = analyzePlanning(latest?.planning, planningReading, now);
+  const {entries, repoProblems, repos} = collectMilestones(data, plan, now);
+  const allReposFailed = !repos.length || repos.every(repo => !repo || (repo.status !== "ok" && repo.status !== "partial"));
+  const out = [];
+  if (allReposFailed) {
+    out.push(chip("#milestones", "?", "open milestones unknown", "warn"));
+  } else {
+    const partial = repoProblems.length > 0;
+    out.push(chip("#milestones", entries.length, partial ? "open observed" : "open", partial ? "warn" : ""));
+    const overdue = entries.filter(entry => entry.due.overdue).length;
+    out.push(chip("#milestones", overdue, "overdue", overdue > 0 ? "bad" : partial ? "warn" : ""));
+  }
+
+  if (!plan.usable) {
+    out.push(chip("#top-blockers", "?", "blocked", "warn"));
+    out.push(chip("#ready-now", "?", "ready now", "warn"));
+  } else {
+    const blockedTotal = plan.blockedList.length;
+    const isPartial = plan.status === "partial";
+    out.push(chip("#top-blockers", blockedTotal, isPartial ? "blocked (partial)" : "blocked",
+      blockedTotal > 0 ? "bad" : isPartial ? "warn" : ""));
+    if (plan.workers === "unknown") {
+      out.push(chip("#ready-now", "?", "ready now", "warn"));
+    } else {
+      const readyLabel = isPartial || plan.workers === "partial" ? "ready now (partial)" : "ready now";
+      out.push(chip("#ready-now", plan.readyNow.length, readyLabel,
+        isPartial || plan.workers === "partial" ? "warn" : plan.readyNow.length > 0 ? "info" : ""));
+    }
+  }
+  return out.join("");
+}
+
+let planningGeneration = 0;
+let planningRetries = 0;
+let latestPlanningReading = null;
+
+function repaintMilestones(now = Date.now()) {
+  if (!runner.latest.milestones) return;
+  const content = document.getElementById("milestones-content");
+  if (content) {
+    content.innerHTML = renderMilestones(runner.latest.milestones, runner.latest.planning, now, latestPlanningReading);
+  }
+  const box = document.getElementById("chips");
+  if (box) box.innerHTML = renderMilestoneChips(runner.latest, now, latestPlanningReading);
+}
+
+function enrichPlanning() {
+  const gen = ++planningGeneration;
+  fetchJson(PLANNING_URL).then(reading => {
+    if (gen !== planningGeneration) return;
+    latestPlanningReading = reading;
+    runner.latest.planning = reading.data;
+    const now = Date.now();
+    repaintMilestones(now);
+    if (reading.data?.issues?.status === "pending" && planningRetries < Machinery.RETRY_LIMIT) {
+      planningRetries += 1;
+      setTimeout(() => { if (gen === planningGeneration) enrichPlanning(); }, 3000);
+    } else {
+      planningRetries = 0;
+    }
+  }).catch(() => {
+    if (gen !== planningGeneration) return;
+    latestPlanningReading = null;
+    runner.latest.planning = null;
+    repaintMilestones();
+  });
+}
+
+function expirePlanningIfStale(_panel, _latest, _updateChips, now = Date.now()) {
+  if (!runner.latest.planning || !latestPlanningReading) return;
+  const ageS = planningAgeSeconds(runner.latest.planning, latestPlanningReading, now);
+  if (ageS !== null && ageS > PLANNING_STALE_AFTER_S && !latestPlanningReading._expiredPainted) {
+    latestPlanningReading._expiredPainted = true;
+    repaintMilestones(now);
+  }
+}
+
+function updateStickyOffset() {
+  if (typeof document !== "object" || !document || typeof getComputedStyle !== "function") return;
+  const header = document.querySelector("header");
+  if (!header || typeof header.getBoundingClientRect !== "function") return;
+  const sticky = getComputedStyle(header).position === "sticky";
+  const offset = sticky ? Math.ceil(header.getBoundingClientRect().height) + 12 : 12;
+  document.documentElement?.style?.setProperty("--sticky-offset", `${offset}px`);
+}
+
+const PANELS = [{
+  id: "milestones",
+  label: "Milestones",
+  urls: ["/api/milestones"],
+  render: data => renderMilestones(data, runner.latest.planning ?? null, Date.now(), latestPlanningReading),
+  onData: () => enrichPlanning(),
+  onTick: expirePlanningIfStale,
+  onError: latest => { planningGeneration += 1; latest.planning = null; latestPlanningReading = null; },
+  retry: data => data?.status === "pending",
+}];
+
+const runner = createPanelRunner({
+  panels: PANELS,
+  renderChips: latest => renderMilestoneChips(latest, Date.now(), latestPlanningReading),
+});
+updateStickyOffset();
+if (typeof ResizeObserver === "function" && typeof document === "object" && document) {
+  const header = document.querySelector("header");
+  if (header) new ResizeObserver(updateStickyOffset).observe(header);
+}
+if (typeof window === "object" && window && typeof window.addEventListener === "function") {
+  window.addEventListener("resize", updateStickyOffset);
+}
 runner.start();
 </script>
 </body>
