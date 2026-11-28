@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 
 import pytest
 
@@ -48,13 +49,25 @@ def _notice(service: AuthorityService):
     return notice, body
 
 
-@pytest.mark.parametrize("slot", ["claude-epics", "claude-infra", "codex-monitor"])
+@pytest.mark.parametrize(
+    "slot",
+    [
+        "claude-epics",
+        "claude-infra",
+        "codex-monitor",
+        "codex-curriculum-upgrade",
+        "claude-monitor",
+        "gemini-monitor",
+        "cursor-monitor",
+    ],
+)
 def test_unclaimed_launcher_request_notifies_drained_cto_once(plane, slot: str) -> None:
     """Defect class: an unclaimed launcher inbox's expiry notice is queued back to that inbox.
 
-    The copy sits for seven days and dead-letters again. ``claude-epics`` is a
-    registry slot, ``claude-infra`` is a slot that is also a static identity,
-    and ``codex-monitor`` is a lane sender that is not a slot row.
+    The copy sits for seven days and dead-letters again. The cases are a
+    registry slot, a slot that is also a static identity, a lane sender, the
+    dedicated slot alias ``codex-curriculum-upgrade``, and the legacy monitor
+    aliases that resolve to a bare provider.
     """
     with AuthorityService(root=plane) as service:
         message = _expire_unclaimed(service, slot, f"handoff-{slot}")
@@ -105,3 +118,34 @@ def test_registered_non_launcher_recipient_still_receives_the_notice(plane) -> N
             "worker-task",
             DURABLE_CTO_RECIPIENT,
         }
+
+
+def test_bare_static_identity_is_not_a_launcher_inbox() -> None:
+    """Control: a static identity that is not a slot or a lane sender stays notifiable."""
+    assert AuthorityService._session_only_launcher_inbox("codex") is False
+
+
+def test_static_lane_sender_is_a_launcher_inbox(monkeypatch) -> None:
+    """Defect class: a lane sender that is also a static identity still gets the notice copy.
+
+    The live lane file has no such sender. A registry that names one must
+    count, including when the sender is a bare static identity.
+    """
+    monkeypatch.setattr(
+        "lu_machinery.ops.driver_lanes.load_registry",
+        lambda: SimpleNamespace(lanes=(SimpleNamespace(sender="codex"),)),
+    )
+    assert AuthorityService._session_only_launcher_inbox("codex") is True
+
+
+def test_unreadable_lane_registry_fails_closed_for_a_static_identity(monkeypatch) -> None:
+    """Defect class: an unreadable lane registry queues the notice back to a static identity.
+
+    The slot roster is readable, so the failure is the lane file alone.
+    """
+
+    def unreadable():
+        raise OSError("lane registry unreadable")
+
+    monkeypatch.setattr("lu_machinery.ops.driver_lanes.load_registry", unreadable)
+    assert AuthorityService._session_only_launcher_inbox("codex") is True

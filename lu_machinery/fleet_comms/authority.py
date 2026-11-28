@@ -2876,12 +2876,13 @@ class AuthorityService:
 
     @staticmethod
     def _session_only_launcher_inbox(name: str) -> bool:
-        """True when ``name`` is a launcher slot or a driver-lane sender.
+        """True when a drain reads ``name`` only while a launcher session is up.
 
-        Those inboxes are read only while a session is up. A bare static
-        identity that is not itself a slot stays with the standing check.
-        An unreadable slot or lane registry fails closed: the notice is not
-        queued back to ``name``.
+        That is a registry slot, a recipient alias (``resolve_recipient_alias``
+        returns another name), or a driver-lane sender. A bare static identity
+        that is none of those stays with the standing check. An unreadable
+        slot registry, alias roster, or lane registry fails closed: the notice
+        is not queued back to ``name``.
         """
         from lu_machinery import agent_identity
         from lu_machinery.ops import driver_lanes
@@ -2893,8 +2894,13 @@ class AuthorityService:
             return True
         if name in slots:
             return True
-        if name in agent_identity.STATIC_VALID_AGENTS:
-            return False
+        try:
+            resolved = agent_identity.resolve_recipient_alias(name, strict=True)
+        except Exception as exc:
+            _LOG.warning("launcher inbox check unreadable: %s", type(exc).__name__)
+            return True
+        if resolved != name:
+            return True
         try:
             senders = {lane.sender for lane in driver_lanes.load_registry().lanes}
         except Exception as exc:
