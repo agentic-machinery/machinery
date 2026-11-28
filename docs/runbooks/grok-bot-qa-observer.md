@@ -33,7 +33,7 @@ Grok 4.7 coding and code/infra review go through the Cursor seat:
 .venv/bin/python lu_machinery/dispatch.py dispatch --agent cursor --model grok-4.7-high
 ```
 
-`dispatch.py` rejects `--agent grok`. grok-4.6 and grok-4.5 stay retired. Grok holds no driver, Ukrainian, advisory, or critical/security final-signoff seat (C-5307; REVIEW-ROTATION-GROK-1127 adds it to the high-risk rotation).
+`dispatch.py` rejects `--agent grok`. Grok 4.6 and 4.5 are retired. The attested Cursor pin joins the code and infra review rotation at every risk, including critical and security paths. Grok has no driver, Ukrainian or advisory seat.
 
 Eggbot stays a separate tasked seat:
 

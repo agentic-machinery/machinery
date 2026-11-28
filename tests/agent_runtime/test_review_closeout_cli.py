@@ -285,26 +285,8 @@ def test_resolve_reviewer_cli_selects_single_reviewer_outside_union_for_cursor_a
     assert payload["quorum"] == []
 
 
-@pytest.mark.parametrize("injected_grok", [False, True])
-def test_resolve_reviewer_cli_excludes_grok_for_grok_adapter_path(tmp_path, monkeypatch, injected_grok):
-    from dataclasses import replace
-
-    from lu_machinery.review import reviewer_resolver
-
-    # The adapter path raises either requested risk to critical, so inject
-    # Grok into the effective ladder that the resolver actually walks.
-    risk = "high" if injected_grok else "medium"
-    if injected_grok:
-        # A caller-supplied Grok rung must still respect subject exclusion.
-        restored = replace(
-            reviewer_resolver.REVIEW_CANDIDATES["openai_frontier"],
-            name="grok-4.7-cursor-fallback", concrete_model="grok-4.7", family="xai", route="cursor", transport="cursor",
-        )
-        monkeypatch.setitem(
-            reviewer_resolver.REVIEW_LADDERS,
-            "critical",
-            (*reviewer_resolver.REVIEW_LADDERS["critical"], (restored,)),
-        )
+@pytest.mark.parametrize("risk", ["medium", "high"])
+def test_resolve_reviewer_cli_excludes_grok_for_grok_adapter_path(tmp_path, risk):
     state_file = tmp_path / "state.json"
     proc = _run_cli(
         state_file,
@@ -323,15 +305,11 @@ def test_resolve_reviewer_cli_excludes_grok_for_grok_adapter_path(tmp_path, monk
     payload = json.loads(proc.stdout)
     assert payload["resolved_risk"] == "critical"
     grok_entries = [entry for entry in payload["trace"] if entry["family"] == "xai"]
-    if injected_grok:
-        assert {entry["name"] for entry in grok_entries} == {"grok-4.7-cursor-fallback"}
-        for grok in grok_entries:
-            assert grok["status"] == "excluded"
-            assert "subject exclusion" in grok["reason"]
-            assert "subject seat grok" in grok["reason"]
-    else:
-        # REVIEW-ROTATION-GROK-1127: the critical ladder lists no Grok seat at all.
-        assert grok_entries == []
+    [grok] = grok_entries
+    assert grok["name"] == "grok-4.7-cursor-fallback"
+    assert grok["status"] == "excluded"
+    assert "subject exclusion" in grok["reason"]
+    assert "subject seat grok" in grok["reason"]
     assert payload["selected"] is None or payload["selected"]["family"] != "xai"
     selected = payload["selected"]
     assert selected is None or selected["family"] not in {"openai", "xai"}
@@ -830,7 +808,7 @@ def test_resolve_reviewer_excludes_every_branch_author_and_agrees_with_the_recor
             facts, task={"agent": "agy", "review_risk": "medium"}, model="gemini-4-neon-high", family="google"
         )
 
-    # Grok reviews at every risk (#9769); an xAI author leaves no reviewer at all.
+    # Adding an xAI author leaves only the Google seat at critical.
     repo.commit(GROK, message="third author")
     retarget = _run_cli(
         state,
@@ -1259,8 +1237,8 @@ def test_pr_mode_target_keeps_the_base_name_for_authorship_exclusion(tmp_path, m
 # restoring that spelling in the stdout reproduces the previous digests.
 # The Neon seat replaces the Flash trace row for low and medium risk.
 # NEON-SOLTIER-1120 (2026-11-20) adds Neon as an eligible critical trace row on security paths; Opus stays selected.
-# REVIEW-ROTATION-GROK-1127 (2026-11-27) puts Sol, Opus, Neon and pinned Cursor Grok in one equal peer row below critical
-# (critical keeps Sol, Opus and Neon) with least-used recent review count and catalog-order tie-break.
+# REVIEW-ROTATION-GROK-1127 added the four-peer rotation below critical. The
+# 2026-11-28 extension adds the pinned Cursor trace row to the security-path receipt.
 @pytest.mark.parametrize(
     "author,risk,path,digest",
     [
@@ -1270,7 +1248,7 @@ def test_pr_mode_target_keeps_the_base_name_for_authorship_exclusion(tmp_path, m
             CURRENT_SOL,
             "low",
             "lu_machinery/agent_runtime/target_admission.py",
-            "04e79645faac3e6081a0fb16d0781a4b03eb6a82c8e0186fe5fe7a0c7932da75",
+            "fe99c6bc60fa431553664b54f00863bd3e8591f164aefa5d1abec3d86c34b3ab",
         ),
     ],
 )

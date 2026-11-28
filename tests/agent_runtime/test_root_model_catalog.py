@@ -449,7 +449,7 @@ def test_catalog_rejects_a_high_ladder_seat_outside_risk_reviewer_models(candida
 
 
 def test_risk_reviewer_models_names_sol_and_opus_at_high():
-    """REVIEW-ROTATION-GROK-1127: Sol, Opus, Neon and pinned Cursor Grok are equal at high and critical."""
+    """The high-risk model allowlist contains all four rotation peers."""
     catalog = load_model_catalog()
     assert catalog["review_scheduler"]["risk_reviewer_models"] == {
         "high": [CURRENT_SOL, "claude-opus-5-5", "gemini-4-neon", "grok-4.7"],

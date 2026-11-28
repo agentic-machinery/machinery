@@ -15,7 +15,7 @@ simpler manual procedure beats new tooling.
 | Trivial | Root documentation for people (README, CHANGELOG, LICENSE, SECURITY); the product's lock bump adopting a new lu-machinery release | Required CI green only; no review of record, no review-loop |
 | Low | Deletions of unused code, test-only, data, `docs/**` | Required CI green + one quick red-team pass: one exact-head APPROVE from a qualified non-author reviewer (any family), `--risk low` |
 | Medium | Ordinary code changes | Required CI + one cross-family review |
-| High | CI workflows, launchers, publishing/merge gates, secrets/credential handling, security tooling, installers, dependency files | Required CI + one exact-head cross-family review at `--risk high` (Sol, Opus, Neon or Grok; the resolver picks); a security path is raised to `critical` (Sol, Opus or Neon) |
+| High | CI workflows, launchers, publishing/merge gates, secrets/credential handling, security tooling, installers, dependency files | Required CI + one exact-head cross-family review. Resolve at `--risk high`. Security paths raise the risk to `critical`. |
 | Ukrainian content | Learner-facing Ukrainian text | Gemini via AGY with Sources, seated by the [Ukrainian profile](ukrainian.md); deletions of learner-facing content keep this tier |
 
 The tier comes from the files changed, never from the author. The path-to-tier table lives in
@@ -51,17 +51,14 @@ and the same reviewer confirms the fix in one delta round. That is the whole Low
 
 The reviewer's risk is the `--risk` passed to the resolver: `high` or `critical` for a High-tier
 change. Seat order and eligibility follow the review rotation in
-[model-assignment](../../../rules/model-assignment.md) (REVIEW-ROTATION-GROK-1127): pinned Cursor
-Grok 4.7 High joins Sol, Opus and Gemini 4 Neon High at `high`, `medium` and `low` only, and
-`critical` seats Sol, Opus or Gemini 4 Neon High: critical and security sign-off stay unchanged
-pending planted-defect data (operator decides). For `code` and `infra` reviews the
+[model-assignment](../../../rules/model-assignment.md). The rotation includes Sol, Opus, native
+AGY Neon and attested Cursor `grok-4.7-high` at every risk, including critical and security
+sign-off (operator 2026-11-28). For `code` and `infra` reviews the
 security-path classifier (`lu_machinery/review/security_paths.py`) is a floor: a change touching
 one of its paths, either name of a rename or a deletion included, is reviewed at `critical`
 whatever risk was passed. Nothing lowers that floor.
 
 One exact-head cross-family review per change (owner decision C-5345, 2026-11-12).
-High risk takes Sol, Opus, Gemini 4 Neon High or Grok 4.7 High; critical risk takes Sol, Opus or Gemini 4 Neon High
-(REVIEW-ROTATION-GROK-1127). There is no second review.
 
 ## 3. Findings
 
