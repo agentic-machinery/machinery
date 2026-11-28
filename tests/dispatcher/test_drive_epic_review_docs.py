@@ -18,6 +18,7 @@ import pytest
 from lu_machinery.ai_agent_bridge import _cli
 from lu_machinery.ai_agent_bridge import _dispatch_wrappers as wrappers
 from lu_machinery.dispatcher import cli as dispatch_cli
+from tests.review.record_support import APPROVAL_REPLY
 from lu_machinery.dispatcher import git as dispatch_git
 from lu_machinery.dispatcher import store, worker
 from lu_machinery.review import record_cf_verdict as recorder
@@ -223,7 +224,7 @@ def test_detached_exact_head_review_launch_settle_and_publication_guards(monkeyp
         "started_at": "2026-10-08T00:00:00+00:00",
     }
     task_path.write_text(json.dumps(task), encoding="utf-8")
-    (task_root / "review-fixture.result").write_text("VERDICT: APPROVE\n", encoding="utf-8")
+    (task_root / "review-fixture.result").write_text(APPROVAL_REPLY, encoding="utf-8")
     # The existing producer regression runs cmd_dispatch --dry-run and checks
     # its actual two-line task-id/run-nonce stdout against the persisted record.
     review_task, review_nonce = "review-fixture", NONCE

@@ -15,6 +15,7 @@ from lu_machinery.publish import github as publisher
 from lu_machinery.review import record_cf_verdict as recorder
 from lu_machinery.review.tiers import classify_pr_files
 from tests.helpers import current_sol, product_tree
+from tests.review.record_support import APPROVAL_REPLY
 
 
 @pytest.fixture(autouse=True)
@@ -44,7 +45,7 @@ def test_low_authors_own_approve_is_refused(low_review, tmp_path):
     (tasks / "author-one.json").write_bytes((tasks / "review-one.json").read_bytes().replace(
         b'"review-one"', b'"author-one"',
     ))
-    (tasks / "author-one.result").write_text("VERDICT: APPROVE")
+    (tasks / "author-one.result").write_text(APPROVAL_REPLY)
     with pytest.raises(recorder.RecordError, match="SELF_REVIEW_DETECTED"):
         recorder.record("author-one", pr_number=1, task_root=tasks, lock_root=tmp_path / "locks")
     assert comments == [] and statuses == []
@@ -100,7 +101,7 @@ def _carbon_task(tasks, name="review-carbon", *, agent="agy", model="gemini-4-ca
     task = json.loads((tasks / "review-one.json").read_text())
     task.update(task_id=name, agent=agent, model=model)
     (tasks / f"{name}.json").write_text(json.dumps(task))
-    (tasks / f"{name}.result").write_text("VERDICT: APPROVE")
+    (tasks / f"{name}.result").write_text(APPROVAL_REPLY)
     return name
 
 

@@ -386,7 +386,9 @@ In your first completed reply, include a plain, unfenced verdict line using
 the label VERDICT, a colon, then APPROVE, REQUEST_CHANGES, or BLOCKED, as warranted
 by your independent judgment. Also include one native JSON object, unfenced, conforming to
 lu_machinery/schemas/code-review-findings.v1.schema.json (schema_version: code-review-findings.v1).
-Read that schema: overall requires correctness, explanation, confidence; each
+Read that schema: overall requires correctness, explanation, confidence, and
+carries review_complete: JSON true when the review is finished (an approval
+without it is refused), false when it is not; each
 finding requires id, title, body, priority, confidence, category, location,
 verbatim, why_wrong, smallest_fix, sources. Do not add fields or wrap the object
 in another object. Retain every material and nonblocking finding, including

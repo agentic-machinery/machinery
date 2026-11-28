@@ -264,6 +264,7 @@ def _parse_review_loop_envelope(text: str) -> dict[str, Any]:
         _REVIEW_VERDICT_LINE_RE,
         _closes_code_fence,
         _commonmark_lines,
+        _top_level_json_values,
         _without_code_fences,
         load_findings_json,
     )
@@ -284,7 +285,8 @@ def _parse_review_loop_envelope(text: str) -> dict[str, Any]:
         ) != 1:
             raise ContractError(f"review_envelope_duplicate_{label.lower()}")
     blocks = [token for token in MarkdownIt("commonmark").parse(text) if token.type == "fence"]
-    if len(blocks) != 1:
+    # Any other top-level JSON value is a second candidate the verdict readers would also read.
+    if len(blocks) != 1 or len(list(_top_level_json_values(text))) != 1:
         raise ContractError("review_envelope_requires_one_json_block")
     block = blocks[0]
     if (
@@ -337,11 +339,23 @@ def canonical_receipt_payload(raw: str) -> dict[str, Any]:
     envelope = text.startswith("VERDICT:")
     if not envelope:
         validate_reviewer_payload(payload)
-        if _effective_verdict(payload) is None:
-            raise ContractError("review_invalid_verdict")
+    verdict = _effective_verdict(payload)
+    if verdict is None:
+        raise ContractError("review_invalid_verdict")
+    if verdict == "APPROVED" and not attests_completion(payload):
+        raise ContractError(
+            "review_completion_not_attested: an approval needs overall.review_complete set to JSON true",
+            exit_code=EXIT_INCOMPLETE,
+        )
     if declares_incomplete_review(text if envelope else "", findings_payloads=(payload,)):
         raise ContractError("review_declares_incomplete", exit_code=EXIT_INCOMPLETE)
     return payload
+
+
+def attests_completion(payload: Mapping[str, Any]) -> bool:
+    """Whether the findings object's ``overall.review_complete`` is JSON ``true`` (never 1, "true" or a truthy value)."""
+    overall = payload.get("overall")
+    return isinstance(overall, Mapping) and overall.get("review_complete") is True
 
 
 def _json_objects(text: str) -> list[dict[str, Any]]:
@@ -437,7 +451,7 @@ def decision_lock(raw: str) -> dict[str, Any]:
     Not an approval path. ``ambiguous`` is true when the reply carries more
     than one verdict or more than one findings object. ``payload`` is set
     only when exactly one findings object is readable, even if it does not
-    yet validate.
+    yet validate. ``attested`` is ``_locked_attestation``.
     """
     from lu_machinery.review.verdict_parser import (
         MISSING_CAPABILITIES_FIELD,
@@ -446,6 +460,7 @@ def decision_lock(raw: str) -> dict[str, Any]:
     )
 
     try:
+        attested = _locked_attestation(raw)
         objects = _json_objects(_outside_blockquotes(raw))
         incomplete = (
             declares_incomplete_review("", findings_payloads=objects)
@@ -454,7 +469,7 @@ def decision_lock(raw: str) -> dict[str, Any]:
         )
         verdicts = list(dict.fromkeys(recognized_verdicts(raw)))
     except (ValueError, RecursionError):
-        return {"ambiguous": True, "verdicts": [], "payload": None}
+        return {"ambiguous": True, "verdicts": [], "payload": None, "attested": False}
     candidates: list[dict[str, Any]] = []
     seen: set[str] = set()
     for payload in objects:
@@ -468,7 +483,23 @@ def decision_lock(raw: str) -> dict[str, Any]:
         "ambiguous": incomplete or len(candidates) > 1 or len(verdicts) > 1,
         "verdicts": verdicts,
         "payload": candidates[0] if len(candidates) == 1 else None,
+        "attested": attested,
     }
+
+
+def _locked_attestation(raw: str) -> bool:
+    """Whether the reply itself attests completion, read by the strict reader and nothing else.
+
+    True only when ``parse_reviewer_json`` reads the reply (bare JSON, one whole closed fence or the
+    review-loop envelope) as a ``code-review-findings.v1`` object with JSON ``true`` at
+    ``overall.review_complete``. An object anywhere else in the reply, in prose, code, a quotation or HTML,
+    attests nothing, so a correction of such a reply never carries completion.
+    """
+    try:
+        payload = parse_reviewer_json(raw)
+    except ContractError:
+        return False
+    return payload.get("schema_version") == SCHEMA_VERSION and attests_completion(payload)
 
 
 def same_decision(lock: Mapping[str, Any], payload: Mapping[str, Any]) -> bool:
@@ -477,6 +508,10 @@ def same_decision(lock: Mapping[str, Any], payload: Mapping[str, Any]) -> bool:
         return False
     stated = False
     prior = lock.get("payload")
+    # The completion attestation is the reviewer's, never the correction's: a reply that did not attest
+    # (``_locked_attestation``) cannot gain it, and one that attested keeps it.
+    if attests_completion(payload) != (lock.get("attested") is True):
+        return False
     if isinstance(prior, Mapping):
         prior_overall = prior.get("overall")
         later = payload.get("overall")

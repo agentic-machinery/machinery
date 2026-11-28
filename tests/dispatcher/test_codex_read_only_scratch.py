@@ -698,7 +698,8 @@ def test_agy_structured_terminal_not_response(case):
     from lu_machinery.review.verdict_parser import recognized_verdicts
 
     payload = {"schema_version": "code-review-findings.v1", "findings": [],
-               "overall": {"correctness": "correct", "explanation": "No defect found.", "confidence": 0.9}}
+               "overall": {"correctness": "correct", "explanation": "No defect found.", "confidence": 0.9,
+                           "review_complete": True}}
     terminal = {"status": "SUCCESS", "structured_output": payload, "response": json.dumps(payload)}
     if case == "conflicting-response":
         terminal["response"] = "VERDICT: REQUEST_CHANGES"
@@ -799,7 +800,8 @@ def test_agy_schema_rejection_is_typed_before_model_init(phase):
                "- at schema: invalid regular expression\n    - unsupported Perl syntax: `(?!`")
     stderr = f"Error: {message}\n\nUsage of agy:\n  --json-schema Optional schema\n"
     payload = {"schema_version": "code-review-findings.v1", "findings": [],
-               "overall": {"correctness": "correct", "explanation": "No defect found.", "confidence": 0.9}}
+               "overall": {"correctness": "correct", "explanation": "No defect found.", "confidence": 0.9,
+                           "review_complete": True}}
     stdout = "" if phase == "before-init" else json.dumps(
         {"event": "init", "init": {"model": "gemini-3.8-flash-high"}}
     ) + "\n"

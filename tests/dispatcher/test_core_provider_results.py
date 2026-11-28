@@ -134,7 +134,8 @@ def test_review_dispatch_resolves_a_running_cursor_author_only_from_its_stream_a
     run_git(sandbox.repo, "push", "origin", "review-source")
     review = sandbox.cli(
         "dispatch", "--agent", "sol", "--model", "echo", "--prompt",
-        '{"schema_version":"code-review-findings.v1","overall":{"correctness":"correct","explanation":"No defects.","confidence":0.9},"findings":[]}',
+        '{"schema_version":"code-review-findings.v1","overall":{"correctness":"correct","explanation":"No defects.",'
+        '"confidence":0.9,"review_complete":true},"findings":[]}',
         "--require-review-verdict", "--mode", "read-only", "--branch", "review-source",
         expected=0,
     )
@@ -305,7 +306,7 @@ def test_agy_terminal_error_settles_only_a_valid_read_only_review(supervise_agy,
     """Defect: AGY exit 0 with terminal ERROR discarded a complete Carbon review."""
     valid = json.dumps({
         "schema_version": "code-review-findings.v1",
-        "overall": {"correctness": "correct", "confidence": 0.9, "explanation": "No defects."},
+        "overall": {"correctness": "correct", "confidence": 0.9, "explanation": "No defects.", "review_complete": True},
         "findings": [],
     })
     response = {

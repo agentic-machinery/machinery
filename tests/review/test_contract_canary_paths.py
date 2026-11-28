@@ -39,7 +39,7 @@ CONTRACT_FILE = "lu_machinery/review/review_contract.py"
 
 RECEIPT = json.dumps({
     "schema_version": "code-review-findings.v1",
-    "overall": {"correctness": "correct", "explanation": "No defects.", "confidence": 0.9},
+    "overall": {"correctness": "correct", "explanation": "No defects.", "confidence": 0.9, "review_complete": True},
     "findings": [],
 })
 

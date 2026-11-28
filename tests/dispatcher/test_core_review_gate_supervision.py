@@ -82,7 +82,7 @@ def test_schemaless_reviewer_missing_verdict_gets_one_correction_turn(sandbox, s
     catalog_path.write_text(yaml.safe_dump(catalog, sort_keys=False))
     findings = (
         '{"schema_version":"code-review-findings.v1",'
-        '"overall":{"correctness":"correct","explanation":"No defects.","confidence":0.9},'
+        '"overall":{"correctness":"correct","explanation":"No defects.","confidence":0.9,"review_complete":true},'
         '"findings":[]}'
     )
     other = findings.replace('"correctness":"correct"', '"correctness":"incorrect"', 1)
@@ -112,7 +112,8 @@ def test_schemaless_reviewer_missing_verdict_gets_one_correction_turn(sandbox, s
         first = "The change is sound.\n" + findings
         reply = "Still commentary without a verdict."
     else:
-        first = "The change is sound.\n" + findings
+        # The strict reader reads it (one bare object) and it attests completion, but it lacks confidence.
+        first = findings.replace(',"confidence":0.9', "", 1)
     binary_dir = sandbox.repo.parent / "bin"
     binary_dir.mkdir()
     version = "0.0.0-R1"
@@ -174,7 +175,7 @@ case "$prompt" in
         if second == "unconfident":
             assert "REQUEST_CHANGES" in correction
         else:
-            assert findings in correction or conflict in correction
+            assert first in correction
     if second == "kept":
         assert record["status"] == "done"
         assert json.loads(record["result_file"] and Path(record["result_file"]).read_text())["overall"]["correctness"] == "correct"

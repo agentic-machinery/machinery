@@ -22,6 +22,7 @@ from lu_machinery.review.reviewer_resolver import (
 from tests.claude_route_accounts import HOST_ACCOUNT
 from tests.helpers.product_tree import configured_roots  # noqa: F401
 from tests.helpers import current_sol
+from tests.review.record_support import APPROVAL_REPLY
 
 CURRENT_SOL = current_sol()
 
@@ -224,7 +225,10 @@ def _record(monkeypatch, tmp_path, *, resolved_model, families=frozenset({"anthr
         **extra,
     }
     (tasks / "review-one.json").write_text(json.dumps(task))
-    (tasks / "review-one.result").write_text("VERDICT: APPROVE")
+    # A critical review approves only with the security sign-off line (``record_cf_verdict.SECURITY_ATTESTATION``).
+    signed = json.loads(APPROVAL_REPLY)
+    signed["overall"]["explanation"] = "SECURITY_VERDICT: PASS\n" + signed["overall"]["explanation"]
+    (tasks / "review-one.result").write_text(json.dumps(signed) if extra.get("review_risk") == "critical" else APPROVAL_REPLY)
     comments: list[dict] = []
 
     def fake_json(args, *, input_text=None):

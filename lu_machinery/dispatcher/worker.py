@@ -2031,7 +2031,9 @@ def _correction_stdin(prior: str) -> bytes:
         "The previous reply is not a recordable review.\n"
         "Return only one JSON object matching code-review-findings.v1.\n"
         "Keep the same verdict, the same findings, and the same meaning.\n"
-        "Include confidence and verbatim where the schema requires them.\n\n"
+        "Include confidence and verbatim where the schema requires them.\n"
+        "Copy overall.review_complete exactly as the previous reply's findings object gave it; "
+        "omit it when that reply had none. A correction never attests completion.\n\n"
         "Previous reply:\n"
         f"{prior}\n"
     ).encode()

@@ -81,6 +81,9 @@ a missing required capability is INCONCLUSIVE (`BLOCKED`), which still blocks;
 exact-head CI that answers the execution questions is valid evidence, a
 capability note is not a verdict, and new tests name their defect class
 (Step 5). Step 6 applies the policy's budget alongside the scope breakers.
+A code or infra reviewer's reply follows
+the [review-loop reply format](../review-loop/references/brief.md#code-or-infra),
+including its completion attestation, which every recorded approval needs.
 
 ## Output
 

@@ -26,6 +26,27 @@ from tests.helpers import current_sol
 CURRENT_SOL = current_sol()
 
 
+def attested_payload(explanation="No defect found at the reviewed head.", findings=(), *, attestation="SECURITY_VERDICT: PASS"):
+    """An approving findings object whose ``overall.explanation`` opens with the security sign-off line."""
+    if attestation is not None:
+        explanation = f"{attestation}\n{explanation}"
+    return {
+        "schema_version": "code-review-findings.v1",
+        "overall": {"correctness": "correct", "explanation": explanation, "confidence": 0.9, "review_complete": True},
+        "findings": list(findings),
+    }
+
+
+def attested_approval(*args, **kwargs):
+    """The sealed reply of an approval with the sign-off, as the schema-bound worker writes it (``structured_result``)."""
+    return json.dumps(attested_payload(*args, **kwargs), ensure_ascii=False, allow_nan=False)
+
+
+def approve_envelope(payload):
+    """A review-loop envelope stating APPROVE around ``payload``."""
+    return "\n".join(("VERDICT: APPROVE", "SCORE: 9/10", "", "```json", json.dumps(payload, indent=2), "```", ""))
+
+
 @pytest.mark.usefixtures("configured_roots", "agent_runtime_roots", "recorder_matcher")
 @pytest.mark.parametrize("rule", [
     "item-quote", "evidence-quote", "evidence-receipt", "unknown-source", "source-excerpt",
@@ -724,13 +745,14 @@ def test_security_sensitive_verdicts_publish_the_finding_count_only(monkeypatch,
     tasks, comments, statuses, _files, _admit = low_review
     cases = (
         ("security", f"VERDICT: CHANGES_REQUESTED\n\n{_FINDING}\n", "CHANGES_REQUESTED", (), ()),
-        ("security", f"VERDICT: APPROVE\n\n{_FINDING}\n", "APPROVED", (), ()),
+        # The security profile is a critical review: its approval carries the sign-off line.
+        ("security", attested_approval(_FINDING), "APPROVED", (), ()),
         (None, f"VERDICT: CHANGES_REQUESTED\n\nSECURITY_VERDICT: FAIL\n\n{_FINDING}\n", "CHANGES_REQUESTED", (), ()),
-        (None, f"VERDICT: APPROVE\n\nSECURITY_VERDICT: PASS\n\n{_FINDING}\n", "APPROVED", (), ()),
+        (None, attested_approval(_FINDING), "APPROVED", (), ()),
         (None, f"VERDICT: CHANGES_REQUESTED\n\n{_FINDING}\n", "CHANGES_REQUESTED", ({"name": "security"},), ()),
         (
             None,
-            f"VERDICT: APPROVE\n\n{_FINDING}\n",
+            attested_approval(_FINDING, attestation=None),
             "APPROVED",
             (),
             ({"number": 403, "url": "https://github.com/unit/public/issues/403",
@@ -747,14 +769,15 @@ def test_security_sensitive_verdicts_publish_the_finding_count_only(monkeypatch,
         assert result["verdict"] == verdict
         assert result["comment"] == "posted" and result["status"] == "posted"
         assert f"verdict={verdict}" in body and f"VERDICT: {verdict}\n" in body
-        assert "Withheld findings: unknown\n" in body
+        # A sealed findings object has a known count; prose has none.
+        assert f"Withheld findings: {'0' if reply.startswith('{') else 'unknown'}\n" in body
         assert "Findings are held privately.\n" in body
         assert _FINDING not in body and "SECURITY_VERDICT" not in body and "<details>" not in body
         assert statuses[-1]["description"].startswith(f"VERDICT: {verdict} ")
         assert statuses[-1]["state"] == ("success" if verdict == "APPROVED" else "failure")
 
     # A security profile is a critical infra sign-off. Sonnet is not one of those seats.
-    task = _seal(tasks, comments, statuses, reply=f"VERDICT: APPROVE\n\n{_FINDING}\n", profile="security")
+    task = _seal(tasks, comments, statuses, reply=attested_approval(_FINDING), profile="security")
     task["model"] = "claude-sonnet-5-5"
     task["agent"] = "claude"
     (tasks / "review-one.json").write_text(json.dumps(task))
@@ -962,7 +985,8 @@ def test_round_cap_applies_to_preflight_dispatch_and_record(
         checks.check_review_budget(args, {"github": REPOSITORY}, SHA)
 
     # The review task exists by publication time. Its own head must not count toward the cap.
-    write_task(tasks, pr=42, review_risk=risk, review_mode="cross_family")
+    # A security path or critical risk makes the approval a security sign-off.
+    write_task(tasks, pr=42, review_risk=risk, review_mode="cross_family", reply=attested_approval())
     if exhausted:
         with pytest.raises(recorder.RecordError, match=refusal):
             recorder.record("review-one", pr_number=42, task_root=tasks, lock_root=tmp_path / "locks")
@@ -1044,6 +1068,8 @@ def test_real_refusal_publishes_only_skeleton(scanned_recorder, tmp_path, detail
 
     tasks, comments, calls, sent, tooling = scanned_recorder
     reply = f"VERDICT: {verdict}\n{detail}\nHarmless reviewer sentence quoting `<!-- cf-verdict`.\n- A prose bullet."
+    if verdict == "APPROVED":
+        reply = attested_approval(reply.split("\n", 1)[1], attestation=None)
     write_task(tasks, reply=reply)
     before = {suffix: (tasks / f"review-one.{suffix}").read_bytes() for suffix in ("json", "result")}
     with pytest.raises(gate.PublishBlocked, match=f"rule={rule}"):
@@ -1053,7 +1079,7 @@ def test_real_refusal_publishes_only_skeleton(scanned_recorder, tmp_path, detail
     assert body == (
         f"### Cross-family review\nhead: {SHA}\nReviewer family: openai\nVERDICT: {verdict}\n"
         f"Reviewer model: {CURRENT_SOL}\nReview score: absent\nAuthored by: gemini-3.8-flash-high\n"
-        "Task id: review-one\n\nWithheld findings: unknown\n"
+        f"Task id: review-one\n\nWithheld findings: {'0' if verdict == 'APPROVED' else 'unknown'}\n"
         "Findings are held privately.\n\n"
         f"<!-- cf-verdict v1 sha={SHA} task=review-one started=2026-09-23T12:00:00.000001+00:00 "
         f"verdict={verdict} model={CURRENT_SOL} family=openai -->"
@@ -1078,7 +1104,7 @@ def test_real_refusal_publishes_only_skeleton(scanned_recorder, tmp_path, detail
 @pytest.mark.usefixtures("agent_runtime_roots")
 def test_clean_publication_bytes_unchanged(scanned_recorder, tmp_path):
     tasks, comments, calls, sent, _ = scanned_recorder
-    reply = "VERDICT: APPROVE\nSCORE: 8/10 one P3 nit.\nOrdinary reviewer text.\n\n  Preserve spacing.\n"
+    reply = attested_approval("SCORE: 8/10 one P3 nit.\nOrdinary reviewer text.\n\n  Preserve spacing.\n", attestation=None)
     write_task(tasks, reply=reply)
     result = recorder.record("review-one", pr_number=42, task_root=tasks, lock_root=tmp_path / "locks")
     expected = (
@@ -1158,7 +1184,10 @@ def test_published_verdict_stores_one_local_publication_marker(monkeypatch, tmp_
     """Defect class: a verdict published on the PR leaves no local marker, so the model statistics cannot tell it
     from an unpublished run (#902), or a recorder rerun stores it twice."""
     tasks, comments, calls = setup_record(monkeypatch, tmp_path)
-    write_task(tasks, reply=f"VERDICT: {verdict}\nOrdinary reviewer text.\n")
+    reply = f"VERDICT: {verdict}\nOrdinary reviewer text.\n"
+    if verdict == "APPROVED":
+        reply = attested_approval("Ordinary reviewer text.", attestation=None)
+    write_task(tasks, reply=reply)
     first = recorder.record("review-one", pr_number=42, task_root=tasks, lock_root=tmp_path / "locks")
     second = recorder.record("review-one", pr_number=42, task_root=tasks, lock_root=tmp_path / "locks")
     assert (first["comment"], second["comment"]) == ("posted", "existing") and calls["posts"] == 1
@@ -1174,7 +1203,7 @@ def _blocking_reply(priorities, explanation="The change breaks a case."):
     return json.dumps({
         "schema_version": "code-review-findings.v1",
         "overall": {"correctness": "incorrect" if any(p in ("P0", "P1", "P2") for p in priorities) else "correct",
-                    "explanation": explanation, "confidence": 0.9},
+                    "explanation": explanation, "confidence": 0.9, "review_complete": True},
         "findings": [{
             "id": f"F{number}", "title": "A defect", "body": "The change breaks a case.", "priority": priority,
             "confidence": 0.9, "category": "correctness",
@@ -1496,7 +1525,7 @@ def test_unwritable_publication_marker_never_undoes_the_publication(monkeypatch,
     from lu_machinery.api import model_stats_rows
 
     tasks, _comments, calls = setup_record(monkeypatch, tmp_path)
-    write_task(tasks, reply="VERDICT: APPROVE\nOrdinary reviewer text.\n")
+    write_task(tasks, reply=attested_approval("Ordinary reviewer text.", attestation=None))
     real = model_stats_rows.record_publications
 
     def busy(*_args, **_kwargs):
@@ -1605,7 +1634,7 @@ def test_skeleton_scanner_rejection_has_no_write(scanned_recorder, tmp_path, mon
     rules["3"] = {"patterns": [{"id": "3-absolute-path", "regex": r"(?!)"}]}
     (synthetic_opsec / "rules.json").write_text(json.dumps(rules))
     monkeypatch.setattr(gate, "private_tooling", lambda: synthetic_opsec)
-    write_task(tasks, reply="VERDICT: APPROVE\ncredential stored SYNTHETIC-DETAIL")
+    write_task(tasks, reply=attested_approval("credential stored SYNTHETIC-DETAIL", attestation=None))
     with pytest.raises(recorder.RecordError, match="synthetic-skeleton-refusal"):
         recorder.record("review-one", pr_number=42, task_root=tasks, lock_root=tmp_path / "locks")
     assert comments == sent == [] and calls == {"posts": 0, "statuses": 0}
@@ -1640,6 +1669,7 @@ def structured_review(count):
             "correctness": "incorrect" if count else "correct",
             "explanation": "credential stored SYNTHETIC-DETAIL",
             "confidence": 0.9,
+            "review_complete": True,
         },
         "findings": [{
             "id": f"F{number}", "title": "Synthetic finding", "body": "Synthetic finding body.",
@@ -1765,6 +1795,248 @@ def test_security_verdict_fail_keeps_changes_requested(scanned_recorder, tmp_pat
     assert statuses[0]["description"] == "VERDICT: CHANGES_REQUESTED openai review-one"
 
 
+def security_finding(priority="P2", finding_id="F1"):
+    return {
+        "id": finding_id, "title": "Link escape", "body": _FINDING, "priority": priority, "confidence": 0.9,
+        "category": "security",
+        "location": {"path": "scripts/example.py", "start_line": 1, "end_line": 1, "claim_type": "present"},
+        "verbatim": "value = shared_state", "why_wrong": "The link is classified by its text.",
+        "smallest_fix": "Resolve the link first.", "sources": ["none"],
+    }
+
+
+def security_reply(correctness, priority="P2"):
+    return json.dumps({
+        "schema_version": "code-review-findings.v1",
+        "overall": {"correctness": correctness, "explanation": "One security finding.", "confidence": 0.9},
+        "findings": [security_finding(priority)],
+    })
+
+
+def _recording_statuses(monkeypatch):
+    statuses = []
+    monkeypatch.setattr(recorder, "post_commit_status", lambda **fields: statuses.append(fields))
+    return statuses
+
+
+@pytest.mark.usefixtures('configured_roots', 'recorder_matcher')
+@pytest.mark.parametrize("priority", ["P2", "P3"])
+@pytest.mark.parametrize("lead", ["", "\n    "], ids=["bare", "indented"])
+@pytest.mark.usefixtures("agent_runtime_roots")
+def test_correct_reply_with_security_finding_records_rejection_withheld(monkeypatch, tmp_path, priority, lead):
+    """Defect class: security finding approved, and published on an unlabeled PR.
+
+    A bare canonical ``correct`` reply with a security P2 or P3 records CHANGES_REQUESTED with a failure
+    status; the comment keeps only the count and the private ledger keeps the true priority. Leading
+    whitespace that Markdown reads as an indented code block does not hide the finding.
+    """
+    from lu_machinery.api import model_stats_rows
+
+    tasks, comments, _calls = setup_record(monkeypatch, tmp_path)
+    statuses = _recording_statuses(monkeypatch)
+    reply = lead + security_reply("correct", priority)
+    write_task(tasks, reply=reply)
+    result = recorder.record("review-one", pr_number=42, task_root=tasks, lock_root=tmp_path / "locks")
+    body = comments[0]["body"]
+    assert result["verdict"] == sweep.lookup_verdict(comments, SHA, "fleet").state == "CHANGES_REQUESTED"
+    assert statuses[0]["state"] == "failure" and "residuals" not in result
+    assert "Withheld findings: 1\n" in body and "Findings are held privately.\n" in body
+    assert _FINDING not in body and "<details>" not in body and "(P3)" not in body
+    summary = model_stats_rows.review_summary((tasks / "review-one.result").read_bytes())
+    assert summary["verdict"] == "incorrect" and summary["priorities"] == {priority: 1}
+
+
+@pytest.mark.usefixtures('configured_roots', 'recorder_matcher')
+@pytest.mark.parametrize("reply, refusal", [
+    (approve_envelope(attested_payload(findings=(security_finding("P3"),))), r"verdict line|SECURITY_APPROVAL_REFUSED"),
+    (approve_envelope(attested_payload(attestation="SECURITY_VERDICT: FAIL")), r"verdict line|SECURITY_APPROVAL_REFUSED"),
+    (attested_approval(attestation="SECURITY_VERDICT: FAIL"), "SECURITY_APPROVAL_REFUSED"),
+    # A prose approval carries no findings object, so the completion check refuses it first.
+    ("VERDICT: APPROVE\n\nSECURITY_VERDICT: FAIL\n", "COMPLETION_ATTESTATION_REFUSED"),
+], ids=["envelope-with-security-finding", "envelope-security-fail", "sealed-security-fail", "prose-security-fail"])
+@pytest.mark.usefixtures("agent_runtime_roots")
+def test_approve_header_with_open_security_signal_is_refused(monkeypatch, tmp_path, reply, refusal):
+    """Defect class: security finding approved under an explicit APPROVE header; nothing is posted."""
+    tasks, comments, calls = setup_record(monkeypatch, tmp_path)
+    write_task(tasks, reply=reply)
+    with pytest.raises(recorder.RecordError, match=refusal):
+        recorder.record("review-one", pr_number=42, task_root=tasks, lock_root=tmp_path / "locks")
+    assert comments == [] and calls == {"posts": 0, "statuses": 0}
+
+
+@pytest.mark.usefixtures('configured_roots', 'recorder_matcher')
+@pytest.mark.parametrize("source", ["task-record", "withheld-comment", "unpublished-run"])
+@pytest.mark.usefixtures("agent_runtime_roots")
+def test_inherited_security_finding_omitted_from_the_latest_reply_blocks(monkeypatch, tmp_path, source):
+    """Defect class: security finding approved after a later round silently omits it.
+
+    An earlier round's security finding binds every later APPROVE until a critical seat signs off. A prior
+    reply that cannot be read (record missing, comment withheld) binds the same way, and so does a finished
+    review run of the PR whose verdict was never published (no marker).
+    """
+    from tests.review.record_support import OTHER, recorded_verdict
+
+    tasks, comments, calls = setup_record(monkeypatch, tmp_path)
+    statuses = _recording_statuses(monkeypatch)
+    prior = recorded_verdict(OTHER, "CHANGES_REQUESTED", task_id="review-zero")
+    if source in {"task-record", "unpublished-run"}:
+        write_task(tasks, task_id="review-zero", worktree_base_sha=OTHER, reply=security_reply("incorrect", "P3"),
+                   started_at="2026-09-23T11:00:00.000001+00:00", review_mode="cross_family")
+    else:
+        marker = prior["body"].rsplit("\n", 1)[1]
+        prior["body"] = recorder.build_comment(
+            sha=OTHER, task_id="review-zero", started="2026-09-23T11:00:00.000001+00:00",
+            verdict="CHANGES_REQUESTED", model="claude-opus-5-5", family="anthropic", reply="",
+            withheld_findings=1,
+        )
+        assert prior["body"].endswith(marker)
+    if source != "unpublished-run":
+        comments.append(prior)
+    published = len(comments)
+    clean = json.dumps({
+        "schema_version": "code-review-findings.v1",
+        "overall": {"correctness": "correct", "explanation": "The fix holds.", "confidence": 0.9, "review_complete": True},
+        "findings": [],
+    })
+    write_task(tasks, reply=clean)
+    with pytest.raises(recorder.RecordError, match=r"SECURITY_APPROVAL_REFUSED: another review of this PR raised "
+                                                   r"a security finding \(review-zero"):
+        recorder.record("review-one", pr_number=42, task_root=tasks, lock_root=tmp_path / "locks")
+    assert len(comments) == published and calls == {"posts": 0, "statuses": 0}
+
+    write_task(tasks, reply=attested_approval("The fix holds."))
+    result = recorder.record("review-one", pr_number=42, task_root=tasks, lock_root=tmp_path / "locks")
+    assert result["verdict"] == "APPROVED" and statuses[-1]["state"] == "success"
+
+
+@pytest.mark.usefixtures('configured_roots', 'recorder_matcher')
+@pytest.mark.parametrize("critical", [
+    {"path": "lu_machinery/review/record_cf_verdict.py"},
+    {"path": "lu_machinery/common/unit.py", "review_risk": "critical"},
+    {"path": "lu_machinery/common/unit.py", "review_profile": "security"},
+], ids=["security-path", "critical-risk", "security-profile"])
+@pytest.mark.usefixtures("agent_runtime_roots")
+def test_critical_approval_needs_one_security_attestation_line(monkeypatch, tmp_path, critical):
+    """Defect class: security finding approved on a critical review without the reviewer's security sign-off.
+
+    APPROVE needs a reply that is one JSON object whose ``overall.explanation`` opens with exactly the line
+    ``SECURITY_VERDICT: PASS``, the reply's only security verdict, decoded strings included. The proof runs
+    the reviewer's raw output through the worker's schema-bound sealing (``structured_result``), which is
+    the only form a critical seat's reply reaches the recorder in.
+    """
+    from lu_machinery.agent_runtime.adapters._output_schema import json_value, structured_result
+    from lu_machinery.review.review_contract import schema_path
+    from tests.review.record_support import facts_for
+
+    schema = json.loads(schema_path(profile="infra").read_text(encoding="utf-8"))
+
+    def sealed(raw):
+        result = structured_result(json_value(raw), schema, returncode=0)
+        return result.response if result.ok else None
+
+    path = critical.pop("path")
+    tasks, comments, calls = setup_record(monkeypatch, tmp_path)
+    statuses = _recording_statuses(monkeypatch)
+    monkeypatch.setattr(recorder, "pr_review_facts", lambda *_a, **_k: facts_for({"google"}, changed_paths=(path,)))
+    monkeypatch.setattr(recorder.GitHubAdapter, "pr_file_rows", lambda *_a: [{"filename": path, "status": "modified"}])
+    # The plan's first placement, a line after SCORE outside the object, never survives the sealing.
+    old_placement = approve_envelope(attested_payload(attestation=None)).replace(
+        "SCORE: 9/10\n", "SCORE: 9/10\nSECURITY_VERDICT: PASS\n")
+    assert sealed(old_placement) is None and sealed(approve_envelope(attested_payload())) is None
+    refused = {
+        "no-sign-off": attested_approval(attestation=None),
+        "second-line": attested_approval("SECURITY_VERDICT: PASS", attestation="Clean."),
+        "inline": attested_approval("Clean. SECURITY_VERDICT: PASS", attestation=None),
+        "trailing-space": attested_approval(attestation="SECURITY_VERDICT: PASS "),
+        "lowercase": attested_approval(attestation="security_verdict: pass"),
+        "two-declarations": attested_approval("Also SECURITY_VERDICT: PASS."),
+        # The second declaration is a JSON escape: only its decoded string spells the key.
+        "escaped-duplicate": attested_approval("Clean. SECURITY_VERDICT: PASS").replace(
+            "Clean. SECURITY_VERDICT", "Clean. SECURITY\\u005fVERDICT"),
+        "in-a-finding": attested_approval(findings=({**security_finding("P3"), "category": "correctness",
+                                                    "body": "SECURITY_VERDICT: PASS"},)),
+        "qualified-pass": attested_approval(attestation="SECURITY_VERDICT: PASS (pending F1)"),
+        "envelope": approve_envelope(attested_payload()),
+        "old-placement": old_placement,
+    }
+    for name, reply in refused.items():
+        if name not in {"envelope", "old-placement"}:
+            assert sealed(reply) is not None, name
+        write_task(tasks, reply=reply, **critical)
+        with pytest.raises(recorder.RecordError, match="SECURITY_APPROVAL_REFUSED"):
+            recorder.record("review-one", pr_number=42, task_root=tasks, lock_root=tmp_path / "locks")
+        assert comments == [] and calls == {"posts": 0, "statuses": 0}, name
+
+    # The sign-off line has no closing punctuation: an unfinished-review admission on the next line, or after
+    # any unpunctuated line, is still read, whether the object is sealed or indented as a Markdown code block.
+    from lu_machinery.review.review_contract import ContractError, canonical_receipt_payload
+
+    for unfinished in (
+        attested_approval("I could not finish the review."),
+        attested_approval("Summary\nI could not finish the review."),
+        # Wrapped across lines after an unpunctuated line.
+        attested_approval("Summary\nI could not finish\nthe review."),
+        # Visible admissions that Markdown rendering hides: a line led by inline code, and an HTML block.
+        attested_approval("Checked `a.py`\n`b.py` I could not finish the review."),
+        attested_approval("Summary\n\n<p>I could not finish the review.</p>"),
+        # Visible admission hidden by HTML markup: nested inline tags, a character reference, a tag inside a word.
+        attested_approval("Summary\n\n<p><b>I</b><i> could</i> not&nbsp;fin<b>ish</b> the review.</p>"),
+        "\n    " + attested_approval("I could not finish the review."),
+        "```json\n" + attested_approval("I could not finish the review.") + "\n```\n",
+    ):
+        # A whole fence reaches the recorder only from a route the worker does not seal.
+        assert unfinished.startswith("```") or sealed(unfinished) is not None
+        with pytest.raises(ContractError, match="review_declares_incomplete"):
+            canonical_receipt_payload(unfinished)
+        write_task(tasks, reply=unfinished, **critical)
+        with pytest.raises(recorder.RecordError, match="inconclusive: reviewer declares an incomplete review"):
+            recorder.record("review-one", pr_number=42, task_root=tasks, lock_root=tmp_path / "locks")
+        assert comments == [] and calls == {"posts": 0, "statuses": 0}
+
+    # A completed review that quotes an admission as a fenced or indented code example still approves.
+    for example in (
+        "The test pins this text:\n\n```\nI could not finish the review.\n```\n\nAll good.",
+        "The fixture:\n\n    I could not finish the review.\n\nAll good.",
+        # The completion check read quoted or attributed text as an admission: an HTML comment, attributed speech.
+        "All good.\n\n<!-- <b>I could not finish the review.</b> -->",
+        "Earlier reviewers said *the review is incomplete*; it is now complete.",
+    ):
+        reply = attested_approval(example)
+        assert sealed(reply) is not None and canonical_receipt_payload(reply)["overall"]["explanation"].endswith(example)
+        write_task(tasks, reply=reply, **critical)
+        result = recorder.record("review-one", pr_number=42, task_root=tasks, lock_root=tmp_path / "locks")
+        assert result["verdict"] == "APPROVED" and statuses[-1]["state"] == "success", example
+        comments.clear()
+        statuses.clear()
+        calls.update(posts=0, statuses=0)
+
+    # A reviewer's pretty-printed raw output, sealed by the worker, signs off.
+    reply = sealed(json.dumps(attested_payload(), indent=2))
+    assert reply == attested_approval()
+    write_task(tasks, reply=reply, **critical)
+    result = recorder.record("review-one", pr_number=42, task_root=tasks, lock_root=tmp_path / "locks")
+    assert result["verdict"] == "APPROVED" and statuses[-1]["state"] == "success"
+
+    # Only a critical_review seat signs off.
+    with pytest.raises(recorder.RecordError, match="needs a critical_review seat"):
+        recorder._require_security_approval(attested_approval(), critical=True, critical_seat=False, inherited=())
+    assert recorder._critical_review_seat({"agent": "codex"}, CURRENT_SOL)
+    assert not recorder._critical_review_seat({"agent": "claude"}, "claude-sonnet-5-5")
+
+
+@pytest.mark.usefixtures('configured_roots', 'recorder_matcher')
+@pytest.mark.parametrize("correctness,verdict", [("incorrect", "CHANGES_REQUESTED"), ("uncertain", "CHANGES_REQUESTED")])
+@pytest.mark.usefixtures("agent_runtime_roots")
+def test_incorrect_or_uncertain_security_reply_never_approves(monkeypatch, tmp_path, correctness, verdict):
+    """Defect class: security finding approved; a rejection or uncertainty is never promoted to approval."""
+    tasks, comments, _calls = setup_record(monkeypatch, tmp_path)
+    statuses = _recording_statuses(monkeypatch)
+    write_task(tasks, reply=security_reply(correctness, "P3"))
+    result = recorder.record("review-one", pr_number=42, task_root=tasks, lock_root=tmp_path / "locks")
+    assert result["verdict"] == sweep.lookup_verdict(comments, SHA, "fleet").state == verdict
+    assert statuses[0]["state"] == "failure"
+
+
 def _all_p3_object():
     payload = structured_review(1)
     payload["overall"]["explanation"] = "One P3 residual."
@@ -1880,7 +2152,7 @@ def test_transport_failure_after_scan_never_retries_skeleton(scanned_recorder, t
 @pytest.mark.usefixtures("agent_runtime_roots")
 def test_head_movement_before_skeleton_write_refuses(scanned_recorder, tmp_path, monkeypatch):
     tasks, comments, calls, sent, _ = scanned_recorder
-    write_task(tasks, reply="VERDICT: APPROVE\ncredential stored SYNTHETIC-DETAIL")
+    write_task(tasks, reply=attested_approval("credential stored SYNTHETIC-DETAIL", attestation=None))
     heads = iter([SHA, "b" * 40])
     monkeypatch.setattr(recorder, "_pr", lambda *args: {
         "number": 42, "headRefName": "codex/42", "headRefOid": next(heads),
@@ -1894,7 +2166,7 @@ def test_head_movement_before_skeleton_write_refuses(scanned_recorder, tmp_path,
 @pytest.mark.usefixtures("agent_runtime_roots")
 def test_edited_skeleton_cannot_reconcile(scanned_recorder, tmp_path):
     tasks, comments, calls, sent, _ = scanned_recorder
-    write_task(tasks, reply="VERDICT: APPROVE\ncredential stored SYNTHETIC-DETAIL")
+    write_task(tasks, reply=attested_approval("credential stored SYNTHETIC-DETAIL", attestation=None))
     recorder.record("review-one", pr_number=42, task_root=tasks, lock_root=tmp_path / "locks")
     comments[0]["updated_at"] = "2026-09-23T14:00:00Z"
     with pytest.raises(recorder.RecordError, match="existing verdict marker was edited or conflicts"):
@@ -2021,7 +2293,8 @@ def test_gemini_code_verdict_refused_before_publication(monkeypatch, tmp_path, r
     tasks, comments, calls = setup_record(monkeypatch, tmp_path)
     monkeypatch.setattr(recorder, "pr_review_facts", lambda *_args, **_kwargs: facts_for({"anthropic"}, changed_paths=(path,)))
     # NEON-SOLTIER-1120: native AGY Gemini 4 Neon High is admitted at critical and on security paths.
-    write_task(tasks, agent="agy", model="gemini-4-neon-high", review_profile="code", review_risk=risk)
+    write_task(tasks, agent="agy", model="gemini-4-neon-high", review_profile="code", review_risk=risk,
+               reply=attested_approval())
     result = recorder.record("review-one", pr_number=42, task_root=tasks, lock_root=tmp_path / "locks")
     assert result["verdict"] == "APPROVED"
     assert calls == {"posts": 1, "statuses": 1}
@@ -2189,7 +2462,8 @@ def test_metadata_only_release_manifest_merges_without_a_ukrainian_seat(monkeypa
         "tests/test_generate_search_index.py",
     ]
     tasks, comments, _ = setup_record(monkeypatch, tmp_path, families={"openai"})
-    write_task(tasks, agent="claude", model="claude-opus-5-5", review_profile="infra", review_risk="critical")
+    write_task(tasks, agent="claude", model="claude-opus-5-5", review_profile="infra", review_risk="critical",
+               reply=attested_approval())
     recorder.record("review-one", pr_number=42, task_root=tasks, lock_root=tmp_path / "locks")
     assert sweep.lookup_verdict(comments, SHA, "fleet").ukrainian_seats == ()
 
@@ -3125,8 +3399,8 @@ def test_mixed_family_head_needs_both_family_approvals(tmp_path, monkeypatch):
 
     monkeypatch.setattr(github, "read", reads)
     row = {"headRefOid": head, "isDraft": False, "title": "Scoped review", "labels": [], "mergeStateStatus": "CLEAN"}
-    write_task(tasks, worktree_base_sha=head, review_risk="critical",
-               result_sha256=hashlib.sha256(b"VERDICT: APPROVE").hexdigest())
+    write_task(tasks, worktree_base_sha=head, review_risk="critical", reply=attested_approval(),
+               result_sha256=hashlib.sha256(attested_approval().encode()).hexdigest())
     with monkeypatch.context() as publication:
         def withhold_reply(_destination, texts, **_kwargs):
             if any("<details>" in text for text in texts):
@@ -3152,7 +3426,7 @@ def test_mixed_family_head_needs_both_family_approvals(tmp_path, monkeypatch):
     assert sweep.parse_marker(comments[1]["body"]) == marker
     assert statuses == ["pending"] and sweep.lookup_verdict(comments, head, "fleet").state == sweep.NEEDS_SEAT
     write_task(tasks, task_id="review-two", agent="claude", model="claude-opus-5-5",
-               worktree_base_sha=head, review_risk="critical")
+               worktree_base_sha=head, review_risk="critical", reply=attested_approval())
     recorder.record("review-two", pr_number=42, task_root=tasks, lock_root=tmp_path / "locks")
     assert statuses == ["pending", "success"] and calls["posts"] == 3
     assert sweep.lookup_verdict(comments, head, "fleet").state == "APPROVED"
@@ -3278,7 +3552,7 @@ def test_three_family_head_needs_an_outside_approval_for_every_family(tmp_path, 
         return subprocess.CompletedProcess([], 0, stdout=json.dumps(value[operation]), stderr="")
 
     monkeypatch.setattr(github, "read", reads)
-    write_task(tasks, worktree_base_sha=head, review_risk="critical")
+    write_task(tasks, worktree_base_sha=head, review_risk="critical", reply=attested_approval())
     recorder.record("review-one", pr_number=42, task_root=tasks, lock_root=tmp_path / "locks")
     marker = sweep.parse_marker(comments[0]["body"])
     assert marker["review_pair"] == "anthropic_google_openai"
@@ -3288,7 +3562,7 @@ def test_three_family_head_needs_an_outside_approval_for_every_family(tmp_path, 
     with pytest.raises(github.gate.PublishBlocked):
         github._refuse_incomplete_seats(REPOSITORY, 42, head, None, tmp_path, {})
     write_task(tasks, task_id="review-two", agent="claude", model="claude-opus-5-5",
-               worktree_base_sha=head, review_risk="critical")
+               worktree_base_sha=head, review_risk="critical", reply=attested_approval())
     recorder.record("review-two", pr_number=42, task_root=tasks, lock_root=tmp_path / "locks")
     scoped = ",".join(sorted((openai, head)))
     assert sweep.parse_marker(comments[1]["body"])["scope_commits"] == tuple(sorted((openai, head)))
@@ -3500,7 +3774,7 @@ def test_recorded_verdict_posts_at_the_active_slug_and_names_the_selector(monkey
     dispatched with, not the selector's active slug, and its receipt never names the selector it relied on."""
     tasks, _comments, calls = setup_record(monkeypatch, tmp_path)
     _transferred(monkeypatch, active)
-    write_task(tasks, reply="VERDICT: APPROVE\nOrdinary reviewer text.\n", repository="org/repos")
+    write_task(tasks, reply=attested_approval("Ordinary reviewer text.", attestation=None), repository="org/repos")
     written = []
     monkeypatch.setattr(recorder, "post_commit_status", lambda **fields: written.append(fields["repository"]))
     post = recorder._post_verdict
@@ -3567,3 +3841,90 @@ def test_publication_ledger_keeps_the_selector_receipt_and_still_reads_legacy_li
     published, counts = model_stats_rows.read_publications(tmp_path)
     assert sorted(published["prior-review"], key=lambda line: line["pr"]) == [legacy, entry]
     assert counts == Counter({"lines": 2, "malformed_lines": 1, "tasks": 1})
+
+
+def _completion(payload, value):
+    """``payload`` with ``overall.review_complete`` set to ``value``, or removed when ``value`` is ``...``."""
+    payload["overall"].pop("review_complete", None)
+    if value is not ...:
+        payload["overall"]["review_complete"] = value
+    return payload
+
+
+@pytest.mark.usefixtures('configured_roots', 'recorder_matcher', 'agent_runtime_roots')
+@pytest.mark.parametrize("value, reason", [
+    (..., "^COMPLETION_ATTESTATION_REFUSED: review_completion_not_attested"),
+    (False, "^COMPLETION_ATTESTATION_REFUSED: review_completion_not_attested"),
+    (None, r"schema_violation:overall\.review_complete:None is not of type 'boolean'"),
+    (1, r"schema_violation:overall\.review_complete:1 is not of type 'boolean'"),
+    ("true", r"schema_violation:overall\.review_complete:'true' is not of type 'boolean'"),
+    ("misplaced", r"schema_violation:\(root\):Additional properties are not allowed \('review_complete' was unexpected\)"),
+], ids=["missing", "false", "null", "one", "string", "misplaced"])
+def test_approve_requires_literal_true_review_complete(monkeypatch, tmp_path, value, reason):
+    """Defect class: approval recorded without affirmative completion attestation.
+
+    Only JSON ``true`` at ``overall.review_complete`` lets a new APPROVE be recorded; a missing, false or
+    non-boolean value, or one placed outside ``overall``, is refused by name before anything is posted (a value
+    the schema refuses is named by the schema check the verdict reader already runs).
+    """
+    tasks, _comments, calls = setup_record(monkeypatch, tmp_path)
+    payload = attested_payload()
+    if value == "misplaced":
+        _completion(payload, ...)["review_complete"] = True
+    else:
+        _completion(payload, value)
+    write_task(tasks, reply=json.dumps(payload))
+    with pytest.raises(recorder.RecordError, match=reason):
+        recorder.record("review-one", pr_number=42, task_root=tasks, lock_root=tmp_path / "locks")
+    assert calls == {"posts": 0, "statuses": 0}
+
+
+_SNIPPET = '{"overall": {"review_complete": true}}'
+
+
+@pytest.mark.parametrize("prior", [
+    "prose", "missing", "false", "true", "prose-then-true", "inline-code", "python-fence", "unversioned-json-fence",
+    "indented", "html-code", "html-comment", "quoted-v1", "multiline-code-v1", "html-wrapped-v1", "false-plus-example",
+    "escaped-key-in-code", "image-code", "link-title", "schema-invalid-true",
+])
+def test_format_correction_never_sets_review_complete(prior):
+    """Defect class: format-only retry upgrades completion.
+
+    The correction lock keeps the original attestation: a reply that did not attest JSON ``true`` (a prose
+    approval, a missing or false value, or an object beside prose, quoted, shown as code or HTML, or
+    unversioned) never gains it. Only a reply the strict reader reads as one findings object keeps it.
+    """
+    from lu_machinery.review.review_contract import canonical_receipt_payload, decision_lock, same_decision
+
+    attested = _completion(attested_payload(attestation=None), True)
+    v1 = json.dumps(attested)
+    prose = "VERDICT: APPROVE\n\n"
+    raw = {
+        "prose": prose + "All checks pass.",
+        "missing": json.dumps(_completion(attested_payload(attestation=None), ...)),
+        "false": json.dumps(_completion(attested_payload(attestation=None), False)),
+        "true": v1,
+        "prose-then-true": "The change is sound.\n" + v1,
+        "inline-code": prose + f"Verified that `{_SNIPPET}` is handled.",
+        "python-fence": prose + f"```python\npayload = {_SNIPPET}\n```",
+        "unversioned-json-fence": prose + f"```json\n{_SNIPPET}\n```",
+        "indented": prose + f"    {_SNIPPET}",
+        "html-code": prose + f"<code>{_SNIPPET}</code>",
+        "html-comment": prose + f"<!-- {_SNIPPET} -->",
+        "quoted-v1": prose + f"> {v1}",
+        "multiline-code-v1": "Verified.\n``\n" + v1 + "\n``",
+        "html-wrapped-v1": "Verified.\n<code>\n" + v1 + "\n</code>",
+        "false-plus-example": json.dumps(_completion(attested_payload(attestation=None), False)) + f"\n\nSee `{_SNIPPET}`.",
+        "escaped-key-in-code": "Checked review_complete.\n``\n" + v1.replace("review_complete", "review\\u005fcomplete") + "\n``",
+        "image-code": "Verified.\n![``\n" + v1 + "\n``](x.png)",
+        "link-title": "Verified [x](https://example.invalid '\n" + v1 + "\n')",
+        # A schema-invalid object (no confidence) the strict reader still reads keeps its attestation.
+        "schema-invalid-true": json.dumps({**attested, "overall": {
+            key: value for key, value in attested["overall"].items() if key != "confidence"}}),
+    }[prior]
+    lock = decision_lock(raw)
+    keeps = prior in {"true", "schema-invalid-true"}
+    assert same_decision(lock, attested) is keeps
+    if keeps:
+        assert same_decision(lock, _completion(attested_payload(attestation=None), ...)) is False
+        assert canonical_receipt_payload(v1) == attested

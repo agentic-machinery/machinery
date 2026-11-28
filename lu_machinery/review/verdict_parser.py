@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import Iterable, Iterator
+from html.parser import HTMLParser
 from itertools import accumulate
 from typing import Any
 
@@ -386,10 +387,12 @@ def invalid_findings_block(response: str, *, stated: str | None = None) -> str |
 
 # These are declarations by the reviewer about its own unfinished work, not
 # general uses of "incomplete" in findings about the code under review.
-# No catastrophic backtracking: on reviewer prose it starts only at ^ or [.!?:], and its repeated units are literal
-# words split by \s+, which no word can match, so no span matches two ways (200k chars: <40 ms).
+# A declaration starts a line (a table cell is its own line) or follows [.!?:], after blanks (rendered inline code or
+# HTML leaves them) and one opening ( or [. No catastrophic backtracking: the lead-in is possessive and stays on its line, and the
+# repeated units are literal words split by \s+, which no word can match, so no span matches two ways (200k chars:
+# <100 ms).
 _INCOMPLETE_REVIEW_RE = re.compile(  # nosemgrep: python.lang.security.audit.regex_dos
-    r"(?:^|[.!?:]\s+)(?:(?:however|unfortunately),?\s+)?(?:"
+    r"(?:^|[.!?:]\s)[^\S\n]*+[(\[]?+[^\S\n]*+(?:(?:however|unfortunately),?\s+)?(?:"
     r"(?:I|we)\s+(?:(?:could|can|did|have)\s+not|cannot|couldn't|can't|didn't|haven't|"
     r"(?:am|are|was|were)\s+unable\s+to)\s+"
     r"(?:finish(?:ed)?|complete(?:d)?)\s+(?:(?:the|this|my|our|full|entire)\s+)*"
@@ -397,8 +400,59 @@ _INCOMPLETE_REVIEW_RE = re.compile(  # nosemgrep: python.lang.security.audit.reg
     r"|(?:(?:the|this|my|our)\s+)?review\s+"
     r"(?:(?:is|was|remains?)\s+(?:incomplete|unfinished|not\s+(?:complete|completed|finished))|"
     r"(?:did\s+not|didn't|has\s+not|hasn't)\s+(?:finish(?:ed)?|complete(?:d)?))\b)",
-    re.IGNORECASE,
+    re.IGNORECASE | re.MULTILINE,
 )
+# Reviewer prose is read as the text a reader sees: Markdown (with GFM tables, so each cell is its own prose) is
+# rendered, then this reads the HTML. These phrasing elements flow inside a line; every other element, known or not,
+# ends one, so an unlisted block element cannot join two lines into one sentence.
+_HTML_INLINE_TAGS = frozenset({
+    "a", "abbr", "b", "bdi", "bdo", "cite", "code", "data", "del", "dfn", "em", "i", "img", "ins", "kbd", "mark",
+    "q", "s", "samp", "small", "span", "strong", "sub", "sup", "time", "u", "var", "wbr",
+})
+# Text in a closed one of these is an example or not shown, as in a Markdown code span or block quote.
+_HTML_EXAMPLE_TAGS = frozenset({"blockquote", "code", "kbd", "pre", "samp", "script", "style", "template"})
+
+
+class _VisibleText(HTMLParser):
+    """Shown text of rendered prose: character references decoded, comments dropped, inline formatting transparent.
+
+    An image is read as its alt text, which a reader who cannot load it sees instead.
+
+    Every element but inline formatting ends a line. An unclosed example element hides nothing.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.parts: list[str] = []
+        self.examples: list[tuple[str, int]] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag not in _HTML_INLINE_TAGS:
+            self.parts.append("\n")
+        if tag in _HTML_EXAMPLE_TAGS:
+            self.examples.append((tag, len(self.parts)))
+        elif tag == "img":
+            self.parts.append(" " + next((value or "" for name, value in attrs if name == "alt"), "") + " ")
+
+    def handle_endtag(self, tag: str) -> None:
+        for depth in range(len(self.examples) - 1, -1, -1):
+            if self.examples[depth][0] == tag:
+                del self.parts[self.examples[depth][1]:]
+                del self.examples[depth:]
+                self.parts.append(" " if tag in {"code", "kbd", "samp"} else "\n")
+                break
+        if tag not in _HTML_INLINE_TAGS:
+            self.parts.append("\n")
+
+    def handle_data(self, data: str) -> None:
+        self.parts.append(data)
+
+
+def _visible_text(html: str) -> str:
+    reader = _VisibleText()
+    reader.feed(html)
+    reader.close()
+    return re.sub(r"\n(?:[^\S\n]*\n)+", "\n", "".join(reader.parts))
 
 
 def _without_inline_json(text: str) -> str:
@@ -423,15 +477,17 @@ def _without_inline_json(text: str) -> str:
 def _completion_prose(response: str) -> list[str]:
     """Own paragraphs, with verdict/score metadata separated from their prose."""
     from markdown_it import MarkdownIt
+    from markdown_it.renderer import RendererHTML
 
     visible = _without_inline_json(_without_code_fences(response, keep_unclosed=False))
+    markdown = MarkdownIt("commonmark").enable("table")
+    renderer = RendererHTML()
     prose = []
-    for token in MarkdownIt("commonmark").parse(visible):
-        if token.type == "inline":
-            rendered = "".join(
-                "\n" if child.type in {"softbreak", "hardbreak"} else " " if child.type == "code_inline" else child.content
-                for child in token.children or []
-            )
+    for token in markdown.parse(visible):
+        if token.type == "html_block":
+            prose.append(_visible_text(token.content).strip())
+        elif token.type == "inline":
+            rendered = _visible_text(renderer.renderInline(token.children or [], markdown.options, {}))
             lines = []
             continuations = []
             for line in _commonmark_lines(rendered):
@@ -454,10 +510,10 @@ def _completion_prose(response: str) -> list[str]:
                     lines.append(line)
                     continuations.append(line)
             for paragraphs in (lines, continuations):
-                prose.extend(
-                    paragraph.replace("\n", " ").strip()
-                    for paragraph in re.split(r"\n[ \t]*\n", "\n".join(paragraphs))
-                )
+                for paragraph in re.split(r"\n[ \t]*\n", "\n".join(paragraphs)):
+                    prose.append(paragraph.replace("\n", " ").strip())
+                    # Line starts kept: a line without closing punctuation cannot hide the declaration after it.
+                    prose.append(paragraph.strip())
     return prose
 
 
