@@ -289,6 +289,75 @@ launcher_print_argv() {
   fi
 }
 
+# launcher_claude_system_prompt — Claude Code keeps only the last system-prompt
+# addition it is given (#1589), so a caller's addition beside the launcher's
+# drops the rules core. Runs before any deploy, lease or canary and sets
+# LC_CLAUDE_SYSTEM_PROMPT_ARGS, the arguments the Claude adapters put before
+# LC_FORWARD_ARGS. When the forwarded arguments hold exactly one provable inline
+# addition (no other append-shaped argument, no literal --, and no option before
+# it that may take it as its value), its value is rewritten in place to the core,
+# a blank line, then the caller's text, so no forwarded element moves. Any other
+# argv keeps main's behaviour: the core's own addition, then the caller's
+# arguments unchanged; an addition the launcher cannot prove still loses the
+# core there, as on main. A provable addition without a value, or an argv slot
+# over the kernel's per-argument limit, refuses (exit 2).
+# shellcheck disable=SC2034  # both results are read by launchers/claude.sh and codex.sh
+launcher_claude_system_prompt() {
+  local arg previous value limit bytes index=0 found=-1 shaped=0 separator=0
+  LC_CLAUDE_SYSTEM_PROMPT_ARGS=()
+  for arg in ${LC_FORWARD_ARGS[@]+"${LC_FORWARD_ARGS[@]}"}; do
+    case "$arg" in
+      --append-system-prompt|--append-system-prompt=*) found="$index"; shaped=$((shaped + 1)) ;;
+      --append-system-prompt-file*) shaped=$((shaped + 1)) ;;
+      --) separator=1 ;;
+    esac
+    index=$((index + 1))
+  done
+  if [ "$shaped" != 1 ] || [ "$separator" = 1 ]; then
+    found=-1
+  elif [ "$found" -gt 0 ]; then
+    previous="${LC_FORWARD_ARGS[found - 1]}"
+    if [[ "$previous" == -* && "$previous" != *=* ]] && { ! launcher_provider_option_arity "$previous" \
+        || [[ "$LC_OPTION_ARITY" != boolean && "$LC_OPTION_ARITY" != optional ]]; }; then
+      found=-1
+    fi
+  fi
+  if [ "$found" -lt 0 ]; then
+    value="${LC_RULES_CORE:-}"
+  else
+    arg="${LC_FORWARD_ARGS[found]}"
+    if [ "$arg" = --append-system-prompt ]; then
+      if [ "$((found + 1))" -ge "${#LC_FORWARD_ARGS[@]}" ]; then
+        launcher_error "refusing to launch: --append-system-prompt requires a value."
+        exit 2
+      fi
+      found=$((found + 1))
+      value="${LC_FORWARD_ARGS[found]}"
+    else
+      value="${arg#*=}"
+    fi
+    if [ -n "${LC_RULES_CORE:-}" ]; then value="$LC_RULES_CORE"$'\n\n'"$value"; fi
+    if [ "$arg" != --append-system-prompt ]; then value="--append-system-prompt=$value"; fi
+  fi
+  if [ -n "$value" ]; then
+    # MAX_ARG_STRLEN: 32 pages per argument (the whole argv slot), its NUL included.
+    limit="$(getconf PAGESIZE)" && bytes="$(printf '%s' "$value" | wc -c)" || {
+      launcher_error "refusing to launch: cannot measure the system-prompt addition."
+      exit 2
+    }
+    if [ "$bytes" -ge "$((limit * 32))" ]; then
+      launcher_error "refusing to launch: the system-prompt addition is $bytes bytes, over the $((limit * 32 - 1))-byte argument limit."
+      exit 2
+    fi
+  fi
+  if [ "$found" -lt 0 ]; then
+    if [ -n "$value" ]; then LC_CLAUDE_SYSTEM_PROMPT_ARGS=(--append-system-prompt "$value"); fi
+  else
+    LC_FORWARD_ARGS[found]="$value"
+  fi
+  LC_CLAUDE_SYSTEM_PROMPT_READY=1
+}
+
 # Every seat starts with the rules core (scripts/lib/rules_core.sh). A driver on
 # a curriculum lane is a content seat and also gets the curriculum addendum. An
 # absent or unreadable core refuses the launch (exit 1), naming the path.
@@ -1313,7 +1382,7 @@ launcher_provider_option_arity() {
       case "$1" in
         --agent|--agents|--append-system-prompt|--append-system-prompt-file|--autocompact|--debug-file|--environment|--fallback-model|--input-format|--json-schema|--max-budget-usd|-n|--name|--output-format|--permission-mode|--permission-prompts|--plugin-dir|--plugin-url|--remote-control-session-name-prefix|--session-id|--setting-sources|--settings|--system-prompt|--system-prompt-file|--system-prompt-snapshot) LC_OPTION_ARITY=one ;;
         --add-dir|--allowedTools|--allowed-tools|--betas|--disallowedTools|--disallowed-tools|--file|--mcp-config|--tools) LC_OPTION_ARITY=many ;;
-        -c|--continue) LC_OPTION_ARITY=boolean ;;
+        -c|--continue|--dangerously-skip-permissions) LC_OPTION_ARITY=boolean ;;
         --cloud|-d|--debug|--from-pr|--prompt-suggestions|--remote-control|-r|--resume|--teleport|-w|--worktree) LC_OPTION_ARITY=optional ;;
         *) return 1 ;;
       esac
@@ -1616,6 +1685,11 @@ launcher_main() {
   # canary or seed can leave side effects behind a failed launch.
   if [ "$LC_MODE" = "driver" ] && [ "$LC_GOVERNOR" = "0" ]; then
     launcher_validate_provider_option_arity || exit 2
+  fi
+  # Build Claude's one system-prompt addition now, so a refusal cannot follow a
+  # deploy, lease or canary.
+  if [ "$LC_HARNESS" = claude-code ]; then
+    launcher_claude_system_prompt
   fi
   launcher_adapter_preflight
 
