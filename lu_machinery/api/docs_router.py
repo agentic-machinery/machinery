@@ -14,7 +14,7 @@ import re
 from collections.abc import Iterator, Mapping
 from datetime import UTC, datetime
 from pathlib import Path
-from urllib.parse import quote
+from urllib.parse import urlencode
 
 import yaml
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
@@ -368,11 +368,16 @@ def _directory_listing(
     }
 
 
-def _page_url(request: Request, limit: int, offset: int) -> str:
-    """The same listing request at another offset, as a path on this server."""
-    query = request.url.include_query_params(limit=limit, offset=offset).query
-    # The ASGI path is decoded, so one quote encodes it. ``url.path`` already escapes "?" and "#".
-    return f"{quote(request.scope['path'])}?{query}"
+def _page_url(*, format: str | None, limit: int, offset: int) -> str:
+    """Query-only relative link to another page of the current listing.
+
+    Built solely from the recognised format and paging parameters so arbitrary query
+    parameters are never echoed and directory segments cannot trigger path redaction.
+    """
+    params: dict[str, str | int] = {"limit": limit, "offset": offset}
+    if format is not None:
+        params = {"format": format, **params}
+    return f"?{urlencode(params)}"
 
 
 def collect_artifacts(
@@ -590,8 +595,8 @@ def serve_artifact(
         following = offset + limit if offset + limit < listing["total"] else None
         return {
             **listing,
-            "previous": None if previous is None else _page_url(request, limit, previous),
-            "next": None if following is None else _page_url(request, limit, following),
+            "previous": None if previous is None else _page_url(format=format, limit=limit, offset=previous),
+            "next": None if following is None else _page_url(format=format, limit=limit, offset=following),
         }
 
     # File serving
