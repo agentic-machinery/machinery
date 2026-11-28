@@ -283,15 +283,34 @@ def test_short_write_is_truncated_back_and_counted(batch_state: Path, monkeypatc
     assert _counters(batch_state, "public")["dropped"]["write_error"] == 1
 
 
-def test_symlinked_scope_directory_is_refused(batch_state: Path, tmp_path: Path) -> None:
-    """Defect class: the append follows a planted directory symlink and writes outside the event log."""
+@pytest.mark.parametrize("planted", [False, True])
+@pytest.mark.parametrize("level", ["telemetry", "telemetry/events", "telemetry/events/public",
+                                   "telemetry/events/private"])
+def test_symlinked_directory_level_is_refused(batch_state: Path, tmp_path: Path, level: str, planted: bool) -> None:
+    """Defect class: an append or a drop count resolves through a planted directory symlink at any level below the
+    batch state, creating directories or overwriting counters outside the event log."""
     outside = tmp_path / "outside-dir"
     outside.mkdir()
-    emit_mod.events_root(batch_state).mkdir(parents=True)
-    (emit_mod.events_root(batch_state) / "public").symlink_to(outside, target_is_directory=True)
+    if planted:  # valid counters wherever the link could lead an append or a drop count
+        for prefix in ("", "events/"):
+            for scope in ("public", "private"):
+                target = outside / prefix / scope / emit_mod.COUNTERS_FILE
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(json.dumps(emit_mod._zero_counters()))
+        (outside / emit_mod.COUNTERS_FILE).write_text(json.dumps(emit_mod._zero_counters()))
+    before = sorted((p.relative_to(outside).as_posix(), p.read_bytes() if p.is_file() else None)
+                    for p in outside.rglob("*"))
+    link = batch_state / level
+    link.parent.mkdir(parents=True, exist_ok=True)
+    link.symlink_to(outside, target_is_directory=True)
+    scope = "private" if level.endswith("private") else "public"
+    good = emit_mod.settlement_event(_record(repo="priv" if scope == "private" else "pub"), repos=REPOS)
 
-    assert emit_mod.append_event(batch_state, emit_mod.settlement_event(_record(), repos=REPOS)) == "error"
-    assert list(outside.iterdir()) == []
+    assert emit_mod.append_event(batch_state, good) == "error"
+    # An invalid event counts privately; a public link still refuses it (the public headroom is unmeasurable).
+    assert emit_mod.append_event(batch_state, {**good, "cwd": "/x"}) == "error"
+    assert sorted((p.relative_to(outside).as_posix(), p.read_bytes() if p.is_file() else None)
+                  for p in outside.rglob("*")) == before
 
 
 def test_symlinked_segment_is_refused(batch_state: Path, tmp_path: Path) -> None:

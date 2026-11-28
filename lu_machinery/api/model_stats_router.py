@@ -2025,7 +2025,8 @@ def collect(batch_state_dir: Path, primary_root: Path, now: datetime | None = No
     scan and one read of the files changed between blocked and approved review heads.
 
     The catalogs are read afresh for each collection: no reading of an earlier one, failed or valid, is reused.
-    ``public_only`` keeps only confirmed-public rows (``telemetry.emit.record_visibility``) and merges of public
+    ``public_only`` keeps only confirmed-public rows (written with ``visibility`` "public" and still public under
+    ``telemetry.emit.record_visibility``; a row written before that field existed is left out) and merges of public
     repositories: the scope the shared, unauthenticated ``/metrics`` may show.
     """
     refresh_readings()
@@ -2043,7 +2044,8 @@ def collect(batch_state_dir: Path, primary_root: Path, now: datetime | None = No
     keys = repository_keys(catalog)
     public_keys = frozenset(key for key, repo in (catalog or {}).items() if repo.authorized_visibility == "public")
     if public_only:
-        raw_rows = [raw for raw in raw_rows if catalog and record_visibility(raw, catalog) == "public"]
+        raw_rows = [raw for raw in raw_rows
+                    if catalog and raw.get("visibility") == "public" and record_visibility(raw, catalog) == "public"]
     moments = [m for m in map(_moment, raw_rows) if m]
     first = min(moments, default=until)
     rows = [row for row in _rows(raw_rows, landing or Landing(), alias_resolver(raw_rows), publications, keys)

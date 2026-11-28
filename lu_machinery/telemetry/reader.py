@@ -15,6 +15,7 @@ deduplicated at read time (the store re-emits on every terminal write); the last
 
 from __future__ import annotations
 
+import logging
 import os
 import stat
 from collections.abc import Iterator, Mapping
@@ -24,23 +25,14 @@ from pathlib import Path
 from threading import Lock
 from typing import Any
 
-from lu_machinery import state_paths
 from lu_machinery.common import json_depth
 from lu_machinery.telemetry import emit
 
+_log = logging.getLogger(__name__)
 _EVENT_MAX_DEPTH = 3
 _ROW_MAX_DEPTH = 32
 _MAX_ROW_BYTES = 64 * 1024
 _TAIL_CHUNK = 64 * 1024
-
-
-def _scope_dir(batch_state: Path, scope: str) -> Path:
-    """The scope directory; a symlink at any level below the batch state is refused (never followed)."""
-    scope_dir = state_paths.telemetry_scope_dir(batch_state, scope)
-    for level in (scope_dir.parent.parent, scope_dir.parent, scope_dir):
-        if level.is_symlink():
-            raise OSError(f"telemetry directory is a symlink: {level.name}")
-    return scope_dir
 
 
 def _decode(line: bytes, limits: emit.EventLogLimits) -> dict[str, Any] | None:
@@ -93,7 +85,7 @@ def _window(scope_dir: Path, limits: emit.EventLogLimits, today: datetime | None
 
 def _events(batch_state: Path, scope: str, limits: emit.EventLogLimits, today: datetime | None,
             repos: Mapping[str, Any] | None) -> Iterator[dict[str, Any]]:
-    scope_dir = _scope_dir(batch_state, scope)
+    scope_dir = emit.checked_scope_dir(batch_state, scope)
     for _day, path, _size in _window(scope_dir, limits, today):
         for line in _scope_lines(path, limits):
             event = _decode(line, limits)
@@ -166,7 +158,7 @@ def _epoch(value: object) -> float | None:
 def _last_public_event_ts(batch_state: Path, limits: emit.EventLogLimits, today: datetime | None,
                           repos: Mapping[str, Any]) -> float | None:
     """The newest valid public event's time, reading the retained segments backwards in bounded chunks."""
-    scope_dir = _scope_dir(batch_state, emit.PUBLIC)
+    scope_dir = emit.checked_scope_dir(batch_state, emit.PUBLIC)
     for _day, path, size in reversed(_window(scope_dir, limits, today)):
         for line in _reversed_lines(path, size, limits):
             event = _decode(line, limits)
@@ -227,6 +219,13 @@ class _RowsCursor:
 
     def last_public(self, path: Path, repos: Mapping[str, Any]) -> float | None:
         signature = tuple(sorted((key, repo.authorized_visibility, repo.slugs) for key, repo in repos.items()))
+        try:
+            rows_dir = path.parent.lstat()
+        except FileNotFoundError:
+            return None
+        if not stat.S_ISDIR(rows_dir.st_mode):  # a symlinked rows directory is never followed: unknown
+            _log.warning("model-stats rows directory is not a plain directory; freshness reference unknown")
+            return None
         with self._lock:
             try:
                 fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
@@ -273,6 +272,8 @@ def _public_row_time(line: bytes, repos: Mapping[str, Any]) -> float | None:
 
     if not isinstance(row, dict) or row.get("schema") != ROW_SCHEMA:  # a row is written only at settlement
         return None
+    if row.get("visibility") != emit.PUBLIC:  # classified by the writer from the raw record; absent is private
+        return None
     if emit.record_visibility(row, repos) != emit.PUBLIC:
         return None
     return _epoch(row.get("finished_at"))
@@ -294,7 +295,7 @@ def public_snapshot(batch_state: Path, *, limits: emit.EventLogLimits | None = N
     batch_state = Path(batch_state)
     if repos is None:
         repos = _repos_or_empty()
-    scope_dir = _scope_dir(batch_state, emit.PUBLIC)
+    scope_dir = emit.checked_scope_dir(batch_state, emit.PUBLIC)
     counters = _public_counters(scope_dir)
     return PublicTelemetry(
         events_last_ts=_last_public_event_ts(batch_state, limits, today, repos),

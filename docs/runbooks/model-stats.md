@@ -257,12 +257,17 @@ first column stays visible.
 ## Metrics (Grafana's contract)
 
 The shared `/metrics` scrape is unauthenticated, so its gauges come from a separate public-scope snapshot: the
-same collection over confirmed-public rows only and merges of public repositories only. A row counts as public
-when it names exactly one registered repository whose visibility is `public` and declares no data class
-(`lu_machinery/telemetry/emit.py` `record_visibility`); a row of a private or unregistered repository, a row with
-no repository, conflicting declarations or an unreadable registry is left out (fail closed). A private settlement
-therefore moves no series on this scrape; the route and the page keep every row. Private figures on a scraped
-surface wait for trusted caller authorization (TRACETEL-1128 Slice 4).
+same collection over confirmed-public rows only and merges of public repositories only. The row writer stores
+`visibility`, classified from the raw task record (`lu_machinery/telemetry/emit.py` `record_visibility`, the
+classifier the telemetry events use) before it defaults a missing `repo` to `public` or drops a conflicting
+declaration: `public` only when the record names exactly one registered repository whose visibility is `public`
+and declares no data class; a private or unregistered repository, no repository, conflicting declarations or an
+unreadable registry give `private`. The scrape reads a row only when its stored `visibility` is `public` and the
+row still classifies public today (fail closed). Rows written before rows carried `visibility` are left out, so
+after this change deploys the scraped model-stats and token gauges count only rows settled since then (the
+24-hour and 7-day token panels refill within a week; the 30-day, 90-day and `all` windows restart); no backfill
+adds the field. A private settlement therefore moves no series on this scrape; the route and the page keep every
+row. Private figures on a scraped surface wait for trusted caller authorization (TRACETEL-1128 Slice 4).
 
 Prometheus keeps about 15 days, so long history comes from the `window="all"` and weekly gauges of the latest
 scrape, not from range queries. A scrape never computes: it reads the cached public snapshot and schedules a

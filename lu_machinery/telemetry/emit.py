@@ -7,6 +7,7 @@ writes the bounded, visibility-partitioned ``telemetry-event.v2`` log under
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import math
@@ -400,10 +401,12 @@ def scope_bytes(scope_dir: Path) -> int:
 
 def _admitted(root: Path, scope: str, cost: int, limits: EventLogLimits, disk: DiskProbe) -> bool:
     """Whether a write of ``cost`` bytes keeps the shared reserve; private writes also keep public headroom."""
-    space: DiskSpace = disk(root.parent.parent)
+    batch_state = root.parent.parent
+    space: DiskSpace = disk(batch_state)
     need = _reserve(space, limits) + cost
     if scope == PRIVATE:
-        need += max(0, limits.scope_bytes - scope_bytes(root / PUBLIC)) + limits.slack_bytes
+        public_used = scope_bytes(checked_scope_dir(batch_state, PUBLIC))
+        need += max(0, limits.scope_bytes - public_used) + limits.slack_bytes
     return space.available >= need
 
 
@@ -411,11 +414,32 @@ def _open_dir(path: Path) -> int:
     return os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
 
 
+def _levels(scope_dir: Path) -> tuple[Path, Path, Path]:
+    """``telemetry``, ``telemetry/events`` and the scope directory, top down below the batch state."""
+    return scope_dir.parent.parent, scope_dir.parent, scope_dir
+
+
+def checked_scope_dir(batch_state: Path, scope: str) -> Path:
+    """The scope directory, refusing (``OSError``) a symlink or non-directory at any existing level below the batch
+    state. Levels are checked top down, so no check resolves through an unchecked ancestor; a missing level ends
+    the walk (nothing exists below it)."""
+    scope_dir = state_paths.telemetry_scope_dir(batch_state, scope)
+    for level in _levels(scope_dir):
+        try:
+            info = level.lstat()
+        except FileNotFoundError:
+            break
+        if not stat.S_ISDIR(info.st_mode):
+            raise OSError(f"telemetry directory is not a plain directory: {level.name}")
+    return scope_dir
+
+
 def _ensure_dir(scope_dir: Path) -> None:
-    """Create ``telemetry/events/<scope>`` below an existing batch-state directory; refuse any symlinked level."""
-    scope_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-    for level in (scope_dir.parent.parent, scope_dir.parent, scope_dir):
-        if level.is_symlink() or not level.is_dir():
+    """Create the telemetry levels one at a time, each only below a level already proven a plain directory."""
+    for level in _levels(scope_dir):
+        with contextlib.suppress(FileExistsError):
+            level.mkdir(mode=0o700)
+        if not stat.S_ISDIR(level.lstat().st_mode):
             raise OSError(f"telemetry directory is not a plain directory: {level.name}")
 
 
@@ -489,6 +513,7 @@ def _bump(scope_dir: Path, scope: str, *, reason: str | None, limits: EventLogLi
     """
     path = scope_dir / COUNTERS_FILE
     root = scope_dir.parent
+    checked_scope_dir(root.parent.parent, scope)
     if _regular_size(path) is None:
         missing = sum(1 for level in (root.parent, root, scope_dir, path) if not level.exists())
         if not _admitted(root, scope, limits.block_bytes * missing, limits, disk):
@@ -542,6 +567,7 @@ def append_event(batch_state: Path, event: dict[str, Any], *, limits: EventLogLi
     scope = PRIVATE if invalid else event["visibility"]
     scope_dir = state_paths.telemetry_scope_dir(batch_state, scope)
     try:
+        checked_scope_dir(batch_state, scope)
         if invalid:
             _bump(scope_dir, scope, reason="invalid", limits=limits, disk=disk)
             return "invalid"

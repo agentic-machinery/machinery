@@ -107,8 +107,11 @@ def test_newest_public_event_skips_torn_and_overlong_tail(batch_state: Path) -> 
 
 
 def _row(task_id: str, repo: str | None, finished: datetime, **extra) -> str:
-    return json.dumps({"schema": "model-stats-row.v1", "task_id": task_id, "repo": repo, "status": "done",
-                       "finished_at": finished.isoformat(), **extra}) + "\n"
+    """A model-stats row as the writer stores it, ``visibility`` classified from the same fields."""
+    row = {"schema": "model-stats-row.v1", "task_id": task_id, "repo": repo, "status": "done",
+           "finished_at": finished.isoformat(), **extra}
+    row.setdefault("visibility", emit_mod.record_visibility(row, REPOS))
+    return json.dumps(row) + "\n"
 
 
 def test_independent_settlement_reference_reads_public_rows_only(batch_state: Path) -> None:
@@ -122,6 +125,11 @@ def test_independent_settlement_reference_reads_public_rows_only(batch_state: Pa
     with rows.open("a") as stream:
         stream.write(_row("none-1", None, NOW + timedelta(minutes=6)))
         stream.write(_row("dc-1", "pub", NOW + timedelta(minutes=7), data_class="restricted"))
+        legacy = json.loads(_row("legacy-1", "pub", NOW + timedelta(minutes=7)))
+        del legacy["visibility"]  # written before rows carried visibility: never public
+        stream.write(json.dumps(legacy) + "\n")
+        stream.write(_row("writer-private", "pub", NOW + timedelta(minutes=7), visibility="private"))
+        stream.write(_row("now-private", "priv", NOW + timedelta(minutes=7), visibility="public"))
     assert reader.public_snapshot(batch_state, today=NOW, repos=REPOS).independent_settlement_last_ts == \
         NOW.timestamp()
 
@@ -149,6 +157,7 @@ def test_private_events_and_drops_never_move_public_snapshot(batch_state: Path) 
 def test_symlinked_public_directory_is_never_read(batch_state: Path, tmp_path: Path) -> None:
     """Defect class: the public reader follows a planted directory symlink and reports foreign data as public."""
     elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
     _emit(elsewhere, "foreign", "n1")
     emit_mod.events_root(batch_state).mkdir(parents=True)
     (emit_mod.events_root(batch_state) / "public").symlink_to(emit_mod.events_root(elsewhere) / "public")
@@ -157,3 +166,13 @@ def test_symlinked_public_directory_is_never_read(batch_state: Path, tmp_path: P
         reader.public_snapshot(batch_state, today=NOW, repos=REPOS)
     with pytest.raises(OSError):
         reader.settlements(batch_state, "public", today=NOW, repos=REPOS)
+
+
+def test_symlinked_rows_directory_is_never_read(batch_state: Path, tmp_path: Path) -> None:
+    """Defect class: the independent freshness reference follows a planted model-stats directory symlink."""
+    elsewhere = tmp_path / "elsewhere-rows"
+    elsewhere.mkdir()
+    (elsewhere / "rows.jsonl").write_text(_row("pub-1", "pub", NOW))
+    (batch_state / "model-stats").symlink_to(elsewhere, target_is_directory=True)
+
+    assert reader.public_snapshot(batch_state, today=NOW, repos=REPOS).independent_settlement_last_ts is None

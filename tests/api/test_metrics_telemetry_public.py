@@ -16,7 +16,7 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from lu_machinery.api import model_stats_router, subscriptions
+from lu_machinery.api import model_stats_router, model_stats_rows, subscriptions
 from lu_machinery.api.main import create_app
 from lu_machinery.api.monitor_context import fixture_context
 from lu_machinery.api.product_contribution import ProductContribution
@@ -28,6 +28,10 @@ from lu_machinery.telemetry import reader
 
 NOW = datetime(2026, 11, 28, 12, 0, 0, tzinfo=UTC)
 REPOS = {
+    # The row writer's default key for a record without a repository is "public": keep it registered and public,
+    # so a substituted default would be visible to the public readers.
+    "public": FleetRepo(key="public", github="example-org/site", local_name="site", role="public-monorepo",
+                        default=True),
     "pub": FleetRepo(key="pub", github="example-org/pub", local_name="pub", role="public-labs"),
     "priv": FleetRepo(key="priv", github="example-org/priv", local_name="priv", role="private-labs"),
 }
@@ -59,9 +63,11 @@ async def _no_lifespan(_app: FastAPI) -> Iterator[None]:
 
 
 @pytest.fixture(autouse=True)
-def _fixture_scope(monkeypatch: pytest.MonkeyPatch) -> None:
+def _fixture_scope(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     monkeypatch.setattr(emit_mod, "load_fleet_repos", lambda: REPOS)
     monkeypatch.setattr(model_stats_router, "fleet_catalog", lambda: REPOS)
+    monkeypatch.setattr(model_stats_rows, "load_fleet_repos", lambda: REPOS)
+    model_stats_rows.refresh_readings()  # no registry reading cached by an earlier test
     monkeypatch.setattr(emit_mod, "_utcnow", lambda: NOW)
     monkeypatch.setattr(emit_mod, "DEFAULT_LIMITS", LIMITS)
     monkeypatch.setattr(store, "now", lambda: NOW.isoformat())
@@ -76,6 +82,8 @@ def _fixture_scope(monkeypatch: pytest.MonkeyPatch) -> None:
         return snapshot, 1.0
 
     monkeypatch.setattr(model_stats_router, "cached_snapshot", snapshot_now)
+    yield
+    model_stats_rows.refresh_readings()  # nor one of this fixture registry for a later test
 
 
 def _scrape(root: Path, monkeypatch: pytest.MonkeyPatch) -> str:
@@ -104,28 +112,48 @@ def _bind_store(monkeypatch: pytest.MonkeyPatch, root: Path) -> Path:
     return tasks.parent
 
 
-def _settle(repo: str) -> None:
+def _settle(repo: str | None) -> None:
     store.record_admission_refusal(None, "claude", {"repo": repo, "model": "claude-opus-5-5", "effort": "high",
                                                     "mode": "workspace-write"}, StartRefusal.CAPACITY)
 
 
+def _settle_conflicting() -> None:
+    """A settled record whose repository declarations disagree (``repo`` public, ``options.repo`` private)."""
+    record = {"schema_version": 2, "task_id": "task-conflicting", "run_nonce": "c" * 32, "status": "done",
+              "agent": "claude", "model": "claude-opus-5-5", "effort": "high", "mode": "workspace-write",
+              "repo": "pub", "options": {"repo": "priv"}, "pid": None, "started_at": NOW.isoformat(),
+              "finished_at": NOW.isoformat(), "duration_s": 1.0}
+    store._write(store.record_path("task-conflicting"), record, exclusive=True)
+
+
+# Each is a private settlement for the shared scrape: a registered private repository, no repository at all (the
+# row writer stores repo "public" for it), and contradicting repository declarations.
+PRIVATE_SETTLEMENTS = {
+    "registered_private": lambda: _settle("priv"),
+    "unclassified": lambda: _settle(None),
+    "conflicting": _settle_conflicting,
+}
+
+
+@pytest.mark.parametrize("kind", sorted(PRIVATE_SETTLEMENTS))
 def test_private_settlement_leaves_unauthenticated_scrape_identical_near_reserve(
-        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Defect class: one private settlement changes a settlement-derived series on the shared scrape (mixed-scope
-    model-stat aggregates, or a private append spending the free space the same public append then lacks)."""
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: str) -> None:
+    """Defect class: one private or unclassified settlement changes a settlement-derived series on the shared scrape
+    (mixed-scope model-stat aggregates, a row writer default read as public, or a private append spending the free
+    space the same public append then lacks)."""
     bodies, full = {}, {}
     for case in ("without_private", "with_private"):
         root = tmp_path / case
         batch_state = _bind_store(monkeypatch, root)
         monkeypatch.setattr(emit_mod, "disk_space", FakeDisk(emit_mod.events_root(batch_state), NEAR_RESERVE))
         if case == "with_private":
-            _settle("priv")
+            PRIVATE_SETTLEMENTS[kind]()
         _settle("pub")
         bodies[case] = _scrape(root, monkeypatch)
         full[case] = model_stats_router.collect(batch_state, root, now=NOW + timedelta(hours=1),
                                                 landing=model_stats_router.Landing())["metrics"]
-        rows = (batch_state / "model-stats" / "rows.jsonl").read_text().splitlines()
-        assert [json.loads(row)["repo"] for row in rows] == (["priv", "pub"] if case == "with_private" else ["pub"])
+        rows = [json.loads(row) for row in (batch_state / "model-stats" / "rows.jsonl").read_text().splitlines()]
+        assert [row["visibility"] for row in rows] == (["private", "public"] if case == "with_private" else ["public"])
 
     # The fixture is sensitive: the mixed-scope aggregation does see the private settlement.
     assert full["without_private"] != full["with_private"]
