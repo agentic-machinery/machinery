@@ -9,6 +9,43 @@ this file.
 
 ## [Unreleased]
 
+<a id="v0.1.84"></a>
+## [0.1.84] - 2026-11-28
+
+### Added
+
+- Record finding outcome labels with stored reviewer_model and per-reviewer label stats ([#1553](https://github.com/agentic-machinery/machinery/pull/1553))
+- Rotate code/infra reviews across Sol, Opus, Neon and Grok; catalog-free review counts (supersedes #1554) ([#1565](https://github.com/agentic-machinery/machinery/pull/1565))
+- Persist a daily error digest ([#1570](https://github.com/agentic-machinery/machinery/pull/1570))
+- Publish the daily error digest ([#1575](https://github.com/agentic-machinery/machinery/pull/1575))
+- Blocked-first Milestones page without resize realign (supersedes #1578) ([#1586](https://github.com/agentic-machinery/machinery/pull/1586))
+
+### Changed
+
+- Say where binding facts for a live worker go and re-check dispatch holds ([#1562](https://github.com/agentic-machinery/machinery/pull/1562))
+- List all five tmp-sweep passes and scope the "-" prefix (supersedes #1584) ([#1585](https://github.com/agentic-machinery/machinery/pull/1585))
+
+### Fixed
+
+- Eliminate polynomial ReDoS and overly-large regex range alerts ([#1550](https://github.com/agentic-machinery/machinery/pull/1550))
+- Fail-closed recipient readers, third lineage (supersedes #1544) ([#1548](https://github.com/agentic-machinery/machinery/pull/1548))
+- Require a repository for read-only PR review ([#1555](https://github.com/agentic-machinery/machinery/pull/1555))
+- Time out AGY workers when model activity stops ([#1557](https://github.com/agentic-machinery/machinery/pull/1557))
+- Exclude four on-demand Markdown rules from Claude autoload ([#1558](https://github.com/agentic-machinery/machinery/pull/1558))
+- Allow loopback aliases and configured hosts in body-read guard ([#1560](https://github.com/agentic-machinery/machinery/pull/1560))
+- Render managed CTO pointer block with cto lane and operator escalation ([#1561](https://github.com/agentic-machinery/machinery/pull/1561))
+- Record live provider log paths ([#1563](https://github.com/agentic-machinery/machinery/pull/1563))
+- Pass Claude one system-prompt addition, core then role ([#1559](https://github.com/agentic-machinery/machinery/pull/1559))
+- Store log lines at their journal severity ([#1571](https://github.com/agentic-machinery/machinery/pull/1571))
+- HTML 404 page with nav for browser paths, no host-specific nav link (supersedes #1566) ([#1572](https://github.com/agentic-machinery/machinery/pull/1572))
+- No epoch dates, paged listings, PR titles and ages (supersedes #1567) ([#1574](https://github.com/agentic-machinery/machinery/pull/1574))
+- Refuse unreadable recipients in claim and receive via pending classifier (supersedes #1539) ([#1577](https://github.com/agentic-machinery/machinery/pull/1577))
+- Keep later tmp-sweep passes running after an earlier failure ([#1579](https://github.com/agentic-machinery/machinery/pull/1579))
+- Expire marked scratch on a dedicated state root ([#1580](https://github.com/agentic-machinery/machinery/pull/1580))
+- Keep the rules core before a caller's developer_instructions (supersedes #1576) ([#1581](https://github.com/agentic-machinery/machinery/pull/1581))
+- Preserve fresh deliveries to historical aliases ([#1583](https://github.com/agentic-machinery/machinery/pull/1583))
+- Reject malformed stored metadata ([#1588](https://github.com/agentic-machinery/machinery/pull/1588))
+
 <a id="v0.1.83"></a>
 ## [0.1.83] - 2026-11-27
 
@@ -1886,7 +1923,8 @@ First release: the machinery extracted from learn-ukrainian as the installable `
 - Rollover confirms replacement bindings without a self-answered quiz. ([#65](https://github.com/learn-ukrainian/machinery/pull/65))
 - Deploy derives release identity from packaged bytes. ([#145](https://github.com/learn-ukrainian/machinery/pull/145))
 
-[Unreleased]: https://github.com/agentic-machinery/machinery/compare/v0.1.83...HEAD
+[Unreleased]: https://github.com/agentic-machinery/machinery/compare/v0.1.84...HEAD
+[0.1.84]: https://github.com/agentic-machinery/machinery/compare/v0.1.83...v0.1.84
 [0.1.83]: https://github.com/agentic-machinery/machinery/compare/v0.1.82...v0.1.83
 [0.1.82]: https://github.com/agentic-machinery/machinery/compare/v0.1.79...v0.1.82
 [0.1.81]: https://github.com/agentic-machinery/machinery/compare/v0.1.79...v0.1.81
