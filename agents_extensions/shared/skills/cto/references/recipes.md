@@ -88,13 +88,17 @@ use the pushed head's tier.
 
 When a work item hits the review cap, record the
 [cap disposition](../../review-loop/references/policy.md#4-convergence) before dispatching any
-replacement. Confirm the predecessor task has settled before dispatch. Use the same parent
-record when a replacement also hits the cap. In the ordered
-replacement brief, link the decision and carry every unresolved blocker with its predecessor
-PR and finding ID, owner, and where it will be resolved. State which findings the replacement
-will address and which remain open on other named work. When a predecessor PR already has a
-bound lifecycle ledger, follow [the existing scope transfer](../../full-send/references/delivery.md#hand-off-record)
-before dispatching the replacement.
+continuation. Confirm the predecessor task has settled before dispatch. Continue fixes on the same
+PR and branch by issuing the PR's single verified continuation grant (`record_cf_verdict.py
+grant-continuation --repository <owner/name> --pr <N> --capped-head <sha> --disposition-ref <ref>
+--authority claude-cto`) and dispatching the worker with `--branch <the PR's head branch>` and
+`--base origin/main`. Authorize a replacement PR on a fresh branch only when the CTO records why
+safe continuation on the original branch is impossible; link that disposition from the successor PR
+body as `Supersedes #N (reason: ...)`, carry every unresolved blocker with its predecessor PR and
+finding ID, owner, and where it will be resolved, and follow
+[the existing scope transfer](../../full-send/references/delivery.md#hand-off-record) when a
+predecessor PR already has a bound lifecycle ledger. Use the same parent record if a continuation
+also caps.
 
 ## Test grants
 
@@ -153,7 +157,10 @@ Dispatch a takeover that continues the existing PR with `--branch <the PR's head
 `--base origin/main`, never the PR branch as base; the `takeover` skill checks out the PR branch.
 A same-PR successor dispatched without `--branch` is refused by `lu_machinery.orchestration.pr_ownership accept`
 with `publish_branch_required` and stops.
-For a replacement authorized after the cap, dispatch on a fresh branch. Grant the paths the
+Continue fixes on the same PR with `--branch <the PR's head branch>` and `--base origin/main`
+(including after the CTO's single cap-continuation grant). Dispatch a replacement on a fresh branch
+only when the CTO recorded why safe continuation on the original branch is impossible, linking that
+disposition from the successor PR body (`Supersedes #N (reason: ...)`), and grant the paths the
 replacement will change relative to `origin/main`, including any inherited changes it keeps.
 The same-PR successor's owned paths must cover the original PR's full diff against `origin/main`,
 not only its own fixes, because `delivered_paths` counts the PR's inherited commits as the

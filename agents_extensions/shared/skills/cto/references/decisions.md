@@ -45,14 +45,20 @@ Practices used:
   only for an infrastructure failure: a failing test node is fixed or deleted, never rerun.
 - For review scope and repeated findings, apply the canonical
   [review budget](../../review-loop/references/policy.md).
-- If the review budget ends with a blocker, limit work to open findings and allow at most one
-  successor lineage per card. Close the predecessor PR when the successor opens. If the budget
-  runs out again, re-slot or redesign without a third lineage.
+- If the review budget ends with a blocker, limit work to open findings and continue on the same PR
+  and branch by issuing at most one CTO cap-continuation round (`record_cf_verdict.py
+  grant-continuation`) bound to the recorded cap disposition and live capped head. If that extra
+  round still ends with a blocker, re-slot or redesign the card. Open a replacement PR only when
+  the CTO records why safe continuation on the original branch is impossible, links that
+  disposition from the successor as `Supersedes #N (reason: ...)`, and closes the predecessor PR
+  when the successor opens.
 - After two failed review executions at the same head (the escalation in
   [review-loop policy](../../review-loop/references/policy.md#recording-the-verdict)), never authorize
-  another same-head run. Dispose of it as a fresh-lineage replacement PR with designated approval,
-  a `BLOCKED` hand-off, or the capability-failure record for a single run that qualifies under
-  the review-loop policy and skill.
+  another same-head run. Dispose of it as a `BLOCKED` hand-off, the capability-failure record for
+  a single run that qualifies under the review-loop policy and skill, a same-PR continuation at a
+  new head within budget (or through the PR's one verified cap-continuation round), or a
+  replacement PR only when the CTO records why safe continuation on the original branch is
+  impossible (`Supersedes #N (reason: ...)`) with designated approval.
 - Apply OO-99 through the binding [native usage pace/reserve rule](../../../rules/model-assignment.md).
   Read each pool's CodexBar pace line, used minus expected. A pool is short only when
   it will not last to reset; reset credits cover a deficit. Use capacity before reset,
