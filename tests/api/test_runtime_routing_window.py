@@ -163,7 +163,8 @@ def test_missing_task_store_is_unknown_not_an_empty_day(tmp_path, monkeypatch):
     unreadable start time) never fails the scan and never vanishes: it makes the
     result partial. A store that stops being listable is unknown at once,
     although an earlier scan is cached, and the scan's age counts from its own
-    ``as_of``.
+    ``as_of``. That age is the elapsed time rounded to the nearest millisecond, so
+    it may sit up to half a millisecond above the true elapsed time.
     """
     result = runtime_router.routing_decisions(_ctx(tmp_path / "batch_state"))
 
@@ -193,7 +194,9 @@ def test_missing_task_store_is_unknown_not_an_empty_day(tmp_path, monkeypatch):
         assert payload["recent"]["status"] == "partial"
         last_reading = payload["recent"]["as_of"]
         scanned = datetime.fromisoformat(payload["recent"]["as_of"].replace("Z", "+00:00"))
-        assert 0 <= payload["recent"]["age_s"] <= (datetime.now(UTC) - scanned).total_seconds()
+        elapsed_s = (datetime.now(UTC) - scanned).total_seconds()
+        # round(..., 3) in runtime_router: at most half a millisecond above elapsed_s.
+        assert 0 <= payload["recent"]["age_s"] <= elapsed_s + 0.0005
 
         def listing_fault(_directory):
             raise PermissionError("listing refused")
