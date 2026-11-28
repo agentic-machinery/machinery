@@ -63,6 +63,8 @@ def test_product_home_replaces_machinery_index_and_contract(tmp_path, monkeypatc
 
 def test_machinery_path_serves_machinery_home_when_product_owns_root(tmp_path, monkeypatch):
     """Defect class: a product that declares its own home at ``/`` hides the machinery page."""
+    from fastapi import HTTPException
+
     from lu_machinery.api import main
     from lu_machinery.api.product_contribution import ProductContribution
 
@@ -75,8 +77,11 @@ def test_machinery_path_serves_machinery_home_when_product_owns_root(tmp_path, m
     request = Request({"type": "http", "app": SimpleNamespace(state=SimpleNamespace(product=product))})
     context = SimpleNamespace(roots=SimpleNamespace(dashboards_dir=tmp_path))
     assert main.serve_static("", request, context).path == product_index
-    for path in ("machinery", "machinery/"):
-        assert main.serve_static(path, request, context).body == b"machinery home"
+    assert main.serve_static("machinery", request, context).body == b"machinery home"
+    # A trailing slash is not a second name for the overview.
+    with pytest.raises(HTTPException) as refused:
+        main.serve_static("machinery/", request, context)
+    assert refused.value.status_code == 404
 
     # A path the machinery dashboards do not hold still reaches the product's declared file.
     empty_dashboards = tmp_path / "empty"
@@ -1015,11 +1020,11 @@ def test_unknown_browser_path_gets_html_404_with_nav(tmp_path):
     async def no_lifespan(_app: FastAPI):
         yield
 
-    # A known page file, owned by this test, so the trailing-slash request is that page's path
-    # and not an unknown file. The overview's ``machinery/`` spelling is served on purpose.
+    # Page files owned by this test, so a trailing slash names a page that exists.
     page = next(contract for contract in PAGE_CONTRACTS if contract.url.strip("/") not in {"", "machinery"})
     dashboards = tmp_path / "dashboards"
     dashboards.mkdir()
+    (dashboards / "index.html").write_text("<p>overview</p>", encoding="utf-8")
     (dashboards / page.file).write_text("<p>page</p>", encoding="utf-8")
     app = create_app(
         fixture_context(tmp_path).with_roots(dashboards_dir=dashboards),
@@ -1040,6 +1045,7 @@ def test_unknown_browser_path_gets_html_404_with_nav(tmp_path):
         for contract in PAGE_CONTRACTS:
             assert f'href="{contract.url}"' in body
         assert "localhost" not in body
+        assert "accept" in response.headers["vary"].lower()
 
     def assert_json_404(response) -> None:
         assert response.status_code == 404
@@ -1048,13 +1054,47 @@ def test_unknown_browser_path_gets_html_404_with_nav(tmp_path):
         assert payload["error"] == "http_error"
         assert payload["detail"] == "Not Found"
         assert payload["error_id"]
+        assert "accept" in response.headers["vary"].lower()
 
     with TestClient(app) as client:
         assert client.get(page.url, headers=browser).status_code == 200
+        assert client.get(home.url, headers=browser).status_code == 200
+        assert client.get(f"/{page.file}", headers=browser).status_code == 200
         assert_html_404(client.get("/not-a-monitor-page", headers=browser))
         assert_html_404(client.get(f"{page.url}/", headers=browser))
+        # The overview slash and a slash on the page file itself used to serve the page.
+        assert_html_404(client.get(f"{home.url}/", headers=browser))
+        assert_html_404(client.get(f"/{page.file}/", headers=browser))
         assert_json_404(client.get("/not-a-monitor-page", headers={"Accept": "application/json"}))
         assert_json_404(client.get(f"{page.url}/", headers={"Accept": "application/json"}))
+        assert_json_404(client.get(f"{home.url}/", headers={"Accept": "application/json"}))
+        assert_json_404(client.get(f"/{page.file}/", headers={"Accept": "application/json"}))
         # A client that names both at the same q, and the default ``*/*``, does not prefer HTML.
         assert_json_404(client.get("/not-a-monitor-page", headers={"Accept": "text/html, application/json"}))
         assert_json_404(client.get(f"{page.url}/", headers={"Accept": "*/*"}))
+        # A weight that is not an HTTP qvalue, and a charset that is not the page's, stay JSON.
+        for header in (
+            "text/html;q=1e0",
+            "text/html;q=+1",
+            "text/html;q=.5",
+            "text/html;q=0.1234",
+            "text/html;q",
+            "text/html;q =0",
+            "text/html;q=bad;q=1",
+            "text/html;charset=iso-8859-1, application/json;q=0.9",
+            'text/html;profile="a,b", application/json',
+        ):
+            assert_json_404(client.get("/not-a-monitor-page", headers={"Accept": header}))
+        # Each Accept line counts. Equal lines stay JSON; a higher HTML q on a later line is HTML.
+        assert_json_404(client.get(
+            "/not-a-monitor-page",
+            headers=[("Accept", "text/html"), ("Accept", "application/json")],
+        ))
+        assert_html_404(client.get(
+            "/not-a-monitor-page",
+            headers=[("Accept", "application/json;q=0.5"), ("Accept", "text/html")],
+        ))
+        assert_html_404(client.get(
+            "/not-a-monitor-page",
+            headers=[("Accept", "text/html;q=0"), ("Accept", "text/html;q=1")],
+        ))

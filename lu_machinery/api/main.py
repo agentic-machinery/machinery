@@ -251,27 +251,71 @@ def _sanitize_public_detail(detail: Any) -> Any:
     return detail
 
 
+# RFC 9110 qvalue: 0 or 1, with at most three fraction digits, and only zeros after 1.
+_ACCEPT_QVALUE = re.compile(r"^(?:0(?:\.[0-9]{0,3})?|1(?:\.0{0,3})?)$")
+_PAGE_CHARSETS = frozenset({"utf-8", "utf8"})
+
+
+def _split_outside_quotes(value: str, separator: str) -> list[str]:
+    """Split on ``separator`` only where it is not inside a quoted string."""
+    parts: list[str] = []
+    buf: list[str] = []
+    quoted = False
+    for char in value:
+        if char == '"':
+            quoted = not quoted
+            buf.append(char)
+        elif char == separator and not quoted:
+            parts.append("".join(buf))
+            buf = []
+        else:
+            buf.append(char)
+    parts.append("".join(buf))
+    return parts
+
+
+def _accept_parameter(param: str) -> tuple[str, str | None]:
+    """One Accept parameter as ``(name, value)``. A weight with no value is ``("q", None)``."""
+    if "=" not in param:
+        return param.lower(), None
+    name, raw = param.split("=", 1)
+    value = raw.strip()
+    if len(value) >= 2 and value[0] == '"' and value[-1] == '"':
+        value = value[1:-1].strip()
+    return name.strip().lower(), value.lower()
+
+
 def _accept_quality(header: str, media_type: str) -> float:
     """The q of the most specific range matching ``media_type``, or 0 when none matches.
 
-    An exact type beats ``type/*``, which beats ``*/*``. A missing or unusable q is 0,
-    so a malformed header cannot prefer a page over the JSON error.
+    An exact type beats ``type/*``, which beats ``*/*``. A missing weight is 1. A weight
+    that is not an HTTP qvalue, or a repeated weight on one range, is 0, so it cannot
+    prefer a page. A comma or semicolon inside quotes is not a separator. A range that
+    names any parameter other than ``q``, or a charset other than the UTF-8 page this
+    server sends, does not match that page.
     """
     wanted_type = media_type.split("/", 1)[0]
     best: tuple[int, float] | None = None
-    for piece in header.split(","):
-        bits = [bit.strip() for bit in piece.split(";") if bit.strip()]
+    for piece in _split_outside_quotes(header, ","):
+        bits = [bit.strip() for bit in _split_outside_quotes(piece, ";") if bit.strip()]
         if not bits:
             continue
         media = bits[0].lower()
-        quality = 1.0
+        weights: list[str | None] = []
+        extras: list[tuple[str, str | None]] = []
         for param in bits[1:]:
-            if param.lower().startswith("q="):
-                try:
-                    quality = float(param[2:].strip())
-                except ValueError:
-                    quality = 0.0
-        if not 0.0 <= quality <= 1.0:
+            name, value = _accept_parameter(param)
+            if name == "q":
+                weights.append(value)
+            else:
+                extras.append((name, value))
+        if extras and (len(extras) != 1 or extras[0][0] != "charset" or extras[0][1] not in _PAGE_CHARSETS):
+            continue
+        if not weights:
+            quality = 1.0
+        elif len(weights) == 1 and weights[0] is not None and _ACCEPT_QVALUE.fullmatch(weights[0]):
+            quality = float(weights[0])
+        else:
             quality = 0.0
         if media == media_type:
             specificity = 2
@@ -289,13 +333,14 @@ def _accept_quality(header: str, media_type: str) -> float:
 def _prefers_html(request: Request) -> bool:
     """True when Accept gives ``text/html`` a strictly higher q than ``application/json``.
 
-    A missing header, ``*/*`` (curl and ``fetch``), or an equal q keeps the JSON error.
-    A navigation request (``text/html`` above JSON) is the only one that gets the page.
+    Every Accept field line counts, in order. A missing header, ``*/*`` (curl and
+    ``fetch``), or an equal q keeps the JSON error. A navigation request
+    (``text/html`` above JSON) is the only one that gets the page.
     """
-    header = request.headers.get("accept")
-    if not header:
+    values = request.headers.getlist("accept")
+    if not values:
         return False
-    return _accept_quality(header, "text/html") > _accept_quality(header, "application/json")
+    return _accept_quality(",".join(values), "text/html") > _accept_quality(",".join(values), "application/json")
 
 
 def _html_not_found() -> HTMLResponse:
@@ -335,22 +380,33 @@ def _html_not_found() -> HTMLResponse:
     return HTMLResponse(body, status_code=404)
 
 
+def _mark_negotiated(response: Response) -> Response:
+    """Record that this 404 was chosen from Accept, without dropping an existing Vary."""
+    current = response.headers.get("vary")
+    response.headers["vary"] = "Accept" if not current else f"{current}, Accept"
+    return response
+
+
 async def http_exception_handler(request: Request, exc: StarletteHTTPException):
     """Normalize handled HTTP errors without changing their status codes.
 
     A browser that prefers HTML gets a page for a 404 (an unknown path, or a known
     page path with a trailing slash, which this server does not redirect). Every
-    other client, and every other status, keeps the JSON envelope.
+    other client, and every other status, keeps the JSON envelope. Both 404
+    representations vary on Accept.
     """
     if exc.status_code == 404 and _prefers_html(request):
-        return _html_not_found()
-    return _error_envelope(
+        return _mark_negotiated(_html_not_found())
+    response = _error_envelope(
         "http_error",
         _sanitize_public_detail(exc.detail),
         status_code=exc.status_code,
         headers=exc.headers,
         bounded=request.url.path == "/api/work/v1/projection",
     )
+    if exc.status_code == 404:
+        return _mark_negotiated(response)
+    return response
 
 
 async def request_validation_exception_handler(request: Request, exc: RequestValidationError):
@@ -1838,7 +1894,7 @@ def _attach_cold_start_research(response: dict[str, Any], role: str | None) -> N
 # ==================== STATIC FILES (MUST BE LAST) ====================
 
 
-MACHINERY_HOME_PATHS = frozenset({"machinery", "machinery/"})
+MACHINERY_HOME_PATHS = frozenset({"machinery"})
 _VERSION_PLACEHOLDER = "__MACHINERY_VERSION__"
 _MACHINERY_REPOSITORY_PLACEHOLDER = "__MACHINERY_REPOSITORY__"
 _NAV_PLACEHOLDER = "__MACHINERY_NAV__"
@@ -1952,6 +2008,22 @@ def _machinery_page_response(page: Path, current_file: str) -> HTMLResponse:
     return HTMLResponse(text)
 
 
+def _slash_suffixed_page(dashboards_dir: Path, path: str, product: ProductContribution | None) -> bool:
+    """True when ``path`` is a known Monitor page with one trailing slash.
+
+    The file lookup drops that slash, so ``/fleet.html/`` and the overview's
+    ``/machinery/`` spelling would otherwise be served as the page. A trailing
+    slash on a page is a missing address. ``/`` itself is the home, not a suffix.
+    """
+    if not path.endswith("/") or path == "/":
+        return False
+    bare = path[:-1]
+    if not bare:
+        return False
+    found = _dashboard_file(dashboards_dir, bare, product)
+    return found is not None and found.page is not None
+
+
 @core_router.get("/{path:path}")
 def serve_static(path: str, request: Request, ctx: MonitorContext = Depends(get_ctx)):
     """Serve a machinery dashboard file, else a file the product declares (C-4687).
@@ -1961,10 +2033,13 @@ def serve_static(path: str, request: Request, ctx: MonitorContext = Depends(get_
     with the shared navigation; every other file is served as it is. A product
     page or asset is served only when the product contribution declares its URL
     path; ``/`` is the product home when the product declares one, else the
-    machinery home, which is always at ``/machinery``.
+    machinery home, which is always at ``/machinery``. A trailing slash on a
+    known page is not that page: the lookup would drop the slash and serve it.
     """
     dashboards_dir = ctx.roots.dashboards_dir
     product = getattr(request.app.state, "product", None)
+    if _slash_suffixed_page(dashboards_dir, path, product):
+        raise HTTPException(status_code=404)
     dashboard = _dashboard_file(dashboards_dir, path, product)
     if dashboard is not None:
         if dashboard.page is not None:
