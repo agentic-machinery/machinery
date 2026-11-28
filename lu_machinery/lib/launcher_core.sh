@@ -293,51 +293,39 @@ launcher_print_argv() {
 # addition it is given (#1589), so a caller's addition beside the launcher's
 # drops the rules core. Runs before any deploy, lease or canary and sets
 # LC_CLAUDE_SYSTEM_PROMPT_ARGS, the arguments the Claude adapters put before
-# LC_FORWARD_ARGS. Without a caller addition, that is the core's one addition.
-# With one, the caller's inline value is rewritten in place to the core, a
-# blank line, then the caller's text, so no forwarded element moves and Claude
-# parses the rest as the caller wrote it. Every other shape refuses (exit 2), as
-# does an addition longer than the kernel's per-argument limit.
+# LC_FORWARD_ARGS. When the forwarded arguments hold exactly one provable inline
+# addition (no other append-shaped argument, no literal --, and no option before
+# it that may take it as its value), its value is rewritten in place to the core,
+# a blank line, then the caller's text, so no forwarded element moves. Any other
+# argv keeps main's behaviour: the core's own addition, then the caller's
+# arguments unchanged; an addition the launcher cannot prove still loses the
+# core there, as on main. A provable addition without a value, or an argv slot
+# over the kernel's per-argument limit, refuses (exit 2).
 # shellcheck disable=SC2034  # both results are read by launchers/claude.sh and codex.sh
 launcher_claude_system_prompt() {
-  local arg previous value merged limit bytes index=0 found=-1
+  local arg previous value limit bytes index=0 found=-1 shaped=0 separator=0
   LC_CLAUDE_SYSTEM_PROMPT_ARGS=()
   for arg in ${LC_FORWARD_ARGS[@]+"${LC_FORWARD_ARGS[@]}"}; do
     case "$arg" in
-      --append-system-prompt|--append-system-prompt=*|--append-system-prompt-file*)
-        if [ "$found" -ge 0 ]; then
-          launcher_error "refusing to launch: pass at most one --append-system-prompt; Claude keeps only the last, which would drop the rules core."
-          exit 2
-        fi
-        found="$index"
-        ;;
+      --append-system-prompt|--append-system-prompt=*) found="$index"; shaped=$((shaped + 1)) ;;
+      --append-system-prompt-file*) shaped=$((shaped + 1)) ;;
+      --) separator=1 ;;
     esac
     index=$((index + 1))
   done
+  if [ "$shaped" != 1 ] || [ "$separator" = 1 ]; then
+    found=-1
+  elif [ "$found" -gt 0 ]; then
+    previous="${LC_FORWARD_ARGS[found - 1]}"
+    if [[ "$previous" == -* && "$previous" != *=* ]] && { ! launcher_provider_option_arity "$previous" \
+        || [[ "$LC_OPTION_ARITY" != boolean && "$LC_OPTION_ARITY" != optional ]]; }; then
+      found=-1
+    fi
+  fi
   if [ "$found" -lt 0 ]; then
     value="${LC_RULES_CORE:-}"
   else
     arg="${LC_FORWARD_ARGS[found]}"
-    if [[ "$arg" == --append-system-prompt-file* ]]; then
-      launcher_error "refusing to launch: $arg is not supported; pass the text inline with --append-system-prompt so the launcher can put the rules core before it."
-      exit 2
-    fi
-    # After a literal --, or as the value of the option before it, the flag is
-    # not an addition at all; neither shape is merged.
-    for previous in "${LC_FORWARD_ARGS[@]}"; do
-      if [ "$previous" = -- ]; then
-        launcher_error "refusing to launch: --append-system-prompt with a literal -- among the provider arguments is ambiguous."
-        exit 2
-      fi
-    done
-    if [ "$found" -gt 0 ]; then
-      previous="${LC_FORWARD_ARGS[found - 1]}"
-      if [[ "$previous" == -* && "$previous" != *=* ]] && { ! launcher_provider_option_arity "$previous" \
-          || [[ "$LC_OPTION_ARITY" != boolean && "$LC_OPTION_ARITY" != optional ]]; }; then
-        launcher_error "refusing to launch: --append-system-prompt follows '$previous', which may take it as its value."
-        exit 2
-      fi
-    fi
     if [ "$arg" = --append-system-prompt ]; then
       if [ "$((found + 1))" -ge "${#LC_FORWARD_ARGS[@]}" ]; then
         launcher_error "refusing to launch: --append-system-prompt requires a value."

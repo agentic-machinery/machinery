@@ -1265,7 +1265,7 @@ def test_launcher_passes_single_system_prompt_with_core_then_role(tmp_path: Path
     """#1589 defect class: a second --append-system-prompt silently drops the rules core, since
     Claude Code keeps only the last addition. Native Claude, the CTO wrapper's role and Codex on
     Claude Code each pass one inline addition, the core then the caller's text, in the caller's
-    own argument slot. Every shape the launcher cannot merge safely refuses before any lease."""
+    own argument slot. An argv it cannot prove keeps main's shape; a refusal precedes any lease."""
     role = "You are the operator-appointed CTO AND cross-epic lead."
     role_file = tmp_path / "role.txt"
     role_file.write_text(role, encoding="utf-8")
@@ -1296,22 +1296,34 @@ def test_launcher_passes_single_system_prompt_with_core_then_role(tmp_path: Path
         at, width = argv.index(additions[0]), 2 if flag == b"--append-system-prompt" else 1
         assert argv[at - slot:at] == caller[:slot], args
         assert argv[at + width:at + len(caller) - slot] == caller[slot + width:], args
-    for extra, reason in (
-        (("--append-system-prompt-file", str(role_file)), "is not supported"),
-        ((f"--append-system-prompt-file={role_file}",), "is not supported"),
-        (("--append-system-prompt", "one", "--append-system-prompt=two"), "at most one"),
-        (("--name", "--append-system-prompt", role), "may take it as its value"),
-        (("--tools", "--append-system-prompt", role), "may take it as its value"),
-        (("--append-system-prompt", role, "--", "question"), "literal --"),
-        (("--append-system-prompt",), "requires a value"),
-        (("--append-system-prompt", "x" * 100_000), "argument limit"),
-        # The joined slot reaches the per-argument limit only with its flag prefix.
-        (("--append-system-prompt=" + "x" * (os.sysconf("SC_PAGE_SIZE") * 32 - 25 - cto_core_bytes),), "argument limit"),
+    # An addition the launcher cannot prove keeps main's argv: the core's own addition first,
+    # then the caller's arguments unchanged (#1589 residual, as on main).
+    for extra in (
+        ("--append-system-prompt-file", str(role_file)),
+        (f"--append-system-prompt-file={role_file}",),
+        ("--append-system-prompt", "one", "--append-system-prompt=two"),
+        ("--name", "--append-system-prompt", role),
+        ("--tools", "--append-system-prompt", role),
+        ("--append-system-prompt", role, "--", "question"),
     ):
         argv_file.unlink(missing_ok=True)
         result = run_launcher(*cto, *extra, env={"LAUNCHER_DRY_RUN_ARGV_FILE": str(argv_file)})
-        assert result.returncode == 2 and reason in result.stderr, (extra, result.stderr)
-        assert "would claim lease" not in result.stdout and not argv_file.exists(), extra
+        assert result.returncode == 0, (extra, result.stdout + result.stderr)
+        argv = argv_file.read_bytes().removesuffix(b"\0").split(b"\0")
+        core = argv[argv.index(b"--append-system-prompt") + 1]
+        assert len(core) == cto_core_bytes and core.startswith(b"<rules-core "), extra
+        caller = [arg.encode() for arg in extra]
+        assert any(argv[at:at + len(caller)] == caller for at in range(len(argv))), extra
+    for extra in (
+        ("--append-system-prompt",),
+        ("--append-system-prompt", "x" * 100_000),
+        # The joined slot reaches the per-argument limit only with its flag prefix.
+        ("--append-system-prompt=" + "x" * (os.sysconf("SC_PAGE_SIZE") * 32 - 25 - cto_core_bytes),),
+    ):
+        argv_file.unlink(missing_ok=True)
+        result = run_launcher(*cto, *extra, env={"LAUNCHER_DRY_RUN_ARGV_FILE": str(argv_file)})
+        assert result.returncode == 2 and "refusing to launch" in result.stderr, (extra[0][:40], result.stderr)
+        assert "would claim lease" not in result.stdout and not argv_file.exists(), extra[0][:40]
 
 
 def test_fleet_cold_clause_keeps_lane_drivers_on_drive_epic(tmp_path: Path) -> None:
