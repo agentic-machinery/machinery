@@ -1298,7 +1298,11 @@ def test_finding_outcome_verb_refuses_unpublished_unknown_or_nonblocking_finding
     assert recorder.main(["finding-outcome", "--task-id", "review-grok", "--pr", "42", "--finding", "F2",
                           "--label", "no_live_trigger", "--evidence", "only main() calls it, after the guard"]) == 0
     assert json.loads(capsys.readouterr().out)["status"] == "recorded"
-    assert _outcomes(tmp_path)[-1]["label"] == "no_live_trigger"
+    outcomes = _outcomes(tmp_path)
+    assert outcomes[-1]["label"] == "no_live_trigger"
+    hold = outcomes[-2]
+    assert hold["label"] == "duplicate" and "head" not in hold and "reviewer_model" not in hold
+    assert hold["finding_id"] == "F2" and hold["task_id"] == "review-grok"
     # A reply with no structured findings takes no label.
     write_task(tasks, task_id="review-text", reply="VERDICT: CHANGES_REQUESTED\nOrdinary reviewer text.\n")
     with pytest.raises(recorder.RecordError, match="no structured findings"):
@@ -1320,7 +1324,7 @@ def test_finding_outcome_verb_refuses_unpublished_unknown_or_nonblocking_finding
     write_task(tasks, reply=_blocking_reply(["P2", "P2"]), started_at="2026-09-23T14:00:00.000001+00:00")
     with pytest.raises(recorder.RecordError, match="review task id review-one names 2 runs in the task store"):
         label("F2", "fixed")
-    assert len(_outcomes(tmp_path)) == 3
+    assert len(_outcomes(tmp_path)) == 4
     assert set(censuses) == {
         "review-one", "review-grok", "review-early", "review-text", "review-overflow-0", "review-overflow-1",
     }

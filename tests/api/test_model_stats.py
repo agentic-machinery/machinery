@@ -2187,6 +2187,47 @@ def test_no_live_trigger_counts_in_precision_denominator_not_numerator(tmp_path)
     assert row["real_precision_ci"] == stats._wilson(1, 2)
 
 
+def test_rollback_and_roll_forward_keep_one_label_for_one_finding(tmp_path):
+    """Defect class: rolling a finding-outcome label back to a writer whose vocabulary does not include it appends a
+    second label for that finding, and rolling forward shows the other label.
+
+    Release 0.1.84 admits only ``fixed``, ``wrong``, ``invented``, ``out_of_scope`` and ``duplicate``. A
+    ``no_live_trigger`` line is invisible to that writer's conflict check, so it appends ``fixed``; its reader
+    attributes ``fixed``; this release's reader then attributes ``no_live_trigger`` and drops the ``fixed`` line.
+    """
+    prior = frozenset({"fixed", "wrong", "invented", "out_of_scope", "duplicate"})
+    batch_state, _ = _state(tmp_path)
+    assert _label(batch_state, "o1-review", 1, "F1", "no_live_trigger",
+                  "only main() calls it, after the guard") == 1
+    path = batch_state / rows.ROWS_DIR / rows.OUTCOMES_FILE
+    finding = [json.loads(line) for line in path.read_bytes().splitlines()
+               if json.loads(line).get("finding_id") == "F1"]
+    visible = [line for line in finding if line.get("kind") == "label" and line.get("label") in prior
+               and "head" not in line and "reviewer_model" not in line]
+    assert len(visible) == 1
+    assert rows.timestamp(visible[0]["recorded_at"]) >= rows.timestamp(_START_A)
+    assert visible[0]["label"] != "fixed"
+    with pytest.raises(rows.OutcomeConflict):
+        _label(batch_state, "o1-review", 1, "F1", "fixed")
+    finding = [json.loads(line) for line in path.read_bytes().splitlines()
+               if json.loads(line).get("finding_id") == "F1"]
+    assert [line["label"] for line in finding if line.get("label") == "fixed"] == []
+    key = ("o1-review", rows.repository_identity("learn-ukrainian/machinery"), 1, "F1", _HEAD_A,
+           rows.timestamp(_START_A))
+    labels, _, counts = rows.read_finding_outcomes(batch_state)
+    assert labels[key][1] == "no_live_trigger"
+    assert counts.get("conflicting_labels", 0) == 0
+    # A second run-bound label, the line 0.1.84 appends when it cannot see the new one. Roll-forward keeps the
+    # original label and counts the extra line instead of switching to it.
+    original = next(line for line in finding if line.get("label") == "no_live_trigger")
+    damaged = {**original, "label": "fixed", "evidence_sha256": None}
+    with path.open("ab") as stream:
+        stream.write(json.dumps(damaged).encode() + b"\n")
+    labels, _, counts = rows.read_finding_outcomes(batch_state)
+    assert labels[key][1] == "no_live_trigger"
+    assert counts["conflicting_labels"] == 1
+
+
 def test_finding_outcome_ledger_keeps_one_label_per_finding_and_skips_damaged_lines(tmp_path):
     """Defect class: a relabel, a same-label retry refused for its new evidence, a repeated contest, a label or
     contest without required run binding (head and started_at) or reviewer_model, a half-bound line accepted, a

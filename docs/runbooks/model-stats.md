@@ -440,9 +440,14 @@ labels remaining conflict-protected on write), counted in `coverage.finding_outc
 `coverage.finding_outcomes.unbound_contests`, and attributed to no reviewer. An unreadable fleet registry counts no label
 (`coverage.finding_outcomes.registry_unreadable`). `real_precision` is
 `fixed / (fixed + wrong + invented + no_live_trigger)` with its Wilson interval; a label is the author's word
-unless a later review contested it. The schema stays `review-finding-outcome.v1`: a reader from before
-`no_live_trigger` skips such a line as malformed (`coverage.finding_outcomes.malformed_lines`) and attributes it
-to no reviewer.
+unless a later review contested it. The schema stays `review-finding-outcome.v1`. A label this release does not know
+still holds its finding (`coverage.finding_outcomes.unknown_labels`, attributed to no reviewer), so another label
+is refused. `no_live_trigger` is outside the vocabulary of release 0.1.84, whose conflict check would otherwise
+skip the line and append a second label. For every label outside that vocabulary the writer also appends a legacy
+occupying line (`duplicate`, no reviewer and no head, the SHA-256 of the phrase `prior-release finding-outcome
+hold`). That line is not an outcome: this release skips it. 0.1.84 refuses a different label for the finding and
+attributes none, and this release keeps attributing the original label. A second run-bound label already in the
+file does not replace the first; it counts in `coverage.finding_outcomes.conflicting_labels`.
 
 Both line kinds go to `batch_state/model-stats/finding-outcomes.jsonl` (schema `review-finding-outcome.v1`)
 under the rows lock; the recorder is its one writer. It keeps the evidence only as its SHA-256, never the text: the

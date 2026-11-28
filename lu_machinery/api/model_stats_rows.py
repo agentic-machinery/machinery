@@ -23,7 +23,8 @@ author label of a blocking finding of a published review (``fixed``, ``wrong``, 
 ``out_of_scope``, ``duplicate``; the evidence line as its SHA-256 only) and one per later review that contested a
 label. A well-formed label line whose label this release does not know (a newer release wrote it) still holds its
 finding: no other label is written for that finding, and the statistics count it in ``unknown_labels``, attributed
-to no reviewer.
+to no reviewer. A label release 0.1.84 does not admit also stores a legacy occupying line that writer can see, so
+a rollback cannot append a second label; this release does not count that line as an outcome.
 """
 
 from __future__ import annotations
@@ -68,7 +69,11 @@ from lu_machinery.orchestration.fleet_repos import (
     repository_identity,
 )
 from lu_machinery.orchestration.task_record_store import REVIEW_TASK_FLAG_FIELDS, iter_task_records
-from lu_machinery.review.findings import EVIDENCED_OUTCOME_LABELS, FINDING_OUTCOME_LABELS
+from lu_machinery.review.findings import (
+    EVIDENCED_OUTCOME_LABELS,
+    FINDING_OUTCOME_LABELS,
+    PRIOR_RELEASE_OUTCOME_LABELS,
+)
 from lu_machinery.review.model_catalog import VARIANT_SUFFIX, canonical_model_id, load_model_catalog
 from lu_machinery.review.review_contract import SCHEMA_VERSION, ContractError, parse_reviewer_json
 from lu_machinery.review.verdict_parser import (
@@ -1192,6 +1197,39 @@ def finding_outcome(*, kind: str, task_id: str, repository: str, pr: int, findin
     return entry
 
 
+_PRIOR_HOLD_LABEL = "duplicate"
+_PRIOR_HOLD_EVIDENCE = hashlib.sha256(b"prior-release finding-outcome hold").hexdigest()
+
+
+def _is_prior_hold(entry: Mapping[str, Any]) -> bool:
+    """A legacy line this writer stores so release 0.1.84's conflict check can see a newer label.
+
+    It is not an outcome. 0.1.84 admits ``duplicate`` and ignores a line with no reviewer, so it refuses a
+    different label and attributes none. This release skips the line.
+    """
+    return (entry.get("kind") == "label" and entry.get("label") == _PRIOR_HOLD_LABEL
+            and entry.get("evidence_sha256") == _PRIOR_HOLD_EVIDENCE
+            and "head" not in entry and _OUTCOME_REVIEWER_MODEL not in entry)
+
+
+def _prior_hold(snapshot: Mapping[str, Any]) -> dict[str, Any] | None:
+    """The occupying line for a label 0.1.84 cannot see, or None when that writer already admits the label."""
+    if snapshot["kind"] != "label" or snapshot["label"] in PRIOR_RELEASE_OUTCOME_LABELS:
+        return None
+    recorded = cast(datetime, timestamp(snapshot["recorded_at"]))
+    started = cast(datetime, timestamp(snapshot["started_at"]))
+    hold: dict[str, Any] = {
+        "schema": OUTCOME_SCHEMA, "kind": "label", "task_id": snapshot["task_id"],
+        "repository": snapshot["repository"], "pr": snapshot["pr"], "finding_id": snapshot["finding_id"],
+        "label": _PRIOR_HOLD_LABEL, "evidence_sha256": _PRIOR_HOLD_EVIDENCE,
+        "recorded_by": snapshot["recorded_by"],
+        "recorded_at": snapshot["recorded_at"] if recorded >= started else snapshot["started_at"],
+    }
+    if not _outcome_ok(hold):
+        raise ValueError("finding outcome field has the wrong shape")
+    return hold
+
+
 def _outcome_lines(path: Path, counts: Counter[str]) -> list[dict[str, Any]]:
     try:
         fd = _open(path, os.O_RDONLY)
@@ -1208,6 +1246,8 @@ def _outcome_lines(path: Path, counts: Counter[str]) -> list[dict[str, Any]]:
             if not _outcome_ok(entry, any_label=True):
                 counts["malformed_lines"] += 1
                 continue
+            if isinstance(entry, dict) and _is_prior_hold(entry):
+                continue
             entries.append(entry)
     counts["lines"] = len(entries)
     return entries
@@ -1223,7 +1263,9 @@ def record_finding_outcomes(batch_state_dir: Path, entries: Iterable[Mapping[str
 
     A label line is one per (review task, repository, PR, finding, head, started_at), the repository by its identity
     across a transfer: the same label again adds nothing and keeps the first line and its evidence, and another label
-    raises OutcomeConflict before anything is written. Every newly written line must carry ``head`` and
+    raises OutcomeConflict before anything is written. A label that release 0.1.84 does not admit also appends a legacy
+    occupying line that writer can see, so a rollback cannot append a different label; the line is not an outcome.
+    Every newly written line must carry ``head`` and
     ``started_at`` (and ``reviewer_model`` on labels); existing legacy lines without them are still read so legacy
     labels remain conflict-protected. A contest line is one per (review task, repository, PR, finding, contesting
     task, head, started_at). Every entry is checked from the exact JSON bytes that will be written: one malformed
@@ -1283,6 +1325,9 @@ def record_finding_outcomes(batch_state_dir: Path, entries: Iterable[Mapping[str
         for snapshot, line in checked:
             exact = key(snapshot)
             if exact not in present and legacy_match(snapshot) is None:
+                hold = _prior_hold(snapshot)
+                if hold is not None:
+                    _append_line(path, _line(hold))
                 _append_line(path, line)
                 present[exact] = snapshot
                 added += 1
@@ -1300,7 +1345,8 @@ def read_finding_outcomes(batch_state_dir: Path) -> tuple[
     binding (``head`` and ``started_at``) are not malformed and count in ``unattributed_labels`` or
     ``unbound_contests`` without joining another ledger or suppressing another run. A run-bound label this release
     does not know counts in ``unknown_labels``, is attributed to no reviewer, and holds its finding like any first
-    label. FleetRepoError when the fleet registry cannot be read."""
+    label. FleetRepoError when the fleet registry cannot be read. A second, different run-bound label for a finding
+    that already has one does not replace it; it counts in ``conflicting_labels``."""
     counts: Counter[str] = Counter()
     labels: dict[OutcomeFindingKey, tuple[str, str, datetime]] = {}
     unknown: set[OutcomeFindingKey] = set()
@@ -1321,8 +1367,14 @@ def read_finding_outcomes(batch_state_dir: Path) -> tuple[
                 counts["unknown_labels"] += 1
                 if finding_key not in labels:
                     unknown.add(finding_key)
-            elif finding_key not in unknown:
-                labels.setdefault(finding_key, (model_id(reviewer), entry["label"], moment))
+            elif finding_key in unknown:
+                counts["conflicting_labels"] += 1
+            else:
+                held = labels.get(finding_key)
+                if held is None:
+                    labels[finding_key] = (model_id(reviewer), entry["label"], moment)
+                elif held[1] != entry["label"]:
+                    counts["conflicting_labels"] += 1
         else:
             if "head" not in entry:
                 counts["unbound_contests"] += 1
