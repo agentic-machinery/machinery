@@ -1094,15 +1094,12 @@ def remote_release(
         lease = _lease_from_payload({**body, "stream_id": stream_id})
         if lease.stream_id != stream_id:
             raise ValueError("stream mismatch")
-        # Read first: a successor may claim the stream as soon as the release commits.
-        status = store.load_remote_epic_status(stream_id, limit=0, snapshot_sha256=None)
-        store.release_remote_session(lease)
-        stored = store._lease_from_row(status["projection"]["lease"])
+        released = store.release_remote_session(lease)
         return JSONResponse(
             content={
                 "schema": SCHEMA,
                 "outcome": "released",
-                "lease": _lease_payload(stored, projection_state="released", session_state="closed", now=utc_now()),
+                "lease": _lease_payload(released, projection_state="released", session_state="closed", now=utc_now()),
             },
             headers={"Cache-Control": "no-store"},
         )

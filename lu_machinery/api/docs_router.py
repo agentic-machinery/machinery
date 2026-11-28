@@ -371,7 +371,19 @@ def _directory_listing(
 def _page_url(request: Request, limit: int, offset: int) -> str:
     """The same listing request at another offset, as a path on this server."""
     query = request.url.include_query_params(limit=limit, offset=offset).query
-    return f"{quote(request.url.path)}?{query}"
+    # The ASGI path is decoded, so one quote encodes it. ``url.path`` already escapes "?" and "#".
+    return f"{quote(request.scope['path'])}?{query}"
+
+
+def _previous_page(total: int, limit: int, offset: int) -> tuple[int, int] | None:
+    """The ``(limit, offset)`` of the page before ``offset``; it never repeats a row of the current one."""
+    if offset == 0:
+        return None
+    if offset >= total:  # past the end: back to the last page of the walk from the start
+        return limit, max(0, total - 1) // limit * limit
+    if offset < limit:  # fewer rows than a page lie before: exactly those
+        return offset, 0
+    return limit, offset - limit
 
 
 def collect_artifacts(
@@ -580,11 +592,11 @@ def serve_artifact(
         if request.url.path.startswith("/artifacts") and format != "json":
             return _artifacts_page(request, resolved_ctx)
         listing = _directory_listing(path, root_key, root_path, remainder, limit=limit, offset=offset)
-        previous = max(0, min(offset, listing["total"]) - limit) if offset else None
+        previous = _previous_page(listing["total"], limit, offset)
         following = offset + limit if offset + limit < listing["total"] else None
         return {
             **listing,
-            "previous": None if previous is None else _page_url(request, limit, previous),
+            "previous": None if previous is None else _page_url(request, *previous),
             "next": None if following is None else _page_url(request, limit, following),
         }
 

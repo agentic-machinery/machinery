@@ -170,8 +170,10 @@ def test_claim_heartbeat_handoff_release_replay_conflict_and_fencing(tmp_path: P
         now=now + timedelta(seconds=4),
     ).entry
     assert entry.type is EntryType.STATE
-    assert store.release_remote_session(renewed, now=now + timedelta(seconds=5)).value == "closed"
-    assert store.release_remote_session(renewed, now=now + timedelta(seconds=6)).value == "closed"
+    # The reply is the stored lease as the release left it, and a replay returns the same one.
+    released = store.release_remote_session(renewed, now=now + timedelta(seconds=5))
+    assert released == replace(renewed, version=renewed.version + 1)
+    assert store.release_remote_session(renewed, now=now + timedelta(seconds=6)) == released
 
     # A closed exact lease is fenced from a later claim, but clean release is idempotent.
     successor, outcome = store.claim_remote_session(
@@ -482,7 +484,7 @@ def test_an_expired_turn_lease_stays_until_an_exact_or_attributed_release(tmp_pa
         store.force_close_expired_session(stream_id=local.stream_id, session_id=local.session_id, candidate=candidate,
                                           now=late)
     # The exact holder closes it after expiry, and the stream is free again.
-    assert store.release_remote_session(lease, now=late).value == "closed"
+    assert store.release_remote_session(lease, now=late) == replace(lease, version=lease.version + 1)
     successor, outcome = _claim(store, _holder("codex", "legacy", "alpha"), "after-release", late)
     assert outcome == "claimed" and successor.generation == lease.generation + 1
     # An attributed operator force release clears an expired turn lease too.

@@ -28,6 +28,7 @@ import time
 from collections.abc import Iterator
 from contextlib import asynccontextmanager
 from pathlib import Path
+from urllib.parse import quote, urlsplit
 
 import pytest
 from fastapi import FastAPI
@@ -366,6 +367,13 @@ def test_artifacts_listing_is_paginated(tmp_path: Path) -> None:
         for later, earlier in zip(pages[:0:-1], pages[-2::-1], strict=True):
             assert client.get(later["previous"]).json()["items"] == earlier["items"]
 
+    # Unaligned and past-end offsets: "previous" ends where the page starts, or at the walk's last page.
+    for offset, start, count in ((1, 0, 1), (2, 0, 2), (4, 1, 3), (len(names), 204, 1), (999, 204, 1)):
+        at = client.get(f"/files/docs/reports?limit=3&offset={offset}").json()
+        back = client.get(at["previous"]).json()
+        assert (back["offset"], back["items_count"]) == (start, count), offset
+        assert [item["name"] for item in back["items"]] == names[start:start + count], offset
+
     for query in (f"limit={docs_router.LISTING_PAGE_MAX + 1}", "limit=0", "offset=-1"):
         assert client.get(f"/files/docs/reports?{query}").status_code == 422, query
 
@@ -376,3 +384,15 @@ def test_artifacts_listing_is_paginated(tmp_path: Path) -> None:
     assert [row for part in parts for row in part["artifacts"]] == complete["artifacts"]
     with pytest.raises(ValueError, match="limit must be at least 1"):
         docs_router.collect_artifacts(limit=0, ctx=ctx)
+
+    # A directory name with URL delimiters is encoded once in both links. TestClient decodes a path
+    # twice, so the link text is compared: following it would not show a second encoding.
+    odd = "Q?A #1 100%"
+    (reports / odd).mkdir()
+    for number in range(8):
+        (reports / odd / f"{number}.md").write_text("# report\n", encoding="utf-8")
+    for prefix in ("/artifacts", "/files"):
+        encoded = f"{prefix}/docs/reports/{quote(odd)}"
+        middle = client.get(f"{encoded}?format=json&limit=3&offset=3").json()
+        assert middle["total"] == 8
+        assert [urlsplit(middle[link]).path for link in ("previous", "next")] == [encoded, encoded]

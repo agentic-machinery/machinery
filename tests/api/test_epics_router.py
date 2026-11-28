@@ -114,6 +114,11 @@ def test_lease_without_timestamps_renders_unknown_not_epoch(tmp_path: Path, monk
     assert 0 <= reply["age_seconds"] < 300
     assert (reply["state"], reply["session_state"]) == ("released", "closed")
     assert host_admission._valid_projection_lease(reply, identity["stream_id"], match_ttl=False)
+    # The release transaction's own lease: what the store holds afterwards, also on a replay.
+    current = client.get("/api/epics/v1/epic:7178").json()["lease"]
+    replayed = client.post("/api/epics/v1/epic:7178/release", json=identity).json()["lease"]
+    for key in (*stored, "version"):
+        assert reply[key] == current[key] == replayed[key], key
 
 
 def test_router_heartbeat_reads_session_state_on_the_write_connection(tmp_path: Path, monkeypatch) -> None:
