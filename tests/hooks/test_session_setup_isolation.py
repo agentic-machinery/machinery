@@ -14,6 +14,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -77,6 +78,18 @@ def _bind_product(layout: HostLayout, product: Path) -> None:
     layout.write()
 
 
+def _invoke_session_setup(
+    hook: Path, *, cwd: Path, env: dict[str, str], payload: str = _STDIN
+) -> subprocess.CompletedProcess[str]:
+    # Make stdin readable before launch so the hook's read deadline does not depend on pytest being scheduled.
+    with tempfile.TemporaryFile(mode="w+", encoding="utf-8", dir=env["HOME"]) as stdin:
+        stdin.write(payload)
+        stdin.seek(0)
+        return subprocess.run(
+            ["bash", str(hook)], cwd=cwd, env=env, stdin=stdin, capture_output=True, text=True, timeout=120, check=False
+        )
+
+
 def _run_hook(
     *,
     cwd: Path,
@@ -105,9 +118,7 @@ def _run_hook(
         env["LU_PRODUCT_ROOT"] = str(product_assertion)
     if pythonpath is not None:
         env["PYTHONPATH"] = pythonpath
-    return subprocess.run(
-        ["bash", str(hook)], cwd=cwd, env=env, input=_STDIN, capture_output=True, text=True, timeout=120, check=False
-    )
+    return _invoke_session_setup(hook, cwd=cwd, env=env)
 
 
 @pytest.mark.parametrize("project_dir_set", [True, False], ids=["CLAUDE_PROJECT_DIR", "no-CLAUDE_PROJECT_DIR"])
@@ -251,7 +262,8 @@ def test_hook_python_children_never_import_from_the_cwd(
     hook = tree / "agents_extensions" / "shared" / "hooks" / _HOOK.name
     result = _run_hook(cwd=tree, home=home, project=tree, pythonpath=pythonpath, plant_log=plant_log, hook=hook, binding=host_layout)
     assert result.returncode == 0, result.stderr
-    assert (Path(host_layout.data["state_root"]) / ".agent/sessions/isolation-probe.json").is_file()
+    receipt = Path(host_layout.data["state_root"]) / ".agent/sessions/isolation-probe.json"
+    assert receipt.is_file(), (result.stdout, result.stderr)
     planted = [
         line
         for line in plant_log.read_text(encoding="utf-8").splitlines()
@@ -424,8 +436,7 @@ def test_workspace_session_reads_its_account_memory_and_writes_state_to_the_stat
         "CLAUDE_CODE_FILE_READ_MAX_OUTPUT_TOKENS": "1", "CLAUDE_PROJECT_DIR": str(workspace),
         "LU_STATE_ROOT": str(state),
     }
-    result = subprocess.run(["bash", str(_HOOK)], cwd=workspace, env=env, input=_STDIN, capture_output=True,
-                            text=True, timeout=120, check=False)
+    result = _invoke_session_setup(_HOOK, cwd=workspace, env=env)
     assert result.returncode == 0, result.stderr
     context = json.loads(result.stdout)["hookSpecificOutput"]["additionalContext"]
     assert "MEMORY.md is 160 lines" in context, context
@@ -456,8 +467,7 @@ def test_workspace_session_reads_its_account_memory_and_writes_state_to_the_stat
     drift_payload = json.dumps({"session_id": "workspace-with-product", "source": "startup"})
 
     def deploy_issues() -> list[str]:
-        ran = subprocess.run(["bash", str(_HOOK)], cwd=workspace, env=drift_env, input=drift_payload, capture_output=True,
-                             text=True, timeout=120, check=False)
+        ran = _invoke_session_setup(_HOOK, cwd=workspace, env=drift_env, payload=drift_payload)
         assert ran.returncode == 0, ran.stderr
         lines = json.loads(ran.stdout)["hookSpecificOutput"]["additionalContext"].splitlines()
         assert not any("PYTHON VERSION PIN MISSING" in line or "VENV WRONG PYTHON" in line for line in lines)
