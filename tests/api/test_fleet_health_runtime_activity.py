@@ -371,7 +371,7 @@ def test_thread_rows_carry_allowlisted_sender(message_reader):
     assert [row["sender"] for row in shared_response.json()["messages"]] == ["other"]
 
     lane_data["lanes"][0]["sender"] = "claude-cto-shared"
-    lane_data["lanes"][1]["sender"] = "claude-cto-shared"
+    lane_data["lanes"][1]["sender"] = "claude-cto-shared "
     driver_lanes.DATA_FILE.write_text(json.dumps(lane_data))
     shared_session_anchor, _ = seed(
         7, b"From shared session cto", thread="shared-session", recipient="claude-cto", sender="claude-cto-shared",
@@ -384,12 +384,30 @@ def test_thread_rows_carry_allowlisted_sender(message_reader):
     by_id = {row["message_id"]: row for row in shared_session_deliveries.json()["deliveries"]}
     assert by_id[shared_session_anchor.rsplit("/", 1)[-1]]["sender"] == "other"
 
+    # Non-CTO whitespace-equivalent sender aliases across seats also collapse to "other"
+    # while exact recipient matching remains preserved for deliveries.
+    lane_data["lanes"][0]["sender"] = "claude-epics"
+    lane_data["lanes"][1]["sender"] = "driver-dup"
+    lane_data["lanes"][2]["sender"] = "driver-dup "
+    driver_lanes.DATA_FILE.write_text(json.dumps(lane_data))
+    dup_anchor, _ = seed(
+        8, b"From whitespace dup", thread="ws-dup", recipient="driver-dup", sender="driver-dup",
+    )
+    dup_thread = client.get(f"{dup_anchor}/thread")
+    assert dup_thread.status_code == 200
+    assert [row["sender"] for row in dup_thread.json()["messages"]] == ["other"]
+    dup_deliveries = client.get("/api/fleet/deliveries", params={"seat": "driver", "state": "queued"})
+    assert dup_deliveries.status_code == 200
+    by_id_dup = {row["message_id"]: row for row in dup_deliveries.json()["deliveries"]}
+    assert by_id_dup[dup_anchor.rsplit("/", 1)[-1]]["sender"] == "other"
+    assert by_id_dup[dup_anchor.rsplit("/", 1)[-1]]["recipient"] == "driver"
+
     # Sender reads use a fixed 256-byte SQL ceiling independent of roster lengths.
     oversized_cto = "claude-cto-" + "z" * 300
     lane_data["lanes"][1]["sender"] = oversized_cto
     driver_lanes.DATA_FILE.write_text(json.dumps(lane_data))
     oversized_anchor, _ = seed(
-        8, b"From oversized cto", thread="oversized-cto", recipient="claude-cto", sender=oversized_cto,
+        9, b"From oversized cto", thread="oversized-cto", recipient="claude-cto", sender=oversized_cto,
     )
     oversized_thread = client.get(f"{oversized_anchor}/thread")
     assert oversized_thread.status_code == 200

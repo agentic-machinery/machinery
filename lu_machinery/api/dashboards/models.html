@@ -416,7 +416,8 @@ function bankedCell(banked) {
 const SUBSCRIPTION_HEADERS = ["Account", "Weekly resets", "Weekly left", "Pace", "5-hour", "Other windows",
   "Credits", "Banked resets", "Plan · renews or ends", "Sign-in", "Reading"];
 
-const budgetClock = {receivedAt: null, receivedMono: null, heldElapsed: 0, paintedKey: ""};
+const MEASURED_CAP_STATUSES = new Set(["cool", "warm", "hot", "near_cap"]);
+const budgetClock = {receivedAt: null, receivedMono: null, heldElapsed: 0, paintedKey: "", apiObs: new Map(), agentObs: new Map()};
 
 function resetBudgetClock(reading = null) {
   budgetClock.receivedAt = typeof reading?.receivedAt === "number" ? reading.receivedAt : null;
@@ -449,6 +450,89 @@ function agedSeconds(ageS, elapsedS = 0) {
 function agedReading(reading, elapsedS = 0) {
   if (!reading || typeof reading !== "object" || elapsedS === 0) return reading;
   return {...reading, age_s: agedSeconds(reading.age_s, elapsedS)};
+}
+
+function serverCacheLagS(budget) {
+  const diag = budget?.diagnostics;
+  if (!diag || typeof diag !== "object") return 0;
+  const dataAge = diag.data_age_s;
+  if (typeof dataAge !== "number" || !Number.isFinite(dataAge) || dataAge < 0) return 0;
+  if (diag.codexbar_data_available === true && typeof diag.codexbar_max_age_s === "number"
+    && Number.isFinite(diag.codexbar_max_age_s) && diag.codexbar_max_age_s >= 0) {
+    return Math.max(0, dataAge - diag.codexbar_max_age_s);
+  }
+  if (diag.budget_ledger_empty === true || (diag.codexbar_data_available !== true && !diag.records_loaded)) return dataAge;
+  return 0;
+}
+
+function observationKey(budget, row, kind) {
+  if (typeof row?.fetched_at === "string" && row.fetched_at) return `f:${row.fetched_at}`;
+  if (typeof budget?.generated_at === "string" && budget.generated_at) return `g:${budget.generated_at}:${row?.age_s ?? ""}`;
+  if (kind === "api") {
+    return `a:${row?.freshness ?? ""}:${row?.age_s ?? ""}:${row?.total_balance ?? ""}:${row?.limit_remaining_usd ?? ""}:${row?.usage_weekly_usd ?? ""}:${row?.balance_probe_state ?? ""}`;
+  }
+  return `p:${row?.freshness ?? ""}:${row?.age_s ?? ""}:${row?.status ?? ""}`;
+}
+
+function recordObservationMap(map, entries, budget, reading, renderNow, kind) {
+  const dataAge = typeof budget?.diagnostics?.data_age_s === "number" && Number.isFinite(budget.diagnostics.data_age_s)
+    ? budget.diagnostics.data_age_s : null;
+  const cacheLag = serverCacheLagS(budget);
+  const activeNames = new Set();
+  for (const [name, row] of entries) {
+    if (!row || typeof row !== "object") continue;
+    activeNames.add(name);
+    const key = observationKey(budget, row, kind);
+    const rowLag = kind === "agent" && name === "cursor" ? 0 : cacheLag;
+    const incomingAge = agedSeconds(row.age_s, rowLag);
+    const prev = map.get(name);
+    if (prev && prev.key === key && typeof incomingAge === "number" && Number.isFinite(incomingAge)) {
+      const diagDelta = dataAge !== null && prev.baseDataAge !== null ? Math.max(0, dataAge - prev.baseDataAge) : 0;
+      prev.minAge = Math.max(prev.minAge, incomingAge, prev.baseAge + diagDelta);
+    } else {
+      map.set(name, {
+        key,
+        baseAge: incomingAge,
+        minAge: incomingAge,
+        startMono: reading && Object.hasOwn(reading, "receivedMono") ? reading.receivedMono : null,
+        startWall: typeof reading?.receivedAt === "number" ? reading.receivedAt : renderNow,
+        heldElapsed: 0,
+        baseDataAge: dataAge,
+      });
+    }
+  }
+  for (const existing of [...map.keys()]) {
+    if (!activeNames.has(existing)) map.delete(existing);
+  }
+}
+
+function recordBudgetObservations(budget, reading, renderNow = Date.now()) {
+  if (!budget || typeof budget !== "object") return;
+  recordObservationMap(budgetClock.apiObs, Object.entries(budget.api_accounts || {}), budget, reading, renderNow, "api");
+  recordObservationMap(budgetClock.agentObs, Object.entries(budget.agents || {}), budget, reading, renderNow, "agent");
+}
+
+function effectiveObservedAgeS(obsMap, name, row, budget, elapsedS = 0, includeCacheLag = true, now = Date.now()) {
+  if (typeof row?.age_s !== "number" || !Number.isFinite(row.age_s) || row.age_s < 0) return row?.age_s;
+  if (typeof elapsedS !== "number" || !Number.isFinite(elapsedS)) return Number.NaN;
+  const lag = includeCacheLag ? serverCacheLagS(budget) : 0;
+  let effective = agedSeconds(row.age_s, lag + elapsedS);
+  const entry = obsMap.get(name);
+  if (entry && typeof entry.baseAge === "number" && Number.isFinite(entry.baseAge)) {
+    let obsElapsed = 0;
+    if (typeof entry.startMono === "number") {
+      if (!Number.isFinite(entry.startMono)) return Number.NaN;
+      const monoNow = Machinery.snapshotClockStamp();
+      if (typeof monoNow !== "number" || !Number.isFinite(monoNow)) return Number.NaN;
+      obsElapsed = Math.max(0, (monoNow - entry.startMono) / 1000);
+    } else if (typeof entry.startWall === "number" && Number.isFinite(entry.startWall)) {
+      if (typeof now !== "number" || !Number.isFinite(now)) return Number.NaN;
+      obsElapsed = Math.max(0, (now - entry.startWall) / 1000);
+    }
+    entry.heldElapsed = Math.max(entry.heldElapsed, obsElapsed);
+    effective = Math.max(effective, entry.minAge, entry.baseAge + entry.heldElapsed);
+  }
+  return effective;
 }
 
 function subscriptionRows(subs, logins, elapsedS = 0) {
@@ -498,7 +582,7 @@ function probeReason(state) {
 function apiRows(budget, elapsedS = 0) {
   const accounts = budget.api_accounts || {};
   return Object.entries(accounts).map(([name, row]) => {
-    const effectiveAge = agedSeconds(row.age_s, elapsedS);
+    const effectiveAge = effectiveObservedAgeS(budgetClock.apiObs, name, row, budget, elapsedS, true);
     const state = readingState(row.freshness, effectiveAge, budget.diagnostics?.stale_threshold_s);
     const balance = typeof row.total_balance === "number" ? `${row.total_balance.toFixed(2)} ${row.currency || ""}`.trim() + " balance"
       : typeof row.limit_remaining_usd === "number" ? `$${row.limit_remaining_usd.toFixed(2)} left` : null;
@@ -522,7 +606,7 @@ function apiRows(budget, elapsedS = 0) {
 
 function cursorUsage(budget, elapsedS = 0) {
   const cursor = budget?.agents?.cursor;
-  const effectiveAge = agedSeconds(cursor?.age_s, elapsedS);
+  const effectiveAge = effectiveObservedAgeS(budgetClock.agentObs, "cursor", cursor, budget, elapsedS, false);
   const freshness = readingState(cursor?.freshness, effectiveAge, budget?.diagnostics?.stale_threshold_s);
   const needsLogin = cursor?.probe_state === "NEED_LOGIN" || cursor?.login_state === "NEED_LOGIN";
   const reason = !budget ? "routing budget did not answer"
@@ -580,10 +664,12 @@ function budgetFreshnessKey(budget, elapsedS = 0) {
   }
   const threshold = budget.diagnostics?.stale_threshold_s;
   for (const [name, row] of Object.entries(budget.api_accounts || {})) {
-    parts.push(`a:${name}:${readingState(row?.freshness, agedSeconds(row?.age_s, elapsedS), threshold)}`);
+    const effectiveAge = effectiveObservedAgeS(budgetClock.apiObs, name, row, budget, elapsedS, true);
+    parts.push(`a:${name}:${readingState(row?.freshness, effectiveAge, threshold)}`);
   }
   for (const [name, info] of Object.entries(budget.agents || {})) {
-    parts.push(`p:${name}:${readingState(info?.freshness, agedSeconds(info?.age_s, elapsedS), threshold)}`);
+    const effectiveAge = effectiveObservedAgeS(budgetClock.agentObs, name, info, budget, elapsedS, name !== "cursor");
+    parts.push(`p:${name}:${readingState(info?.freshness, effectiveAge, threshold)}`);
   }
   return parts.join("|");
 }
@@ -847,12 +933,14 @@ function renderChips(latest, now = Date.now()) {
   }
   if (budget) {
     const threshold = budget.diagnostics?.stale_threshold_s;
-    const agents = budget.agents && typeof budget.agents === "object" ? Object.values(budget.agents) : [];
+    const agents = budget.agents && typeof budget.agents === "object" ? Object.entries(budget.agents) : [];
     let verified = 0, nearCap = 0, unknownPools = 0;
-    for (const info of agents) {
+    for (const [name, info] of agents) {
       if (!info || typeof info !== "object") continue;
-      const st = readingState(info.freshness, agedSeconds(info.age_s, elapsed), threshold);
-      if (st === "fresh" && !info.stale && typeof info.status === "string" && info.status && info.status !== "unknown") {
+      const effectiveAge = effectiveObservedAgeS(budgetClock.agentObs, name, info, budget, elapsed, name !== "cursor", now);
+      const st = readingState(info.freshness, effectiveAge, threshold);
+      const needsLogin = info.probe_state === "NEED_LOGIN" || info.login_state === "NEED_LOGIN";
+      if (st === "fresh" && !info.stale && !needsLogin && typeof info.status === "string" && MEASURED_CAP_STATUSES.has(info.status)) {
         verified += 1;
         if (info.status === "near_cap") nearCap += 1;
       } else {
@@ -914,6 +1002,7 @@ const PANELS = [
     withReadings: true,
     render: (budget, logins, readings, renderNow) => {
       resetBudgetClock(readings?.[0] || null);
+      recordBudgetObservations(budget, readings?.[0] || null, renderNow);
       const elapsed = budgetElapsedS(renderNow);
       budgetClock.paintedKey = budgetFreshnessKey(budget, elapsed);
       return renderUsage(budget?.subscriptions, budget, logins, elapsed);

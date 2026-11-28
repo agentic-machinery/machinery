@@ -815,7 +815,12 @@ function renderThreadItems(anchorId, rows, limit, offset, nextOffset, {focusMess
     nodes.push(button);
   }
   setNodeChildren(box, nodes);
-  if (focusTarget && typeof focusTarget.focus === "function") focusTarget.focus();
+  if (focusTarget && typeof focusTarget.focus === "function") {
+    focusTarget.focus();
+  } else if (focusFirst) {
+    const readerHeading = document.getElementById("message-reader-heading");
+    if (readerHeading && typeof readerHeading.focus === "function") readerHeading.focus();
+  }
 }
 
 async function loadMessageBody(id) {
@@ -852,13 +857,42 @@ async function loadMessageBody(id) {
   rememberStatus("messages", status);
 }
 
+function isFocusInside(container) {
+  if (!container || typeof document !== "object" || !document) return false;
+  const active = document.activeElement;
+  return Boolean(active && typeof container.contains === "function" && container.contains(active));
+}
+
+function setThreadStatus(box, className, textValue) {
+  if (!box) return;
+  const existing = typeof box.querySelector === "function" ? box.querySelector("[data-thread-status]") : null;
+  if (existing) {
+    existing.className = className;
+    existing.textContent = textValue;
+    return;
+  }
+  const note = safeEl("p", className, textValue);
+  note.dataset.threadStatus = "1";
+  note.setAttribute("data-thread-status", "1");
+  if (typeof box.appendChild === "function") box.appendChild(note);
+}
+
 async function loadMessageThread(id, offset = 0, {preserveFocus = false} = {}) {
   const seq = ++messageThreadRequest;
   currentThreadAnchorId = id;
   const box = document.getElementById("message-thread");
   const heading = document.getElementById("message-thread-heading");
-  if (heading) heading.textContent = "Thread";
-  setNodeChildren(box, [safeEl("p", "muted", "Loading thread…")]);
+  const keepMounted = preserveFocus && Boolean(
+    box && ((typeof box.querySelector === "function" && box.querySelector("button"))
+      || (Array.isArray(box.children) && box.children.length > 0))
+  );
+  if (keepMounted) {
+    setThreadStatus(box, "muted", "Loading thread…");
+    rememberStatus("messages", "Loading thread…");
+  } else {
+    if (heading) heading.textContent = "Thread";
+    setNodeChildren(box, [safeEl("p", "muted", "Loading thread…")]);
+  }
   try {
     const response = await fetch(
       `${MESSAGE_URL}/${encodeURIComponent(id)}/thread?offset=${offset}`, {cache: "no-store"}
@@ -867,9 +901,20 @@ async function loadMessageThread(id, offset = 0, {preserveFocus = false} = {}) {
     if (seq !== messageThreadRequest) return;
     if (!response.ok || !Array.isArray(payload.messages)) throw new Error("Thread unavailable");
     currentThreadRows = payload.messages;
-    renderThreadItems(id, payload.messages, payload.limit, offset, payload.next_offset, {focusFirst: preserveFocus});
+    const focusFirst = preserveFocus && isFocusInside(box);
+    renderThreadItems(id, payload.messages, payload.limit, offset, payload.next_offset, {focusFirst});
   } catch {
-    if (seq === messageThreadRequest) setNodeChildren(box, [safeEl("p", "error", "Thread could not load.")]);
+    if (seq !== messageThreadRequest) return;
+    if (keepMounted) {
+      setThreadStatus(box, "error", "Thread could not load.");
+      rememberStatus("messages", "Thread could not load.");
+      return;
+    }
+    const retry = safeEl("button", "retry", "Retry");
+    retry.type = "button";
+    retry.addEventListener("click", () => loadMessageThread(id, offset, {preserveFocus: true}));
+    setNodeChildren(box, [safeEl("p", "error", "Thread could not load."), retry]);
+    rememberStatus("messages", "Thread could not load.");
   }
 }
 
