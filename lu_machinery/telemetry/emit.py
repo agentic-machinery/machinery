@@ -951,8 +951,9 @@ def _eligible_owners(owners: Sequence[Mapping[str, Any]], pr: int, head_sha: str
     """
     eligible = []
     for owner in owners:
-        if not isinstance(owner, Mapping) or owner.get("pr") != pr or owner.get("head_sha") != head_sha:
-            continue
+        if not (isinstance(owner, Mapping) and _int_in(owner.get("pr"), 1, 2**31 - 1) and owner["pr"] == pr
+                and isinstance(owner.get("head_sha"), str) and owner["head_sha"] == head_sha):
+            continue  # a malformed identifier (7.0, true) is no owner, never an equal one
         trace = trace_of(owner) if visibility != PUBLIC else public_trace_of(owner, repos)
         eligible.append({"trace": trace})
     return eligible if visibility != PUBLIC else [item for item in eligible if item["trace"] is not None]

@@ -257,6 +257,10 @@ def test_multi_pr_merge_group_records_pr_head_receipt_and_span_links() -> None:
     private = emit.merge_group_event(jobs_attempt=1, repo="priv", visibility="private", run=run, jobs=_jobs(9003, head=CANDIDATE),
                                      receipt=receipt, owners=owners, now=NOW, repos=REPOS)
     assert len(private["span_links"]) == 5  # inherited and private owners link only in the private scope
+    odd_owner = emit.merge_group_event(jobs_attempt=1, repo="pub", visibility="public", run=run,
+                                       jobs=_jobs(9003, head=CANDIDATE), receipt=receipt, now=NOW, repos=REPOS,
+                                       owners=[_owner(OTHER, pr=5.0, head=OLD_HEAD), _owner(TRACE)])
+    assert odd_owner["span_links"] == [{**TRACE, "pr": 7, "head_sha": HEAD}]
     for bad in (None, {"tested_sha": OLD_HEAD, "entries": entries}, {"tested_sha": CANDIDATE, "entries": [
             *entries, {"pr": 7, "head_sha": OLD_HEAD}]}):
         unproven = emit.merge_group_event(jobs_attempt=1, repo="pub", visibility="public", run=run, jobs=_jobs(9003, head=CANDIDATE),
@@ -305,6 +309,9 @@ def test_ownership_transfer_cancellation_and_missing_or_ambiguous_ci_are_explici
     assert (transferred["ownership"], transferred.get("trace_id")) == ("transferred", None)
     assert [link["trace_id"] for link in transferred["span_links"]] == [OTHER["trace_id"], TRACE["trace_id"]]
     assert _ci(owners=[])["ownership"] == "unknown"
+    for odd in (7.0, True, "7"):  # a malformed owner PR number is no owner, never a second (transfer) one
+        assert _ci(owners=[_owner(OTHER, pr=odd), _owner(TRACE)])["ownership"] == "single"
+    assert _ci(pr=1, owners=[_owner(TRACE, pr=True)])["ownership"] == "unknown"
     hidden = _ci(owners=[_owner(OTHER, data_class="private-ops"), _owner(TRACE)])  # one owner is a private task
     assert (hidden["ownership"], hidden["trace_id"], hidden.get("span_links")) == ("single", TRACE["trace_id"], None)
     single = _ci()
