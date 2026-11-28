@@ -235,6 +235,32 @@ def record_path(task_id: str) -> Path:
     return tasks_dir() / f"{task_id}.json"
 
 
+def name_stream_logs(record: dict, path: Path) -> tuple[Path, Path]:
+    """Name the stream destinations. Provider is null until a separate log is bound."""
+    logs = path.parent / "logs"
+    stdout = logs / f"{path.stem}.stdout.log"
+    stderr = logs / f"{path.stem}.stderr.log"
+    record["log_paths"] = {"stdout": str(stdout.absolute()), "stderr": str(stderr.absolute()), "provider": None}
+    return stdout, stderr
+
+
+def name_bound_provider_log(task_id: str | None, run_nonce: object, log: Path) -> None:
+    """Record the runtime's diagnostic path for its own live bound dispatch."""
+    if not task_id or task_id != os.environ.get("LEARN_UKRAINIAN_DISPATCH_TASK_ID") or not isinstance(run_nonce, str):
+        return
+    path = record_path(task_id)
+    with task_state_lock(path):
+        record = _current_record(path)
+        if (record is None or record.get("task_id") != task_id or record.get("run_nonce") != run_nonce
+                or record.get("pid") != os.getpid()
+                or record.get("status") != "running" or record.get("settling_at") or not record.get("review_attempt")):
+            return
+        if not isinstance(record.get("log_paths"), dict):
+            name_stream_logs(record, path)
+        record["log_paths"]["provider"] = str(log.absolute())
+        _write_atomic(path, record, exclusive=False)
+
+
 def retention_hold_error(record: dict) -> str | None:
     """Describe a malformed hold without treating false-like values as booleans."""
     if "worktree_retention_hold" in record:
@@ -734,6 +760,8 @@ def begin_settlement(record: dict) -> None:
             record[HANDOFF_RECEIPT_KEY] = current[HANDOFF_RECEIPT_KEY]
         if CLIENT_CANCEL_NONCE_KEY in current:
             record[CLIENT_CANCEL_NONCE_KEY] = current[CLIENT_CANCEL_NONCE_KEY]
+        if current.get("review_attempt") and "log_paths" in current:
+            record["log_paths"] = current["log_paths"]
 
 
 CLIENT_CANCEL_NONCE_KEY = "client_cancel_nonce"

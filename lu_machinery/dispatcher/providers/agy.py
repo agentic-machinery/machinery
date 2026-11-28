@@ -220,11 +220,18 @@ def terminal_result_observer(stdout_path):
     return observed
 
 
-def model_request_observer(argv: list[str]) -> Callable[[], bool] | None:
-    """Observe complete model-request lines appended to this AGY invocation's log."""
+def invocation_log_path(argv: list[str]) -> Path | None:
+    """Return the diagnostic log named by the AGY launch."""
     if "--log-file" not in argv:
         return None
-    path = Path(argv[argv.index("--log-file") + 1])
+    return Path(argv[argv.index("--log-file") + 1])
+
+
+def model_request_observer(argv: list[str]) -> Callable[[], bool] | None:
+    """Observe complete model-request lines appended to this AGY invocation's log."""
+    path = invocation_log_path(argv)
+    if path is None:
+        return None
     try:
         offset = path.stat().st_size
     except OSError:

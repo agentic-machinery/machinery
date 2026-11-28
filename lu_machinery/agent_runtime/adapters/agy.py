@@ -1204,6 +1204,11 @@ class AgyAdapter:
             else {}
         )
 
+        if isinstance(boundary, AttemptBoundary) and not consumer_route:
+            from lu_machinery.dispatcher.store import name_bound_provider_log
+
+            name_bound_provider_log(task_id, tc.get("run_nonce"), log_path)
+
         return InvocationPlan(
             cmd=cmd,
             cwd=cwd.resolve(),
