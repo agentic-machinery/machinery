@@ -3,7 +3,7 @@
 Used by `full-send` and `full-stop` between opening the PR and the gate. One supervisor per PR:
 the accountable driver's cycle.
 
-`"$PY"` is the primary checkout's interpreter ([delivery](delivery.md#interpreter)).
+`"$PY"` is the bound machinery runtime interpreter (`LU_PYTHON`) ([delivery](delivery.md#interpreter)).
 
 ## Waiting
 

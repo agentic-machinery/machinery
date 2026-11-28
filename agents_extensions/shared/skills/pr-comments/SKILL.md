@@ -9,11 +9,15 @@ A pointer skill. The rules that govern public text are in
 `docs/dev/agent-public-text.md` (the typed publisher) and rules core P8 (operational
 security). This file adds only the order of operations; it is not a second copy of them.
 
-Recipes run with the primary checkout's interpreter, resolved once
+Recipes run with the bound machinery runtime interpreter (`LU_PYTHON`), resolved once
 ([delivery](../full-send/references/delivery.md#interpreter)):
 
 ```bash
-PY="$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")/.venv/bin/python"
+if [[ "${LU_PYTHON:-}" != /* || ! -f "$LU_PYTHON" || ! -x "$LU_PYTHON" ]]; then
+  printf '%s\n' 'Error: missing_interpreter_binding: LU_PYTHON must name an absolute executable.' >&2
+  exit 1
+fi
+PY="$LU_PYTHON"
 ```
 
 ## Every agent comment
