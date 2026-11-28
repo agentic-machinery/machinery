@@ -66,7 +66,7 @@ def _runtime_env(lu_python: str | None) -> dict[str, str]:
 def _make_venv(path: Path) -> Path:
     subprocess.run(
         [sys.executable, "-m", "venv", "--without-pip", str(path)],
-        check=True, capture_output=True, text=True,
+        check=True, capture_output=True, text=True, timeout=30,
     )
     return path / "bin" / "python"
 
@@ -649,18 +649,18 @@ def test_recipes_run_machinery_modules_with_bound_runtime(tmp_path):
     target_root.mkdir()
     subprocess.run(
         ["git", "init", "-q", "-b", "main", str(target_root)],
-        check=True, capture_output=True, text=True, env=_runtime_env(None),
+        check=True, capture_output=True, text=True, timeout=30, env=_runtime_env(None),
     )
     target_python = _make_venv(target_root / ".venv")
     machinery_python = _make_venv(tmp_path / "machinery-venv")
     purelib = subprocess.run(
         [str(machinery_python), "-c", "import sysconfig; print(sysconfig.get_path('purelib'))"],
-        check=True, capture_output=True, text=True,
+        check=True, capture_output=True, text=True, timeout=30,
     ).stdout.strip()
     Path(purelib, "lu_machinery_repo.pth").write_text(f"{REPO_ROOT}\n", encoding="utf-8")
     denied = subprocess.run(
         [str(target_python), "-c", "import lu_machinery"],
-        cwd=target_root, capture_output=True, text=True, env=_runtime_env(None),
+        cwd=target_root, capture_output=True, text=True, timeout=30, env=_runtime_env(None),
     )
     assert denied.returncode != 0
 
