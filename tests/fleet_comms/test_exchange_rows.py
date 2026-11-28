@@ -397,7 +397,7 @@ def test_valid_reply_matches_get_message_and_links_to_parent_delivery(
 def test_reply_with_missing_parent_emits_typed_reply_parent_not_found_error(
     plane: Path, capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """Defect class: orphan reply with missing parent crashes or drops when delivery fails normalization."""
+    """Defect class: orphan or in-scope self-reply crashes or drops when delivery fails normalization."""
     missing_parent_id = "message_" + ("0" * 32)
     with AuthorityService(root=plane) as service:
         parent = service.publish_message(
@@ -415,9 +415,25 @@ def test_reply_with_missing_parent_emits_typed_reply_parent_not_found_error(
             created_at="2026-11-28T01:02:00Z",
             idempotency_key="missing-parent-orphan",
         )
+        # In-scope self-replies (selected conversation and queried recipient) must survive F4 filtering (F8).
+        conv_self_reply = service.publish_message(
+            sender="claude",
+            body=f"conv self {BODY_SENTINEL}",
+            recipients=("claude-cto",),
+            conversation_id=parent.conversation_id,
+            created_at="2026-11-28T01:02:10Z",
+            idempotency_key="self-reply-conv",
+        )
+        sender_self_reply = service.publish_message(
+            sender="codex",
+            body=f"sender self {BODY_SENTINEL}",
+            recipients=("claude-cto",),
+            created_at="2026-11-28T01:02:20Z",
+            idempotency_key="self-reply-sender",
+        )
 
-    # Point orphan.in_reply_to at a nonexistent parent, and corrupt delivery attempt_count
-    # to prove the delivery's conversation is still retained for orphan reply discovery (F5).
+    # Point orphan.in_reply_to at a nonexistent parent, point self-replies at themselves,
+    # and corrupt delivery attempt_count to prove conversation retention (F5, F8).
     conn = sqlite3.connect(str(plane / "comms.sqlite3"))
     try:
         conn.execute("PRAGMA foreign_keys = OFF")
@@ -425,6 +441,10 @@ def test_reply_with_missing_parent_emits_typed_reply_parent_not_found_error(
         conn.execute(
             "UPDATE comms_messages SET in_reply_to = ? WHERE message_id = ?",
             (missing_parent_id, orphan.message_id),
+        )
+        conn.execute(
+            "UPDATE comms_messages SET in_reply_to = message_id WHERE message_id IN (?, ?)",
+            (conv_self_reply.message_id, sender_self_reply.message_id),
         )
         conn.execute(
             "UPDATE authority_deliveries SET attempt_count = 'bad' WHERE delivery_id = ?",
@@ -439,10 +459,11 @@ def test_reply_with_missing_parent_emits_typed_reply_parent_not_found_error(
     assert payload["delivery_count"] == 1
     assert payload["deliveries"][0]["ok"] is False
     assert payload["deliveries"][0]["error"] == "delivery_row_corrupt"
-    assert payload["reply_count"] == 1
-    assert payload["error_count"] == 2
+    assert payload["reply_count"] == 3
+    assert payload["error_count"] == 4
 
-    row = payload["replies"][0]
+    replies_by_mid = {row["message_id"]: row for row in payload["replies"]}
+    row = replies_by_mid[orphan.message_id]
     assert row["ok"] is False
     assert row["error"] == "reply_parent_not_found"
     assert row["reply_link_status"] == "missing_parent"
@@ -450,6 +471,12 @@ def test_reply_with_missing_parent_emits_typed_reply_parent_not_found_error(
     assert row["in_reply_to"] == missing_parent_id
     assert row["parent_conversation_id"] is None
     assert row["message"] == expected_orphan
+
+    for self_mid in (conv_self_reply.message_id, sender_self_reply.message_id):
+        self_row = replies_by_mid[self_mid]
+        assert self_row["ok"] is False
+        assert self_row["error"] == "reply_self_reference"
+        assert self_row["reply_link_status"] == "self_reply"
 
 
 def test_reply_in_other_conversation_emits_typed_reply_thread_mismatch_error(
@@ -537,6 +564,20 @@ def test_corrupt_row_emits_typed_error_while_sibling_rows_still_print(
             created_at="2026-11-28T01:01:10Z",
             idempotency_key="corrupt-sibling-bad-nan",
         )
+        bad_ctx_nan_msg = service.publish_message(
+            sender="operator",
+            body=f"bad ctx nan {BODY_SENTINEL}",
+            recipients=("codex",),
+            created_at="2026-11-28T01:01:15Z",
+            idempotency_key="corrupt-sibling-bad-ctx-nan",
+        )
+        bad_ctx_inf_msg = service.publish_message(
+            sender="operator",
+            body=f"bad ctx inf {BODY_SENTINEL}",
+            recipients=("codex",),
+            created_at="2026-11-28T01:01:16Z",
+            idempotency_key="corrupt-sibling-bad-ctx-inf",
+        )
         bad_utf8_msg = service.publish_message(
             sender="operator",
             body=f"bad utf8 {BODY_SENTINEL}",
@@ -588,6 +629,14 @@ def test_corrupt_row_emits_typed_error_while_sibling_rows_still_print(
             ('{"score": NaN}', bad_nan_msg.message_id),
         )
         conn.execute(
+            "UPDATE authority_message_metadata SET context_revisions_json = ? WHERE message_id = ?",
+            ('{"rev": NaN}', bad_ctx_nan_msg.message_id),
+        )
+        conn.execute(
+            "UPDATE authority_message_metadata SET context_revisions_json = ? WHERE message_id = ?",
+            ('{"rev": {"nested": -Infinity}, "overflow": 1e999}', bad_ctx_inf_msg.message_id),
+        )
+        conn.execute(
             "UPDATE authority_message_metadata SET provenance_json = CAST(X'80' AS TEXT) WHERE message_id = ?",
             (bad_utf8_msg.message_id,),
         )
@@ -609,9 +658,9 @@ def test_corrupt_row_emits_typed_error_while_sibling_rows_still_print(
     expected_good_reply = _expected_message_dict(plane, good_reply.message_id)
 
     payload = _run_exchange(capsys, plane, recipient="codex")
-    assert payload["delivery_count"] == 6
+    assert payload["delivery_count"] == 8
     assert payload["reply_count"] == 2
-    assert payload["error_count"] == 6
+    assert payload["error_count"] == 8
 
     by_mid = {row["message_id"]: row for row in payload["deliveries"]}
     assert by_mid[good_msg.message_id]["ok"] is True
@@ -627,8 +676,16 @@ def test_corrupt_row_emits_typed_error_while_sibling_rows_still_print(
     assert by_mid[bad_nan_msg.message_id]["error"] == "provenance_corrupt"
     assert by_mid[bad_nan_msg.message_id]["message"] is None
 
+    assert by_mid[bad_ctx_nan_msg.message_id]["ok"] is False
+    assert by_mid[bad_ctx_nan_msg.message_id]["error"] == "context_revisions_corrupt"
+    assert by_mid[bad_ctx_nan_msg.message_id]["message"] is None
+
+    assert by_mid[bad_ctx_inf_msg.message_id]["ok"] is False
+    assert by_mid[bad_ctx_inf_msg.message_id]["error"] == "context_revisions_corrupt"
+    assert by_mid[bad_ctx_inf_msg.message_id]["message"] is None
+
     assert by_mid[bad_utf8_msg.message_id]["ok"] is False
-    assert by_mid[bad_utf8_msg.message_id]["error"] == "message_row_corrupt"
+    assert by_mid[bad_utf8_msg.message_id]["error"] == "provenance_corrupt"
     assert by_mid[bad_utf8_msg.message_id]["message"] is None
 
     assert by_mid[bad_overflow_msg.message_id]["ok"] is False
@@ -647,13 +704,17 @@ def test_corrupt_row_emits_typed_error_while_sibling_rows_still_print(
     assert replies_by_mid[reply_to_missing_meta.message_id]["error"] == "message_not_found"
     assert replies_by_mid[reply_to_missing_meta.message_id]["parent_conversation_id"] == missing_meta_parent.conversation_id
 
-    # Boundary refusals still fail closed with typed JSON errors and exit 3 (including UTC overflow, F1).
+    # Boundary refusals still fail closed with typed JSON errors and exit 3 (F1, F9).
     bad_since = _run_exchange(capsys, plane, recipient="codex", since="not-a-date", expected_rc=EXIT_ERROR)
     assert bad_since["error"] == "invalid_since"
     overflow_since = _run_exchange(
         capsys, plane, recipient="codex", since="9999-12-31T23:59:59-01:00", expected_rc=EXIT_ERROR,
     )
     assert overflow_since["error"] == "invalid_since"
+    surrogate_recipient = _run_exchange(
+        capsys, plane, recipient="codex\udc80", expected_rc=EXIT_ERROR,
+    )
+    assert surrogate_recipient["error"] == "invalid_recipient"
     missing_store = _run_exchange(
         capsys, plane.parent / "absent-plane", recipient="codex", expected_rc=EXIT_ERROR,
     )

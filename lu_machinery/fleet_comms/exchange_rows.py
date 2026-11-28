@@ -20,6 +20,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from lu_machinery.common import json_depth
 from lu_machinery.control_plane.storage import (
     ControlPlaneError,
     ControlPlaneUnsupportedComponentError,
@@ -119,6 +120,57 @@ def _require_strict_json(value: Any, *, error_code: str) -> None:
         raise AuthorityServiceError(error_code) from exc
 
 
+def _reject_non_finite_constant(token: str) -> Any:
+    raise ValueError(f"non_finite_json_constant:{token}")
+
+
+def _require_utf8_arg(value: str, *, error_code: str) -> str:
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise ExchangeRowsError(error_code) from exc
+    return value
+
+
+def _validate_raw_message_metadata(conn: SQLiteConnection, message_id: str) -> None:
+    """Validate stored JSON metadata strictly before Fleet's stringifier runs."""
+    row = conn.execute(
+        """SELECT context_revisions_json, provenance_json
+           FROM authority_message_metadata
+           WHERE message_id = ?""",
+        (message_id,),
+    ).fetchone()
+    if row is None:
+        return
+    for column, error_code, require_string_values in (
+        ("context_revisions_json", "context_revisions_corrupt", True),
+        ("provenance_json", "provenance_corrupt", False),
+    ):
+        raw = row[column]
+        if raw is None:
+            continue
+        if not isinstance(raw, str):
+            raise AuthorityServiceError(error_code)
+        try:
+            parsed = json_depth.loads(
+                raw,
+                max_depth=512,
+                parse_constant=_reject_non_finite_constant,
+            )
+        except (json.JSONDecodeError, ValueError) as exc:
+            raise AuthorityServiceError(error_code) from exc
+        except RecursionError as exc:
+            raise AuthorityServiceError("message_metadata_corrupt") from exc
+        if not isinstance(parsed, dict):
+            raise AuthorityServiceError(error_code)
+        if require_string_values and any(
+            not isinstance(key, str) or not isinstance(value, str)
+            for key, value in parsed.items()
+        ):
+            raise AuthorityServiceError(error_code)
+        _require_strict_json(parsed, error_code=error_code)
+
+
 def _message_to_dict(message: AuthorityMessage) -> dict[str, Any]:
     _as_nonempty_str(message.message_id, error_code="message_row_corrupt")
     _as_nonempty_str(message.conversation_id, error_code="message_row_corrupt")
@@ -136,6 +188,7 @@ def _message_to_dict(message: AuthorityMessage) -> dict[str, Any]:
 
 
 def _read_message_cached(
+    conn: SQLiteConnection,
     service: AuthorityService,
     cache: dict[str, tuple[dict[str, Any] | None, str | None]],
     message_id: str,
@@ -144,6 +197,7 @@ def _read_message_cached(
     if cached is not None:
         return cached
     try:
+        _validate_raw_message_metadata(conn, message_id)
         message = service.get_message(message_id)
         result: tuple[dict[str, Any] | None, str | None] = (_message_to_dict(message), None)
     except AuthorityServiceError as exc:
@@ -356,6 +410,7 @@ def read_exchange_rows(
         since_dt = _parse_required_iso(since, field="since")
     except AuthorityServiceError as exc:
         raise ExchangeRowsError(str(exc)) from exc
+    recipient_name = _require_utf8_arg(recipient_name, error_code="invalid_recipient")
     since_iso = since_dt.isoformat().replace("+00:00", "Z")
 
     try:
@@ -405,7 +460,14 @@ def read_exchange_rows(
         raise ExchangeRowsError(str(exc)) from exc
     except ControlPlaneUnsupportedComponentError as exc:
         raise ExchangeRowsError("authority_unsupported_component") from exc
-    except (OSError, sqlite3.Error, ControlPlaneError, ArtifactStoreError, PlaneRootAnchorError) as exc:
+    except (
+        OSError,
+        UnicodeEncodeError,
+        sqlite3.Error,
+        ControlPlaneError,
+        ArtifactStoreError,
+        PlaneRootAnchorError,
+    ) as exc:
         raise ExchangeRowsError("exchange_store_unavailable") from exc
 
 
@@ -468,7 +530,7 @@ def _collect_exchange_payload(
         delivery_ids_by_message.setdefault(message_id, []).append(delivery_id)
 
         lifecycle, lifecycle_error = _delivery_lifecycle(conn, delivery_dict)
-        message_dict, message_error = _read_message_cached(service, message_cache, message_id)
+        message_dict, message_error = _read_message_cached(conn, service, message_cache, message_id)
         if message_dict is not None:
             selected_conversations.add(str(message_dict["conversation_id"]))
         else:
@@ -508,9 +570,14 @@ def _collect_exchange_payload(
             parsed_reply_created = _try_parse_created_at(raw_reply["created_at"])
             if parsed_reply_created is not None and parsed_reply_created < since_dt:
                 continue
-            # Exclude replies whose known parent exists in comms_messages outside the
+            # Exclude replies whose distinct known parent exists in comms_messages outside the
             # selected deliveries (e.g., another recipient's message or pre-window delivery).
-            if raw_parent is not None and _lookup_parent_in_comms(conn, parent_comms_cache, raw_parent)[0]:
+            # Self-references (raw_parent == raw_mid) stay in scope for the self-reply classifier.
+            if (
+                raw_parent is not None
+                and raw_parent != raw_mid
+                and _lookup_parent_in_comms(conn, parent_comms_cache, raw_parent)[0]
+            ):
                 continue
             if raw_sender != recipient_name and (raw_conv is None or raw_conv not in selected_conversations):
                 continue
@@ -521,7 +588,7 @@ def _collect_exchange_payload(
         if raw_mid is None or not raw_mid.strip():
             reply_dict, reply_error = None, "message_row_corrupt"
         else:
-            reply_dict, reply_error = _read_message_cached(service, message_cache, raw_mid)
+            reply_dict, reply_error = _read_message_cached(conn, service, message_cache, raw_mid)
         if reply_error is not None:
             reply_payload: dict[str, Any] = {
                 "ok": False,
@@ -561,7 +628,7 @@ def _collect_exchange_payload(
                 link_error = "reply_thread_mismatch"
                 parent_conv = raw_parent_conv
             else:
-                parent_dict, parent_error = _read_message_cached(service, message_cache, parent_id)
+                parent_dict, parent_error = _read_message_cached(conn, service, message_cache, parent_id)
                 if parent_dict is not None:
                     parent_conv = str(parent_dict["conversation_id"])
                     if reply_conv == parent_conv:

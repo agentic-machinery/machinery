@@ -388,6 +388,7 @@ tests/fleet_comms/test_cold_start_board.py
 tests/fleet_comms/test_cto_recipient.py
 tests/fleet_comms/test_delivery_cli.py
 tests/fleet_comms/test_efficiency_metrics_authority.py
+tests/fleet_comms/test_exchange_rows.py
 tests/fleet_comms/test_fleet_comms_authority_cutover.py
 tests/fleet_comms/test_fleet_comms_b2.py
 tests/fleet_comms/test_fleet_comms_bottleneck_metrics.py
