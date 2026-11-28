@@ -1949,6 +1949,25 @@ def test_critical_approval_needs_one_security_attestation_line(monkeypatch, tmp_
             recorder.record("review-one", pr_number=42, task_root=tasks, lock_root=tmp_path / "locks")
         assert comments == [] and calls == {"posts": 0, "statuses": 0}, name
 
+    # The sign-off line has no closing punctuation: an unfinished-review admission on the next line, or after
+    # any unpunctuated line, is still read, whether the object is sealed or indented as a Markdown code block.
+    from lu_machinery.review.review_contract import ContractError, canonical_receipt_payload
+
+    for unfinished in (
+        attested_approval("I could not finish the review."),
+        attested_approval("Summary\nI could not finish the review."),
+        "\n    " + attested_approval("I could not finish the review."),
+        "```json\n" + attested_approval("I could not finish the review.") + "\n```\n",
+    ):
+        # A whole fence reaches the recorder only from a route the worker does not seal.
+        assert unfinished.startswith("```") or sealed(unfinished) is not None
+        with pytest.raises(ContractError, match="review_declares_incomplete"):
+            canonical_receipt_payload(unfinished)
+        write_task(tasks, reply=unfinished, **critical)
+        with pytest.raises(recorder.RecordError, match="inconclusive: reviewer declares an incomplete review"):
+            recorder.record("review-one", pr_number=42, task_root=tasks, lock_root=tmp_path / "locks")
+        assert comments == [] and calls == {"posts": 0, "statuses": 0}
+
     # A reviewer's pretty-printed raw output, sealed by the worker, signs off.
     reply = sealed(json.dumps(attested_payload(), indent=2))
     assert reply == attested_approval()
