@@ -1961,6 +1961,8 @@ def test_critical_approval_needs_one_security_attestation_line(monkeypatch, tmp_
         # Visible admissions that Markdown rendering hides: a line led by inline code, and an HTML block.
         attested_approval("Checked `a.py`\n`b.py` I could not finish the review."),
         attested_approval("Summary\n\n<p>I could not finish the review.</p>"),
+        # Visible admission hidden by HTML markup: nested inline tags, a character reference, a tag inside a word.
+        attested_approval("Summary\n\n<p><b>I</b><i> could</i> not&nbsp;fin<b>ish</b> the review.</p>"),
         "\n    " + attested_approval("I could not finish the review."),
         "```json\n" + attested_approval("I could not finish the review.") + "\n```\n",
     ):
@@ -1977,9 +1979,12 @@ def test_critical_approval_needs_one_security_attestation_line(monkeypatch, tmp_
     for example in (
         "The test pins this text:\n\n```\nI could not finish the review.\n```\n\nAll good.",
         "The fixture:\n\n    I could not finish the review.\n\nAll good.",
+        # The completion check read quoted or attributed text as an admission: an HTML comment, attributed speech.
+        "All good.\n\n<!-- <b>I could not finish the review.</b> -->",
+        "Earlier reviewers said *the review is incomplete*; it is now complete.",
     ):
         reply = attested_approval(example)
-        assert sealed(reply) is not None and canonical_receipt_payload(reply)["overall"]["explanation"].endswith("good.")
+        assert sealed(reply) is not None and canonical_receipt_payload(reply)["overall"]["explanation"].endswith(example)
         write_task(tasks, reply=reply, **critical)
         result = recorder.record("review-one", pr_number=42, task_root=tasks, lock_root=tmp_path / "locks")
         assert result["verdict"] == "APPROVED" and statuses[-1]["state"] == "success", example
