@@ -1958,6 +1958,9 @@ def test_critical_approval_needs_one_security_attestation_line(monkeypatch, tmp_
         attested_approval("Summary\nI could not finish the review."),
         # Wrapped across lines after an unpunctuated line.
         attested_approval("Summary\nI could not finish\nthe review."),
+        # Visible admissions that Markdown rendering hides: a line led by inline code, and an HTML block.
+        attested_approval("Checked `a.py`\n`b.py` I could not finish the review."),
+        attested_approval("Summary\n\n<p>I could not finish the review.</p>"),
         "\n    " + attested_approval("I could not finish the review."),
         "```json\n" + attested_approval("I could not finish the review.") + "\n```\n",
     ):

@@ -386,10 +386,11 @@ def invalid_findings_block(response: str, *, stated: str | None = None) -> str |
 
 # These are declarations by the reviewer about its own unfinished work, not
 # general uses of "incomplete" in findings about the code under review.
-# No catastrophic backtracking: on reviewer prose it starts only at a line start or [.!?:], and its repeated units are literal
-# words split by \s+, which no word can match, so no span matches two ways (200k chars: <40 ms).
+# No catastrophic backtracking: on reviewer prose it starts only at a line start (after any blanks, which rendered inline
+# code or HTML leaves) or [.!?:], and its repeated units are literal words split by \s+, which no word can match, so no
+# span matches two ways (200k chars: <60 ms).
 _INCOMPLETE_REVIEW_RE = re.compile(  # nosemgrep: python.lang.security.audit.regex_dos
-    r"(?:^|[.!?:]\s+)(?:(?:however|unfortunately),?\s+)?(?:"
+    r"(?:^[^\S\n]*|[.!?:]\s+)(?:(?:however|unfortunately),?\s+)?(?:"
     r"(?:I|we)\s+(?:(?:could|can|did|have)\s+not|cannot|couldn't|can't|didn't|haven't|"
     r"(?:am|are|was|were)\s+unable\s+to)\s+"
     r"(?:finish(?:ed)?|complete(?:d)?)\s+(?:(?:the|this|my|our|full|entire)\s+)*"
@@ -399,6 +400,7 @@ _INCOMPLETE_REVIEW_RE = re.compile(  # nosemgrep: python.lang.security.audit.reg
     r"(?:did\s+not|didn't|has\s+not|hasn't)\s+(?:finish(?:ed)?|complete(?:d)?))\b)",
     re.IGNORECASE | re.MULTILINE,
 )
+_HTML_TAG_RE = re.compile(r"<[^<>]*>")
 
 
 def _without_inline_json(text: str) -> str:
@@ -427,9 +429,13 @@ def _completion_prose(response: str) -> list[str]:
     visible = _without_inline_json(_without_code_fences(response, keep_unclosed=False))
     prose = []
     for token in MarkdownIt("commonmark").parse(visible):
-        if token.type == "inline":
+        if token.type == "html_block":
+            # Its visible text is own prose too; each tag ends a line.
+            prose.append(_HTML_TAG_RE.sub("\n", token.content).strip())
+        elif token.type == "inline":
             rendered = "".join(
-                "\n" if child.type in {"softbreak", "hardbreak"} else " " if child.type == "code_inline" else child.content
+                "\n" if child.type in {"softbreak", "hardbreak", "html_inline"}
+                else " " if child.type == "code_inline" else child.content
                 for child in token.children or []
             )
             lines = []
