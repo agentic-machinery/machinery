@@ -222,7 +222,8 @@ def test_fleet_status_live_lease_and_redaction(tmp_path: Path) -> None:
         assert s201["holder"] is not None
         assert s201["holder"]["agent"] == "[redacted]"  # path rejected
         assert s201["holder"]["harness"] == "valid-harness"
-        assert s201["holder"]["instance_id"] == "inst-001"
+        # Monitor's listing never publishes a holder's instance id (machinery-infra#1659).
+        assert s201["holder"]["instance_id"] == "[redacted]"
         assert s201["holder"]["host_id"] == "[redacted]"  # IP rejected
         assert s201["session_state"] == "open"
         assert s201["heartbeat_age_seconds"] is not None

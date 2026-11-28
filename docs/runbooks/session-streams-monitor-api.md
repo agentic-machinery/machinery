@@ -33,6 +33,10 @@ bootstrap attempt.
 | GET | `/api/session-streams/v1/digest/{stream_id}?limit=20` | Pinned + recent entries |
 | GET | `/api/session-streams/v1/plane-continuity` | Bundle board (streams + plane pointer) |
 
+Status and digest never serve a holder's lease identity: status omits `session_id`,
+`holder_instance_id` and `holder_process_id`, and every entry's `session_id` reads
+`[redacted]`, as in the epics lease projection (machinery-infra#1659).
+
 Message plane status remains `/api/comms/v1/plane-status`; query it rather than
 hard-coding a mode. The default and any authority change remain operator/advisor
 gated, and this observer does not perform either action.

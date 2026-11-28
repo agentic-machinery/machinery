@@ -16,6 +16,7 @@ import pytest
 from jsonschema import Draft202012Validator, FormatChecker
 from lu_machinery.session_canary import shared_hydration as hydration
 
+from tests.epics_monitor_stub import public_lease
 from tests.helpers.product_tree import configured_roots  # noqa: F401
 
 pytestmark = pytest.mark.usefixtures("configured_roots")
@@ -92,7 +93,15 @@ def test_unsafe_stream_evidence_resets_driver_identity(monkeypatch: pytest.Monke
         assert capsule[field] == {"status": "unavailable", "reason": "unsafe-stream-evidence"}
 
 
+def _published(response: dict[str, object]) -> dict[str, object]:
+    """``response`` as Monitor answers it: the fixture keeps the exact envelope, Monitor only its digest."""
+    published = deepcopy(response)
+    published["lease"] = public_lease(published.get("lease"))
+    return published
+
+
 def _remote_stream(monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:
+    """The launcher's environment lease and Monitor's stream answer, its lease still the full envelope."""
     values = {
         "SESSION_STREAM_ID": "epic:123",
         "SESSION_STREAM_SESSION_ID": "session-fixture",
@@ -150,7 +159,7 @@ def stream_fetch(monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest
             assert stream_id == "epic:123"
             assert deadline == 10.5
             clock[0] += request.param
-            return response
+            return _published(response)
 
         monkeypatch.setattr(hydration, "_fetch_remote_stream", fetch)
 
@@ -529,7 +538,7 @@ def test_retry_refuses_nontransient_failures_even_after_deadline(monkeypatch, fa
         clock[0] += 0.501
         if failure in {"http-status", "malformed-json"}:
             raise LookupError("timeout deadline-exceeded connection failure")
-        return response
+        return _published(response)
 
     def no_sleep(seconds):
         pytest.fail("permanent failures must not back off or retry")
