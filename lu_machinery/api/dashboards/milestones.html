@@ -968,13 +968,8 @@ let latestCompleteRepos = new Set();
 let latestMilestoneTimeKey = "";
 let initialMilestonesSettled = false;
 let initialPlanningSettled = false;
-// fragmentLocked stops data repaints from re-aligning once the page settles or the reader gives
-// input; readerScrolled records that the reader scrolled away, after which a header height change
-// no longer re-aligns the anchor (until the next hash change).
+// fragmentLocked stops data repaints from re-aligning once the page settles or the reader gives input.
 let fragmentLocked = false;
-let readerScrolled = false;
-let pointerPressed = false;
-let lastStickyOffset = null;
 let fragmentRafId = null;
 
 function currentHashId() {
@@ -984,8 +979,8 @@ function currentHashId() {
   try { return decodeURIComponent(raw); } catch { return raw; }
 }
 
-function alignFragmentNow(force = false) {
-  if (fragmentLocked && !force) return false;
+function alignFragmentNow() {
+  if (fragmentLocked) return false;
   if (typeof document !== "object" || !document || typeof document.getElementById !== "function") return false;
   const id = currentHashId();
   if (!id) {
@@ -994,7 +989,7 @@ function alignFragmentNow(force = false) {
   }
   const target = document.getElementById(id);
   if (!target || target.hidden) return false;
-  updateStickyOffset(true);
+  updateStickyOffset();
   if (typeof target.scrollIntoView === "function") {
     target.scrollIntoView({block: "start"});
   }
@@ -1136,7 +1131,7 @@ function expireSnapshotsIfStale(panel, latest, _updateChips, now = Date.now()) {
   if (shouldRepaint) repaintMilestones(now);
 }
 
-function updateStickyOffset(fromAlign = false) {
+function updateStickyOffset() {
   if (typeof document !== "object" || !document || typeof getComputedStyle !== "function") return;
   const header = document.querySelector("header");
   if (!header || typeof header.getBoundingClientRect !== "function") return;
@@ -1148,14 +1143,6 @@ function updateStickyOffset(fromAlign = false) {
   const sticky = getComputedStyle(header).position === "sticky";
   const offset = sticky ? Math.ceil(header.getBoundingClientRect().height) + 12 : 12;
   document.documentElement?.style?.setProperty("--sticky-offset", `${offset}px`);
-  const changed = lastStickyOffset !== null && offset !== lastStickyOffset;
-  lastStickyOffset = offset;
-  // A header height change (resize, sticky again) moves the anchor under it; keep the anchor in view
-  // unless the reader has moved away from it.
-  if (!fromAlign && changed && currentHashId() && !readerScrolled) {
-    if (fragmentLocked) alignFragmentNow(true);
-    else scheduleFragmentAlignment();
-  }
 }
 
 const PANELS = [{
@@ -1193,34 +1180,22 @@ const runner = createPanelRunner({
   renderChips: latest => renderMilestoneChips(latest, Date.now(), latestPlanningReading, latestMilestoneReading),
 });
 updateStickyOffset();
-// Browser callbacks pass entries or an Event; never let them reach the fromAlign flag.
-const onHeaderResize = () => updateStickyOffset();
 if (typeof ResizeObserver === "function" && typeof document === "object" && document) {
   const header = document.querySelector("header");
-  if (header) new ResizeObserver(onHeaderResize).observe(header);
+  if (header) new ResizeObserver(updateStickyOffset).observe(header);
 }
 if (typeof window === "object" && window && typeof window.addEventListener === "function") {
-  window.addEventListener("resize", onHeaderResize);
-  // Any input locks the fragment against data repaints. Only scrolling input marks the reader as
-  // scrolled away: a click or tap moves nothing, while a scrollbar or selection drag scrolls with a
-  // pointer pressed. Layout scrolls (anchoring, an end-of-page clamp) come with no input at all.
+  window.addEventListener("resize", updateStickyOffset);
   const lockFragment = () => { fragmentLocked = true; };
-  const markReaderScroll = () => { fragmentLocked = true; readerScrolled = true; };
-  window.addEventListener("wheel", markReaderScroll, {passive: true});
-  window.addEventListener("touchmove", markReaderScroll, {passive: true});
+  window.addEventListener("wheel", lockFragment, {passive: true});
   window.addEventListener("touchstart", lockFragment, {passive: true});
-  window.addEventListener("pointerdown", () => { pointerPressed = true; lockFragment(); }, {passive: true});
-  window.addEventListener("pointerup", () => { pointerPressed = false; }, {passive: true});
-  window.addEventListener("pointercancel", () => { pointerPressed = false; }, {passive: true});
-  window.addEventListener("scroll", () => { if (pointerPressed) markReaderScroll(); }, {passive: true});
   window.addEventListener("keydown", event => {
     if (["ArrowDown", "ArrowUp", "PageDown", "PageUp", "Home", "End", " "].includes(event.key)) {
-      markReaderScroll();
+      fragmentLocked = true;
     }
   });
   window.addEventListener("hashchange", () => {
     fragmentLocked = false;
-    readerScrolled = false;
     scheduleFragmentAlignment();
   });
 }
