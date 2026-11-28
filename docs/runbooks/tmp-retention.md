@@ -36,11 +36,11 @@ with up to 10 minutes of random delay. Missed runs catch up. It starts
    batch_state scratch expiry (see below).
 
 Every pass except the last is prefixed `-`, so a pass that exits with a
-failure is logged and the later passes still run; when every pass exits, the
-unit result reflects only the last pass. The `-` prefix covers only a pass's
-own exit status. If systemd stops the unit while a pass runs (for example
-when that pass exceeds its own `TimeoutStartSec=3600` timer, which records
-the result `timeout`), do not assume the later passes ran.
+failure is logged and the later passes still run. The `-` prefix covers only
+a pass's own exit status. If systemd stops the unit while a pass runs (for
+example when that pass exceeds its own `TimeoutStartSec=3600` timer, which
+records the result `timeout`), do not assume the later passes ran. Read each
+pass's own lines in the journal to see how it ended.
 
 The unit does not set `RestrictAddressFamilies=`. In a user manager every
 seccomp setting forces `NoNewPrivileges=yes`, and sudo then refuses to run.
