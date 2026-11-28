@@ -509,6 +509,14 @@ def _attempt_day(key: object) -> str:
     return match[1]
 
 
+def _utf8_text(value: object) -> bool:
+    """A non-empty string that encodes as UTF-8; a JSON string can hold a lone surrogate."""
+    try:
+        return isinstance(value, str) and bool(value.encode())
+    except UnicodeEncodeError:
+        return False
+
+
 def _load_publish_state(path: Path) -> dict[str, Any]:
     """The pending proposal, kept until Fleet returns its receipt and the ledger records it."""
     try:
@@ -519,8 +527,7 @@ def _load_publish_state(path: Path) -> dict[str, Any]:
         if attempt is not None and (
             not isinstance(attempt, dict) or set(attempt) != {"key", "sender", "body", "proposed"}
             or not _attempt_day(attempt["key"])
-            or not isinstance(attempt["sender"], str) or not attempt["sender"]
-            or not isinstance(attempt["body"], str) or not attempt["body"]
+            or not _utf8_text(attempt["sender"]) or not _utf8_text(attempt["body"])
             or not isinstance(attempt["proposed"], dict) or not attempt["proposed"]
             or not all(
                 _SIGNATURE.fullmatch(sig) and _ledger_row(row, proposed=False)
