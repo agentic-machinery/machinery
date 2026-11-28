@@ -254,7 +254,8 @@ def message_reader(fleet_panels, fleet_root):
 
         def seed(
             index, body, *, conversation="conversation", channel="first",
-            thread="thread", recipient="driver-sender", linked=True, digest=None, message_id=None,
+            thread="thread", recipient="driver-sender", sender="driver-sender",
+            linked=True, digest=None, message_id=None,
         ):
             artifact = store.store_bytes(body, producer="authority-message", retention_class="message-body")
             mid = message_id or f"message_{index:032x}"
@@ -268,8 +269,8 @@ def message_reader(fleet_panels, fleet_root):
                     """INSERT INTO comms_messages(
                         message_id, conversation_id, sender, kind, body_inline,
                         body_artifact_id, content_sha256, created_at
-                    ) VALUES (?, ?, 'driver-sender', 'message', 'inline-sentinel', ?, ?, ?)""",
-                    (mid, conversation, artifact.artifact_id, digest or artifact.sha256, created),
+                    ) VALUES (?, ?, ?, 'message', 'inline-sentinel', ?, ?, ?)""",
+                    (mid, conversation, sender, artifact.artifact_id, digest or artifact.sha256, created),
                 )
                 connection.execute(
                     """INSERT INTO authority_message_metadata(message_id, channel_id, thread_id, created_at)
@@ -318,7 +319,7 @@ def test_message_reader_refuses_cross_record_disclosure_and_pages_visible_member
         assert response.json() == {
             "read_only": True, "state": "ok", "limit": 1, "offset": offset,
             "next_offset": next_offset, "messages": [
-                {"message_id": path.rsplit("/", 1)[1], "kind": "message",
+                {"message_id": path.rsplit("/", 1)[1], "sender": "driver", "kind": "message",
                  "created_at": f"2026-11-26T11:00:0{offset + 1}Z"},
             ],
         }
@@ -340,6 +341,33 @@ def test_message_reader_refuses_cross_record_disclosure_and_pages_visible_member
     invalid_page = client.get(f"{anchor}/thread?limit=101")
     assert (invalid_page.status_code, invalid_page.json()["state"]) == (400, "invalid_page")
     assert invalid_page.headers["cache-control"] == "no-store"
+
+
+def test_thread_rows_carry_allowlisted_sender(message_reader):
+    """Defect class: thread rows lack sender or leak a label outside the deliveries allowlist."""
+    client, seed, _db = message_reader
+    anchor, _ = seed(1, b"From driver", sender="driver-sender")
+    seed(2, b"From session CTO", sender="claude-cto-session")
+    seed(3, b"From external", sender="eggbot")
+    seed(4, b"From unlisted", sender="secret-unlisted-sender-label")
+    seed(5, b"From oversized", sender="oversized-" + "x" * 300)
+
+    response = client.get(f"{anchor}/thread")
+    assert response.status_code == 200
+    assert response.headers["cache-control"] == "no-store"
+    rows = response.json()["messages"]
+    assert [row["sender"] for row in rows] == ["driver", "cto", "eggbot", "other", "other"]
+    assert "secret-unlisted-sender-label" not in response.text
+    assert "oversized-" not in response.text
+
+    # An address shared between two seats is ambiguous and collapses to "other", matching deliveries.
+    lane_data = json.loads(driver_lanes.DATA_FILE.read_text())
+    lane_data["lanes"][1]["sender"] = "claude-cto"
+    driver_lanes.DATA_FILE.write_text(json.dumps(lane_data))
+    shared_anchor, _ = seed(6, b"From shared", thread="shared", recipient="claude-cto", sender="claude-cto")
+    shared_response = client.get(f"{shared_anchor}/thread")
+    assert shared_response.status_code == 200
+    assert [row["sender"] for row in shared_response.json()["messages"]] == ["other"]
 
 
 @pytest.mark.parametrize(
