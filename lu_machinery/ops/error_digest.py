@@ -545,25 +545,31 @@ def _load_publish_state(path: Path) -> dict[str, Any]:
         state = json_depth.loads(path.read_text(), max_depth=5)
         if not isinstance(state, dict) or set(state) != {"attempt"}:
             raise ValueError
-        attempt = state["attempt"]
-        if attempt is not None:
-            if not isinstance(attempt, dict) or set(attempt) != {"day", "sender", "max_new", "kinds"}:
-                raise ValueError
-            day, kinds = attempt["day"], attempt["kinds"]
-            if (
-                not _date_text(day) or not date.min < date.fromisoformat(day) < datetime.now(UTC).date()
-                or not _valid_sender(attempt["sender"])
-                or type(attempt["max_new"]) is not int or attempt["max_new"] < 1
-                or not isinstance(kinds, list) or not kinds
-                or not all(_pending_kind(kind, day) for kind in kinds)
-                or len({kind["sig"] for kind in kinds}) != len(kinds)
-            ):
-                raise ValueError
+        if state["attempt"] is not None and not _valid_attempt(state["attempt"]):
+            raise ValueError
     except FileNotFoundError:
         return {"attempt": None}
     except (KeyError, TypeError, ValueError, RecursionError):
         raise DigestError("publish state: unavailable (invalid_state)") from None
     return state
+
+
+def _valid_attempt(attempt: object) -> bool:
+    """A pending attempt the loader accepts; the writer checks the same rules before persisting."""
+    try:
+        if not isinstance(attempt, dict) or set(attempt) != {"day", "sender", "max_new", "kinds"}:
+            return False
+        day, kinds = attempt["day"], attempt["kinds"]
+        return (
+            _date_text(day) and date.min < date.fromisoformat(day) < datetime.now(UTC).date()
+            and _valid_sender(attempt["sender"])
+            and type(attempt["max_new"]) is int and attempt["max_new"] >= 1
+            and isinstance(kinds, list) and bool(kinds)
+            and all(_pending_kind(kind, day) for kind in kinds)
+            and len({kind["sig"] for kind in kinds}) == len(kinds)
+        )
+    except (KeyError, TypeError, ValueError):
+        return False
 
 
 def _proposal_key(day: str, sender: str, body: str) -> str:
@@ -839,7 +845,8 @@ def _publish_proposal(body: str, sender: str, key: str, deadline: float) -> None
         else [sys.executable, "-I", "-m", "lu_machinery.fleet_comms"]
     )
     _send(
-        [*command, "channel", "publish", "cto", "-", "--sender", sender,
+        # One word per option value: a stored sender can start with "-".
+        [*command, "channel", "publish", "cto", "-", f"--sender={sender}",
          "--recipient", "claude-cto", "--kind", "proposal", "--idempotency-key", key],
         "Fleet publish", deadline, input=body.encode(),
     )
@@ -880,10 +887,19 @@ def _publish_run(day: date, directory: Path, sender: str, *, backfill: bool, max
             state=state, recovered_day=recovered_day, cli=cli, sender=sender, deadline=deadline,
         )
         if not failure and kinds and not any(row["proposal_day"] == day.isoformat() for row in ledger.values()):
-            _prepare_proposal(day, kinds, max_new)  # an egress refusal stores no attempt
-            state["attempt"] = {"day": day.isoformat(), "sender": sender, "max_new": max_new, "kinds": kinds}
-            _write_state(state_path, _json_bytes(state), replace=True)
-            failure = _deliver(state, state_path, ledger, ledger_path, deadline)
+            # A saved report kind can carry extra fields or text the loader refuses;
+            # store only the pending fields, and nothing the next run would reject.
+            attempt = {
+                "day": day.isoformat(), "sender": sender, "max_new": max_new,
+                "kinds": [{field: kind.get(field) for field in sorted(_PENDING_KIND_FIELDS)} for kind in kinds],
+            }
+            if not _valid_attempt(attempt):
+                failure = DigestError("publish state: refused (invalid_attempt)")
+            else:
+                _prepare_proposal(day, attempt["kinds"], max_new)  # an egress refusal stores no attempt
+                state["attempt"] = attempt
+                _write_state(state_path, _json_bytes(state), replace=True)
+                failure = _deliver(state, state_path, ledger, ledger_path, deadline)
         banner = "\n".join(filter(None, (ledger_error, _pending_note(state))))
         headline, journal_body = _journal_summary(report, count, banner)
         _post_journal(cli, day, headline, journal_body, sender, deadline)

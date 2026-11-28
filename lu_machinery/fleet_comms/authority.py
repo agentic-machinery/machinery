@@ -2356,9 +2356,9 @@ class AuthorityService:
         if existing_id is not None:
             existing = self.get_message(existing_id)
             # The earlier format did not bind the delivery mode. A queue-only message
-            # has no deliveries, a live one to explicit recipients has one each.
+            # has no deliveries, a live one has one per recipient, explicit or fan-out.
             if (not deliver and existing.delivery_ids) or (
-                live_delivery and not subscriber_fanout and len(existing.delivery_ids) != len(recipients_norm)
+                live_delivery and len(existing.delivery_ids) != len(recipients_norm)
             ):
                 raise AuthorityServiceError("idempotency_key_reused_with_different_payload")
             return existing

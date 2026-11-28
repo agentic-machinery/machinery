@@ -186,12 +186,11 @@ if args[:2] == ["journal", "add"]:
     if os.environ.get("DIGEST_FAKE_JOURNAL_FAIL"):
         sys.exit(1)
 else:
-    assert args[:12] == [
-        "channel", "publish", "cto", "-", "--sender", "devops",
+    assert args == [
+        "channel", "publish", "cto", "-", "--sender=devops",
         "--recipient", "claude-cto", "--kind", "proposal", "--idempotency-key", args[-1],
     ]
-    assert len(args) == 12
-    target, key, body = "fleet", args[11], sys.stdin.read()
+    target, key, body = "fleet", args[10], sys.stdin.read()
     if os.environ.get("DIGEST_FAKE_FLEET_FAIL") == "before_write":
         sys.exit(1)
 path = Path(os.environ["DIGEST_FIXTURE"], target + "-writes.json")
