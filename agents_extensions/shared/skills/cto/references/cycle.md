@@ -21,10 +21,10 @@ never fine.
    each Claude pool, Codex, Grok and Cursor, AGY and any other catalog pool. A pool with no
    metric gets a hand-read meter, and the gap is logged as a monitoring task. Grok and Cursor
    share one meter, never two pools of headroom. Keep readings in a scratch log for trends.
-   Count the series per pool (for example `count by (pool) (lu_cto_pool_left_percent)`) or use
-   the Monitor planning view (`lu_machinery/api/planning.py`), never a head-limited dump: the
-   scorecard file writes each pool's block in turn, so a truncated listing showed one pool and
-   was misread as only one pool being live.
+   Read which pools report by counting the series per pool (for example
+   `count by (pool) (lu_cto_pool_left_percent)`), never from a head-limited dump or a view
+   that lists only known pools: the scorecard file writes each pool's block in turn, so a
+   truncated listing showed one pool and was misread as only one pool being live.
    Read each pool's CodexBar pace line: used minus expected and whether it will last to reset.
    When the [pace rule](decisions.md#tactical-layer-per-cycle) shows a deficit, shift ready work
    to an eligible pool with reserve. Unknown pace is not scarcity.
