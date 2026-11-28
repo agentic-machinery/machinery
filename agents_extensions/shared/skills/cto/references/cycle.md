@@ -12,8 +12,8 @@ never fine.
    not a reason to keep measuring by hand.
 1. **Inbox.** Inspect the launcher slot and drain the three driver recipients
    ([startup](startup.md#4-identity-and-inbox)) at cycle start, after workers settle and
-   before handoff. Deliveries keep arriving between a drain and a dispatch, so claim and
-   dispatch in the same step, then read, apply and ack what you claimed. `claude-cto` is the durable CTO
+   before handoff. Claim and read each delivery, then dispatch, then apply and ack.
+   `claude-cto` is the durable CTO
    recipient: claim it with your session identity as `--worker-id`, and a worker escalation
    waits there at most one cycle. Any backlog still queued at a `claude-cto-<id>` name is a
    leftover to drain once, then report it as a producer defect.
