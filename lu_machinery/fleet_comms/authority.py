@@ -34,6 +34,7 @@ from lu_machinery.agent_runtime.target_admission import (
     stored_kimi_row,
 )
 from lu_machinery.common import json_depth
+from lu_machinery.common.github_client import loads_strict_json
 from lu_machinery.control_plane.storage import (
     Authority,
     ControlPlaneUnsupportedComponentError,
@@ -3281,18 +3282,22 @@ class AuthorityService:
             raise AuthorityStaleLeaseError("stale_delivery_lease")
 
     @staticmethod
-    def _decode_mapping(raw: Any, *, field: str) -> dict[str, Any]:
+    def _decode_mapping(raw: object, *, field: str) -> dict[str, Any]:
+        if not isinstance(raw, str):
+            raise AuthorityServiceError(f"{field}_corrupt")
         try:
-            decoded = json_depth.loads(str(raw or "{}"), max_depth=512)
-        except json.JSONDecodeError as exc:
+            decoded = loads_strict_json(raw, max_depth=512)
+        except (ValueError, RecursionError) as exc:
             raise AuthorityServiceError(f"{field}_corrupt") from exc
         if not isinstance(decoded, dict):
             raise AuthorityServiceError(f"{field}_corrupt")
         return decoded
 
-    def _decode_string_mapping(self, raw: Any) -> dict[str, str]:
+    def _decode_string_mapping(self, raw: object) -> dict[str, str]:
         decoded = self._decode_mapping(raw, field="context_revisions")
-        return {str(key): str(value) for key, value in decoded.items()}
+        if any(not isinstance(value, str) for value in decoded.values()):
+            raise AuthorityServiceError("context_revisions_corrupt")
+        return decoded
 
     @staticmethod
     def _context_revision_from_row(row: sqlite3.Row) -> ContextRevision:

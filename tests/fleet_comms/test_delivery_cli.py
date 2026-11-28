@@ -383,6 +383,75 @@ def read_body(capsys, delivery, *, worker="seat-1", token=None, expected=EXIT_OK
     return json.loads(output.out)
 
 
+@pytest.mark.parametrize(
+    ("raw", "context_only"),
+    [
+        pytest.param('{"entry":NaN}', False, id="nan"),
+        pytest.param('{"entry":Infinity}', False, id="infinity"),
+        pytest.param('{"entry":1e999}', False, id="numeric-overflow"),
+        pytest.param('{"entry":"first","entry":"last"}', False, id="duplicate-key"),
+        pytest.param('{"entry":42}', True, id="non-string-context-value"),
+    ],
+)
+def test_delivery_readers_reject_malformed_stored_metadata(plane, capsys, raw, context_only):
+    """Defect class: a malformed stored metadata value is silently accepted."""
+    provenance = {"entry": {"values": [None, False, 1.5]}}
+    revisions = {"entry": "revision-1"}
+    with AuthorityService(root=plane) as service:
+        channel = service.create_channel("metadata-test", metadata=provenance)
+        service.subscribe(channel.name, ("codex",), metadata=provenance)
+        message = service.publish_message(
+            sender="operator", body="private body sentinel", channel=channel.name,
+            provenance=provenance, context_revisions=revisions,
+        )
+        valid = service.get_message(message.message_id)
+        assert valid.provenance == provenance
+        assert valid.context_revisions == revisions
+        assert service.get_channel(channel.name).metadata == provenance
+        # This fixture alone simulates corruption after the immutable row was written.
+        with service._write_transaction():
+            service._conn.execute("DROP TRIGGER authority_message_metadata_immutable_update")
+    delivery = claim(capsys)
+    assert read_body(capsys, delivery)["body"] == "private body sentinel"
+
+    message_metadata = [("context_revisions", raw, json.dumps(provenance))]
+    if not context_only:
+        message_metadata.append(("provenance", json.dumps(revisions), raw))
+    for field, revision_json, provenance_json in message_metadata:
+        with AuthorityService(root=plane) as service:
+            with service._write_transaction():
+                service._conn.execute(
+                    """UPDATE authority_message_metadata
+                       SET context_revisions_json = ?, provenance_json = ? WHERE message_id = ?""",
+                    (revision_json, provenance_json, message.message_id),
+                )
+            error = f"{field}_corrupt"
+            with pytest.raises(AuthorityServiceError, match=rf"^{error}$"):
+                service.get_message(message.message_id)
+        expected = {"content_included": False, "error": error}
+        assert read_body(capsys, delivery, expected=EXIT_ERROR) == expected
+        assert invoke(
+            capsys, "receive", "--recipient", "codex", "--worker-id", "seat-1", expected=EXIT_ERROR,
+        ) == expected
+
+    if not context_only:
+        with AuthorityService(root=plane) as service:
+            with service._write_transaction():
+                service._conn.execute(
+                    "UPDATE authority_channel_subscribers SET metadata_json = ? WHERE channel_id = ? AND recipient = ?",
+                    (raw, channel.channel_id, "codex"),
+                )
+                service._conn.execute(
+                    "UPDATE authority_channels SET metadata_json = ? WHERE channel_id = ?", (raw, channel.channel_id),
+                )
+            with pytest.raises(AuthorityServiceError, match=r"^subscriber_metadata_corrupt$"):
+                service.subscribe(channel.name, ("codex",))
+            with pytest.raises(AuthorityServiceError, match=r"^channel_metadata_corrupt$"):
+                service.get_channel(channel.name)
+            with pytest.raises(AuthorityServiceError, match=r"^channel_metadata_corrupt$"):
+                service.create_channel(channel.name)
+
+
 def test_delivery_read_returns_body_only_to_the_current_lease_holder(plane, capsys):
     publish(plane)
     delivery = claim(capsys)
