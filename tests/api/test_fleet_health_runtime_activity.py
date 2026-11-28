@@ -360,7 +360,8 @@ def test_thread_rows_carry_allowlisted_sender(message_reader):
     assert "secret-unlisted-sender-label" not in response.text
     assert "oversized-" not in response.text
 
-    # An address shared between two seats is ambiguous and collapses to "other", matching deliveries.
+    # An address shared between two seats is ambiguous and collapses to "other", matching deliveries —
+    # including a shared session-CTO-prefixed address (never promoted to "cto").
     lane_data = json.loads(driver_lanes.DATA_FILE.read_text())
     lane_data["lanes"][1]["sender"] = "claude-cto"
     driver_lanes.DATA_FILE.write_text(json.dumps(lane_data))
@@ -368,6 +369,35 @@ def test_thread_rows_carry_allowlisted_sender(message_reader):
     shared_response = client.get(f"{shared_anchor}/thread")
     assert shared_response.status_code == 200
     assert [row["sender"] for row in shared_response.json()["messages"]] == ["other"]
+
+    lane_data["lanes"][0]["sender"] = "claude-cto-shared"
+    lane_data["lanes"][1]["sender"] = "claude-cto-shared"
+    driver_lanes.DATA_FILE.write_text(json.dumps(lane_data))
+    shared_session_anchor, _ = seed(
+        7, b"From shared session cto", thread="shared-session", recipient="claude-cto", sender="claude-cto-shared",
+    )
+    shared_session_thread = client.get(f"{shared_session_anchor}/thread")
+    assert shared_session_thread.status_code == 200
+    assert [row["sender"] for row in shared_session_thread.json()["messages"]] == ["other"]
+    shared_session_deliveries = client.get("/api/fleet/deliveries", params={"seat": "cto", "state": "queued"})
+    assert shared_session_deliveries.status_code == 200
+    by_id = {row["message_id"]: row for row in shared_session_deliveries.json()["deliveries"]}
+    assert by_id[shared_session_anchor.rsplit("/", 1)[-1]]["sender"] == "other"
+
+    # Sender reads use a fixed 256-byte SQL ceiling independent of roster lengths.
+    oversized_cto = "claude-cto-" + "z" * 300
+    lane_data["lanes"][1]["sender"] = oversized_cto
+    driver_lanes.DATA_FILE.write_text(json.dumps(lane_data))
+    oversized_anchor, _ = seed(
+        8, b"From oversized cto", thread="oversized-cto", recipient="claude-cto", sender=oversized_cto,
+    )
+    oversized_thread = client.get(f"{oversized_anchor}/thread")
+    assert oversized_thread.status_code == 200
+    assert [row["sender"] for row in oversized_thread.json()["messages"]] == ["other"]
+    oversized_deliveries = client.get("/api/fleet/deliveries", params={"seat": "cto", "state": "queued"})
+    assert oversized_deliveries.status_code == 200
+    by_id_oversized = {row["message_id"]: row for row in oversized_deliveries.json()["deliveries"]}
+    assert by_id_oversized[oversized_anchor.rsplit("/", 1)[-1]]["sender"] == "other"
 
 
 @pytest.mark.parametrize(

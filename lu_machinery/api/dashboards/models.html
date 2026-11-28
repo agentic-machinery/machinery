@@ -416,7 +416,42 @@ function bankedCell(banked) {
 const SUBSCRIPTION_HEADERS = ["Account", "Weekly resets", "Weekly left", "Pace", "5-hour", "Other windows",
   "Credits", "Banked resets", "Plan · renews or ends", "Sign-in", "Reading"];
 
-function subscriptionRows(subs, logins) {
+const budgetClock = {receivedAt: null, receivedMono: null, heldElapsed: 0, paintedKey: ""};
+
+function resetBudgetClock(reading = null) {
+  budgetClock.receivedAt = typeof reading?.receivedAt === "number" ? reading.receivedAt : null;
+  budgetClock.receivedMono = reading && Object.hasOwn(reading, "receivedMono") ? reading.receivedMono : null;
+  budgetClock.heldElapsed = 0;
+}
+
+function budgetElapsedS(now = Date.now()) {
+  if (budgetClock.receivedAt === null) return 0;
+  let elapsed = 0;
+  if (typeof budgetClock.receivedMono === "number") {
+    if (!Number.isFinite(budgetClock.receivedMono)) return Number.NaN;
+    const monoNow = Machinery.snapshotClockStamp();
+    if (typeof monoNow !== "number" || !Number.isFinite(monoNow)) return Number.NaN;
+    elapsed = Math.max(0, (monoNow - budgetClock.receivedMono) / 1000);
+  } else {
+    if (typeof now !== "number" || !Number.isFinite(now)) return Number.NaN;
+    elapsed = Math.max(0, (now - budgetClock.receivedAt) / 1000);
+  }
+  budgetClock.heldElapsed = Math.max(budgetClock.heldElapsed, elapsed);
+  return budgetClock.heldElapsed;
+}
+
+function agedSeconds(ageS, elapsedS = 0) {
+  if (typeof ageS !== "number" || !Number.isFinite(ageS) || ageS < 0) return ageS;
+  if (typeof elapsedS !== "number" || !Number.isFinite(elapsedS)) return Number.NaN;
+  return ageS + Math.max(0, elapsedS);
+}
+
+function agedReading(reading, elapsedS = 0) {
+  if (!reading || typeof reading !== "object" || elapsedS === 0) return reading;
+  return {...reading, age_s: agedSeconds(reading.age_s, elapsedS)};
+}
+
+function subscriptionRows(subs, logins, elapsedS = 0) {
   const staleAfter = subs.stale_after_s;
   const hidden = [];
   const groups = (Array.isArray(subs.providers) ? subs.providers : []).map(provider => {
@@ -427,7 +462,8 @@ function subscriptionRows(subs, logins) {
     if (!accounts.length) return "";
     return `<tr class="group"><th scope="colgroup" colspan="${SUBSCRIPTION_HEADERS.length}">${escapeHtml(provider.label || provider.provider)}</th></tr>`
       + accounts.map(row => {
-        const usage = readingState(row.reading?.status, row.reading?.age_s, staleAfter) === "fresh" ? row : {};
+        const reading = agedReading(row.reading, elapsedS);
+        const usage = readingState(reading?.status, reading?.age_s, staleAfter) === "fresh" ? row : {};
         const weekly = usage.weekly || {};
         return `<tr>${labelled([
           text(row.account),
@@ -440,7 +476,7 @@ function subscriptionRows(subs, logins) {
           bankedCell(row.banked_resets?.source === "provider" ? usage.banked_resets : row.banked_resets),
           planCell(row.plan),
           signInCell(row.account, logins),
-          readingCell(row.reading, staleAfter),
+          readingCell(reading, staleAfter),
         ], SUBSCRIPTION_HEADERS)}</tr>`;
       }).join("");
   }).join("");
@@ -459,10 +495,11 @@ function probeReason(state) {
   return String(state).replaceAll("_", " ").toLowerCase();
 }
 
-function apiRows(budget) {
+function apiRows(budget, elapsedS = 0) {
   const accounts = budget.api_accounts || {};
   return Object.entries(accounts).map(([name, row]) => {
-    const state = readingState(row.freshness, row.age_s, budget.diagnostics?.stale_threshold_s);
+    const effectiveAge = agedSeconds(row.age_s, elapsedS);
+    const state = readingState(row.freshness, effectiveAge, budget.diagnostics?.stale_threshold_s);
     const balance = typeof row.total_balance === "number" ? `${row.total_balance.toFixed(2)} ${row.currency || ""}`.trim() + " balance"
       : typeof row.limit_remaining_usd === "number" ? `$${row.limit_remaining_usd.toFixed(2)} left` : null;
     const spent = typeof row.usage_weekly_usd === "number" ? `$${row.usage_weekly_usd.toFixed(2)} this week` : null;
@@ -474,19 +511,19 @@ function apiRows(budget) {
       values = [...figures, probe].filter(Boolean).join("; ") || null;
       valueClass = "";
     } else if (state === "last_good") {
-      const marked = figures.length ? `${figures.join("; ")} (last good)` : null;
-      values = [marked, probe].filter(Boolean).join("; ") || "unknown";
+      values = probe ? `unknown; ${probe}` : "unknown";
       valueClass = "warn";
     }
     return [text(name), text(values, valueClass),
-      freshnessCell(state, row.age_s),
+      freshnessCell(state, effectiveAge),
       text(row.health?.healthy === false ? "unhealthy" : null, "bad")];
   });
 }
 
-function cursorUsage(budget) {
+function cursorUsage(budget, elapsedS = 0) {
   const cursor = budget?.agents?.cursor;
-  const freshness = readingState(cursor?.freshness, cursor?.age_s, budget?.diagnostics?.stale_threshold_s);
+  const effectiveAge = agedSeconds(cursor?.age_s, elapsedS);
+  const freshness = readingState(cursor?.freshness, effectiveAge, budget?.diagnostics?.stale_threshold_s);
   const needsLogin = cursor?.probe_state === "NEED_LOGIN" || cursor?.login_state === "NEED_LOGIN";
   const reason = !budget ? "routing budget did not answer"
     : needsLogin ? "sign-in required"
@@ -504,11 +541,11 @@ function cursorUsage(budget) {
   return mTable(["Cursor window", "Remaining"], rows, true);
 }
 
-function renderUsage(subs, budget, logins) {
-  const api = budget ? mTable(["API account", "Balance / spend", "Reading", ""], apiRows(budget), true)
+function renderUsage(subs, budget, logins, elapsedS = 0) {
+  const api = budget ? mTable(["API account", "Balance / spend", "Reading", ""], apiRows(budget, elapsedS), true)
     : unknown("API account balances: the routing budget did not answer");
-  if (!subs) return unknown("subscription account snapshot unavailable") + cursorUsage(budget) + api;
-  const {groups, hidden} = subscriptionRows(subs, logins);
+  if (!subs) return unknown("subscription account snapshot unavailable") + cursorUsage(budget, elapsedS) + api;
+  const {groups, hidden} = subscriptionRows(subs, logins, elapsedS);
   const facts = subs.sources?.plan_facts;
   const notes = [];
   if (facts?.reason_code) {
@@ -526,8 +563,29 @@ function renderUsage(subs, budget, logins) {
     : '<p class="muted">None.</p>';
   const models = subs.catalog_models;
   const catalog = Array.isArray(models) ? escapeHtml(models.join(", ") || "No current models.") : "Catalog unavailable.";
-  return subsTable + cursorUsage(budget) + notes.map(note => `<p class="muted">${escapeHtml(note)}</p>`).join("") + api
+  return subsTable + cursorUsage(budget, elapsedS) + notes.map(note => `<p class="muted">${escapeHtml(note)}</p>`).join("") + api
     + `<p class="muted"><strong>Current catalog models.</strong> ${catalog}</p>`;
+}
+
+function budgetFreshnessKey(budget, elapsedS = 0) {
+  if (!budget || typeof budget !== "object") return "none";
+  const parts = [];
+  const subs = budget.subscriptions;
+  const staleAfter = subs?.stale_after_s;
+  for (const provider of Array.isArray(subs?.providers) ? subs.providers : []) {
+    for (const row of Array.isArray(provider.accounts) ? provider.accounts : []) {
+      if (row.plan?.ended) continue;
+      parts.push(`s:${row.account}:${readingState(row.reading?.status, agedSeconds(row.reading?.age_s, elapsedS), staleAfter)}`);
+    }
+  }
+  const threshold = budget.diagnostics?.stale_threshold_s;
+  for (const [name, row] of Object.entries(budget.api_accounts || {})) {
+    parts.push(`a:${name}:${readingState(row?.freshness, agedSeconds(row?.age_s, elapsedS), threshold)}`);
+  }
+  for (const [name, info] of Object.entries(budget.agents || {})) {
+    parts.push(`p:${name}:${readingState(info?.freshness, agedSeconds(info?.age_s, elapsedS), threshold)}`);
+  }
+  return parts.join("|");
 }
 
 function renderCapacityForecast(data) {
@@ -755,11 +813,12 @@ function tickRouting(_panel, _latest, updateChips) {
   paintRoutingAges();
 }
 
-function renderChips(latest) {
+function renderChips(latest, now = Date.now()) {
   const out = [];
   const budget = latest.usage;
   const subs = budget?.subscriptions;
   const logins = latest.logins;
+  const elapsed = budgetElapsedS(now);
   if (subs) {
     const staleAfter = subs.stale_after_s;
     for (const provider of Array.isArray(subs.providers) ? subs.providers : []) {
@@ -767,7 +826,7 @@ function renderChips(latest) {
       if (!accounts.length) continue;
       let minLeft = null, runsOut = 0, deficit = 0, unknownCount = 0;
       for (const row of accounts) {
-        const st = readingState(row.reading?.status, row.reading?.age_s, staleAfter);
+        const st = readingState(row.reading?.status, agedSeconds(row.reading?.age_s, elapsed), staleAfter);
         const fresh = st === "fresh";
         const pace = fresh ? row.pace : null;
         const left = fresh && row.weekly?.status === "ok" && validPct(row.weekly.left_pct) ? row.weekly.left_pct : null;
@@ -788,16 +847,29 @@ function renderChips(latest) {
   }
   if (budget) {
     const threshold = budget.diagnostics?.stale_threshold_s;
-    const agents = budget.agents || {};
-    let nearCap = 0;
-    for (const info of Object.values(agents)) {
+    const agents = budget.agents && typeof budget.agents === "object" ? Object.values(budget.agents) : [];
+    let verified = 0, nearCap = 0, unknownPools = 0;
+    for (const info of agents) {
       if (!info || typeof info !== "object") continue;
-      const st = readingState(info.freshness, info.age_s, threshold);
-      if (st === "fresh" && !info.stale && info.status === "near_cap") nearCap += 1;
+      const st = readingState(info.freshness, agedSeconds(info.age_s, elapsed), threshold);
+      if (st === "fresh" && !info.stale && typeof info.status === "string" && info.status && info.status !== "unknown") {
+        verified += 1;
+        if (info.status === "near_cap") nearCap += 1;
+      } else {
+        unknownPools += 1;
+      }
     }
-    out.push(chip("#budget", nearCap, nearCap === 1 ? "pool near cap" : "pools near cap", nearCap ? "warn" : ""));
+    if (verified === 0) {
+      out.push(chip("#budget", "?", "pools near cap unknown", "warn"));
+    } else if (unknownPools > 0) {
+      out.push(chip("#budget", nearCap, `${nearCap === 1 ? "pool" : "pools"} near cap (${unknownPools} unknown)`, "warn"));
+    } else {
+      out.push(chip("#budget", nearCap, nearCap === 1 ? "pool near cap" : "pools near cap", nearCap ? "warn" : ""));
+    }
   }
-  if (logins && logins.state !== "pending") {
+  if (logins === null) {
+    out.push(chip("#budget", "?", "sign-in unknown", "warn"));
+  } else if (logins && logins.state !== "pending") {
     const accounts = Array.isArray(logins.accounts) ? logins.accounts : [];
     const signedOut = accounts.filter(row => row.logged_in === false).length;
     const otherIssues = accounts.filter(row => {
@@ -822,15 +894,37 @@ function renderChips(latest) {
   return out.join("");
 }
 
+function tickBudget(panel, latest, updateChips, now = Date.now()) {
+  if (!panel.ok || !latest.usage) return;
+  const elapsed = budgetElapsedS(now);
+  const nextKey = budgetFreshnessKey(latest.usage, elapsed);
+  if (nextKey === budgetClock.paintedKey) return;
+  budgetClock.paintedKey = nextKey;
+  const box = document.getElementById("usage-content");
+  if (box) box.innerHTML = renderUsage(latest.usage?.subscriptions, latest.usage, latest.logins, elapsed);
+  if (typeof updateChips === "function") updateChips();
+}
+
 const PANELS = [
   {
     id: "usage",
     label: "Budget now",
     urls: ["/api/state/routing-budget?include_subscriptions=true", "/api/runtime/logins"],
     sourceLabels: ["Routing budget", "Sign-in"],
-    render: (budget, logins) => renderUsage(budget?.subscriptions, budget, logins),
+    withReadings: true,
+    render: (budget, logins, readings, renderNow) => {
+      resetBudgetClock(readings?.[0] || null);
+      const elapsed = budgetElapsedS(renderNow);
+      budgetClock.paintedKey = budgetFreshnessKey(budget, elapsed);
+      return renderUsage(budget?.subscriptions, budget, logins, elapsed);
+    },
     onData: (data, latest) => { latest.logins = data[1]; },
-    onError: latest => { latest.logins = null; },
+    onError: latest => {
+      latest.logins = null;
+      resetBudgetClock(null);
+      budgetClock.paintedKey = "";
+    },
+    onTick: tickBudget,
     retry: (budget, logins) => !budget.subscriptions || !logins || logins.state === "pending",
   },
   {

@@ -632,18 +632,50 @@ assert.match(M.prChips(unknownTotalPrs).join(''), /<b>1<\/b> open PRs observed Â
     const firstId = 'message_00000000000000000000000000000001';
     const secondId = 'message_00000000000000000000000000000002';
     let headingFocused = 0;
+    const focusedTargets = [];
+    const listButtons = [];
+    let nextRowIds = [firstId, secondId];
+    const filterSeatEl = document.getElementById('filter-seat');
+    filterSeatEl.focus = () => { document.activeElement = filterSeatEl; focusedTargets.push('filter-seat'); };
+    const messagesContentEl = document.getElementById('messages-content');
+    const setListRows = ids => {
+      listButtons.length = 0;
+      for (const id of ids) {
+        const btn = {
+          dataset: {openMessage: id},
+          focus() { document.activeElement = btn; focusedTargets.push(`row:${id}`); },
+          setAttribute() {}, removeAttribute() {},
+        };
+        listButtons.push(btn);
+      }
+    };
+    let messagesHtml = '';
+    Object.defineProperty(messagesContentEl, 'innerHTML', {
+      get() { return messagesHtml; },
+      set(val) {
+        messagesHtml = val;
+        setListRows(nextRowIds);
+        if (document.activeElement && !listButtons.includes(document.activeElement)) {
+          document.activeElement = null;
+        }
+      },
+    });
+    messagesContentEl.contains = node => listButtons.includes(node);
+    messagesContentEl.querySelectorAll = selector => selector === 'button[data-open-message]' ? [...listButtons] : [];
+    setListRows([firstId, secondId]);
     document.createElement = tag => ({
       tag, children: [], dataset: {}, style: {}, textContent: '', attrs: {},
       set innerHTML(_) { assert.fail('Message reader inserted HTML'); },
       setAttribute(k, v) { this.attrs[k] = v; },
       appendChild(child) { this.children.push(child); },
       addEventListener(type, listener) { this[type] = listener; },
+      focus() { document.activeElement = this; focusedTargets.push(`el:${this.dataset.threadMessage || this.textContent || tag}`); },
     });
     for (const id of ['message-body', 'message-thread']) {
       document.getElementById(id).replaceChildren = function (...nodes) { this.children = nodes; };
     }
     document.getElementById('comms-layout').classList = {add() {}, remove() {}};
-    document.getElementById('message-reader-heading').focus = () => { headingFocused += 1; };
+    document.getElementById('message-reader-heading').focus = () => { headingFocused += 1; focusedTargets.push('reader-heading'); };
     document.getElementById('message-reader').focus = () => {};
     document.addEventListener = (type, handler) => listeners.set(type, [...(listeners.get(type) || []), handler]);
     const fetchPanel = globalThis.fetch;
@@ -662,8 +694,25 @@ assert.match(M.prChips(unknownTotalPrs).join(''), /<b>1<\/b> open PRs observed Â
       await new Promise(resolve => setImmediate(resolve));
       assert.equal(pending.size, 0);
       assert.ok(requests.some(url => url.startsWith('/api/fleet/deliveries')));
+      // F6: 30s poll preserves focus on the currently focused message button, or falls back stably if removed.
+      listButtons[1].focus();
+      focusedTargets.length = 0;
       await timers[0]();
       assert.equal(pending.size, 0);
+      assert.deepEqual(focusedTargets, [`row:${secondId}`], 'F6: poll preserves focused message row');
+      listButtons[1].focus();
+      nextRowIds = [firstId];
+      focusedTargets.length = 0;
+      await timers[0]();
+      assert.deepEqual(focusedTargets, [`row:${firstId}`], 'F6: poll falls back to first row when focused row disappears');
+      listButtons[0].focus();
+      nextRowIds = [];
+      focusedTargets.length = 0;
+      await timers[0]();
+      assert.deepEqual(focusedTargets, ['filter-seat'], 'F6: poll falls back to #filter-seat when list becomes empty');
+      nextRowIds = [firstId, secondId];
+      setListRows([firstId, secondId]);
+      focusedTargets.length = 0;
       const select = id => listeners.get('click').forEach(listener => listener({
         target: {closest: selector => selector === 'button[data-open-message]' ? {dataset: {openMessage: id}} : null},
       }));
@@ -703,18 +752,25 @@ assert.match(M.prChips(unknownTotalPrs).join(''), /<b>1<\/b> open PRs observed Â
       const [members, next] = document.getElementById('message-thread').children;
       assert.match(members.children[0].children[0].textContent, /11:00 request, cto/);
       assert.match(members.children[1].children[0].textContent, /11:05 message, driver \(this\)/);
+      focusedTargets.length = 0;
       members.children[0].children[0].click();
       assert.deepEqual([...pending.keys()], [bodyUrl(firstId)], 'A thread member loads only its own body');
+      assert.deepEqual(focusedTargets, [`el:${firstId}`], 'F6: clicking a thread member preserves focus on its rebuilt button');
+      focusedTargets.length = 0;
       next.click();
       const nextPage = `/api/fleet/messages/${secondId}/thread?offset=50`;
       assert.deepEqual([...pending.keys()], [bodyUrl(firstId), nextPage]);
       resolve(bodyUrl(firstId), {state: 'ok', message_id: firstId, body: 'first body'});
-      resolve(nextPage, {messages: [], limit: 50, next_offset: null});
+      resolve(nextPage, {messages: [{message_id: firstId, sender: 'cto', kind: 'request', created_at: '2026-11-26T11:00:01Z'}], limit: 50, next_offset: null});
       await new Promise(resolve => setImmediate(resolve));
       assert.equal(document.getElementById('message-body').children[0].textContent, 'first body');
-      // Escape closes the reader.
+      assert.deepEqual(focusedTargets, [`el:${firstId}`], 'F6: paging the thread moves focus to the first rebuilt thread button');
+      // Escape closes the reader and falls back cleanly if the previously opened row is no longer in the list.
+      setListRows([firstId]);
+      focusedTargets.length = 0;
       listeners.get('keydown').forEach(listener => listener({key: 'Escape'}));
       assert.equal(document.getElementById('message-reader').hidden, true);
+      assert.deepEqual(focusedTargets, [`row:${firstId}`], 'F6: closing the reader falls back cleanly when original row disappeared');
     } finally {
       globalThis.setInterval = originalInterval;
       globalThis.fetch = fetchPanel;
@@ -1125,6 +1181,36 @@ globalThis.fetch = async (url) => {
   await timers[0]();
   assert.equal(requested.some(u => u.includes('/api/fleet/messages/')), false, `body/thread fetched on poll: ${requested}`);
   assert.equal(requested.some(u => u.includes('/transcript')), false, `transcript fetched on poll: ${requested}`);
+
+  // F1: Loading /comms?msg=<id> (including after an initial deliveries failure and poll recovery)
+  // never fetches /body or /thread on load or poll; it only highlights the matching row until clicked.
+  requested.length = 0;
+  timers.length = 0;
+  globalThis.location.search = '?msg=message_0000000000000000000000000000000a';
+  let failFirstDeliveries = true;
+  const baseFetch = globalThis.fetch;
+  globalThis.fetch = async (url) => {
+    const s = String(url);
+    if (s.startsWith('/api/fleet/deliveries') && failFirstDeliveries) {
+      failFirstDeliveries = false;
+      requested.push(s);
+      return {ok: false, status: 503, headers: {get: () => null}, text: async () => '{}'};
+    }
+    return baseFetch(url);
+  };
+  document._commsControlsBound = false;
+  new Function('Machinery', body + '\nrunner.start();')(M);
+  await new Promise(resolve => setImmediate(resolve));
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(requested.some(u => u.includes('/api/fleet/messages/')), false, `deep link fetched body/thread on failed load: ${requested}`);
+  await timers[0]();
+  await timers[0]();
+  assert.equal(requested.some(u => u.includes('/api/fleet/messages/')), false, `deep link fetched body/thread on poll recovery: ${requested}`);
+  assert.equal(requested.some(u => u.includes('/transcript')), false, `deep link fetched transcript on poll recovery: ${requested}`);
+  const linkedHtml = getEl('messages-content').innerHTML;
+  assert.match(linkedHtml, /class="message-row is-linked"[^>]*data-open-message="message_0000000000000000000000000000000a"/);
+  assert.doesNotMatch(linkedHtml, /aria-current="true"/);
+  assert.equal(getEl('message-reader').hidden, true);
 })().catch(err => { console.error(err); process.exitCode = 1; });
 """
     ran = subprocess.run(
