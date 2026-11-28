@@ -241,7 +241,8 @@ commands one per call (`git rev-parse HEAD`, `git diff {base}..HEAD`, `git log`,
 ## 4. Reply format
 Reply with one JSON object and nothing else, matching `{FINDINGS_SCHEMA}` in the machinery
 repository (field names, required fields and allowed values as that file defines them).
-`overall.correctness` is `correct` to approve and `incorrect` to request changes. Each finding
+`overall.correctness` is `correct` to approve and `incorrect` to request changes, and
+`overall.review_complete` is JSON `true` once the review is finished (an approval without it is refused). Each finding
 carries an id (F1, F2, ...), a priority P0-P3, and a repository-relative location with line.
 """
 

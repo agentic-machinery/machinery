@@ -264,6 +264,7 @@ def _parse_review_loop_envelope(text: str) -> dict[str, Any]:
         _REVIEW_VERDICT_LINE_RE,
         _closes_code_fence,
         _commonmark_lines,
+        _top_level_json_values,
         _without_code_fences,
         load_findings_json,
     )
@@ -284,7 +285,8 @@ def _parse_review_loop_envelope(text: str) -> dict[str, Any]:
         ) != 1:
             raise ContractError(f"review_envelope_duplicate_{label.lower()}")
     blocks = [token for token in MarkdownIt("commonmark").parse(text) if token.type == "fence"]
-    if len(blocks) != 1:
+    # Any other top-level JSON value is a second candidate the verdict readers would also read.
+    if len(blocks) != 1 or len(list(_top_level_json_values(text))) != 1:
         raise ContractError("review_envelope_requires_one_json_block")
     block = blocks[0]
     if (
@@ -449,7 +451,7 @@ def decision_lock(raw: str) -> dict[str, Any]:
     Not an approval path. ``ambiguous`` is true when the reply carries more
     than one verdict or more than one findings object. ``payload`` is set
     only when exactly one findings object is readable, even if it does not
-    yet validate.
+    yet validate. ``attested`` is ``_locked_attestation``.
     """
     from lu_machinery.review.verdict_parser import (
         MISSING_CAPABILITIES_FIELD,
@@ -458,6 +460,7 @@ def decision_lock(raw: str) -> dict[str, Any]:
     )
 
     try:
+        attested = _locked_attestation(raw)
         objects = _json_objects(_outside_blockquotes(raw))
         incomplete = (
             declares_incomplete_review("", findings_payloads=objects)
@@ -466,7 +469,7 @@ def decision_lock(raw: str) -> dict[str, Any]:
         )
         verdicts = list(dict.fromkeys(recognized_verdicts(raw)))
     except (ValueError, RecursionError):
-        return {"ambiguous": True, "verdicts": [], "payload": None}
+        return {"ambiguous": True, "verdicts": [], "payload": None, "attested": False}
     candidates: list[dict[str, Any]] = []
     seen: set[str] = set()
     for payload in objects:
@@ -480,7 +483,42 @@ def decision_lock(raw: str) -> dict[str, Any]:
         "ambiguous": incomplete or len(candidates) > 1 or len(verdicts) > 1,
         "verdicts": verdicts,
         "payload": candidates[0] if len(candidates) == 1 else None,
+        "attested": attested,
     }
+
+
+def _locked_attestation(raw: str) -> bool:
+    """Whether the reply itself attests completion, read as the verdict readers read its findings object.
+
+    True only when the reply has exactly one top-level ``code-review-findings.v1`` object, it carries JSON
+    ``true`` at ``overall.review_complete``, the key appears nowhere else in the raw text and not inside code,
+    and the reply holds no raw HTML (which can show any text as code or hide it). Any other copy (code, a
+    quotation, HTML, a comment, an escape) makes the attestation ambiguous, so it is not locked.
+    """
+    from markdown_it import MarkdownIt
+
+    from lu_machinery.review.verdict_parser import _FINDINGS_ENVELOPE_KEYS, _top_level_json_values
+
+    candidates = [
+        value for value in _top_level_json_values(raw)
+        if isinstance(value, dict) and _FINDINGS_ENVELOPE_KEYS & value.keys()
+    ]
+    if not (
+        len(candidates) == 1
+        and candidates[0].get("schema_version") == SCHEMA_VERSION
+        and attests_completion(candidates[0])
+        and raw.count("review_complete") == 1
+    ):
+        return False
+    for token in MarkdownIt("commonmark").parse(raw):
+        for item in (token, *(token.children or ())):
+            if item.type in {"html_inline", "html_block"}:
+                return False
+            shown_as_code = item.type in {"code_inline", "code_block"} or (
+                item.type == "fence" and item.info.strip() not in {"", "json"})
+            if shown_as_code and "review_complete" in item.content:
+                return False
+    return True
 
 
 def same_decision(lock: Mapping[str, Any], payload: Mapping[str, Any]) -> bool:
@@ -490,8 +528,8 @@ def same_decision(lock: Mapping[str, Any], payload: Mapping[str, Any]) -> bool:
     stated = False
     prior = lock.get("payload")
     # The completion attestation is the reviewer's, never the correction's: a reply that did not attest
-    # (no object, a missing, false or non-boolean value) cannot gain it, and one that attested keeps it.
-    if attests_completion(payload) != (isinstance(prior, Mapping) and attests_completion(prior)):
+    # (``_locked_attestation``) cannot gain it, and one that attested keeps it.
+    if attests_completion(payload) != (lock.get("attested") is True):
         return False
     if isinstance(prior, Mapping):
         prior_overall = prior.get("overall")

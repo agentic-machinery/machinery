@@ -3868,25 +3868,45 @@ def test_approve_requires_literal_true_review_complete(monkeypatch, tmp_path, va
     assert calls == {"posts": 0, "statuses": 0}
 
 
-@pytest.mark.parametrize("prior", ["prose", "missing", "false", "true"])
+_SNIPPET = '{"overall": {"review_complete": true}}'
+
+
+@pytest.mark.parametrize("prior", [
+    "prose", "missing", "false", "true", "prose-then-true", "inline-code", "python-fence", "unversioned-json-fence",
+    "indented", "html-code", "html-comment", "quoted-v1", "multiline-code-v1", "html-wrapped-v1", "false-plus-example",
+])
 def test_format_correction_never_sets_review_complete(prior):
     """Defect class: format-only retry upgrades completion.
 
     The correction lock keeps the original attestation: a reply that did not attest JSON ``true`` (a prose
-    approval, a missing or false value) never gains it, and one that did keeps it.
+    approval, a missing or false value, an attestation only quoted, shown as code or HTML, unversioned, or
+    beside another copy) never gains it, and one whose one top-level findings object did keeps it.
     """
     from lu_machinery.review.review_contract import canonical_receipt_payload, decision_lock, same_decision
 
     attested = _completion(attested_payload(attestation=None), True)
+    v1 = json.dumps(attested)
+    prose = "VERDICT: APPROVE\n\n"
     raw = {
-        "prose": "VERDICT: APPROVE\n\nAll checks pass.",
+        "prose": prose + "All checks pass.",
         "missing": json.dumps(_completion(attested_payload(attestation=None), ...)),
         "false": json.dumps(_completion(attested_payload(attestation=None), False)),
-        "true": json.dumps(attested),
+        "true": v1,
+        "prose-then-true": "The change is sound.\n" + v1,
+        "inline-code": prose + f"Verified that `{_SNIPPET}` is handled.",
+        "python-fence": prose + f"```python\npayload = {_SNIPPET}\n```",
+        "unversioned-json-fence": prose + f"```json\n{_SNIPPET}\n```",
+        "indented": prose + f"    {_SNIPPET}",
+        "html-code": prose + f"<code>{_SNIPPET}</code>",
+        "html-comment": prose + f"<!-- {_SNIPPET} -->",
+        "quoted-v1": prose + f"> {v1}",
+        "multiline-code-v1": "Verified.\n``\n" + v1 + "\n``",
+        "html-wrapped-v1": "Verified.\n<code>\n" + v1 + "\n</code>",
+        "false-plus-example": json.dumps(_completion(attested_payload(attestation=None), False)) + f"\n\nSee `{_SNIPPET}`.",
     }[prior]
     lock = decision_lock(raw)
-    assert not lock["ambiguous"]
-    assert same_decision(lock, attested) is (prior == "true")
-    if prior == "true":
+    keeps = prior in {"true", "prose-then-true"}
+    assert same_decision(lock, attested) is keeps
+    if keeps:
         assert same_decision(lock, _completion(attested_payload(attestation=None), ...)) is False
-        assert canonical_receipt_payload(json.dumps(attested)) == attested
+        assert canonical_receipt_payload(v1) == attested

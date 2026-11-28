@@ -61,9 +61,18 @@ _FENCE = "```json\n" + _GOOD + "\n```"
     (_FENCE + "\n\n" + _FENCE, "non_json_or_chatter"),
     ("```json\n" + _GOOD + "\n", "non_json_or_chatter"),
     ("VERDICT: REQUEST_CHANGES\nSCORE: 9/10\n\n" + _FENCE + "\n", "review_envelope_verdict_mismatch"),
+    ("VERDICT: APPROVE\nSCORE: 9/10\n\n" + _FENCE + "\n\n" + json.dumps(_approval(review_complete=False)),
+     "review_envelope_requires_one_json_block"),
+    ("VERDICT: APPROVE\nSCORE: 9/10\n\n" + json.dumps(_approval(correctness="incorrect")) + "\n\n" + _FENCE,
+     "review_envelope_requires_one_json_block"),
+    ("VERDICT: APPROVE\nSCORE: 9/10\n\n" + _FENCE + '\n\n{"missing_capabilities": ["shell"]}',
+     "review_envelope_requires_one_json_block"),
+    ("VERDICT: APPROVE\nSCORE: 9/10\n\n" + _FENCE + "\n\n" + _GOOD[:-1] + ', "findings": []}',
+     "review_envelope_unreadable"),
 ], ids=["prose-only", "prose-then-object", "duplicate-key-nested", "duplicate-key-root", "no-schema-version",
         "unsupported-schema-version", "nested-attestation", "quoted-attestation", "two-objects", "two-fences",
-        "unclosed-fence", "envelope-verdict-mismatch"])
+        "unclosed-fence", "envelope-verdict-mismatch", "envelope-unfenced-false", "envelope-unfenced-incorrect",
+        "envelope-unfenced-capabilities", "envelope-unfenced-duplicate-key"])
 def test_strict_parser_refuses_untyped_or_ambiguous_approval(raw, reason):
     """Defect class: lossy or permissive decode admits an approval.
 
