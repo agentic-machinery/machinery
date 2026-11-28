@@ -37,6 +37,9 @@ with up to 10 minutes of random delay. Missed runs catch up. It starts
 
 Every pass except the last is prefixed `-`, so a failing pass is logged and
 the later passes still run; the unit result reflects only the last pass.
+This covers a pass that exits. `TimeoutStartSec=3600` covers all five passes
+together: if it expires, systemd stops the pass that is running, the later
+passes do not run, and the unit fails with result `timeout`.
 
 The unit does not set `RestrictAddressFamilies=`. In a user manager every
 seccomp setting forces `NoNewPrivileges=yes`, and sudo then refuses to run.
@@ -613,8 +616,10 @@ are excluded from this staleness report; the sweep ledger owns them.
 
 The scheduled tmp-sweep service runs a final
 `lu_machinery.hygiene.tmp_sweep --batch-state --apply --summary` pass, including
-through the data-volume guard dropin. A failed earlier pass is logged and
-does not stop this pass. Inspect without changing anything:
+through the data-volume guard dropin. An earlier pass that exits with a
+failure is logged and does not stop this pass, but this pass does not run if
+the unit's start timeout expires first (see [What runs](#what-runs)). Inspect
+without changing anything:
 
 ```bash
 .venv/bin/python -m lu_machinery.hygiene.tmp_sweep --batch-state --summary
