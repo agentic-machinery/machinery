@@ -116,8 +116,10 @@ also caps. Keep the earlier decisions and ledgers linked.
 
 Continue fixes on the same PR and branch. After the cap is reached, the CTO may authorize at
 most one additional charged review round on that same PR through the verified cap disposition
-(`record_cf_verdict.py grant-continuation --repository <owner/name> --pr <N> --capped-head <sha>
---disposition-ref <ref> --authority claude-cto`), adding strictly one round to the PR's
+(recording `CAP_CONTINUATION: authorize repo=<owner/name> pr=#<N> head=<40-hex-sha>` in a CTO
+`decision` item or parent issue/issue comment and issuing `record_cf_verdict.py grant-continuation
+--repository <owner/name> --pr <N> --capped-head <sha> --disposition-ref <ref> --authority
+claude-cto`), adding strictly one round to the PR's
 cumulative allowance while preserving the findings ledger, reservations, exemptions, exact-head
 independence requirements, and required CI (both same-head PR CI and merge-group CI). A second
 continuation grant on the same PR is refused; if the PR still blocks after the additional round,

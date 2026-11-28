@@ -9,6 +9,7 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import shutil
 import stat
 import subprocess
@@ -213,8 +214,14 @@ CAP_CONTINUATION_THREAT_MODEL = "cooperative_same_os_user"
 _CAP_DRIVER_STATE_CLI_ENV = "LU_DRIVER_STATE_CLI"
 _CAP_DRIVER_STATE_CLI_DEFAULT = "lu-driver-state"
 _CAP_DRIVER_STATE_TIMEOUT_S = 30
+_CAP_DRIVER_STATE_ACTIVE_STATUSES = frozenset({"open", "active"})
 _CAP_REPO_SLUG = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*\Z")
-_CAP_REPO_TOKEN = re.compile(r"(?<![A-Za-z0-9_.-])([A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*)(?![A-Za-z0-9_.-])")
+_CAP_DIRECTIVE_LINE = re.compile(
+    r"^[ \t]*(?:[-*>]?[ \t]*)?CAP_CONTINUATION:[ \t]+(authorize|deny)[ \t]+"
+    r"repo=([A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*)[ \t]+"
+    r"pr=#([1-9][0-9]*)[ \t]+head=([0-9a-f]{40})[ \t]*$",
+    re.MULTILINE,
+)
 _CAP_DRIVER_STATE_REF = re.compile(r"driver-state:([A-Za-z0-9][A-Za-z0-9._:-]{0,127})\Z")
 _CAP_GITHUB_ISSUE_REF = re.compile(
     r"github:issue:([A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*)#([1-9][0-9]*)\Z"
@@ -2664,9 +2671,6 @@ def require_review_round_within_budget(
         cap_continuation=cap_continuation,
     )
     receipt = decide(recorded, heads, exempt_key)
-    if "cap_continuation" in receipt:
-        # Admitted by the PR's one CTO cap-continuation round; any earlier capability replacement was already spent.
-        return receipt
     if uncharged is None or uncharged["head"] == sha or uncharged["head"] in heads:
         # The exemption frees no head here: a round at the exempt head charges that head itself.
         return receipt
@@ -2705,21 +2709,19 @@ def _round_decision(
 ) -> dict[str, Any]:
     """:func:`require_review_round_within_budget`'s decision for one count of the charged heads."""
     base = budget if base_budget is None else base_budget
-    if len(heads) < budget:
-        if cap_continuation is not None and len(heads) >= base:
-            return {"cap_continuation": dict(cap_continuation)}
+    if len(heads) < base:
         return {}
     exempt = (
-        budget_exempt_heads(comments, sha, login, prove=prove_merge_only, unrecorded=heads - recorded, approval_context=approval_context)
+        budget_exempt_heads(
+            comments, sha, login, prove=prove_merge_only, unrecorded=heads - recorded, approval_context=approval_context
+        )
         if prove_merge_only
         else {}
     )
     if sha in exempt:
         return {"budget_exemption": {"reason": CLEAN_BASE_MERGE, **exempt[sha]}}
     counted = heads - set(exempt) - repair_heads
-    if len(counted) < budget:
-        if cap_continuation is not None and len(counted) >= base:
-            return {"cap_continuation": dict(cap_continuation)}
+    if len(counted) < base:
         return {}
     unrecorded = sorted(counted - recorded)
     if unrecorded:
@@ -2737,14 +2739,19 @@ def _round_decision(
         f"REVIEW_BUDGET_EXHAUSTED: PR #{pr} already has verdicts at {len(counted)} heads{note} and its budget "
         f"is {budget} rounds; budget end is never approval, escalate instead of recording round {len(counted) + 1}"
     )
-    # Once per lineage: only a retry of the round already admitted at this head may run it again.
+    # Once per lineage: evaluate a qualifying repair before charging the CTO cap-continuation round
+    # so a repair keeps its repair receipt and REPAIR_VERIFIED attestation rather than consuming the extra round.
     if repair is not None and not repair_heads - {sha}:
         try:
             receipt = repair()
         except RecordError as exc:
+            if cap_continuation is not None and len(counted) < budget:
+                return {"cap_continuation": dict(cap_continuation)}
             raise RecordError(f"{exhausted}; {exc}") from None
         if receipt is not None:
             return {"repair_round": receipt}
+    if cap_continuation is not None and len(counted) < budget:
+        return {"cap_continuation": dict(cap_continuation)}
     raise RecordError(exhausted)
 
 
@@ -2975,7 +2982,7 @@ def _validate_cap_continuation_receipt(
         raise CapContinuationRefused("store", f"cap-continuation receipt {filename} has invalid base_budget")
     if type(data["extra_rounds"]) is not int or data["extra_rounds"] != 1:
         raise CapContinuationRefused("store", f"cap-continuation receipt {filename} must grant exactly 1 extra round")
-    if data["authority"] not in CAP_CONTINUATION_AUTHORITIES:
+    if not isinstance(data["authority"], str) or data["authority"] not in CAP_CONTINUATION_AUTHORITIES:
         raise CapContinuationRefused("store", f"cap-continuation receipt {filename} has untrusted authority")
     if _clean_actor_token(data["actor"]) is None:
         raise CapContinuationRefused("store", f"cap-continuation receipt {filename} has invalid actor")
@@ -3061,7 +3068,7 @@ def _read_cap_continuation(
 def _write_cap_continuation_exclusive(
     receipt_root: Path, *, primary_key: str, stored_repo: str, number: int, receipt: Mapping[str, Any]
 ) -> Path:
-    """Atomically create the PR's single cap-continuation receipt with O_CREAT | O_EXCL."""
+    """Write and fsync a temp file in the receipt directory, then publish atomically without replacing."""
     if receipt_root.is_symlink():
         raise CapContinuationRefused("store", "cap-continuation store must not be a symlink")
     receipt_root.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -3071,46 +3078,71 @@ def _write_cap_continuation_exclusive(
     except OSError as exc:
         raise CapContinuationRefused("store", f"cap-continuation store must be a real directory: {exc}") from None
     name = _cap_grant_filename(primary_key, number)
+    tmp_name = f".{name}.tmp.{os.getpid()}.{secrets.token_hex(8)}"
     path = receipt_root / name
     payload = (json.dumps(receipt, sort_keys=True, indent=2) + "\n").encode("utf-8")
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
+    tmp_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
     try:
         try:
-            fd = os.open(name, flags, 0o600, dir_fd=dir_fd)
-        except FileExistsError:
-            raise CapContinuationRefused(
-                "duplicate",
-                f"PR #{number} in {stored_repo} already used its one CTO cap-continuation grant",
-            ) from None
+            fd = os.open(tmp_name, tmp_flags, 0o600, dir_fd=dir_fd)
         except OSError as exc:
-            raise CapContinuationRefused("store", f"cannot create cap-continuation receipt: {exc}") from None
+            raise CapContinuationRefused("store", f"cannot stage cap-continuation receipt: {exc}") from None
         try:
             with os.fdopen(fd, "wb") as stream:
                 stream.write(payload)
                 stream.flush()
                 os.fsync(stream.fileno())
+            try:
+                os.link(tmp_name, name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+            except FileExistsError:
+                raise CapContinuationRefused(
+                    "duplicate",
+                    f"PR #{number} in {stored_repo} already used its one CTO cap-continuation grant",
+                ) from None
+            except OSError as exc:
+                raise CapContinuationRefused("store", f"cannot publish cap-continuation receipt: {exc}") from None
             os.fsync(dir_fd)
-        except Exception:
+        finally:
             with suppress(OSError):
-                os.unlink(name, dir_fd=dir_fd)
-            raise
+                os.unlink(tmp_name, dir_fd=dir_fd)
     finally:
         os.close(dir_fd)
     return path
 
 
-def _text_matches_cap_target(
-    text: str, *, stored_repo: str, number: int, capped_head: str, require_repo: bool
-) -> bool:
-    if not re.search(rf"(?<![A-Za-z0-9])#{number}(?!\d)", text):
-        return False
-    if not re.search(rf"(?<![0-9a-fA-F]){re.escape(capped_head)}(?![0-9a-fA-F])", text):
-        return False
-    if require_repo:
-        tokens = _CAP_REPO_TOKEN.findall(text)
-        if not any(_same_cap_repository(token, stored_repo) for token in tokens):
-            return False
-    return True
+def _cap_directive_actions(text: str, *, stored_repo: str, number: int, capped_head: str) -> set[str]:
+    """Structured CAP_CONTINUATION directive actions in ``text`` (outside code fences) bound to repo, PR and head."""
+    visible = _without_code_fences(text, keep_unclosed=False)
+    actions: set[str] = set()
+    for match in _CAP_DIRECTIVE_LINE.finditer(visible):
+        action, repo_token, pr_token, head_token = match.groups()
+        if (
+            _same_cap_repository(repo_token, stored_repo)
+            and int(pr_token) == number
+            and head_token == capped_head
+        ):
+            actions.add(action)
+    return actions
+
+
+def _driver_state_decision_texts(note: Mapping[str, Any]) -> list[str]:
+    """Text entries of a driver-state decision record (statement, body, and individual notes)."""
+    texts: list[str] = []
+    for field in ("statement", "body"):
+        val = note.get(field)
+        if isinstance(val, str) and val:
+            texts.append(val)
+    notes = note.get("notes")
+    if isinstance(notes, list):
+        for entry in notes:
+            if isinstance(entry, str) and entry:
+                texts.append(entry)
+            elif isinstance(entry, Mapping):
+                for key in ("text", "body", "note"):
+                    item = entry.get(key)
+                    if isinstance(item, str) and item:
+                        texts.append(item)
+    return texts
 
 
 def _default_driver_state_show(item_id: str, environment: Mapping[str, str]) -> dict[str, Any]:
@@ -3181,23 +3213,30 @@ def _verify_cap_disposition(
             raise CapContinuationRefused(
                 "disposition", f"driver-state record {item_id} lane is {note.get('lane')!r}, expected 'cto'"
             )
+        kind = note.get("kind")
+        if not isinstance(kind, str) or kind != "decision":
+            raise CapContinuationRefused(
+                "disposition", f"driver-state record {item_id} kind is {kind!r}, expected 'decision'"
+            )
         status = note.get("status")
-        if not isinstance(status, str) or not status.strip() or status == "dropped":
-            raise CapContinuationRefused("disposition", f"driver-state record {item_id} status {status!r} is not active")
-        text_parts = [
-            text
-            for field in ("statement", "body", "done_when", "notes", "evidence", "summary", "text")
-            if field in note
-            for text in _strings(note[field])
-        ]
-        combined = "\n".join(text_parts)
-        if not _text_matches_cap_target(
-            combined, stored_repo=stored_repo, number=number, capped_head=capped_head, require_repo=True
-        ):
+        if not isinstance(status, str) or status not in _CAP_DRIVER_STATE_ACTIVE_STATUSES:
             raise CapContinuationRefused(
                 "disposition",
-                f"driver-state record {item_id} does not bind repository {stored_repo}, PR #{number}, "
-                f"and capped head {capped_head}",
+                f"driver-state record {item_id} status {status!r} is not an active decision status "
+                f"({sorted(_CAP_DRIVER_STATE_ACTIVE_STATUSES)})",
+            )
+        actions: set[str] = set()
+        for entry_text in _driver_state_decision_texts(note):
+            actions.update(
+                _cap_directive_actions(
+                    entry_text, stored_repo=stored_repo, number=number, capped_head=capped_head
+                )
+            )
+        if actions != {"authorize"}:
+            raise CapContinuationRefused(
+                "disposition",
+                f"driver-state decision {item_id} lacks an uncontested affirmative directive "
+                f"'CAP_CONTINUATION: authorize repo={stored_repo} pr=#{number} head={capped_head}'",
             )
         canonical_payload = json.dumps(dict(note), sort_keys=True, separators=(",", ":")).encode("utf-8")
         return hashlib.sha256(canonical_payload).hexdigest()
@@ -3215,19 +3254,21 @@ def _verify_cap_disposition(
                 "disposition",
                 f"{disposition_ref} is a pull request, not a parent CTO disposition issue",
             )
-        if _author_login(issue, rest_only=True) != login or issue.get("author_association") not in TRUSTED_ASSOCIATIONS:
+        issue_assoc = issue.get("author_association")
+        if (
+            _author_login(issue, rest_only=True) != login
+            or not isinstance(issue_assoc, str)
+            or issue_assoc not in TRUSTED_ASSOCIATIONS
+        ):
             raise CapContinuationRefused("disposition", f"parent issue {disposition_ref} author is not trusted")
         body = issue.get("body")
         if not isinstance(body, str):
             raise CapContinuationRefused("disposition", f"parent issue {disposition_ref} body is unavailable")
-        same_repo = _same_cap_repository(issue_github.stored, stored_repo)
-        if not _text_matches_cap_target(
-            body, stored_repo=stored_repo, number=number, capped_head=capped_head, require_repo=not same_repo
-        ):
+        if _cap_directive_actions(body, stored_repo=stored_repo, number=number, capped_head=capped_head) != {"authorize"}:
             raise CapContinuationRefused(
                 "disposition",
-                f"parent issue {disposition_ref} does not bind repository {stored_repo}, PR #{number}, "
-                f"and capped head {capped_head}",
+                f"parent issue {disposition_ref} lacks an uncontested affirmative directive "
+                f"'CAP_CONTINUATION: authorize repo={stored_repo} pr=#{number} head={capped_head}'",
             )
         return hashlib.sha256(body.encode("utf-8")).hexdigest()
 
@@ -3239,9 +3280,11 @@ def _verify_cap_disposition(
         comment = gh_read(["gh", "api", f"repos/{issue_github.active}/issues/comments/{comment_id}"])
         if not isinstance(comment, Mapping) or type(comment.get("id")) is not int or comment["id"] != comment_id:
             raise CapContinuationRefused("disposition", f"disposition comment {disposition_ref} could not be verified")
+        comment_assoc = comment.get("author_association")
         if (
             _author_login(comment, rest_only=True) != login
-            or comment.get("author_association") not in TRUSTED_ASSOCIATIONS
+            or not isinstance(comment_assoc, str)
+            or comment_assoc not in TRUSTED_ASSOCIATIONS
         ):
             raise CapContinuationRefused("disposition", f"disposition comment {disposition_ref} author is not trusted")
         issue_url = comment.get("issue_url")
@@ -3281,13 +3324,11 @@ def _verify_cap_disposition(
         body = comment.get("body")
         if not isinstance(body, str):
             raise CapContinuationRefused("disposition", f"disposition comment {disposition_ref} body is unavailable")
-        if not _text_matches_cap_target(
-            body, stored_repo=stored_repo, number=number, capped_head=capped_head, require_repo=not same_repo
-        ):
+        if _cap_directive_actions(body, stored_repo=stored_repo, number=number, capped_head=capped_head) != {"authorize"}:
             raise CapContinuationRefused(
                 "disposition",
-                f"disposition comment {disposition_ref} does not bind repository {stored_repo}, PR #{number}, "
-                f"and capped head {capped_head}",
+                f"disposition comment {disposition_ref} lacks an uncontested affirmative directive "
+                f"'CAP_CONTINUATION: authorize repo={stored_repo} pr=#{number} head={capped_head}'",
             )
         return hashlib.sha256(body.encode("utf-8")).hexdigest()
 
@@ -3330,12 +3371,12 @@ def grant_cap_continuation(
             else "worker/boundary-marked caller cannot issue a cap-continuation grant"
         )
         raise CapContinuationRefused("worker_caller", detail)
-    if authority not in CAP_CONTINUATION_AUTHORITIES:
+    if not isinstance(authority, str) or authority not in CAP_CONTINUATION_AUTHORITIES:
         raise CapContinuationRefused(
             "authority", f"{authority!r} is not an allowed authority ({sorted(CAP_CONTINUATION_AUTHORITIES)})"
         )
     seat_env = environment.get("SESSION_SEAT")
-    if seat_env is not None and seat_env != "cto":
+    if seat_env is not None and (not isinstance(seat_env, str) or seat_env != "cto"):
         raise CapContinuationRefused("authority", f"SESSION_SEAT={seat_env!r} is not the CTO seat")
     if not is_cto_caller(environment):
         raise CapContinuationRefused(
@@ -3399,6 +3440,16 @@ def grant_cap_continuation(
         review_root = _review_repository_root(stored_repo, root or _repo_root())
         adapter = GitHubAdapter(review_root)
         _, tier = _pr_files_and_tier(adapter, github.active, number)
+        if tier is None:
+            raise CapContinuationRefused(
+                "pr",
+                f"PR #{number} review tier is unavailable; cannot establish budget exhaustion",
+            )
+        if tier == "trivial":
+            raise CapContinuationRefused(
+                "not_exhausted",
+                f"PR #{number} is trivial tier and has no review cap",
+            )
         base_budget = repository_review_rounds(stored_repo, tier=tier)
         login = adapter.identity()
         try:
@@ -3452,6 +3503,24 @@ def grant_cap_continuation(
             driver_state_reader=driver_state_reader,
             github_reader=gh_read,
         )
+        # Re-read the live PR immediately before publishing the receipt: a remote push can advance
+        # the head during file, comment, lineage, or disposition reads.
+        rechecked = gh_read(
+            ["gh", "pr", "view", str(number), "--repo", github.active, "--json", "headRefOid,headRefName,state"]
+        )
+        if not isinstance(rechecked, Mapping) or rechecked.get("state") != "OPEN":
+            raise CapContinuationRefused("pr", f"PR #{number} in {github.active} is no longer open")
+        rechecked_sha, rechecked_branch = rechecked.get("headRefOid"), rechecked.get("headRefName")
+        if rechecked_branch != branch:
+            raise CapContinuationRefused(
+                "pr", f"PR #{number} branch changed from {branch!r} to {rechecked_branch!r} before grant publication"
+            )
+        if rechecked_sha != capped_head:
+            rechecked_label = rechecked_sha[:12] if isinstance(rechecked_sha, str) else repr(rechecked_sha)
+            raise CapContinuationRefused(
+                "stale_head",
+                f"PR #{number} head moved to {rechecked_label} before grant publication; expected {capped_head[:12]}",
+            )
         receipt: dict[str, Any] = {
             "schema": CAP_CONTINUATION_SCHEMA,
             "repository": stored_repo,

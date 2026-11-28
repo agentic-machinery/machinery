@@ -87,7 +87,9 @@ change. No landing check compares the risk a review ran at with the tier, so the
 use the pushed head's tier.
 
 When a work item hits the review cap, record the
-[cap disposition](../../review-loop/references/policy.md#4-convergence) before dispatching any
+[cap disposition](../../review-loop/references/policy.md#4-convergence) (including the structured
+line `CAP_CONTINUATION: authorize repo=<owner/name> pr=#<N> head=<40-hex-sha>` in an active CTO
+`decision` item or parent issue/issue comment) before dispatching any
 continuation. Confirm the predecessor task has settled before dispatch. Continue fixes on the same
 PR and branch by issuing the PR's single verified continuation grant (`record_cf_verdict.py
 grant-continuation --repository <owner/name> --pr <N> --capped-head <sha> --disposition-ref <ref>
