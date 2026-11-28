@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import atexit
 import json
 import os
 import re
@@ -10,6 +11,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 import tomllib
 from contextlib import suppress
@@ -27,8 +29,9 @@ from lu_machinery.session_streams.store import SessionStreamStore
 from lu_machinery.session_supervisor import LaunchRole, SessionSupervisor
 from tests.epics_monitor_stub import epics_monitor_stub
 from tests.epics_monitor_stub import isolated_monitor_state as isolated_monitor_state
-from tests.helpers import current_sol
+from tests.helpers import current_sol, product_checkout
 from tests.helpers.product_tree import configured_roots as configured_roots
+from tests.host_context.conftest import git as fixture_git
 from tests.launcher_sandbox import (
     bind_driver_protocol_fixture,
     bind_launcher_environment,
@@ -102,6 +105,40 @@ def _run_launcher_process(
     return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
 
 
+_DRY_RUN_CHECKOUTS: dict[tuple[str, str, str, bool, str | None], Path] = {}
+
+
+def _dry_run_checkout(*, claude_usage_stub: bool) -> Path:
+    """Build each read-only dry-run checkout view once per process instead of per call."""
+    rules_core_override = (
+        (LAUNCH_ROOT / "lu_machinery/lib/rules_core.sh").read_text(encoding="utf-8")
+        if LAUNCH_ROOT != REPO
+        else None
+    )
+    base = tempfile.gettempdir()
+    key = (
+        base,
+        str(product_checkout().resolve()),
+        str(machinery_root().resolve()),
+        claude_usage_stub,
+        rules_core_override,
+    )
+    cached = _DRY_RUN_CHECKOUTS.get(key)
+    if cached is not None and cached.is_dir():
+        return cached
+    temp_dir = Path(tempfile.mkdtemp(prefix="launcher-dry-run-", dir=base))
+    atexit.register(shutil.rmtree, temp_dir, ignore_errors=True)
+    overrides: dict[tuple[str, ...], str] = {}
+    if claude_usage_stub:
+        overrides[("lu_machinery", "lib", "claude_weekly_used.py")] = "print('0')\n"
+    if rules_core_override is not None:
+        overrides[("lu_machinery", "lib", "rules_core.sh")] = rules_core_override
+    checkout = _build_view(temp_dir / "checkout", overrides)
+    fixture_git(checkout, "remote", "add", "origin", "https://github.com/learn-ukrainian/learn-ukrainian.github.io.git")
+    _DRY_RUN_CHECKOUTS[key] = checkout
+    return checkout
+
+
 def run_launcher(
     name: str,
     *args: str,
@@ -110,14 +147,10 @@ def run_launcher(
     root: Path | None = None,
 ) -> subprocess.CompletedProcess[str]:
     if dry_run and root is None:
-        with TemporaryDirectory(prefix="launcher-usage-", dir=ensure_scratch_root()) as temporary:
-            overrides = {}
-            if name in ("start-claude.sh", "start-claude-driver.sh", "start-claude-cto.sh"):
-                overrides[("lu_machinery", "lib", "claude_weekly_used.py")] = "print('0')\n"
-            if LAUNCH_ROOT != REPO:
-                overrides[("lu_machinery", "lib", "rules_core.sh")] = (LAUNCH_ROOT / "lu_machinery/lib/rules_core.sh").read_text()
-            checkout = _build_view(Path(temporary) / "checkout", overrides)
-            return run_launcher(name, *args, env=env, dry_run=True, root=checkout)
+        checkout = _dry_run_checkout(
+            claude_usage_stub=name in ("start-claude.sh", "start-claude-driver.sh", "start-claude-cto.sh"),
+        )
+        return run_launcher(name, *args, env=env, dry_run=True, root=checkout)
     if not dry_run and root is None:
         with TemporaryDirectory(prefix="launcher-checkout-") as temporary:
             checkout = Path(temporary) / "checkout"
@@ -1335,16 +1368,18 @@ def test_launcher_passes_single_system_prompt_with_core_then_role(tmp_path: Path
         assert argv[at + width:at + len(caller) - slot] == caller[slot + width:], args
     # An addition the launcher cannot prove keeps main's argv: the core's own addition first,
     # then the caller's arguments unchanged (#1589 residual, as on main).
-    for extra in (
-        ("--append-system-prompt-file", str(role_file)),
-        (f"--append-system-prompt-file={role_file}",),
-        ("--append-system-prompt", "one", "--append-system-prompt=two"),
-        ("--name", "--append-system-prompt", role),
-        ("--tools", "--append-system-prompt", role),
-        ("--append-system-prompt", role, "--", "question"),
+    # Verify the CTO wrapper once and exercise the remaining shared-core shapes through the
+    # lighter interactive wrapper so the test stays well within its CI deadline.
+    for prefix, extra in (
+        (cto, ("--append-system-prompt-file", str(role_file))),
+        (("start-claude.sh", "--"), (f"--append-system-prompt-file={role_file}",)),
+        (("start-claude.sh", "--"), ("--append-system-prompt", "one", "--append-system-prompt=two")),
+        (("start-claude.sh", "--"), ("--name", "--append-system-prompt", role)),
+        (("start-claude.sh", "--"), ("--tools", "--append-system-prompt", role)),
+        (("start-claude.sh", "--"), ("--append-system-prompt", role, "--", "question")),
     ):
         argv_file.unlink(missing_ok=True)
-        result = run_launcher(*cto, *extra, env={"LAUNCHER_DRY_RUN_ARGV_FILE": str(argv_file)})
+        result = run_launcher(*prefix, *extra, env={"LAUNCHER_DRY_RUN_ARGV_FILE": str(argv_file)})
         assert result.returncode == 0, (extra, result.stdout + result.stderr)
         argv = argv_file.read_bytes().removesuffix(b"\0").split(b"\0")
         core = argv[argv.index(b"--append-system-prompt") + 1]
@@ -1397,18 +1432,12 @@ def test_codex_keeps_core_before_caller_developer_instructions(
     argv_file = tmp_path / "argv"
     cto = ("start-codex-cto.sh", "--epic", "epics", "KICK", "--")
     cto_core_toml_bytes = 0
+    # End-to-end launcher runs prove every Codex wrapper (CTO, interactive, driver) wires
+    # launcher_codex_developer_instructions into its real argv, dry-run placeholder and
+    # pre-lease refusal gates.
     for args, expected_role, expected_prefix in (
         ((*cto, "--search", "-c", f"developer_instructions={rules_core.toml_basic_string(role)}", "--no-alt-screen"), role, ""),
         (("start-codex.sh", "--", "--config", "developer_instructions=Raw caller text", "--search"), "Raw caller text", ""),
-        (("start-codex.sh", "--", f"--config=developer_instructions={rules_core.toml_basic_string(role)}"), role, "--config="),
-        (("start-codex.sh", "--", "-c=developer_instructions='Literal \\n text'"), r"Literal \n text", "-c="),
-        (("start-codex.sh", "--", "-cdeveloper_instructions=Attached short"), "Attached short", "-c"),
-        (("start-codex.sh", "--", "-c", "developer_instructions="), "", ""),
-        # Round 1 & 2 F1: Unicode White_Space key padding, whitespace before dot left
-        # unrelated, trimmed multiline quoted value.
-        (("start-codex.sh", "--", "-c", "\u00a0developer_instructions\u00a0=Sample"), "Sample", ""),
-        (("start-codex.sh", "--", "-c", "developer_instructions .sub=other", "-c", "developer_instructions=Sample"), "Sample", ""),
-        (("start-codex.sh", "--", "-c", 'developer_instructions=\n"Sample"'), "Sample", ""),
         (("start-codex-driver.sh", "--epic", "devops", "-c", "developer_instructions=Driver role", "Driver task"), "Driver role", ""),
     ):
         argv_file.unlink(missing_ok=True)
@@ -1447,58 +1476,27 @@ def test_codex_keeps_core_before_caller_developer_instructions(
             assert argv[flag_at - flag_rel:flag_at] == caller[:flag_rel], args
             assert argv[flag_at + width:flag_at + width + len(caller) - flag_rel - width] == caller[flag_rel + width:], args
 
-    # Unprovable shapes keep main's argv: core first, then caller arguments verbatim.
-    for extra in (
-        ("-c", "developer_instructions=one", "-c", "developer_instructions=two"),
-        ("-p", "-c", "developer_instructions=role"),
-        ("--enable", "-cdeveloper_instructions=role"),
-        ("-c", "-c", "developer_instructions=role"),
-        ("--unknown-opt", "-c", "developer_instructions=role"),
-        ("-c", "developer_instructions=role", "--", "question"),
-        ("--", "-c", "developer_instructions=role"),
-        ("-c", "developer_instructions=123"),
-        ("-c", "developer_instructions=true"),
-        # Narrowed contract: only plain text and TOML 1.0 strings are provable; containers,
-        # TOML 1.1-only forms, numbers, dates, times, invalid quoting and a raw CR in a
-        # quoted value (tomllib folds CRLF to LF, Codex keeps it) keep main's argv.
-        ("-c", 'developer_instructions={ note = "sample", }'),
-        ("-c", 'developer_instructions="""Sample\r\nb"""'),
-        ("-c", "developer_instructions=" + "[" * 100 + "]" * 100),
-        ("-c", "developer_instructions=12:34"),
-        ("-c", r'developer_instructions="\e\x41"'),
-        ("-c", 'developer_instructions="Sample'),
-        ("-c", "developer_instructions=12:34:56 # note"),
-        ("-c", f"developer_instructions={2**63}"),
-        ("-c", "developer_instructions=" + "9" * 4500),
-        ("-c", "developer_instructions=1e400"),
-        ("-c", "developer_instructions=2026-11-28"),
-        ("-c", "developer_instructions=inf"),
-        ("-c", "\x1cdeveloper_instructions=Sample"),
-        ("-c", "developer_instructions.sub=x"),
-    ):
-        argv_file.unlink(missing_ok=True)
-        result = run_launcher(*cto, *extra, env={"LAUNCHER_DRY_RUN_ARGV_FILE": str(argv_file)})
-        assert result.returncode == 0, (extra, result.stdout + result.stderr)
-        argv = [arg.decode("utf-8") for arg in argv_file.read_bytes().removesuffix(b"\0").split(b"\0")]
-        first_c = next(
-            i for i, a in enumerate(argv[:-1])
-            if a == "-c" and argv[i + 1].startswith("developer_instructions=")
-        )
-        core_val = tomllib.loads(argv[first_c + 1])["developer_instructions"]
-        assert core_val.startswith("<rules-core ") and core_val.rstrip().endswith("</rules-core>"), extra
-        caller = list(extra)
-        assert any(argv[at:at + len(caller)] == caller for at in range(len(argv))), extra
+    # Unprovable shape keeps main's argv end to end on the CTO wrapper.
+    unprovable_cto = ("-c", "developer_instructions=one", "-c", "developer_instructions=two")
+    argv_file.unlink(missing_ok=True)
+    result = run_launcher(*cto, *unprovable_cto, env={"LAUNCHER_DRY_RUN_ARGV_FILE": str(argv_file)})
+    assert result.returncode == 0, (unprovable_cto, result.stdout + result.stderr)
+    argv = [arg.decode("utf-8") for arg in argv_file.read_bytes().removesuffix(b"\0").split(b"\0")]
+    first_c = next(
+        i for i, a in enumerate(argv[:-1])
+        if a == "-c" and argv[i + 1].startswith("developer_instructions=")
+    )
+    core_val = tomllib.loads(argv[first_c + 1])["developer_instructions"]
+    assert core_val.startswith("<rules-core ") and core_val.rstrip().endswith("</rules-core>"), unprovable_cto
+    assert any(argv[at:at + len(unprovable_cto)] == list(unprovable_cto) for at in range(len(argv))), unprovable_cto
 
-    # Provable missing value and over-limit slots refuse with exit 2 before lease/exec.
+    # Provable missing value and exact MAX_ARG_STRLEN boundary refuse with exit 2 before lease/exec.
     page_limit = os.sysconf("SC_PAGE_SIZE") * 32
     # Joined slot at exact MAX_ARG_STRLEN: "--config=developer_instructions=" (32)
     # + core TOML (cto_core_toml_bytes, includes quotes) + "\\n\\n" (4) + filler == page_limit.
     joined_boundary_filler = "x" * (page_limit - len("--config=developer_instructions=") - cto_core_toml_bytes - 4)
     for extra in (
         ("-c", "developer_instructions"),
-        ("--config=developer_instructions",),
-        ("-cdeveloper_instructions",),
-        ("-c", "developer_instructions=" + "x" * 100_000),
         (f"--config=developer_instructions={joined_boundary_filler}",),
     ):
         argv_file.unlink(missing_ok=True)
@@ -1506,13 +1504,131 @@ def test_codex_keeps_core_before_caller_developer_instructions(
         assert result.returncode == 2 and "refusing to launch" in result.stderr, (extra[0][:40], result.stderr)
         assert "would claim lease" not in result.stdout and not argv_file.exists(), extra[0][:40]
 
+    # Exercise the remaining bash flag spellings, argv-structure branches and refusal shapes
+    # directly against the real launcher_codex_developer_instructions and codex.sh arity table
+    # in one shell session, loading the real rules core once instead of booting the full
+    # launcher wrapper 30+ times.
+    expected_core = rules_core.core_block(rules_core.resolve_seat())
+    shell_merge_cases = (
+        (("--search", f"--config=developer_instructions={rules_core.toml_basic_string(role)}"), role, "--config="),
+        (("-c=developer_instructions='Literal \\n text'",), r"Literal \n text", "-c="),
+        (("-cdeveloper_instructions=Attached short",), "Attached short", "-c"),
+        (("-c", "developer_instructions="), "", ""),
+        # Round 1 & 2 F1: Unicode White_Space key padding, whitespace before dot left
+        # unrelated, trimmed multiline quoted value.
+        (("-c", "\u00a0developer_instructions\u00a0=Sample"), "Sample", ""),
+        (("-c", "developer_instructions .sub=other", "-c", "developer_instructions=Sample"), "Sample", ""),
+        (("-c", 'developer_instructions=\n"Sample"'), "Sample", ""),
+    )
+    shell_unprovable_cases = (
+        ("-p", "-c", "developer_instructions=role"),
+        ("--enable", "-cdeveloper_instructions=role"),
+        ("-c", "-c", "developer_instructions=role"),
+        ("--unknown-opt", "-c", "developer_instructions=role"),
+        ("-c", "developer_instructions=role", "--", "question"),
+        ("--", "-c", "developer_instructions=role"),
+        # Representative decoder-refused and classifier-other shapes through bash NUL piping;
+        # the full decoder value matrix is exercised in-process via runtime_context.build below.
+        ("-c", "developer_instructions=123"),
+        ("-c", 'developer_instructions="""Sample\r\nb"""'),
+        ("-c", "\x1cdeveloper_instructions=Sample"),
+        ("-c", "developer_instructions.sub=x"),
+    )
+    shell_refusal_cases = (
+        ("--config=developer_instructions",),
+        ("-cdeveloper_instructions",),
+        ("-c", "developer_instructions=" + "x" * 100_000),
+    )
+    shell_out = tmp_path / "codex-shell-matrix"
+    shell_out.mkdir()
+    py_no_bc = tmp_path / "py-no-bc"
+    py_no_bc.write_text(f"#!/usr/bin/env bash\nexec {shlex.quote(sys.executable)} -B \"$@\"\n", encoding="utf-8")
+    py_no_bc.chmod(0o755)
+    shell_lines = [
+        "set -euo pipefail",
+        f"source {shlex.quote(str(machinery_path('lib/launcher_core.sh')))}",
+        f"source {shlex.quote(str(machinery_path('launchers/codex.sh')))}",
+        f"source {shlex.quote(str(machinery_path('lib/rules_core.sh')))}",
+        f"launcher_project_python() {{ printf '%s\\n' {shlex.quote(str(py_no_bc))}; }}",
+        "LC_PROVIDER=codex LC_MODE=interactive LC_HARNESS=codex LC_DRY_RUN=1",
+        f"rules_core_load {shlex.quote(str(py_no_bc))} '' codex",
+        "run_ok() {",
+        '  local out="$1"; shift',
+        '  LC_FORWARD_ARGS=("$@")',
+        "  LC_CODEX_DEVELOPER_INSTRUCTIONS_ARGS=()",
+        '  LC_RULES_CORE_TOML=""',
+        "  launcher_codex_developer_instructions",
+        '  if [ "${#LC_CODEX_DEVELOPER_INSTRUCTIONS_ARGS[@]}" -gt 0 ]; then printf "%s\\0" "${LC_CODEX_DEVELOPER_INSTRUCTIONS_ARGS[@]}" > "$out.core"; else : > "$out.core"; fi',
+        '  if [ "${#LC_FORWARD_ARGS[@]}" -gt 0 ]; then printf "%s\\0" "${LC_FORWARD_ARGS[@]}" > "$out.fwd"; else : > "$out.fwd"; fi',
+        "}",
+        "run_refuse() {",
+        '  local out="$1"; shift',
+        "  set +e",
+        '  (LC_FORWARD_ARGS=("$@"); LC_CODEX_DEVELOPER_INSTRUCTIONS_ARGS=(); LC_RULES_CORE_TOML=""; launcher_codex_developer_instructions) >"$out.out" 2>"$out.err"',
+        '  printf "%s\\n" "$?" > "$out.rc"',
+        "  set -e",
+        "}",
+    ]
+    for idx, (case_args, _, _) in enumerate(shell_merge_cases):
+        shell_lines.append("run_ok " + shlex.join([str(shell_out / f"merge-{idx}"), *case_args]))
+    for idx, case_args in enumerate(shell_unprovable_cases):
+        shell_lines.append("run_ok " + shlex.join([str(shell_out / f"unprov-{idx}"), *case_args]))
+    for idx, case_args in enumerate(shell_refusal_cases):
+        shell_lines.append("run_refuse " + shlex.join([str(shell_out / f"refuse-{idx}"), *case_args]))
+    matrix_result = _run_launcher_process(
+        ["bash", "-c", "\n".join(shell_lines)],
+        cwd=tmp_path,
+        env=launcher_environment(),
+        timeout=60,
+    )
+    assert matrix_result.returncode == 0, matrix_result.stdout + matrix_result.stderr
+
+    def _read_nul(path: Path) -> list[str]:
+        raw = path.read_bytes()
+        return [] if not raw else [part.decode("utf-8") for part in raw.removesuffix(b"\0").split(b"\0")]
+
+    for idx, (case_args, expected_role, expected_prefix) in enumerate(shell_merge_cases):
+        core_args = _read_nul(shell_out / f"merge-{idx}.core")
+        fwd_args = _read_nul(shell_out / f"merge-{idx}.fwd")
+        assert core_args == [], (case_args, core_args)
+        settings = _dev_settings(fwd_args)
+        assert len(settings) == 1, (case_args, settings)
+        slot_idx, pfx, payload = settings[0]
+        assert pfx == expected_prefix, case_args
+        assert tomllib.loads(payload)["developer_instructions"] == f"{expected_core}\n\n{expected_role}", case_args
+        caller = list(case_args)
+        rel = next(
+            i for i, a in enumerate(caller)
+            if (
+                runtime_context.classify_codex_config_payload(a if expected_prefix == "" else a[len(expected_prefix):])
+                or ("", None)
+            )[0] == "setting"
+            and (expected_prefix == "" or a.startswith(expected_prefix))
+        )
+        flag_rel = rel - 1 if expected_prefix == "" else rel
+        flag_at = slot_idx - 1 if expected_prefix == "" else slot_idx
+        width = 2 if expected_prefix == "" else 1
+        assert fwd_args[:flag_at] == caller[:flag_rel], case_args
+        assert fwd_args[flag_at + width:] == caller[flag_rel + width:], case_args
+
+    for idx, case_args in enumerate(shell_unprovable_cases):
+        core_args = _read_nul(shell_out / f"unprov-{idx}.core")
+        fwd_args = _read_nul(shell_out / f"unprov-{idx}.fwd")
+        assert fwd_args == list(case_args), (case_args, fwd_args)
+        assert len(core_args) == 2 and core_args[0] == "-c", (case_args, core_args)
+        assert tomllib.loads(core_args[1])["developer_instructions"] == expected_core, case_args
+
+    for idx, case_args in enumerate(shell_refusal_cases):
+        rc = int((shell_out / f"refuse-{idx}.rc").read_text(encoding="utf-8").strip())
+        err = (shell_out / f"refuse-{idx}.err").read_text(encoding="utf-8")
+        assert rc == 2 and "refusing to launch" in err, (case_args[0][:40], rc, err)
+
     # Dispatcher runtime_context.build enforces the same ruling C contract for Codex workers.
     worktree = tmp_path / "wt"
     worktree.mkdir()
     brief = tmp_path / "brief.md"
     brief.write_bytes(b"Do the task.\n")
     spec = TaskSpec("codex-core", "codex", CURRENT_SOL, "high", "workspace-write", worktree, brief, tmp_path / "final")
-    expected_core = rules_core.core_block(rules_core.resolve_seat())
     base_argv = ["codex", "exec", "--json", "-C", str(worktree), "-m", CURRENT_SOL, "--dangerously-bypass-approvals-and-sandbox"]
 
     def _make_stub_provider(extra_args: list[str]):
@@ -1526,6 +1642,7 @@ def test_codex_keeps_core_before_caller_developer_instructions(
     for extra, expected_role, expected_prefix in (
         (["-c", f"developer_instructions={rules_core.toml_basic_string(role)}"], role, ""),
         (["--config=developer_instructions=Worker raw"], "Worker raw", "--config="),
+        (["-c", "developer_instructions="], "", ""),
         (["-c", "\u00a0developer_instructions\u00a0=Sample"], "Sample", ""),
         (["-c", "developer_instructions .sub=other", "-c", "developer_instructions=Sample"], "Sample", ""),
         (["-c", 'developer_instructions=\n"Sample"'], "Sample", ""),
@@ -1543,7 +1660,9 @@ def test_codex_keeps_core_before_caller_developer_instructions(
         ["-p", "-c", "developer_instructions=role"],
         ["--", "-c", "developer_instructions=role"],
         ["-c", "developer_instructions=123"],
+        ["-c", "developer_instructions=true"],
         ["-c", 'developer_instructions={ note = "sample", }'],
+        ["-c", 'developer_instructions="""Sample\r\nb"""'],
         ["-c", "developer_instructions='''Sample\r\nb'''"],
         ["-c", "developer_instructions=" + "[" * 100 + "]" * 100],
         ["-c", "developer_instructions=12:34"],
@@ -1554,6 +1673,9 @@ def test_codex_keeps_core_before_caller_developer_instructions(
         ["-c", "developer_instructions=" + "9" * 4500],
         ["-c", "developer_instructions=1e400"],
         ["-c", "developer_instructions=2026-11-28"],
+        ["-c", "developer_instructions=inf"],
+        ["-c", "\x1cdeveloper_instructions=Sample"],
+        ["-c", "developer_instructions.sub=x"],
     ):
         provider = _make_stub_provider(extra)
         monkeypatch.setattr(runtime_context.providers, "load", lambda _agent, _p=provider: _p)
