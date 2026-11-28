@@ -412,12 +412,14 @@ def _inherited_security_reviews(
     for index, marker in _trusted_markers(comments, login):
         if (marker["task"], marker["started"]) == (task_id, started):
             continue
+        prior: str | None = None
         try:
-            record, prior = _task(marker["task"], task_root)
-            if record.get("worktree_base_sha") != marker["sha"] or _normalized_started(record) != marker["started"]:
-                prior = None
+            record, sealed = _task(marker["task"], task_root)
         except RecordError:
-            prior = None
+            pass
+        else:
+            if record.get("worktree_base_sha") == marker["sha"] and _normalized_started(record) == marker["started"]:
+                prior = sealed
         if prior is None:
             prior = _published_reply(comments[index])
         if prior is None:
