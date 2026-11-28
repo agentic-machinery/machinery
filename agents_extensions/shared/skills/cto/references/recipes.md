@@ -13,10 +13,13 @@ file only points there and adds what the CTO seat learned on top.
 - When the CTO rules that a PR must not land yet (for example until a review covers every item), it applies a hold the merge-queue keeper reads,
   the `hold` label (`HOLD_LABELS`) or the `[hold]` title marker (`HOLD_TITLE`) in `lu_machinery/orchestration/merge_queue_keeper.py`, in the same action
   as the ruling, and names the condition for removing it. An instruction to a lane alone does not stop the keeper.
-- Before closing a PR as superseded, compare the two PRs' full commit lists, merge commits
-  included (`gh pr view <N> --json commits` for each; `git range-diff` skips merges, so read a
-  merge's own changes with `git show -c <merge>`), and require the successor to carry every
-  change that is not a version pin. A newer release number alone does not make a PR a successor.
+- Before closing a PR as superseded, compare what each PR changes: fetch both heads
+  (`git fetch origin pull/<N>/head`; deepen a shallow clone if Git finds no merge base) and read
+  `git diff origin/main...<head>` for each. That diff includes merge commits and conflict
+  resolutions, which `git range-diff` and `git show -c` can miss, and has no page limit
+  (`gh pr view --json commits` lists at most 100).
+  Require the successor to carry every change that is not a version pin. A newer release number
+  alone does not make a PR a successor.
 
 ## Publish orders
 
