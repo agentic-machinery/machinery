@@ -2,21 +2,25 @@
 
 import json
 import os
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
 
+from lu_machinery import state_paths
 from lu_machinery.dispatcher import store
 from lu_machinery.ops import error_digest as digest
 
 _DAY = "2025-02-01"
 _START = 1738368000000000
+_REPO = Path(__file__).resolve().parents[2]
 
 
 @pytest.fixture
 def journal(tmp_path, monkeypatch):
-    task_store = tmp_path / "tasks"
-    task_store.mkdir()
+    task_store = state_paths.tasks_dir(tmp_path)
+    task_store.mkdir(parents=True)
     monkeypatch.setattr(store, "tasks_dir", lambda: task_store)
     monkeypatch.setenv("LU_TASKS_DIR", str(task_store))
     monkeypatch.setenv("PATH", str(tmp_path) + os.pathsep + os.environ["PATH"])
@@ -156,3 +160,125 @@ def test_untagged_unit_reported_unproven_not_zero(journal):
     journal(head=_START + 1)
     assert _run(directory) == 0
     assert path.read_bytes() == first
+
+
+@pytest.fixture
+def destinations(tmp_path, monkeypatch):
+    binding = tmp_path / "host.json"
+    binding.write_text(json.dumps({"schema": "machinery.sandbox-state.v1", "state_root": str(tmp_path)}))
+    monkeypatch.setenv("LU_HOST_CONTEXT", str(binding))
+    fake = tmp_path / "fake-digest-destination"
+    fake.write_text(
+        f"#!{sys.executable}\n"
+        """\
+import json
+import os
+import sys
+from pathlib import Path
+
+args = sys.argv[1:]
+if args[:2] == ["journal", "add"]:
+    assert args[2:6] == ["--project", "fleet", "--type", "note"]
+    assert args[6] == "--headline" and args[8] == "--body" and args[10] == "--source-key"
+    assert len(args) == 12 and len(args[9]) <= 2000
+    assert os.environ["LU_INBOX_WORKER"] == "devops"
+    target, key, body = "journal", args[11], args[7] + "\\n" + args[9]
+else:
+    assert args[:12] == [
+        "channel", "publish", "cto", "-", "--sender", "devops",
+        "--recipient", "claude-cto", "--kind", "proposal", "--idempotency-key", args[-1],
+    ]
+    assert len(args) == 12
+    target, key, body = "fleet", args[11], sys.stdin.read()
+    if os.environ.get("DIGEST_FAKE_FLEET_FAIL"):
+        sys.exit(1)
+path = Path(os.environ["DIGEST_FIXTURE"], target + "-writes.json")
+writes = json.loads(path.read_text()) if path.exists() else {}
+if key in writes:
+    if target == "fleet":
+        assert writes[key] == body
+else:
+    writes[key] = body
+    path.write_text(json.dumps(writes))
+"""
+    )
+    fake.chmod(0o700)
+    monkeypatch.setenv("LU_DRIVER_STATE_CLI", str(fake))
+    monkeypatch.setenv("LU_ERROR_DIGEST_FLEET_CLI", str(fake))
+
+    def writes(target):
+        path = tmp_path / f"{target}-writes.json"
+        return json.loads(path.read_text()) if path.exists() else {}
+
+    return writes
+
+
+def _publish(directory: Path, day: str = _DAY) -> subprocess.CompletedProcess[str]:
+    env = {
+        name: os.environ[name] for name in (
+            "PATH", "DIGEST_FIXTURE", "DIGEST_FAKE_FLEET_FAIL", "LU_HOST_CONTEXT",
+            "LU_DRIVER_STATE_CLI", "LU_ERROR_DIGEST_FLEET_CLI",
+        ) if name in os.environ
+    }
+    return subprocess.run(
+        [sys.executable, "-m", "lu_machinery.ops.error_digest",
+         "--day", day, "--report-dir", str(directory), "--publish", "--sender", "devops"],
+        cwd=_REPO, env=env, text=True, capture_output=True, check=False, timeout=20,
+    )
+
+
+def test_second_run_same_day_adds_no_entry_or_message(journal, destinations):
+    """A rerun can duplicate the journal entry or Fleet proposal."""
+    directory = journal([_entry(PRIORITY="3"), _entry(PRIORITY="3")])
+    first = _publish(directory)
+    assert first.returncode == 0, first.stderr
+    notes, proposals = destinations("journal"), destinations("fleet")
+    key = f"error-digest:{_DAY}"
+    assert list(notes) == list(proposals) == [key]
+    assert notes[key].startswith(f"Error digest {_DAY}: 2 errors, 0 warnings, 1 kinds (1 new); 0 units unproven")
+    assert "Full table: error-digest-2025-02-01.json" in notes[key]
+    assert "| writer.service | 2 | 0 | 0 | tagged |" in notes[key]
+    kind = digest.signature("journal", "writer.service", "error", "worker failed")
+    assert f"{kind} (2): writer.service error - worker failed" in proposals[key]
+    ledger = directory / "error-digest-kinds.v1.json"
+    first_ledger = ledger.read_bytes()
+    assert json.loads(first_ledger)[kind]["proposal_day"] == _DAY
+    second = _publish(directory)
+    assert second.returncode == 0, second.stderr
+    assert destinations("journal") == notes
+    assert destinations("fleet") == proposals
+    assert ledger.read_bytes() == first_ledger
+    print(f"run 1: +{len(notes)} journal entry, +{len(proposals)} Fleet proposal")
+    print(f"run 2: +{len(destinations('journal')) - len(notes)} journal entries, "
+          f"+{len(destinations('fleet')) - len(proposals)} Fleet proposals")
+
+
+def test_failed_publish_leaves_ledger_unchanged(journal, destinations, monkeypatch):
+    """A kind can be marked proposed before Fleet accepts the message."""
+    directory = journal([_entry(PRIORITY="3")])
+    directory.mkdir()
+    ledger = directory / "error-digest-kinds.v1.json"
+    ledger.write_text("{}\n")
+    previous = ledger.read_bytes()
+    monkeypatch.setenv("DIGEST_FAKE_FLEET_FAIL", "1")
+    failed = _publish(directory)
+    assert failed.returncode == 1
+    assert "Fleet publish: unavailable (write_refused)" in failed.stderr
+    assert ledger.read_bytes() == previous
+    assert destinations("fleet") == {}
+    assert list(destinations("journal")) == [f"error-digest:{_DAY}"]
+
+    # The next successful run must finish the staged proposal with its original
+    # key even after the scheduled day has advanced.
+    next_day = "2025-02-02"
+    journal([_entry(PRIORITY="3", MESSAGE="new failure", __REALTIME_TIMESTAMP=str(_START + 86_400_000_000))])
+    monkeypatch.delenv("DIGEST_FAKE_FLEET_FAIL")
+    retry = _publish(directory, next_day)
+    assert retry.returncode == 0, retry.stderr
+    assert sorted(destinations("journal")) == [f"error-digest:{_DAY}", f"error-digest:{next_day}"]
+    assert list(destinations("fleet")) == [f"error-digest:{_DAY}"]
+    kind = digest.signature("journal", "writer.service", "error", "worker failed")
+    assert list(json.loads(ledger.read_bytes())) == [kind]
+    next_run = _publish(directory, next_day)
+    assert next_run.returncode == 0, next_run.stderr
+    assert sorted(destinations("fleet")) == [f"error-digest:{_DAY}", f"error-digest:{next_day}"]
