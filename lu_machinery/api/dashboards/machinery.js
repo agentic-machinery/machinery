@@ -9,10 +9,8 @@
   const THEMES = ["auto", "light", "dark"];
 
   // The page navigation is rendered by the server from the page contracts (main.py), so it is
-  // in the HTML before this script runs. Only external site links are built here.
-  const SITE_LINKS = [
-    {href: "http://localhost:8768/", label: "KubeDojo"},
-  ];
+  // in the HTML before this script runs. This script adds no site links: a host-specific
+  // URL would only work on one machine.
 
   function escapeHtml(value) {
     return String(value ?? "").replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;")
@@ -24,10 +22,6 @@
   }
 
   // ---- Navigation & theme ----
-
-  function renderSitesHtml() {
-    return SITE_LINKS.map(site => `<a href="${escapeHtml(site.href)}">${escapeHtml(site.label)}</a>`).join("");
-  }
 
   function readStoredTheme() {
     try {
@@ -88,8 +82,6 @@
 
   function initChrome() {
     if (typeof document !== "object" || !document || !document.getElementById) return;
-    const sites = document.getElementById("machinery-sites");
-    if (sites) sites.innerHTML = renderSitesHtml();
     let mode = applyTheme(readStoredTheme());
     const toggle = document.getElementById("theme-toggle");
     if (toggle && !toggle.dataset.bound && typeof toggle.addEventListener === "function") {
@@ -709,12 +701,10 @@
     REFRESH_MS,
     OPTIONAL_WAIT_MS,
     RETRY_LIMIT,
-    SITE_LINKS,
     FRESHNESS_LABELS,
     DEFAULT_OPTIONAL,
     escapeHtml,
     safeHttpUrl,
-    renderSitesHtml,
     applyTheme,
     renderVersion,
     loadVersion,

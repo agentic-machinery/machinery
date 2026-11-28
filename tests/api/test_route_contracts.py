@@ -997,3 +997,64 @@ assert.match(M.prChips(unknownTotalPrs).join(''), /<b>1<\/b> open PRs observed Â
         timeout=15,
     )
     assert ran.returncode == 0, ran.stderr
+
+
+def test_unknown_browser_path_gets_html_404_with_nav(tmp_path):
+    """Defect class: a browser dead-ends on raw JSON for an unknown or trailing-slash page path, or an API client stops getting JSON."""
+    from contextlib import asynccontextmanager
+
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from lu_machinery.api.main import create_app
+    from lu_machinery.api.monitor_context import fixture_context
+    from lu_machinery.api.product_contribution import ProductContribution
+    from lu_machinery.api.route_contracts import PAGE_CONTRACTS
+
+    @asynccontextmanager
+    async def no_lifespan(_app: FastAPI):
+        yield
+
+    # A known page file, owned by this test, so the trailing-slash request is that page's path
+    # and not an unknown file. The overview's ``machinery/`` spelling is served on purpose.
+    page = next(contract for contract in PAGE_CONTRACTS if contract.url.strip("/") not in {"", "machinery"})
+    dashboards = tmp_path / "dashboards"
+    dashboards.mkdir()
+    (dashboards / page.file).write_text("<p>page</p>", encoding="utf-8")
+    app = create_app(
+        fixture_context(tmp_path).with_roots(dashboards_dir=dashboards),
+        lifespan=no_lifespan,
+        product=ProductContribution(),
+    )
+    browser = {"Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"}
+    home = next(contract for contract in PAGE_CONTRACTS if contract.file == "index.html")
+
+    def assert_html_404(response) -> None:
+        assert response.status_code == 404
+        assert response.headers["content-type"].startswith("text/html")
+        body = response.text
+        assert not body.lstrip().startswith("{")
+        assert 'id="machinery-nav"' in body
+        assert "This page is not on the Monitor." in body
+        assert f'href="{home.url}"' in body
+        for contract in PAGE_CONTRACTS:
+            assert f'href="{contract.url}"' in body
+        assert "localhost" not in body
+
+    def assert_json_404(response) -> None:
+        assert response.status_code == 404
+        assert response.headers["content-type"].startswith("application/json")
+        payload = response.json()
+        assert payload["error"] == "http_error"
+        assert payload["detail"] == "Not Found"
+        assert payload["error_id"]
+
+    with TestClient(app) as client:
+        assert client.get(page.url, headers=browser).status_code == 200
+        assert_html_404(client.get("/not-a-monitor-page", headers=browser))
+        assert_html_404(client.get(f"{page.url}/", headers=browser))
+        assert_json_404(client.get("/not-a-monitor-page", headers={"Accept": "application/json"}))
+        assert_json_404(client.get(f"{page.url}/", headers={"Accept": "application/json"}))
+        # A client that names both at the same q, and the default ``*/*``, does not prefer HTML.
+        assert_json_404(client.get("/not-a-monitor-page", headers={"Accept": "text/html, application/json"}))
+        assert_json_404(client.get(f"{page.url}/", headers={"Accept": "*/*"}))

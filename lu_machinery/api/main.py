@@ -251,8 +251,99 @@ def _sanitize_public_detail(detail: Any) -> Any:
     return detail
 
 
+def _accept_quality(header: str, media_type: str) -> float:
+    """The q of the most specific range matching ``media_type``, or 0 when none matches.
+
+    An exact type beats ``type/*``, which beats ``*/*``. A missing or unusable q is 0,
+    so a malformed header cannot prefer a page over the JSON error.
+    """
+    wanted_type = media_type.split("/", 1)[0]
+    best: tuple[int, float] | None = None
+    for piece in header.split(","):
+        bits = [bit.strip() for bit in piece.split(";") if bit.strip()]
+        if not bits:
+            continue
+        media = bits[0].lower()
+        quality = 1.0
+        for param in bits[1:]:
+            if param.lower().startswith("q="):
+                try:
+                    quality = float(param[2:].strip())
+                except ValueError:
+                    quality = 0.0
+        if not 0.0 <= quality <= 1.0:
+            quality = 0.0
+        if media == media_type:
+            specificity = 2
+        elif media == f"{wanted_type}/*":
+            specificity = 1
+        elif media == "*/*":
+            specificity = 0
+        else:
+            continue
+        if best is None or specificity > best[0] or (specificity == best[0] and quality > best[1]):
+            best = (specificity, quality)
+    return 0.0 if best is None else best[1]
+
+
+def _prefers_html(request: Request) -> bool:
+    """True when Accept gives ``text/html`` a strictly higher q than ``application/json``.
+
+    A missing header, ``*/*`` (curl and ``fetch``), or an equal q keeps the JSON error.
+    A navigation request (``text/html`` above JSON) is the only one that gets the page.
+    """
+    header = request.headers.get("accept")
+    if not header:
+        return False
+    return _accept_quality(header, "text/html") > _accept_quality(header, "application/json")
+
+
+def _html_not_found() -> HTMLResponse:
+    """A small 404 page with the shared Monitor navigation and a link to the overview.
+
+    The path is not echoed: a missing page has nothing else to say, and the URL is
+    not a value this page is allowed to reflect.
+    """
+    home = next(page for page in PAGE_CONTRACTS if page.file == "index.html")
+    nav = _machinery_nav_html(None)
+    home_href = html.escape(home.url, quote=True)
+    home_label = html.escape(home.nav_label, quote=True)
+    body = (
+        "<!doctype html>\n"
+        '<html lang="en">\n'
+        "<head>\n"
+        '<meta charset="utf-8">\n'
+        '<meta name="viewport" content="width=device-width, initial-scale=1">\n'
+        "<title>Not found — Machinery</title>\n"
+        '<link rel="icon" href="data:,">\n'
+        '<link rel="stylesheet" href="/machinery.css">\n'
+        "</head>\n"
+        "<body>\n"
+        '<a class="skip" href="#main">Skip to main content</a>\n'
+        "<header>\n"
+        '  <div class="header-nav">\n'
+        f'    <nav class="pages" id="machinery-nav" aria-label="Pages">{nav}</nav>\n'
+        "  </div>\n"
+        "</header>\n"
+        '<main id="main" tabindex="-1">\n'
+        "<h1>Not found</h1>\n"
+        f'<p>This page is not on the Monitor. <a href="{home_href}">{home_label}</a></p>\n'
+        "</main>\n"
+        "</body>\n"
+        "</html>\n"
+    )
+    return HTMLResponse(body, status_code=404)
+
+
 async def http_exception_handler(request: Request, exc: StarletteHTTPException):
-    """Normalize handled HTTP errors without changing their status codes."""
+    """Normalize handled HTTP errors without changing their status codes.
+
+    A browser that prefers HTML gets a page for a 404 (an unknown path, or a known
+    page path with a trailing slash, which this server does not redirect). Every
+    other client, and every other status, keeps the JSON envelope.
+    """
+    if exc.status_code == 404 and _prefers_html(request):
+        return _html_not_found()
     return _error_envelope(
         "http_error",
         _sanitize_public_detail(exc.detail),
