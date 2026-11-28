@@ -1423,8 +1423,10 @@ def test_codex_keeps_core_before_caller_developer_instructions(
         ("-c", "developer_instructions=123"),
         ("-c", "developer_instructions=true"),
         # Narrowed contract: only plain text and TOML 1.0 strings are provable; containers,
-        # TOML 1.1-only forms, numbers, dates, times and invalid quoting keep main's argv.
+        # TOML 1.1-only forms, numbers, dates, times, invalid quoting and a raw CR in a
+        # quoted value (tomllib folds CRLF to LF, Codex keeps it) keep main's argv.
         ("-c", 'developer_instructions={ note = "sample", }'),
+        ("-c", 'developer_instructions="""Sample\r\nb"""'),
         ("-c", "developer_instructions=" + "[" * 100 + "]" * 100),
         ("-c", "developer_instructions=12:34"),
         ("-c", r'developer_instructions="\e\x41"'),
@@ -1506,6 +1508,7 @@ def test_codex_keeps_core_before_caller_developer_instructions(
         ["--", "-c", "developer_instructions=role"],
         ["-c", "developer_instructions=123"],
         ["-c", 'developer_instructions={ note = "sample", }'],
+        ["-c", "developer_instructions='''Sample\r\nb'''"],
         ["-c", "developer_instructions=" + "[" * 100 + "]" * 100],
         ["-c", "developer_instructions=12:34"],
         ["-c", r'developer_instructions="\e\x41"'],

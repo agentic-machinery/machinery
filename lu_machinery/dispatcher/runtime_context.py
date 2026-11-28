@@ -159,18 +159,23 @@ def decode_codex_config_string(raw_value: str) -> str | None:
     shapes are provable here:
 
     * a valid TOML 1.0 basic or literal string (the trimmed value starts with
-      ``"`` or ``'`` and ``tomllib`` reads it as the only key's string); TOML 1.1
-      adds no string form that 1.0 reads differently, so Codex reads the same text;
+      ``"`` or ``'``, holds no raw carriage return, and ``tomllib`` reads it as the
+      only key's string); TOML 1.1 adds no string form that 1.0 reads differently,
+      so Codex reads the same text. A raw carriage return is excluded because
+      ``tomllib`` folds CRLF to LF inside multiline strings while Codex keeps it;
     * unambiguous plain text, which no TOML value can start: it does not start
       with ``[``, ``{``, ``+``, ``-`` or a digit, nor with ``true``, ``false``,
       ``inf`` or ``nan``; Codex's parse fails and it uses the literal fallback.
 
     Every other shape (containers, numbers, booleans, dates and times, TOML
-    1.1-only strings, an invalid quoted value, extra keys) returns None, so
+    1.1-only strings, an invalid quoted value, a raw carriage return in a quoted
+    value, extra keys) returns None, so
     callers keep main's argv unchanged.
     """
     trimmed = raw_value.strip(_CODEX_WHITESPACE)
     if trimmed[:1] in ('"', "'"):
+        if "\r" in trimmed:
+            return None
         try:
             parsed = tomllib.loads(f"v = {trimmed}")
         except (ValueError, RecursionError):  # TOMLDecodeError, over-long integers, deep nesting
