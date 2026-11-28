@@ -612,6 +612,8 @@ _REPOSITORY_SLUG = re.compile(r"[A-Za-z0-9-]{1,39}/[A-Za-z0-9._-]{1,100}", re.AS
 PULL_REQUESTS_TTL_S = 120.0
 PULL_REQUESTS_TIMEOUT_S = 20.0
 PULL_REQUESTS_PER_REPOSITORY = 50
+# GitHub's own title limit: a longer value is not a GitHub PR title and is withheld.
+PR_TITLE_MAX = 256
 REVIEW_STATUS_CONTEXT = "fleet/cross-family-review"
 # The one file a project's lu-machinery version is read from, at its default branch head.
 PIN_FILE = "uv.lock"
@@ -711,9 +713,10 @@ def _pull_request_row(
     task_id = branch.rsplit("/", 1)[-1] if isinstance(branch, str) and len(branch) <= 512 else None
     # A private project shows counts and states only: no PR number, title, link or creation time.
     # A public title is public GitHub text, with filesystem paths redacted as milestone titles are.
+    title = node["title"]
     return {
         "number": None if private else number,
-        "title": None if private else sanitize_text(node["title"]),
+        "title": None if private or len(title) > PR_TITLE_MAX else sanitize_text(title),
         "url": f"https://github.com/{repository}/pull/{number}" if number is not None and not private else None,
         "task_reference": None if private else _recorded_task_reference(tasks_dir, task_id, slugs),
         "draft": node.get("isDraft") is True,

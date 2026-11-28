@@ -141,9 +141,10 @@ def test_panel_response_never_echoes_unvetted_provider_values(panel_client, monk
     assert response.status_code == 200, response.text
     data = response.json()
     if route.endswith("pull-requests"):
-        # A public repository's PR title is public GitHub text: it crosses with only filesystem paths redacted.
+        # A public repository's PR title is public GitHub text: it crosses with only filesystem paths redacted,
+        # and one longer than GitHub allows is withheld.
         titles = [row.pop("title") for repo in data["repositories"] for row in repo["pull_requests"]]
-        assert titles == [sanitize_text(dirty)] * 3
+        assert titles == [None if len(dirty) > git_hygiene_router.PR_TITLE_MAX else sanitize_text(dirty)] * 3
         assert dirty not in json.dumps(data)
     else:
         assert dirty not in response.text
