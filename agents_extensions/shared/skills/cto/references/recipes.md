@@ -78,11 +78,13 @@ budget-check` take `--repository <owner>/<name>`, and recording a verdict reads 
 review task (`--task-id`); `--repo` is a fleet repository key (the dispatcher, `closeout_cli
 target`). A brief that said "review-loop with `--repo <key>`" made `resolve-reviewer` fail
 closed with `author task provenance conflicts with commit trailer`.
-Every brief takes its `--risk` from `lu_machinery.review.tiers` for the paths it expects to
-change. Edits to skill files rate medium; the release cut's follow-up PR (record the
-release, start the next version) rates high (machinery #1589, #1546), and the review policy
-requires high or critical risk for a High-tier change. No landing check compares the risk a
-review ran at with the tier, so the brief must set it.
+Every brief has the review take its `--risk` from `lu_machinery.review.tiers` at the pushed
+head, as `review-loop` does before round 1, never from the paths the brief expects to change;
+the resolver may still raise it. Edits to the `cto` skill's reference Markdown rated medium for
+#1593; the release cut's follow-up PR (record the release, start the next version) rates high
+(machinery #1589, #1546), and the review policy requires high or critical risk for a High-tier
+change. No landing check compares the risk a review ran at with the tier, so the review must
+use the pushed head's tier.
 
 When a work item hits the review cap, record the
 [cap disposition](../../review-loop/references/policy.md#4-convergence) before dispatching any
