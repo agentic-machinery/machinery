@@ -73,7 +73,7 @@ End in exactly one of these states, naming the receiving driver:
 
 Ready is never reported as delivered. The receiving driver removes the hold and lands it with
 `full-send`. Closing a PR is a driver act. Closing an issue as duplicate, obsolete or not
-planned is the CTO's (rules core P4).
+planned is the CTO's or eggbot's (rules core P4).
 
 ## Report
 

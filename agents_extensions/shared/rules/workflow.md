@@ -553,7 +553,7 @@ through Fleet Comms; the CTO opens, folds or drops them.
   a checklist item. Open a new linked issue only when the work needs its own PR or has a
   different outcome, and give it an owner and acceptance criteria. Security work and
   evidence-backed preventive reliability work may keep their own issue.
-- **Creating an issue (CTO only)**: link it to its stream epic AT CREATION — native sub-issue
+- **Creating an issue (CTO or eggbot)**: link it to its stream epic AT CREATION — native sub-issue
   (preferred) or a `#N` checklist line in the epic body. An unlinked issue is an ORPHAN
   and gets flagged at every agent's cold start until adopted.
 - **Finish before starting (#10665)**: a lane with an open PR that has waited more than
@@ -574,7 +574,8 @@ through Fleet Comms; the CTO opens, folds or drops them.
   duplicate whose unresolved criteria were first moved to the surviving issue. Auto-close
   keywords are fine, but verify — `Fixes #N` closes the whole issue even when scope
   remains: use `Refs #N`, or move the remaining criteria FIRST (to an open parent with the
-  same outcome, else a new linked issue under the filing rule above).
+  same outcome, else a new linked issue under the filing rule above). Obsolete and not
+  planned closes follow rules core P4.
 - These intake rules bind every lane, the CTO included.
 - **New stream?** Only with a new epic + a registry entry in the same PR — streams are
   deliberate, not emergent.
