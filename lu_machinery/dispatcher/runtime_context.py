@@ -4,6 +4,7 @@ import datetime
 import json
 import math
 import os
+import re
 import tomllib
 from dataclasses import replace
 from pathlib import Path
@@ -123,61 +124,185 @@ _CODEX_WHITESPACE = (
 )
 _CODEX_I64_MIN = -(1 << 63)
 _CODEX_I64_MAX = (1 << 63) - 1
+_CODEX_MAX_TOML_DEPTH = 80
+_HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
+_TOML11_TIME_NO_SEC_RE = re.compile(r"^(\d{2}:\d{2})$")
+_TOML11_DT_NO_SEC_RE = re.compile(r"^(\d{4}-\d{2}-\d{2}[Tt ]\d{2}:\d{2})([Zz]|[+-]\d{2}:\d{2})?$")
+_TOML_FRAC_RE = re.compile(r"\.(\d+)")
 
 
 def classify_codex_config_payload(payload: str) -> tuple[str, str | None] | None:
-    """Classify a Codex ``-c`` / ``--config`` payload using Codex's whitespace trimming."""
+    """Classify a Codex ``-c`` / ``--config`` payload using Codex's whitespace trimming.
+
+    Codex trims Unicode ``White_Space`` from the whole key once and splits dotted
+    paths on ``.`` without trimming inside segments.
+    """
     if "=" in payload:
         key, raw = payload.split("=", 1)
         trimmed = key.strip(_CODEX_WHITESPACE)
         if trimmed == "developer_instructions":
             return "setting", raw
-        if trimmed.startswith("developer_instructions") and trimmed[len("developer_instructions"):].lstrip(
-            _CODEX_WHITESPACE
-        ).startswith("."):
+        if trimmed.startswith("developer_instructions."):
             return "subkey", None
         return None
     trimmed = payload.strip(_CODEX_WHITESPACE)
     if trimmed == "developer_instructions":
         return "missing_value", None
-    if trimmed.startswith("developer_instructions") and trimmed[len("developer_instructions"):].lstrip(
-        _CODEX_WHITESPACE
-    ).startswith("."):
+    if trimmed.startswith("developer_instructions."):
         return "subkey", None
     return None
 
 
-def decode_codex_config_string(raw_value: str) -> str | None:
-    """Decode Codex ``-c developer_instructions=<raw_value>`` matching Codex CLI semantics.
+def _normalize_toml11_basic_string(raw: str) -> str:
+    """Translate TOML 1.1 ``\\e`` and ``\\xHH`` escapes inside basic strings for Python's TOML 1.0 tomllib."""
+    if not raw.startswith('"'):
+        return raw
+    multiline = raw.startswith('"""')
+    index = 3 if multiline else 1
+    out = [raw[:index]]
+    length = len(raw)
+    while index < length:
+        ch = raw[index]
+        if ch == "\\":
+            if index + 1 >= length:
+                out.append(raw[index:])
+                return "".join(out)
+            nxt = raw[index + 1]
+            if nxt == "e":
+                out.append("\\u001b")
+                index += 2
+            elif (
+                nxt == "x"
+                and index + 3 < length
+                and raw[index + 2] in _HEX_DIGITS
+                and raw[index + 3] in _HEX_DIGITS
+            ):
+                out.append(f"\\u00{raw[index + 2:index + 4]}")
+                index += 4
+            else:
+                out.append(raw[index:index + 2])
+                index += 2
+            continue
+        if multiline:
+            if ch == '"':
+                end = index
+                while end < length and raw[end] == '"':
+                    end += 1
+                run = end - index
+                out.append(raw[index:end])
+                index = end
+                if run >= 3:
+                    out.append(raw[index:])
+                    return "".join(out)
+                continue
+        elif ch == '"':
+            out.append(raw[index:])
+            return "".join(out)
+        out.append(ch)
+        index += 1
+    return "".join(out)
 
-    Codex trims Unicode ``White_Space`` from ``raw_value``, parses as a TOML value
-    (signed 64-bit integers and finite 64-bit floats), and falls back to the trimmed
-    literal string on parse failure. Valid TOML strings return their decoded text;
-    TOML date/time/datetime values render as their trimmed literal text in Codex;
-    valid non-string TOML values (bool, in-range i64, f64/inf/nan, array, table)
-    return None so callers keep main's argv and let Codex reject the invalid type.
+
+def _normalize_toml11_temporal(raw: str) -> str:
+    """Normalize TOML 1.1 second-less times (``HH:MM``) on the first line for Python's TOML 1.0 tomllib."""
+    first, sep, rest = raw.partition("\n")
+    head, hash_sep, comment = first.partition("#")
+    stripped = head.strip(_CODEX_WHITESPACE)
+    if _TOML11_TIME_NO_SEC_RE.fullmatch(stripped):
+        normalized = f"{stripped}:00"
+    elif (match := _TOML11_DT_NO_SEC_RE.fullmatch(stripped)) is not None:
+        normalized = f"{match.group(1)}:00{match.group(2) or ''}"
+    else:
+        return raw
+    return f"{normalized}{hash_sep}{comment}{sep}{rest}"
+
+
+def _format_codex_temporal(value: datetime.date | datetime.time | datetime.datetime, raw: str) -> str:
+    """Serialize a parsed TOML date/time/datetime matching Codex's ``toml::value::Datetime::Display``."""
+    head = raw.split("\n", 1)[0].split("#", 1)[0].strip(_CODEX_WHITESPACE)
+    if isinstance(value, datetime.datetime):
+        frac_match = _TOML_FRAC_RE.search(head)
+        frac = ""
+        if frac_match:
+            digits = frac_match.group(1)[:9].rstrip("0")
+            if digits:
+                frac = f".{digits}"
+        tz = ""
+        if value.tzinfo is not None:
+            if head.endswith(("Z", "z")):
+                tz = "Z"
+            else:
+                offset = value.utcoffset() or datetime.timedelta(0)
+                total_minutes = int(offset.total_seconds() // 60)
+                sign = "+" if total_minutes >= 0 else "-"
+                hh, mm = divmod(abs(total_minutes), 60)
+                tz = f"{sign}{hh:02d}:{mm:02d}"
+        return (
+            f"{value.year:04d}-{value.month:02d}-{value.day:02d}"
+            f"T{value.hour:02d}:{value.minute:02d}:{value.second:02d}{frac}{tz}"
+        )
+    if isinstance(value, datetime.date):
+        return value.isoformat()
+    frac_match = _TOML_FRAC_RE.search(head)
+    frac = ""
+    if frac_match:
+        digits = frac_match.group(1)[:9].rstrip("0")
+        if digits:
+            frac = f".{digits}"
+    return f"{value.hour:02d}:{value.minute:02d}:{value.second:02d}{frac}"
+
+
+def _codex_container_valid(value: object, depth: int = 0) -> bool:
+    """True when a parsed TOML list/dict stays within Codex's nesting depth and i64 bounds."""
+    if isinstance(value, list):
+        if depth + 1 > _CODEX_MAX_TOML_DEPTH:
+            return False
+        return all(_codex_container_valid(item, depth + 1) for item in value)
+    if isinstance(value, dict):
+        if depth + 1 > _CODEX_MAX_TOML_DEPTH:
+            return False
+        return all(_codex_container_valid(item, depth + 1) for item in value.values())
+    if isinstance(value, int) and not isinstance(value, bool):
+        return _CODEX_I64_MIN <= value <= _CODEX_I64_MAX
+    return True
+
+
+def decode_codex_config_string(raw_value: str) -> str | None:
+    """Decode Codex ``-c developer_instructions=<raw_value>`` matching Codex CLI 0.172.0 semantics.
+
+    Codex trims Unicode ``White_Space`` from ``raw_value``, parses as a TOML 1.1 value
+    (signed 64-bit integers, finite 64-bit floats, max container nesting depth 80), and
+    on parse failure strips outer ``"`` / ``'`` quotes from the trimmed literal string.
+    Valid TOML strings return their decoded text; TOML date/time/datetime values serialize
+    via ``toml::value::Datetime::Display``; valid non-string TOML values (bool, in-range
+    i64, f64/inf/nan, bounded array/table) return None so callers keep main's argv and let
+    Codex reject the invalid type unchanged.
     """
     trimmed = raw_value.strip(_CODEX_WHITESPACE)
+    fallback = trimmed.strip("\"'")
+    candidate = _normalize_toml11_temporal(_normalize_toml11_basic_string(trimmed))
     try:
-        parsed = tomllib.loads(f"v = {trimmed}")
-    except tomllib.TOMLDecodeError:
-        return trimmed
+        parsed = tomllib.loads(f"v = {candidate}")
+    except (tomllib.TOMLDecodeError, ValueError, RecursionError):
+        return fallback
     if len(parsed) != 1 or "v" not in parsed:
-        return trimmed
+        return fallback
     value = parsed["v"]
     if isinstance(value, str):
         return value
     if isinstance(value, bool):
         return None
     if isinstance(value, int):
-        return None if _CODEX_I64_MIN <= value <= _CODEX_I64_MAX else trimmed
+        return None if _CODEX_I64_MIN <= value <= _CODEX_I64_MAX else fallback
     if isinstance(value, float):
         head = trimmed.split("#", 1)[0].strip(_CODEX_WHITESPACE).lower()
         if math.isinf(value) and head not in {"inf", "+inf", "-inf"}:
-            return trimmed
+            return fallback
         return None
     if isinstance(value, (datetime.date, datetime.time, datetime.datetime)):
-        return trimmed
+        return _format_codex_temporal(value, trimmed)
+    if isinstance(value, (list, dict)):
+        return None if _codex_container_valid(value) else fallback
     return None
 
 

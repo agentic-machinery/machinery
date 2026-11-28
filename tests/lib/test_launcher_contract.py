@@ -1367,11 +1367,18 @@ def test_codex_keeps_core_before_caller_developer_instructions(
         (("start-codex.sh", "--", "-c=developer_instructions='Literal \\n text'"), r"Literal \n text", "-c="),
         (("start-codex.sh", "--", "-cdeveloper_instructions=Attached short"), "Attached short", "-c"),
         (("start-codex.sh", "--", "-c", "developer_instructions="), "", ""),
-        # Round 1 F1 & F2: Unicode White_Space key padding, trimmed multiline quoted value,
-        # i64 overflow, f64 overflow, and TOML dates (all treated as strings by Codex).
+        # Round 1 & 2 F1/F2: Unicode White_Space key padding, whitespace before dot left
+        # unrelated, trimmed multiline quoted value, unterminated quote stripping, TOML 1.1
+        # escapes, temporal comments/formats, i64/f64/width/depth parser boundaries.
         (("start-codex.sh", "--", "-c", "\u00a0developer_instructions\u00a0=Sample"), "Sample", ""),
+        (("start-codex.sh", "--", "-c", "developer_instructions .sub=other", "-c", "developer_instructions=Sample"), "Sample", ""),
         (("start-codex.sh", "--", "-c", 'developer_instructions=\n"Sample"'), "Sample", ""),
+        (("start-codex.sh", "--", "-c", 'developer_instructions="Sample'), "Sample", ""),
+        (("start-codex.sh", "--", "-c", r'developer_instructions="\e\x41"'), "\x1bA", ""),
+        (("start-codex.sh", "--", "-c", "developer_instructions=12:34:56 # note"), "12:34:56", ""),
         (("start-codex.sh", "--", "-c", f"developer_instructions={2**63}"), str(2**63), ""),
+        (("start-codex.sh", "--", "-c", "developer_instructions=" + "9" * 4500), "9" * 4500, ""),
+        (("start-codex.sh", "--", "-c", "developer_instructions=" + "[" * 100 + "]" * 100), "[" * 100 + "]" * 100, ""),
         (("start-codex.sh", "--", "-c", "developer_instructions=1e400"), "1e400", ""),
         (("start-codex.sh", "--", "-c", "developer_instructions=2026-11-28"), "2026-11-28", ""),
         (("start-codex-driver.sh", "--epic", "devops", "-c", "developer_instructions=Driver role", "Driver task"), "Driver role", ""),
@@ -1400,7 +1407,11 @@ def test_codex_keeps_core_before_caller_developer_instructions(
             caller = list(args[args.index("--") + 1:])
             rel = next(
                 i for i, a in enumerate(caller)
-                if "developer_instructions" in a
+                if (
+                    runtime_context.classify_codex_config_payload(a if expected_prefix == "" else a[len(expected_prefix):])
+                    or ("", None)
+                )[0] == "setting"
+                and (expected_prefix == "" or a.startswith(expected_prefix))
             )
             flag_rel = rel - 1 if expected_prefix == "" else rel
             flag_at = slot_idx - 1 if expected_prefix == "" else slot_idx
@@ -1474,8 +1485,14 @@ def test_codex_keeps_core_before_caller_developer_instructions(
         (["-c", f"developer_instructions={rules_core.toml_basic_string(role)}"], role, ""),
         (["--config=developer_instructions=Worker raw"], "Worker raw", "--config="),
         (["-c", "\u00a0developer_instructions\u00a0=Sample"], "Sample", ""),
+        (["-c", "developer_instructions .sub=other", "-c", "developer_instructions=Sample"], "Sample", ""),
         (["-c", 'developer_instructions=\n"Sample"'], "Sample", ""),
+        (["-c", 'developer_instructions="Sample'], "Sample", ""),
+        (["-c", r'developer_instructions="\e\x41"'], "\x1bA", ""),
+        (["-c", "developer_instructions=12:34:56 # note"], "12:34:56", ""),
         (["-c", f"developer_instructions={2**63}"], str(2**63), ""),
+        (["-c", "developer_instructions=" + "9" * 4500], "9" * 4500, ""),
+        (["-c", "developer_instructions=" + "[" * 100 + "]" * 100], "[" * 100 + "]" * 100, ""),
         (["-c", "developer_instructions=1e400"], "1e400", ""),
         (["-c", "developer_instructions=2026-11-28"], "2026-11-28", ""),
     ):
