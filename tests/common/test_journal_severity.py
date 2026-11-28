@@ -47,3 +47,22 @@ def test_multiline_record_counts_once():
     assert warning[0].startswith("<4>") and "[WARNING]" in warning[0]
     assert warning[1].startswith("<7>")
     assert not any(line.startswith("<6>") for line in warning)
+
+    # A NUL is a journald entry boundary, and the following text can supply its own priority.
+    nul = formatter.format(
+        logging.LogRecord("api.test", logging.WARNING, __file__, 1, "hello\x00<3>injected", (), None)
+    )
+    assert "\x00" not in nul
+    nul_lines = nul.split("\n")
+    assert len(nul_lines) == 1
+    assert nul_lines[0].startswith("<4>")
+    assert "\\x00" in nul_lines[0]
+
+    # A line past journald's default 48 KiB LineMax would otherwise continue at info.
+    long_lines = formatter.format(
+        logging.LogRecord("api.test", logging.ERROR, __file__, 1, "E" * (48 * 1024), (), None)
+    ).split("\n")
+    assert sum(line.startswith("<3>") for line in long_lines) == 1
+    assert long_lines[0].startswith("<3>")
+    assert all(line.startswith("<7>") for line in long_lines[1:])
+    assert all(len(line.encode()) <= 48 * 1024 for line in long_lines)

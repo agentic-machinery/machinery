@@ -331,6 +331,7 @@ tests/common/test_github_request_normalizer.py
 tests/common/test_github_slice1_landing_guard.py
 tests/common/test_hramatka_scope_gate.py
 tests/common/test_http_status.py
+tests/common/test_journal_severity.py
 tests/common/test_jsonl.py
 tests/common/test_jsonl_readers_ai_agent_bridge.py
 tests/common/test_jsonl_readers_fleet_comms.py
