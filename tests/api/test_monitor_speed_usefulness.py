@@ -155,7 +155,7 @@ assert.doesNotMatch(renderWorkers({tasks: []}), /unfinished|zombie/);
 
 def test_home_hides_stale_subscription_quota_and_api_balances():
     """Stale or unverified readings must not render actionable quota, pace, reset or balance numbers."""
-    subs_script = _page_script("subscriptions.html", until="\nconst PANELS = [")
+    subs_script = _page_script("models.html", until="\nconst PANELS = [")
     overview_script = _page_script("index.html", until="\nconst PANELS = [")
     _node(
         _DOM
@@ -262,8 +262,8 @@ assert.match(renderAlerts({status: 'ok', heartbeat: true, alerts: [
 
 def test_home_comms_collection_errors_are_unavailable_even_when_store_exists():
     """A collector failure must not appear as successful plane access just because the database exists."""
-    fleet_script = _page_script("fleet.html", until="\nconst PANELS = [")
-    _node(_DOM + _machinery_js_prelude() + fleet_script + r"""
+    comms_script = _page_script("comms.html", until="\nconst PANELS = [")
+    _node(_DOM + _machinery_js_prelude() + comms_script + r"""
 const metrics = {source: 'authority', store: {reachable: true}, deliveries: {queued: 99}};
 assert.match(renderComms(metrics), /authority reachable/);
 for (const failure of [{db_error: 'DatabaseError'}, {db_missing: true}]) {
@@ -375,21 +375,22 @@ globalThis.fetch = async (url) => {
 def test_home_announces_panel_status_and_has_skip_purpose_and_sites_label():
     """Defect class: a panel status change is silent, or the skip link, sites label, or purpose line is missing."""
     dashboards = machinery_path("api/dashboards")
-    for name in ("index.html", "subscriptions.html", "fleet.html", "pull-requests.html", "milestones.html", "model-stats.html", "journal.html"):
+    for name in ("index.html", "fleet.html", "comms.html", "pull-requests.html", "milestones.html", "models.html", "journal.html"):
         page = (dashboards / name).read_text()
         assert 'class="skip" href="#main"' in page, name
         assert '<main id="main" tabindex="-1">' in page, name
         assert 'aria-label="Sites"' in page, name
     assert (dashboards / "index.html").read_text().count('aria-live="polite"') == 4
-    subs_page = (dashboards / "subscriptions.html").read_text()
-    assert subs_page.count('aria-live="polite"') == 1
-    assert "Which subscription is near its limit, when it resets, and whether anything is signed out." in subs_page
-    assert (dashboards / "fleet.html").read_text().count('aria-live="polite"') == 5
+    assert (dashboards / "fleet.html").read_text().count('aria-live="polite"') == 3
+    assert (dashboards / "comms.html").read_text().count('aria-live="polite"') == 2
+    models_page = (dashboards / "models.html").read_text()
+    assert models_page.count('aria-live="polite"') == 4
+    assert "What can be spent now, where recent work was routed, and which model gives the best value." in models_page
     assert (dashboards / "pull-requests.html").read_text().count('aria-live="polite"') == 1
     assert (dashboards / "milestones.html").read_text().count('aria-live="polite"') == 1
     assert (dashboards / "journal.html").read_text().count('aria-live="polite"') == 1
 
-    subs_script = _page_script("subscriptions.html")
+    models_script = _page_script("models.html")
     fleet_script = _page_script("fleet.html")
     _node(
         r"""
@@ -418,21 +419,21 @@ globalThis.fetch = async (url) => {
 };
 """
         + _machinery_js_prelude()
-        + "const subsRunner = (() => {\n" + subs_script + "\nreturn runner;\n})();\n"
+        + "const modelsRunner = (() => {\n" + models_script + "\nreturn runner;\n})();\n"
         + "const fleetRunner = (() => {\n" + fleet_script + "\nreturn runner;\n})();\n"
         + r"""
 (async () => {
-  await subsRunner.refreshAll();
+  await modelsRunner.refreshAll();
   await fleetRunner.refreshAll();
-  assert.ok(announced.indexOf('Loading Subscriptions.') < announced.indexOf("Subscriptions isn't available in this view."));
+  assert.ok(announced.indexOf('Loading Budget now.') < announced.indexOf("Budget now isn't available in this view."));
   assert.equal(announced.filter(item => item === 'Agent fleet loaded.').length, 1);
   failSubscriptions = false;
-  await subsRunner.refreshAll();
+  await modelsRunner.refreshAll();
   await fleetRunner.refreshAll();
-  assert.equal(announced.filter(item => item === 'Subscriptions loaded.').length, 1);
-  await subsRunner.refreshAll();
+  assert.equal(announced.filter(item => item === 'Budget now loaded.').length, 1);
+  await modelsRunner.refreshAll();
   await fleetRunner.refreshAll();
-  assert.equal(announced.filter(item => item === 'Subscriptions loaded.').length, 1);
+  assert.equal(announced.filter(item => item === 'Budget now loaded.').length, 1);
   assert.equal(announced.filter(item => item === 'Agent fleet loaded.').length, 1);
 })().catch(error => {console.error(error); process.exitCode = 1;});
 """
@@ -518,7 +519,7 @@ assert.doesNotMatch(clear, /unknown|chip bad|chip warn/);
 
 def test_panel_age_is_the_snapshot_header_plus_elapsed():
     """Defect class: client-side age from observed_at, or Number('') becoming 0, disagrees with the server snapshot age."""
-    subs_script = _page_script("subscriptions.html", until="\nconst PANELS = [")
+    subs_script = _page_script("models.html", until="\nconst PANELS = [")
     _node(_DOM + _machinery_js_prelude() + subs_script + r"""
 const {headingAge, panelAgeSeconds} = Machinery;
 const now = Date.now();
