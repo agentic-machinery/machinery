@@ -280,6 +280,26 @@ def test_task_detail_falls_back_to_archived_record_and_result(tmp_path, monkeypa
     assert data["result"] == "archived reply"
 
 
+def test_task_detail_never_publishes_a_turns_lease_envelope(tmp_path, monkeypatch):
+    """Defect class: lease takeover by an unauthorized local caller. A dispatch turn's record keeps its exact
+    Monitor lease envelope; serving it on task detail let any loopback reader renew or release the turn's lease."""
+    from lu_machinery.dispatcher.host_admission import TURN_LEASE_KEY
+
+    tasks_dir = tmp_path / "tasks"
+    _pin_tasks_dir(monkeypatch, tasks_dir)
+    envelope = {"monitor": "http://127.0.0.1:8765", "lease": {"session_id": "turn-session-x", "lease_id": "turn-lease-x"}}
+    # A terminal-abandon succession receipt copies the driver's lease, also inside preserved artifacts.
+    authority = {"stream_id": "epic:1", "session_id": "session-d", "lease_id": "lease-driver", "generation": 1}
+    receipt = {"succession": {"schema": "terminal-abandon-succession.v1", "authority": authority}}
+    nested = {"worktree_abandon": receipt, "preserved_artifacts": [{"abandon_proof": receipt}]}
+    for path, task_id in ((tasks_dir / "turn-hot.json", "turn-hot"), (tasks_dir / "archive" / "turn-old.json", "turn-old")):
+        _write_task(path, {**_task_payload(task_id, status="done"), TURN_LEASE_KEY: envelope, **nested})
+        data = client.get(f"/api/delegate/tasks/{task_id}").json()
+        assert data["task"]["task_id"] == task_id and TURN_LEASE_KEY not in data["task"], data
+        assert data["task"]["worktree_abandon"]["succession"]["authority"]["generation"] == 1  # the receipt stays
+        assert "turn-lease-x" not in json.dumps(data) and "lease-driver" not in json.dumps(data)
+
+
 def test_task_listing_keeps_archived_history_and_active_views_stay_hot(tmp_path, monkeypatch):
     """#8625: status=all and terminal filters read archive/; active queries read the hot directory only."""
     tasks_dir = tmp_path / "tasks"
