@@ -1,6 +1,5 @@
 """Exercise the daily report with a journalctl fake and a private task store."""
 
-import hashlib
 import json
 import os
 import subprocess
@@ -233,6 +232,14 @@ def _publish(directory: Path, day: str = _DAY) -> subprocess.CompletedProcess[st
     )
 
 
+def _proposal_days(proposals: dict[str, str]) -> list[str]:
+    """Each Fleet key is bound to its day, sender and body; return the days in order."""
+    days = [key.split(":")[2] for key in proposals]
+    expected = [digest._proposal_key(day, "devops", body) for day, body in zip(days, proposals.values(), strict=True)]
+    assert list(proposals) == expected
+    return days
+
+
 def test_second_run_same_day_adds_no_entry_or_message(journal, destinations, monkeypatch):
     """A rerun can duplicate the journal entry or Fleet proposal."""
     directory = journal([_entry(PRIORITY="3"), _entry(PRIORITY="3")])
@@ -245,8 +252,9 @@ def test_second_run_same_day_adds_no_entry_or_message(journal, destinations, mon
     first = _publish(directory)
     assert first.returncode == 0, first.stderr
     notes, proposals = destinations("journal"), destinations("fleet")
-    key, fleet_key = f"error-digest:{_DAY}", f"error-digest:v2:{_DAY}"
-    assert list(notes) == [key] and list(proposals) == [fleet_key]
+    key = f"error-digest:{_DAY}"
+    assert list(notes) == [key] and _proposal_days(proposals) == [_DAY]
+    (fleet_key,) = proposals
     assert notes[key].startswith(f"Error digest {_DAY}: 2 errors, 0 warnings, 1 kinds (1 new); 0 units unproven")
     assert "Full table: error-digest-2025-02-01.json" in notes[key]
     assert "| writer.service | 2 | 0 | 0 | tagged |" in notes[key]
@@ -273,7 +281,7 @@ def test_second_run_same_day_adds_no_entry_or_message(journal, destinations, mon
     assert destinations("journal") == notes
     next_key = f"error-digest:{next_day}"
     proposals = destinations("fleet")
-    assert list(proposals) == [fleet_key, f"error-digest:v2:{next_day}"]
+    assert _proposal_days(proposals) == [_DAY, next_day] and next(iter(proposals)) == fleet_key
 
     monkeypatch.delenv("DIGEST_FAKE_JOURNAL_FAIL")
     recovered = _publish(directory, next_day)
@@ -295,12 +303,11 @@ def test_failed_publish_leaves_ledger_unchanged(journal, destinations, monkeypat
     assert "Fleet publish: unavailable (write_refused)" in failed.stderr
     assert ledger.read_bytes() == previous
     assert destinations("fleet") == {}
-    key, fleet_key = f"error-digest:{_DAY}", f"error-digest:v2:{_DAY}"
+    key = f"error-digest:{_DAY}"
     state = directory / ".error-digest-publish.v2.json"
     attempt = json.loads(state.read_bytes())["attempt"]
-    assert attempt["key"] == fleet_key
-    body_sha = hashlib.sha256(attempt["body"].encode()).hexdigest()
-    assert f"Fleet proposal for {_DAY} not confirmed, body SHA-256 {body_sha}" in destinations("journal")[key]
+    assert (attempt["day"], attempt["sender"]) == (_DAY, "devops")
+    assert f"Fleet proposal for {_DAY} (1 kinds) not confirmed" in destinations("journal")[key]
 
     # An ambiguous completion on a later run must still leave the kind ledger
     # unchanged. The pending proposal is resent under its own key, never a fresh one.
@@ -311,16 +318,18 @@ def test_failed_publish_leaves_ledger_unchanged(journal, destinations, monkeypat
     assert ambiguous.returncode == 1
     assert ledger.read_bytes() == previous
     fleet = destinations("fleet")
-    assert fleet == {fleet_key: attempt["body"]}
+    assert _proposal_days(fleet) == [_DAY]
+    (fleet_key,) = fleet
     assert json.loads(state.read_bytes())["attempt"] == attempt
 
     monkeypatch.delenv("DIGEST_FAKE_FLEET_FAIL")
     next_run = _publish(directory, next_day)
     assert next_run.returncode == 0, next_run.stderr
-    next_key, next_fleet_key = f"error-digest:{next_day}", f"error-digest:v2:{next_day}"
+    next_key = f"error-digest:{next_day}"
     proposals = destinations("fleet")
-    assert sorted(proposals) == [fleet_key, next_fleet_key]
+    assert _proposal_days(proposals) == [_DAY, next_day]
     assert proposals[fleet_key] == fleet[fleet_key]
+    next_fleet_key = list(proposals)[1]
     kind = digest.signature("journal", "writer.service", "error", "worker failed")
     new_kind = digest.signature("journal", "writer.service", "error", "new failure")
     assert new_kind in proposals[next_fleet_key] and kind not in proposals[next_fleet_key]
