@@ -1419,7 +1419,7 @@ def get_acp_conversation(conversation_id: str, *, ctx: MonitorContext) -> dict[s
         connection.close()
 
 
-_ACP_TRANSCRIPT_ALLOWED_FETCH_SITES = frozenset({"same-origin", "none"})
+_ALLOWED_FETCH_SITES = frozenset({"same-origin", "none"})
 MONITOR_ALLOWED_HOSTS_ENV = "LU_MONITOR_ALLOWED_HOSTS"
 _LOOPBACK_HOST_ALIASES: tuple[str, ...] = ("localhost", "127.0.0.1", "[::1]")
 _DNS_LABEL_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
@@ -1616,6 +1616,22 @@ def _bound_acp_listener(request: Request) -> tuple[str, int] | None:
     return authority_host, raw_port
 
 
+def browser_request_access_refusal(request: Request) -> str | None:
+    """Reject cross-origin browser requests while permitting tools without browser headers."""
+    origins = request.headers.getlist("origin")
+    if origins:
+        hosts = request.headers.getlist("host")
+        scheme = request.scope.get("scheme")
+        if len(origins) != 1 or len(hosts) != 1 or scheme not in {"http", "https"}:
+            return "invalid_origin"
+        if origins[0] != f"{scheme}://{hosts[0]}":
+            return "invalid_origin"
+    fetch_sites = request.headers.getlist("sec-fetch-site")
+    if fetch_sites and (len(fetch_sites) != 1 or fetch_sites[0] not in _ALLOWED_FETCH_SITES):
+        return "cross_site_request"
+    return None
+
+
 def local_body_read_access_refusal(request: Request) -> str | None:
     """Shared guard for all body-bearing Monitor routes; returns a typed refusal reason or ``None``.
 
@@ -1637,18 +1653,12 @@ def local_body_read_access_refusal(request: Request) -> str | None:
     listener_host, listener_port = listener
 
     hosts: list[str] = []
-    origins: list[str] = []
-    fetch_sites: list[str] = []
     for raw_name, raw_value in request.headers.raw:
         name = raw_name.decode("latin-1").strip().lower()
         if name == "forwarded" or name.startswith("x-forwarded-"):
             return "forwarding_header_present"
         if name == "host":
             hosts.append(raw_value.decode("latin-1"))
-        elif name == "origin":
-            origins.append(raw_value.decode("latin-1"))
-        elif name == "sec-fetch-site":
-            fetch_sites.append(raw_value.decode("latin-1"))
 
     client = request.client
     client_host = client.host if client else None
@@ -1671,12 +1681,7 @@ def local_body_read_access_refusal(request: Request) -> str | None:
     allowed_hosts = _loopback_allowed_hosts(listener_host, listener_port) | configured_hosts
     if len(hosts) != 1 or hosts[0] not in allowed_hosts:
         return "invalid_host"
-    expected_origin = f"http://{hosts[0]}"
-    if len(origins) > 1 or (len(origins) == 1 and origins[0] != expected_origin):
-        return "invalid_origin"
-    if len(fetch_sites) > 1 or (len(fetch_sites) == 1 and fetch_sites[0] not in _ACP_TRANSCRIPT_ALLOWED_FETCH_SITES):
-        return "cross_site_request"
-    return None
+    return browser_request_access_refusal(request)
 
 
 def local_body_read_refusal_response(request: Request) -> JSONResponse | None:
@@ -1684,6 +1689,11 @@ def local_body_read_refusal_response(request: Request) -> JSONResponse | None:
     refusal = local_body_read_access_refusal(request)
     if refusal is None:
         return None
+    return monitor_access_refusal_response(refusal)
+
+
+def monitor_access_refusal_response(refusal: str) -> JSONResponse:
+    """Report a typed Monitor request refusal without caching it."""
     return JSONResponse(
         status_code=403,
         content={"detail": "Forbidden", "reason": refusal},

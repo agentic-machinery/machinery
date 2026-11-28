@@ -31,7 +31,6 @@ from urllib.parse import parse_qs
 
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, Response
 from prometheus_client import CollectorRegistry, Counter, Histogram, generate_latest
 from prometheus_client.core import Metric
@@ -2076,6 +2075,21 @@ class PrometheusMetricsMiddleware:
             self._errors.labels(**labels).inc()
 
 
+class MonitorBrowserRequestMiddleware:
+    """Apply the browser request guard before any Monitor HTTP route runs."""
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] == "http":
+            refusal = runtime_api.browser_request_access_refusal(Request(scope))
+            if refusal is not None:
+                await runtime_api.monitor_access_refusal_response(refusal)(scope, receive, send)
+                return
+        await self.app(scope, receive, send)
+
+
 def create_app(
     context: MonitorContext,
     *,
@@ -2118,13 +2132,7 @@ def create_app(
     factory_app.state.product = product
     factory_app.state.metrics_snapshot = metrics.snapshot
     install_providers(product)
-    factory_app.add_middleware(
-        CORSMiddleware,
-        allow_origins=["*"],
-        allow_credentials=False,
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
+    factory_app.add_middleware(MonitorBrowserRequestMiddleware)
     factory_app.middleware("http")(resilience_middleware)
     factory_app.middleware("http")(opsec_path_sanitizer_middleware)
     factory_app.add_middleware(metrics.wrap)
