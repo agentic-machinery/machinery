@@ -1432,6 +1432,8 @@ class Cut:
             raise CutError("product runtime sandbox requires bubblewrap")
         boundary: list[str | Path] = [
             "--die-with-parent", "--ro-bind", "/", "/", "--dev", "/dev", "--remount-ro", "/dev",
+            # pytest_scratch falls back here if it cannot trust the ancestry of TMPDIR.
+            "--perms", "0700", "--tmpfs", "/dev/shm",
             "--bind", self.work, self.work,
         ]
         default_context_dir = host_context.DEFAULT_PATH.parent
@@ -1445,27 +1447,32 @@ class Cut:
             LEARN_UKRAINIAN_PYTHON=str(python),
         )
         node, npm = node_tools
-        deploy_env = {
-            **env,
-            "PATH": f"{python.parent}:{Path(node).parent}:{env['PATH']}",
-            "npm_config_offline": "true",
-            "npm_config_cache": str(self.work / "npm-cache"),
-        }
         commands = (
-            ("product key tests", [python, "-m", "pytest", "-q", "--maxfail=1", *tests], env),
+            ("product key tests", [python, "-m", "pytest", "-q", "--maxfail=1", *tests]),
             ("Verify Agent Deployment",
-             [node, npm, "run", "--silent", "--if-present=false", "--script-shell=/bin/sh", "agents:deploy"], deploy_env),
+             [node, npm, "run", "--silent", "--if-present=false", "--script-shell=/bin/sh", "agents:deploy"]),
         )
-        for name, argv, command_env in commands:
-            self.step = name
-            result = self.run(
-                [Path(bwrap).absolute(), *boundary, "--", *argv],
-                cwd=product, env=command_env, timeout=300, check=False, kill_group=True,
-            )
-            if result.returncode:
-                failure = "product runtime sandbox could not start" if result.stderr.startswith("bwrap:") else f"{name} failed"
-                raise CutError(f"{failure} (exit {result.returncode}); see cut.log")
-            self.say(f"{name} passed with the candidate wheel")
+        with tempfile.TemporaryDirectory(prefix="consumer-state-", dir=self.work) as scratch:
+            for name, argv in commands:
+                self.step = name
+                command_env = env
+                if name == "Verify Agent Deployment":
+                    # The product launcher resolves its interpreter through an explicit binding.
+                    command_env = self._consumer_env(Path(scratch), python, product)
+                    command_env.update(
+                        LU_PYTHON=str(python),
+                        PATH=f"{python.parent}:{Path(node).parent}:{command_env['PATH']}",
+                        npm_config_offline="true",
+                        npm_config_cache=str(self.work / "npm-cache"),
+                    )
+                result = self.run(
+                    [Path(bwrap).absolute(), *boundary, "--", *argv],
+                    cwd=product, env=command_env, timeout=300, check=False, kill_group=True,
+                )
+                if result.returncode:
+                    failure = "product runtime sandbox could not start" if result.stderr.startswith("bwrap:") else f"{name} failed"
+                    raise CutError(f"{failure} (exit {result.returncode}); see cut.log")
+                self.say(f"{name} passed with the candidate wheel")
 
     def contract_canary(self) -> subprocess.CompletedProcess[str]:
         """The candidate's canary orchestration and sealed candidate receipt gate."""
