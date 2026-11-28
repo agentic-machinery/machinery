@@ -10,11 +10,15 @@ Run the same work as [full-send](../full-send/SKILL.md) steps 1 to 7, then hand 
 ready to merge. Anyone may run this skill, including workers. Its terminal is `ready`, never
 `merge`.
 
-Recipes run with the primary checkout's interpreter, resolved once
+Recipes run with the bound machinery runtime interpreter (`LU_PYTHON`), resolved once
 ([delivery](../full-send/references/delivery.md#interpreter)):
 
 ```bash
-PY="$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")/.venv/bin/python"
+if [[ "${LU_PYTHON:-}" != /* || ! -f "$LU_PYTHON" || ! -x "$LU_PYTHON" ]]; then
+  printf '%s\n' 'Error: missing_interpreter_binding: LU_PYTHON must name an absolute executable.' >&2
+  exit 1
+fi
+PY="$LU_PYTHON"
 ```
 
 ## Never merge

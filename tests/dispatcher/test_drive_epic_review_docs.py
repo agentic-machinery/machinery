@@ -30,9 +30,45 @@ from tests.helpers.product_tree import configured_roots  # noqa: F401
 
 
 REFERENCE = machinery_path("agents_extensions/shared/skills/drive-epic/references/review-merge-cleanup.md")
+REPO_ROOT = REFERENCE.parents[5]
 
 HEAD = "a" * 40
 NONCE = "run-nonce-fixture"
+
+# The five delivery recipes. A target checkout's .venv is not the machinery runtime.
+_DELIVERY_RECIPE_SITES = (
+    "agents_extensions/shared/skills/review-loop/SKILL.md",
+    "agents_extensions/shared/skills/full-send/SKILL.md",
+    "agents_extensions/shared/skills/full-stop/SKILL.md",
+    "agents_extensions/shared/skills/full-send/references/delivery.md",
+    "agents_extensions/shared/skills/drive-epic/references/review-merge-cleanup.md",
+)
+
+
+def _first_py_setup(text: str) -> str:
+    """The bash fence prefix that assigns PY, inclusive of that assignment."""
+    for block in re.findall(r"^```bash\n(.*?)^```", text, re.M | re.S):
+        lines = []
+        for line in block.splitlines():
+            lines.append(line)
+            if line.startswith("PY="):
+                return "\n".join(lines).strip()
+    raise AssertionError("bash fence does not assign PY")
+
+
+def _runtime_env(lu_python: str | None) -> dict[str, str]:
+    env = {"PATH": os.environ["PATH"], "HOME": os.environ.get("HOME", "/tmp")}
+    if lu_python is not None:
+        env["LU_PYTHON"] = lu_python
+    return env
+
+
+def _make_venv(path: Path) -> Path:
+    subprocess.run(
+        [sys.executable, "-m", "venv", "--without-pip", str(path)],
+        check=True, capture_output=True, text=True, timeout=30,
+    )
+    return path / "bin" / "python"
 
 
 def _canonical_review_asks():
@@ -296,9 +332,8 @@ def test_documented_shell_continues_only_same_nonce_wait(tmp_path, scenario, exp
     recipe = next(
         block for block in re.findall(r"^```bash\n(.*?)^```", body, re.M | re.S) if "dispatch_result=" in block
     )
-    # Replace only the interpreter boundary; keep the documented shell, parser,
-    # flags, stdout capture and continuation logic intact.
-    recipe = recipe.replace('PY="$PRIMARY_REPO/.venv/bin/python"', 'PY="$RECIPE_PY"')
+    # The fence resolves PY from LU_PYTHON. Point that binding at the stub and
+    # keep the documented shell, parser, flags and continuation logic intact.
     helper = tmp_path / "native_boundary.py"
     helper.write_text(
         """import json, os, subprocess, sys
@@ -375,7 +410,7 @@ raise SystemExit(dispatch_cli.main(argv))
         timeout=45,
         env={
             **{key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
-            "RECIPE_PY": str(executable),
+            "LU_PYTHON": str(executable),
             "RECIPE_REPO": str(REFERENCE.parents[5]),
             "RECIPE_CALLS": str(call_file),
             "RECIPE_SCENARIO": scenario,
@@ -568,7 +603,6 @@ raise SystemExit(dispatch_cli.main(argv))
     # Execute the documented initialization, recovery fence and existing loop verbatim;
     # substitute only the interpreter boundary, never initialize REVIEW_NONCE in the test.
     initialization = launch.split("# If requires_silence_timeout", 1)[0]
-    initialization = initialization.replace('PY="$PRIMARY_REPO/.venv/bin/python"', 'PY="$RECIPE_PY"')
     loop = "while true; do" + launch.split("while true; do", 1)[1]
     env = {key: value for key, value in os.environ.items() if key not in ("REVIEW_NONCE", "PYTHONPATH")}
     result = subprocess.run(
@@ -579,7 +613,7 @@ raise SystemExit(dispatch_cli.main(argv))
         timeout=45,
         env={
             **env,
-            "RECIPE_PY": str(executable),
+            "LU_PYTHON": str(executable),
             "RECIPE_REPO": str(REFERENCE.parents[5]),
             "RECIPE_ROOT": str(tmp_path),
             "RECIPE_SCENARIO": scenario,
@@ -603,6 +637,63 @@ raise SystemExit(dispatch_cli.main(argv))
         assert result.stdout == ""
     else:
         assert "invalid task identity/nonce" in result.stderr
+
+
+def test_recipes_run_machinery_modules_with_bound_runtime(tmp_path):
+    """Defect class: recipe picks a target-checkout venv without lu_machinery.
+
+    Each delivery recipe, run from a target checkout, must import lu_machinery
+    with the bound runtime (LU_PYTHON) and refuse when that binding is missing.
+    """
+    target_root = tmp_path / "target"
+    target_root.mkdir()
+    subprocess.run(
+        ["git", "init", "-q", "-b", "main", str(target_root)],
+        check=True, capture_output=True, text=True, timeout=30, env=_runtime_env(None),
+    )
+    target_python = _make_venv(target_root / ".venv")
+    machinery_python = _make_venv(tmp_path / "machinery-venv")
+    purelib = subprocess.run(
+        [str(machinery_python), "-c", "import sysconfig; print(sysconfig.get_path('purelib'))"],
+        check=True, capture_output=True, text=True, timeout=30,
+    ).stdout.strip()
+    Path(purelib, "lu_machinery_repo.pth").write_text(f"{REPO_ROOT}\n", encoding="utf-8")
+    denied = subprocess.run(
+        [str(target_python), "-c", "import lu_machinery"],
+        cwd=target_root, capture_output=True, text=True, timeout=30, env=_runtime_env(None),
+    )
+    assert denied.returncode != 0
+
+    probe = "\"$PY\" -c 'import lu_machinery, sys; print(sys.executable)'"
+    bound = _runtime_env(str(machinery_python))
+    for relative in _DELIVERY_RECIPE_SITES:
+        setup = _first_py_setup((REPO_ROOT / relative).read_text(encoding="utf-8"))
+        assert "git-common-dir" not in setup
+        assert "missing_interpreter_binding" in setup
+        result = subprocess.run(
+            ["bash", "-c", f"set -euo pipefail\n{setup}\n{probe}"],
+            cwd=target_root, capture_output=True, text=True, timeout=30, env=bound,
+        )
+        assert result.returncode == 0, (relative, result.stderr)
+        assert result.stdout.strip() == str(machinery_python)
+
+        for label, value in (
+            ("unset", None),
+            ("empty", ""),
+            ("relative", "python"),
+            ("missing", str(tmp_path / "missing-python")),
+            ("directory", str(tmp_path)),
+            ("not-executable", str(tmp_path / "plain")),
+        ):
+            if label == "not-executable":
+                Path(value).write_text("", encoding="utf-8")
+            refused = subprocess.run(
+                ["bash", "-c", f"set -euo pipefail\n{setup}\n"],
+                cwd=target_root, capture_output=True, text=True, timeout=30,
+                env=_runtime_env(value),
+            )
+            assert refused.returncode != 0, (relative, label)
+            assert "missing_interpreter_binding" in refused.stderr, (relative, label, refused.stderr)
 
 
 pytestmark = pytest.mark.usefixtures("configured_roots")
