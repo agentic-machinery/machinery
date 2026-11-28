@@ -17,7 +17,7 @@ pytest scratch is deleted directly, without quarantine.
 
 `learn-ukrainian-tmp-sweep.timer` runs every hour at 30 minutes past, UTC,
 with up to 10 minutes of random delay. Missed runs catch up. It starts
-`learn-ukrainian-tmp-sweep.service`, which runs three steps in order:
+`learn-ukrainian-tmp-sweep.service`, which runs five passes in order:
 
 1. `lu_machinery.hygiene.batch_state_retention`: the read-only staleness report.
 2. `lu_machinery.hygiene.tmp_sweep --unattributed-scratch --apply --summary`: the
@@ -25,8 +25,18 @@ with up to 10 minutes of random delay. Missed runs catch up. It starts
    ones and deletes inactive, unheld pytest run folders. It logs counts and
    byte totals only, never entry names; the ledger holds the quarantined
    names.
-3. `lu_machinery.hygiene.tmp_sweep --batch-state --apply --summary`: explicit
+3. `lu_machinery.hygiene.tmp_sweep --temp-root /var/tmp --settled-task-only --apply --summary`:
+   quarantines and purges only settled-task scratch in `/var/tmp` and skips
+   the pytest pass (see Dispatched task scratch below).
+4. `lu_machinery.maintenance.task_log_retention --apply --summary`: unlinks
+   dispatch stdout and stderr logs after all their runs settle, once the log
+   and every run's finish are seven days old (see Dispatch stdout and stderr
+   log expiry below).
+5. `lu_machinery.hygiene.tmp_sweep --batch-state --apply --summary`: explicit
    batch_state scratch expiry (see below).
+
+Every pass except the last is prefixed `-`, so a failing pass is logged and
+the later passes still run; the unit result reflects only the last pass.
 
 The unit does not set `RestrictAddressFamilies=`. In a user manager every
 seccomp setting forces `NoNewPrivileges=yes`, and sudo then refuses to run.
@@ -603,8 +613,8 @@ are excluded from this staleness report; the sweep ledger owns them.
 
 The scheduled tmp-sweep service runs a final
 `lu_machinery.hygiene.tmp_sweep --batch-state --apply --summary` pass, including
-through the data-volume guard dropin. A failed earlier service command stops
-the later commands and retains scratch. Inspect without changing anything:
+through the data-volume guard dropin. A failed earlier pass is logged and
+does not stop this pass. Inspect without changing anything:
 
 ```bash
 .venv/bin/python -m lu_machinery.hygiene.tmp_sweep --batch-state --summary
