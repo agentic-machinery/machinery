@@ -111,7 +111,7 @@ def test_task_log_expiry_requires_every_run_old_settled_and_unheld(
         assert task_log_retention.main([]) == 0
         report = json.loads(capsys.readouterr().out)
         assert report == {
-            "mode": "dry-run", "selected": 3, "logs": eligible,
+            "mode": "dry-run", "selected": 3, "eligible_bytes": 45, "logs": eligible,
             "retained": {
                 "log_not_regular": 2, "log_too_recent": 1, "retention_hold": 2, "retention_hold_invalid": 1,
                 "task_finish_unknown": 1, "task_liveness_unproven": 3, "task_lock_busy": 1,
@@ -134,6 +134,7 @@ def test_task_log_expiry_requires_every_run_old_settled_and_unheld(
         assert task_log_retention.main(["--apply", "--summary"]) == 0
         held = json.loads(capsys.readouterr().out)
         assert held["selected"] == 0
+        assert held["eligible_bytes"] == 0
         assert held["retained"]["batch_state_hold"] == len(old_logs) - len(eligible) - 1
         assert {entry.name for entry in logs.iterdir()} == before.difference(eligible)
 

@@ -15,6 +15,7 @@ from collections import Counter, defaultdict
 from contextlib import ExitStack
 from datetime import datetime
 from pathlib import Path
+from typing import NamedTuple
 
 from lu_machinery.common.task_store_paths import tasks_dir
 from lu_machinery.dispatcher import store, worker
@@ -162,23 +163,34 @@ def _candidate_logs(logs_fd: int, cutoff: float, retained: Counter[str]) -> dict
     return candidates
 
 
-def sweep(task_root: Path, *, cutoff: float, apply: bool) -> tuple[list[str], Counter[str]]:
-    """Return expired (or dry-run eligible) basenames and counts for retained entries."""
+class SweepResult(NamedTuple):
+    """Eligible (or unlinked) basenames, retained entry counts, and exact eligible byte total."""
+
+    eligible: list[str]
+    retained: Counter[str]
+    eligible_bytes: int
+
+
+def sweep(task_root: Path, *, cutoff: float, apply: bool) -> SweepResult:
+    """Return expired (or dry-run eligible) basenames, retained counts, and eligible bytes."""
     if not task_root.is_absolute():
         raise ValueError("task root must be absolute")
+    if not math.isfinite(cutoff):
+        raise ValueError("cutoff must be finite")
     eligible: list[str] = []
     retained: Counter[str] = Counter()
+    eligible_bytes = 0
     hold = any(entry["parts"][0] == "tasks" for entry in load_holds(RETENTION_LIST))
     with ExitStack() as roots:
         tasks_fd = os.open(task_root, _DIR_FLAGS)
         roots.callback(os.close, tasks_fd)
         logs_fd = _open_child(tasks_fd, "logs", roots)
         if logs_fd is None:
-            return eligible, retained
+            return SweepResult(eligible, retained, eligible_bytes)
         candidates = _candidate_logs(logs_fd, cutoff, retained)
         if hold:
             retained["batch_state_hold"] += sum(map(len, candidates.values()))
-            return eligible, retained
+            return SweepResult(eligible, retained, eligible_bytes)
 
         task_ids = tuple(candidates)
         for offset in range(0, len(task_ids), _LOCK_BATCH_SIZE):
@@ -217,7 +229,8 @@ def sweep(task_root: Path, *, cutoff: float, apply: bool) -> tuple[list[str], Co
                             retained["log_io_error"] += 1
                         else:
                             eligible.append(name)
-    return eligible, retained
+                            eligible_bytes += info.st_size
+    return SweepResult(eligible, retained, eligible_bytes)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -228,7 +241,7 @@ def main(argv: list[str] | None = None) -> int:
         epilog="Examples:\n"
         "  .venv/bin/python -m lu_machinery.maintenance.task_log_retention\n"
         "  .venv/bin/python -m lu_machinery.maintenance.task_log_retention --apply --summary\n"
-        "Outputs: JSON counts and eligible basenames. Only --apply unlinks logs.\n"
+        "Outputs: JSON counts, eligible_bytes and eligible basenames. Only --apply unlinks logs.\n"
         "Exit codes: 0 completed, 1 I/O or store failure, 2 invalid arguments.\n"
         "Related: docs/runbooks/tmp-retention.md, issue #1206.",
     )
@@ -241,13 +254,14 @@ def main(argv: list[str] | None = None) -> int:
     if not math.isfinite(age) or age <= 0:
         parser.error("--min-age-days must be finite and positive")
     try:
-        eligible, retained = sweep(tasks_dir(), cutoff=time.time() - age, apply=args.apply)
+        eligible, retained, eligible_bytes = sweep(tasks_dir(), cutoff=time.time() - age, apply=args.apply)
     except (OSError, ValueError) as error:
         print(json.dumps({"error": "task_log_inventory_unavailable", "kind": type(error).__name__}))
         return 1
     report: dict[str, object] = {
         "mode": "apply" if args.apply else "dry-run",
         "selected": len(eligible),
+        "eligible_bytes": eligible_bytes,
         "retained": dict(retained),
     }
     if not args.summary:

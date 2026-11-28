@@ -468,6 +468,7 @@ tests/lib/test_start_cto_wrappers.py
 tests/maintenance/test_batch_state_retention.py
 tests/maintenance/test_claude_session_scratch.py
 tests/maintenance/test_github_cache.py
+tests/maintenance/test_task_log_retention.py
 tests/ops/test_clear_stale_git_lock.py
 tests/ops/test_context_cost_report.py
 tests/ops/test_context_guard.py
