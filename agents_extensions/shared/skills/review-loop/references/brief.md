@@ -149,13 +149,13 @@ The reviewer marks every earlier id `resolved` or `still open: <reason>`, confir
 each `not_applicable` claim on its evidence ([findings](policy.md#3-findings)), and contests an
 outcome label its evidence does not support with a line `CONTEST <finding-id>: <reason>` in
 `overall.explanation` (the verdict recorder stores it against the previous blocking round, and
-the label then counts as contested). Delta-round scope, fix-diff regression checks, final-round
-P2 carry, and authorized replacement delta rules follow
-[policy §4](policy.md#4-convergence): when `final_round` is true and every acceptance criterion
-is verified with no open P0, P1, or security finding (current or inherited), the reviewer issues
-APPROVE naming each carried P2 ID, and on `security_paths.py` paths includes the required
-exact-head `SECURITY_VERDICT: PASS` attestation line from the qualified critical reviewer. The
-reply uses the round 1 reply format.
+the label then counts as contested). Delta-round scope, fix-diff regression checks, final-round P2 carry, and authorized replacement
+delta rules follow [policy §3](policy.md#3-findings) and [§4](policy.md#4-convergence):
+final-round approval with carried P2s requires every acceptance criterion verified and no open
+P0, P1, security finding (current or inherited), or blocking §3 uncertainty (retaining the
+Reply format rule to withhold APPROVE when material evidence is pending), and on
+`security_paths.py` paths requires the exact-head `SECURITY_VERDICT: PASS` attestation line
+from the qualified critical reviewer. The reply uses the round 1 reply format.
 
 ## Commands a read-only reviewer can run
 

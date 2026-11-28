@@ -268,7 +268,8 @@ Disposition guide, subject to this round's scope under the review budget:
   [§4](../review-loop/references/policy.md#4-convergence) (including
   out-of-scope defects the PR neither introduces, exposes nor worsens,
   hypothetical/unproven P2 triggers, and newly noticed pre-existing P2s in
-  later rounds); track it with an owner. Style, naming, cleanup and "consider"
+  later rounds that the PR and fix neither introduce, expose, nor worsen);
+  track it with an owner. Style, naming, cleanup and "consider"
   items are not findings.
 - **`stop_and_escalate`** — fixing it would itself blow a breaker (Step 6):
   it changes the public/task contract, crosses an owner boundary, needs a
