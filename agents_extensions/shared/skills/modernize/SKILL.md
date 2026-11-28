@@ -26,15 +26,16 @@ Use a dispatch worktree; treat changes already in another worktree as their owne
 
    ```bash
    git fetch origin
-   gh pr view "$PR" --json state,title,body,baseRefName,headRefName,headRefOid,mergeable,statusCheckRollup,reviews,closingIssuesReferences
-   OLD_HEAD="$(git rev-parse "origin/$BRANCH")"
    BASE_SHA="$(git rev-parse "origin/$BASE")"
+   OLD_HEAD="$(git rev-parse "origin/$BRANCH")"
+   gh pr view "$PR" --json state,title,body,baseRefName,headRefName,headRefOid,mergeable,statusCheckRollup,reviews,closingIssuesReferences
    MERGE_BASE="$(git merge-base "$BASE_SHA" "$OLD_HEAD")"
    ```
 
-   Use the PR's actual base, not an assumed one. `BASE_SHA` is that fetch's `origin/$BASE`.
-   Use it for the later log and range-diff; do not read `origin/$BASE` again. Record state,
-   head, merge-base, checks and reviews.
+   The base and branch names are known before that fetch. `BASE_SHA` and `OLD_HEAD` are
+   taken immediately after it, before any other command. Use those SHAs for the later log
+   and range-diff; do not read `origin/$BASE` again. Record state, head, merge-base, checks
+   and reviews.
 2. **State the original goal in one sentence**, from the title, body, linked issue, commits,
    review threads and the full diff.
 3. **Inspect what changed on the base since it diverged**, beyond overlapping lines:
