@@ -821,6 +821,7 @@ def summary_row(path: Path, record: Mapping[str, Any], source_mtime_ns: int | No
     raw_repo = record.get("repo") if record.get("repo") is not None else options.get("repo")
     repo = "public" if raw_repo is None else label(raw_repo, "unknown")
     raw_class = record.get("data_class") if record.get("data_class") is not None else options.get("data_class")
+    repository = record.get("repository")
     fresh, cached, output = counts
     # Terminal status still decides whether a verdict is stored. A review that is typed, or
     # whose reply validated, is not reported as missing review evidence.
@@ -846,6 +847,8 @@ def summary_row(path: Path, record: Mapping[str, Any], source_mtime_ns: int | No
         "allowance": None if refusal else _allowance(record),
         "review": review,
         "repo": repo,
+        # The GitHub owner/name the task ran on, so a reader can bind a publication without a fleet catalog.
+        "repository": repository if isinstance(repository, str) and REPOSITORY_SLUG.fullmatch(repository) else None,
         "data_class": None if raw_class is None else label(raw_class),
         "pr": int(pr) if isinstance(pr, int | str) and not isinstance(pr, bool) and str(pr).isdigit() else None,
         "pinned_head": head if isinstance(head, str) and _SHA.fullmatch(head) else None,
@@ -1409,7 +1412,8 @@ def _sample_ok(value: object) -> bool:
     )
 
 
-def _review_ok(review: object, *, role: object, status: object, repo: object, data_class: object) -> bool:
+def _review_ok(review: object, *, role: object, status: object, repo: object, data_class: object,
+               check_sample_visibility: bool = True) -> bool:
     if review is None:
         return True
     if role != "review" or status != "done" or not isinstance(review, dict):
@@ -1436,15 +1440,22 @@ def _review_ok(review: object, *, role: object, status: object, repo: object, da
     sample = review["unparsed_sample"]
     if not isinstance(reason, str) or reason not in UNPARSED_REASONS:
         return False
+    if reason in ("missing_result", "too_big"):
+        return sample is None
     # The writer's eligibility rule again: a public repository, and a catalogued public data class when one is named.
-    if reason in ("missing_result", "too_big") or not _repo_is_public(repo) or (
-            data_class is not None and (not isinstance(data_class, str) or data_class not in _public_data_classes())):
+    # Both are catalog facts; a reader that must not depend on a catalog skips them and keeps the sample shape check.
+    if check_sample_visibility and (not _repo_is_public(repo) or (
+            data_class is not None and (not isinstance(data_class, str) or data_class not in _public_data_classes()))):
         return sample is None
     return _optional(sample, _sample_ok)
 
 
-def _well_formed(row: Mapping[str, Any]) -> bool:
-    """Whether every nested value has the shape ``summary_row`` writes; a damaged row is skipped, never trusted."""
+def _well_formed(row: Mapping[str, Any], *, check_sample_visibility: bool = True) -> bool:
+    """Whether every nested value has the shape ``summary_row`` writes; a damaged row is skipped, never trusted.
+
+    ``check_sample_visibility=False`` reads no catalog: an unparsed-reply sample is checked for its own shape only,
+    not for the repository and data-class visibility the writer applied when it stored it.
+    """
     tokens_ = row.get("tokens")
     allowance = row.get("allowance")
     review = row.get("review")
@@ -1464,11 +1475,12 @@ def _well_formed(row: Mapping[str, Any]) -> bool:
                   and (a["pool"] is None or (isinstance(a["pool"], str) and a["pool"] in POOLS))
                   and _reading_ok(a["start"]) and _reading_ok(a["finish"])),
         _review_ok(review, role=row.get("role"), status=row.get("status"), repo=row.get("repo"),
-                   data_class=row.get("data_class")),
+                   data_class=row.get("data_class"), check_sample_visibility=check_sample_visibility),
         _optional(row.get("review_evidence_absent"), lambda flag: flag is True and row.get("role") == "review"
                   and row.get("status") != NEVER_STARTED and (review is None or (
                       isinstance(review, dict) and review.get("verdict") == "unparsed"))),
         _optional(row.get("pr"), _count_value),
+        _optional(row.get("repository"), lambda v: isinstance(v, str) and REPOSITORY_SLUG.fullmatch(v) is not None),
         _optional(row.get("pinned_head"), _sha),
         _optional(landing, lambda d: isinstance(d, dict) and d.keys() == {"pr", "merge_sha"}
                   and _count_value(d["pr"]) and _sha(d["merge_sha"])),

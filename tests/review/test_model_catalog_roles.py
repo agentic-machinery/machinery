@@ -647,6 +647,7 @@ def test_recent_review_counts_reads_published_code_infra_records_and_fails_close
     sha_superseded = "1" * 40
     sha_unclassified = "2" * 40
     sha_bad_selector = "3" * 40
+    sha_other_repo = "4" * 40
 
     def make_row(**overrides):
         base = {
@@ -655,6 +656,7 @@ def test_recent_review_counts_reads_published_code_infra_records_and_fails_close
             "effort": "high",
             "status": "done",
             "repo": "machinery",
+            "repository": repo_slug,
             "tokens": valid_tokens,
         }
         base.update(overrides)
@@ -679,6 +681,8 @@ def test_recent_review_counts_reads_published_code_infra_records_and_fails_close
         {"schema": "review-publication.v1", "task_id": "t-superseded", "repository": repo_slug, "pr": 8, "head": sha_superseded, "verdict": "APPROVED", "published_at": "2026-11-27T11:00:00Z"},
         # F3: unclassified review class must not be counted.
         {"schema": "review-publication.v1", "task_id": "t-unclassified", "repository": repo_slug, "pr": 9, "head": sha_unclassified, "verdict": "APPROVED", "published_at": "2026-11-27T11:00:00Z"},
+        # F10: a publication on another repository earns no credit for the same task id, PR and head.
+        {"schema": "review-publication.v1", "task_id": "t-other-repo", "repository": "agentic-machinery/machinery-infra", "pr": 12, "head": sha_other_repo, "verdict": "APPROVED", "published_at": "2026-11-27T11:00:00Z"},
     ]
     rows = [
         make_row(task_id="t-sol", role="review", model=CURRENT_SOL, **{"class": "infra/critical"}, pr=1, pinned_head=sha_sol),
@@ -695,6 +699,7 @@ def test_recent_review_counts_reads_published_code_infra_records_and_fails_close
         make_row(task_id="t-superseded", role="review", model="claude-opus-5-5", **{"class": "code/high"}, pr=8, pinned_head=sha_superseded),
         make_row(task_id="t-superseded", role="review", model="claude-opus-5-5", **{"class": "code/high"}, pr=8, pinned_head=sha_mismatch),
         make_row(task_id="t-unclassified", role="review", model="claude-opus-5-5", **{"class": "unclassified"}, pr=9, pinned_head=sha_unclassified),
+        make_row(task_id="t-other-repo", role="review", model="claude-opus-5-5", **{"class": "code/high"}, pr=12, pinned_head=sha_other_repo),
     ]
     (stats / "publications.jsonl").write_text("\n".join(json.dumps(p) for p in pubs) + "\n", encoding="utf-8")
     (stats / "rows.jsonl").write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
@@ -776,6 +781,7 @@ _ROTATION_VALID_ROW = {
     "class": "code/high",
     "status": "done",
     "repo": "machinery",
+    "repository": "agentic-machinery/machinery",
     "tokens": {"fresh_input": 100, "cached_input": 50, "output": 25},
     "pr": 1,
     "pinned_head": _ROTATION_SHA,
@@ -805,6 +811,9 @@ _ROTATION_VALID_ROW = {
         ({"status": "running"}, "sol", ""),
         # A PR of 0, a misspelled risk or a number that overflows to infinity is not a persisted row.
         ({"pr": 0}, "sol", ""),
+        # Values only the canonical row validator refuses: a PR past the signed 64-bit bound, a non-object tokens field.
+        ({"pr": 2**63}, "sol", ""),
+        ({"tokens": []}, "sol", ""),
         ({"class": "code/hihg"}, "sol", ""),
         (', "extra": 1e9999', "sol", ""),
         # Frozen 16-level nesting contract: a depth-17 later row is skipped; depth 16 still supersedes.

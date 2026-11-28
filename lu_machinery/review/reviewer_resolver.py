@@ -196,9 +196,11 @@ def read_recent_review_counts(
     Reads ``<batch_state>/model-stats/publications.jsonl`` (the published-verdict
     ledger written by ``record_cf_verdict``) over the trailing ``window_days``
     ``[now - window_days, now]`` and joins each publication to the latest valid
-    ``rows.jsonl`` row of the same task id, at the row's pinned head and, when the
-    row names one, its PR. The counts depend on those two files alone: no model or
-    fleet catalog is read, so a catalog read failure never changes review credit.
+    ``rows.jsonl`` row of the same task id, on the row's repository (the GitHub
+    owner/name ``summary_row`` stores at record time; a row without one earns no
+    credit), its pinned head and, when the row names one, its PR. The counts depend
+    on those two files alone: no model or fleet catalog is read, so a catalog read
+    failure never changes review credit.
     Keys are the model labels the writer stored (``summary_row`` writes the catalog
     id at record time); ``resolve_reviewer`` maps them onto its candidates. Missing
     or unsafe state paths fail closed to ``{}``.
@@ -233,8 +235,8 @@ def read_recent_review_counts(
         pubs_fd = _open_regular_in_dir(dir_fd, model_stats_rows.PUBLICATIONS_FILE)
         if pubs_fd is None:
             return {}
-        # Each task's in-window published targets, as (PR, head).
-        published: dict[str, set[tuple[int, str]]] = {}
+        # Each task's in-window published targets, as (repository, PR, head).
+        published: dict[str, set[tuple[str, int, str]]] = {}
         try:
             with os.fdopen(pubs_fd, "rb") as stream:
                 for line in _bounded_ledger_lines(stream):
@@ -249,7 +251,9 @@ def read_recent_review_counts(
                     # future-dated publication can never hide an in-window publication.
                     if published_at is None or not (cutoff <= published_at <= reference_now):
                         continue
-                    published.setdefault(entry["task_id"], set()).add((entry["pr"], entry["head"]))
+                    published.setdefault(entry["task_id"], set()).add(
+                        (entry["repository"].lower(), entry["pr"], entry["head"])
+                    )
         except OSError:
             return {}
 
@@ -275,6 +279,7 @@ def read_recent_review_counts(
                         not isinstance(tid, str)
                         or tid not in published
                         or not model_stats_rows.valid_task_id(tid)
+                        or not model_stats_rows._well_formed(row, check_sample_visibility=False)
                         or not _persisted_row_shape(row)
                     ):
                         continue
@@ -289,8 +294,14 @@ def read_recent_review_counts(
 
     counts: Counter[str] = Counter()
     for tid, row in latest_rows.items():
-        row_pr, pinned_head = row.get("pr"), row.get("pinned_head")
-        if any(head == pinned_head and row_pr in (None, pr) for pr, head in published[tid]):
+        repository, row_pr, pinned_head = row.get("repository"), row.get("pr"), row.get("pinned_head")
+        if not isinstance(repository, str):
+            continue
+        # Both slugs passed the ASCII owner/name grammar, so lower() is GitHub's case-insensitive match.
+        if any(
+            repo == repository.lower() and head == pinned_head and row_pr in (None, pr)
+            for repo, pr, head in published[tid]
+        ):
             counts[str(row["model"])] += 1  # a stored model label, checked by _persisted_row_shape
     return dict(counts)
 
