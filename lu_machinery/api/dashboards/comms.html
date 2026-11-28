@@ -1120,7 +1120,7 @@ function formatStateSummary(state, label, reason) {
 
 function renderTranscriptDom(conversationId, payload, httpStatus = 200) {
   const container = document.getElementById("discussions-transcript");
-  if (!container) return;
+  if (!container) return "unavailable";
   const nodes = [];
 
   const heading = discussionEl("h3", "", `Transcript: ${conversationId}`);
@@ -1130,23 +1130,23 @@ function renderTranscriptDom(conversationId, payload, httpStatus = 200) {
     const reason = typeof payload?.reason === "string" ? payload.reason : "forbidden";
     nodes.push(discussionEl("p", "error", `Transcript access refused (${reason.replaceAll("_", " ")}).`));
     setNodeChildren(container, nodes);
-    return false;
+    return "unavailable";
   }
   if (httpStatus === 404) {
     nodes.push(discussionEl("p", "muted", "Discussion not found."));
     setNodeChildren(container, nodes);
-    return false;
+    return "unavailable";
   }
   if (httpStatus === 503 || payload?.state === "backend_unavailable") {
     const reason = typeof payload?.reason === "string" ? payload.reason : "store_unavailable";
     nodes.push(discussionEl("p", "error", formatStateSummary("backend_unavailable", payload?.label, reason)));
     setNodeChildren(container, nodes);
-    return false;
+    return "unavailable";
   }
-  if (!payload || typeof payload !== "object" || !Array.isArray(payload.messages)) {
+  if (!(httpStatus >= 200 && httpStatus < 300) || !payload || typeof payload !== "object" || !Array.isArray(payload.messages)) {
     nodes.push(discussionEl("p", "error", "Transcript response could not be read."));
     setNodeChildren(container, nodes);
-    return false;
+    return "unavailable";
   }
 
   const topState = typeof payload.state === "string" ? payload.state : "unknown";
@@ -1163,7 +1163,7 @@ function renderTranscriptDom(conversationId, payload, httpStatus = 200) {
   if (!payload.messages.length) {
     nodes.push(discussionEl("p", "muted", "No transcript turns available."));
     setNodeChildren(container, nodes);
-    return;
+    return topState === "ok" ? "empty" : "unavailable";
   }
 
   const list = discussionEl("div", "journal-list");
@@ -1207,7 +1207,7 @@ function renderTranscriptDom(conversationId, payload, httpStatus = 200) {
   }
   nodes.push(list);
   setNodeChildren(container, nodes);
-  return true;
+  return "loaded";
 }
 
 async function loadDiscussionsList() {
@@ -1269,8 +1269,13 @@ async function openDiscussion(conversationId) {
     let payload = null;
     try { payload = JSON.parse(await response.text()); } catch { payload = null; }
     if (seq !== transcriptRequestSeq || conversationId !== selectedConversationId) return;
-    const loaded = renderTranscriptDom(conversationId, payload, response.status);
-    discussionStatus(loaded ? `Transcript ${conversationId} loaded.` : `Transcript ${conversationId} unavailable.`);
+    const outcome = renderTranscriptDom(conversationId, payload, response.status);
+    const statusText = outcome === "loaded"
+      ? `Transcript ${conversationId} loaded.`
+      : outcome === "empty"
+        ? `Transcript ${conversationId} has no turns yet.`
+        : `Transcript ${conversationId} unavailable.`;
+    discussionStatus(statusText);
   } catch (error) {
     if (error && error.name === "AbortError") return;
     if (seq !== transcriptRequestSeq || conversationId !== selectedConversationId) return;

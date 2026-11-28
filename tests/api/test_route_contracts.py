@@ -716,6 +716,12 @@ assert.match(M.prChips(unknownTotalPrs).join(''), /<b>1<\/b> open PRs observed Â
     discListEl.children = [];
     discListEl.replaceChildren = function (...nodes) { this.children = nodes; };
     discListEl.appendChild = function (node) { this.children.push(node); };
+    let discListClick = null;
+    discListEl.addEventListener = (type, fn) => { if (type === 'click') discListClick = fn; };
+    const discTranscriptEl = document.getElementById('discussions-transcript');
+    discTranscriptEl.children = [];
+    discTranscriptEl.replaceChildren = function (...nodes) { this.children = nodes; };
+    discTranscriptEl.appendChild = function (node) { this.children.push(node); };
     const messagesContentEl = document.getElementById('messages-content');
     const setListRows = ids => {
       listButtons.length = 0;
@@ -806,6 +812,30 @@ assert.match(M.prChips(unknownTotalPrs).join(''), /<b>1<\/b> open PRs observed Â
           failure_windows: {'24h': {dead_letters: {total: metricsDeadCount}, failed_deliveries: {total: 2}, failed_jobs: {total: 0}}},
         };
         return Promise.resolve({ok: true, status: 200, text: async () => JSON.stringify(payload), headers: {get: () => null}});
+      }
+      if (url.startsWith('/api/runtime/acp/conversations/')) {
+        if (url.includes('/conv-empty/transcript')) {
+          return Promise.resolve({ok: true, status: 200, text: async () => JSON.stringify({conversation_id: 'conv-empty', state: 'ok', label: 'ok', reason: null, truncated: false, messages: []}), headers: {get: () => null}});
+        }
+        if (url.includes('/conv-loaded/transcript')) {
+          return Promise.resolve({ok: true, status: 200, text: async () => JSON.stringify({conversation_id: 'conv-loaded', state: 'ok', label: 'ok', reason: null, truncated: false, messages: [{ordinal: 1, state: 'ok', label: 'ok', reason: null, kind: 'request', sender: 'cto', recipient: 'driver', created_at: '2026-11-28T00:00:00Z', round: 1, body: 'hello'}]}), headers: {get: () => null}});
+        }
+        if (url.includes('/conv-corrupt/transcript')) {
+          return Promise.resolve({ok: true, status: 200, text: async () => JSON.stringify({conversation_id: 'conv-corrupt', state: 'missing_or_corrupt', label: 'Missing or corrupt', reason: 'malformed_participants', truncated: false, messages: []}), headers: {get: () => null}});
+        }
+        if (url.includes('/conv-503/transcript')) {
+          return Promise.resolve({ok: false, status: 503, text: async () => JSON.stringify({conversation_id: 'conv-503', state: 'backend_unavailable', label: 'Backend unavailable', reason: 'store_unavailable'}), headers: {get: () => null}});
+        }
+        if (url.includes('/conv-404/transcript')) {
+          return Promise.resolve({ok: false, status: 404, text: async () => JSON.stringify({detail: 'Conversation not found', reason: 'conversation_not_found'}), headers: {get: () => null}});
+        }
+        if (url.includes('/conv-403/transcript')) {
+          return Promise.resolve({ok: false, status: 403, text: async () => JSON.stringify({detail: 'Forbidden', reason: 'loopback_required'}), headers: {get: () => null}});
+        }
+        if (url.includes('/conv-500/transcript')) {
+          return Promise.resolve({ok: false, status: 500, text: async () => JSON.stringify({state: 'ok', messages: []}), headers: {get: () => null}});
+        }
+        return Promise.resolve({ok: true, status: 200, text: async () => '{bad json', headers: {get: () => null}});
       }
       if (url.startsWith('/api/fleet/acp/conversations')) {
         discussionsFetches += 1;
@@ -1002,6 +1032,29 @@ assert.match(M.prChips(unknownTotalPrs).join(''), /<b>1<\/b> open PRs observed Â
       discListeners.toggle();
       await new Promise(resolve => setImmediate(resolve));
       assert.equal(discussionsFetches, 3, 'F1: valid available response latches until explicit refresh');
+
+      // PR1592-F2: openDiscussion distinguishes empty (HTTP 200 ok with no messages), loaded, and unavailable transcripts.
+      const clickDiscussion = async (id) => {
+        discListClick({target: {closest: sel => sel === 'button[data-discussion-id]' ? {dataset: {discussionId: id}} : null}});
+        await new Promise(resolve => setImmediate(resolve));
+        await new Promise(resolve => setImmediate(resolve));
+      };
+      await clickDiscussion('conv-empty');
+      assert.equal(document.getElementById('discussions-status').textContent, 'Transcript conv-empty has no turns yet.');
+      await clickDiscussion('conv-loaded');
+      assert.equal(document.getElementById('discussions-status').textContent, 'Transcript conv-loaded loaded.');
+      await clickDiscussion('conv-corrupt');
+      assert.equal(document.getElementById('discussions-status').textContent, 'Transcript conv-corrupt unavailable.');
+      await clickDiscussion('conv-503');
+      assert.equal(document.getElementById('discussions-status').textContent, 'Transcript conv-503 unavailable.');
+      await clickDiscussion('conv-404');
+      assert.equal(document.getElementById('discussions-status').textContent, 'Transcript conv-404 unavailable.');
+      await clickDiscussion('conv-403');
+      assert.equal(document.getElementById('discussions-status').textContent, 'Transcript conv-403 unavailable.');
+      await clickDiscussion('conv-500');
+      assert.equal(document.getElementById('discussions-status').textContent, 'Transcript conv-500 unavailable.');
+      await clickDiscussion('conv-malformed');
+      assert.equal(document.getElementById('discussions-status').textContent, 'Transcript conv-malformed unavailable.');
     } finally {
       globalThis.setInterval = originalInterval;
       globalThis.fetch = fetchPanel;
