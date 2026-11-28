@@ -3,7 +3,7 @@
 Used by `full-send` and `full-stop` when they create or update a PR. Publishing goes through the
 typed publisher (`docs/dev/agent-public-text.md`), which scans every field before it is sent.
 
-`"$PY"` is the primary checkout's interpreter ([delivery](delivery.md#interpreter)).
+`"$PY"` is the bound machinery runtime interpreter (`LU_PYTHON`) ([delivery](delivery.md#interpreter)).
 
 ## Before creating
 

@@ -42,7 +42,9 @@ from lu_machinery.fleet_comms.artifacts import (
 )
 from lu_machinery.fleet_comms.authority import (
     AUTHORITY_MESSAGE_ID_RE,
+    CLEANUP_EXPIRY_REASON,
     DURABLE_CTO_RECIPIENT,
+    RECIPIENT_SETTLED_REASON,
     AuthorityDeliveryState,
     is_session_cto_recipient,
     load_external_recipients,
@@ -506,6 +508,11 @@ BOARD_PR_LIST_TTL_S = 30.0
 
 
 
+# Dead letters the authority writes while cleaning up as designed (an operator's expire-stale
+# run, or mail to a task that has settled) are not faults. Both health projections skip them.
+_EXPECTED_CLEANUP_REASONS = (CLEANUP_EXPIRY_REASON, RECIPIENT_SETTLED_REASON)
+
+
 def _count_by_state(connection: Any, table: str, column: str) -> dict[str, int]:
     if not _table_exists(connection, table):
         return {}
@@ -616,10 +623,10 @@ def _authority_health_snapshot(
         if _table_exists(connection, "authority_dead_letters"):
             dead_letters = int(
                 connection.execute(
-                    # A deliberate expire-stale cleanup is not a failure (authority.CLEANUP_EXPIRY_REASON).
                     "SELECT COUNT(*) FROM authority_dead_letters"
-                    f" WHERE created_at >= {placeholder} AND reason_code <> {placeholder}",
-                    (window["since"], "expired_by_cleanup"),
+                    f" WHERE created_at >= {placeholder}"
+                    f" AND reason_code NOT IN ({placeholder}, {placeholder})",
+                    (window["since"], *_EXPECTED_CLEANUP_REASONS),
                 ).fetchone()[0]
             )
     except _DATABASE_ERRORS:
@@ -891,7 +898,7 @@ SELECT
     (SELECT COUNT(*) FROM authority_jobs
      WHERE state IN ('queued', 'running') AND deadline_at IS NOT NULL AND deadline_at < ?),
     (SELECT COUNT(*) FROM authority_dead_letters
-     WHERE created_at >= ? AND reason_code <> 'expired_by_cleanup')
+     WHERE created_at >= ? AND reason_code NOT IN (?, ?))
 """
 
 
@@ -1023,7 +1030,13 @@ def _sqlite_overview_snapshot(plane_root: Path) -> dict[str, Any] | None:
             return None
         row = connection.execute(
             _SQLITE_OVERVIEW_SNAPSHOT_SQL,
-            (len(known) + 1, window["since"], window["until"], window["since"]),
+            (
+                len(known) + 1,
+                window["since"],
+                window["until"],
+                window["since"],
+                *_EXPECTED_CLEANUP_REASONS,
+            ),
         ).fetchone()
         if row is None:
             return None

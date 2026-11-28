@@ -46,7 +46,7 @@ from lu_machinery.session_streams.store import (
     SessionStreamStore,
 )
 
-from .remote import RemoteEpicClient, RemoteLeaseLostError, RemoteSupervisorError
+from .remote import RemoteEpicClient, RemoteLeaseLostError, RemoteSupervisorError, lease_digest
 
 CAPSULE_SCHEMA = "session-supervisor-bootstrap.v1"
 LEASE_ENV_PREFIX = "SESSION_STREAM_"
@@ -557,11 +557,12 @@ class SessionSupervisor:
             response = self.remote.stream(stream_id, digest_limit=digest_limit)
             if lease is not None:
                 current = response.get("lease")
-                expected = self.remote._lease_payload(lease)
+                # Monitor publishes the digest of the exact envelope, never the envelope itself.
                 if (
                     not isinstance(current, dict)
                     or current.get("state") != "active"
-                    or any(current.get(key) != value for key, value in expected.items())
+                    or current.get("stream_id") != lease.stream_id
+                    or current.get("lease_digest") != lease_digest(lease)
                 ):
                     raise RemoteLeaseLostError("LEASE LOST: live-state reconciliation fenced the bootstrap lease")
                 try:

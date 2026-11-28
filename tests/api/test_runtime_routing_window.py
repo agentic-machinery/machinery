@@ -186,6 +186,9 @@ def test_missing_task_store_is_unknown_not_an_empty_day(tmp_path, monkeypatch):
     assert [row["task_id"] for row in partial["decisions"]] == ["good"]
 
     cache_invalidate()  # the route scans the store afresh
+    # The route answers "pending" past its wall-clock deadline. This test checks the status a
+    # finished scan yields, so the deadline is lifted for its reads instead of racing runner load.
+    monkeypatch.setattr(runtime_router, "ROUTING_WAIT_S", 60.0)
     api = FastAPI()
     api.include_router(runtime_router.router, prefix="/api/runtime")
     api.dependency_overrides[runtime_router.get_ctx] = lambda: _ctx(tmp_path / "batch_state")

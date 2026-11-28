@@ -322,6 +322,30 @@ def _assert_under_root(full_path: Path, root_path: Path) -> None:
         raise HTTPException(status_code=403, detail="Path traversal not allowed") from e
 
 
+def _undiscoverable(full_path: Path, root_path: Path, project_root: Path) -> bool:
+    """True when discovery would never list ``full_path``.
+
+    Discovery prunes ``DISCOVERY_EXCLUDES`` and hidden names. Direct reads and
+    listings apply the same rule to the requested path and to its resolved
+    target, so an in-root symlink cannot reach an excluded subtree or a dotfile.
+    """
+    lexical = (full_path, root_path, project_root)
+    resolved = (full_path.resolve(), root_path.resolve(), project_root.resolve())
+    for path, root, project in (lexical, resolved):
+        try:
+            below_root = _relative_to_root(path, root)
+        except ValueError:
+            below_root = "."
+        if any(part.startswith(".") for part in below_root.split("/") if part != "."):
+            return True
+        try:
+            if _is_excluded(_relative_to_root(path, project)):
+                return True
+        except ValueError:
+            continue
+    return False
+
+
 def _relative_to_root(path: Path, root: Path) -> str:
     """Return a stable root-relative path across symlinked checkout roots."""
     # Compare complete lexical components, without constructing every ancestor
@@ -335,7 +359,7 @@ def _relative_to_root(path: Path, root: Path) -> str:
 
 
 def _directory_listing(
-    path: str, root_key: str, root_path: Path, remainder: str, *, limit: int, offset: int,
+    path: str, root_key: str, root_path: Path, remainder: str, *, limit: int, offset: int, project_root: Path,
 ) -> dict:
     """One page of a directory, in name order, with the count of every listed entry."""
     full_path = safe_join(root_path, remainder) if remainder else safe_join(root_path)
@@ -344,6 +368,7 @@ def _directory_listing(
     # Every entry is checked, so one that escapes the root refuses all pages alike.
     for entry in entries:
         _assert_under_root(entry, root_path)
+    entries = [entry for entry in entries if not _undiscoverable(entry, root_path, project_root)]
     items = []
     for entry in entries[offset:offset + limit]:
         stat = entry.stat()
@@ -576,6 +601,9 @@ def serve_artifact(
     except ValueError as e:
         raise HTTPException(status_code=403, detail=str(e)) from e
     _assert_under_root(full_path, root_path)
+    # Checked before existence, so the answer never says whether an excluded path exists.
+    if _undiscoverable(full_path, root_path, resolved_ctx.roots.project_root):
+        raise HTTPException(status_code=403, detail="Path is excluded from documentation artifacts")
 
     # codeql[py/path-injection] -- full_path validated via safe_join + _assert_under_root above. See #1860.
     if not full_path.exists():
@@ -588,7 +616,10 @@ def serve_artifact(
         # One fixed grid of pages: "previous" and "next" then never skip, repeat or resize a page.
         if offset % limit:
             raise HTTPException(status_code=422, detail="offset must be a multiple of limit")
-        listing = _directory_listing(path, root_key, root_path, remainder, limit=limit, offset=offset)
+        listing = _directory_listing(
+            path, root_key, root_path, remainder, limit=limit, offset=offset,
+            project_root=resolved_ctx.roots.project_root,
+        )
         last = max(0, listing["total"] - 1) // limit * limit
         # Past the end, "previous" is the last page that has rows.
         previous = min(offset - limit, last) if offset else None

@@ -48,28 +48,58 @@ def bind_workflow_runs(
         if not isinstance(row, dict) or row.get("head_sha") != head:
             return None
         item = dict(row)
-        app = row.get("app")
-        if not isinstance(app, dict):
-            app = {}
-        if app.get("id") == 15368 and app.get("slug") == "github-actions":
-            url = urlsplit(str(row.get("details_url") or ""))
-            prefix = f"/{repo}/actions/runs/"
-            suffix = url.path.removeprefix(prefix).split("/")
-            if url.netloc == "github.com" and url.path.startswith(prefix) and suffix[0].isdigit():
-                run_id = int(suffix[0])
-                if run_id not in cache:
-                    cache[run_id] = get_run(run_id)
-                run = cache[run_id]
-                suite = row.get("check_suite")
-                if (not isinstance(run, dict) or run.get("id") != run_id
-                        or run.get("head_sha") != head or not isinstance(suite, dict)
-                        or type(suite.get("id")) is not int or run.get("check_suite_id") != suite["id"]
-                        or type(run.get("workflow_id")) is not int or run["workflow_id"] <= 0):
-                    return None
-                item["workflowId"] = run["workflow_id"]
-                item["workflowName"] = run.get("name")
+        run_id = actions_run_id(row, repo)
+        if run_id is not None:
+            if run_id not in cache:
+                cache[run_id] = get_run(run_id)
+            run = cache[run_id]
+            suite = row.get("check_suite")
+            if (not isinstance(run, dict) or run.get("id") != run_id
+                    or run.get("head_sha") != head or not isinstance(suite, dict)
+                    or type(suite.get("id")) is not int or run.get("check_suite_id") != suite["id"]
+                    or type(run.get("workflow_id")) is not int or run["workflow_id"] <= 0):
+                return None
+            item["workflowId"] = run["workflow_id"]
+            item["workflowName"] = run.get("name")
         bound.append(item)
     return bound
+
+
+def actions_run_id(row: dict[str, Any], repo: str) -> int | None:
+    """The Actions run a check run's details URL locates, or None; a locator only, never proof of identity."""
+    app = row.get("app")
+    if not isinstance(app, dict) or app.get("id") != 15368 or app.get("slug") != "github-actions":
+        return None
+    url = urlsplit(str(row.get("details_url") or ""))
+    prefix = f"/{repo}/actions/runs/"
+    suffix = url.path.removeprefix(prefix).split("/")
+    if url.netloc == "github.com" and url.path.startswith(prefix) and suffix[0].isdigit():
+        return int(suffix[0])
+    return None
+
+
+def check_run_attempts(rows: list[Any], head: str, repo: str, name: str) -> list[dict[str, Any]]:
+    """Every attempt of the check ``name`` on ``head``, before any latest-run collapse (#1615).
+
+    ``collapse_status_rollup`` keeps the latest run of each identity, so a red attempt followed by a green rerun
+    on the same head reads as green. Statistics need every attempt: each row named ``name`` on ``head`` is kept
+    with its check-run id, the Actions run its details URL locates and its check suite. A row whose check-run id
+    is not an integer is not an attempt anyone can key, and is left out.
+    """
+    attempts = []
+    for row in rows:
+        if not isinstance(row, dict) or row.get("head_sha") != head or row.get("name") != name:
+            continue
+        if type(row.get("id")) is not int:
+            continue
+        suite = row.get("check_suite")
+        attempts.append({
+            "check_run_id": row["id"], "run_id": actions_run_id(row, repo),
+            "check_suite_id": suite.get("id") if isinstance(suite, dict) and type(suite.get("id")) is int else None,
+            "status": row.get("status"), "conclusion": row.get("conclusion"),
+            "started_at": row.get("started_at"), "completed_at": row.get("completed_at"),
+        })
+    return sorted(attempts, key=lambda attempt: attempt["check_run_id"])
 
 
 def rollup_identity(entry: dict[str, Any]) -> tuple[str, ...] | None:

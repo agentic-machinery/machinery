@@ -17,6 +17,7 @@ from lu_machinery.session_supervisor.remote import (
     RemoteUnreachableError,
 )
 from tests.epics_monitor_stub import isolated_monitor_state as isolated_monitor_state
+from tests.epics_monitor_stub import public_lease
 
 pytestmark = pytest.mark.usefixtures("isolated_monitor_state")
 
@@ -84,11 +85,12 @@ def test_remote_claim_preflights_health_and_emits_one_json_document(monkeypatch,
                     },
                 }
             )
+        # Status reads publish the envelope only as its lease_digest (machinery-infra#1659).
         return _Response(
             {
                 "schema": "remote-epic-lifecycle.v1",
                 "stream_id": "epic:7178",
-                "lease": _lease_payload(),
+                "lease": public_lease(_lease_payload()),
                 "session_state": "open",
                 "digest": {"stream_id": "epic:7178", "limit": 20, "high_water_entry_id": 0, "pinned": [], "recent": []},
             }
@@ -735,7 +737,9 @@ def test_delayed_event_after_successor_exit_cannot_restart_again(supervisory_cyc
     assert len(starts) == 1
 
 
-@pytest.mark.parametrize("case", ["matching", "mismatch", "expired", "malformed-expiry", "missing-expiry", "worker"])
+@pytest.mark.parametrize(
+    "case", ["matching", "mismatch", "other-holder", "expired", "malformed-expiry", "missing-expiry", "worker"]
+)
 def test_capsule_cli_uses_environment_lease_read_only(monkeypatch, capsys, case) -> None:
     from lu_machinery.session_streams.hooks import lease_from_environment
 
@@ -760,6 +764,9 @@ def test_capsule_cli_uses_environment_lease_read_only(monkeypatch, capsys, case)
     current["session_state"] = "open"
     if case == "mismatch":
         current["fencing_token"] = 2
+    elif case == "other-holder":
+        # Same public counters, another holder's hidden envelope: only lease_digest tells them apart.
+        current["lease_id"] = "lease-other"
     elif case == "expired":
         current["expires_at"] = "2000-01-01T00:00:00Z"
     elif case == "malformed-expiry":
@@ -779,7 +786,7 @@ def test_capsule_cli_uses_environment_lease_read_only(monkeypatch, capsys, case)
             self.reads.append(stream_id)
             return {
                 "stream_id": stream_id,
-                "lease": current,
+                "lease": public_lease(current),
                 "digest": {
                     "stream_id": stream_id,
                     "limit": digest_limit,

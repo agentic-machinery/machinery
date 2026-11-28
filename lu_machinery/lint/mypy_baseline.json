@@ -959,11 +959,6 @@
     },
     {
       "path": "lu_machinery/api/epics_router.py",
-      "code": "attr-defined",
-      "message": "\"LeaseHolder\" has no attribute \"get\""
-    },
-    {
-      "path": "lu_machinery/api/epics_router.py",
       "code": "no-any-return",
       "message": "Returning Any from function declared to return \"dict[str, Any]\""
     },
@@ -4303,11 +4298,6 @@
       "message": "Unsupported target for indexed assignment (\"Any | None | dict[str, str] | str\")"
     },
     {
-      "path": "lu_machinery/fleet/terminal_abandon.py",
-      "code": "union-attr",
-      "message": "Item \"None\" of \"Any | None\" has no attribute \"get\""
-    },
-    {
       "path": "lu_machinery/fleet/usage.py",
       "code": "arg-type",
       "message": "Argument \"transport\" to \"compute_routing_budget\" has incompatible type \"str\"; expected \"Literal['acp', 'dispatch']\""
@@ -7441,11 +7431,6 @@
       "path": "lu_machinery/session_canary/shared_hydration.py",
       "code": "arg-type",
       "message": "Argument 1 to \"HTTPConnection\" has incompatible type \"None | str\"; expected \"str\""
-    },
-    {
-      "path": "lu_machinery/session_canary/shared_hydration.py",
-      "code": "no-any-return",
-      "message": "Returning Any from function declared to return \"bool\""
     },
     {
       "path": "lu_machinery/session_supervisor/__init__.py",

@@ -981,6 +981,8 @@ def _dispatch(args) -> int:
                 record["worktree_remote_url"] = publish_remote
             if args.mode != "read-only" and args.owned_path and record["worktree_remote_url"] is None:
                 raise ValueError("write task with owned paths refused: origin must match the registered canonical repository URL")
+            # Before the writer exists: settlement credits it only with commits no remote branch held now (#1615).
+            store.capture_task_start_remote_refs(record)
             record.update(advisory_fields, **account_fields, **trial_fields, **gate_fields)
             record["pool_shadow"] = pool_selector.shadow_decision(record)
             if agent == "muse":

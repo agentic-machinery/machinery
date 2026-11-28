@@ -104,6 +104,50 @@ def test_health_names_both_ledgers_when_authority_window_is_empty(
     assert runtime["records_in_window"] == 2
 
 
+def test_settlement_cleanup_dead_letters_do_not_degrade_health(
+    client: TestClient, fleet_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Defect class: expected cleanup is reported as an authority fault."""
+    monkeypatch.setenv("LEARN_UKRAINIAN_CP_AUTHORITY_FLEET_COMMS", "sqlite")
+    monkeypatch.delenv("LEARN_UKRAINIAN_CP_AUTHORITY", raising=False)
+    monkeypatch.delenv("LEARN_UKRAINIAN_CP_PG_DSN", raising=False)
+    monkeypatch.setattr(fleet_router, "recent_runtime_records", lambda *, limit, ctx=None: _runtime_records())
+    inside = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    def add_dead_letters(*reasons: str) -> None:
+        with closing(sqlite3.connect(fleet_root / "comms.sqlite3")) as connection, connection:
+            connection.executemany(
+                "INSERT INTO authority_dead_letters VALUES (?, NULL, NULL, ?, ?)",
+                [(f"letter-{reason}", reason, inside) for reason in reasons],
+            )
+
+    def projections() -> tuple[dict, dict]:
+        # /health and the single-query /overview fast path hold separate SQL.
+        assert fleet_router._sqlite_overview_snapshot(fleet_root) is not None
+        return client.get("/api/fleet/health").json(), client.get("/api/fleet/overview").json()
+
+    add_dead_letters("recipient_settled", "expired_by_cleanup")
+    health, overview = projections()
+    assert health["ok"] is True
+    for authority in (health["authority_health"], overview["authority_health"]):
+        assert (authority["state"], authority["ok"], authority["dead_letters"]) == ("idle", True, 0)
+    assert overview["counts"]["dead_letters"]["total"] == 2
+
+    for total, genuine in enumerate(("deadline_expired", "attempts_exhausted"), start=1):
+        add_dead_letters(genuine)
+        health, overview = projections()
+        assert health["ok"] is False
+        for authority in (health["authority_health"], overview["authority_health"]):
+            assert (authority["state"], authority["ok"], authority["dead_letters"]) == ("degraded", False, total)
+        assert overview["counts"]["dead_letters"]["total"] == 2 + total
+
+    with closing(sqlite3.connect(fleet_root / "comms.sqlite3")) as connection:
+        reasons = connection.execute("SELECT reason_code FROM authority_dead_letters ORDER BY 1").fetchall()
+    assert [row[0] for row in reasons] == [
+        "attempts_exhausted", "deadline_expired", "expired_by_cleanup", "recipient_settled",
+    ]
+
+
 def test_overview_non_integer_migration_versions_fall_back_to_diagnostic_reader(
     client: TestClient, fleet_root: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

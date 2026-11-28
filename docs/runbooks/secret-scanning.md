@@ -339,6 +339,8 @@ Row #41 traces Python analysis `2209383055` on main commit
 `e3f9a8b271959791e079316188adb734f1bb6295` (2026-11-19).
 Row #42 traces Python analysis `2220196117` on main commit
 `37b29d1ba171d5e03a4be0b52717f443c979a131` (2026-11-21).
+Row #71 traces Python analysis `2268713419` on the PR #1622 merge commit
+`a3383dec40ab761a09cc077b82c68db28485e3f3` (2026-11-28).
 
 | Alert | Rule | Reviewed location | Disposition and data-flow evidence |
 | --- | --- | --- | --- |
@@ -375,6 +377,7 @@ Row #42 traces Python analysis `2220196117` on main commit
 | 33 | `py/polynomial-redos` | `lu_machinery/common/github_client.py:1717` | Fixed in #767. The source of #29 reached `_canonical_endpoint`'s scheme pattern. `re.match` tries only position 0, so the run was already linear (one million `A` characters take 2 ms; the same pattern unanchored is quadratic), but the analysis treated the pattern as unanchored. The pattern now begins with `^`, and the source no longer reaches it. |
 | 41 | `py/clear-text-storage-sensitive-data` | `lu_machinery/dispatcher/store.py:339` | False positive. All three SARIF flows start at `trusted_core_context()` in `tests/agent_runtime/test_attempt_network.py:403`. The helper returns public rules Markdown and provenance that contains repository-relative source names and SHA-256 digests (`lu_machinery/review/render_contract.py:64-83`). The test appends fixture text and passes the rendered prompt to `store.create()` (`test_attempt_network.py:404-415`). The prompt enters at `store.py:325` and is written to an exclusive `0600` file at `store.py:338-339`. The reported flows contain public rules, provenance and fixture text. |
 | 42 | `py/clear-text-storage-sensitive-data` | `lu_machinery/dispatcher/store.py:339` | False positive. This is #41's result, given a new alert number. The same analysis marked #41 fixed and opened #42 at 2026-11-20T23:06:29Z, after #1032 edited `store.py` beside `create()`. All three SARIF flows match #41's: `trusted_core_context()` at `tests/agent_runtime/test_attempt_network.py:403`, then `prefix` and `rendered` (lines 403-415), then `prompt` at `store.py:325` and the `stream.write(prompt)` sink at line 339. CodeQL treats the call as a secret only because of its name: the shared `SensitiveDataHeuristics.qll` `maybeSecret()` pattern classifies any name containing `trusted` as secret, except `untrusted` and `is_trusted`. The function returns public rules Markdown with a provenance block of repository-relative source names and SHA-256 digests (`lu_machinery/review/render_contract.py:64-83`), and the test appends fixture text. In production, `create()` writes the dispatch prompt that the model provider receives in full. Briefs must not contain credentials, so this local copy is not the exposure boundary. `create()` writes it once, at `<task>.prompt` beside the task record (`lu_machinery/dispatcher/cli.py:576`), with `O_CREAT`/`O_EXCL` (which also refuses a planted symlink) and mode `0600`, in a task directory created with mode `0700` when absent. |
+| 71 | `py/polynomial-redos` | `lu_machinery/common/json_depth.py:86` | False positive. #1622 made request bodies reach `json_depth.loads` (`read_json_body_bounded` in `lu_machinery/api/project_state_router.py`, used by the project-state report and tool-timing routes), and the analysis flags `_TOKEN` (defined at line 42, scanned with `finditer` at line 86). Its string branch is the unrolled-loop form with `re.DOTALL`: an opening quote, then runs of characters other than the quote and the backslash, each run separated by one backslash and exactly one following character. The run class and the escape pair cannot match the same character, so the body has one way to match any text. The tail accepts a closing quote, or the end of text after at most one backslash, so an attempt never fails after the body and never backtracks into it; an unterminated string runs once to the end and the scan stops. The reported witness (`"\a` followed by repetitions of `\"\a`, unterminated, with and without a trailing backslash) scans linearly: 40 KB in 1.1-1.4 ms, 160 KB in 4.2-6.7 ms, 640 KB in 26-29 ms. The routes also cap the body (4 KiB and 256 KiB) before decoding. |
 
 ### Queue-ref instances still block dismissal
 
@@ -436,10 +439,13 @@ and [file permissions](https://codeql.github.com/codeql-query-help/python/py-ove
 
 ### Scanned code-scanning dismissal
 
-An interactive seat can use the closed publisher verb after a merged PR has
-reviewed the alert. Workers and reviewers are refused before any transport,
-including direct Python publisher calls. The worker broker, reviewer relay
-and raw `gh api` write guard do not admit this verb.
+An interactive seat can use the closed publisher verb after reviewed triage of
+the alert: a merged same-repository PR for default-branch alerts, or an open
+same-repository PR whose exact head carries a recorded cross-family `APPROVE`
+when the alert's active open instances exist only on that open PR. Workers and
+reviewers are refused before any transport, including direct Python publisher
+calls. The worker broker, reviewer relay and raw `gh api` write guard do not
+admit this verb.
 
 ```sh
 .venv/bin/python -m lu_machinery.publish code-scanning-dismiss \
@@ -448,7 +454,9 @@ and raw `gh api` write guard do not admit this verb.
 ```
 
 The comment must name `Alert #N`, explain that alert, and include exactly one
-canonical same-repository merged PR link. Its explanation must include a letter beyond the alert identifier and link.
+canonical same-repository PR link (merged for default-branch alerts; open and
+exact-head cross-family approved for open-PR-only alerts). Its explanation must
+include a letter beyond the alert identifier and link.
 Its final text passes the common OPSEC scanner and verdict-marker guard, then the same text is frozen into the
 request. Supported reasons are `false positive`, `won't fix` and `used in tests`.
 Issue-close reasons are separate.
@@ -460,17 +468,44 @@ and `path:line`. The final cell contains the written rationale, starting with
 `False positive.` or `Won't fix.` as appropriate. `used in tests` requires a
 false-positive row whose location is under `tests/`.
 
-Before sending, the publisher retrieves that file at the PR's merge SHA and
-at the base branch's current resolved head, explicitly in `refs/heads/` so a
-same-named tag cannot select the triage. The alert's current triage row
-must be byte-identical to the reviewed row; removal or reclassification
-refuses the write. Duplicate rows also count when padded with whitespace or
-written without optional outer table pipes. Except for the closed-PR merge-ref rule above, the publisher checks the alert and every open branch instance, and compares their SARIF
-rule, location, messages and flow evidence with the analysis at the triage
-merge. Analysis-local indexes are resolved before comparison. Missing analysis,
-unknown evidence or drift refuses the write. If a later change moves a location
-or changes a flow, the alert needs fresh reviewed triage. A final preflight
-re-read rejects alert, instance or current-triage-head changes during validation.
+For a **default-branch alert** (merged PR path), before sending, the publisher
+retrieves that file at the PR's merge SHA and at the base branch's current
+resolved head, explicitly in `refs/heads/` so a same-named tag cannot select
+the triage. The alert's current triage row must be byte-identical to the
+reviewed row; removal or reclassification refuses the write. Duplicate rows
+also count when padded with whitespace or written without optional outer table
+pipes. Except for the closed-PR merge-ref rule above, the publisher checks the
+alert (`state == "open"`) and every open branch instance, and compares their
+SARIF rule, location, messages and flow evidence with the analysis at the
+triage merge. Analysis-local indexes are resolved before comparison. Missing
+analysis, unknown evidence or drift refuses the write. If a later change moves
+a location or changes a flow, the alert needs fresh reviewed triage. A final
+preflight re-read rejects alert, instance or current-triage-head changes during
+validation.
+
+For an **open-PR-only alert** (open PR path), the linked PR must be explicitly
+open, unmerged, non-draft (`draft: false`), and same-repository (both `head.repo`
+and `base.repo` matching the target repository). Every instance state must be
+in GitHub's supported set (`open`, `dismissed`, `fixed`), and every active open
+instance (ignoring only verified closed or merged `refs/pull/<n>/merge` refs)
+must lie on that linked PR's `refs/pull/<pr>/merge` ref; any open instance on
+the default branch, another branch or another open PR refuses and requires the
+merged-PR path. The alert must explicitly carry `state` (`null` as GitHub
+returns for PR-only alerts, or `"open"`), `dismissed_at: null`, and
+`fixed_at: null`. The publisher reads this runbook at the PR's immutable
+`head.sha` and `base.sha` (verifying the row was absent at `base.sha`, added by
+the PR diff, and uniquely present with no duplicate or contradicting row at
+`head.sha`), and verifies an unedited recorded cross-family `APPROVE` from the
+trusted recorder login for that exact `head.sha` (concrete attested author
+families distinct from the reviewer's family; `red_team`, same-family,
+stale-head, unattested-author or rejected heads are refused). Each open
+instance on `refs/pull/<pr>/merge` must match the row's `path:line`, have an
+analyzed commit bound to `head.sha` (either `head.sha` directly or a two-parent
+PR merge commit whose second parent is `head.sha`), and match the analysis's
+SARIF rule and location. A final preflight re-read rejects alert, instance,
+comment, or skipped-PR changes, then re-validates the PR's identity,
+same-repository head/base, `base.sha`, `head.sha`, and non-draft open state
+immediately before sending the PATCH.
 
 The only mutation is one PATCH of the numbered alert with `state=dismissed`,
 its reason and the scanned comment. The publisher reports success only after

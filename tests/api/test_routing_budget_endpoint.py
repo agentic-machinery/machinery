@@ -1072,7 +1072,7 @@ def test_http_fresh_codexbar_kicks_background_and_does_not_block(monkeypatch, tm
     app = FastAPI()
     app.state.ctx = fixture_context(tmp_path)
     app.include_router(state_router.router, prefix="/api/state")
-    response = TestClient(app).get("/api/state/routing-budget?fresh_codexbar=true")
+    response = _local_client(app).get("/api/state/routing-budget?fresh_codexbar=true")
 
     assert response.status_code == 200
     data = response.json()
@@ -1080,6 +1080,31 @@ def test_http_fresh_codexbar_kicks_background_and_does_not_block(monkeypatch, tm
     assert kicked == ["kick"]
     assert data["diagnostics"]["fresh_codexbar_requested"] is True
     assert data["diagnostics"]["fresh_codexbar_blocking"] is False
+
+
+def _local_client(app: FastAPI) -> TestClient:
+    """A client the shared local guard accepts: direct loopback peer, loopback Host, no Origin."""
+    return TestClient(app, base_url="http://127.0.0.1:8765", client=("127.0.0.1", 50000))
+
+
+def test_http_fresh_codexbar_from_a_non_local_caller_is_refused(monkeypatch, tmp_path):
+    """Defect class: any HTTP caller able to start provider probes with ``?fresh_codexbar=true``."""
+    _configure(monkeypatch, tmp_path, [])
+    kicked = []
+    monkeypatch.setattr(state_router, "trigger_background_refresh", lambda: kicked.append("kick"))
+    app = FastAPI()
+    app.state.ctx = fixture_context(tmp_path)
+    app.include_router(state_router.router, prefix="/api/state")
+
+    for remote in (
+        TestClient(app),
+        TestClient(app, base_url="http://127.0.0.1:8765", client=("127.0.0.1", 50000), headers={"Origin": "https://evil.example"}),
+        TestClient(app, base_url="http://127.0.0.1:8765", client=("127.0.0.1", 50000), headers={"X-Forwarded-For": "203.0.113.9"}),
+    ):
+        refused = remote.get("/api/state/routing-budget?fresh_codexbar=true")
+        assert refused.status_code == 403
+        assert refused.headers["Cache-Control"] == "no-store"
+    assert kicked == []
 
 
 def test_repeated_fresh_requests_within_interval_start_one_claude_probe(monkeypatch, tmp_path):
@@ -1104,7 +1129,7 @@ def test_repeated_fresh_requests_within_interval_start_one_claude_probe(monkeypa
     app = FastAPI()
     app.state.ctx = fixture_context(tmp_path)
     app.include_router(state_router.router, prefix="/api/state")
-    client = TestClient(app)
+    client = _local_client(app)
     try:
         first = client.get("/api/state/routing-budget?fresh_codexbar=true")
         assert first.status_code == 200

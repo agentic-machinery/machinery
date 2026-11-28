@@ -10,7 +10,7 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from lu_machinery.api.monitor_context import MonitorContext, get_ctx
 from lu_machinery.api.observer_presence import _direct_loopback_peer
@@ -34,8 +34,49 @@ from lu_machinery.api.project_state_store import (
     upsert_report,
     workers_status_from_document,
 )
+from lu_machinery.common import json_depth
 
 router = APIRouter(prefix="/projects/v1", tags=["fleet-projects"])
+
+# A full report (200 workers, every service, every lane) stays far below this; a larger body is refused unread.
+MAX_REPORT_BODY_BYTES = 256 * 1024
+# The collector reports one row per service definition and per lane; these caps leave room for growth.
+MAX_REPORT_SERVICES = 64
+MAX_REPORT_LANE_USAGE = 64
+# Reports nest a few levels; a body nested deeper is refused instead of exhausting the parser's stack.
+MAX_BODY_JSON_DEPTH = 32
+# The exact keys the collector writes; anything else would be stored and served back verbatim.
+_PRIMARY_KEYS = frozenset({"head_sha", "origin_main_sha", "origin_main_age_s", "ahead", "behind", "dirty_count"})
+_WORKTREES_KEYS = frozenset({"count"})
+
+
+class BodyTooLargeError(ValueError):
+    """The request body exceeded the route's byte limit; nothing past the limit was read."""
+
+
+async def read_json_body_bounded(request: Request, *, max_bytes: int) -> Any:
+    """Read and decode one JSON request body, refusing it once it passes ``max_bytes``.
+
+    A declared ``Content-Length`` above the limit is refused before any byte is
+    read; a body without one, or one that lies, stops at the first chunk that
+    crosses the limit. Raises ``BodyTooLargeError`` for size and ``ValueError``
+    for a body that is not UTF-8 JSON or nests past ``MAX_BODY_JSON_DEPTH``.
+    """
+    declared = request.headers.get("content-length")
+    if declared is not None and declared.isascii() and declared.isdecimal() and int(declared) > max_bytes:
+        raise BodyTooLargeError("request body too large")
+    chunks: list[bytes] = []
+    size = 0
+    async for chunk in request.stream():
+        size += len(chunk)
+        if size > max_bytes:
+            raise BodyTooLargeError("request body too large")
+        chunks.append(chunk)
+    try:
+        return json_depth.loads(b"".join(chunks).decode("utf-8"), max_depth=MAX_BODY_JSON_DEPTH)
+    except RecursionError as exc:
+        raise ValueError("request body nests too deeply") from exc
+
 
 EXTRA_REPORTER_HOST_IDS = frozenset({"mac-operator"})
 
@@ -305,10 +346,10 @@ class ProjectStateReport(BaseModel):
     host_id: str
     primary: dict[str, Any]
     worktrees: dict[str, Any]
-    services: list[dict[str, Any]]
+    services: list[dict[str, Any]] = Field(max_length=MAX_REPORT_SERVICES)
     collected_at: str
     workers: list[dict[str, Any]] | None = None
-    lane_usage: list[dict[str, Any]] | None = None
+    lane_usage: list[dict[str, Any]] | None = Field(None, max_length=MAX_REPORT_LANE_USAGE)
 
 
 @router.get("")
@@ -323,12 +364,22 @@ def get_projects(
 @router.post("/report")
 async def post_project_report(
     request: Request,
-    body: ProjectStateReport,
     ctx: MonitorContext = Depends(get_ctx),
 ) -> JSONResponse:
+    """Store one host's report; the peer is checked and the body size bounded before it is parsed."""
     no_store = {"Cache-Control": "no-store"}
     if not _direct_loopback_peer(request):
         return JSONResponse(status_code=403, content={"detail": "Forbidden"}, headers=no_store)
+    try:
+        body = ProjectStateReport.model_validate(
+            await read_json_body_bounded(request, max_bytes=MAX_REPORT_BODY_BYTES)
+        )
+    except BodyTooLargeError:
+        return JSONResponse(status_code=413, content={"detail": "request body too large"}, headers=no_store)
+    except (ValueError, ValidationError):
+        return JSONResponse(status_code=422, content={"detail": "invalid project state report"}, headers=no_store)
+    if set(body.primary) != _PRIMARY_KEYS or set(body.worktrees) != _WORKTREES_KEYS:
+        return JSONResponse(status_code=400, content={"detail": "invalid project state report"}, headers=no_store)
 
     allowed = allowed_reporter_host_ids(ctx)
     if body.host_id not in allowed:

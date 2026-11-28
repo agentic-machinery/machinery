@@ -252,6 +252,7 @@ tests/api/test_lane_health.py
 tests/api/test_lane_health_redaction.py
 tests/api/test_launchd_supervisor.py
 tests/api/test_load_samples.py
+tests/api/test_metrics_telemetry_public.py
 tests/api/test_model_stats.py
 tests/api/test_monitor_api_telemetry.py
 tests/api/test_monitor_client_failover.py
@@ -590,6 +591,8 @@ tests/storage_callers/test_write_contract.py
 tests/storage_callers/test_writer_lock.py
 tests/telemetry/test_cost_report.py
 tests/telemetry/test_telemetry_emit.py
+tests/telemetry/test_telemetry_events_v2.py
+tests/telemetry/test_telemetry_reader.py
 tests/test_fleet_repos.py
 tests/test_installed_root_contract.py
 tests/test_merged_delivery.py

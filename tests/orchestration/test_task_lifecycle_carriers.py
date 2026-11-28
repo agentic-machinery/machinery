@@ -71,12 +71,52 @@ def test_agent_ledger_persists_carrier_and_monitor_returns_it(
         lifecycle_file=path,
     )
     monitored = asyncio.run(
-        coordination_router.coordination_task("closeout-worker", ctx=fixture_context(tmp_path))
+        coordination_router.coordination_task("closeout-worker", ctx=fixture_context(tmp_path), full_detail=True)
     )
 
     assert task["task_lifecycle"]["state_file"] == str(path.resolve())
     assert monitored["task_lifecycle"] == task["task_lifecycle"]
     assert task["task_lifecycle"]["identity"] == task_lifecycle.load_lifecycle(path)["identity"]
+
+
+def test_coordination_task_serves_full_ledger_record_only_to_local_caller(tmp_path: Path) -> None:
+    """Defect class: a raw ledger record (paths, thread, metadata, events, lifecycle) served to any caller."""
+    from fastapi import FastAPI  # lazy-ok: only this test builds an app
+    from fastapi.testclient import TestClient  # lazy-ok: only this test builds an app
+
+    agent_ledger.upsert_task(
+        tmp_path,
+        task_id="closeout-worker",
+        agent="codex",
+        status="running",
+        thread_id="thread-private",
+        worktree=str(tmp_path / "private-worktree"),
+        owned_paths=["lu_machinery/api"],
+        metadata={"note": "private"},
+        lifecycle_file=_lifecycle_file(tmp_path),
+    )
+    app = FastAPI()
+    app.state.ctx = fixture_context(tmp_path)
+    app.include_router(coordination_router.router, prefix="/api/coordination")
+    url = "/api/coordination/tasks/closeout-worker"
+
+    for remote in (
+        TestClient(app),
+        TestClient(app, base_url="http://127.0.0.1:8765", client=("127.0.0.1", 50000), headers={"Origin": "https://evil.example"}),
+    ):
+        summary = remote.get(url).json()
+        assert set(summary) == {*coordination_router.SUMMARY_FIELDS, "owned_paths_count", "events_count", "detail"}
+        assert (summary["task_id"], summary["status"], summary["detail"]) == ("closeout-worker", "running", "summary")
+        assert summary["owned_paths_count"] == 1
+        assert "private" not in json.dumps(summary)
+
+    local = TestClient(app, base_url="http://127.0.0.1:8765", client=("127.0.0.1", 50000)).get(url).json()
+    assert local["thread_id"] == "thread-private"
+    assert local["metadata"] == {"note": "private"}
+    assert "task_lifecycle" in local
+    # A direct call without the dependency never receives full detail.
+    direct = asyncio.run(coordination_router.coordination_task("closeout-worker", ctx=fixture_context(tmp_path)))
+    assert direct["detail"] == "summary"
 
 
 @pytest.mark.parametrize("fresh", [False, True], ids=["rollover", "fresh"])

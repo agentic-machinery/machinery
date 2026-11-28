@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -58,6 +59,29 @@ def test_session_stream_status_and_digest_for_harness() -> None:
         assert dig.json()["limit"] == 5
         assert "pinned" in dig.json()
         assert "recent" in dig.json()
+
+
+def test_session_stream_status_and_digest_withhold_holder_identity(tmp_path: Path) -> None:
+    """Defect class: lease takeover by an unauthorized local caller. Any loopback process reads these routes; they
+    served the live holder's session id, instance id and pid beside the epics status (machinery-infra#1659)."""
+    from lu_machinery.session_streams.model import EntryType, LeaseHolder
+
+    ctx = fixture_context(tmp_path)
+    store = ctx.stores.session_streams_store
+    holder = LeaseHolder("codex", "codex-cli", "inst-hidden", process_id=48151, task_id="task-hidden")
+    lease, _ = store.claim_remote_session(
+        stream_id="epic:4707", holder=holder, lineage_id="lineage-1", ttl_seconds=900,
+        session_id="session-hidden", lease_id="lease-hidden",
+    )
+    store.append_entry(lease, entry_type=EntryType.STATE, body="working", idempotency_key="state-1")
+    client = _client(ctx)
+
+    status = client.get("/api/session-streams/v1/status/epic:4707")
+    digest = client.get("/api/session-streams/v1/digest/epic:4707")
+    assert status.status_code == 200 and digest.status_code == 200
+    assert status.json()["holder_agent"] == "codex" and digest.json()["recent"][-1]["body"] == "working"
+    for body in (status.text, digest.text):
+        assert not any(value in body for value in ("session-hidden", "lease-hidden", "inst-hidden", "48151")), body
 
 
 def test_session_stream_status_rejects_bad_id() -> None:
@@ -129,3 +153,60 @@ def test_session_streams_missing_db_returns_404(tmp_path: Path) -> None:
         d = factory_client.get("/api/session-streams/v1/digest/epic:4707")
         assert d.status_code == 404
         assert "session-stream database is unavailable" in d.json()["detail"]
+
+
+def test_status_and_digest_serve_the_epics_safe_projection(monkeypatch) -> None:
+    """Defect class: raw session-stream entries and holder fields served past the epics API's safe projection."""
+    from types import SimpleNamespace  # lazy-ok: only this test builds fakes
+
+    from lu_machinery.api import session_streams_router as module  # lazy-ok: monkeypatch target
+    from lu_machinery.session_streams.handoff import HandoffStatus  # lazy-ok: fake status
+
+    private = "/Users/alice/private"
+    entry = {
+        "entry_id": 1,
+        "stream": "epic:7178",  # allow-hardcoded-epic: projection fixture
+        "session_id": "session",
+        "agent": "codex",
+        "harness": "codex-cli",
+        "idempotency_key": "key",
+        "body": "safe",
+        "refs": [{"kind": "source", "uri": f"{private}.txt", "target_entry_id": None}],
+    }
+    digest = SimpleNamespace(pinned=[entry], recent=[{**entry, "entry_id": 2, "agent": private}])
+    store = SimpleNamespace(load_digest=lambda stream_id, *, limit: digest)
+    status = HandoffStatus(
+        stream_id="epic:7178",  # allow-hardcoded-epic: projection fixture
+        session_id="session",
+        session_state="open",
+        lease_state="active",
+        lease_expired=False,
+        holder_agent=private,
+        holder_harness="codex-cli",
+        holder_instance_id="instance",
+        holder_kind="process",
+        holder_process_id=1,
+        holder_process_alive=True,
+        expires_at="2099-01-01T00:00:00Z",
+        heartbeat_at="2099-01-01T00:00:00Z",
+        claimable_force_close=False,
+        reason=f"remote lease held by {private}/codex-cli",
+    )
+    monkeypatch.setattr(module, "_store", lambda ctx: store)
+    monkeypatch.setattr(module, "entry_as_dict", lambda value: dict(value))
+    monkeypatch.setattr(module, "diagnose_handoff", lambda store, stream_id: status)
+    client = _client()
+
+    digest_body = client.get("/api/session-streams/v1/digest/epic:7178").json()
+    assert private not in json.dumps(digest_body)
+    assert digest_body["pinned"][0]["refs"] == []
+    assert digest_body["recent"][0]["agent"] == "[redacted]"
+    status_body = client.get("/api/session-streams/v1/status/epic:7178").json()
+    assert private not in json.dumps(status_body)
+    assert (status_body["holder_agent"], status_body["reason"]) == ("[redacted]", "[redacted]")
+    assert status_body["holder_harness"] == "codex-cli"
+
+    # The canonical stream-ID rule, not a prefix check, admits the path.
+    for bad in ("epic:abc", "epic:7178x", "epic:"):
+        assert client.get(f"/api/session-streams/v1/status/{bad}").status_code == 400, bad
+        assert client.get(f"/api/session-streams/v1/digest/{bad}").status_code == 400, bad
