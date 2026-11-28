@@ -241,7 +241,13 @@ def record_verdict(
     task_id = review.pop("_task_id", "review")
     caller = review.pop("_caller", repo.root)
     cli = review.pop("_cli", False)
-    reply = review.pop("_reply", "Checked.\n\nVERDICT: APPROVE\n")
+    # A review-loop envelope with the security sign-off: these branches touch security paths at critical risk.
+    reply = review.pop("_reply", "\n".join((
+        "VERDICT: APPROVE", "SCORE: 9/10", "SECURITY_VERDICT: PASS", "", "```json",
+        json.dumps({"schema_version": "code-review-findings.v1", "findings": [],
+                    "overall": {"correctness": "correct", "explanation": "Checked.", "confidence": 0.9}}),
+        "```", "",
+    )))
     base, head = repo.sha("origin/main"), repo.sha("feature")
     review_root = caller / "batch_state" / "tasks" if cli else tmp_path / "review-tasks"
     review_root.mkdir(parents=True, exist_ok=True)
