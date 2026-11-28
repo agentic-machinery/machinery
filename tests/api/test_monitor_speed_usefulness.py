@@ -351,6 +351,10 @@ globalThis.fetch = async (url) => {
         }
       : poolMode === 'source_ttl_expiry'
       ? {
+          claude: {
+            freshness: 'fresh', age_s: 809, stale_threshold_s: 810, status: 'near_cap', lane_status: 'cool', stale: false, remaining_pct: 73,
+            pool_pace: {pool: 'claude:a', status: 'near_cap', stale: false, age_s: 809, stale_threshold_s: 810},
+          },
           codex: {freshness: 'fresh', age_s: 809, stale_threshold_s: 810, status: 'cool', stale: false, remaining_pct: 75},
           cursor: {freshness: 'fresh', age_s: 599, stale_threshold_s: 600, status: 'cool', stale: false, provider_windows: {auto: {remaining_pct: 82}, api: {remaining_pct: 64}}},
         }
@@ -365,10 +369,28 @@ globalThis.fetch = async (url) => {
       : undefined;
     const isolatedCursorModes = new Set([
       'need_login_only', 'need_probe_hot_only', 'shared_grok_cursor_near_cap',
-      'stale_pool_pace_fresh_cursor', 'expiring_pool_pace_only', 'source_ttl_expiry',
+      'stale_pool_pace_fresh_cursor', 'expiring_pool_pace_only',
     ]);
     const subProviders = isolatedCursorModes.has(poolMode)
       ? []
+      : poolMode === 'source_ttl_expiry'
+      ? [
+          {
+            provider: 'claude',
+            label: 'Claude',
+            accounts: [
+              {
+                account: 'Claude a',
+                source: 'monitor',
+                pool_status: 'near_cap',
+                reading: {status: 'fresh', age_s: 809, stale_threshold_s: 810, read_at: '2026-11-28T00:55:31Z'},
+                weekly: {status: 'ok', used_pct: 100, left_pct: 0, resets_at: subResetAt},
+                pace: {status: 'ok', state: 'deficit', headroom_pct: -20, lasts_to_reset: false, runs_out_in_s: 0},
+                plan: {status: 'ok'},
+              },
+            ],
+          },
+        ]
       : poolMode === 'seven_canonical_pools'
       ? [
           {
@@ -377,14 +399,18 @@ globalThis.fetch = async (url) => {
             accounts: [
               {
                 account: 'Claude a',
-                reading: {status: 'fresh', age_s: 30, read_at: '2026-11-28T01:00:00Z'},
+                source: 'monitor',
+                pool_status: 'cool',
+                reading: {status: 'fresh', age_s: 30, stale_threshold_s: 810, read_at: '2026-11-28T01:00:00Z'},
                 weekly: {status: 'ok', used_pct: 27, left_pct: 73, resets_at: subResetAt},
                 pace: {status: 'ok', state: 'reserve', headroom_pct: 14, lasts_to_reset: true},
                 plan: {status: 'ok'},
               },
               {
                 account: 'Claude b',
-                reading: {status: 'fresh', age_s: 899, read_at: '2026-11-28T00:45:01Z'},
+                source: 'monitor',
+                pool_status: 'near_cap',
+                reading: {status: 'fresh', age_s: 809, stale_threshold_s: 810, read_at: '2026-11-28T00:46:31Z'},
                 weekly: {status: 'ok', used_pct: 100, left_pct: 0, resets_at: subResetAt},
                 pace: {status: 'ok', state: 'deficit', headroom_pct: -30, lasts_to_reset: false, runs_out_in_s: 0},
                 plan: {status: 'ok'},
@@ -397,14 +423,18 @@ globalThis.fetch = async (url) => {
             accounts: [
               {
                 account: 'Codex a',
-                reading: {status: 'fresh', age_s: 30, read_at: '2026-11-28T01:00:00Z'},
-                weekly: {status: 'ok', used_pct: 20, left_pct: 80, resets_at: subResetAt},
-                pace: {status: 'ok', state: 'on_pace', headroom_pct: 0, lasts_to_reset: true},
+                source: 'usage_cache',
+                pool_status: 'cool',
+                reading: {status: 'fresh', age_s: 30, stale_threshold_s: 900, read_at: '2026-11-28T01:00:00Z'},
+                weekly: {status: 'ok', used_pct: 99.0, left_pct: 1.0, resets_at: subResetAt},
+                pace: {status: 'ok', state: 'on_pace', headroom_pct: 0, lasts_to_reset: false},
                 plan: {status: 'ok'},
               },
               {
                 account: 'Codex b',
-                reading: {status: 'fresh', age_s: 30, read_at: '2026-11-28T01:00:00Z'},
+                source: 'usage_cache',
+                pool_status: 'cool',
+                reading: {status: 'fresh', age_s: 30, stale_threshold_s: 900, read_at: '2026-11-28T01:00:00Z'},
                 weekly: {status: 'ok', used_pct: 30, left_pct: 70, resets_at: subResetAt},
                 pace: {status: 'ok', state: 'on_pace', headroom_pct: 0, lasts_to_reset: true},
                 plan: {status: 'ok'},
@@ -417,14 +447,18 @@ globalThis.fetch = async (url) => {
             accounts: [
               {
                 account: 'AGY Gemini',
-                reading: {status: 'fresh', age_s: 30, read_at: '2026-11-28T01:00:00Z'},
+                source: 'usage_cache',
+                pool_status: 'cool',
+                reading: {status: 'fresh', age_s: 30, stale_threshold_s: 900, read_at: '2026-11-28T01:00:00Z'},
                 weekly: {status: 'ok', used_pct: 15, left_pct: 85, resets_at: subResetAt},
                 pace: {status: 'ok', state: 'reserve', headroom_pct: 10, lasts_to_reset: true},
                 plan: {status: 'ok'},
               },
               {
                 account: 'AGY Claude/GPT',
-                reading: {status: 'fresh', age_s: 30, read_at: '2026-11-28T01:00:00Z'},
+                source: 'usage_cache',
+                pool_status: 'near_cap',
+                reading: {status: 'fresh', age_s: 30, stale_threshold_s: 900, read_at: '2026-11-28T01:00:00Z'},
                 weekly: {status: 'ok', used_pct: 99.5, left_pct: 0.5, resets_at: subResetAt},
                 pace: {status: 'ok', state: 'deficit', headroom_pct: -20, lasts_to_reset: false, runs_out_in_s: 0},
                 plan: {status: 'ok'},
@@ -437,7 +471,9 @@ globalThis.fetch = async (url) => {
             accounts: [
               {
                 account: 'Grok+Cursor',
-                reading: {status: 'fresh', age_s: 30, read_at: '2026-11-28T01:00:00Z'},
+                source: 'usage_cache',
+                pool_status: 'cool',
+                reading: {status: 'fresh', age_s: 30, stale_threshold_s: 900, read_at: '2026-11-28T01:00:00Z'},
                 weekly: {status: 'ok', used_pct: 10, left_pct: 90, resets_at: subResetAt},
                 pace: {status: 'ok', state: 'reserve', headroom_pct: 20, lasts_to_reset: true},
                 plan: {status: 'ok'},
@@ -450,6 +486,7 @@ globalThis.fetch = async (url) => {
           label: 'Claude',
           accounts: [{
             account: 'Claude a',
+            pool_status: 'cool',
             reading: {status: 'fresh', age_s: 899, read_at: '2026-11-28T00:45:01Z'},
             weekly: {status: 'ok', left_pct: 73, resets_at: subResetAt},
             pace: {status: 'ok', state: 'reserve', headroom_pct: 14, lasts_to_reset: true},
@@ -635,20 +672,21 @@ const models = (() => {
     assert.match(document.getElementById('chips').innerHTML, /<b>\?<\/b> pools near cap unknown/);
     assert.doesNotMatch(document.getElementById('chips').innerHTML, /<b>1<\/b> pool near cap/);
 
-    // PR1569-F7: Canonical subscription pools without routing lanes (Claude b, AGY Claude/GPT) enter the near-cap chip.
+    // PR1569-F7: Canonical subscription pools without routing lanes (Claude b, AGY Claude/GPT) enter the near-cap chip,
+    // using canonical backend pool_status (so rounded 99.0% Codex a with pool_status='cool' is not miscounted as near_cap).
     poolMode = 'seven_canonical_pools';
     monoNow = 550000;
     generatedAt = '2026-11-28T01:18:00Z';
     await models.runner.loadPanel(models.PANELS[0]);
     updateChips();
     assert.match(document.getElementById('chips').innerHTML, /chip warn[^>]*><b>2<\/b> pools near cap<\/a>/);
-    assert.doesNotMatch(document.getElementById('chips').innerHTML, /<b>0<\/b> pools near cap/);
-    // When Claude b crosses 900s on a browser tick, chip drops it to unknown while keeping AGY Claude/GPT near cap.
+    assert.doesNotMatch(document.getElementById('chips').innerHTML, /<b>0<\/b> pools near cap|<b>3<\/b> pools near cap/);
+    // F1: When Claude b crosses its 810s Claude probe TTL on a browser tick, chip drops it to unknown while keeping AGY Claude/GPT near cap.
     monoNow += 2000;
     models.PANELS[0].onTick(models.PANELS[0], models.runner.latest, updateChips, fakeNow);
     assert.match(document.getElementById('chips').innerHTML, /chip warn[^>]*><b>1<\/b> pool near cap \(1 unknown\)<\/a>/);
 
-    // F1: Browser 1s ticks enforce each observation's source freshness limit (600s API/Cursor, 810s CodexBar)
+    // F1: Browser 1s ticks enforce each observation's source freshness limit (600s API/Cursor, 810s CodexBar & Claude sub/pool_pace)
     // even while the aggregate snapshot remains under 900s.
     poolMode = 'source_ttl_expiry';
     monoNow = 600000;
@@ -659,12 +697,14 @@ const models = (() => {
     assert.match(document.getElementById('usage-content').innerHTML, /55\.00 USD balance/);
     assert.match(document.getElementById('usage-content').innerHTML, /82% left/);
     assert.match(document.getElementById('usage-content').innerHTML, /64% left/);
-    assert.match(document.getElementById('chips').innerHTML, /<b>0<\/b> pools near cap<\/a>/);
+    assert.match(document.getElementById('chips').innerHTML, /<b>1<\/b> pool near cap<\/a>/);
     monoNow += 2000;
     models.PANELS[0].onTick(models.PANELS[0], models.runner.latest, updateChips, fakeNow);
     const sourceExpiredHtml = document.getElementById('usage-content').innerHTML;
     assert.doesNotMatch(sourceExpiredHtml, /55\.00|12\.00|82% left|64% left/, 'F1: API & Cursor figures withdraw at 600s source limit');
-    assert.match(document.getElementById('chips').innerHTML, /<b>\?<\/b> pools near cap unknown/, 'F1: Cursor (600s) and Codex (810s) both withdraw at their source limits');
+    assert.match(sourceExpiredHtml, /STALE/, 'F1: Claude subscription Reading cell shows STALE at 810s probe TTL');
+    assert.match(document.getElementById('chips').innerHTML, /<b>\?<\/b> Claude/, 'F1: Claude provider chip withdraws at 810s probe TTL');
+    assert.match(document.getElementById('chips').innerHTML, /<b>\?<\/b> pools near cap unknown/, 'F1: Cursor (600s), Codex (810s), and Claude sub+pool_pace (810s) all withdraw at their source limits');
 
     // Non-finite monotonic clock withdraws figures as unknown rather than keeping stale fresh values.
     poolMode = 'all_fresh';

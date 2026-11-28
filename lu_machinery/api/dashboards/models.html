@@ -489,44 +489,23 @@ function rowReadingState(freshness, ageS, row, budget) {
   return readingState(freshness, ageS, budget?.diagnostics?.stale_threshold_s);
 }
 
-function subscriptionPoolCapStatus(row, staleAfter, elapsedS = 0) {
-  if (!row || typeof row !== "object" || row.plan?.ended) return null;
-  if (readingState(row.reading?.status, agedSeconds(row.reading?.age_s, elapsedS), staleAfter) !== "fresh") return null;
-  const weekly = row.weekly || {};
-  if (weekly.status !== "ok") return null;
-  const used = validPct(weekly.used_pct) ? weekly.used_pct
-    : validPct(weekly.left_pct) ? 100 - weekly.left_pct : null;
-  if (used === null) return null;
-  const pace = row.pace || {};
-  if (pace.status === "ok") {
-    const headroom = pace.headroom_pct;
-    const expected = pace.expected_used_pct;
-    if (typeof headroom !== "number" || !Number.isFinite(headroom) || headroom < -100 || headroom > 100) return null;
-    if (expected != null && !validPct(expected)) return null;
+function subReadingLimit(reading, subs) {
+  const ownLimit = typeof reading?.stale_threshold_s === "number" && Number.isFinite(reading.stale_threshold_s) && reading.stale_threshold_s > 0
+    ? reading.stale_threshold_s : null;
+  if (ownLimit !== null) return ownLimit;
+  return typeof subs?.stale_after_s === "number" && Number.isFinite(subs.stale_after_s) && subs.stale_after_s > 0
+    ? subs.stale_after_s : 900;
+}
+
+function subReadingState(reading, subs, elapsedS = 0) {
+  const aged = agedSeconds(reading?.age_s, elapsedS);
+  const snapLimit = typeof subs?.stale_after_s === "number" && Number.isFinite(subs.stale_after_s) && subs.stale_after_s > 0
+    ? subs.stale_after_s : 900;
+  const limit = subReadingLimit(reading, subs);
+  if (limit < snapLimit && reading?.status === "fresh" && typeof aged === "number" && Number.isFinite(aged) && aged >= limit) {
+    return "stale";
   }
-  if (used >= 99 && pace.lasts_to_reset !== true) return "near_cap";
-  if (pace.status !== "ok") {
-    if (pace.reason_code === "too_early_in_window" || pace.reason === "too_early_in_window") return "cool";
-    if (used >= 99 && pace.lasts_to_reset === true) return "cool";
-    return null;
-  }
-  if (pace.lasts_to_reset === true) return "cool";
-  if (pace.lasts_to_reset === false) {
-    const delta = pace.state === "on_pace" ? 0
-      : pace.state === "deficit" ? 2.1
-      : pace.state === "reserve" ? -2.1
-      : typeof pace.headroom_pct === "number" && Number.isFinite(pace.headroom_pct) ? -pace.headroom_pct : null;
-    if (delta !== null && Math.abs(delta) <= 2) return "cool";
-    if (delta !== null && delta < -2) return "cool";
-    if (delta !== null && delta > 2 && (pace.state === "deficit" || pace.expected_used_pct != null)) {
-      if (typeof pace.runs_out_in_s === "number" && Number.isInteger(pace.runs_out_in_s) && pace.runs_out_in_s <= 0) {
-        return "near_cap";
-      }
-      return "hot";
-    }
-    return null;
-  }
-  return null;
+  return readingState(reading?.status, aged, limit);
 }
 
 function poolPaceFreshStatus(poolId, info, budget, elapsedS, laneFresh, now = Date.now()) {
@@ -535,18 +514,23 @@ function poolPaceFreshStatus(poolId, info, budget, elapsedS, laneFresh, now = Da
   if (poolPace.stale === true || typeof elapsedS !== "number" || !Number.isFinite(elapsedS)) {
     return {present: true, fresh: false, status: null};
   }
-  const threshold = typeof poolPace.stale_threshold_s === "number" && Number.isFinite(poolPace.stale_threshold_s) && poolPace.stale_threshold_s > 0
-    ? poolPace.stale_threshold_s
-    : (budget?.subscriptions?.stale_after_s ?? budget?.diagnostics?.stale_threshold_s);
+  const snapLimit = typeof budget?.subscriptions?.stale_after_s === "number" && Number.isFinite(budget.subscriptions.stale_after_s) && budget.subscriptions.stale_after_s > 0
+    ? budget.subscriptions.stale_after_s
+    : (budget?.diagnostics?.stale_threshold_s ?? 900);
+  const ownLimit = typeof poolPace.stale_threshold_s === "number" && Number.isFinite(poolPace.stale_threshold_s) && poolPace.stale_threshold_s > 0
+    ? poolPace.stale_threshold_s : null;
+  const threshold = ownLimit ?? snapLimit;
   const hasOwnAge = typeof poolPace.age_s === "number" && Number.isFinite(poolPace.age_s) && poolPace.age_s >= 0;
   if (hasOwnAge) {
     const aged = effectiveObservedAgeS(budgetClock.poolPaceObs, poolId, poolPace, budget, elapsedS, now);
+    if (ownLimit !== null && ownLimit < snapLimit && typeof aged === "number" && Number.isFinite(aged) && aged >= ownLimit) {
+      return {present: true, fresh: false, status: null};
+    }
     if (readingState("fresh", aged, threshold) !== "fresh") return {present: true, fresh: false, status: null};
   }
   const subRow = subscriptionRowForPool(budget, poolId);
   if (subRow) {
-    const staleAfter = budget?.subscriptions?.stale_after_s ?? threshold;
-    if (readingState(subRow.reading?.status, agedSeconds(subRow.reading?.age_s, elapsedS), staleAfter) !== "fresh") {
+    if (subReadingState(subRow.reading, budget?.subscriptions, elapsedS) !== "fresh") {
       return {present: true, fresh: false, status: null};
     }
   }
@@ -733,7 +717,11 @@ function subscriptionRows(subs, logins, elapsedS = 0) {
     return `<tr class="group"><th scope="colgroup" colspan="${SUBSCRIPTION_HEADERS.length}">${escapeHtml(provider.label || provider.provider)}</th></tr>`
       + accounts.map(row => {
         const reading = agedReading(row.reading, elapsedS);
-        const usage = readingState(reading?.status, reading?.age_s, staleAfter) === "fresh" ? row : {};
+        const rowLimit = subReadingLimit(row.reading, subs);
+        const state = subReadingState(row.reading, subs, elapsedS);
+        const displayReading = reading && state === "stale" && reading.status === "fresh"
+          ? {...reading, status: "stale"} : reading;
+        const usage = state === "fresh" ? row : {};
         const weekly = usage.weekly || {};
         return `<tr>${labelled([
           text(row.account),
@@ -746,7 +734,7 @@ function subscriptionRows(subs, logins, elapsedS = 0) {
           bankedCell(row.banked_resets?.source === "provider" ? usage.banked_resets : row.banked_resets),
           planCell(row.plan),
           signInCell(row.account, logins),
-          readingCell(reading, staleAfter),
+          readingCell(displayReading, rowLimit),
         ], SUBSCRIPTION_HEADERS)}</tr>`;
       }).join("");
   }).join("");
@@ -841,11 +829,10 @@ function budgetFreshnessKey(budget, elapsedS = 0) {
   if (!budget || typeof budget !== "object") return "none";
   const parts = [];
   const subs = budget.subscriptions;
-  const staleAfter = subs?.stale_after_s;
   for (const provider of Array.isArray(subs?.providers) ? subs.providers : []) {
     for (const row of Array.isArray(provider.accounts) ? provider.accounts : []) {
       if (row.plan?.ended) continue;
-      parts.push(`s:${row.account}:${readingState(row.reading?.status, agedSeconds(row.reading?.age_s, elapsedS), staleAfter)}`);
+      parts.push(`s:${row.account}:${subReadingState(row.reading, subs, elapsedS)}`);
     }
   }
   for (const [name, row] of Object.entries(budget.api_accounts || {})) {
@@ -1095,13 +1082,12 @@ function renderChips(latest, now = Date.now()) {
   const logins = latest.logins;
   const elapsed = budgetElapsedS(now);
   if (subs) {
-    const staleAfter = subs.stale_after_s;
     for (const provider of Array.isArray(subs.providers) ? subs.providers : []) {
       const accounts = (Array.isArray(provider.accounts) ? provider.accounts : []).filter(row => !row.plan?.ended);
       if (!accounts.length) continue;
       let minLeft = null, runsOut = 0, deficit = 0, unknownCount = 0;
       for (const row of accounts) {
-        const st = readingState(row.reading?.status, agedSeconds(row.reading?.age_s, elapsed), staleAfter);
+        const st = subReadingState(row.reading, subs, elapsed);
         const fresh = st === "fresh";
         const pace = fresh ? row.pace : null;
         const left = fresh && row.weekly?.status === "ok" && validPct(row.weekly.left_pct) ? row.weekly.left_pct : null;
@@ -1123,15 +1109,16 @@ function renderChips(latest, now = Date.now()) {
   if (budget) {
     const pools = new Map();
     if (subs && typeof subs === "object") {
-      const staleAfter = subs.stale_after_s ?? budget.diagnostics?.stale_threshold_s;
       for (const provider of Array.isArray(subs.providers) ? subs.providers : []) {
         for (const row of Array.isArray(provider.accounts) ? provider.accounts : []) {
           if (!row || row.plan?.ended) continue;
           const poolId = ACCOUNT_POOL_IDS[row.account];
           if (!poolId) continue;
           const record = pools.get(poolId) || {verified: false, nearCap: false};
-          const subStatus = subscriptionPoolCapStatus(row, staleAfter, elapsed);
-          if (subStatus && MEASURED_CAP_STATUSES.has(subStatus)) {
+          const fresh = subReadingState(row.reading, subs, elapsed) === "fresh";
+          const subStatus = fresh && typeof row.pool_status === "string" && MEASURED_CAP_STATUSES.has(row.pool_status)
+            ? row.pool_status : null;
+          if (subStatus) {
             record.verified = true;
             if (subStatus === "near_cap") record.nearCap = true;
           }

@@ -420,6 +420,16 @@ def test_cached_routing_budget_ages_api_account_balances(monkeypatch, tmp_path):
         snapshot = {
             "generated_at": "2026-11-28T06:00:00Z",
             "agents": {
+                "claude": {
+                    "eligible": True,
+                    "status": "near_cap",
+                    "lane_status": "cool",
+                    "freshness": "fresh",
+                    "stale": False,
+                    "age_s": 809.0,
+                    "codexbar": {"freshness": "fresh", "stale": False, "age_s": 809.0},
+                    "pool_pace": {"pool": "claude:a", "status": "near_cap", "stale": False, "age_s": 809.0},
+                },
                 "codex": {
                     "eligible": True,
                     "status": "cool",
@@ -427,6 +437,25 @@ def test_cached_routing_budget_ages_api_account_balances(monkeypatch, tmp_path):
                     "stale": False,
                     "age_s": 500.0,
                     "codexbar": {"freshness": "fresh", "stale": False, "age_s": 500.0},
+                },
+                "gemini": {
+                    "eligible": True,
+                    "status": "near_cap",
+                    "lane_status": "near_cap",
+                    "status_source": "weekly_pace",
+                    "burn_pct_7d": 100.0,
+                    "remaining_pct": 0.0,
+                    "spent_7d_usd": 100.0,
+                    "freshness": "unavailable",
+                    "age_s": None,
+                    "notebook_report": {
+                        "source": "notebook-report",
+                        "age_s": 899.0,
+                        "stale_threshold_s": 900.0,
+                        "weekly_used_pct": 100.0,
+                        "weekly_remaining_pct": 0.0,
+                        "freshness": "fresh",
+                    },
                 },
                 "cursor": {
                     "eligible": True,
@@ -478,26 +507,74 @@ def test_cached_routing_budget_ages_api_account_balances(monkeypatch, tmp_path):
                 "sources": {"usage_cache": {"status": "ok"}},
                 "providers": [
                     {
+                        "provider": "claude",
+                        "label": "Claude",
+                        "accounts": [
+                            {
+                                "account": "Claude a",
+                                "source": "monitor",
+                                "reading": {"status": "fresh", "age_s": 809.0, "read_at": "2026-11-28T05:46:31Z"},
+                                "weekly": {"status": "ok", "used_pct": 100.0, "used_pct_exact": 100.0, "left_pct": 0.0},
+                                "pace": {"status": "ok", "state": "deficit", "headroom_pct": -20.0, "expected_used_pct": 80.0, "lasts_to_reset": False, "runs_out_in_s": 0},
+                            },
+                            {
+                                "account": "Claude b",
+                                "source": "monitor",
+                                "reading": {"status": "fresh", "age_s": 809.0, "read_at": "2026-11-28T05:46:31Z"},
+                                "weekly": {"status": "ok", "used_pct": 100.0, "used_pct_exact": 100.0, "left_pct": 0.0},
+                                "pace": {"status": "ok", "state": "deficit", "headroom_pct": -20.0, "expected_used_pct": 80.0, "lasts_to_reset": False, "runs_out_in_s": 0},
+                            },
+                        ],
+                    },
+                    {
                         "provider": "codex",
                         "label": "Codex",
                         "accounts": [
                             {
                                 "account": "Codex a",
+                                "source": "usage_cache",
                                 "reading": {"status": "fresh", "age_s": 600.0, "read_at": "2026-11-28T05:50:00Z"},
-                            }
+                                "weekly": {"status": "ok", "used_pct": 99.0, "used_pct_exact": 98.99, "left_pct": 1.0},
+                                "pace": {"status": "ok", "state": "on_pace", "headroom_pct": 0.0, "expected_used_pct": 98.99, "lasts_to_reset": False},
+                            },
+                            {
+                                "account": "Codex b",
+                                "source": "usage_cache",
+                                "reading": {"status": "fresh", "age_s": 600.0, "read_at": "2026-11-28T05:50:00Z"},
+                                "weekly": {"status": "ok", "used_pct": 99.0, "used_pct_exact": 98.99, "left_pct": 1.0},
+                                "pace": {"status": "unknown", "reason": "no_pace"},
+                            },
                         ],
-                    }
+                    },
+                    {
+                        "provider": "agy",
+                        "label": "AGY",
+                        "accounts": [
+                            {
+                                "account": "AGY Claude/GPT",
+                                "source": "usage_cache",
+                                "reading": {"status": "fresh", "age_s": 30.0, "read_at": "2026-11-28T05:59:30Z"},
+                                "weekly": {"status": "ok", "used_pct": 100.0, "used_pct_exact": 100.0, "left_pct": 0.0},
+                                "pace": {"status": "ok", "state": "deficit", "headroom_pct": -20.0, "expected_used_pct": 80.0, "lasts_to_reset": False, "runs_out_in_s": 0},
+                            },
+                        ],
+                    },
                 ],
             },
             "recommendation": {"primary_agent_for_code": "codex", "warnings": []},
             "diagnostics": {
                 "data_age_s": 10.0,
                 "codexbar_max_age_s": 500.0,
-                "notebook_report_max_age_s": 200.0,
+                "notebook_report_available": True,
+                "notebook_report_max_age_s": 899.0,
+                "usage_sources": {"allotment": "codexbar+notebook-report"},
                 "stale": False,
                 "stale_threshold_s": 900,
             },
-            "ranked_by_headroom": [{"lane": "codex"}],
+            "ranked_by_headroom": [
+                {"lane": "codex", "status": "cool"},
+                {"lane": "gemini", "status": "near_cap", "burn_pct_7d": 100.0, "remaining_pct": 0.0},
+            ],
         }
         stored_snapshot.clear()
         stored_snapshot.update(snapshot)
@@ -512,8 +589,25 @@ def test_cached_routing_budget_ages_api_account_balances(monkeypatch, tmp_path):
         first = client.get("/api/state/routing-budget?include_subscriptions=true").json()
         assert first["api_accounts"]["deepseek"]["age_s"] == 599.0
         assert first["api_accounts"]["deepseek"]["freshness"] == "fresh"
-        # F1: +2s crosses the 600s default source freshness limit for prepaid API accounts and Cursor,
-        # while Codex/CodexBar (810s), pool_pace (900s), and the aggregate snapshot (900s) remain fresh.
+        # PR1569-F7: Canonical backend pool_status is projected onto subscription rows using exact used_pct_exact.
+        first_subs = {
+            row["account"]: row
+            for prov in first["subscriptions"]["providers"]
+            for row in prov["accounts"]
+        }
+        assert first_subs["Claude a"]["pool_status"] == "near_cap"
+        assert first_subs["Claude a"]["reading"]["stale_threshold_s"] == pytest.approx(810.0)
+        assert first_subs["Claude b"]["pool_status"] == "near_cap"
+        assert first_subs["Claude b"]["reading"]["stale_threshold_s"] == pytest.approx(810.0)
+        assert first_subs["Codex a"]["pool_status"] == "cool"
+        assert first_subs["Codex a"]["reading"]["stale_threshold_s"] == pytest.approx(900.0)
+        assert first_subs["Codex b"]["pool_status"] == "unknown"
+        assert first_subs["AGY Claude/GPT"]["pool_status"] == "near_cap"
+        assert first["agents"]["gemini"]["status"] == "near_cap"
+        assert first["agents"]["gemini"]["remaining_pct"] == 0.0
+        assert first["diagnostics"]["notebook_report_available"] is True
+
+        # F1 + F2: +2s crosses 600s for API/Cursor, 810s for Claude subscriptions & pool_pace, and 900s for notebook_report.
         clock["t"] += 2.0
         at_601 = client.get("/api/state/routing-budget?include_subscriptions=true").json()
         assert at_601["api_accounts"]["deepseek"]["age_s"] == pytest.approx(601.0)
@@ -528,6 +622,27 @@ def test_cached_routing_budget_ages_api_account_balances(monkeypatch, tmp_path):
         assert at_601["agents"]["cursor"]["codexbar"]["stale"] is True
         assert at_601["agents"]["cursor"]["pool_pace"]["age_s"] == pytest.approx(602.0)
         assert at_601["agents"]["cursor"]["pool_pace"]["stale"] is False
+        assert at_601["agents"]["claude"]["freshness"] == "stale"
+        assert at_601["agents"]["claude"]["pool_pace"]["stale"] is True
+        assert at_601["agents"]["claude"]["pool_pace"]["stale_threshold_s"] == pytest.approx(810.0)
+        at_601_subs = {
+            row["account"]: row
+            for prov in at_601["subscriptions"]["providers"]
+            for row in prov["accounts"]
+        }
+        assert at_601_subs["Claude a"]["reading"]["status"] == "stale"
+        assert at_601_subs["Claude b"]["reading"]["status"] == "stale"
+        assert at_601_subs["Codex a"]["reading"]["status"] == "fresh"
+        assert at_601["agents"]["gemini"]["status"] == "unknown"
+        assert at_601["agents"]["gemini"]["lane_status"] == "unknown"
+        assert at_601["agents"]["gemini"]["burn_pct_7d"] is None
+        assert at_601["agents"]["gemini"]["remaining_pct"] is None
+        assert at_601["agents"]["gemini"]["spent_7d_usd"] is None
+        gemini_ranked = next(r for r in at_601["ranked_by_headroom"] if r["lane"] == "gemini")
+        assert gemini_ranked["status"] == "unknown"
+        assert gemini_ranked["remaining_pct"] is None
+        assert at_601["diagnostics"]["notebook_report_available"] is False
+        assert at_601["diagnostics"]["usage_sources"]["allotment"] == "codexbar"
         assert at_601["agents"]["codex"]["age_s"] == pytest.approx(502.0)
         assert at_601["agents"]["codex"]["freshness"] == "fresh"
         assert at_601["agents"]["codex"]["stale_threshold_s"] == pytest.approx(810.0)
@@ -574,13 +689,20 @@ def test_cached_routing_budget_ages_api_account_balances(monkeypatch, tmp_path):
         assert body["codex_accounts"]["codex:b"]["freshness"] == "stale"
         assert body["codex_accounts"]["codex:b"]["codexbar"]["age_s"] == pytest.approx(956.0)
         assert body["diagnostics"]["codexbar_max_age_s"] == pytest.approx(806.0)
-        assert body["diagnostics"]["notebook_report_max_age_s"] == pytest.approx(506.0)
-    assert with_subs["subscriptions"]["providers"][0]["accounts"][0]["reading"]["age_s"] == pytest.approx(906.0)
-    assert with_subs["subscriptions"]["providers"][0]["accounts"][0]["reading"]["status"] == "stale"
+        assert body["diagnostics"]["notebook_report_max_age_s"] == pytest.approx(1205.0)
+    with_subs_accounts = {
+        row["account"]: row
+        for prov in with_subs["subscriptions"]["providers"]
+        for row in prov["accounts"]
+    }
+    assert with_subs_accounts["Codex a"]["reading"]["age_s"] == pytest.approx(906.0)
+    assert with_subs_accounts["Codex a"]["reading"]["status"] == "stale"
     assert "subscriptions" not in without_subs
     assert stored_snapshot["api_accounts"]["deepseek"]["age_s"] == 599.0
     assert stored_snapshot["api_accounts"]["deepseek"]["freshness"] == "fresh"
     assert stored_snapshot["agents"]["cursor"]["age_s"] == 599.0
+    assert stored_snapshot["agents"]["gemini"]["status"] == "near_cap"
+    assert stored_snapshot["agents"]["gemini"]["remaining_pct"] == 0.0
 
 
 def test_task_rewrite_serves_warm_snapshot_while_recompute_is_blocked(monkeypatch, tmp_path):
