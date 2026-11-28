@@ -10,9 +10,12 @@ never fine.
    (`lu_cto_source_ok == 0`) is an attention item. Use hand-run commands (`gh`, usage
    meters) only for what no metric covers; a missing or wrong metric is a monitoring task,
    not a reason to keep measuring by hand.
-1. **Inbox.** Inspect the launcher slot and drain the three driver recipients
+1. **Inbox.** Drain the three driver recipients and, while no epics lane driver other than this
+   CTO session holds the epics stream lease, `claude-epics` the same fenced way as `claude-cto`
    ([startup](startup.md#4-identity-and-inbox)) at cycle start, after workers settle and
-   before handoff. Claim and read each delivery, then dispatch if the delivery permits it, then apply and ack the outcome even if no work launches.
+   before handoff. Those claims never return launcher supervisory requests (the authority
+   filter in `lu_machinery/fleet_comms/authority.py:1603-1626` and `:2330-2332`); hand the
+   `claude-epics` drain back once another epics lane driver holds the lease again. Claim and read each delivery, then dispatch if the delivery permits it, then apply and ack the outcome even if no work launches.
    `claude-cto` is the durable CTO
    recipient: claim it with your session identity as `--worker-id`, and a worker escalation
    waits there at most one cycle. Any backlog still queued at a `claude-cto-<id>` name is a

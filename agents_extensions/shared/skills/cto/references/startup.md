@@ -51,10 +51,17 @@ and the authority service refuses any publication to `claude-cto-<anything>`. Yo
 identity `claude-cto-<session id>` is only the consumer identity: pass it as `--worker-id`
 when you claim and acknowledge, never as a recipient and never to workers as an address.
 The default drain covers `cto`, `epics` and `claude-cto`.
-`claude-epics` (`lu_machinery/config/area_assignments.yaml` `epics.slots`) carries the launcher's
-supervisory deliveries. Inspect that slot first with
-`"$LEARN_UKRAINIAN_PYTHON" -I -m lu_machinery.fleet_comms backlog`. Leave claims on that slot to
-the launcher because the claim command cannot select a delivery by ID or kind.
+`claude-epics` (`lu_machinery/config/area_assignments.yaml` `epics.slots`) is the epics lane's
+slot. Inspect it first with `"$LEARN_UKRAINIAN_PYTHON" -I -m lu_machinery.fleet_comms backlog`.
+While no epics lane driver other than this CTO session holds the epics stream lease
+(`/api/session-streams/v1/status/{stream_id}`, `docs/runbooks/session-streams-monitor-api.md`),
+the CTO is that slot's ordinary consumer: drain `claude-epics` exactly like `claude-cto`, with
+your session identity as `--worker-id`. Such a claim or receive replay never returns a launcher
+supervisory request: the authority filters legacy supervisory mail out of claims and replay on
+every recipient except `supervisor:epic:<number>` (`lu_machinery/fleet_comms/authority.py:1603-1626`)
+and refuses new supervisory mail to ordinary recipients (`authority.py:2330-2332`). When another
+epics lane driver holds the lease again, stop draining `claude-epics` and hand its ordinary drain
+back to that driver.
 The Fleet authority service admits every exact recipient, even where a convenience CLI
 lists fewer. For each message run the authority-delivery procedure in
 `docs/runbooks/driver-seat-cli-move.md` § 5: claim, read the body, reconcile prior effects,
