@@ -284,6 +284,15 @@ def _cached_host_layout_template() -> HostLayout:
     template_dir = Path(tempfile.mkdtemp(prefix="host-binding-template-", dir=base))
     atexit.register(shutil.rmtree, template_dir, ignore_errors=True)
     template = build_host_layout(template_dir)
+    # Keep isolated (-I) launcher child calls from writing __pycache__ into shared checkouts.
+    site = (
+        template_dir
+        / "runtime"
+        / "lib"
+        / f"python{sys.version_info.major}.{sys.version_info.minor}"
+        / "site-packages"
+    )
+    (site / "no-bytecode.pth").write_text("import sys; sys.dont_write_bytecode = True\n", encoding="utf-8")
     _HOST_LAYOUT_TEMPLATES[key] = (template_dir, template)
     return template
 

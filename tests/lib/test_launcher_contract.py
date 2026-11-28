@@ -1510,7 +1510,7 @@ def test_codex_keeps_core_before_caller_developer_instructions(
     # launcher wrapper 30+ times.
     expected_core = rules_core.core_block(rules_core.resolve_seat())
     shell_merge_cases = (
-        ((f"--config=developer_instructions={rules_core.toml_basic_string(role)}",), role, "--config="),
+        (("--search", f"--config=developer_instructions={rules_core.toml_basic_string(role)}"), role, "--config="),
         (("-c=developer_instructions='Literal \\n text'",), r"Literal \n text", "-c="),
         (("-cdeveloper_instructions=Attached short",), "Attached short", "-c"),
         (("-c", "developer_instructions="), "", ""),
@@ -1541,14 +1541,17 @@ def test_codex_keeps_core_before_caller_developer_instructions(
     )
     shell_out = tmp_path / "codex-shell-matrix"
     shell_out.mkdir()
+    py_no_bc = tmp_path / "py-no-bc"
+    py_no_bc.write_text(f"#!/usr/bin/env bash\nexec {shlex.quote(sys.executable)} -B \"$@\"\n", encoding="utf-8")
+    py_no_bc.chmod(0o755)
     shell_lines = [
         "set -euo pipefail",
         f"source {shlex.quote(str(machinery_path('lib/launcher_core.sh')))}",
         f"source {shlex.quote(str(machinery_path('launchers/codex.sh')))}",
         f"source {shlex.quote(str(machinery_path('lib/rules_core.sh')))}",
-        f"launcher_project_python() {{ printf '%s\\n' {shlex.quote(sys.executable)}; }}",
-        "LC_PROVIDER=codex LC_MODE=interactive LC_HARNESS=native LC_DRY_RUN=1",
-        f"rules_core_load {shlex.quote(sys.executable)} '' codex",
+        f"launcher_project_python() {{ printf '%s\\n' {shlex.quote(str(py_no_bc))}; }}",
+        "LC_PROVIDER=codex LC_MODE=interactive LC_HARNESS=codex LC_DRY_RUN=1",
+        f"rules_core_load {shlex.quote(str(py_no_bc))} '' codex",
         "run_ok() {",
         '  local out="$1"; shift',
         '  LC_FORWARD_ARGS=("$@")',
