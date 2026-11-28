@@ -1475,6 +1475,8 @@ def test_model_version_and_effort_are_never_collapsed_or_defaulted(tmp_path, mon
                                            "Not enough data", "pool_pace", "/subscriptions",
                                            "landed_ci"))
     assert "quota-alerts" not in html and "Cached snapshot fallback:" not in html
+    assert all(token not in html for token in ("planning-blockers", "planning-ready", "planning-blocked"))
+    assert "planning-pools" in html and 'href="/milestones"' in html
     # Ten short tasks must stay eligible, and the score is approvals over recorded hours.
     rank_root = tmp_path / "value"
     rank_tasks = rank_root / "tasks"
