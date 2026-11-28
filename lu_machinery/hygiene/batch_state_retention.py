@@ -111,7 +111,8 @@ def scratch_expiry(
         holds = load_holds(RETENTION_LIST)
         if any(hold["parts"][0] == origin.name for hold in holds):
             return None, "expiry_held"
-        root = origin.parent.parent
+        batch = origin.parent
+        root = batch.parent
         env = safe_git_env()
         env.update(LC_ALL="C", GIT_DISCOVERY_ACROSS_FILESYSTEM="1")
         tracked = subprocess.run(
@@ -127,10 +128,11 @@ def scratch_expiry(
             or root != state_root()
             or root.resolve(strict=True) != root
             or not stat.S_ISDIR(root.lstat().st_mode)
+            or not stat.S_ISDIR(batch.lstat().st_mode)
         ):
             return None, "expiry_proof_unknown"
-        # Git can emit the same error for a broken checkout marker.
-        for ancestor in (root, *root.parents):
+        # Git can miss a broken marker or a checkout rooted at batch_state.
+        for ancestor in (batch, *batch.parents):
             try:
                 (ancestor / ".git").lstat()
             except FileNotFoundError:
