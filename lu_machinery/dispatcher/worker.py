@@ -568,7 +568,7 @@ def start(spec: TaskSpec, record: dict, prompt: bytes, hard_timeout: float, *, p
     if not record.get("admission_hold"):
         record["admission_hold"] = new_admission_hold(record["run_nonce"])
     path = store.record_path(spec.task_id)
-    logs = path.parent / "logs"
+    _, stderr_path = store.name_stream_logs(record, path)
     try:
         if progress is not None:
             progress["record"] = True  # from here a record of this run may name the prompt file
@@ -577,8 +577,8 @@ def start(spec: TaskSpec, record: dict, prompt: bytes, hard_timeout: float, *, p
         except FileExistsError as exc:
             if not _submitted_prompt_already_published(record, prompt, exc.filename):
                 raise
-        logs.mkdir(exist_ok=True, mode=0o700)
-        with open(logs / f"{spec.task_id}.stderr.log", "ab", opener=lambda p, f: os.open(p, f, 0o600)) as err:
+        stderr_path.parent.mkdir(exist_ok=True, mode=0o700)
+        with open(stderr_path, "ab", opener=lambda p, f: os.open(p, f, 0o600)) as err:
             mask = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM, signal.SIGINT})
             try:
                 if progress is not None:
@@ -586,7 +586,7 @@ def start(spec: TaskSpec, record: dict, prompt: bytes, hard_timeout: float, *, p
                 process, launch = admission.spawn_supervisor(
                     [sys.executable, "-I", "-m", "lu_machinery.dispatcher.worker", str(path)],
                     task_id=spec.task_id, run_nonce=record["run_nonce"], cwd=state_root(),
-                    stderr=err, stderr_log=logs / f"{spec.task_id}.stderr.log",
+                    stderr=err, stderr_log=stderr_path,
                     env={**os.environ,
                          "LEARN_UKRAINIAN_DISPATCH_TASK_ID": spec.task_id,
                          "LEARN_UKRAINIAN_DISPATCH_AGENT": spec.agent},
@@ -2292,8 +2292,8 @@ def supervise(path: Path, options: dict | None = None, hard_timeout: float | Non
 
     previous_term = signal.signal(signal.SIGTERM, cancelled)
     previous_int = signal.signal(signal.SIGINT, cancelled)
-    stdout_path = path.parent / "logs" / f"{spec.task_id}.stdout.log"
-    stderr_path = path.parent / "logs" / f"{spec.task_id}.stderr.log"
+    # Derive destinations here too, so a record from an older launcher still names its logs.
+    stdout_path, stderr_path = store.name_stream_logs(record, path)
     try:
         signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGTERM, signal.SIGINT})
         try:
@@ -2474,6 +2474,13 @@ def supervise(path: Path, options: dict | None = None, hard_timeout: float | Non
                     start_new_session=True,
                     pass_fds=() if draft_fd is None else (draft_fd,),
                 )
+                if spec.agent == "agy":
+                    from lu_machinery.dispatcher.providers.agy import invocation_log_path
+
+                    provider_log = invocation_log_path(invocation.argv)
+                    record["log_paths"]["provider"] = (
+                        str((spec.worktree / provider_log).absolute()) if provider_log is not None else None
+                    )
                 record.update(status="running", provider_pgid=child.pid)
                 store.replace(record, path, require_existing=True)
                 terminal_observer = getattr(provider, "terminal_result_observer", None)

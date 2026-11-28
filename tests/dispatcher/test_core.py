@@ -563,6 +563,161 @@ def test_initial_response_timeout_default_is_600():
     assert args.silence_timeout == 3600
 
 
+def test_task_record_names_provider_log_for_every_mode(spec, configured_roots, monkeypatch, tmp_path):
+    """Defect class: a live task's log location is undiscoverable."""
+    from lu_machinery.agent_runtime.adapters import agy as runtime_agy
+    from lu_machinery.agent_runtime.attempt_boundary import AttemptBoundary
+    from lu_machinery.agent_runtime.review_mcp import SUPPORTED_HARNESSES
+    from lu_machinery.dispatcher import review_attempt
+    from lu_machinery.dispatcher.providers import agy, claude
+    from lu_machinery.dispatcher.types import Invocation
+
+    tasks = tmp_path / "tasks"
+    tasks.mkdir()
+    monkeypatch.setenv("LU_TASKS_DIR", str(tasks))
+    monkeypatch.setenv("LU_SCRATCH_ROOT", str(tmp_path / "scratch"))
+    monkeypatch.delenv("LU_RUNTIME_TMP_BASE_ROOT", raising=False)
+    monkeypatch.setattr(agy, "workspace_sources_refusal", lambda *_: None)
+    monkeypatch.setattr(agy, "has_ambient_sources_config", lambda *_, **__: False)
+    monkeypatch.setattr(agy, "_workspace_sources_settings", lambda **_: None)
+    monkeypatch.setattr(agy_sandbox, "unavailable", lambda: None)
+    monkeypatch.setattr(agy_sandbox, "launcher", lambda _spec, argv: argv)
+    monkeypatch.setattr(claude, "managed_policy", lambda _: None)
+    monkeypatch.setattr(worker.headroom, "check_plan", lambda *_, **__: None)
+    monkeypatch.setattr(worker.headroom, "check_runtime", lambda *_, **__: None)
+    monkeypatch.setattr(worker.git, "pin_settlement_registry", lambda: None)
+    monkeypatch.setattr(worker.git, "snapshot_delivery", lambda *_: {})
+    monkeypatch.setattr(worker, "_allowance", lambda *_: {})
+    monkeypatch.setattr(worker, "_provider_env", lambda _: {})
+    monkeypatch.setattr(worker, "_enforce_delivery", lambda _: None)
+    monkeypatch.setattr(worker, "_reap_settled", lambda *_, **__: None)
+    monkeypatch.setattr(worker, "_turn_tree_unproven", lambda _: False)
+    monkeypatch.setattr(worker, "_release_stream", lambda *_, **__: None)
+    monkeypatch.setattr(worker.scratch, "start", lambda *_: None)
+    monkeypatch.setattr(worker.write_boundary, "launcher", lambda _, invocation, __: invocation.argv)
+    monkeypatch.setattr(worker.write_boundary, "verify", lambda *_: ({}, None))
+    monkeypatch.setattr(worker.write_boundary, "discard", lambda _: None)
+    monkeypatch.setattr(worker.admission, "spawn_supervisor", lambda *_, **__: (
+        SimpleNamespace(pid=os.getpid(), stdin=Mock()), {}
+    ))
+    code = (
+        "import sys\n"
+        "from pathlib import Path\n"
+        "print('provider stdout')\n"
+        "print('provider stderr', file=sys.stderr)\n"
+        "if '--log-file' in sys.argv:\n"
+        "    log = Path(sys.argv[sys.argv.index('--log-file') + 1])\n"
+        "    log.parent.mkdir(parents=True, exist_ok=True)\n"
+        "    log.write_text('provider diagnostic')\n"
+    )
+
+    def build(task, env):
+        argv = agy.build(task, env).argv if task.agent == "agy" else []
+        return Invocation([sys.executable, "-c", code, *argv], None, env, None)
+
+    observed = []
+
+    def observe_running(child, *_args, **_kwargs):
+        live = store.read(task_id)
+        child.wait(timeout=10)
+        paths = live["log_paths"]
+        contents = {name: Path(path).read_text() for name, path in paths.items() if path is not None}
+        observed.append((live["status"], paths, contents))
+
+    monkeypatch.setattr(worker.runtime_context, "build", build)
+    monkeypatch.setattr(worker, "communicate", observe_running)
+    boundary = object.__new__(AttemptBoundary)
+    boundary.consumer = False
+    boundary.sources_enabled = False
+    monkeypatch.setattr(runtime_agy, "require_hook_config", lambda *_, **__: None)
+    monkeypatch.setattr(runtime_agy, "_require_background_wait_support", lambda _: None)
+    monkeypatch.setattr(runtime_agy, "_write_review_permissions", lambda *_, **__: None)
+
+    def run_bound(task, record, prompt, _deadlines):
+        if task.agent != "agy":
+            live = store.read(task.task_id)
+            observed.append((live["status"], live["log_paths"], None))
+            return review_attempt.Outcome("done", None, "done", None, {})
+        config = {"review_attempt_boundary": boundary, "review_write_root": str(tmp_path / "attempt"),
+                  "run_nonce": record["run_nonce"]}
+        adapter = runtime_agy.AgyAdapter()
+        stdout, stderr = tmp_path / "bound.stdout", tmp_path / "bound.stderr"
+        stdout.touch()
+        stderr.touch()
+
+        def make_plan():
+            return adapter.build_invocation(
+                prompt=prompt, mode=task.mode, cwd=task.worktree, model=task.model,
+                task_id=task.task_id, session_id=None, tool_config=config,
+            )
+
+        def observe_bound(log):
+            live = store.read(task.task_id)
+            observed.append((live["status"], live["log_paths"], str(log)))
+            return True
+
+        for _ in range(2):  # Each launched retry gets its own diagnostic file.
+            _watch_bound_agy(tmp_path, monkeypatch, stdout, stderr, SimpleNamespace(monotonic=lambda: 0),
+                             observe_bound, plan=make_plan(), task_id=task.task_id, run_nonce=record["run_nonce"])
+        unlaunched = make_plan().liveness_paths[0]
+        observed.append(("unlaunched", store.read(task.task_id)["log_paths"], str(unlaunched)))
+        return review_attempt.Outcome("done", None, "done", None, {})
+
+    monkeypatch.setattr(review_attempt, "run", run_bound)
+    cases = [(agent, mode) for agent in providers.PROVIDERS for mode in ("read-only", "workspace-write")]
+    cases += [(agent, "manifest-bound") for agent in sorted(SUPPORTED_HARNESSES)]
+    cases.append(("agy", "orchestrator"))
+    for agent, launch_mode in cases:
+        task_id = f"{agent}-{launch_mode}"
+        bound = launch_mode == "manifest-bound"
+        orchestrator = launch_mode == "orchestrator"
+        mode = "read-only" if bound else "workspace-write" if orchestrator else launch_mode
+        task = dataclasses.replace(spec, task_id=task_id, agent=agent, mode=mode, model="gemini-4-neon-high",
+                                   final_file=tasks / f"{task_id}.result")
+        record = store.new_record(task, {"key": "public", "github": "example/repo"}, "main", "a" * 40,
+                                  {"research_owned_path": []})
+        record["prompt_file"] = str(tasks / f"{task_id}.prompt")
+        if bound:
+            record["review_attempt"] = {"attempt_id": "example"}
+            monkeypatch.setenv("LEARN_UKRAINIAN_DISPATCH_TASK_ID", task_id)
+        if orchestrator:
+            record["orchestrator"] = {"stream": "epic:123"}
+        scope_limits = (60, 5, time.monotonic() + 10) if orchestrator else None
+        worker.start(task, record, spec.prompt_file.read_bytes(), 10, scope_limits=scope_limits)
+
+        expected = {
+            "stdout": str(tasks / "logs" / f"{task_id}.stdout.log"),
+            "stderr": str(tasks / "logs" / f"{task_id}.stderr.log"),
+            "provider": None,
+        }
+        assert store.read(task_id)["log_paths"] == expected, task_id
+        observed.clear()
+        worker.supervise(store.record_path(task_id))
+        if bound:
+            logs = [entry[2] for entry in observed]
+            if agent == "agy":
+                assert len(logs) == len(set(logs)) == 3 and all(logs)
+                first, last, abandoned = logs
+                assert observed == [
+                    ("running", {**expected, "provider": first}, first),
+                    ("running", {**expected, "provider": last}, last),
+                    ("unlaunched", {**expected, "provider": last}, abandoned),
+                ]
+            else:
+                assert observed == [("running", expected, None)], task_id
+                last = None
+            assert store.read(task_id)["log_paths"] == {**expected, "provider": last}
+        else:
+            contents = {"stdout": "provider stdout\n", "stderr": "provider stderr\n"}
+            if agent == "agy":
+                expected["provider"] = str(
+                    tmp_path / "scratch" / f"agy-read-only-{task_id}" / "runtime" / "logs" / "agy.log"
+                    if mode == "read-only" else tasks / f"{task_id}.log"
+                )
+                contents["provider"] = "provider diagnostic"
+            assert observed == [("running", expected, contents)], (task_id, store.read(task_id)["error"])
+
+
 def test_run_worker_silence_timeout_kills_silent_subprocess(sandbox):
     """Ported from tests/test_delegate.py with the same test name, including process-tree cleanup.
 
@@ -641,14 +796,19 @@ def _watch_agy(tmp_path, monkeypatch, mode, tick):
     return None, now
 
 
-def _watch_bound_agy(tmp_path, monkeypatch, stdout, stderr, clock, advance):
+def _watch_bound_agy(tmp_path, monkeypatch, stdout, stderr, clock, advance, *,
+                     plan=None, task_id="watch-agy", run_nonce=None):
     from lu_machinery.agent_runtime import runner
+    from lu_machinery.agent_runtime import watchdog as runtime_watchdog
     from lu_machinery.agent_runtime.adapters.base import InvocationPlan
     from lu_machinery.agent_runtime.result import ParseResult
     from lu_machinery.agent_runtime.watchdog import WatchdogState, _emit_line
 
-    log = tmp_path / "agy.log"
-    plan = InvocationPlan(cmd=["agy", "--log-file", str(log)], cwd=tmp_path, liveness_paths=(log,))
+    if plan is None:
+        log = tmp_path / "agy.log"
+        plan = InvocationPlan(cmd=["agy", "--log-file", str(log)], cwd=tmp_path, liveness_paths=(log,))
+    else:
+        log = plan.liveness_paths[0]
     child = SimpleNamespace(pid=100, returncode=None)
     child.poll = lambda: child.returncode
     monkeypatch.setattr(runner, "_spawn_subprocess", lambda *_args, **_kwargs: (child, None, None))
@@ -677,6 +837,7 @@ def _watch_bound_agy(tmp_path, monkeypatch, stdout, stderr, clock, advance):
         return state, []
 
     monkeypatch.setattr(runner, "time", clock)
+    monkeypatch.setattr(runtime_watchdog, "time", clock)
     monkeypatch.setattr(runner, "start_watchdog", start_watchdog)
     monkeypatch.setattr(runner, "stop_watchdog", lambda *_args, **_kwargs: None)
     boundary = SimpleNamespace(workspace=tmp_path, verify_seat=lambda *_args: None,
@@ -685,9 +846,9 @@ def _watch_bound_agy(tmp_path, monkeypatch, stdout, stderr, clock, advance):
                               parse_response=lambda **_kwargs: ParseResult(ok=False, response=""))
     outcome = runner._execute_invocation_once(
         agent_name="agy", adapter=adapter, plan=plan, prompt="Test prompt", mode="read-only", cwd=tmp_path,
-        model="gemini-4-neon-high", task_id="watch-agy", session_id=None, entrypoint="dispatch",
+        model="gemini-4-neon-high", task_id=task_id, session_id=None, entrypoint="dispatch",
         hard_timeout=11, stall_timeout=0, stdout_silence_timeout=3, initial_response_timeout=2,
-        tool_config={"review_attempt_boundary": boundary},
+        tool_config={"review_attempt_boundary": boundary, "run_nonce": run_nonce},
     )
     return outcome.kill_reason
 
