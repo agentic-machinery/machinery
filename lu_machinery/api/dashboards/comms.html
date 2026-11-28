@@ -655,21 +655,20 @@ function renderMessages(payload) {
 }
 
 function renderChips(latest) {
-  const out = [];
   const metrics = latest.comms;
-  if (metrics) {
-    const ok = !metrics.db_error && !metrics.db_missing;
-    const queued = ok && typeof metrics.deliveries?.queued === "number" ? metrics.deliveries.queued : null;
-    const day = ok ? (metrics.failure_windows?.["24h"] || {}) : {};
-    const dead = typeof day.dead_letters?.total === "number" ? day.dead_letters.total : null;
-    const failedDeliv = typeof day.failed_deliveries?.total === "number" ? day.failed_deliveries.total : null;
-    const failedJobs = typeof day.failed_jobs?.total === "number" ? day.failed_jobs.total : null;
-    const failed = failedDeliv !== null && failedJobs !== null ? failedDeliv + failedJobs : failedDeliv;
-    out.push(chip("/comms?state=queued", queued ?? "?", "queued", queued === null || queued > 0 ? "warn" : "", "queued"));
-    out.push(chip("#health", dead ?? "?", "dead letters / 24 h", dead === null || dead > 0 ? "warn" : "", "dead-letters"));
-    out.push(chip("#health", failed ?? "?", "failed / 24 h", failed === null || failed > 0 ? "warn" : "", "failed"));
-  }
-  return out.join("");
+  if (metrics === undefined) return "";
+  const ok = Boolean(metrics) && !metrics.db_error && !metrics.db_missing;
+  const queued = ok && typeof metrics.deliveries?.queued === "number" ? metrics.deliveries.queued : null;
+  const day = ok ? (metrics.failure_windows?.["24h"] || {}) : {};
+  const dead = typeof day.dead_letters?.total === "number" ? day.dead_letters.total : null;
+  const failedDeliv = typeof day.failed_deliveries?.total === "number" ? day.failed_deliveries.total : null;
+  const failedJobs = typeof day.failed_jobs?.total === "number" ? day.failed_jobs.total : null;
+  const failed = failedDeliv !== null && failedJobs !== null ? failedDeliv + failedJobs : failedDeliv;
+  return [
+    chip("/comms?state=queued", queued ?? "?", "queued", queued === null || queued > 0 ? "warn" : "", "queued"),
+    chip("#health", dead ?? "?", "dead letters / 24 h", dead === null || dead > 0 ? "warn" : "", "dead-letters"),
+    chip("#health", failed ?? "?", "failed / 24 h", failed === null || failed > 0 ? "warn" : "", "failed"),
+  ].join("");
 }
 
 function currentPath() {
@@ -1045,21 +1044,25 @@ function discussionTranscriptUrl(conversationId) {
   return `${ACP_TRANSCRIPT_PREFIX}/${encodeURIComponent(conversationId)}/transcript`;
 }
 
+function validDiscussionsList(payload) {
+  return Boolean(payload)
+    && typeof payload === "object"
+    && !Array.isArray(payload)
+    && (payload.availability === "available" || payload.availability === "empty")
+    && Array.isArray(payload.conversations);
+}
+
 function renderDiscussionsListDom(payload) {
   const container = document.getElementById("discussions-list");
-  if (!container) return;
-  if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+  if (!container) return validDiscussionsList(payload);
+  if (!validDiscussionsList(payload)) {
     setNodeChildren(container, [discussionEl("p", "error", "Discussions list unavailable.")]);
-    return;
+    return false;
   }
-  if (payload.availability !== "available" && payload.availability !== "empty") {
-    setNodeChildren(container, [discussionEl("p", "error", "Discussions list unavailable.")]);
-    return;
-  }
-  const rows = Array.isArray(payload.conversations) ? payload.conversations : [];
+  const rows = payload.conversations;
   if (!rows.length) {
     setNodeChildren(container, [discussionEl("p", "muted", "No ACP discussions recorded.")]);
-    return;
+    return true;
   }
   const tbl = discussionEl("table");
   const thead = discussionEl("thead");
@@ -1104,6 +1107,7 @@ function renderDiscussionsListDom(payload) {
   }
   tbl.appendChild(tbody);
   setNodeChildren(container, [tbl]);
+  return true;
 }
 
 function formatStateSummary(state, label, reason) {
@@ -1126,23 +1130,23 @@ function renderTranscriptDom(conversationId, payload, httpStatus = 200) {
     const reason = typeof payload?.reason === "string" ? payload.reason : "forbidden";
     nodes.push(discussionEl("p", "error", `Transcript access refused (${reason.replaceAll("_", " ")}).`));
     setNodeChildren(container, nodes);
-    return;
+    return false;
   }
   if (httpStatus === 404) {
     nodes.push(discussionEl("p", "muted", "Discussion not found."));
     setNodeChildren(container, nodes);
-    return;
+    return false;
   }
   if (httpStatus === 503 || payload?.state === "backend_unavailable") {
     const reason = typeof payload?.reason === "string" ? payload.reason : "store_unavailable";
     nodes.push(discussionEl("p", "error", formatStateSummary("backend_unavailable", payload?.label, reason)));
     setNodeChildren(container, nodes);
-    return;
+    return false;
   }
   if (!payload || typeof payload !== "object" || !Array.isArray(payload.messages)) {
     nodes.push(discussionEl("p", "error", "Transcript response could not be read."));
     setNodeChildren(container, nodes);
-    return;
+    return false;
   }
 
   const topState = typeof payload.state === "string" ? payload.state : "unknown";
@@ -1203,6 +1207,7 @@ function renderTranscriptDom(conversationId, payload, httpStatus = 200) {
   }
   nodes.push(list);
   setNodeChildren(container, nodes);
+  return true;
 }
 
 async function loadDiscussionsList() {
@@ -1214,7 +1219,7 @@ async function loadDiscussionsList() {
       cache: "no-store",
       headers: {Accept: "application/json"},
     });
-    if (seq !== discussionsListSeq) return;
+    if (seq !== discussionsListSeq) return false;
     if (!response.ok) {
       discussionStatus(`Discussions unavailable (HTTP ${response.status}).`);
       setNodeChildren(container, [discussionEl("p", "error", `Discussions unavailable (HTTP ${response.status}).`)]);
@@ -1223,8 +1228,12 @@ async function loadDiscussionsList() {
     let payload;
     try { payload = JSON.parse(await response.text()); } catch { payload = null; }
     if (seq !== discussionsListSeq) return false;
-    renderDiscussionsListDom(payload);
-    const count = Array.isArray(payload?.conversations) ? payload.conversations.length : 0;
+    const loaded = renderDiscussionsListDom(payload);
+    if (!loaded) {
+      discussionStatus("Discussions list unavailable.");
+      return false;
+    }
+    const count = payload.conversations.length;
     discussionStatus(`Loaded ${count} discussion${count === 1 ? "" : "s"}.`);
     return true;
   } catch {
@@ -1260,8 +1269,8 @@ async function openDiscussion(conversationId) {
     let payload = null;
     try { payload = JSON.parse(await response.text()); } catch { payload = null; }
     if (seq !== transcriptRequestSeq || conversationId !== selectedConversationId) return;
-    renderTranscriptDom(conversationId, payload, response.status);
-    discussionStatus(`Transcript ${conversationId} loaded.`);
+    const loaded = renderTranscriptDom(conversationId, payload, response.status);
+    discussionStatus(loaded ? `Transcript ${conversationId} loaded.` : `Transcript ${conversationId} unavailable.`);
   } catch (error) {
     if (error && error.name === "AbortError") return;
     if (seq !== transcriptRequestSeq || conversationId !== selectedConversationId) return;
@@ -1291,7 +1300,7 @@ function bindDiscussionsPanel() {
   const refreshBtn = document.getElementById("discussions-refresh");
   if (refreshBtn && typeof refreshBtn.addEventListener === "function") {
     refreshBtn.addEventListener("click", () => {
-      loadDiscussionsList().then(ok => { if (ok) loadedOnce = true; });
+      loadDiscussionsList().then(ok => { loadedOnce = Boolean(ok); });
     });
   }
   const listBox = document.getElementById("discussions-list");
