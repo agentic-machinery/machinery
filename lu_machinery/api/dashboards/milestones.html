@@ -9,6 +9,7 @@
 <style>
   /* The header stays sticky at every width, so every anchor target clears its measured height. */
   main, main [id] { scroll-margin-top: var(--sticky-offset, 96px); }
+  header.unstuck { position: static; }
 </style>
 </head>
 <body>
@@ -64,6 +65,7 @@ const PLANNING_URL = "/api/fleet/model-stats/planning";
 const MILESTONES_STALE_AFTER_S = 420;
 const PLANNING_STALE_AFTER_S = 420;
 const DAY_MS = 86400000;
+const STICKY_HEADER_MAX_VIEWPORT_SHARE = 0.5;
 const SLUG_RE = /^[A-Za-z0-9][A-Za-z0-9_.-]*\/[A-Za-z0-9][A-Za-z0-9_.-]*$/;
 const ISSUE_REF_RE = /^([A-Za-z0-9][A-Za-z0-9_.-]*\/[A-Za-z0-9][A-Za-z0-9_.-]*)#([1-9][0-9]*)$/;
 
@@ -75,13 +77,14 @@ function isFiniteNonNeg(value) {
   return typeof value === "number" && Number.isFinite(value) && value >= 0;
 }
 
-function renderTable(headers, rows, numericCols = []) {
+function renderTable(headers, rows, numericCols = [], caption = null) {
   const numSet = new Set(numericCols);
   const head = headers
     .map((h, i) => `<th scope="col"${numSet.has(i) ? ' class="num"' : ""}>${escapeHtml(h)}</th>`)
     .join("");
   const body = rows.map(cells => `<tr>${labelled(cells, headers)}</tr>`).join("");
-  return `<table><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table>`;
+  const cap = caption ? `<caption class="warn">${escapeHtml(caption)}</caption>` : "";
+  return `<table>${cap}<thead><tr>${head}</tr></thead><tbody>${body}</tbody></table>`;
 }
 
 function milestoneClosedUrl(slug, number) {
@@ -286,6 +289,17 @@ function isIssueReadyNow(enriched, plan) {
   return enriched.readyStatus === "ready_now" || (Boolean(enriched.key) && plan.readyNowSet.has(enriched.key));
 }
 
+// The one expiry rule for a repository row: the snapshot's elapsed staleness, the row's own
+// stale flag, or the row's age plus the time since receipt past the bound.
+function repoExpired(repo, fresh) {
+  if (fresh.stale || repo.stale) return true;
+  return isFiniteNonNeg(repo.age_seconds) && (repo.age_seconds + fresh.elapsedS) > MILESTONES_STALE_AFTER_S;
+}
+
+// Planning results are live, but which milestone an issue belongs to comes from the milestone
+// snapshot. An expired repository gets no join, so no live result sits under stale membership.
+const EXPIRED_JOIN_PLAN = Object.freeze({...analyzePlanning(null), status: "milestones-stale"});
+
 function completeMilestoneRepos(data, milestoneReading = null, now = Date.now()) {
   const complete = new Set();
   if (!data || typeof data !== "object" || data.status === "pending") return complete;
@@ -295,9 +309,7 @@ function completeMilestoneRepos(data, milestoneReading = null, now = Date.now())
   for (const repo of repos) {
     if (!repo || typeof repo !== "object" || repo.private) continue;
     if (typeof repo.repository !== "string" || !repo.repository) continue;
-    const repoExpired = isFiniteNonNeg(repo.age_seconds)
-      && (repo.age_seconds + fresh.elapsedS) > MILESTONES_STALE_AFTER_S;
-    if (repo.status !== "ok" || repo.stale || repoExpired) continue;
+    if (repo.status !== "ok" || repoExpired(repo, fresh)) continue;
     const milestones = Array.isArray(repo.milestones) ? repo.milestones : null;
     if (!milestones) continue;
     const allIssuesComplete = milestones.every(item => item && typeof item === "object" && item.issues_status === "ok");
@@ -306,8 +318,9 @@ function completeMilestoneRepos(data, milestoneReading = null, now = Date.now())
   return complete;
 }
 
-function collectMilestones(data, plan, now) {
+function collectMilestones(data, globalPlan, now, milestoneReading = null) {
   const repos = Array.isArray(data?.repositories) ? data.repositories : [];
+  const fresh = milestoneFreshness(data, milestoneReading, now);
   const labelRepo = shortRepoMap(repos);
   const entries = [];
   const repoProblems = [];
@@ -317,12 +330,14 @@ function collectMilestones(data, plan, now) {
     if (!repo || typeof repo !== "object") continue;
     const isPrivate = Boolean(repo.private);
     const repoLabel = isPrivate ? "(private)" : labelRepo(repo.repository);
-    if (repo.status !== "ok" || repo.stale) {
+    const expired = repoExpired(repo, fresh);
+    const plan = expired ? EXPIRED_JOIN_PLAN : globalPlan;
+    if (repo.status !== "ok" || expired) {
       repoProblems.push({
         repoLabel,
         status: repo.status || "unknown",
         reason: repo.status !== "ok" ? (repo.reason || "milestone data unknown") : "milestone snapshot is stale",
-        stale: Boolean(repo.stale),
+        stale: expired,
       });
     }
     const milestones = Array.isArray(repo.milestones) ? repo.milestones : [];
@@ -424,6 +439,8 @@ function collectMilestones(data, plan, now) {
         overdueCell,
         blockedCountKnown,
         issuesIncomplete: incompleteIssues,
+        membershipExpired: expired,
+        plan,
         item,
       });
     }
@@ -446,7 +463,7 @@ function collectMilestones(data, plan, now) {
       || (a.number ?? 0) - (b.number ?? 0);
   });
 
-  return {entries, repoProblems, repos};
+  return {entries, repoProblems, repos, fresh};
 }
 
 function readyStatusBadge(enriched, plan) {
@@ -488,7 +505,8 @@ function renderIssueStatusTable(items, plan) {
   return renderTable(["Issue", "Status", "Labels"], rows);
 }
 
-function renderMilestoneCard(entry, plan) {
+function renderMilestoneCard(entry) {
+  const plan = entry.plan;
   const closedUrl = milestoneClosedUrl(entry.repoSlug, entry.number);
   const closedLink = closedUrl
     ? `<a class="ms-closed-link" href="${escapeHtml(closedUrl)}">Closed issues on GitHub</a>`
@@ -509,7 +527,8 @@ function renderMilestoneCard(entry, plan) {
     parts.push('<p class="warn">Open issue list is incomplete or unavailable.</p>');
   }
   if (!plan.usable) {
-    const why = plan.status === "stale" ? "planning snapshot is stale"
+    const why = plan.status === "milestones-stale" ? "milestone snapshot is stale; issues below are last known"
+      : plan.status === "stale" ? "planning snapshot is stale"
       : plan.status === "pending" ? "planning data is still loading"
       : "planning data is unavailable";
     parts.push(`<p class="warn">Blocker and ready-now status unknown (${escapeHtml(why)}).</p>`);
@@ -718,7 +737,7 @@ function renderMilestonesOverview(data, plan, now, milestoneReading = null) {
       completeRepos: new Set(),
     };
   }
-  const {entries, repoProblems, repos} = collectMilestones(data, plan, now);
+  const {entries, repoProblems, repos, fresh} = collectMilestones(data, plan, now, milestoneReading);
   const out = [renderFreshnessStrip(data, plan, milestoneReading, now)];
 
   for (const problem of repoProblems) {
@@ -731,7 +750,8 @@ function renderMilestonesOverview(data, plan, now, milestoneReading = null) {
   if (!repos.length) {
     out.push('<p class="warn">Fleet milestone data is unavailable.</p>');
   } else if (!entries.length) {
-    if (!repoProblems.length) out.push('<p class="muted">No open milestones.</p>');
+    if (fresh.stale) out.push('<p class="warn">Open milestones unknown: the milestone snapshot is stale.</p>');
+    else if (!repoProblems.length) out.push('<p class="muted">No open milestones.</p>');
   } else {
     const summaryRows = entries.map(entry => {
       const nameCell = entry.isPrivate
@@ -747,13 +767,16 @@ function renderMilestonesOverview(data, plan, now, milestoneReading = null) {
         text(entry.repoLabel, entry.isPrivate ? "muted" : ""),
       ];
     });
-    out.push(renderTable(["Milestone", "Blocked", "Overdue", "Due", "Open", "Closed", "Repo"], summaryRows, [1, 2, 4]));
+    const caption = fresh.stale ? "Last known values: the milestone snapshot is STALE."
+      : entries.some(entry => entry.membershipExpired) ? "Rows from repositories marked STALE are last known values."
+      : null;
+    out.push(renderTable(["Milestone", "Blocked", "Overdue", "Due", "Open", "Closed", "Repo"], summaryRows, [1, 2, 4], caption));
 
     const publicEntries = entries.filter(entry => !entry.isPrivate);
     if (publicEntries.length) {
       out.push("<h2>Milestone details</h2>");
       for (const entry of publicEntries) {
-        out.push(renderMilestoneCard(entry, plan));
+        out.push(renderMilestoneCard(entry));
       }
     }
   }
@@ -788,15 +811,16 @@ function countChip(href, count, label, gap, positiveTone) {
   return chip(href, count, gap ? `${label} (${gap})` : label, tone);
 }
 
-function renderMilestoneChips(latest, now = Date.now(), planningReading = null) {
+function renderMilestoneChips(latest, now = Date.now(), planningReading = null, milestoneReading = null) {
   const data = latest?.milestones;
   const plan = analyzePlanning(latest?.planning, planningReading, now);
   const hasMilestones = Boolean(data && data.status !== "pending");
-  const collected = hasMilestones ? collectMilestones(data, plan, now) : null;
-  // The same per-milestone gaps the cards report: open issues without a planning verdict,
-  // or an issue list that is incomplete while the milestone still has open issues.
-  const milestoneGap = Boolean(collected) && collected.entries.some(
-    entry => !entry.isPrivate && (entry.unaccountedCount > 0 || entry.issuesIncomplete));
+  const collected = hasMilestones ? collectMilestones(data, plan, now, milestoneReading) : null;
+  // The same per-milestone gaps the cards report: open issues without a planning verdict, an
+  // issue list that is incomplete, or expired membership, while the milestone has open issues.
+  const milestoneGap = Boolean(collected) && collected.entries.some(entry => !entry.isPrivate && (
+    entry.unaccountedCount > 0 || entry.issuesIncomplete
+    || (entry.membershipExpired && (entry.openCount === null || entry.openCount > 0))));
   const depsUnknown = isNonNegInt(plan.coverage.dependency_unknown) && plan.coverage.dependency_unknown > 0;
   const planGap = plan.status === "partial" ? "partial" : (milestoneGap || depsUnknown) ? "incomplete" : null;
   const out = [];
@@ -814,10 +838,13 @@ function renderMilestoneChips(latest, now = Date.now(), planningReading = null) 
     if (allReposFailed) {
       out.push(chip("#milestones", "unknown", "open milestones", "warn"));
     } else {
-      const repoGap = repoProblems.length > 0 ? "partial" : null;
+      const repoGap = repoProblems.some(problem => problem.stale) ? "stale"
+        : repoProblems.length > 0 ? "partial" : null;
       const allPrivate = entries.length > 0 && entries.every(entry => entry.isPrivate);
       if (allPrivate) {
         out.push(chip("#milestones", "withheld", "overdue", ""));
+      } else if (collected.fresh.stale) {
+        out.push(chip("#milestones", "unknown", "overdue (stale)", "warn"));
       } else {
         const overdue = entries.filter(entry => entry.due.overdue).length;
         out.push(countChip("#milestones", overdue, "overdue", repoGap, "bad"));
@@ -833,8 +860,13 @@ function renderMilestoneChips(latest, now = Date.now(), planningReading = null) 
   }
 
   if (collected && !allReposFailed) {
-    out.push(countChip("#milestones", collected.entries.length, "open",
-      collected.repoProblems.length > 0 ? "partial" : null, ""));
+    const problems = collected.repoProblems;
+    if (collected.fresh.stale) {
+      out.push(chip("#milestones", "unknown", "open (stale)", "warn"));
+    } else {
+      out.push(countChip("#milestones", collected.entries.length, "open",
+        problems.some(problem => problem.stale) ? "stale" : problems.length > 0 ? "partial" : null, ""));
+    }
   }
 
   return out.join("");
@@ -943,7 +975,7 @@ function updatePlanningDom(now = Date.now()) {
   );
   const box = document.getElementById("chips");
   if (box) {
-    const chipHtml = renderMilestoneChips(runner.latest, now, latestPlanningReading);
+    const chipHtml = renderMilestoneChips(runner.latest, now, latestPlanningReading, latestMilestoneReading);
     if (box.innerHTML !== chipHtml) box.innerHTML = chipHtml;
   }
   scheduleFragmentAlignment();
@@ -1017,6 +1049,11 @@ function updateStickyOffset(fromAlign = false) {
   if (typeof document !== "object" || !document || typeof getComputedStyle !== "function") return;
   const header = document.querySelector("header");
   if (!header || typeof header.getBoundingClientRect !== "function") return;
+  // A header taller than half the viewport would leave too little room to read or reach an
+  // anchor, so it scrolls away with the page instead. Its height is the same either way.
+  const viewportH = typeof window === "object" && window && Number.isFinite(window.innerHeight) ? window.innerHeight : 0;
+  header.classList?.toggle("unstuck",
+    viewportH > 0 && header.getBoundingClientRect().height > viewportH * STICKY_HEADER_MAX_VIEWPORT_SHARE);
   const sticky = getComputedStyle(header).position === "sticky";
   const offset = sticky ? Math.ceil(header.getBoundingClientRect().height) + 12 : 12;
   document.documentElement?.style?.setProperty("--sticky-offset", `${offset}px`);
@@ -1058,7 +1095,7 @@ const PANELS = [{
 
 const runner = createPanelRunner({
   panels: PANELS,
-  renderChips: latest => renderMilestoneChips(latest, Date.now(), latestPlanningReading),
+  renderChips: latest => renderMilestoneChips(latest, Date.now(), latestPlanningReading, latestMilestoneReading),
 });
 updateStickyOffset();
 // Browser callbacks pass entries or an Event; never let them reach the fromAlign flag.

@@ -717,5 +717,52 @@ const partialChipsOverdue = renderMilestoneChips({{milestones: partialNoneOverdu
 assert.match(partialChipsOverdue, /<b>unknown<\\/b> overdue \\(partial\\)/);
 assert.match(partialChipsOverdue, /<b>unknown<\\/b> open \\(partial\\)/);
 assert.doesNotMatch(partialChipsOverdue, /<b>0<\\/b> (overdue|open)/);
+
+// Expired milestone data is never current: an empty complete snapshot read at 419.5 s shows known
+// zeros, and once it crosses the bound the chips and the empty state read unknown.
+const emptyData = {{status: "ok", age_seconds: 419.5, stale: false, repositories: [
+  {{repository: "fixture/machinery", private: false, status: "ok", stale: false, age_seconds: 419.5, milestones: []}},
+]}};
+const emptyReading = {{data: emptyData, ageHeader: "419.5", boundHeader: "420", state: "fresh", receivedAt: now}};
+const emptyFreshChips = renderMilestoneChips({{milestones: emptyData, planning: okPlanning}}, now, null, emptyReading);
+assert.match(emptyFreshChips, /<b>0<\\/b> overdue/);
+assert.match(renderMilestones(emptyData, okPlanning, now, null, emptyReading), /No open milestones\\./);
+const emptyExpiredChips = renderMilestoneChips({{milestones: emptyData, planning: okPlanning}}, now + 1000, null, emptyReading);
+assert.match(emptyExpiredChips, /<b>unknown<\\/b> overdue \\(stale\\)/);
+assert.match(emptyExpiredChips, /<b>unknown<\\/b> open \\(stale\\)/);
+const emptyExpiredHtml = renderMilestones(emptyData, okPlanning, now + 1000, null, emptyReading);
+assert.doesNotMatch(emptyExpiredHtml, /No open milestones\\./);
+assert.match(emptyExpiredHtml, /Open milestones unknown: the milestone snapshot is stale/);
+
+// A live Planning match never stays under expired membership: fresh, the blocked issue sits in its
+// milestone; expired, the card and the Blocked cell say unknown and the issue joins membership unknown.
+const matchedPlanning = JSON.parse(JSON.stringify(completeWithOutside));
+matchedPlanning.issues.blocked.push({{ref: "fixture/machinery#10", blocked_by: ["fixture/machinery#2"], private_blockers: 0}});
+matchedPlanning.issues.ready = [];
+matchedPlanning.issues.ready_now = [];
+const matchReading = {{data, ageHeader: "60", boundHeader: "420", state: "fresh", receivedAt: now}};
+const matchFreshHtml = renderMilestones(data, matchedPlanning, now, null, matchReading);
+assert.equal(summaryCellsFor(matchFreshHtml, "v0.4.0")[1], "1");
+assert.match(matchFreshHtml, /<h4>Blocked \\(1\\)<\\/h4>/);
+assert.match(matchFreshHtml, /Blocked issues outside open milestones \\(1\\)/);
+const matchExpiredHtml = renderMilestones(data, matchedPlanning, now + 400000, null, matchReading);
+assert.equal(summaryCellsFor(matchExpiredHtml, "v0.4.0")[1], "unknown");
+assert.doesNotMatch(matchExpiredHtml, /<h4>Blocked \\(1\\)<\\/h4>/);
+assert.match(matchExpiredHtml, /milestone snapshot is stale; issues below are last known/);
+assert.match(matchExpiredHtml, /Blocked issues \\(milestone membership unknown: 2\\)/);
+assert.match(matchExpiredHtml, /<caption class="warn">Last known values: the milestone snapshot is STALE\\.<\\/caption>/);
+const matchExpiredChips = renderMilestoneChips({{milestones: data, planning: matchedPlanning}}, now + 400000, null, matchReading);
+assert.match(matchExpiredChips, /<b>2<\\/b> blocked \\(incomplete\\)/);
+assert.match(matchExpiredChips, /<b>unknown<\\/b> ready now \\(incomplete\\)/);
+assert.match(matchExpiredChips, /<b>unknown<\\/b> open \\(stale\\)/);
+// A fresh partial snapshot keeps the positive match from its fresh repository.
+// (A new reading object: panelAgeSeconds holds the largest elapsed time seen on a reading.)
+const freshPartialReading = {{
+  data: partialSnapshot, ageHeader: "30.000", boundHeader: "420", state: "unavailable", receivedAt: now,
+}};
+const matchPartialHtml = renderMilestones(partialSnapshot, matchedPlanning, now, null, freshPartialReading);
+assert.match(matchPartialHtml, /<h4>Blocked \\(1\\)<\\/h4>/);
+assert.doesNotMatch(matchPartialHtml, /milestone membership unknown/);
+assert.match(matchPartialHtml, /Blocked issues outside open milestones \\(1\\)/);
 """
     _run_milestones_node(body)
