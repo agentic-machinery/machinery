@@ -251,8 +251,33 @@ def _sanitize_public_detail(detail: Any) -> Any:
     return detail
 
 
+# A 404 at one of these namespaces, its root or anything under it (as a prefix route contract
+# matches), keeps the JSON envelope: the API, and /files, the artifact alias the route contracts
+# list for agents, without the browser page. Any other 404 is an address a browser followed.
+_JSON_404_PREFIXES = ("/api/", "/files/")
+
+
+def _not_found_page() -> HTMLResponse:
+    """A small 404 page with the shared Monitor navigation and a link home. The path is not echoed."""
+    return HTMLResponse(
+        '<!doctype html>\n<html lang="en">\n<head>\n<meta charset="utf-8">\n'
+        '<meta name="viewport" content="width=device-width, initial-scale=1">\n'
+        '<title>Not found — Machinery</title>\n<link rel="icon" href="data:,">\n'
+        '<link rel="stylesheet" href="/machinery.css">\n</head>\n<body>\n<header>\n'
+        f'<div class="header-nav"><nav class="pages" id="machinery-nav" aria-label="Pages">{_machinery_nav_html(None)}</nav></div>\n'
+        '</header>\n<main id="main">\n<h1>Not found</h1>\n'
+        '<p>No Monitor page is at this address. <a href="/">Go to the Monitor home</a></p>\n</main>\n</body>\n</html>\n',
+        status_code=404,
+    )
+
+
 async def http_exception_handler(request: Request, exc: StarletteHTTPException):
-    """Normalize handled HTTP errors without changing their status codes."""
+    """Normalize handled HTTP errors without changing their status codes.
+
+    The 404 body is chosen by path, never by headers: a small page outside ``_JSON_404_PREFIXES``.
+    """
+    if exc.status_code == 404 and not f"{request.url.path}/".startswith(_JSON_404_PREFIXES):
+        return _not_found_page()
     return _error_envelope(
         "http_error",
         _sanitize_public_detail(exc.detail),
@@ -1747,7 +1772,7 @@ def _attach_cold_start_research(response: dict[str, Any], role: str | None) -> N
 # ==================== STATIC FILES (MUST BE LAST) ====================
 
 
-MACHINERY_HOME_PATHS = frozenset({"machinery", "machinery/"})
+MACHINERY_HOME_PATHS = frozenset({"machinery"})
 _VERSION_PLACEHOLDER = "__MACHINERY_VERSION__"
 _MACHINERY_REPOSITORY_PLACEHOLDER = "__MACHINERY_REPOSITORY__"
 _NAV_PLACEHOLDER = "__MACHINERY_NAV__"
@@ -1870,13 +1895,17 @@ def serve_static(path: str, request: Request, ctx: MonitorContext = Depends(get_
     with the shared navigation; every other file is served as it is. A product
     page or asset is served only when the product contribution declares its URL
     path; ``/`` is the product home when the product declares one, else the
-    machinery home, which is always at ``/machinery``.
+    machinery home, which is always at ``/machinery``. A page with a trailing slash
+    is not that page (the lookup drops the slash), so it is a 404, never a redirect
+    built from the request path; ``//`` stays the home.
     """
     dashboards_dir = ctx.roots.dashboards_dir
     product = getattr(request.app.state, "product", None)
     dashboard = _dashboard_file(dashboards_dir, path, product)
     if dashboard is not None:
         if dashboard.page is not None:
+            if path.endswith("/") and path != "/":
+                raise HTTPException(status_code=404)
             return _machinery_page_response(dashboard.path, dashboard.page)
         # Starlette's own rule, applied to the name the file was found under rather than to the link target.
         media_type = mimetypes.guess_type(dashboard.name)[0] or "application/octet-stream"
