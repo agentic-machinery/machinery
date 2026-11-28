@@ -305,9 +305,11 @@ row and sends one deduplicated alert to `claude-cto`. `diagnose_handoff` and
 Before closing a held `dispatch-turn` lease, verify quiescence in three steps:
 
 1. **Inspect the turn record and Monitor projection:** confirm the holder `task_id`,
-   `instance_id` (run nonce), `session_id`, `lease_id`, `generation`, and `fencing_token`
-   via `.venv/bin/python -m lu_machinery.dispatch status <task-id>` and
-   `GET /api/epics/v1/epic:<N>`.
+   `generation`, `fencing_token` and `lease_digest` in `GET /api/epics/v1/epic:<N>`, and the
+   turn record's `run_nonce` and `turn_lease` envelope via
+   `.venv/bin/python -m lu_machinery.dispatch status <task-id>`. Monitor publishes the lease
+   envelope only as `lease_digest`; the release recipe below proves the record's envelope
+   is the stream's current lease by that digest.
 2. **Prove the turn scope and task services are gone on the recorded host:** do **not**
    rely on a raw `'lu-worker-<task-id>*'` glob (which misses task IDs whose trailing
    punctuation is stripped by `_unit_piece`, such as `turn-review.`, and misses task
@@ -448,142 +450,77 @@ Before closing a held `dispatch-turn` lease, verify quiescence in three steps:
 
 Once all three checks pass **and the lease is past `expires_at` (`state == "expired"`)**,
 close **only the exact checked lease** using Monitor's fenced exact-envelope release
-(`POST /api/epics/v1/epic:<N>/release` with `session_id`, `lease_id`, `generation`,
-`fencing_token`, and exact `holder`). Turn leases are not heartbeated
+(`host_admission.release_turn`, which posts `POST /api/epics/v1/epic:<N>/release`). Monitor's
+status never publishes a holder's `session_id`, `lease_id`, `holder.instance_id` or
+`holder.process_id`, only `lease_digest` (the SHA-256 of that exact envelope), so the
+envelope comes from the turn record's `turn_lease` field, which the turn kept when its claim
+succeeded, and the recipe proves it is the stream's current lease by its `lease_digest`. A turn
+record without `turn_lease` (its claim answer was lost) has no exact-envelope path: keep the hold
+and escalate to the operator. Turn leases are not heartbeated
 (`host_admission.claim_turn`), so a terminal or stuck turn's lease reaches `state == "expired"`
 on its own within its TTL. Under rules core `r2-lease`, a remote lease remains live until
 `expires_at` and earlier release requires an attributed operator release through the
 supervisor flow; therefore, for an `active` (unexpired) lease, **keep the hold until
 `state == "expired"`** rather than closing it through the unattributed exact-envelope path.
 Monitor verifies all envelope fields atomically inside its transaction and refuses with
-`409 LEASE LOST` (`RemoteLeaseLostError`) if the original holder already closed and a
-successor claimed the stream:
+`409 LEASE LOST` if the original holder already closed and a successor claimed the stream:
 
 ```bash
 .venv/bin/python -c '
 import sys
 from datetime import UTC, datetime
-from lu_machinery.dispatcher.store import parse_utc_timestamp
-from lu_machinery.session_streams.model import HolderKind, Lease, LeaseHolder
-from lu_machinery.session_supervisor.remote import RemoteEpicClient
+from lu_machinery.dispatcher import host_admission, store
+from lu_machinery.session_supervisor.remote import RemoteEpicClient, envelope_digest
 
 def require(cond, msg, detail=None):
     if not cond:
         raise SystemExit(f"refused: {msg}: {detail!r}")
 
-def is_pos_int(value):
-    return type(value) is int and value > 0
-
-def is_nonempty_str(value):
-    return isinstance(value, str) and bool(value.strip())
-
-require(len(sys.argv) == 4, "usage: <stream-id> <lease-id> <generation>", sys.argv[1:])
-stream_id, expected_lease_id = sys.argv[1], sys.argv[2]
-require(
-    is_nonempty_str(stream_id) and is_nonempty_str(expected_lease_id),
-    "usage: <stream-id> <lease-id> <generation>",
-    sys.argv[1:],
-)
+require(len(sys.argv) == 4, "usage: <stream-id> <task-id> <run-nonce>", sys.argv[1:])
+stream_id, tid, nonce = sys.argv[1:]
+require(all(v.strip() and not any(c.isspace() for c in v) for v in (stream_id, tid, nonce)),
+        "usage: <stream-id> <task-id> <run-nonce>", sys.argv[1:])
 try:
-    expected_gen = int(sys.argv[3])
-except ValueError:
-    raise SystemExit(f"refused: generation must be an integer: {sys.argv[3]!r}")
-require(expected_gen > 0, "generation must be positive", expected_gen)
+    store.record_path(tid)
+    records = store.strict_task_inventory(include_archive=True)
+except (OSError, ValueError) as exc:
+    raise SystemExit(f"refused: task store or turn record unreadable: {type(exc).__name__}: {exc}")
+matches = [r for r in records if r.get("task_id") == tid and r.get("run_nonce") == nonce]
+require(len(matches) == 1, "expected exactly one turn record for this task id and run nonce", len(matches))
+envelope = matches[0].get(host_admission.TURN_LEASE_KEY)
+require(isinstance(envelope, dict) and isinstance(envelope.get("lease"), dict),
+        "turn record holds no lease envelope; keep the hold and escalate", tid)
+try:
+    expected = envelope_digest(envelope["lease"])
+except (KeyError, TypeError, ValueError) as exc:
+    raise SystemExit(f"refused: malformed turn lease envelope: {type(exc).__name__}")
+require(envelope["lease"].get("stream_id") == stream_id, "turn lease names another stream", stream_id)
 
 client = RemoteEpicClient()
 proj = client.stream(stream_id)
-require(isinstance(proj, dict), "malformed stream projection", proj)
+require(isinstance(proj, dict) and proj.get("stream_id") == stream_id, "malformed stream projection", proj)
 raw = proj.get("lease")
 require(isinstance(raw, dict), "malformed lease projection", raw)
+require(raw.get("lease_digest") == expected, "the stream lease is not this turn record's lease", raw)
 require(raw.get("state") == "expired", "lease is not expired", raw)
-require(
-    raw.get("stream_id") == stream_id
-    and raw.get("lease_id") == expected_lease_id
-    and is_pos_int(raw.get("generation"))
-    and raw["generation"] == expected_gen,
-    "lease identity mismatch",
-    raw,
-)
-require(is_nonempty_str(raw.get("session_id")), "malformed lease session_id", raw)
-hb_dt = parse_utc_timestamp(raw.get("heartbeat_at"))
-require(hb_dt is not None, "malformed lease heartbeat_at", raw)
-exp_dt = parse_utc_timestamp(raw.get("expires_at"))
-require(exp_dt is not None, "malformed lease expires_at", raw)
-require(hb_dt <= exp_dt, "lease heartbeat_at is after expires_at", raw)
-require(exp_dt <= datetime.now(UTC), "lease expires_at is not in the past", raw)
-for field in ("fencing_token", "ttl_seconds", "version"):
-    require(is_pos_int(raw.get(field)), f"malformed lease {field}", raw)
-h = raw.get("holder")
-require(isinstance(h, dict), "malformed lease holder", raw)
-require(h.get("harness") == "dispatch-turn", "holder is not dispatch-turn", h)
-for field in ("agent", "instance_id"):
-    require(is_nonempty_str(h.get(field)), f"malformed holder {field}", h)
-holder_kind_raw = h.get("holder_kind")
-require(
-    isinstance(holder_kind_raw, str) and holder_kind_raw in {k.value for k in HolderKind},
-    "malformed holder_kind",
-    h,
-)
-holder_kind = HolderKind(holder_kind_raw)
-if holder_kind is HolderKind.PROCESS:
-    require(is_pos_int(h.get("process_id")), "malformed holder process_id", h)
-else:
-    require(h.get("process_id") is None, "app_thread holder process_id must be null", h)
-for field in ("task_id", "host_id"):
-    require(h.get(field) is None or is_nonempty_str(h.get(field)), f"malformed holder {field}", h)
-lease = Lease(
-    stream_id=raw["stream_id"],
-    session_id=raw["session_id"],
-    lease_id=raw["lease_id"],
-    generation=raw["generation"],
-    fencing_token=raw["fencing_token"],
-    holder=LeaseHolder(
-        agent=h["agent"],
-        harness=h["harness"],
-        instance_id=h["instance_id"],
-        process_id=h.get("process_id"),
-        holder_kind=holder_kind,
-        task_id=h.get("task_id"),
-        host_id=h.get("host_id"),
-    ),
-    heartbeat_at=raw["heartbeat_at"],
-    expires_at=raw["expires_at"],
-    ttl_seconds=raw["ttl_seconds"],
-    version=raw["version"],
-)
-try:
-    lease.holder.validate()
-except ValueError as exc:
-    raise SystemExit(f"refused: invalid lease holder: {exc}")
-res = client.release(lease)
-require(isinstance(res, dict), "malformed release response", res)
-rel = res.get("lease")
-require(
-    res.get("outcome") == "released"
-    and isinstance(rel, dict)
-    and rel.get("stream_id") == stream_id
-    and rel.get("lease_id") == expected_lease_id
-    and is_pos_int(rel.get("generation"))
-    and rel["generation"] == expected_gen,
-    "unexpected release acknowledgement",
-    res,
-)
-after_proj = client.stream(stream_id)
-require(isinstance(after_proj, dict), "malformed post-release projection", after_proj)
-after = after_proj.get("lease")
+exp_dt = store.parse_utc_timestamp(raw.get("expires_at"))
+require(exp_dt is not None and exp_dt <= datetime.now(UTC), "lease expires_at is not in the past", raw)
+holder = raw.get("holder")
+require(isinstance(holder, dict) and holder.get("harness") == "dispatch-turn", "holder is not dispatch-turn", holder)
+
+reason = host_admission.release_turn(envelope, stream=stream_id, task_id=tid, run_nonce=nonce)
+require(reason is None, "release not acknowledged", reason)
+after = client.stream(stream_id).get("lease")
 require(
     isinstance(after, dict)
     and after.get("state") == "released"
     and after.get("session_state") == "closed"
-    and after.get("stream_id") == stream_id
-    and after.get("lease_id") == expected_lease_id
-    and is_pos_int(after.get("generation"))
-    and after["generation"] == expected_gen,
+    and after.get("lease_digest") == expected,
     "post-release state mismatch",
     after,
 )
-print(f"released {stream_id} lease_id={expected_lease_id} generation={expected_gen}")
-' epic:<N> <lease-id> <generation>
+print(f"released {stream_id} task_id={tid} lease_digest={expected}")
+' epic:<N> <task-id> <run-nonce>
 ```
 
 Do **not** run the exact-envelope recipe on an `active` (unexpired) lease, and do **not**

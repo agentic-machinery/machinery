@@ -47,6 +47,7 @@ from lu_machinery.session_streams.store import (
     TurnLeaseUnclearedError,
     validate_entry_body,
 )
+from lu_machinery.session_supervisor.remote import lease_digest
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -394,12 +395,28 @@ def _lease_from_payload(payload: dict[str, Any]) -> Lease:
     )
 
 
-def _lease_payload(lease: Lease, *, projection_state: str, session_state: str, now: datetime) -> dict[str, Any]:
+def _lease_payload(
+    lease: Lease, *, projection_state: str, session_state: str, now: datetime, reveal_envelope: bool = False
+) -> dict[str, Any]:
+    """A lease as Monitor publishes it.
+
+    Status, listing and conflict answers never carry the holder's secret envelope fields (``session_id``,
+    ``lease_id``, ``holder.instance_id``, ``holder.process_id``): any loopback process reads them, and with them
+    it could renew, hand off or release the holder's lease. They carry ``lease_digest`` (remote.envelope_digest
+    of the exact stored envelope) instead, so a holder still recognises its own lease. Only a holder operation's
+    reply (``reveal_envelope``), whose caller supplied or chose that envelope, echoes it in full.
+    """
     expired = projection_state == "active" and now >= parse_timestamp(lease.expires_at)
-    return {
+    holder: dict[str, Any] = {
+        "agent": _response_token(lease.holder.agent),
+        "harness": _response_token(lease.holder.harness),
+        "task_id": _response_optional_token(lease.holder.task_id),
+        "holder_kind": lease.holder.holder_kind.value,
+        "host_id": _response_host(lease.holder.host_id),
+    }
+    payload: dict[str, Any] = {
         "stream_id": lease.stream_id,
-        "session_id": _response_token(lease.session_id),
-        "lease_id": _response_token(lease.lease_id),
+        "lease_digest": lease_digest(lease),
         "generation": lease.generation,
         "fencing_token": lease.fencing_token,
         "state": "expired" if expired else projection_state,
@@ -409,16 +426,14 @@ def _lease_payload(lease: Lease, *, projection_state: str, session_state: str, n
         "ttl_seconds": lease.ttl_seconds,
         "version": lease.version,
         "age_seconds": max(0, int((now - parse_timestamp(lease.heartbeat_at)).total_seconds())),
-        "holder": {
-            "agent": _response_token(lease.holder.agent),
-            "harness": _response_token(lease.holder.harness),
-            "instance_id": _response_token(lease.holder.instance_id),
-            "task_id": _response_optional_token(lease.holder.task_id),
-            "process_id": lease.holder.process_id,
-            "holder_kind": lease.holder.holder_kind.value,
-            "host_id": _response_host(lease.holder.host_id),
-        },
+        "holder": holder,
     }
+    if reveal_envelope:
+        payload["session_id"] = _response_token(lease.session_id)
+        payload["lease_id"] = _response_token(lease.lease_id)
+        holder["instance_id"] = _response_token(lease.holder.instance_id)
+        holder["process_id"] = lease.holder.process_id
+    return payload
 
 
 def _digest_payload(store: SessionStreamStore, stream_id: str, limit: int) -> dict[str, Any]:
@@ -481,7 +496,14 @@ def _response_host(value: Any) -> str | None:
     return None if value is None else value if isinstance(value, str) and opaque_host_id(value) else "[redacted]"
 
 
-def _stream_response(store: SessionStreamStore, stream_id: str, limit: int) -> dict[str, Any]:
+def _stream_response(
+    store: SessionStreamStore, stream_id: str, limit: int, *, reveal_for: Lease | None = None
+) -> dict[str, Any]:
+    """The stream's status; its lease envelope only when it is exactly ``reveal_for`` (the caller's own claim).
+
+    The claim reply re-reads the projection after the claim commits, so a successor that claimed in between
+    is published like any status read, never with its envelope.
+    """
     # One read snapshot for every part of the status (#12627). Without the
     # seeded marker, the store resolves the newest receipt inside that snapshot.
     marker = _registry_snapshot_marker()
@@ -498,7 +520,10 @@ def _stream_response(store: SessionStreamStore, stream_id: str, limit: int) -> d
     if row is not None:
         lease = store._lease_from_row(row)  # the router is a typed projection consumer
         session_state = SessionState.EXPIRED.value if row.get("session_expired_at") else str(row["session_state"])
-        lease_payload = _lease_payload(lease, projection_state=str(row["state"]), session_state=session_state, now=now)
+        reveal = reveal_for is not None and lease_digest(lease) == lease_digest(reveal_for)
+        lease_payload = _lease_payload(
+            lease, projection_state=str(row["state"]), session_state=session_state, now=now, reveal_envelope=reveal
+        )
     return {
         "schema": SCHEMA,
         "stream_id": stream_id,
@@ -908,7 +933,7 @@ def remote_claim(
         stream_id = _epic_stream(stream_id)
         session_id, lease_id, lineage_id, holder, ttl, limit = _claim_values({**body, "stream_id": stream_id})
         store = _store(ctx)
-        _lease, outcome = store.claim_remote_session(
+        claimed, outcome = store.claim_remote_session(
             stream_id=stream_id,
             holder=holder,
             lineage_id=lineage_id,
@@ -916,7 +941,7 @@ def remote_claim(
             session_id=session_id,
             lease_id=lease_id,
         )
-        response = _stream_response(store, stream_id, limit)
+        response = _stream_response(store, stream_id, limit, reveal_for=claimed)
         response["outcome"] = outcome
         return JSONResponse(content=response, headers={"Cache-Control": "no-store"})
     except TurnLeaseUnclearedError:
@@ -934,7 +959,7 @@ def remote_claim(
             current = raw_holder if isinstance(raw_holder, dict) else {}
             detail += (
                 f"; current holder={current.get('agent', '?')}/{current.get('harness', '?')} "
-                f"instance_id={current.get('instance_id', '?')}; expires_at={lease.get('expires_at', '?')}"
+                f"lease_digest={lease.get('lease_digest', '?')}; expires_at={lease.get('expires_at', '?')}"
             )
         return _error(409, detail)
     except LeaseConflictError:
@@ -950,7 +975,7 @@ def remote_claim(
             409,
             "epic stream already has live session; "
             f"current holder={holder.get('agent', '?')}/{holder.get('harness', '?')} "
-            f"instance_id={holder.get('instance_id', '?')}; "
+            f"lease_digest={lease.get('lease_digest', '?')}; "
             f"expires_at={lease.get('expires_at', '?')}",
         )
     except (ValueError, ContentRejectedError):
@@ -986,6 +1011,7 @@ def remote_heartbeat(
                     projection_state=projection_state,
                     session_state=session_state,
                     now=utc_now(),
+                    reveal_envelope=True,
                 ),
             },
             headers={"Cache-Control": "no-store"},
@@ -1083,7 +1109,9 @@ def remote_release(
             content={
                 "schema": SCHEMA,
                 "outcome": "released",
-                "lease": _lease_payload(released, projection_state="released", session_state="closed", now=utc_now()),
+                "lease": _lease_payload(
+                    released, projection_state="released", session_state="closed", now=utc_now(), reveal_envelope=True
+                ),
             },
             headers={"Cache-Control": "no-store"},
         )

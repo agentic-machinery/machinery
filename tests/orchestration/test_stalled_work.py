@@ -505,7 +505,7 @@ def test_stalled_cycle_sends_mail_to_lane_and_cto(host, capsys):
         "kind": "held_turn_lease",
         "lane": "claude-cto",
         "stream_id": "epic:9999",
-        "lease_id": "fixture-lease",
+        "lease_digest": "f" * 64,
         "generation": 1,
         "task_id": "fixture-turn",
     })
@@ -620,8 +620,8 @@ def test_held_turn_lease_surfaces_one_cto_alert_and_refuses_ttl_takeover_advice(
     from lu_machinery.session_streams.model import LeaseHolder
     from lu_machinery.session_streams.store import TURN_HOLDER_HARNESS, SessionStreamDatabase, SessionStreamStore
     from lu_machinery.session_supervisor import LaunchRole, SessionSupervisor, SupervisorError
-    from lu_machinery.session_supervisor.remote import RemoteEpicClient
-    from tests.epics_monitor_stub import epics_monitor_stub
+    from lu_machinery.session_supervisor.remote import RemoteEpicClient, lease_digest
+    from tests.epics_monitor_stub import epics_monitor_stub, public_lease
 
     terminal_nonce = "1" * 32
     overdue_nonce = "2" * 32
@@ -662,33 +662,32 @@ def test_held_turn_lease_surfaces_one_cto_alert_and_refuses_ttl_takeover_advice(
         hard_timeout=7200,
     )
 
-    def stream_row(stream_id, task_id, nonce, *, state="active", expires_delta=1800, gen=1):
-        return {
+    def stream_row(stream_id, task_id, nonce, *, state="active", expires_delta=1800, gen=1, public=True):
+        """One listing row; ``public=False`` gives the exact envelope a turn record keeps (TURN_LEASE_KEY)."""
+        envelope = {
             "stream_id": stream_id,
-            "lease": {
-                "stream_id": stream_id,
-                "session_id": f"turn-session-{nonce}",
-                "lease_id": f"turn-lease-{nonce}",
-                "generation": gen,
-                "fencing_token": gen,
-                "state": state,
-                "session_state": "closed" if state == "released" else "open",
-                "heartbeat_at": (NOW - timedelta(minutes=10)).isoformat().replace("+00:00", "Z"),
-                "expires_at": (NOW + timedelta(seconds=expires_delta)).isoformat().replace("+00:00", "Z"),
-                "ttl_seconds": 3600,
-                "version": 1,
-                "age_seconds": 600,
-                "holder": {
-                    "agent": "claude",
-                    "harness": TURN_HOLDER_HARNESS,
-                    "instance_id": nonce,
-                    "task_id": task_id,
-                    "process_id": 999999,
-                    "holder_kind": "process",
-                    "host_id": None,
-                },
+            "session_id": f"turn-session-{nonce}",
+            "lease_id": f"turn-lease-{nonce}",
+            "generation": gen,
+            "fencing_token": gen,
+            "state": state,
+            "session_state": "closed" if state == "released" else "open",
+            "heartbeat_at": (NOW - timedelta(minutes=10)).isoformat().replace("+00:00", "Z"),
+            "expires_at": (NOW + timedelta(seconds=expires_delta)).isoformat().replace("+00:00", "Z"),
+            "ttl_seconds": 3600,
+            "version": 1,
+            "age_seconds": 600,
+            "holder": {
+                "agent": "claude",
+                "harness": TURN_HOLDER_HARNESS,
+                "instance_id": nonce,
+                "task_id": task_id,
+                "process_id": 999999,
+                "holder_kind": "process",
+                "host_id": None,
             },
         }
+        return {"stream_id": stream_id, "lease": public_lease(envelope) if public else envelope}
 
     streams = [
         stream_row("epic:11151", "turn-terminal", terminal_nonce, state="active", expires_delta=1800, gen=2),
@@ -711,6 +710,32 @@ def test_held_turn_lease_surfaces_one_cto_alert_and_refuses_ttl_takeover_advice(
     assert by_task["turn-terminal"]["lane"] == "claude-cto"
     assert by_task["turn-terminal"]["reason"] == "terminal_turn:done"
     assert by_task["turn-overdue"]["reason"] == "overdue_turn_lease_expired"
+    assert by_task["turn-terminal"]["lease_digest"] == streams[0]["lease"]["lease_digest"]
+    assert by_task["turn-terminal"]["run_nonce"] is None  # this record keeps no claimed envelope to prove it
+
+    # machinery-infra#1659: the status names a lease only by its digest, so the turn record's own claimed envelope
+    # (TURN_LEASE_KEY) decides whether a held lease is that record's run or a lease the record no longer owns.
+    # (task, stream, the record's run nonce, the nonce of the run whose lease Monitor still holds)
+    cases = (("turn-own", "epic:11156", "6" * 32, "6" * 32), ("turn-replaced", "epic:11155", "7" * 32, "5" * 32))
+    for task_id, stream_id, record_nonce, _held in cases:
+        claimed = stream_row(stream_id, task_id, record_nonce, public=False)["lease"]
+        host.record(task_id, status="done", mode="orchestrator", orchestrator={"stream": stream_id},
+                    run_nonce=record_nonce, worktree_branch=None, finished_at=(NOW - timedelta(minutes=5)).isoformat(),
+                    turn_lease={"monitor": "http://127.0.0.1:8765", "lease": claimed})
+    claimed_report = mod.scan(
+        host.tasks,
+        {SLUG: host.tmp_path},
+        repos=REPOS,
+        now=NOW,
+        adapter_factory=lambda path: mod.GitHubAdapter(path, runner=host.gh),
+        stream_fetcher=lambda: [stream_row(stream_id, task_id, held) for task_id, stream_id, _nonce, held in cases],
+    )
+    claimed_rows = {row["task_id"]: row for row in claimed_report["rows"] if row["kind"] == "held_turn_lease"}
+    assert (claimed_rows["turn-own"]["reason"], claimed_rows["turn-own"]["run_nonce"]) == ("terminal_turn:done", "6" * 32)
+    assert (claimed_rows["turn-replaced"]["reason"], claimed_rows["turn-replaced"]["run_nonce"]) == (
+        "turn_record_superseded", None)
+    for task_id in ("turn-own", "turn-replaced"):
+        (host.tasks / f"{task_id}.json").unlink()
 
     # Routing sends exactly one deduplicated alert per held turn lease to claude-cto across cycles,
     # even when the lease transitions from active to expired between scans (F5).
@@ -847,4 +872,6 @@ def test_held_turn_lease_surfaces_one_cto_alert_and_refuses_ttl_takeover_advice(
         )
         with pytest.raises(RemoteLeaseLostError):
             client.release(claimed_lease)
-        assert client.stream("epic:11151")["lease"]["lease_id"] == f"turn-lease-{overdue_nonce}"
+        current, _state = monitor_store.lease_projection("epic:11151")
+        assert current.lease_id == f"turn-lease-{overdue_nonce}"
+        assert client.stream("epic:11151")["lease"]["lease_digest"] == lease_digest(current)

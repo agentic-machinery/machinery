@@ -45,7 +45,12 @@ from lu_machinery.orchestration.validate_fleet_taxonomy import (
 )
 from lu_machinery.orchestration.worktree_claims import RELEASED_TASK_STATUSES
 from lu_machinery.session_streams.store import TURN_HOLDER_HARNESS
-from lu_machinery.session_supervisor.remote import RemoteEpicClient, RemoteSupervisorError, RemoteUnreachableError
+from lu_machinery.session_supervisor.remote import (
+    RemoteEpicClient,
+    RemoteSupervisorError,
+    RemoteUnreachableError,
+    envelope_digest,
+)
 
 # This package's import name, from the unresolved file location: never from __package__, which a
 # short import spelling (orchestration.x with scripts/ on sys.path) shortens. Its dotted parts
@@ -252,6 +257,20 @@ def _turn_overdue_budget_seconds(record: Mapping[str, Any]) -> float | None:
     return None
 
 
+def _record_turn_lease_digest(record: Mapping[str, Any]) -> str | None:
+    """The digest of the lease envelope a turn record claimed (host_admission.TURN_LEASE_KEY), or None without one."""
+    from lu_machinery.dispatcher.host_admission import TURN_LEASE_KEY
+
+    envelope = record.get(TURN_LEASE_KEY)
+    lease = envelope.get("lease") if isinstance(envelope, Mapping) else None
+    if not isinstance(lease, Mapping):
+        return None
+    try:
+        return envelope_digest(lease)
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
 def _held_turn_lease_rows(
     candidates: list[stale.Candidate],
     streams: list[dict[str, Any]],
@@ -274,8 +293,10 @@ def _held_turn_lease_rows(
         if not isinstance(holder, dict) or holder.get("harness") != TURN_HOLDER_HARNESS:
             continue
         task_id = holder.get("task_id")
-        run_nonce = holder.get("instance_id")
-        lease_id = lease.get("lease_id")
+        # Monitor publishes the exact envelope only as its digest; the turn record keeps the envelope it claimed.
+        digest = lease.get("lease_digest")
+        lease_digest = digest if isinstance(digest, str) and digest else None
+        run_nonce: str | None = None
         generation = lease.get("generation")
         expires_at = stale._parse_ts(lease.get("expires_at"))
         heartbeat_at = stale._parse_ts(lease.get("heartbeat_at"))
@@ -286,11 +307,14 @@ def _held_turn_lease_rows(
         since: datetime | None = None
         if candidate is not None:
             rec = candidate.record
-            rec_nonce = rec.get("run_nonce")
-            if isinstance(run_nonce, str) and isinstance(rec_nonce, str) and rec_nonce != run_nonce:
+            rec_digest = _record_turn_lease_digest(rec)
+            if rec_digest is not None and lease_digest is not None and rec_digest != lease_digest:
                 reason = "turn_record_superseded"
                 since = expires_at or heartbeat_at
             else:
+                if rec_digest is not None and rec_digest == lease_digest:
+                    rec_nonce = rec.get("run_nonce")
+                    run_nonce = rec_nonce if isinstance(rec_nonce, str) else None
                 status = rec.get("status")
                 if isinstance(status, str) and status in TERMINAL:
                     settled = finished(candidate)
@@ -341,7 +365,7 @@ def _held_turn_lease_rows(
                 "commit": None,
                 "pr": None,
                 "stream_id": stream_id,
-                "lease_id": lease_id if isinstance(lease_id, str) else None,
+                "lease_digest": lease_digest,
                 "generation": generation if isinstance(generation, int) and not isinstance(generation, bool) else None,
                 "run_nonce": run_nonce if isinstance(run_nonce, str) else None,
                 "lease_state": state,
@@ -593,19 +617,23 @@ def route(report: dict[str, Any], *, cycle: int, service: AuthorityService) -> l
             messages.append(message.message_id)
     for row in sorted(
         turn_lease_rows,
-        key=lambda r: (str(r.get("stream_id")), str(r.get("lease_id")), str(r.get("generation")), str(r.get("task_id"))),
+        key=lambda r: (
+            str(r.get("stream_id")), str(r.get("lease_digest")), str(r.get("generation")), str(r.get("task_id"))
+        ),
     ):
         identity = {
             "kind": "held_turn_lease",
             "stream_id": row.get("stream_id"),
-            "lease_id": row.get("lease_id"),
+            "lease_digest": row.get("lease_digest"),
             "generation": row.get("generation"),
             "task_id": row.get("task_id"),
             "run_nonce": row.get("run_nonce"),
         }
         payload = json.dumps(identity, sort_keys=True, separators=(",", ":"))
         stream_key = str(row.get("stream_id") or "unknown")
-        lease_key = str(row.get("lease_id") or row.get("task_id") or hashlib.sha256(payload.encode()).hexdigest()[:16])
+        lease_key = str(
+            row.get("lease_digest") or row.get("task_id") or hashlib.sha256(payload.encode()).hexdigest()[:16]
+        )
         gen_key = str(row["generation"]) if row.get("generation") is not None else "unknown"
         key = f"stalled:held-turn-lease:{stream_key}:{lease_key}:{gen_key}"
         message = service.publish_message(
@@ -613,7 +641,7 @@ def route(report: dict[str, Any], *, cycle: int, service: AuthorityService) -> l
             recipients=("claude-cto",),
             kind="request",
             body=(
-                f"Held dispatch-turn lease on {stream_key} (lease_id={lease_key}, generation={gen_key}). "
+                f"Held dispatch-turn lease on {stream_key} (lease_digest={lease_key}, generation={gen_key}). "
                 f"{_TURN_LEASE_RECOVERY_ADVICE}\n{payload}"
             ),
             correlation_id=f"held-turn-lease:{stream_key}:{lease_key}:{gen_key}",
