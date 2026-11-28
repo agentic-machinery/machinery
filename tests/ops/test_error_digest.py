@@ -1,6 +1,5 @@
 """Exercise the daily report with a journalctl fake and a private task store."""
 
-import hashlib
 import json
 import os
 import subprocess
@@ -187,12 +186,11 @@ if args[:2] == ["journal", "add"]:
     if os.environ.get("DIGEST_FAKE_JOURNAL_FAIL"):
         sys.exit(1)
 else:
-    assert args[:12] == [
-        "channel", "publish", "cto", "-", "--sender", "devops",
+    assert args == [
+        "channel", "publish", "cto", "-", "--sender=devops",
         "--recipient", "claude-cto", "--kind", "proposal", "--idempotency-key", args[-1],
     ]
-    assert len(args) == 12
-    target, key, body = "fleet", args[11], sys.stdin.read()
+    target, key, body = "fleet", args[10], sys.stdin.read()
     if os.environ.get("DIGEST_FAKE_FLEET_FAIL") == "before_write":
         sys.exit(1)
 path = Path(os.environ["DIGEST_FIXTURE"], target + "-writes.json")
@@ -233,6 +231,14 @@ def _publish(directory: Path, day: str = _DAY) -> subprocess.CompletedProcess[st
     )
 
 
+def _proposal_days(proposals: dict[str, str]) -> list[str]:
+    """Each Fleet key is bound to its day, sender and body; return the days in order."""
+    days = [key.split(":")[2] for key in proposals]
+    expected = [digest._proposal_key(day, "devops", body) for day, body in zip(days, proposals.values(), strict=True)]
+    assert list(proposals) == expected
+    return days
+
+
 def test_second_run_same_day_adds_no_entry_or_message(journal, destinations, monkeypatch):
     """A rerun can duplicate the journal entry or Fleet proposal."""
     directory = journal([_entry(PRIORITY="3"), _entry(PRIORITY="3")])
@@ -246,12 +252,13 @@ def test_second_run_same_day_adds_no_entry_or_message(journal, destinations, mon
     assert first.returncode == 0, first.stderr
     notes, proposals = destinations("journal"), destinations("fleet")
     key = f"error-digest:{_DAY}"
-    assert list(notes) == list(proposals) == [key]
+    assert list(notes) == [key] and _proposal_days(proposals) == [_DAY]
+    (fleet_key,) = proposals
     assert notes[key].startswith(f"Error digest {_DAY}: 2 errors, 0 warnings, 1 kinds (1 new); 0 units unproven")
     assert "Full table: error-digest-2025-02-01.json" in notes[key]
     assert "| writer.service | 2 | 0 | 0 | tagged |" in notes[key]
     kind = digest.signature("journal", "writer.service", "error", "worker failed")
-    assert f"{kind} (2): writer.service error - worker failed" in proposals[key]
+    assert f"{kind} (2): writer.service error - worker failed" in proposals[fleet_key]
     ledger = directory / "error-digest-kinds.v1.json"
     first_ledger = ledger.read_bytes()
     assert json.loads(first_ledger)[kind]["proposal_day"] == _DAY
@@ -273,7 +280,7 @@ def test_second_run_same_day_adds_no_entry_or_message(journal, destinations, mon
     assert destinations("journal") == notes
     next_key = f"error-digest:{next_day}"
     proposals = destinations("fleet")
-    assert list(proposals) == [key, next_key]
+    assert _proposal_days(proposals) == [_DAY, next_day] and next(iter(proposals)) == fleet_key
 
     monkeypatch.delenv("DIGEST_FAKE_JOURNAL_FAIL")
     recovered = _publish(directory, next_day)
@@ -296,33 +303,36 @@ def test_failed_publish_leaves_ledger_unchanged(journal, destinations, monkeypat
     assert ledger.read_bytes() == previous
     assert destinations("fleet") == {}
     key = f"error-digest:{_DAY}"
-    state = directory / ".error-digest-publish.v1.json"
-    audit = json.loads(state.read_bytes())
-    assert audit["attempt"] is None
-    body_sha = audit["delivery_unknown"][key]
-    assert f"delivery_unknown for {_DAY} attempt 0, body SHA-256 {body_sha}" in destinations("journal")[key]
+    state = directory / ".error-digest-publish.v2.json"
+    attempt = json.loads(state.read_bytes())["attempt"]
+    assert (attempt["day"], attempt["sender"]) == (_DAY, "devops")
+    assert f"Fleet proposal for {_DAY} (1 kinds) not confirmed" in destinations("journal")[key]
 
-    # Ambiguous completion after a later publish must still leave the kind
-    # ledger unchanged. Both days' kinds remain eligible under a fresh key.
+    # An ambiguous completion on a later run must still leave the kind ledger
+    # unchanged. The pending proposal is resent under its own key, never a fresh one.
     next_day = "2025-02-02"
     journal([_entry(PRIORITY="3", MESSAGE="new failure", __REALTIME_TIMESTAMP=str(_START + 86_400_000_000))])
     monkeypatch.setenv("DIGEST_FAKE_FLEET_FAIL", "after_write")
     ambiguous = _publish(directory, next_day)
     assert ambiguous.returncode == 1
     assert ledger.read_bytes() == previous
-    ambiguous_key = f"error-digest:{next_day}:1"
     fleet = destinations("fleet")
-    assert list(fleet) == [ambiguous_key]
-    audit = json.loads(state.read_bytes())
-    assert audit["delivery_unknown"][ambiguous_key] == hashlib.sha256(fleet[ambiguous_key].encode()).hexdigest()
+    assert _proposal_days(fleet) == [_DAY]
+    (fleet_key,) = fleet
+    assert json.loads(state.read_bytes())["attempt"] == attempt
 
     monkeypatch.delenv("DIGEST_FAKE_FLEET_FAIL")
     next_run = _publish(directory, next_day)
     assert next_run.returncode == 0, next_run.stderr
-    retry_key = f"error-digest:{next_day}:2"
-    assert sorted(destinations("fleet")) == [ambiguous_key, retry_key]
-    assert destinations("fleet")[retry_key] == fleet[ambiguous_key]
+    next_key = f"error-digest:{next_day}"
+    proposals = destinations("fleet")
+    assert _proposal_days(proposals) == [_DAY, next_day]
+    assert proposals[fleet_key] == fleet[fleet_key]
+    next_fleet_key = list(proposals)[1]
     kind = digest.signature("journal", "writer.service", "error", "worker failed")
     new_kind = digest.signature("journal", "writer.service", "error", "new failure")
-    assert set(json.loads(ledger.read_bytes())) == {kind, new_kind}
-    assert sorted(destinations("journal")) == [key, f"error-digest:{next_day}"]
+    assert new_kind in proposals[next_fleet_key] and kind not in proposals[next_fleet_key]
+    rows = json.loads(ledger.read_bytes())
+    assert {sig: row["proposal_day"] for sig, row in rows.items()} == {kind: _DAY, new_kind: next_day}
+    assert json.loads(state.read_bytes()) == {"attempt": None}
+    assert sorted(destinations("journal")) == [key, next_key]
