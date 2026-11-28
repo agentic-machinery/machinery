@@ -82,7 +82,9 @@ required capability is INCONCLUSIVE, which still blocks; exact-head CI that
 answers the execution questions is valid evidence, a capability note is not a
 verdict, and new tests name their defect class (Step 5). From round 2 on, the
 reviewer follows the policy's delta-round rule. Step 6 applies the policy's
-budget alongside the scope breakers.
+budget alongside the scope breakers. A code or infra reviewer's reply follows
+the [review-loop reply format](../review-loop/references/brief.md#code-or-infra),
+including its completion attestation, which every recorded approval needs.
 
 ## Output
 

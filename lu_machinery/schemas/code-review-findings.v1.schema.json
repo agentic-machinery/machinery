@@ -103,6 +103,10 @@
         },
         "confidence": {
           "$ref": "#/$defs/confidence"
+        },
+        "review_complete": {
+          "type": "boolean",
+          "description": "The reviewer's attestation that the review is finished. An approval (correctness correct) is recorded only when this is JSON true; any other reply may omit it."
         }
       }
     },

@@ -337,11 +337,23 @@ def canonical_receipt_payload(raw: str) -> dict[str, Any]:
     envelope = text.startswith("VERDICT:")
     if not envelope:
         validate_reviewer_payload(payload)
-        if _effective_verdict(payload) is None:
-            raise ContractError("review_invalid_verdict")
+    verdict = _effective_verdict(payload)
+    if verdict is None:
+        raise ContractError("review_invalid_verdict")
+    if verdict == "APPROVED" and not attests_completion(payload):
+        raise ContractError(
+            "review_completion_not_attested: an approval needs overall.review_complete set to JSON true",
+            exit_code=EXIT_INCOMPLETE,
+        )
     if declares_incomplete_review(text if envelope else "", findings_payloads=(payload,)):
         raise ContractError("review_declares_incomplete", exit_code=EXIT_INCOMPLETE)
     return payload
+
+
+def attests_completion(payload: Mapping[str, Any]) -> bool:
+    """Whether the findings object's ``overall.review_complete`` is JSON ``true`` (never 1, "true" or a truthy value)."""
+    overall = payload.get("overall")
+    return isinstance(overall, Mapping) and overall.get("review_complete") is True
 
 
 def _json_objects(text: str) -> list[dict[str, Any]]:
@@ -477,6 +489,10 @@ def same_decision(lock: Mapping[str, Any], payload: Mapping[str, Any]) -> bool:
         return False
     stated = False
     prior = lock.get("payload")
+    # The completion attestation is the reviewer's, never the correction's: a reply that did not attest
+    # (no object, a missing, false or non-boolean value) cannot gain it, and one that attested keeps it.
+    if attests_completion(payload) != (isinstance(prior, Mapping) and attests_completion(prior)):
+        return False
     if isinstance(prior, Mapping):
         prior_overall = prior.get("overall")
         later = payload.get("overall")

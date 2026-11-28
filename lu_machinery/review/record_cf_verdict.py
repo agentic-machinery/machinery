@@ -124,6 +124,8 @@ from lu_machinery.review.model_catalog import (
 from lu_machinery.review.review_contract import (
     ContractError,
     ItemChunk,
+    _effective_verdict,
+    canonical_receipt_payload,
     captured_sources_events,
     item_judgments_verdict,
     judge_item_reply,
@@ -513,6 +515,27 @@ def _require_security_approval(
             f"overall.explanation opens with the line {SECURITY_ATTESTATION!r}, the only security verdict in the reply"
         )
 
+
+
+COMPLETION_REFUSED = "COMPLETION_ATTESTATION_REFUSED"
+
+
+def _completion_refusal(reply: str) -> str | None:
+    """Why a code review reply cannot carry a new approval, or None when it can.
+
+    The reply must be the canonical receipt the dispatcher seals (``canonical_receipt_payload``: bare JSON, one
+    whole closed fence or the review-loop envelope, read strictly), approve, and attest completion with JSON
+    ``true`` at ``overall.review_complete``. A run the dispatcher did not seal is read the same way here.
+    """
+    try:
+        payload = canonical_receipt_payload(reply)
+    except ContractError as exc:
+        return str(exc)
+    except RecursionError:
+        return NESTED_TOO_DEEPLY
+    if _effective_verdict(payload) != "APPROVED":
+        return "the canonical findings object does not approve"
+    return None
 
 def _label_names(labels: Any) -> set[str]:
     """Label names on a PR or issue payload the recorder already read."""
@@ -3903,10 +3926,14 @@ def record(
             raise RecordError("red-team prompt digest does not match completed review task")
     elif red_team_prompt is not None:
         raise RecordError("red-team prompt requires review_mode=red_team")
+    # The strict receipt reader runs before the verdict readers decode the reply.
+    completion_refusal = None if is_ukrainian_review(task) else _completion_refusal(reply)
     review = _task_verdict(task, reply)
     repository, branch, sha = review.repository, review.branch, review.sha
     model, family, verdict, finding_count = review.model, review.family, review.verdict, review.finding_count
     ukrainian, sources_count, started = review.ukrainian, review.sources_count, review.started
+    if verdict == "APPROVED" and completion_refusal is not None:
+        raise RecordError(f"{COMPLETION_REFUSED}: {completion_refusal}")
     if ukrainian and verdict == "APPROVED":
         _require_ukrainian_claim_support(task, reply, task_id, task_root)
     # Local records, locks and lineage use the registry slug; GitHub is read and written at the active slug.

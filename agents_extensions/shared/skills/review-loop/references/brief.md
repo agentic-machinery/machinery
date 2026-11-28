@@ -97,6 +97,11 @@ schema's other required fields. `overall.correctness` is `correct` to approve, `
 to request changes, and `uncertain` for `BLOCKED`. A finding with category `security`
 blocks at every priority, so a reply that approves never carries one.
 
+**Completion attestation.** `overall.review_complete` is the JSON boolean `true` when the
+review is finished and `false` when it is not. The dispatcher and the recorder refuse an
+approval unless the object carries exactly `true` there, even when the merge-base schema copy
+predates the field; the installed release's schema defines it. Prose never replaces it.
+
 **Security sign-off.** A critical review (a security path, critical risk or the `security`
 profile) approves only with a sign-off, and so does any approval after another review of the
 PR raised a security finding. The sign-off is the first line of `overall.explanation`,

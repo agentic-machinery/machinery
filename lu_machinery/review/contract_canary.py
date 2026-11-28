@@ -425,7 +425,8 @@ def _run_steps(
         f"Read-only review-contract canary at {head}. Inspect lu_machinery/review/contract_canary.py "
         "and report any concrete correctness defect you can verify. Do not change files or dispatch tasks. "
         "Return exactly the canonical code-review-findings.v1 JSON object required by your output contract: "
-        "schema_version, overall (correctness, explanation, confidence), findings. "
+        "schema_version, overall (correctness, explanation, confidence, review_complete), findings. "
+        "Set overall.review_complete to JSON true only when this canary review is finished. "
         "An empty findings list is permitted if no defect is verified. This is canary evidence, "
         "never a review of record."
     )
