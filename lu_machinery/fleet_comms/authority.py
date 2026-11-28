@@ -34,6 +34,7 @@ from lu_machinery.agent_runtime.target_admission import (
     stored_kimi_row,
 )
 from lu_machinery.common import json_depth
+from lu_machinery.common.github_client import loads_strict_json
 from lu_machinery.control_plane.storage import (
     Authority,
     ControlPlaneUnsupportedComponentError,
@@ -476,7 +477,7 @@ def _safe_json_mapping(value: Mapping[str, Any] | None) -> dict[str, Any]:
         return {}
     try:
         encoded = _canonical_json(dict(value))
-        loaded = json_depth.loads(encoded, max_depth=512)
+        loaded = loads_strict_json(encoded, max_depth=512)
     except (TypeError, ValueError) as exc:
         raise AuthorityServiceError("metadata_must_be_json_serializable") from exc
     if not isinstance(loaded, dict):  # pragma: no cover - dict(value) guarantees this
@@ -3281,18 +3282,22 @@ class AuthorityService:
             raise AuthorityStaleLeaseError("stale_delivery_lease")
 
     @staticmethod
-    def _decode_mapping(raw: Any, *, field: str) -> dict[str, Any]:
+    def _decode_mapping(raw: object, *, field: str) -> dict[str, Any]:
+        if not isinstance(raw, str):
+            raise AuthorityServiceError(f"{field}_corrupt")
         try:
-            decoded = json_depth.loads(str(raw or "{}"), max_depth=512)
-        except json.JSONDecodeError as exc:
+            decoded = loads_strict_json(raw, max_depth=512)
+        except (ValueError, RecursionError) as exc:
             raise AuthorityServiceError(f"{field}_corrupt") from exc
         if not isinstance(decoded, dict):
             raise AuthorityServiceError(f"{field}_corrupt")
         return decoded
 
-    def _decode_string_mapping(self, raw: Any) -> dict[str, str]:
+    def _decode_string_mapping(self, raw: object) -> dict[str, str]:
         decoded = self._decode_mapping(raw, field="context_revisions")
-        return {str(key): str(value) for key, value in decoded.items()}
+        if any(not isinstance(value, str) for value in decoded.values()):
+            raise AuthorityServiceError("context_revisions_corrupt")
+        return decoded
 
     @staticmethod
     def _context_revision_from_row(row: sqlite3.Row) -> ContextRevision:
