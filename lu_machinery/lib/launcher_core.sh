@@ -273,13 +273,20 @@ launcher_require_binary() {
 # the rules core replaced by a size placeholder; LAUNCHER_DRY_RUN_ARGV_FILE, when
 # set, receives the exact NUL-separated argv the launch would exec.
 launcher_print_argv() {
-  local arg placeholder
+  local arg placeholder inner_toml=""
   placeholder="<rules-core seat=${LC_RULES_SEAT:-none} bytes=${LC_RULES_CORE_BYTES:-0}>"
+  if [ -n "${LC_RULES_CORE_TOML:-}" ]; then
+    inner_toml="${LC_RULES_CORE_TOML#\"}"
+    inner_toml="${inner_toml%\"}"
+  fi
   for arg in "$@"; do
     if [ -n "${LC_RULES_CORE:-}" ]; then
       arg="${arg//"$LC_RULES_CORE"/$placeholder}"
       if [ -n "${LC_RULES_CORE_TOML:-}" ]; then
         arg="${arg//"$LC_RULES_CORE_TOML"/$placeholder}"
+        if [ -n "$inner_toml" ]; then
+          arg="${arg//"$inner_toml"/$placeholder}"
+        fi
       fi
     fi
     printf '%q ' "$arg"
@@ -287,6 +294,33 @@ launcher_print_argv() {
   if [ -n "${LAUNCHER_DRY_RUN_ARGV_FILE:-}" ]; then
     printf '%s\0' "$@" > "$LAUNCHER_DRY_RUN_ARGV_FILE"
   fi
+}
+
+# launcher_check_arg_length VALUE LABEL — refuse (exit 2) when VALUE reaches
+# Linux MAX_ARG_STRLEN (32 pages per argv slot, its NUL byte included).
+launcher_check_arg_length() {
+  local value="$1" label="$2" limit bytes
+  [ -n "$value" ] || return 0
+  # MAX_ARG_STRLEN: 32 pages per argument (the whole argv slot), its NUL included.
+  limit="$(getconf PAGESIZE)" && bytes="$(printf '%s' "$value" | wc -c)" || {
+    launcher_error "refusing to launch: cannot measure the $label."
+    exit 2
+  }
+  if [ "$bytes" -ge "$((limit * 32))" ]; then
+    launcher_error "refusing to launch: the $label is $bytes bytes, over the $((limit * 32 - 1))-byte argument limit."
+    exit 2
+  fi
+}
+
+# launcher_arg_preceded_by_value_option INDEX — true when LC_FORWARD_ARGS[INDEX]
+# could be consumed as the value of LC_FORWARD_ARGS[INDEX - 1].
+launcher_arg_preceded_by_value_option() {
+  local index="$1" previous
+  [ "$index" -gt 0 ] || return 1
+  previous="${LC_FORWARD_ARGS[index - 1]}"
+  [[ "$previous" == -* && "$previous" != *=* ]] || return 1
+  ! launcher_provider_option_arity "$previous" \
+    || [[ "$LC_OPTION_ARITY" != boolean && "$LC_OPTION_ARITY" != optional ]]
 }
 
 # launcher_claude_system_prompt — Claude Code keeps only the last system-prompt
@@ -303,7 +337,7 @@ launcher_print_argv() {
 # over the kernel's per-argument limit, refuses (exit 2).
 # shellcheck disable=SC2034  # both results are read by launchers/claude.sh and codex.sh
 launcher_claude_system_prompt() {
-  local arg previous value limit bytes index=0 found=-1 shaped=0 separator=0
+  local arg value index=0 found=-1 shaped=0 separator=0
   LC_CLAUDE_SYSTEM_PROMPT_ARGS=()
   for arg in ${LC_FORWARD_ARGS[@]+"${LC_FORWARD_ARGS[@]}"}; do
     case "$arg" in
@@ -313,14 +347,8 @@ launcher_claude_system_prompt() {
     esac
     index=$((index + 1))
   done
-  if [ "$shaped" != 1 ] || [ "$separator" = 1 ]; then
+  if [ "$shaped" != 1 ] || [ "$separator" = 1 ] || [ "$found" -lt 0 ] || launcher_arg_preceded_by_value_option "$found"; then
     found=-1
-  elif [ "$found" -gt 0 ]; then
-    previous="${LC_FORWARD_ARGS[found - 1]}"
-    if [[ "$previous" == -* && "$previous" != *=* ]] && { ! launcher_provider_option_arity "$previous" \
-        || [[ "$LC_OPTION_ARITY" != boolean && "$LC_OPTION_ARITY" != optional ]]; }; then
-      found=-1
-    fi
   fi
   if [ "$found" -lt 0 ]; then
     value="${LC_RULES_CORE:-}"
@@ -339,23 +367,131 @@ launcher_claude_system_prompt() {
     if [ -n "${LC_RULES_CORE:-}" ]; then value="$LC_RULES_CORE"$'\n\n'"$value"; fi
     if [ "$arg" != --append-system-prompt ]; then value="--append-system-prompt=$value"; fi
   fi
-  if [ -n "$value" ]; then
-    # MAX_ARG_STRLEN: 32 pages per argument (the whole argv slot), its NUL included.
-    limit="$(getconf PAGESIZE)" && bytes="$(printf '%s' "$value" | wc -c)" || {
-      launcher_error "refusing to launch: cannot measure the system-prompt addition."
-      exit 2
-    }
-    if [ "$bytes" -ge "$((limit * 32))" ]; then
-      launcher_error "refusing to launch: the system-prompt addition is $bytes bytes, over the $((limit * 32 - 1))-byte argument limit."
-      exit 2
-    fi
-  fi
+  launcher_check_arg_length "$value" 'system-prompt addition'
   if [ "$found" -lt 0 ]; then
     if [ -n "$value" ]; then LC_CLAUDE_SYSTEM_PROMPT_ARGS=(--append-system-prompt "$value"); fi
   else
     LC_FORWARD_ARGS[found]="$value"
   fi
   LC_CLAUDE_SYSTEM_PROMPT_READY=1
+}
+
+# launcher_codex_developer_instructions — Codex keeps only the last
+# -c/--config developer_instructions=... override it is given, so a caller's
+# setting after the launcher's drops the rules core (sibling of #1559). Runs
+# before any deploy, lease or canary and sets LC_CODEX_DEVELOPER_INSTRUCTIONS_ARGS.
+# Follows #1559's ruling C: when LC_FORWARD_ARGS holds exactly one provable
+# developer_instructions setting (no other developer_instructions-shaped config,
+# no literal --, and no option before its flag that may take it as its value),
+# its value is rewritten in place to "<core>\n\n<caller>" as one TOML basic
+# string so no forwarded element moves. Any other argv keeps main's behaviour:
+# the core's own -c developer_instructions=... first, then LC_FORWARD_ARGS
+# unchanged. A provable setting with no =value, or an argv slot at or over the
+# kernel per-argument limit, refuses (exit 2) before any side effect.
+# shellcheck disable=SC2034  # both results are read by launchers/codex.sh
+launcher_codex_developer_instructions() {
+  local arg payload kind raw prefix v_idx slot py merged_out merged_toml merge_rc
+  local index=0 found=-1 value_index=-1 shaped=0 separator=0
+  local found_prefix="" found_has_eq=0 found_raw=""
+  local count="${#LC_FORWARD_ARGS[@]}"
+  LC_CODEX_DEVELOPER_INSTRUCTIONS_ARGS=()
+  while [ "$index" -lt "$count" ]; do
+    arg="${LC_FORWARD_ARGS[index]}"
+    payload=""
+    prefix=""
+    v_idx=-1
+    case "$arg" in
+      --)
+        separator=1
+        ;;
+      -c|--config)
+        if [ "$((index + 1))" -lt "$count" ]; then
+          payload="${LC_FORWARD_ARGS[index + 1]}"
+          v_idx=$((index + 1))
+        fi
+        ;;
+      --config=*)
+        prefix='--config='
+        payload="${arg#--config=}"
+        v_idx="$index"
+        ;;
+      -c=*)
+        prefix='-c='
+        payload="${arg#-c=}"
+        v_idx="$index"
+        ;;
+      -c?*)
+        prefix='-c'
+        payload="${arg#-c}"
+        v_idx="$index"
+        ;;
+    esac
+    if [ "$v_idx" -ge 0 ] && [[ "$payload" == *developer_instructions* ]]; then
+      py="$(launcher_project_python)" || { rules_core_refuse "key classification failed"; exit 1; }
+      kind="$(rules_core_classify_codex_payload "$py" "$payload")" || { rules_core_refuse "key classification failed"; exit 1; }
+      case "$kind" in
+        setting)
+          found="$index"
+          value_index="$v_idx"
+          found_prefix="$prefix"
+          found_has_eq=1
+          found_raw="${payload#*=}"
+          shaped=$((shaped + 1))
+          ;;
+        missing_value)
+          found="$index"
+          value_index="$v_idx"
+          found_prefix="$prefix"
+          found_has_eq=0
+          found_raw=""
+          shaped=$((shaped + 1))
+          ;;
+        subkey)
+          shaped=$((shaped + 1))
+          ;;
+      esac
+    fi
+    index=$((index + 1))
+  done
+  if [ "$shaped" != 1 ] || [ "$separator" = 1 ] || [ "$found" -lt 0 ] || launcher_arg_preceded_by_value_option "$found"; then
+    found=-1
+  fi
+  if [ "$found" -ge 0 ]; then
+    if [ "$found_has_eq" != 1 ]; then
+      launcher_error "refusing to launch: developer_instructions requires a value."
+      exit 2
+    fi
+    if [ -n "${LC_RULES_CORE:-}" ]; then
+      py="$(launcher_project_python)" || { rules_core_refuse "TOML encoding failed"; exit 1; }
+      merge_rc=0
+      merged_out="$(rules_core_merge_toml "$py" "$found_raw")" || merge_rc=$?
+      if [ "$merge_rc" -eq 3 ]; then
+        found=-1
+      elif [ "$merge_rc" -ne 0 ]; then
+        rules_core_refuse "TOML encoding failed"
+        exit 1
+      else
+        LC_RULES_CORE_TOML="${merged_out%%$'\n'*}"
+        merged_toml="${merged_out#*$'\n'}"
+        slot="${found_prefix}developer_instructions=${merged_toml}"
+        launcher_check_arg_length "$slot" 'developer_instructions setting'
+        LC_FORWARD_ARGS[value_index]="$slot"
+      fi
+    else
+      launcher_check_arg_length "${LC_FORWARD_ARGS[value_index]}" 'developer_instructions setting'
+    fi
+  fi
+  if [ "$found" -lt 0 ] && [ -n "${LC_RULES_CORE:-}" ]; then
+    if LC_RULES_CORE_TOML="$(rules_core_toml "$(launcher_project_python)")"; then
+      slot="developer_instructions=$LC_RULES_CORE_TOML"
+      launcher_check_arg_length "$slot" 'developer_instructions setting'
+      LC_CODEX_DEVELOPER_INSTRUCTIONS_ARGS=(-c "$slot")
+    else
+      rules_core_refuse "TOML encoding failed"
+      exit 1
+    fi
+  fi
+  LC_CODEX_DEVELOPER_INSTRUCTIONS_READY=1
 }
 
 # Every seat starts with the rules core (scripts/lib/rules_core.sh). A driver on
@@ -459,6 +595,14 @@ launcher_defaults() {
   LC_CALLER_PROMPT_INDICES=()
   LC_PROVIDER_ARGS=()
   LC_POST_SEPARATOR_INDEX=-1
+  # shellcheck disable=SC2034  # read by launchers/claude.sh and codex.sh
+  LC_CLAUDE_SYSTEM_PROMPT_READY=0
+  # shellcheck disable=SC2034
+  LC_CLAUDE_SYSTEM_PROMPT_ARGS=()
+  # shellcheck disable=SC2034
+  LC_CODEX_DEVELOPER_INSTRUCTIONS_READY=0
+  # shellcheck disable=SC2034
+  LC_CODEX_DEVELOPER_INSTRUCTIONS_ARGS=()
 }
 
 launcher_need_value() {
@@ -1375,6 +1519,7 @@ launcher_provider_option_arity() {
       case "$1" in
         -c|--config|--enable|--disable|--remote|--remote-auth-token-env|--local-provider|-p|--profile|-s|--sandbox|-C|--cd|--add-dir|-a|--ask-for-approval) LC_OPTION_ARITY=one ;;
         -i|--image) LC_OPTION_ARITY=many ;;
+        --strict-config|--oss|--approve-for-me|--dangerously-bypass-approvals-and-sandbox|--dangerously-bypass-hook-trust|--worktree|--search|--no-alt-screen|--no-daemon|--skip-git-repo-check|--trust|--ephemeral|--ignore-user-config|--ignore-rules|--json) LC_OPTION_ARITY=boolean ;;
         *) return 1 ;;
       esac
       ;;
@@ -1686,10 +1831,12 @@ launcher_main() {
   if [ "$LC_MODE" = "driver" ] && [ "$LC_GOVERNOR" = "0" ]; then
     launcher_validate_provider_option_arity || exit 2
   fi
-  # Build Claude's one system-prompt addition now, so a refusal cannot follow a
-  # deploy, lease or canary.
+  # Build Claude's one system-prompt addition or Codex's one developer_instructions
+  # setting now, so a refusal cannot follow a deploy, lease or canary.
   if [ "$LC_HARNESS" = claude-code ]; then
     launcher_claude_system_prompt
+  elif [ "$LC_HARNESS" = codex ]; then
+    launcher_codex_developer_instructions
   fi
   launcher_adapter_preflight
 

@@ -207,16 +207,10 @@ launcher_adapter_exec() {
       -C "$LC_SESSION_ROOT" --model "$LC_MODEL"
       -c "model_reasoning_effort=$LC_EFFORT"
     )
-    # AGENTS.md autoload does not carry the rules core; developer_instructions
-    # adds it as a developer message (TOML-encoded so -c never reparses it).
-    if [ -n "${LC_RULES_CORE:-}" ]; then
-      if LC_RULES_CORE_TOML="$(rules_core_toml "$(launcher_project_python)")"; then
-        cmd+=(-c "developer_instructions=$LC_RULES_CORE_TOML")
-      else
-        rules_core_refuse "TOML encoding failed"
-        exit 1
-      fi
-    fi
+    # AGENTS.md autoload does not carry the rules core; launcher_main put it in
+    # the one developer_instructions setting (launcher_codex_developer_instructions).
+    [ "${LC_CODEX_DEVELOPER_INSTRUCTIONS_READY:-0}" = 1 ] || { launcher_error 'developer_instructions setting not prepared.'; exit 1; }
+    cmd+=(${LC_CODEX_DEVELOPER_INSTRUCTIONS_ARGS[@]+"${LC_CODEX_DEVELOPER_INSTRUCTIONS_ARGS[@]}"})
   else
     cmd=(claude --model "$LC_MODEL")
     # The one system-prompt addition, core first (launcher_claude_system_prompt).
