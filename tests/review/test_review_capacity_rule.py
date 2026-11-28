@@ -141,13 +141,15 @@ def test_10016_usage_snapshot_does_not_rank_reviewers():
     data["agents"]["claude"]["codexbar"]["weekly_pace_delta_pct"] = 1
     result = resolve_reviewer(ResolverInputs(author_model="grok-4.7", risk="critical", routing_snapshot=data, claude_account=HOST_ACCOUNT))
 
-    assert result.selected.concrete_model == "claude-opus-5-5"
-    assert result.selected.health == "healthy"
-    sol = next(item for item in result.trace if item.name == "openai_frontier")
-    assert sol.status == "eligible"
-    assert sol.capacity.remaining_pct is None
-    assert sol.capacity.freshness == credit_lane.UNKNOWN
-    assert result.selected.selection_score[:-1] == sol.selection_score[:-1]
+    # REVIEW-ROTATION-GROK-1127: tied recent counts break by catalog order (Sol before Opus),
+    # never by usage pace; both remain eligible with identical workload/inflight/failure prefixes.
+    assert result.selected.concrete_model == CURRENT_SOL
+    assert result.selected.capacity.remaining_pct is None
+    assert result.selected.capacity.freshness == credit_lane.UNKNOWN
+    opus = next(item for item in result.trace if item.name == "claude-opus-5-5")
+    assert opus.status == "eligible"
+    assert opus.health == "healthy"
+    assert result.selected.selection_score[:-2] == opus.selection_score[:-2]
 
 
 @pytest.mark.parametrize(
@@ -260,8 +262,8 @@ def test_legacy_normalization_keeps_writer_policy_but_review_ignores_hot():
     data = {"claude": "hot", "codex": "healthy"}
     assert normalize_routing_snapshot(data) == {"claude": "near_cap", "codex": "healthy"}
     result = resolve_reviewer(ResolverInputs(author_model="grok-4.7", risk="critical", routing_snapshot=data, claude_account=HOST_ACCOUNT))
-    assert result.selected.concrete_model == "claude-opus-5-5"
-    assert next(item for item in result.trace if item.concrete_model == "claude-opus-5-5").status == "selected"
+    assert result.selected.concrete_model == CURRENT_SOL
+    assert next(item for item in result.trace if item.concrete_model == "claude-opus-5-5").status == "eligible"
 
 
 @pytest.mark.parametrize(

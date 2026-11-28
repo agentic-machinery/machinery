@@ -330,7 +330,7 @@ def test_resolve_reviewer_cli_excludes_grok_for_grok_adapter_path(tmp_path, monk
             assert "subject exclusion" in grok["reason"]
             assert "subject seat grok" in grok["reason"]
     else:
-        # The automatic ladders list no Grok seat at all.
+        # REVIEW-ROTATION-GROK-1127: the critical ladder lists no Grok seat at all.
         assert grok_entries == []
     assert payload["selected"] is None or payload["selected"]["family"] != "xai"
     selected = payload["selected"]
@@ -1259,16 +1259,18 @@ def test_pr_mode_target_keeps_the_base_name_for_authorship_exclusion(tmp_path, m
 # restoring that spelling in the stdout reproduces the previous digests.
 # The Neon seat replaces the Flash trace row for low and medium risk.
 # NEON-SOLTIER-1120 (2026-11-20) adds Neon as an eligible critical trace row on security paths; Opus stays selected.
+# REVIEW-ROTATION-GROK-1127 (2026-11-27) puts Sol, Opus, Neon and pinned Cursor Grok in one equal peer row below critical
+# (critical keeps Sol, Opus and Neon) with least-used recent review count and catalog-order tie-break.
 @pytest.mark.parametrize(
     "author,risk,path,digest",
     [
-        (CURRENT_SOL, "medium", "ordinary.py", "c40560750db50e8cb3fb5f3b1a0306f85f46c9fddbd16bac8c7f25a19f06a5a3"),
-        ("claude-opus-5-5", "low", "ordinary.py", "0c344d1acfc5c53a8c8853062d0eb38577c4699fb5863daf3bd0259763229a10"),
+        (CURRENT_SOL, "medium", "ordinary.py", "966174c485764da99f62466e0eccebc42de63bd70bd985def13ee3e48802cc8d"),
+        ("claude-opus-5-5", "low", "ordinary.py", "a9674a242f7d35c92c391b937b7c6a837f19081e9196b14df19c036a67ca98d8"),
         (
             CURRENT_SOL,
             "low",
             "lu_machinery/agent_runtime/target_admission.py",
-            "e0a0c58465fd5020f7b5ce4064ae0cf5502756c070c56d74c9235961c37963c2",
+            "04e79645faac3e6081a0fb16d0781a4b03eb6a82c8e0186fe5fe7a0c7932da75",
         ),
     ],
 )

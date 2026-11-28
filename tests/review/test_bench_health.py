@@ -24,16 +24,16 @@ CURRENT_SOL = current_sol()
 
 
 
-# The restored Cursor Grok pin stays outside ordinary reviewer-of-record ladders.
+# REVIEW-ROTATION-GROK-1127: pinned Cursor Grok sits in the equal peer row at every risk.
 GROK = "grok-4.7-cursor-fallback"
 DEFAULT_COUNTS = {
-    "anthropic": ["openai_frontier"],
-    "google": ["openai_frontier", "claude-opus-5-5", "claude-opus-5-5-agy", "claude-sonnet-5-5", "claude-sonnet-5-5-agy"],
-    "openai": ["claude-opus-5-5", "claude-opus-5-5-agy", "claude-sonnet-5-5", "claude-sonnet-5-5-agy"],
+    "anthropic": [GROK, "openai_frontier"],
+    "google": [GROK, "openai_frontier", "claude-opus-5-5", "claude-opus-5-5-agy", "claude-sonnet-5-5", "claude-sonnet-5-5-agy"],
+    "openai": [GROK, "claude-opus-5-5", "claude-opus-5-5-agy", "claude-sonnet-5-5", "claude-sonnet-5-5-agy"],
     "moonshot": ["openai_frontier", "claude-opus-5-5", "claude-opus-5-5-agy", "claude-sonnet-5-5", "claude-sonnet-5-5-agy"],
-    "zhipu": ["openai_frontier", "claude-opus-5-5", "claude-opus-5-5-agy", "claude-sonnet-5-5", "claude-sonnet-5-5-agy"],
+    "zhipu": [GROK, "openai_frontier", "claude-opus-5-5", "claude-opus-5-5-agy", "claude-sonnet-5-5", "claude-sonnet-5-5-agy"],
     "xai": ["openai_frontier", "claude-opus-5-5", "claude-opus-5-5-agy", "claude-sonnet-5-5", "claude-sonnet-5-5-agy"],
-    "deepseek": ["openai_frontier", "claude-opus-5-5", "claude-opus-5-5-agy", "claude-sonnet-5-5", "claude-sonnet-5-5-agy"],
+    "deepseek": [GROK, "openai_frontier", "claude-opus-5-5", "claude-opus-5-5-agy", "claude-sonnet-5-5", "claude-sonnet-5-5-agy"],
 }
 
 
@@ -72,7 +72,7 @@ def test_bench_health_default_snapshot_closes_the_anthropic_shortfall_below_crit
         assert len(results[family]) >= 2, f"Family {family} has < 2 eligible seats: {results[family]}"
         assert all(REVIEW_CANDIDATES[name].family != family for name in results[family])
         assert not set(results[family]) & {"composer-2.5", "pool", "pool-xs"}
-    # NEON-SOLTIER-1120 adds Neon to critical review after Sol and Opus.
+    # REVIEW-ROTATION-GROK-1127: critical and security sign-off stay Sol, Opus and Neon (no Grok).
     critical = check_bench_health(routing_snapshot=snapshot, data_egress_policy="local_interactive", risk="critical")
     assert critical["anthropic"] == ["openai_frontier", "gemini-4-neon-high"]
     assert GROK not in {name for seats in critical.values() for name in seats}
@@ -109,21 +109,20 @@ def test_bench_exclusions_match_automatic_resolver(risk, profile, capsys):
         assert set(seats) == {entry.name for entry in resolution.trace if entry.status in {"selected", "eligible"}}
     if risk == "high":
         assert {family: results[family] for family in ("anthropic", "openai")} == {
-            "anthropic": ["openai_frontier", *neon],
-            "openai": ["claude-opus-5-5", "claude-opus-5-5-agy", *neon],
+            "anthropic": [GROK, "openai_frontier", *neon],
+            "openai": [GROK, "claude-opus-5-5", "claude-opus-5-5-agy", *neon],
         }
         for family in set(AUTHOR_FAMILIES) - {"anthropic", "openai"}:
-            # Neon never reviews Google-authored work.
+            grok_seat = [] if family in {"xai", "moonshot"} else [GROK]
             own = [] if family == "google" else neon
-            assert results[family] == ["openai_frontier", "claude-opus-5-5", "claude-opus-5-5-agy", *own]
+            assert results[family] == [*grok_seat, "openai_frontier", "claude-opus-5-5", "claude-opus-5-5-agy", *own]
         # The resolver names the single eligibility rule, not a bench-local list.
-        rule = f"performed only by {CURRENT_SOL}, claude-opus-5-5"
-        assert rule in exclusions["anthropic"][GROK]
-        assert rule in exclusions["openai"][GROK]
+        rule = f"performed only by {CURRENT_SOL}, claude-opus-5-5, gemini-4-neon, grok-4.7"
         assert rule in exclusions["openai"]["claude-sonnet-5-5"]
         return
     if risk != "critical":
         return
+    # REVIEW-ROTATION-GROK-1127: critical keeps Sol, Opus and Neon; Grok lacks critical_review.
     assert results["anthropic"] == ["openai_frontier", "gemini-4-neon-high"]
     assert results["openai"] == ["claude-opus-5-5", "claude-opus-5-5-agy", "gemini-4-neon-high"]
     assert set(exclusions["anthropic"]) == set(REVIEW_CANDIDATES) - {"openai_frontier", "gemini-4-neon-high"}
@@ -226,7 +225,7 @@ def test_bench_health_preserves_egress_gate(policy, monkeypatch):
     results = check_bench_health(routing_snapshot={}, data_egress_policy=policy)
     assert all("glm-5.3" not in seats for seats in results.values())
     assert all("openai_frontier" not in seats for seats in results.values())
-    assert results["anthropic"] == ["gemini-4-neon-high"]
+    assert results["anthropic"] == [GROK, "gemini-4-neon-high"]
     pinned = evaluate_candidate(
         retired_candidate("glm-5.3"),
         ResolverInputs(
@@ -261,14 +260,14 @@ def test_bench_health_preserves_capacity_gate(status, reason, route, names, caps
         assert all(not names.intersection(seats) for seats in results.values())
     else:
         assert results == DEFAULT_COUNTS
-    # Without Codex, Gemini alone leaves Anthropic authors below the unchanged two-seat floor.
-    assert main([], routing_snapshot=data) == (1 if route == "codex" and blocked else 0)
+    # REVIEW-ROTATION-GROK-1127: without Codex, Grok + Neon keep Anthropic at 2 seats (pass).
+    assert main([], routing_snapshot=data) == 0
     for finding in _findings(capsys.readouterr()):
         for name in names:
             if REVIEW_CANDIDATES[name].family != finding["author_family"]:
                 assert finding["excluded_seats"][name] == reason
     assert results["anthropic"] == (
-        ["gemini-4-neon-high"] if route == "codex" and blocked else DEFAULT_COUNTS["anthropic"]
+        [GROK, "gemini-4-neon-high"] if route == "codex" and blocked else DEFAULT_COUNTS["anthropic"]
     )
     # Check exclusion reasons even when the remaining seats prevent a CLI shortfall.
     _, excluded = bench_health._bench_inventory(
@@ -298,18 +297,33 @@ def test_accepted_single_seat_still_requires_available_reviewer(risk, status, ro
     if route == "claude":
         data["agents"]["agy"] = {"status": "unhealthy"}
     # Neon on AGY still reviews Anthropic-authored high and critical work when Codex is out (NEON-SOLTIER-1120).
+    # REVIEW-ROTATION-GROK-1127: pinned Cursor Grok also remains eligible on non-Claude near_cap
+    # below critical; critical and security sign-off stay Sol, Opus and Neon.
     neon_fills = route == "codex"
+    grok_fills = status == "near_cap" and risk != "critical"
     expected_exit = 0 if neon_fills else (1 if status == "unhealthy" or route == "claude" else 0)
     assert main(["--risk", risk], routing_snapshot=data) == expected_exit
     captured = capsys.readouterr()
     neon = ["gemini-4-neon-high"] if neon_fills else []
+    grok_seat = [GROK] if grok_fills else []
     if status == "near_cap":
         results = check_bench_health(routing_snapshot=data, risk=risk)
-        assert results[family] == (["openai_frontier", *neon] if route == "codex" else [])
+        assert results[family] == ([*grok_seat, "openai_frontier", *neon] if route == "codex" else grok_seat)
         findings = _findings(captured)
-        if route == "claude":
-            # Claude's cap leaves OpenAI authors with no reviewer and every other non-Anthropic
-            # family below its two-seat minimum: Cursor Grok no longer fills them (GROK-CANCEL-1110).
+        if route == "claude" and grok_fills:
+            # Claude's cap drops Opus; non-Claude near_cap leaves Cursor Grok eligible for every
+            # non-{xai,moonshot} family (1 seat for openai = accepted single seat; 2 seats for other
+            # families; xai and moonshot keep openai_frontier only -> 1 < 2 shortfall).
+            assert {finding["author_family"] for finding in findings} == {"xai", "moonshot"}
+            for finding in findings:
+                assert (finding["minimum"], finding["counted_seats"]) == (2, ["openai_frontier"])
+                assert finding["excluded_seats"]["claude-opus-5-5"] == (
+                    "quota bucket is near cap — automatic assignments are prohibited"
+                )
+            assert "BENCH HEALTH FAIL" in captured.err
+        elif route == "claude":
+            # At critical Cursor Grok holds no seat: Claude's cap leaves OpenAI authors with no
+            # reviewer and every other non-Anthropic family below its two-seat minimum.
             assert {finding["author_family"] for finding in findings} == set(AUTHOR_FAMILIES) - {"anthropic"}
             for finding in findings:
                 if finding["author_family"] == "openai":
