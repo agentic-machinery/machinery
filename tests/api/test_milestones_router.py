@@ -146,9 +146,9 @@ def test_milestone_percent_and_private_counts_only(tmp_path, monkeypatch, public
          + '\nprocess.stdout.write(renderMilestones(' + json.dumps(data) + '));'],
         capture_output=True, text=True, check=True, timeout=10,
     ).stdout
-    assert "6/8 (75%)" in rendered
-    assert "6 of 8 closed (75%)" in rendered
-    assert 'value="75"' in rendered
+    assert "6 of 8 closed" in rendered
+    assert "<progress" not in rendered
+    assert "75%" not in rendered
     assert "Ship &lt;progress&gt;" in rendered
     assert "Work 7" in rendered
     assert "private-title" not in rendered
@@ -196,7 +196,7 @@ def test_milestones_page_sorts_overdue_first_and_joins_blockers():
                 "milestones": [
                     {
                         "number": 10,
-                        "title": "No due low",
+                        "title": "No due open",
                         "description_first_line": "",
                         "due_on": None,
                         "open_issues": 6,
@@ -272,14 +272,21 @@ def test_milestones_page_sorts_overdue_first_and_joins_blockers():
                     },
                     {
                         "number": 11,
-                        "title": "No due high",
+                        "title": "No due blocked",
                         "description_first_line": "",
                         "due_on": None,
                         "open_issues": 1,
                         "closed_issues": 9,
                         "percent_complete": 90.0,
                         "issues_status": "ok",
-                        "issues": [],
+                        "issues": [
+                            {
+                                "number": 110,
+                                "title": "Undated blocked work",
+                                "url": "https://github.com/Fixture/Machinery/issues/110",
+                                "labels": [],
+                            },
+                        ],
                     },
                 ],
             },
@@ -313,12 +320,12 @@ def test_milestones_page_sorts_overdue_first_and_joins_blockers():
             "coverage": {
                 "repositories_read": 2,
                 "repositories_total": 2,
-                "open_issues": 6,
+                "open_issues": 7,
                 "dependency_unknown": 0,
                 "private_open_issues": 1,
             },
             "blockers": [
-                {"ref": "fixture/machinery#88", "direct": 1, "total": 2},
+                {"ref": "fixture/machinery#88", "direct": 2, "total": 2},
                 {"ref": None, "direct": 1, "total": 1},
             ],
             "ready": [
@@ -337,6 +344,11 @@ def test_milestones_page_sorts_overdue_first_and_joins_blockers():
                     "blocked_by": ["fixture/machinery#88", "fixture/other#9"],
                     "private_blockers": 1,
                 },
+                {
+                    "ref": "fixture/machinery#110",
+                    "blocked_by": ["fixture/machinery#88"],
+                    "private_blockers": 0,
+                },
             ],
         },
         "capacity": [],
@@ -349,53 +361,75 @@ const planning = {json.dumps(planning_fixture)};
 const html = renderMilestones(data, planning, now);
 const chips = renderMilestoneChips({{milestones: data, planning}}, now);
 
-// Order in At-a-glance summary table: overdue earliest first -> overdue later -> due soonest -> no-due % desc.
+// Owner direction: no progress bars and no percentages anywhere on the page.
+assert.doesNotMatch(html, /<progress\\b/i, "progress bar must not be rendered");
+assert.doesNotMatch(html, /\\d+%/, "percentages must not be rendered");
+
+// At-a-glance summary table leads with Blocked and Overdue counts after Milestone.
 const summary = html.split("<h2>Milestone details</h2>")[0];
-const expectedOrder = ["v0.3.9", "Overdue later", "v0.4.0", "No due high", "Private milestone", "No due low"];
+const headers = [...summary.matchAll(/<th scope="col"[^>]*>(.*?)<\\/th>/gs)].map(m => m[1]);
+assert.deepEqual(headers, ["Milestone", "Blocked", "Overdue", "Due", "Open", "Closed", "Repo"]);
+
+// Order in At-a-glance summary table: overdue earliest -> overdue later -> due soonest -> undated blocked -> undated open desc.
+const expectedOrder = ["v0.3.9", "Overdue later", "v0.4.0", "No due blocked", "No due open", "Private milestone"];
 const positions = expectedOrder.map(name => summary.indexOf(name));
 assert.ok(positions.every(pos => pos >= 0), "every milestone appears in summary: " + JSON.stringify(positions));
 for (let i = 1; i < positions.length; i++) {{
   assert.ok(positions[i - 1] < positions[i], `order mismatch: ${{expectedOrder[i - 1]}} before ${{expectedOrder[i]}}`);
 }}
 
-// Overdue text, anchors, th scope="col", closed issues link, freshness strip.
+// Overdue text, anchors, plain-text closed count, closed issues link, freshness strip.
 assert.match(summary, /OVERDUE 3 d/);
+assert.match(summary, /16 of 20 closed/);
 assert.match(summary, /href="#ms-machinery-2"/);
-assert.match(summary, /<th scope="col">Milestone<\\/th>/);
 assert.match(html, /id="ms-machinery-2"/);
 assert.match(html, /https:\\/\\/github\\.com\\/Fixture\\/Machinery\\/milestone\\/2\\?closed=1/);
 assert.match(html, /data 2m, planning 4m/);
 
-// Inside v0.4.0: blocked issue #101 comes BEFORE unblocked #100, joins case-folded blockers + private count.
+// Inside overdue v0.3.9: Overdue section holds unblocked overdue issue #88 with Ready now badge.
+const overdueStart = html.indexOf('id="ms-machinery-1"');
+const overdueEnd = html.indexOf("</article>", overdueStart);
+const overdueCard = html.slice(overdueStart, overdueEnd);
+assert.match(overdueCard, /9 of 10 closed/);
+assert.match(overdueCard, /<h4>Overdue \\(1\\)<\\/h4>/);
+assert.match(overdueCard, /#88 Blocker root/);
+assert.match(overdueCard, /Ready now/);
+
+// Inside non-overdue v0.4.0: Blocked -> Ready now -> Other open, plain-text "16 of 20 closed".
 const cardStart = html.indexOf('id="ms-machinery-2"');
 const cardEnd = html.indexOf("</article>", cardStart);
 const card = html.slice(cardStart, cardEnd);
-assert.match(card, /16 of 20 closed \\(80%\\)/);
+assert.match(card, /16 of 20 closed/);
 assert.match(card, /<h4>Blocked \\(1\\)<\\/h4>/);
-assert.match(card, /<h4>Open \\(3\\)<\\/h4>/);
+assert.match(card, /<h4>Ready now \\(1\\)<\\/h4>/);
+assert.match(card, /<h4>Other open \\(2\\)<\\/h4>/);
+assert.ok(card.indexOf("<h4>Blocked (1)</h4>") < card.indexOf("<h4>Ready now (1)</h4>"));
+assert.ok(card.indexOf("<h4>Ready now (1)</h4>") < card.indexOf("<h4>Other open (2)</h4>"));
 assert.ok(card.indexOf("#101 Blocked migration") < card.indexOf("#100 Ready feature"), "blocked issue appears first");
+assert.ok(card.indexOf("#100 Ready feature") < card.indexOf("#102 Label only not dep-blocked"), "ready now appears before other open");
 assert.match(card, /Blocked<\\/span> by <a href="https:\\/\\/github\\.com\\/fixture\\/machinery\\/issues\\/88">#88<\\/a>, <a href="https:\\/\\/github\\.com\\/fixture\\/other\\/issues\\/9">fixture\\/other#9<\\/a>, \\+1 private/);
 
-// Label "blocked" on #102 does NOT make it a blocker (stays in Open, badge shows Path conflict, label shown as label).
-const blockedSection = card.slice(card.indexOf("<h4>Blocked (1)</h4>"), card.indexOf("<h4>Open (3)</h4>"));
-const openSection = card.slice(card.indexOf("<h4>Open (3)</h4>"));
+// Label "blocked" on #102 does NOT make it a blocker (stays in Other open, badge shows Path conflict, label shown as label).
+const blockedSection = card.slice(card.indexOf("<h4>Blocked (1)</h4>"), card.indexOf("<h4>Ready now (1)</h4>"));
+const otherSection = card.slice(card.indexOf("<h4>Other open (2)</h4>"));
 assert.doesNotMatch(blockedSection, /#102/);
-assert.match(openSection, /#102 Label only not dep-blocked/);
-assert.match(openSection, /Path conflict/);
-assert.match(openSection, /Ready now/);
-assert.match(openSection, /Scope unknown/);
+assert.match(otherSection, /#102 Label only not dep-blocked/);
+assert.match(otherSection, /Path conflict/);
+assert.match(otherSection, /Scope unknown/);
 
 // Top blockers and Ready now moved from model-stats.
 assert.match(html, /<h2 id="top-blockers">Top blockers<\\/h2>/);
-assert.match(html, /unblocks 2 \\(direct 1\\)/);
+assert.match(html, /unblocks 2 \\(direct 2\\)/);
 assert.match(html, /Private issue/);
 assert.match(html, /<h2 id="ready-now">Ready now<\\/h2>/);
 
-// Header chips reflect open, overdue, blocked, ready now.
-assert.match(chips, /<b>6<\\/b> open/);
+// Header chips lead with blocked and overdue, then ready now and open.
+assert.match(chips, /<b>2<\\/b> blocked/);
 assert.match(chips, /<b>2<\\/b> overdue/);
-assert.match(chips, /<b>1<\\/b> blocked/);
 assert.match(chips, /<b>2<\\/b> ready now/);
+assert.match(chips, /<b>6<\\/b> open/);
+assert.ok(chips.indexOf("blocked") < chips.indexOf("overdue"));
+assert.ok(chips.indexOf("overdue") < chips.indexOf("open"));
 """
     _run_milestones_node(body)
 
@@ -460,13 +494,12 @@ def test_milestones_page_shows_unknown_or_withheld_never_zero():
 const now = Date.parse({json.dumps(now_iso)});
 const data = {json.dumps(milestones_fixture)};
 
-function blockedCellFor(html, rowMarker) {{
+function summaryCellsFor(html, rowMarker) {{
   const summary = html.split("<h2>Milestone details</h2>")[0];
   const rows = [...summary.matchAll(/<tr>(.*?)<\\/tr>/gs)].map(m => m[1]);
   const row = rows.find(r => r.includes(rowMarker));
   assert.ok(row, "row missing for " + rowMarker);
-  const cells = [...row.matchAll(/<td[^>]*>(.*?)<\\/td>/gs)].map(m => m[1]);
-  return cells[cells.length - 1];
+  return [...row.matchAll(/<td[^>]*>(.*?)<\\/td>/gs)].map(m => m[1]);
 }}
 
 const unusableCases = [
@@ -474,18 +507,28 @@ const unusableCases = [
   ["status unknown", {{issues: {{status: "unknown", blocked: [], ready: [], ready_now: [], blockers: []}}}}],
   ["status stale", {{issues: {{status: "stale", age_s: 500, blocked: [], ready: [], ready_now: [], blockers: []}}}}],
   ["expired age_s", {{issues: {{status: "ok", age_s: 421, blocked: [], ready: [], ready_now: [], blockers: []}}}}],
+  ["missing age_s", {{issues: {{status: "ok", blocked: [], ready: [], ready_now: [], blockers: []}}}}],
   ["status pending", {{issues: {{status: "pending"}}}}],
 ];
 for (const [name, planning] of unusableCases) {{
   const html = renderMilestones(data, planning, now);
-  const pubBlocked = blockedCellFor(html, "v0.4.0");
-  const privBlocked = blockedCellFor(html, "Private milestone");
-  assert.equal(pubBlocked, "unknown", `${{name}}: public blocked must be unknown, never 0`);
-  assert.equal(privBlocked, "withheld", `${{name}}: private blocked must be withheld`);
+  const pubCells = summaryCellsFor(html, "v0.4.0");
+  const privCells = summaryCellsFor(html, "Private milestone");
+  assert.equal(pubCells[1], "unknown", `${{name}}: public blocked must be unknown, never 0`);
+  assert.equal(privCells[1], "withheld", `${{name}}: private blocked must be withheld`);
+  assert.equal(privCells[2], "withheld", `${{name}}: private overdue must be withheld, never 0`);
   const chips = renderMilestoneChips({{milestones: data, planning}}, now);
   assert.match(chips, /<b>\\?<\\/b> blocked/, `${{name}}: blocked chip must be ?`);
   assert.match(chips, /<b>\\?<\\/b> ready now/, `${{name}}: ready now chip must be ?`);
 }}
+
+// All-private snapshot: overdue chip fails closed as withheld, never 0.
+const privateOnly = {{
+  ...data,
+  repositories: [data.repositories[1]],
+}};
+const privateChips = renderMilestoneChips({{milestones: privateOnly, planning: null}}, now);
+assert.match(privateChips, /<b>withheld<\\/b> overdue/);
 
 // Partial planning shows values AND "partial: N of M repos", while private stays "withheld".
 const partialPlanning = {{
@@ -502,8 +545,9 @@ const partialPlanning = {{
 }};
 const partialHtml = renderMilestones(data, partialPlanning, now);
 assert.match(partialHtml, /partial: 2 of 3 repos/);
-assert.equal(blockedCellFor(partialHtml, "v0.4.0"), "1");
-assert.equal(blockedCellFor(partialHtml, "Private milestone"), "withheld");
+assert.equal(summaryCellsFor(partialHtml, "v0.4.0")[1], "1");
+assert.equal(summaryCellsFor(partialHtml, "Private milestone")[1], "withheld");
+assert.equal(summaryCellsFor(partialHtml, "Private milestone")[2], "withheld");
 // Workers unknown -> ready-now fails closed (never 0 ready now).
 const partialChips = renderMilestoneChips({{milestones: data, planning: partialPlanning}}, now);
 assert.match(partialChips, /<b>\\?<\\/b> ready now/);
@@ -521,7 +565,7 @@ const okPlanning = {{
   }},
 }};
 const incompleteHtml = renderMilestones(incompleteData, okPlanning, now);
-assert.equal(blockedCellFor(incompleteHtml, "v0.4.0"), "unknown");
+assert.equal(summaryCellsFor(incompleteHtml, "v0.4.0")[1], "unknown");
 assert.match(incompleteHtml, /Open issue list is incomplete or unavailable/);
 """
     _run_milestones_node(body)
