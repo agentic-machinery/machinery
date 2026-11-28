@@ -308,7 +308,8 @@ def test_rest_pr_identity_matches_both_transferred_repository_slugs(monkeypatch)
 # Approved by claude-cto for issue #1615 (AC-08, AC-09, AC-11, AC-12).
 def _run_git(cwd, *args):
     done = subprocess.run(["git", "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
-                           "-c", "commit.gpgsign=false", "-C", str(cwd), *args], capture_output=True, text=True)
+                           "-c", "commit.gpgsign=false", "-C", str(cwd), *args],
+                          capture_output=True, text=True, timeout=60)
     assert done.returncode == 0, done.stderr
     return done.stdout.strip()
 
@@ -327,8 +328,8 @@ def _new_commit(work, message):
 def origin(tmp_path, monkeypatch):
     """A bare origin and a writer clone; the verifier's private namespace fetches from the bare origin."""
     bare, work = tmp_path / "origin.git", tmp_path / "work"
-    subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(bare)], check=True)
-    subprocess.run(["git", "clone", "-q", str(bare), str(work)], check=True, capture_output=True)
+    subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(bare)], check=True, timeout=60)
+    subprocess.run(["git", "clone", "-q", str(bare), str(work)], check=True, capture_output=True, timeout=60)
 
     @contextmanager
     def private_remote(task_id, url):

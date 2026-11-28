@@ -1682,8 +1682,12 @@ RUFF_CONFIG_FILES = frozenset({"pyproject.toml", "ruff.toml", ".ruff.toml"})
 RUFF_BUCKETS = ("cancelled_or_superseded", "infrastructure_failure", "missing_or_reused_evidence", "guard_failure",
                 "ruff_code_failure", "base_only_ruff_failure", "ambiguous_base_or_merge_context", "ruff_pass")
 FINDING_ORIGINS = frozenset({"pr", "base", "unresolved"})
-_RUFF_CODE = re.compile(r"[A-Z]{1,4}[0-9]{1,5}\Z")
-_RULE_TITLE = re.compile(r"Ruff \(([A-Z]{1,4}[0-9]{1,5})\)\Z")
+# Ruff's GitHub output titles an annotation ``ruff (I001)`` (CI Gate, Ruff 0.15); a rule name such as
+# ``invalid-syntax`` takes the code's place for a parse error.
+_RUFF_CODE = re.compile(r"[A-Za-z][A-Za-z0-9-]{0,39}\Z")
+_RULE_TITLE = re.compile(r"[Rr]uff \(([A-Za-z][A-Za-z0-9-]{0,39})\)\Z")
+# ``ruff check lu_machinery`` reports repository-relative paths under the checked tree; anything else is unresolved.
+_LINTED_PATH = re.compile(r"lu_machinery/(?:[^/\x00]+/)*[^/\x00]+\Z")
 _RUFF_KEYS = frozenset({
     "schema", "repository", "repository_id", "pr", "measured_head_sha", "check_name", "check_run_id", "run_id",
     "run_attempt", "started_at", "completed_at", "status", "conclusion", "steps", "findings", "base_sha",
@@ -1862,9 +1866,10 @@ def _interval_ok(item: object) -> bool:
 
 
 def _known_run_ok(item: object) -> bool:
-    return (isinstance(item, dict) and item.keys() == {"created_at", "done", "pr", "base_sha"}
+    return (isinstance(item, dict) and item.keys() == {"created_at", "done", "pr", "base_sha", "attempts"}
             and timestamp(item["created_at"]) is not None and type(item["done"]) is bool
-            and _optional(item["pr"], _count_value) and _optional(item["base_sha"], _sha))
+            and _optional(item["pr"], _count_value) and _optional(item["base_sha"], _sha)
+            and _count_value(item["attempts"]))
 
 
 def read_ruff_state(batch_state_dir: Path) -> dict[str, Any] | None:
@@ -1947,7 +1952,8 @@ def finding_origins(annotations: list[Mapping[str, Any]], comparison: Mapping[st
             continue
         path, line = annotation.get("path"), annotation.get("start_line")
         origin = "unresolved"
-        if comparison is not None and isinstance(path, str) and type(line) is int:
+        if (comparison is not None and isinstance(path, str) and _LINTED_PATH.fullmatch(path)
+                and ".." not in path.split("/") and type(line) is int):
             changed = files.get(path)
             if changed is None:
                 origin = "base" if whole and not config_changed else "unresolved"
@@ -2114,6 +2120,10 @@ def import_ruff_attempts(batch_state_dir: Path, client: Any, *, repository: str,
                 documents[run_id] = document
             elif str(run_id) in known:
                 known[str(run_id)]["done"] = False
+            else:
+                # Seen on a head but unreadable: revisited, then reported as an incomplete interval.
+                known[str(run_id)] = {"created_at": _utc_iso(moment), "done": False, "pr": None, "base_sha": None,
+                                      "attempts": 0}
         receipts = []
         comparisons: dict[tuple[str, str], Any] = {}
         observed_at = _utc_iso(moment)
@@ -2128,9 +2138,16 @@ def import_ruff_attempts(batch_state_dir: Path, client: Any, *, repository: str,
             repository_id = repository_value.get("id") if isinstance(repository_value, dict) else None
             if pr is None or created is None or not _count_value(repository_id) or not _count_value(
                     run.get("run_attempt")):
+                # Kept and revisited; still unmapped when its window closes, it is reported as an incomplete interval.
                 counts["unmapped_runs"] += 1
-                if entry is not None:
-                    entry["done"] = False
+                known[str(run_id)] = {"created_at": _utc_iso(created) if created else observed_at, "done": False,
+                                      "pr": entry["pr"] if entry else None,
+                                      "base_sha": entry["base_sha"] if entry else None,
+                                      "attempts": entry["attempts"] if entry else 0}
+                continue
+            if entry is not None and entry["done"] and entry["attempts"] == run["run_attempt"]:
+                # Every attempt of this run is already recorded complete; only a new attempt needs its jobs.
+                counts["runs_unchanged"] += 1
                 continue
             if base_sha is not None and (base_sha, head) not in comparisons:
                 comparisons[(base_sha, head)] = read(
@@ -2170,7 +2187,8 @@ def import_ruff_attempts(batch_state_dir: Path, client: Any, *, repository: str,
                 }
                 receipts.append(receipt)
                 done = done and ruff_complete(receipt)
-            known[str(run_id)] = {"created_at": _utc_iso(created), "done": done, "pr": pr, "base_sha": base_sha}
+            known[str(run_id)] = {"created_at": _utc_iso(created), "done": done, "pr": pr, "base_sha": base_sha,
+                                  "attempts": run["run_attempt"]}
         intervals = state["incomplete_intervals"]
         for key, item in list(known.items()):
             if cast(datetime, timestamp(item["created_at"])) < revisit_after:

@@ -2764,6 +2764,36 @@ def test_red_first_head_is_kept_beside_the_green_head_that_followed_it(tmp_path)
     assert (buckets["ruff_code_failure"], buckets["ruff_pass"]) == (1, 1)
 
 
+_PATCH = "@@ -10,2 +10,3 @@\n context\n+import os\n context"
+
+
+@pytest.mark.parametrize(("annotation", "files", "origin"), [
+    ({"path": "lu_machinery/x.py", "start_line": 11, "title": "ruff (F401)"}, [("lu_machinery/x.py", _PATCH)], "pr"),
+    ({"path": "lu_machinery/y.py", "start_line": 3, "title": "Ruff (E501)"}, [("lu_machinery/x.py", _PATCH)], "base"),
+    ({"path": "lu_machinery/x.py", "start_line": 10, "title": "ruff (F401)"}, [("lu_machinery/x.py", _PATCH)],
+     "unresolved"),
+    ({"path": "lu_machinery/y.py", "start_line": 3, "title": "ruff (E501)"},
+     [("lu_machinery/x.py", _PATCH), ("pyproject.toml", None)], "unresolved"),
+    ({"path": "lu_machinery/y.py", "start_line": 3, "title": "ruff (E501)"},
+     [(f"lu_machinery/f{index}.py", None) for index in range(300)], "unresolved"),
+    ({"path": "/home/runner/work/lu_machinery/y.py", "start_line": 3, "title": "ruff (E501)"},
+     [("lu_machinery/x.py", _PATCH)], "unresolved"),
+    ({"path": "lu_machinery/x.py", "start_line": 11, "title": "ruff (F401)"}, [("lu_machinery/x.py", None)],
+     "unresolved"),
+], ids=["added-line", "untouched-file", "unchanged-line", "config-changed", "file-list-capped", "outside-tree",
+        "no-patch"])
+def test_ruff_findings_are_attributed_to_the_pr_only_on_lines_it_added(annotation, files, origin):
+    """Defect class: a Ruff finding blamed on the pull request, or cleared as a base finding, without a whole
+    comparison that proves where it came from (AC-05, AC-06)."""
+    comparison = {"total_commits": 1, "commits": [{"sha": "1" * 40}],
+                  "files": [{"filename": name, "additions": 1, "deletions": 0, "patch": patch}
+                            for name, patch in files]}
+    noise = {"path": ".github", "start_line": 66, "title": ""}  # the step's exit-code annotation, not a finding
+    assert rows.finding_origins([noise, annotation], comparison) == [
+        {"code": annotation["title"].split("(")[1].rstrip(")"), "origin": origin}]
+    assert rows.finding_origins([annotation], None)[0]["origin"] == "unresolved"
+
+
 class _RuffGitHub:
     """GitHub's REST answers for one repository's CI ``Ruff`` attempts; records every endpoint it served."""
 
@@ -2831,7 +2861,7 @@ def test_ruff_collector_reads_forward_every_attempt_and_reports_incomplete_inter
             _job(9101, after + timedelta(minutes=5), lint="success")]},
         f"{root}/check-runs/9001": {"output": {"annotations_count": 2}},
         f"{root}/check-runs/9001/annotations": [
-            {"path": "lu_machinery/x.py", "start_line": 2, "title": "Ruff (F401)"},
+            {"path": "lu_machinery/x.py", "start_line": 2, "title": "ruff (F401)"},
             {"path": ".github", "start_line": 1, "title": ""}],
         f"{root}/compare/{base}...{head_a}": compare, f"{root}/compare/{base}...{head_b}": compare,
         f"{root}/commits/{head_a}/check-runs": {"total_count": 2, "check_runs": [
