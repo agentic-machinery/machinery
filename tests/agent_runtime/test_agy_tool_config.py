@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -24,6 +25,8 @@ from tests.agent_runtime.product_roots import (  # noqa: F401
     agent_runtime_roots,
     configured_roots,
 )
+from tests.dispatcher.test_providers_b import _bind_agy_test_host
+from tests.host_context.conftest import build_host_layout
 
 pytestmark = pytest.mark.usefixtures("agent_runtime_roots", "bind_registration_runtime")
 
@@ -43,13 +46,16 @@ def _write_agy_mcp_config(app_data_dir: Path, data: dict) -> Path:
 
 
 def test_consumer_read_only_agy_without_tool_config_gets_bounded_route(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, agent_runtime_roots,  # noqa: F811
 ) -> None:
     """Consumer read-only AGY with no tool_config was refused instead of bounded."""
     from lu_machinery.agent_runtime import review_mcp, runner
     from lu_machinery.agent_runtime.adapters.agy import AgyAdapter
     from lu_machinery.agent_runtime.attempt_boundary import AttemptBoundary
 
+    layout = build_host_layout(tmp_path / "host")
+    _bind_agy_test_host(monkeypatch, layout, agent_runtime_roots.product)
+    shutil.copytree(agent_runtime_roots.product / "scripts", Path(layout.data["repos"]["public"]) / "scripts")
     checkout = tmp_path / "consumer"
     checkout.mkdir()
     subprocess.run(["git", "init", "-q", str(checkout)], check=True, timeout=10)
