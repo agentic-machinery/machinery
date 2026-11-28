@@ -38,6 +38,7 @@ from lu_machinery.orchestration.task_record_store import (
 from . import panel_values
 from .delegate_router import _authoritative_task_repository, active_snapshot
 from .monitor_context import MonitorContext, get_ctx, resolve_context
+from .opsec_sanitize import sanitize_text
 from .state_helpers import (
     cache_get_or_compute_async,
     cache_get_stored,
@@ -626,7 +627,7 @@ LIVE_WORKERS_MAX_AGE_S = 60.0
 # restart starts it again.
 _UNKNOWN_SINCE: dict[str, str] = {}
 _PR_FIELDS = (
-    "number isDraft createdAt headRefName mergeStateStatus"
+    "number title isDraft createdAt headRefName mergeStateStatus"
     " mergeQueueEntry { position state }"
     " commits(last: 1) { nodes { commit { statusCheckRollup { state }"
     f' status {{ context(name: "{REVIEW_STATUS_CONTEXT}") {{ state }} }} }} }} }}'
@@ -708,9 +709,11 @@ def _pull_request_row(
     number = raw_number if type(raw_number) is int and 0 < raw_number < 1_000_000_000 else None
     branch = node.get("headRefName")
     task_id = branch.rsplit("/", 1)[-1] if isinstance(branch, str) and len(branch) <= 512 else None
-    # A private project shows counts and states only: no PR number, link or creation time.
+    # A private project shows counts and states only: no PR number, title, link or creation time.
+    # A public title is public GitHub text, with filesystem paths redacted as milestone titles are.
     return {
         "number": None if private else number,
+        "title": None if private else sanitize_text(node["title"]),
         "url": f"https://github.com/{repository}/pull/{number}" if number is not None and not private else None,
         "task_reference": None if private else _recorded_task_reference(tasks_dir, task_id, slugs),
         "draft": node.get("isDraft") is True,
@@ -840,7 +843,7 @@ def _enum(value: object, names: frozenset[str]) -> TypeGuard[str]:
 
 
 # Keys every PR node, its commit and its queue entry carry when GitHub answers the query as asked.
-_PR_NODE_KEYS = {"number", "isDraft", "createdAt", "headRefName", "mergeStateStatus", "mergeQueueEntry", "commits"}
+_PR_NODE_KEYS = {"number", "title", "isDraft", "createdAt", "headRefName", "mergeStateStatus", "mergeQueueEntry", "commits"}
 
 
 def _complete_pull_request(node: object) -> bool:
@@ -854,6 +857,7 @@ def _complete_pull_request(node: object) -> bool:
     # A malformed number would read as a private PR, and a non-boolean draft flag as ready.
     created = node["createdAt"]
     if (not _graphql_int(node["number"], 1) or node["number"] >= 1_000_000_000 or type(node["isDraft"]) is not bool
+            or not isinstance(node["title"], str)
             or not isinstance(node["headRefName"], str) or not _enum(node["mergeStateStatus"], _MERGE_STATE_ENUM)
             or not isinstance(created, str) or not _DATETIME.fullmatch(created) or panel_values.timestamp(created) is None):
         return False

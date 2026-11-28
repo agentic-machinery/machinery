@@ -13,6 +13,7 @@ from fastapi.testclient import TestClient
 from lu_machinery.api import epics_router
 from lu_machinery.api.config import LIVE_REPO_ROOT
 from lu_machinery.api.monitor_context import fixture_context
+from lu_machinery.dispatcher import host_admission
 from lu_machinery.session_streams.model import SessionState
 from lu_machinery.session_streams.store import LifecycleError, SessionStreamStore
 from tests.epics_monitor_stub import epics_app_for_store
@@ -85,6 +86,34 @@ def test_router_claim_heartbeat_handoff_release_round_trip(tmp_path: Path, monke
     assert (
         client.post("/api/epics/v1/epic:7178/release", json=exact).status_code == 200
     )  # allow-hardcoded-epic: remote lifecycle route fixture
+
+
+def test_lease_without_timestamps_renders_unknown_not_epoch(tmp_path: Path, monkeypatch) -> None:
+    """Defect class: a missing lease timestamp is published as a 1970-01-01 date.
+
+    The remote client releases with an identity envelope that carries no timestamps.
+    The reply must show the stored lease, and the dispatcher must still accept it.
+    """
+    client = _client(tmp_path, monkeypatch)
+    claimed = _claim(client)["lease"]
+    identity = {
+        key: claimed[key]
+        for key in ("stream_id", "session_id", "lease_id", "generation", "fencing_token", "holder")
+    }
+
+    parsed = epics_router._lease_from_payload(identity)
+    assert (parsed.heartbeat_at, parsed.expires_at) == ("unknown", "unknown")
+
+    released = client.post("/api/epics/v1/epic:7178/release", json=identity)
+
+    assert released.status_code == 200, released.text
+    assert "1970-" not in released.text
+    reply = released.json()["lease"]
+    stored = ("heartbeat_at", "expires_at", "ttl_seconds")
+    assert {key: reply[key] for key in stored} == {key: claimed[key] for key in stored}
+    assert 0 <= reply["age_seconds"] < 300
+    assert (reply["state"], reply["session_state"]) == ("released", "closed")
+    assert host_admission._valid_projection_lease(reply, identity["stream_id"], match_ttl=False)
 
 
 def test_router_heartbeat_reads_session_state_on_the_write_connection(tmp_path: Path, monkeypatch) -> None:

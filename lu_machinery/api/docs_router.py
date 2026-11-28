@@ -14,6 +14,7 @@ import re
 from collections.abc import Iterator, Mapping
 from datetime import UTC, datetime
 from pathlib import Path
+from urllib.parse import quote
 
 import yaml
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
@@ -37,6 +38,10 @@ _HTML_META_RE = re.compile(
     re.IGNORECASE,
 )
 _HEAD_BYTES = 8192
+
+# Directory listing page size: the default, and the most one request may ask for.
+LISTING_PAGE_SIZE = 100
+LISTING_PAGE_MAX = 500
 
 # Path prefixes (relative to project_root) to exclude from discovery.
 DISCOVERY_EXCLUDES = ("docs/archive", "docs/resources/podcasts/raw")
@@ -329,14 +334,18 @@ def _relative_to_root(path: Path, root: Path) -> str:
     return "/".join(path_parts[len(root_parts):]) or "."
 
 
-def _directory_listing(path: str, root_key: str, root_path: Path, remainder: str) -> dict:
+def _directory_listing(
+    path: str, root_key: str, root_path: Path, remainder: str, *, limit: int, offset: int,
+) -> dict:
+    """One page of a directory, in name order, with the count of every listed entry."""
     full_path = safe_join(root_path, remainder) if remainder else safe_join(root_path)
     _assert_under_root(full_path, root_path)
-    items = []
-    for entry in sorted(full_path.iterdir()):
-        if entry.name.startswith("."):
-            continue
+    entries = [entry for entry in sorted(full_path.iterdir()) if not entry.name.startswith(".")]
+    # Every entry is checked, so one that escapes the root refuses all pages alike.
+    for entry in entries:
         _assert_under_root(entry, root_path)
+    items = []
+    for entry in entries[offset:offset + limit]:
         stat = entry.stat()
         item = {
             "name": entry.name,
@@ -352,8 +361,17 @@ def _directory_listing(path: str, root_key: str, root_path: Path, remainder: str
         "root": root_key,
         "relative_path": remainder,
         "items_count": len(items),
+        "total": len(entries),
+        "limit": limit,
+        "offset": offset,
         "items": items,
     }
+
+
+def _page_url(request: Request, limit: int, offset: int) -> str:
+    """The same listing request at another offset, as a path on this server."""
+    query = request.url.include_query_params(limit=limit, offset=offset).query
+    return f"{quote(request.url.path)}?{query}"
 
 
 def collect_artifacts(
@@ -363,6 +381,8 @@ def collect_artifacts(
     status: str | None = None,
     author: str | None = None,
     types: tuple[str, ...] = ("html", "md"),
+    limit: int | None = None,
+    offset: int = 0,
     ctx: MonitorContext | None = None,
 ) -> dict:
     """Return all HTML and MD artifacts under discovery roots.
@@ -377,8 +397,12 @@ def collect_artifacts(
         status: Filter by status.
         author: Filter by author.
         types: Tuples of extensions to include (default: html, md).
+        limit: Page size. ``None`` returns every match from ``offset`` on.
+        offset: Matches to skip, newest first. ``total`` always counts every match.
         ctx: Application context providing filesystem roots.
     """
+    if (limit is not None and limit < 1) or offset < 0:
+        raise ValueError("limit must be at least 1 and offset must not be negative")
     resolved_ctx = resolve_context(ctx)
     project_root = resolved_ctx.roots.project_root
     project_prefix = _project_prefix(project_root)
@@ -476,7 +500,7 @@ def collect_artifacts(
     return {
         "generated_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
         "total": len(artifacts),
-        "artifacts": artifacts,
+        "artifacts": artifacts[offset:None if limit is None else offset + limit],
     }
 
 
@@ -525,9 +549,11 @@ def serve_artifact(
     path: str,
     request: Request,
     format: str | None = Query(None, pattern="^(json)$"),
+    limit: int = Query(LISTING_PAGE_SIZE, ge=1, le=LISTING_PAGE_MAX),
+    offset: int = Query(0, ge=0),
     ctx: MonitorContext = Depends(get_ctx),
 ):
-    """Serve a documentation artifact or list a directory."""
+    """Serve a documentation artifact or list one page of a directory."""
     resolved_ctx = resolve_context(ctx)
     if not path:
         return list_roots(request, format, ctx=resolved_ctx)
@@ -553,7 +579,14 @@ def serve_artifact(
     if full_path.is_dir():
         if request.url.path.startswith("/artifacts") and format != "json":
             return _artifacts_page(request, resolved_ctx)
-        return _directory_listing(path, root_key, root_path, remainder)
+        listing = _directory_listing(path, root_key, root_path, remainder, limit=limit, offset=offset)
+        previous = max(0, min(offset, listing["total"]) - limit) if offset else None
+        following = offset + limit if offset + limit < listing["total"] else None
+        return {
+            **listing,
+            "previous": None if previous is None else _page_url(request, limit, previous),
+            "next": None if following is None else _page_url(request, limit, following),
+        }
 
     # File serving
     media_type = _MIME_TYPES.get(full_path.suffix.lower())

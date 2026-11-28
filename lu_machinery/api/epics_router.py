@@ -383,8 +383,9 @@ def _lease_from_payload(payload: dict[str, Any]) -> Lease:
         generation=_integer(source.get("generation"), "generation"),
         fencing_token=_integer(source.get("fencing_token"), "fencing_token"),
         holder=holder,
-        heartbeat_at=str(source.get("heartbeat_at", "1970-01-01T00:00:00Z")),
-        expires_at=str(source.get("expires_at", "1970-01-01T00:00:00Z")),
+        # A client's identity envelope carries no timestamps. Replies publish the stored lease's.
+        heartbeat_at=str(source.get("heartbeat_at", "unknown")),
+        expires_at=str(source.get("expires_at", "unknown")),
         ttl_seconds=_integer(source.get("ttl_seconds", DEFAULT_TTL_SECONDS), "ttl_seconds", maximum=86_400),
         version=_integer(source.get("version", 1), "version"),
     )
@@ -1093,12 +1094,15 @@ def remote_release(
         lease = _lease_from_payload({**body, "stream_id": stream_id})
         if lease.stream_id != stream_id:
             raise ValueError("stream mismatch")
+        # Read first: a successor may claim the stream as soon as the release commits.
+        status = store.load_remote_epic_status(stream_id, limit=0, snapshot_sha256=None)
         store.release_remote_session(lease)
+        stored = store._lease_from_row(status["projection"]["lease"])
         return JSONResponse(
             content={
                 "schema": SCHEMA,
                 "outcome": "released",
-                "lease": _lease_payload(lease, projection_state="released", session_state="closed", now=utc_now()),
+                "lease": _lease_payload(stored, projection_state="released", session_state="closed", now=utc_now()),
             },
             headers={"Cache-Control": "no-store"},
         )

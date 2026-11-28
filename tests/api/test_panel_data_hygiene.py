@@ -19,6 +19,7 @@ from lu_machinery.api import (
     state_router,
 )
 from lu_machinery.api.monitor_context import fixture_context
+from lu_machinery.api.opsec_sanitize import sanitize_text
 from lu_machinery.orchestration.fleet_repos import FleetRepo
 from tests.opsec_fixtures import TOKEN
 
@@ -138,8 +139,14 @@ def test_panel_response_never_echoes_unvetted_provider_values(panel_client, monk
     _inputs(monkeypatch, ctx, dirty)
     response = client.get(route)
     assert response.status_code == 200, response.text
-    assert dirty not in response.text
     data = response.json()
+    if route.endswith("pull-requests"):
+        # A public repository's PR title is public GitHub text: it crosses with only filesystem paths redacted.
+        titles = [row.pop("title") for repo in data["repositories"] for row in repo["pull_requests"]]
+        assert titles == [sanitize_text(dirty)] * 3
+        assert dirty not in json.dumps(data)
+    else:
+        assert dirty not in response.text
     if route.startswith("/api/delegate/"):
         assert data["total"] == 1 and data["tasks"][0]["duration_s"] == 17
         assert data["tasks"][0]["model"] == "gpt-6.1-sol"

@@ -416,7 +416,7 @@ def test_pull_requests_route_hides_private_repo_titles_and_branches(monkeypatch,
     public, private, unstated = payload["repositories"]
     assert public["pull_requests"][0]["url"] == "https://github.com/new-owner/machinery/pull/7"
     assert public["pull_requests"][0]["number"] == 7 and public["pull_requests"][0]["created_at"]
-    assert "title" not in public["pull_requests"][0]
+    assert public["pull_requests"][0]["title"] == "secret-title"
     # An unrecorded branch suffix is withheld on a public repository too.
     assert public["pull_requests"][0]["task_reference"] is None
     assert "secret-branch" not in json.dumps(public["pull_requests"])
@@ -429,10 +429,9 @@ def test_pull_requests_route_hides_private_repo_titles_and_branches(monkeypatch,
         # A private project shows counts and states only: its pin is withheld.
         assert repo["pin"] == {"state": "withheld", "version": None}
         assert repo["private"] is True
-        # A private project's PRs are states only: no number, link or creation time.
-        assert [repo["pull_requests"][0][key] for key in ("number", "url", "created_at")] == [None, None, None]
+        # A private project's PRs are states only: no number, title, link or creation time.
+        assert [repo["pull_requests"][0][key] for key in ("number", "title", "url", "created_at")] == [None] * 4
         assert repo["pull_requests"][0]["queue"] is not None and repo["pull_requests"][0]["ci"] == "success"
-        assert "title" not in repo["pull_requests"][0]
         assert repo["pull_requests"][0]["task_reference"] is None
         assert "secret" not in json.dumps(repo)
 
@@ -664,7 +663,7 @@ def test_pull_requests_route_reports_unknown_when_github_fails(monkeypatch, tmp_
     for repo in (null_node, no_list):
         assert (repo["status"], repo["reason"], repo["pull_requests"]) == ("unknown", "github_invalid_response", [])
     # A PR node that lacks a field the query asked for is no reading of that PR either.
-    for field in ("mergeQueueEntry", "commits", "isDraft"):
+    for field in ("mergeQueueEntry", "commits", "isDraft", "title"):
         partial = {key: value for key, value in _open_pr("codex/x", 3).items() if key != field}
         repos["r1"] = {"isPrivate": False, "pullRequests": {"totalCount": 1, "nodes": [partial]}}
         _graphql_result(monkeypatch, 0, json.dumps({"data": repos}))
@@ -689,7 +688,8 @@ def test_pull_requests_route_reports_unknown_when_github_fails(monkeypatch, tmp_
                              ({"mergeQueueEntry": {"position": 1, "state": []}}, 1),
                              ({"mergeStateStatus": "clean"}, 1), ({"mergeStateStatus": {}}, 1),
                              ({"createdAt": "2030-01-01"}, 1), ({"createdAt": "2030-01-01T00:00:00+05:00"}, 1),
-                             ({"createdAt": None}, 1), ({"headRefName": 7}, 1), ({}, 2**31)):
+                             ({"createdAt": None}, 1), ({"headRefName": 7}, 1), ({}, 2**31),
+                             ({"title": None}, 1), ({"title": 7}, 1)):
         repos["r1"] = {"isPrivate": False, "pullRequests": {"totalCount": total, "nodes": [{**_open_pr("codex/x", 3), **malformed}]}}
         _graphql_result(monkeypatch, 0, json.dumps({"data": repos}))
         assert git_hygiene_router.compute_pull_requests(tmp_path)["repositories"][1]["status"] == "unknown", malformed
@@ -743,7 +743,7 @@ _KEPT_ARCHIVED = "kept-archived"
 
 def _open_pr(branch: str, number: int) -> dict:
     return {
-        "number": number, "isDraft": False, "createdAt": "2030-01-01T00:00:00Z",
+        "number": number, "title": f"PR {number}", "isDraft": False, "createdAt": "2030-01-01T00:00:00Z",
         "headRefName": branch, "mergeStateStatus": "CLEAN", "mergeQueueEntry": None,
         "commits": {"nodes": [{"commit": {"statusCheckRollup": {"state": "SUCCESS"},
                                           "status": {"context": {"state": "SUCCESS"}}}}]},
