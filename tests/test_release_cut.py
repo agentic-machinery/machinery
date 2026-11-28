@@ -981,8 +981,8 @@ def _simulate_consumer_adoption(monkeypatch, tmp_path, failing_check=None):
     sandbox.chmod(0o755)
     monkeypatch.setenv("PATH", f"{sandbox.parent}:{os.environ['PATH']}")
     context_file = tmp_path / "default-context/host.v1.json"
+    # The directory alone makes the product sandbox mask it; no binding file, so the cut runs unbound.
     context_file.parent.mkdir()
-    context_file.write_text("{}")
     monkeypatch.setattr(host_context, "DEFAULT_PATH", context_file)
     calls = []
 
@@ -1235,6 +1235,79 @@ def test_failure_alert_is_published_from_the_primary_checkout(monkeypatch, tmp_p
     assert Path(toplevel).resolve() == primary.resolve()
     assert "channel publish cto - --sender release-cut --source release --recipient claude-cto" in argv
     assert body.startswith("release-cut FAILED (dry run) at Node provisioning: Unsafe Node dependency artifact")
+
+
+_HOST_ASSERTED_ENV = (
+    "LU_STATE_ROOT", "LEARN_UKRAINIAN_STATE_ROOT", "LU_TASKS_DIR", "LEARN_UKRAINIAN_BATCH_STATE_DIR",
+    "FLEET_COMMS_ROOT", "LEARN_UKRAINIAN_OWNERSHIP_LEDGER", "LU_GITHUB_CACHE_DIR", "LU_GITHUB_SLUG",
+    "LEARN_UKRAINIAN_GITHUB_SLUG", "LU_PRIMARY_REPO_ROOT", "LEARN_UKRAINIAN_PRIMARY_REPO_ROOT", "LU_PRODUCT_ROOT",
+    "LEARN_UK_REPO_ROOT", "LU_PYTHON", "LEARN_UKRAINIAN_PYTHON", "LEARN_UKRAINIAN_INFRA_PRIVATE_ROOT",
+    "LU_FLEET_REPO_SELECTOR_FILE", "LU_PROFILE_PATH", "LU_REPOS_ROOT", "MONITOR_PROJECT_STATE_URL",
+    "LU_MONITOR_LOOPBACK", "MONITOR_API_BASE_URL", "MONITOR_API_URL", "AB_MONITOR_URL", "MONITOR_API_URLS",
+    "AB_MONITOR_URLS", "MONITOR_BASE_URLS", "DELEGATE_MONITOR_API",
+)
+
+
+def test_cut_uses_binding_product_python_and_alerts_on_runtime_env(monkeypatch, tmp_path, capsys):
+    """Defect class: release cut cannot alert the CTO on a bound host.
+
+    The cut took its product interpreter from LEARN_UKRAINIAN_PYTHON, which a host binding asserts is the
+    machinery runtime, and the alert inherited that env, so Fleet Comms refused "disagrees with host context".
+    """
+    from tests.host_context.conftest import build_host_layout
+
+    layout = build_host_layout(tmp_path / "host")
+    product_python = build_host_layout(tmp_path / "product").python
+    assert product_python != layout.python
+    layout.data["products"]["public"]["python"] = str(product_python)
+    layout.write()
+    for name in _HOST_ASSERTED_ENV:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv(host_context.CONTEXT_ENV, str(layout.file))
+    monkeypatch.setenv("HOME", str(tmp_path))
+    repos = {key: Path(path) for key, path in layout.data["repos"].items()}
+    monkeypatch.setattr(git_module, "resolve_repo", lambda name=None: (
+        repos["machinery" if name == "machinery" else "public"],
+        {"github": "agentic-machinery/machinery" if name == "machinery" else "learn-ukrainian/learn-ukrainian.github.io"},
+    ))
+    monkeypatch.setattr(repo_root, "primary_root", lambda *args, **kwargs: repos["machinery"])
+
+    def project_interpreter(*args, **kwargs):
+        raise AssertionError("a bound host must not resolve the product interpreter from LU_PYTHON")
+
+    monkeypatch.setattr(repo_root, "project_interpreter", project_interpreter)
+    cuts, alerts = [], []
+    original_run = Cut.run
+
+    def run(self, argv, **kwargs):
+        command = [str(part) for part in argv]
+        if "lu_machinery.fleet_comms" in command:
+            alerts.append((command, dict(kwargs.get("env") or self.env())))
+            return subprocess.CompletedProcess(command, 0, "", "")
+        return original_run(self, argv, **kwargs)
+
+    def execute(cut):
+        cuts.append(cut)
+        cut.step = "Node provisioning"
+        raise CutError("fixture failure")
+
+    monkeypatch.setattr(Cut, "run", run)
+    monkeypatch.setattr(release_cut, "execute", execute)
+    assert main(["cut", "--dry-run", "--x-agent", "claude/claude-opus-5-5"]) == 1
+    assert "alert to claude-cto failed" not in capsys.readouterr().err
+    assert cuts[0].host_python == product_python
+    (command, env), = alerts
+    assert command[0] == str(layout.python)
+    assert env["LU_PYTHON"] == str(layout.python)
+    assert "LEARN_UKRAINIAN_PYTHON" not in env
+    # The alert's child re-reads the binding with this env; a disagreeing legacy setting raises here.
+    assert host_context.load_host_context(role="state", env=env).runtime.python == layout.python
+
+    # A caller still exporting the product interpreter is refused before the cut, naming the variable.
+    monkeypatch.setenv("LEARN_UKRAINIAN_PYTHON", str(product_python))
+    assert main(["cut", "--dry-run", "--x-agent", "claude/claude-opus-5-5"]) == 1
+    assert "LEARN_UKRAINIAN_PYTHON disagrees with host context" in capsys.readouterr().err
+    assert len(cuts) == 1
 
 
 def test_success_reaps_only_rebuildable_scratch_and_failure_preserves_it(monkeypatch, tmp_path):
