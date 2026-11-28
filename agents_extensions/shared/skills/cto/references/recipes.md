@@ -15,8 +15,11 @@ file only points there and adds what the CTO seat learned on top.
   as the ruling, and names the condition for removing it. An instruction to a lane alone does not stop the keeper.
 - Before closing a PR as superseded, compare what each PR changes: fetch both heads
   (`git fetch origin pull/<N>/head`, in a full checkout: if `git rev-parse --is-shallow-repository`
-  prints `true`, run `git fetch --unshallow` first) and read
-  `git diff origin/main...<head>` for each. That diff includes merge commits and conflict
+  prints `true`, run `git fetch --unshallow` first) and main
+  (`git fetch origin refs/heads/main:refs/remotes/origin/main`), pin each fetched SHA
+  (`git rev-parse FETCH_HEAD` after each head's fetch, `git rev-parse origin/main` once), and
+  read `git diff <main SHA>...<head SHA>` for each PR against that one main SHA. If a fetch
+  fails, leave the predecessor open. That diff includes merge commits and conflict
   resolutions, which `git range-diff` and `git show -c` can miss, and has no page limit
   (`gh pr view --json commits` lists at most 100).
   Require the successor to carry every change that is not a version pin. A newer release number
