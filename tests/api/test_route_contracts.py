@@ -104,13 +104,13 @@ def test_unknown_browser_path_gets_html_404_with_nav(tmp_path):
     browser = {"accept": "text/html,application/xhtml+xml,*/*;q=0.8"}
     assert client.get("/fleet", headers=browser).text == "<p>fleet.html</p>"
     links = [page.url for page in route_contracts.PAGE_CONTRACTS] + ["/"]
-    for path in ("/not-a-monitor-page", "/a/b/", "/fleet/", "/fleet.html/", "/machinery/", "/index.html/"):
+    for path in ("/not-a-monitor-page", "/a/b/", "/fleet/", "/fleet.html/", "/machinery/", "/index.html/", "/apix", "/files-x"):
         response = client.get(path, headers=browser)
         assert (response.status_code, response.headers["content-type"]) == (404, "text/html; charset=utf-8"), path
         assert re.findall(r'<a href="([^"]*)"', response.text) == links, path
         assert "not-a-monitor-page" not in response.text
-    # The API keeps its JSON error whatever the client accepts.
-    for path in ("/api/not-a-route", "/api/fleet/not-a-route/"):
+    # The API and the /files alias, at their root or under it, keep the JSON error whatever the client accepts.
+    for path in ("/api/not-a-route", "/api/fleet/not-a-route/", "/files", "/files?format=json"):
         for headers in (browser, {"accept": "application/json"}):
             response = client.get(path, headers=headers)
             assert (response.status_code, response.json()["error"]) == (404, "http_error"), path

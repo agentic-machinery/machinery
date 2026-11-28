@@ -251,8 +251,9 @@ def _sanitize_public_detail(detail: Any) -> Any:
     return detail
 
 
-# A 404 under these keeps the JSON envelope: the API, and /files, the artifact alias the route
-# contracts list for agents, without the browser page. Any other 404 is an address a browser followed.
+# A 404 at one of these namespaces, its root or anything under it (as a prefix route contract
+# matches), keeps the JSON envelope: the API, and /files, the artifact alias the route contracts
+# list for agents, without the browser page. Any other 404 is an address a browser followed.
 _JSON_404_PREFIXES = ("/api/", "/files/")
 
 
@@ -275,7 +276,7 @@ async def http_exception_handler(request: Request, exc: StarletteHTTPException):
 
     The 404 body is chosen by path, never by headers: a small page outside ``_JSON_404_PREFIXES``.
     """
-    if exc.status_code == 404 and not request.url.path.startswith(_JSON_404_PREFIXES):
+    if exc.status_code == 404 and not f"{request.url.path}/".startswith(_JSON_404_PREFIXES):
         return _not_found_page()
     return _error_envelope(
         "http_error",
