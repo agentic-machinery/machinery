@@ -245,13 +245,13 @@ def test_second_run_same_day_adds_no_entry_or_message(journal, destinations, mon
     first = _publish(directory)
     assert first.returncode == 0, first.stderr
     notes, proposals = destinations("journal"), destinations("fleet")
-    key = f"error-digest:{_DAY}"
-    assert list(notes) == list(proposals) == [key]
+    key, fleet_key = f"error-digest:{_DAY}", f"error-digest:v2:{_DAY}"
+    assert list(notes) == [key] and list(proposals) == [fleet_key]
     assert notes[key].startswith(f"Error digest {_DAY}: 2 errors, 0 warnings, 1 kinds (1 new); 0 units unproven")
     assert "Full table: error-digest-2025-02-01.json" in notes[key]
     assert "| writer.service | 2 | 0 | 0 | tagged |" in notes[key]
     kind = digest.signature("journal", "writer.service", "error", "worker failed")
-    assert f"{kind} (2): writer.service error - worker failed" in proposals[key]
+    assert f"{kind} (2): writer.service error - worker failed" in proposals[fleet_key]
     ledger = directory / "error-digest-kinds.v1.json"
     first_ledger = ledger.read_bytes()
     assert json.loads(first_ledger)[kind]["proposal_day"] == _DAY
@@ -273,7 +273,7 @@ def test_second_run_same_day_adds_no_entry_or_message(journal, destinations, mon
     assert destinations("journal") == notes
     next_key = f"error-digest:{next_day}"
     proposals = destinations("fleet")
-    assert list(proposals) == [key, next_key]
+    assert list(proposals) == [fleet_key, f"error-digest:v2:{next_day}"]
 
     monkeypatch.delenv("DIGEST_FAKE_JOURNAL_FAIL")
     recovered = _publish(directory, next_day)
@@ -295,10 +295,10 @@ def test_failed_publish_leaves_ledger_unchanged(journal, destinations, monkeypat
     assert "Fleet publish: unavailable (write_refused)" in failed.stderr
     assert ledger.read_bytes() == previous
     assert destinations("fleet") == {}
-    key = f"error-digest:{_DAY}"
+    key, fleet_key = f"error-digest:{_DAY}", f"error-digest:v2:{_DAY}"
     state = directory / ".error-digest-publish.v2.json"
     attempt = json.loads(state.read_bytes())["attempt"]
-    assert attempt["key"] == key
+    assert attempt["key"] == fleet_key
     body_sha = hashlib.sha256(attempt["body"].encode()).hexdigest()
     assert f"Fleet proposal for {_DAY} not confirmed, body SHA-256 {body_sha}" in destinations("journal")[key]
 
@@ -311,19 +311,19 @@ def test_failed_publish_leaves_ledger_unchanged(journal, destinations, monkeypat
     assert ambiguous.returncode == 1
     assert ledger.read_bytes() == previous
     fleet = destinations("fleet")
-    assert fleet == {key: attempt["body"]}
+    assert fleet == {fleet_key: attempt["body"]}
     assert json.loads(state.read_bytes())["attempt"] == attempt
 
     monkeypatch.delenv("DIGEST_FAKE_FLEET_FAIL")
     next_run = _publish(directory, next_day)
     assert next_run.returncode == 0, next_run.stderr
-    next_key = f"error-digest:{next_day}"
+    next_key, next_fleet_key = f"error-digest:{next_day}", f"error-digest:v2:{next_day}"
     proposals = destinations("fleet")
-    assert sorted(proposals) == [key, next_key]
-    assert proposals[key] == fleet[key]
+    assert sorted(proposals) == [fleet_key, next_fleet_key]
+    assert proposals[fleet_key] == fleet[fleet_key]
     kind = digest.signature("journal", "writer.service", "error", "worker failed")
     new_kind = digest.signature("journal", "writer.service", "error", "new failure")
-    assert new_kind in proposals[next_key] and kind not in proposals[next_key]
+    assert new_kind in proposals[next_fleet_key] and kind not in proposals[next_fleet_key]
     rows = json.loads(ledger.read_bytes())
     assert {sig: row["proposal_day"] for sig, row in rows.items()} == {kind: _DAY, new_kind: next_day}
     assert json.loads(state.read_bytes()) == {"attempt": None}

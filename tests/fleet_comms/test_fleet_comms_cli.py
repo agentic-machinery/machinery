@@ -466,7 +466,8 @@ def test_publish_retry_after_context_revision_returns_original_receipt(
 
     A publisher that crashed after commit retries with the same key and payload.
     The channel's context revision and its subscribers change in between; the
-    retry must return the original receipt, never a refusal or a second message.
+    retry must return the original receipt, field for field, never a refusal or
+    a second message.
     """
     from lu_machinery.fleet_comms.authority import AuthorityService
 
@@ -477,7 +478,7 @@ def test_publish_retry_after_context_revision_returns_original_receipt(
     assert main(["channel", "context", "cto", "context revision one"]) == EXIT_OK
     capsys.readouterr()
     direct = ["channel", "publish", "cto", "digest proposal", "--sender", "devops", "--recipient", "other",
-              "--kind", "proposal", "--idempotency-key", "retry-direct"]
+              "--recipient", "codex", "--correlation-id", "", "--kind", "proposal", "--idempotency-key", "retry-direct"]
     fanout = ["channel", "publish", "cto", "fan-out notice", "--sender", "devops", "--idempotency-key", "retry-fanout"]
     receipts = [_publish_receipt(capsys, argv) for argv in (direct, fanout)]
 
@@ -492,7 +493,7 @@ def test_publish_retry_after_context_revision_returns_original_receipt(
         assert connection.execute("SELECT COUNT(*) FROM comms_messages").fetchone()[0] == 2
         assert sorted(
             row[0] for row in connection.execute("SELECT recipient FROM authority_deliveries")
-        ) == ["codex", "other"]
+        ) == ["codex", "codex", "other"]
 
 
 @pytest.mark.usefixtures("placeholder_seats_registered")
