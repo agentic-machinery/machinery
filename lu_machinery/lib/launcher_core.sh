@@ -390,7 +390,7 @@ launcher_claude_system_prompt() {
 # kernel per-argument limit, refuses (exit 2) before any side effect.
 # shellcheck disable=SC2034  # both results are read by launchers/codex.sh
 launcher_codex_developer_instructions() {
-  local arg payload key raw prefix v_idx has_eq slot py merged_out merged_toml merge_rc
+  local arg payload kind raw prefix v_idx slot py merged_out merged_toml merge_rc
   local index=0 found=-1 value_index=-1 shaped=0 separator=0
   local found_prefix="" found_has_eq=0 found_raw=""
   local count="${#LC_FORWARD_ARGS[@]}"
@@ -426,28 +426,27 @@ launcher_codex_developer_instructions() {
         v_idx="$index"
         ;;
     esac
-    if [ "$v_idx" -ge 0 ]; then
-      if [[ "$payload" == *=* ]]; then
-        key="${payload%%=*}"
-        raw="${payload#*=}"
-        has_eq=1
-      else
-        key="$payload"
-        raw=""
-        has_eq=0
-      fi
-      key="${key#"${key%%[![:space:]]*}"}"
-      key="${key%"${key##*[![:space:]]}"}"
-      case "$key" in
-        developer_instructions)
+    if [ "$v_idx" -ge 0 ] && [[ "$payload" == *developer_instructions* ]]; then
+      py="$(launcher_project_python)" || { rules_core_refuse "key classification failed"; exit 1; }
+      kind="$(rules_core_classify_codex_payload "$py" "$payload")" || { rules_core_refuse "key classification failed"; exit 1; }
+      case "$kind" in
+        setting)
           found="$index"
           value_index="$v_idx"
           found_prefix="$prefix"
-          found_has_eq="$has_eq"
-          found_raw="$raw"
+          found_has_eq=1
+          found_raw="${payload#*=}"
           shaped=$((shaped + 1))
           ;;
-        developer_instructions.*)
+        missing_value)
+          found="$index"
+          value_index="$v_idx"
+          found_prefix="$prefix"
+          found_has_eq=0
+          found_raw=""
+          shaped=$((shaped + 1))
+          ;;
+        subkey)
           shaped=$((shaped + 1))
           ;;
       esac

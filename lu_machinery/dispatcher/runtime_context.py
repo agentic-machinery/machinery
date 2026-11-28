@@ -1,6 +1,8 @@
 """Shared worker resources belong to the dispatcher, independent of the Git target."""
 
+import datetime
 import json
+import math
 import os
 import tomllib
 from dataclasses import replace
@@ -112,33 +114,71 @@ _CODEX_BOOLEAN_OPTIONS = frozenset({
 })
 
 
-def _classify_codex_config_payload(payload: str) -> tuple[str, str | None] | None:
+# Exact 25 Unicode White_Space code points trimmed by Rust str::trim() in Codex CLI.
+# Python str.strip() also trims ASCII separators (\x1c-\x1f), which Codex does not.
+_CODEX_WHITESPACE = (
+    "\t\n\x0b\x0c\r \x85\xa0\u1680"
+    "\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a"
+    "\u2028\u2029\u202f\u205f\u3000"
+)
+_CODEX_I64_MIN = -(1 << 63)
+_CODEX_I64_MAX = (1 << 63) - 1
+
+
+def classify_codex_config_payload(payload: str) -> tuple[str, str | None] | None:
+    """Classify a Codex ``-c`` / ``--config`` payload using Codex's whitespace trimming."""
     if "=" in payload:
         key, raw = payload.split("=", 1)
-        trimmed = key.strip()
+        trimmed = key.strip(_CODEX_WHITESPACE)
         if trimmed == "developer_instructions":
             return "setting", raw
-        if trimmed.startswith("developer_instructions."):
+        if trimmed.startswith("developer_instructions") and trimmed[len("developer_instructions"):].lstrip(
+            _CODEX_WHITESPACE
+        ).startswith("."):
             return "subkey", None
         return None
-    trimmed = payload.strip()
+    trimmed = payload.strip(_CODEX_WHITESPACE)
     if trimmed == "developer_instructions":
         return "missing_value", None
-    if trimmed.startswith("developer_instructions."):
+    if trimmed.startswith("developer_instructions") and trimmed[len("developer_instructions"):].lstrip(
+        _CODEX_WHITESPACE
+    ).startswith("."):
         return "subkey", None
     return None
 
 
-def _decode_codex_config_string(raw_value: str) -> str | None:
-    """Decode Codex -c developer_instructions=<raw_value>: TOML value, else trimmed literal."""
+def decode_codex_config_string(raw_value: str) -> str | None:
+    """Decode Codex ``-c developer_instructions=<raw_value>`` matching Codex CLI semantics.
+
+    Codex trims Unicode ``White_Space`` from ``raw_value``, parses as a TOML value
+    (signed 64-bit integers and finite 64-bit floats), and falls back to the trimmed
+    literal string on parse failure. Valid TOML strings return their decoded text;
+    TOML date/time/datetime values render as their trimmed literal text in Codex;
+    valid non-string TOML values (bool, in-range i64, f64/inf/nan, array, table)
+    return None so callers keep main's argv and let Codex reject the invalid type.
+    """
+    trimmed = raw_value.strip(_CODEX_WHITESPACE)
     try:
-        parsed = tomllib.loads(f"v = {raw_value}")
+        parsed = tomllib.loads(f"v = {trimmed}")
     except tomllib.TOMLDecodeError:
-        return raw_value.strip()
+        return trimmed
     if len(parsed) != 1 or "v" not in parsed:
-        return raw_value.strip()
+        return trimmed
     value = parsed["v"]
-    return value if isinstance(value, str) else None
+    if isinstance(value, str):
+        return value
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return None if _CODEX_I64_MIN <= value <= _CODEX_I64_MAX else trimmed
+    if isinstance(value, float):
+        head = trimmed.split("#", 1)[0].strip(_CODEX_WHITESPACE).lower()
+        if math.isinf(value) and head not in {"inf", "+inf", "-inf"}:
+            return trimmed
+        return None
+    if isinstance(value, (datetime.date, datetime.time, datetime.datetime)):
+        return trimmed
+    return None
 
 
 def _check_codex_arg_length(slot: str) -> None:
@@ -150,6 +190,12 @@ def _check_codex_arg_length(slot: str) -> None:
             f"refusing to launch: the developer_instructions setting is {size} bytes, "
             f"over the {limit - 1}-byte argument limit"
         )
+
+
+def check_codex_core_arg_length(seat: str | None = None) -> None:
+    """Fail closed if the Codex rules-core argv slot reaches Linux MAX_ARG_STRLEN."""
+    core = rules_core.core_block(rules_core.resolve_seat(seat))
+    _check_codex_arg_length("developer_instructions=" + rules_core.toml_basic_string(core))
 
 
 def _inject_codex_developer_instructions(argv: list[str], core: str) -> list[str]:
@@ -193,7 +239,7 @@ def _inject_codex_developer_instructions(argv: list[str], core: str) -> list[str
             payload = arg[len(prefix):]
             v_idx = index
         if payload is not None:
-            classified = _classify_codex_config_payload(payload)
+            classified = classify_codex_config_payload(payload)
             if classified is not None:
                 kind, raw = classified
                 shaped += 1
@@ -212,7 +258,7 @@ def _inject_codex_developer_instructions(argv: list[str], core: str) -> list[str
     if found >= 0:
         if found_kind == "missing_value":
             raise ValueError("refusing to launch: developer_instructions requires a value")
-        decoded = _decode_codex_config_string(found_raw or "")
+        decoded = decode_codex_config_string(found_raw or "")
         if decoded is None:
             found = -1
         else:

@@ -79,29 +79,36 @@ rules_core_toml() {
   project_python_run "$1" -m "$PROJECT_PACKAGE.lib.rules_core" --seat "$LC_RULES_SEAT" --format toml
 }
 
-# rules_core_merge_toml PYTHON RAW_VALUE — decode RAW_VALUE as Codex does (TOML
-# value, falling back to trimmed raw text) and print two lines: the framed core
-# as a TOML basic string, then "<core>\n\n<decoded>" as one TOML basic string.
-# Exits 3 when RAW_VALUE is a valid TOML non-string (e.g. number, bool, table)
-# so callers keep main's argv and let Codex reject the invalid type unchanged.
+# rules_core_classify_codex_payload PYTHON PAYLOAD — classify a Codex -c/--config
+# payload using runtime_context.classify_codex_config_payload (Codex's Unicode
+# White_Space trimming) and print one of: setting, missing_value, subkey, other.
+rules_core_classify_codex_payload() {
+  local py="$1" payload="$2"
+  printf '%s' "$payload" | project_python_run "$py" -c '
+import importlib, sys
+
+classify = importlib.import_module(f"{sys.argv[1]}.dispatcher.runtime_context").classify_codex_config_payload
+res = classify(sys.stdin.read())
+sys.stdout.write("other\n" if res is None else f"{res[0]}\n")
+' "$PROJECT_PACKAGE"
+}
+
+# rules_core_merge_toml PYTHON RAW_VALUE — decode RAW_VALUE through the shared
+# runtime_context.decode_codex_config_string decoder and print two lines: the
+# framed core as a TOML basic string, then "<core>\n\n<decoded>" as one TOML
+# basic string. Exits 3 when RAW_VALUE is a valid TOML non-string so callers
+# keep main's argv and let Codex reject the invalid type unchanged.
 rules_core_merge_toml() {
   local py="$1" raw_value="$2"
   printf '%s\0%s' "${LC_RULES_CORE:-}" "$raw_value" | project_python_run "$py" -c '
-import importlib, sys, tomllib
+import importlib, sys
 
 toml_basic_string = importlib.import_module(f"{sys.argv[1]}.lib.rules_core").toml_basic_string
+decode = importlib.import_module(f"{sys.argv[1]}.dispatcher.runtime_context").decode_codex_config_string
 core, raw = sys.stdin.read().split("\0", 1)
-try:
-    parsed = tomllib.loads(f"v = {raw}")
-except tomllib.TOMLDecodeError:
-    decoded = raw.strip()
-else:
-    if len(parsed) != 1 or "v" not in parsed:
-        decoded = raw.strip()
-    elif isinstance(parsed["v"], str):
-        decoded = parsed["v"]
-    else:
-        raise SystemExit(3)
+decoded = decode(raw)
+if decoded is None:
+    raise SystemExit(3)
 merged = f"{core}\n\n{decoded}" if core else decoded
 sys.stdout.write(toml_basic_string(core) + "\n" + toml_basic_string(merged) + "\n")
 ' "$PROJECT_PACKAGE"

@@ -1345,15 +1345,13 @@ def test_codex_keeps_core_before_caller_developer_instructions(
         for idx, arg in enumerate(argv):
             if arg in ("-c", "--config") and idx + 1 < len(argv):
                 payload = argv[idx + 1]
-                key = payload.split("=", 1)[0].strip()
-                if key == "developer_instructions" or key.startswith("developer_instructions."):
+                if runtime_context.classify_codex_config_payload(payload) is not None:
                     found.append((idx + 1, "", payload))
             else:
                 for pfx in ("--config=", "-c=", "-c"):
                     if arg.startswith(pfx) and len(arg) > len(pfx):
                         payload = arg[len(pfx):]
-                        key = payload.split("=", 1)[0].strip()
-                        if key == "developer_instructions" or key.startswith("developer_instructions."):
+                        if runtime_context.classify_codex_config_payload(payload) is not None:
                             found.append((idx, pfx, payload))
                         break
         return found
@@ -1369,6 +1367,13 @@ def test_codex_keeps_core_before_caller_developer_instructions(
         (("start-codex.sh", "--", "-c=developer_instructions='Literal \\n text'"), r"Literal \n text", "-c="),
         (("start-codex.sh", "--", "-cdeveloper_instructions=Attached short"), "Attached short", "-c"),
         (("start-codex.sh", "--", "-c", "developer_instructions="), "", ""),
+        # Round 1 F1 & F2: Unicode White_Space key padding, trimmed multiline quoted value,
+        # i64 overflow, f64 overflow, and TOML dates (all treated as strings by Codex).
+        (("start-codex.sh", "--", "-c", "\u00a0developer_instructions\u00a0=Sample"), "Sample", ""),
+        (("start-codex.sh", "--", "-c", 'developer_instructions=\n"Sample"'), "Sample", ""),
+        (("start-codex.sh", "--", "-c", f"developer_instructions={2**63}"), str(2**63), ""),
+        (("start-codex.sh", "--", "-c", "developer_instructions=1e400"), "1e400", ""),
+        (("start-codex.sh", "--", "-c", "developer_instructions=2026-11-28"), "2026-11-28", ""),
         (("start-codex-driver.sh", "--epic", "devops", "-c", "developer_instructions=Driver role", "Driver task"), "Driver role", ""),
     ):
         argv_file.unlink(missing_ok=True)
@@ -1413,6 +1418,9 @@ def test_codex_keeps_core_before_caller_developer_instructions(
         ("-c", "developer_instructions=role", "--", "question"),
         ("--", "-c", "developer_instructions=role"),
         ("-c", "developer_instructions=123"),
+        ("-c", "developer_instructions=true"),
+        ("-c", "developer_instructions=inf"),
+        ("-c", "\x1cdeveloper_instructions=Sample"),
         ("-c", "developer_instructions.sub=x"),
     ):
         argv_file.unlink(missing_ok=True)
@@ -1465,6 +1473,11 @@ def test_codex_keeps_core_before_caller_developer_instructions(
     for extra, expected_role, expected_prefix in (
         (["-c", f"developer_instructions={rules_core.toml_basic_string(role)}"], role, ""),
         (["--config=developer_instructions=Worker raw"], "Worker raw", "--config="),
+        (["-c", "\u00a0developer_instructions\u00a0=Sample"], "Sample", ""),
+        (["-c", 'developer_instructions=\n"Sample"'], "Sample", ""),
+        (["-c", f"developer_instructions={2**63}"], str(2**63), ""),
+        (["-c", "developer_instructions=1e400"], "1e400", ""),
+        (["-c", "developer_instructions=2026-11-28"], "2026-11-28", ""),
     ):
         provider = _make_stub_provider(extra)
         monkeypatch.setattr(runtime_context.providers, "load", lambda _agent, _p=provider: _p)
@@ -1496,6 +1509,33 @@ def test_codex_keeps_core_before_caller_developer_instructions(
         monkeypatch.setattr(runtime_context.providers, "load", lambda _agent, _p=provider: _p)
         with pytest.raises(ValueError, match="refusing to launch"):
             runtime_context.build(spec, {})
+
+    # Round 1 F3: dispatch admission validates the Codex core slot before reserving worktrees/leases.
+    from contextlib import nullcontext
+    from types import SimpleNamespace
+
+    from lu_machinery.dispatcher import cli as dispatcher_cli
+
+    runtime_context.check_codex_core_arg_length()
+    monkeypatch.setattr(rules_core, "core_block", lambda seat="core", root=None: "x" * page_limit)
+    monkeypatch.setattr(dispatcher_cli.admission, "record_refusal", lambda *a, **kw: nullcontext())
+    with pytest.raises(ValueError, match="refusing to launch"):
+        dispatcher_cli._dispatch(
+            SimpleNamespace(
+                agent="codex",
+                model=CURRENT_SOL,
+                mode="read-only",
+                prompt="hi",
+                prompt_file=None,
+                review_attempt=None,
+                require_review_verdict=False,
+                owned_path=(),
+                pr=None,
+                repo=None,
+                initiator=None,
+                print_advisory_binding=False,
+            )
+        )
 
 
 def test_fleet_cold_clause_keeps_lane_drivers_on_drive_epic(tmp_path: Path) -> None:
