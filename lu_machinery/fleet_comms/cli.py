@@ -629,6 +629,40 @@ def _refuse_kimi_recipients(recipients: list[str] | tuple[str, ...]) -> None:
         raise FleetCommsCliError(str(exc)) from exc
 
 
+def _refuse_unreadable_recipient(args: argparse.Namespace) -> int | None:
+    """Refuse claim or receive when ``deliveries pending`` classifies the recipient as not drained.
+
+    Calls ``pending_delivery_snapshot`` directly so claim, receive and pending share
+    one classifier with no second roster, alias or task lookup. Only proven
+    ``recipient_not_registered`` and ``recipient_settled`` refuse; unknown standing
+    (``recipient_standing_unverified``) and store/probe errors admit so doubt never
+    hides mail. Never opens, initializes or writes the store on refusal.
+    """
+    from lu_machinery.fleet_comms.authority import (
+        RECIPIENT_NOT_REGISTERED_REASON,
+        RECIPIENT_SETTLED_REASON,
+        pending_delivery_snapshot,
+    )
+
+    snapshot = pending_delivery_snapshot(args.recipient, root=_authority_root(args), limit=1)
+    reason = snapshot.get("reason")
+    if reason not in {RECIPIENT_NOT_REGISTERED_REASON, RECIPIENT_SETTLED_REASON}:
+        return None
+    name = " ".join(str(args.recipient or "").split())
+    detail = (
+        f"no drain reads {name}; check with deliveries pending --recipient {shlex.quote(name)} "
+        + "or deliveries expire-stale (--apply dead-letters held rows). "
+        + "A dispatched task's recipient is its bare task id."
+    )
+    sys.stdout.write(_json_dump({
+        "error": reason,
+        "recipient": name,
+        "detail": detail,
+        "content_included": False,
+    }))
+    return EXIT_ERROR
+
+
 def cmd_deliveries(args: argparse.Namespace) -> int:
     """Expose fenced delivery operations; read and receive return bodies to the lease holder."""
     from lu_machinery.control_plane.storage import ControlPlaneError
@@ -643,6 +677,9 @@ def cmd_deliveries(args: argparse.Namespace) -> int:
         return EXIT_OK if payload["probe"] == "ok" else EXIT_ERROR
     if args.deliveries_command in {"claim", "receive"}:
         _refuse_kimi_recipients((args.recipient,))
+        refused = _refuse_unreadable_recipient(args)
+        if refused is not None:
+            return refused
     try:
         with AuthorityService(root=_authority_root(args)) as service:
             if args.deliveries_command in {"claim", "receive"}:
@@ -731,11 +768,11 @@ def _add_deliveries_parser(sub: Any) -> None:
     )
     epilog = (
         "Examples:\n"
-        f"  .venv/bin/python -m {_PACKAGE} deliveries claim --recipient codex --worker-id seat-1\n"
-        f"  .venv/bin/python -m {_PACKAGE} deliveries receive --recipient worker-task --worker-id worker-task\n"
-        f"  .venv/bin/python -m {_PACKAGE} deliveries consume DELIVERY --worker-id seat-1 --fence-token 1 --driver-generation gen-1\n"
-        f"  .venv/bin/python -m {_PACKAGE} deliveries ack DELIVERY --worker-id seat-1 --fence-token 1\n"
-        f"  .venv/bin/python -m {_PACKAGE} deliveries read DELIVERY --worker-id seat-1 --fence-token 1\n"
+        f"  <project python> -I -m {_PACKAGE} deliveries claim --recipient claude-cto --worker-id seat-1\n"
+        f"  <project python> -I -m {_PACKAGE} deliveries receive --recipient <task-id> --worker-id <task-id>\n"
+        f"  <project python> -I -m {_PACKAGE} deliveries consume DELIVERY --worker-id seat-1 --fence-token 1 --driver-generation gen-1\n"
+        f"  <project python> -I -m {_PACKAGE} deliveries ack DELIVERY --worker-id seat-1 --fence-token 1\n"
+        f"  <project python> -I -m {_PACKAGE} deliveries read DELIVERY --worker-id seat-1 --fence-token 1\n"
         "Outputs: JSON on stdout; message bodies only from read and receive.\n"
         "  Receive claims and reads in one call: {delivery: {delivery_id, fence_token, sender, body, ...},\n"
         "  content_included: true}.\n"
@@ -764,7 +801,9 @@ def _add_deliveries_parser(sub: Any) -> None:
         "  task's own deliveries (recipient and worker id are the task id).\n"
         "Exit codes: 0 = success, including an empty claim or receive,\n"
         "  1 = status, read, ack or consume named a delivery that does not exist,\n"
-        "  2 = usage error, 3 = operation refused or storage error.\n"
+        "  2 = usage error, 3 = operation refused or storage error. Claim and receive refuse with 3\n"
+        "  any recipient deliveries pending classifies as not drained (recipient_not_registered or\n"
+        "  recipient_settled) without opening the store or claiming, reclaiming or expiring rows.\n"
         f"Related: {_PACKAGE}.authority.AuthorityService; channels publish; plane-status."
     )
     deliveries = sub.add_parser(
@@ -799,7 +838,10 @@ def _add_deliveries_parser(sub: Any) -> None:
             help="Authority storage directory (default: FLEET_COMMS_ROOT or shared plane root; e.g. /tmp/test-plane)",
         )
         if name in {"claim", "receive"}:
-            operation.add_argument("--recipient", required=True, help="Exact recipient seat, e.g. codex")
+            operation.add_argument(
+                "--recipient", required=True,
+                help="Exact recipient: a registered slot (e.g. claude-cto) or a live task id",
+            )
             operation.add_argument("--lease-seconds", type=int, default=300, help="Positive lease duration in seconds (default: 300)")
             operation.add_argument("--max-attempts", type=int, default=3, help="Positive delivery attempt limit (default: 3)")
         else:

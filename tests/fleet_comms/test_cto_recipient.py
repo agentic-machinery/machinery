@@ -441,3 +441,228 @@ def test_unreadable_alias_roster_leaves_an_alias_unverified_never_refused(plane,
         roster.chmod(0o600)
     assert (snapshot["count"], snapshot["reason"]) == (None, "recipient_standing_unverified")
     assert authority.pending_delivery_snapshot("cursor-monitor", root=plane)["probe"] == "ok"
+
+
+def _seed_delivery(plane, recipient, *, body="secret body sentinel", key="k1", imported=False):
+    with AuthorityService(root=plane) as service:
+        if imported:
+            with service._write_transaction():
+                return service._publish_message_tx(
+                    sender="claude-cto", body=body, channel=None, targets=None, kind="request",
+                    imported_recipients=(recipient,), imported_source="test-legacy", idempotency_key=key,
+                )
+        return service.publish_message(
+            sender="claude-cto", body=body, recipients=(recipient,), kind="request", idempotency_key=key,
+        )
+
+
+def _store_snapshot(plane):
+    with AuthorityService(root=plane) as service:
+        deliveries = [
+            tuple(row)
+            for row in service.store.connection.execute(
+                """SELECT delivery_id, recipient, state, lease_owner, lease_expires_at, fence_token, attempt_count
+                   FROM authority_deliveries ORDER BY delivery_id"""
+            ).fetchall()
+        ]
+        dead = dead_letter_reasons(service)
+        wakes = service.store.connection.execute("SELECT COUNT(*) FROM authority_wake_receipts").fetchone()[0]
+    return deliveries, dead, wakes
+
+
+@pytest.mark.parametrize("operation", ["claim", "receive"])
+@pytest.mark.parametrize("case", [
+    "registered_slot",
+    "slot_colliding_settled_task",
+    "driver_lane",
+    "durable_cto",
+    "bot_external",
+    "supervisory",
+    "legacy_session_cto",
+    "live_task",
+    "alias_monitor",
+    "alias_slot",
+    "pr1539_f3_alias_eio",
+    "pr1539_f7_malformed_slot_roster",
+    "pr1539_f8_inaccessible_tasks_dir",
+    "unknown_task_status",
+    "incomplete_roster_settled_task",
+    "unregistered_epics",
+    "unregistered_whitespace",
+    "unregistered_prefixed_task",
+    "unregistered_bot",
+    "unregistered_grok_build",
+    "settled_task",
+])
+def test_claim_receive_refuse_only_what_pending_reports(
+    plane, tasks, monkeypatch, tmp_path, capsys, case, operation,
+):
+    """Defect class: claim or receive refuse a recipient with queued mail, or accept one pending reports as not drained (#1567 AC-02)."""
+    import errno
+
+    from lu_machinery import agent_identity
+    from lu_machinery.fleet_comms import authority
+    from lu_machinery.ops import driver_lanes
+    from lu_machinery.orchestration import validate_fleet_taxonomy
+
+    tasks_dir = tmp_path / "tasks"
+    expected_refusal: str | None = None
+    expected_pending_reason: str | None = None
+    query_name: str
+    stored_name: str
+    restore_dir_mode = False
+
+    if case == "registered_slot":
+        stored_name = query_name = "cursor-core"
+        _seed_delivery(plane, stored_name)
+    elif case == "slot_colliding_settled_task":
+        stored_name = query_name = "cursor-core"
+        tasks(stored_name, "done")
+        _seed_delivery(plane, stored_name)
+    elif case == "driver_lane":
+        stored_name = query_name = "codex-devops"
+        _seed_delivery(plane, stored_name)
+    elif case == "durable_cto":
+        stored_name = query_name = "claude-cto"
+        _seed_delivery(plane, stored_name)
+    elif case == "bot_external":
+        stored_name = query_name = "eggbot"
+        _seed_delivery(plane, stored_name)
+    elif case == "supervisory":
+        stored_name = query_name = "supervisor:epic:9999"
+        _seed_delivery(plane, stored_name)
+    elif case == "legacy_session_cto":
+        stored_name = query_name = LEGACY
+        _seed_delivery(plane, stored_name, imported=True)
+    elif case == "live_task":
+        stored_name = query_name = tasks("cto-10-live", "running")
+        _seed_delivery(plane, stored_name)
+    elif case == "alias_monitor":
+        stored_name = query_name = "cursor-monitor"
+        _seed_delivery(plane, stored_name, imported=True)
+    elif case == "alias_slot":
+        stored_name = query_name = "codex-curriculum-upgrade"
+        _seed_delivery(plane, stored_name, imported=True)
+    elif case == "pr1539_f3_alias_eio":
+        stored_name = query_name = "cursor-monitor"
+        _seed_delivery(plane, stored_name, imported=True)
+        roster = tmp_path / "area_assignments.yaml"
+        roster.write_text(agent_identity.ASSIGNMENTS_PATH.read_text(encoding="utf-8"), encoding="utf-8")
+        monkeypatch.setattr(agent_identity, "ASSIGNMENTS_PATH", roster)
+        assert authority._roster_complete() is True  # roster succeeds and caches before alias EIO
+
+        def fail_eio(_path):
+            raise OSError(errno.EIO, "Input/output error")
+
+        monkeypatch.setattr(validate_fleet_taxonomy, "read_regular_file_bytes", fail_eio)
+        expected_pending_reason = "recipient_standing_unverified"
+    elif case == "pr1539_f7_malformed_slot_roster":
+        stored_name = query_name = "cursor-core"
+        _seed_delivery(plane, stored_name)
+        data = yaml.safe_load(agent_identity.ASSIGNMENTS_PATH.read_text(encoding="utf-8"))
+        data["assignments"]["core"]["slots"] = "cursor-core"  # scalar instead of list
+        roster = tmp_path / "area_assignments.yaml"
+        roster.write_text(yaml.safe_dump(data), encoding="utf-8")
+        monkeypatch.setattr(agent_identity, "ASSIGNMENTS_PATH", roster)
+        expected_pending_reason = "recipient_standing_unverified"
+    elif case == "pr1539_f8_inaccessible_tasks_dir":
+        stored_name = query_name = tasks("cto-10-f8-live", "running")
+        _seed_delivery(plane, stored_name)
+        tasks_dir.chmod(0o600)
+        restore_dir_mode = True
+        expected_pending_reason = "recipient_standing_unverified"
+    elif case == "unknown_task_status":
+        stored_name = query_name = tasks("cto-10-paused", "running")
+        _seed_delivery(plane, stored_name)
+        tasks(stored_name, "paused")
+        expected_pending_reason = "recipient_standing_unverified"
+    elif case == "incomplete_roster_settled_task":
+        stored_name = query_name = tasks("cto-10-settled-outage", "running")
+        _seed_delivery(plane, stored_name)
+        tasks(stored_name, "done")
+        monkeypatch.setattr(driver_lanes, "DATA_FILE", tmp_path / "missing-lanes.json")
+        expected_pending_reason = "recipient_standing_unverified"
+    elif case == "unregistered_epics":
+        stored_name = query_name = "epics"
+        _seed_delivery(plane, stored_name, imported=True, key="k-epics")
+        # Also seed an expired lease to prove refusal never reclaims any row.
+        _seed_delivery(plane, "claude-cto", key="k-expired")
+        with AuthorityService(root=plane) as service:
+            service.claim_next_delivery("claude-cto", "old-seat", now="2000-01-01T00:00:00Z")
+        expected_refusal = expected_pending_reason = "recipient_not_registered"
+    elif case == "unregistered_whitespace":
+        stored_name = "epics"
+        query_name = "  epics  "
+        _seed_delivery(plane, stored_name, imported=True)
+        expected_refusal = expected_pending_reason = "recipient_not_registered"
+    elif case == "unregistered_prefixed_task":
+        stored_name = query_name = "claude/cto-7b96-demo"
+        _seed_delivery(plane, stored_name, imported=True)
+        expected_refusal = expected_pending_reason = "recipient_not_registered"
+    elif case == "unregistered_bot":
+        stored_name = query_name = "eggbot-2"
+        _seed_delivery(plane, stored_name, imported=True)
+        expected_refusal = expected_pending_reason = "recipient_not_registered"
+    elif case == "unregistered_grok_build":
+        stored_name = query_name = "grok-build"
+        _seed_delivery(plane, stored_name, imported=True)
+        expected_refusal = expected_pending_reason = "recipient_not_registered"
+    elif case == "settled_task":
+        stored_name = query_name = tasks("cto-10-done", "running")
+        _seed_delivery(plane, stored_name)
+        tasks(stored_name, "done")
+        expected_refusal = expected_pending_reason = "recipient_settled"
+    else:
+        raise AssertionError(f"unhandled case: {case}")
+
+    try:
+        pending_expected = EXIT_OK if expected_pending_reason is None else EXIT_ERROR
+        pending = run(capsys, "deliveries", "pending", "--recipient", query_name, expected=pending_expected)
+        if expected_pending_reason is None:
+            assert pending["probe"] == "ok"
+            assert pending["count"] == 1
+        else:
+            assert pending["probe"] == "unknown"
+            assert pending["reason"] == expected_pending_reason
+
+        if expected_refusal is not None:
+            before = _store_snapshot(plane)
+            assert main(["deliveries", operation, "--recipient", query_name, "--worker-id", "seat-1"]) == EXIT_ERROR
+            captured = capsys.readouterr()
+            assert captured.err == ""
+            assert "secret body sentinel" not in captured.out
+            refused = json.loads(captured.out)
+            assert refused["error"] == expected_refusal
+            assert refused["recipient"] == stored_name
+            assert refused["content_included"] is False
+            assert f"deliveries pending --recipient {stored_name}" in refused["detail"]
+            assert "queued" not in refused and "running" not in refused
+            assert _store_snapshot(plane) == before
+            # Refusal never opens, initializes, or writes a store.
+            uninit = tmp_path / "uninitialized-plane"
+            assert main([
+                "deliveries", operation, "--root", str(uninit),
+                "--recipient", query_name, "--worker-id", "seat-1",
+            ]) == EXIT_ERROR
+            capsys.readouterr()
+            assert not uninit.exists()
+        else:
+            result = run(capsys, "deliveries", operation, "--recipient", query_name, "--worker-id", "seat-1")
+            leased = result["delivery"] if operation == "receive" else result
+            assert leased["recipient"] == stored_name
+            assert leased["state"] == "running"
+            if operation == "receive":
+                assert result["content_included"] is True
+                assert leased["body"] == "secret body sentinel"
+            else:
+                assert result["content_included"] is False
+            acked = run(
+                capsys, "deliveries", "ack", leased["delivery_id"],
+                "--worker-id", "seat-1", "--fence-token", str(leased["fence_token"]),
+            )
+            assert acked["state"] == "acknowledged"
+            empty = run(capsys, "deliveries", operation, "--recipient", query_name, "--worker-id", "seat-1")
+            assert empty == {"delivery": None, "content_included": False}
+    finally:
+        if restore_dir_mode:
+            tasks_dir.chmod(0o700)
