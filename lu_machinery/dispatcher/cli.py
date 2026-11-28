@@ -566,7 +566,9 @@ def _dispatch(args) -> int:
     agent = ALIASES.get(args.agent, args.agent)
     with admission.record_refusal(args, agent, StartRefusal.SETUP):
         try:
-            rules_core.require_core()
+            seat = rules_core.require_core()
+            if agent == "codex":
+                runtime_context.check_codex_core_arg_length(seat)
         except rules_core.RulesCoreMissing as exc:
             raise ValueError(f"dispatch refused: {exc}; the rules core is required.") from None
     if args.mode == "read-only" and args.pr is not None and not args.repo:

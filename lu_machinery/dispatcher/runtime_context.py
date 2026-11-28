@@ -2,6 +2,7 @@
 
 import json
 import os
+import tomllib
 from dataclasses import replace
 from pathlib import Path
 
@@ -91,6 +92,193 @@ def _context_file(path: Path, body: bytes, *, dry_run: bool) -> str:
     return str(path)
 
 
+# Codex CLI boolean flags (codex and codex exec); mirrors launcher_provider_option_arity.
+_CODEX_BOOLEAN_OPTIONS = frozenset({
+    "--strict-config",
+    "--oss",
+    "--approve-for-me",
+    "--dangerously-bypass-approvals-and-sandbox",
+    "--dangerously-bypass-hook-trust",
+    "--worktree",
+    "--search",
+    "--no-alt-screen",
+    "--no-daemon",
+    "--skip-git-repo-check",
+    "--trust",
+    "--ephemeral",
+    "--ignore-user-config",
+    "--ignore-rules",
+    "--json",
+})
+
+
+# Exact 25 Unicode White_Space code points trimmed by Rust str::trim() in Codex CLI.
+# Python str.strip() also trims ASCII separators (\x1c-\x1f), which Codex does not.
+_CODEX_WHITESPACE = (
+    "\t\n\x0b\x0c\r \x85\xa0\u1680"
+    "\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a"
+    "\u2028\u2029\u202f\u205f\u3000"
+)
+
+
+# First characters of every TOML value that is not a string (integers, floats,
+# dates, times, arrays, inline tables) in TOML 1.0 and 1.1, and the words that
+# start the remaining non-string values (booleans, special floats).
+_TOML_NON_STRING_STARTS = frozenset("[{+-0123456789")
+_TOML_NON_STRING_WORDS = ("true", "false", "inf", "nan")
+
+
+def classify_codex_config_payload(payload: str) -> tuple[str, str | None] | None:
+    """Classify a Codex ``-c`` / ``--config`` payload using Codex's whitespace trimming.
+
+    Codex trims Unicode ``White_Space`` from the whole key once and splits dotted
+    paths on ``.`` without trimming inside segments.
+    """
+    if "=" in payload:
+        key, raw = payload.split("=", 1)
+        trimmed = key.strip(_CODEX_WHITESPACE)
+        if trimmed == "developer_instructions":
+            return "setting", raw
+        if trimmed.startswith("developer_instructions."):
+            return "subkey", None
+        return None
+    trimmed = payload.strip(_CODEX_WHITESPACE)
+    if trimmed == "developer_instructions":
+        return "missing_value", None
+    if trimmed.startswith("developer_instructions."):
+        return "subkey", None
+    return None
+
+
+def decode_codex_config_string(raw_value: str) -> str | None:
+    """Return the text Codex uses for ``-c developer_instructions=<raw_value>``, or None.
+
+    Narrowed contract (#1559 ruling C, no new parser): Codex trims Unicode
+    ``White_Space`` from the value, parses it as a TOML value and, when that
+    fails, uses the trimmed text with outer ``"``/``'`` stripped. Only two
+    shapes are provable here:
+
+    * a valid TOML 1.0 basic or literal string (the trimmed value starts with
+      ``"`` or ``'``, holds no raw carriage return, and ``tomllib`` reads it as the
+      only key's string); TOML 1.1 adds no string form that 1.0 reads differently,
+      so Codex reads the same text. A raw carriage return is excluded because
+      ``tomllib`` folds CRLF to LF inside multiline strings while Codex keeps it;
+    * unambiguous plain text, which no TOML value can start: it does not start
+      with ``[``, ``{``, ``+``, ``-`` or a digit, nor with ``true``, ``false``,
+      ``inf`` or ``nan``; Codex's parse fails and it uses the literal fallback.
+
+    Every other shape (containers, numbers, booleans, dates and times, TOML
+    1.1-only strings, an invalid quoted value, a raw carriage return in a quoted
+    value, extra keys) returns None, so
+    callers keep main's argv unchanged.
+    """
+    trimmed = raw_value.strip(_CODEX_WHITESPACE)
+    if trimmed[:1] in ('"', "'"):
+        if "\r" in trimmed:
+            return None
+        try:
+            parsed = tomllib.loads(f"v = {trimmed}")
+        except (ValueError, RecursionError):  # TOMLDecodeError, over-long integers, deep nesting
+            return None
+        value = parsed.get("v")
+        return value if len(parsed) == 1 and isinstance(value, str) else None
+    if trimmed[:1] in _TOML_NON_STRING_STARTS or trimmed.startswith(_TOML_NON_STRING_WORDS):
+        return None
+    return trimmed.strip("\"'")
+
+
+def _check_codex_arg_length(slot: str) -> None:
+    """Refuse an argv slot at or over Linux MAX_ARG_STRLEN (32 pages, NUL included)."""
+    limit = os.sysconf("SC_PAGE_SIZE") * 32
+    size = len(slot.encode("utf-8"))
+    if size >= limit:
+        raise ValueError(
+            f"refusing to launch: the developer_instructions setting is {size} bytes, "
+            f"over the {limit - 1}-byte argument limit"
+        )
+
+
+def check_codex_core_arg_length(seat: str | None = None) -> None:
+    """Fail closed if the Codex rules-core argv slot reaches Linux MAX_ARG_STRLEN."""
+    core = rules_core.core_block(rules_core.resolve_seat(seat))
+    _check_codex_arg_length("developer_instructions=" + rules_core.toml_basic_string(core))
+
+
+def _inject_codex_developer_instructions(argv: list[str], core: str) -> list[str]:
+    """Keep the rules core first in Codex developer_instructions (ruling C, #1559 sibling).
+
+    When ``argv[1:]`` holds exactly one provable ``-c`` / ``--config``
+    ``developer_instructions=V`` setting (not after ``--``, not preceded by a
+    value-taking or unclassified option), rewrite it in place as ``core``, a
+    blank line, then ``V`` (TOML-encoded). Unprovable shapes keep main's
+    behaviour (existing arguments unchanged, core appended). A provable setting
+    with no ``=value``, or an argv slot at or over ``MAX_ARG_STRLEN``, refuses.
+    """
+    separator = False
+    shaped = 0
+    found = -1
+    value_index = -1
+    found_prefix = ""
+    found_kind = ""
+    found_raw: str | None = None
+    for index in range(1, len(argv)):
+        arg = argv[index]
+        payload: str | None = None
+        prefix = ""
+        v_idx = -1
+        if arg == "--":
+            separator = True
+        elif arg in ("-c", "--config"):
+            if index + 1 < len(argv):
+                payload = argv[index + 1]
+                v_idx = index + 1
+        elif arg.startswith("--config="):
+            prefix = "--config="
+            payload = arg[len(prefix):]
+            v_idx = index
+        elif arg.startswith("-c="):
+            prefix = "-c="
+            payload = arg[len(prefix):]
+            v_idx = index
+        elif arg.startswith("-c") and len(arg) > 2:
+            prefix = "-c"
+            payload = arg[len(prefix):]
+            v_idx = index
+        if payload is not None:
+            classified = classify_codex_config_payload(payload)
+            if classified is not None:
+                kind, raw = classified
+                shaped += 1
+                if kind in ("setting", "missing_value"):
+                    found = index
+                    value_index = v_idx
+                    found_prefix = prefix
+                    found_kind = kind
+                    found_raw = raw
+    if shaped != 1 or separator or found < 0:
+        found = -1
+    elif found > 1:
+        previous = argv[found - 1]
+        if previous.startswith("-") and "=" not in previous and previous not in _CODEX_BOOLEAN_OPTIONS:
+            found = -1
+    if found >= 0:
+        if found_kind == "missing_value":
+            raise ValueError("refusing to launch: developer_instructions requires a value")
+        decoded = decode_codex_config_string(found_raw or "")
+        if decoded is None:
+            found = -1
+        else:
+            merged = f"{core}\n\n{decoded}" if core else decoded
+            slot = f"{found_prefix}developer_instructions={rules_core.toml_basic_string(merged)}"
+            _check_codex_arg_length(slot)
+            argv[value_index] = slot
+            return argv
+    slot = "developer_instructions=" + rules_core.toml_basic_string(core)
+    _check_codex_arg_length(slot)
+    argv += ["-c", slot]
+    return argv
+
+
 def build(
     spec: TaskSpec, env: dict[str, str], *, launch_prompt: bytes | None = None, conversation: str | None = None,
 ) -> Invocation:
@@ -123,7 +311,7 @@ def build(
         else:
             argv += ["--append-system-prompt-file", path]
     elif spec.agent == "codex":
-        argv += ["-c", "developer_instructions=" + rules_core.toml_basic_string(core)]
+        argv = _inject_codex_developer_instructions(argv, core)
     else:
         body = core.encode("utf-8") + b"\n\n" + body
     stdin: bytes | None = body
