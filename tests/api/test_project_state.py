@@ -159,6 +159,32 @@ def test_post_report_loopback_and_expiry(monkeypatch: pytest.MonkeyPatch) -> Non
     assert expired["freshness"] == "unknown"
 
 
+def test_post_report_bounds_body_and_stored_shape(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Defect class: a report parsed before its peer and size are checked, or stored with unbounded or foreign members."""
+    monkeypatch.setenv("MONITOR_OCCUPANCY_HOST_IDS", _PLACEHOLDER_MAP)
+    url = "/api/fleet/projects/v1/report"
+    # A remote peer is refused before the body is parsed: invalid JSON still gets 403, not 422.
+    remote = client.post(url, content=b"not json", headers={"Content-Type": "application/json"})
+    assert remote.status_code == 403
+    huge = b"x" * (router_mod.MAX_REPORT_BODY_BYTES + 1)
+    assert loop_client.post(url, content=huge, headers={"Content-Type": "application/json"}).status_code == 413
+    # Nesting inside the byte limit is refused with a 422, never a parser stack overflow (500).
+    nested = b"[" * 50_000 + b"]" * 50_000
+    assert loop_client.post(url, content=nested, headers={"Content-Type": "application/json"}).status_code == 422
+
+    too_many_services = _document(services=[_service(f"svc{n}") for n in range(router_mod.MAX_REPORT_SERVICES + 1)])
+    assert _post_report(too_many_services).status_code == 422
+    too_many_lanes = {**_document(), "lane_usage": [{}] * (router_mod.MAX_REPORT_LANE_USAGE + 1)}
+    assert _post_report(too_many_lanes).status_code == 422
+    for foreign in (
+        {**_document(), "primary": {**_primary(), "note": "x" * 1000}},
+        {**_document(), "worktrees": {"count": 2, "paths": ["/srv/x"]}},
+    ):
+        refused = _post_report(foreign)
+        assert (refused.status_code, refused.json()["detail"]) == (400, "invalid project state report")
+    assert _post_report(_document()).status_code == 200
+
+
 def test_drift_matrix_release_behind(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("MONITOR_OCCUPANCY_HOST_IDS", _PLACEHOLDER_MAP)
     monkeypatch.setattr(router_mod, "_self_host_ids", lambda: set())

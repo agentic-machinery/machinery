@@ -12,9 +12,10 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException, Query
 
 from lu_machinery.session_streams.handoff import diagnose_handoff
-from lu_machinery.session_streams.model import entry_as_dict
+from lu_machinery.session_streams.model import entry_as_dict, validate_stream_id
 from lu_machinery.session_streams.store import NotFoundError, SessionStreamStore
 
+from .epics_router import _response_token, _safe_entry
 from .monitor_context import MonitorContext, get_ctx
 from .repository_authority import build_repository_identity
 
@@ -29,6 +30,30 @@ def _store(ctx: MonitorContext) -> SessionStreamStore:
     if store is None:
         raise FileNotFoundError("session-stream database is unavailable")
     return store
+
+
+def _valid_stream_id(stream_id: str) -> str:
+    try:
+        return validate_stream_id(stream_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+_STATUS_TOKEN_FIELDS = ("session_id", "holder_agent", "holder_harness", "holder_instance_id")
+
+
+def _safe_status(status: dict[str, Any]) -> dict[str, Any]:
+    """Project a handoff diagnosis through the same token rule as the epics API.
+
+    ``reason`` quotes the holder, so it is withheld whenever a holder field is.
+    """
+    safe = dict(status)
+    for field in _STATUS_TOKEN_FIELDS:
+        if safe[field] is not None:
+            safe[field] = _response_token(safe[field])
+    if any(safe[field] != status[field] for field in _STATUS_TOKEN_FIELDS):
+        safe["reason"] = "[redacted]"
+    return safe
 
 
 def _store_health(ctx: MonitorContext) -> dict[str, Any]:
@@ -74,15 +99,14 @@ def session_stream_status(
     ctx: MonitorContext = Depends(get_ctx),
 ) -> dict[str, Any]:
     """Handoff/lease diagnosis for one stream (read-only; no claim)."""
-    if not stream_id.startswith("epic:"):
-        raise HTTPException(status_code=400, detail="stream_id must look like epic:N")
+    stream_id = _valid_stream_id(stream_id)
     try:
         status = diagnose_handoff(_store(ctx), stream_id)
     except (NotFoundError, FileNotFoundError) as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except Exception as exc:  # pragma: no cover - defensive API boundary
         raise HTTPException(status_code=500, detail="status_failed") from exc
-    return status.as_dict()
+    return _safe_status(status.as_dict())
 
 
 @router.get("/v1/digest/{stream_id:path}")
@@ -91,9 +115,8 @@ def session_stream_digest(
     limit: int = Query(default=20, ge=0, le=500),
     ctx: MonitorContext = Depends(get_ctx),
 ) -> dict[str, Any]:
-    """Pinned entries plus last N non-pinned entries (bounded)."""
-    if not stream_id.startswith("epic:"):
-        raise HTTPException(status_code=400, detail="stream_id must look like epic:N")
+    """Pinned entries plus last N non-pinned entries (bounded), through the epics API's safe entry projection."""
+    stream_id = _valid_stream_id(stream_id)
     try:
         digest = _store(ctx).load_digest(stream_id, limit=limit)
     except (NotFoundError, FileNotFoundError) as exc:
@@ -103,8 +126,8 @@ def session_stream_digest(
     return {
         "stream_id": stream_id,
         "limit": limit,
-        "pinned": [entry_as_dict(e) for e in digest.pinned],
-        "recent": [entry_as_dict(e) for e in digest.recent],
+        "pinned": [_safe_entry(entry_as_dict(e)) for e in digest.pinned],
+        "recent": [_safe_entry(entry_as_dict(e)) for e in digest.recent],
         "pinned_count": len(digest.pinned),
         "recent_count": len(digest.recent),
     }

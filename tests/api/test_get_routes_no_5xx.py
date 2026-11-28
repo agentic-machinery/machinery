@@ -340,6 +340,38 @@ def test_parameter_free_get_on_a_never_fetched_checkout_is_not_5xx(
         assert set(dialed) == {expected}, f"{route} dialed {dialed}, expected port {expected}"
 
 
+def test_direct_artifact_reads_honour_discovery_exclusions(tmp_path: Path) -> None:
+    """Defect class: a direct read or listing serving what discovery excludes (excluded subtrees, hidden targets)."""
+    resources = tmp_path / "docs" / "resources"
+    raw = resources / "podcasts" / "raw"
+    raw.mkdir(parents=True)
+    (raw / "episode.md").write_text("# excluded\n", encoding="utf-8")
+    (resources / "podcasts" / "notes.md").write_text("# notes\n", encoding="utf-8")
+    (resources / ".secret.md").write_text("# hidden\n", encoding="utf-8")
+    (resources / "alias.md").symlink_to(resources / ".secret.md")
+    (resources / "raw-link").symlink_to(raw, target_is_directory=True)
+    ctx = fixture_context(tmp_path).with_roots(effective_roots={"docs/resources": resources})
+    assert "docs/resources" in docs_router.build_effective_roots(tmp_path)
+    client = TestClient(create_app(ctx, lifespan=_no_lifespan, product=ProductContribution()))
+
+    for prefix, query in (("/files", ""), ("/artifacts", "?format=json")):
+        for path in (
+            "docs/resources/podcasts/raw/episode.md",
+            "docs/resources/podcasts/raw",
+            "docs/resources/podcasts/raw/missing.md",
+            "docs/resources/alias.md",
+            "docs/resources/raw-link/episode.md",
+            "docs/resources/raw-link",
+        ):
+            response = client.get(f"{prefix}/{path}{query}")
+            assert response.status_code == 403, (prefix, path, response.status_code)
+        listing = client.get(f"{prefix}/docs/resources/podcasts{query}").json()
+        assert [item["name"] for item in listing["items"]] == ["notes.md"], prefix
+        top = client.get(f"{prefix}/docs/resources{query}").json()
+        assert [item["name"] for item in top["items"]] == ["podcasts"], prefix
+    assert client.get("/files/docs/resources/podcasts/notes.md").status_code == 200
+
+
 def test_artifacts_listing_is_paginated(tmp_path: Path) -> None:
     """Defect class: a listing returns everything in one response, or its pager skips, repeats or breaks links."""
     reports = tmp_path / "docs" / "reports"
