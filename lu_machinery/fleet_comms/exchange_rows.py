@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any
 
 from lu_machinery.common import json_depth
+from lu_machinery.common.repo_root import MachineryConfigError
 from lu_machinery.control_plane.storage import (
     ControlPlaneError,
     ControlPlaneUnsupportedComponentError,
@@ -37,6 +38,7 @@ from lu_machinery.fleet_comms.authority import (
 )
 from lu_machinery.fleet_comms.opsec_store import COMMS_RESPONSE_SCHEMA_VERSION
 from lu_machinery.fleet_comms.paths import (
+    RETIRED_LOCAL_PLANE_MESSAGE,
     PlaneRootAnchorError,
     default_plane_root,
     local_plane_is_retired,
@@ -51,6 +53,20 @@ _OPTIONAL_DELIVERY_TEXT_FIELDS = (
     "lease_owner",
     "acknowledgment_artifact_id",
     "terminal_sha256",
+)
+_REQUIRED_MESSAGE_TEXT_FIELDS = (
+    "message_id",
+    "conversation_id",
+    "kind",
+    "sender",
+    "content_sha256",
+    "thread_id",
+)
+_OPTIONAL_MESSAGE_TEXT_FIELDS = (
+    "in_reply_to",
+    "recipient",
+    "channel_id",
+    "correlation_id",
 )
 _SQL_IN_CHUNK_SIZE = 200
 _SORT_LAST = (1, "")
@@ -141,16 +157,50 @@ def _require_utf8_arg(value: str, *, error_code: str) -> str:
     return value
 
 
-def _validate_raw_message_metadata(conn: SQLiteConnection, message_id: str) -> None:
-    """Validate stored JSON metadata strictly before Fleet's stringifier runs."""
+def plane_root_error_code(exc: BaseException) -> str:
+    """Map root-anchor and config refusals to path-free typed error codes."""
+    if isinstance(exc, MachineryConfigError):
+        return "exchange_store_unavailable"
+    if isinstance(exc, PlaneRootAnchorError):
+        message = str(exc)
+        if message == RETIRED_LOCAL_PLANE_MESSAGE:
+            return "retired_local_plane"
+        if message in {"plane_root_is_git_checkout", "plane_root_unresolvable"}:
+            return message
+        return "exchange_store_unavailable"
+    if isinstance(exc, ValueError):
+        return "plane_root_unresolvable"
+    return "exchange_store_unavailable"
+
+
+def _validate_raw_message_row(conn: SQLiteConnection, message_id: str) -> None:
+    """Validate raw SQLite storage types and JSON metadata before AuthorityService coerces them."""
     row = conn.execute(
-        """SELECT context_revisions_json, provenance_json
-           FROM authority_message_metadata
-           WHERE message_id = ?""",
+        """SELECT m.message_id, m.conversation_id, m.in_reply_to, m.kind, m.sender,
+                  m.recipient, m.body_artifact_id, m.content_sha256, m.created_at,
+                  meta.channel_id, meta.thread_id, meta.correlation_id,
+                  meta.context_revisions_json, meta.provenance_json
+           FROM comms_messages m
+           JOIN authority_message_metadata meta ON meta.message_id = m.message_id
+           WHERE m.message_id = ?""",
         (message_id,),
     ).fetchone()
     if row is None:
         return
+    for column in _REQUIRED_MESSAGE_TEXT_FIELDS:
+        _as_nonempty_str(row[column], error_code="message_row_corrupt")
+    for column in _OPTIONAL_MESSAGE_TEXT_FIELDS:
+        value = row[column]
+        if value is not None and not isinstance(value, str):
+            raise AuthorityServiceError("message_row_corrupt")
+    body_artifact_id = row["body_artifact_id"]
+    if body_artifact_id is None:
+        raise AuthorityServiceError("message_body_artifact_missing")
+    if not isinstance(body_artifact_id, str):
+        raise AuthorityServiceError("message_row_corrupt")
+    if not body_artifact_id.strip():
+        raise AuthorityServiceError("message_body_artifact_missing")
+    _parse_required_iso(row["created_at"], field="created_at")
     for column, error_code, require_string_values in (
         ("context_revisions_json", "context_revisions_corrupt", True),
         ("provenance_json", "provenance_corrupt", False),
@@ -179,6 +229,13 @@ def _validate_raw_message_metadata(conn: SQLiteConnection, message_id: str) -> N
         ):
             raise AuthorityServiceError(error_code)
         _require_strict_json(parsed, error_code=error_code)
+    delivery_rows = conn.execute(
+        """SELECT delivery_id FROM authority_deliveries
+           WHERE message_id = ? ORDER BY delivery_id ASC""",
+        (message_id,),
+    ).fetchall()
+    for item in delivery_rows:
+        _as_nonempty_str(item["delivery_id"], error_code="message_row_corrupt")
 
 
 def _message_to_dict(message: AuthorityMessage) -> dict[str, Any]:
@@ -207,7 +264,7 @@ def _read_message_cached(
     if cached is not None:
         return cached
     try:
-        _validate_raw_message_metadata(conn, message_id)
+        _validate_raw_message_row(conn, message_id)
         message = service.get_message(message_id)
         result: tuple[dict[str, Any] | None, str | None] = (_message_to_dict(message), None)
     except AuthorityServiceError as exc:
@@ -432,9 +489,17 @@ def read_exchange_rows(
 
     try:
         plane_root = validate_plane_root(root) if root is not None else default_plane_root()
-    except PlaneRootAnchorError as exc:
-        raise ExchangeRowsError("exchange_store_unavailable") from exc
-    if local_plane_is_retired(root=plane_root):
+        retired = local_plane_is_retired(root=plane_root)
+    except (
+        PlaneRootAnchorError,
+        MachineryConfigError,
+        OSError,
+        RuntimeError,
+        ValueError,
+        UnicodeEncodeError,
+    ) as exc:
+        raise ExchangeRowsError(plane_root_error_code(exc)) from exc
+    if retired:
         raise ExchangeRowsError("retired_local_plane")
 
     try:

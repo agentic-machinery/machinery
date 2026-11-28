@@ -61,13 +61,16 @@ def _expected_message_dict(root: Path, message_id: str) -> dict[str, Any]:
 
 def _run_exchange(
     capsys: pytest.CaptureFixture[str],
-    root: Path,
+    root: Path | str | None,
     *,
     recipient: str = "codex",
     since: str = SINCE_TS,
     expected_rc: int = EXIT_OK,
 ) -> dict[str, Any]:
-    rc = main(["fleet", "exchange", "--recipient", recipient, "--since", since, "--root", str(root)])
+    argv = ["fleet", "exchange", "--recipient", recipient, "--since", since]
+    if root is not None:
+        argv.extend(["--root", str(root)])
+    rc = main(argv)
     output = capsys.readouterr()
     assert rc == expected_rc, f"rc={rc}, stdout={output.out!r}, stderr={output.err!r}"
     assert output.err == ""
@@ -539,9 +542,9 @@ def test_reply_in_other_conversation_emits_typed_reply_thread_mismatch_error(
 
 
 def test_corrupt_row_emits_typed_error_while_sibling_rows_still_print(
-    plane: Path, capsys: pytest.CaptureFixture[str],
+    plane: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Defect class: corrupt metadata, overflow timestamps, invalid UTF-8, or NaN aborts the batch."""
+    """Defect class: corrupt metadata, storage types, overflow timestamps, invalid UTF-8, or root errors break isolation or JSON output."""
     with AuthorityService(root=plane) as service:
         good_msg = service.publish_message(
             sender="operator",
@@ -592,6 +595,34 @@ def test_corrupt_row_emits_typed_error_while_sibling_rows_still_print(
             created_at="2026-11-28T01:01:18Z",
             idempotency_key="corrupt-sibling-bad-prov-dup-key",
         )
+        bad_blob_sender_msg = service.publish_message(
+            sender="operator",
+            body=f"bad blob sender {BODY_SENTINEL}",
+            recipients=("codex",),
+            created_at="2026-11-28T01:01:18.100000Z",
+            idempotency_key="corrupt-sibling-bad-blob-sender",
+        )
+        bad_blob_meta_msg = service.publish_message(
+            sender="operator",
+            body=f"bad blob meta {BODY_SENTINEL}",
+            recipients=("codex",),
+            created_at="2026-11-28T01:01:18.200000Z",
+            idempotency_key="corrupt-sibling-bad-blob-meta",
+        )
+        bad_blob_foreign_delivery_msg = service.publish_message(
+            sender="operator",
+            body=f"bad blob foreign delivery {BODY_SENTINEL}",
+            recipients=("codex", "claude"),
+            created_at="2026-11-28T01:01:18.300000Z",
+            idempotency_key="corrupt-sibling-bad-blob-foreign-delivery",
+        )
+        bad_blob_reply_parent_msg = service.publish_message(
+            sender="codex",
+            body=f"bad blob reply parent {BODY_SENTINEL}",
+            recipients=("claude-cto",),
+            created_at="2026-11-28T01:01:18.400000Z",
+            idempotency_key="corrupt-sibling-bad-blob-reply-parent",
+        )
         bad_utf8_msg = service.publish_message(
             sender="operator",
             body=f"bad utf8 {BODY_SENTINEL}",
@@ -632,6 +663,8 @@ def test_corrupt_row_emits_typed_error_while_sibling_rows_still_print(
 
     conn = sqlite3.connect(str(plane / "comms.sqlite3"))
     try:
+        conn.execute("PRAGMA foreign_keys = OFF")
+        conn.execute("DROP TRIGGER IF EXISTS authority_comms_message_immutable_update")
         conn.execute("DROP TRIGGER IF EXISTS authority_message_metadata_immutable_update")
         conn.execute("DROP TRIGGER IF EXISTS authority_message_metadata_immutable_delete")
         conn.execute(
@@ -659,6 +692,22 @@ def test_corrupt_row_emits_typed_error_while_sibling_rows_still_print(
             ('{"outer": {"x": 1e999, "x": 1}}', bad_prov_dup_key_msg.message_id),
         )
         conn.execute(
+            "UPDATE comms_messages SET sender = X'73796e746865746963' WHERE message_id = ?",
+            (bad_blob_sender_msg.message_id,),
+        )
+        conn.execute(
+            "UPDATE authority_message_metadata SET correlation_id = X'626164' WHERE message_id = ?",
+            (bad_blob_meta_msg.message_id,),
+        )
+        conn.execute(
+            "UPDATE authority_deliveries SET delivery_id = X'666f726569676e' WHERE message_id = ? AND recipient = 'claude'",
+            (bad_blob_foreign_delivery_msg.message_id,),
+        )
+        conn.execute(
+            "UPDATE comms_messages SET in_reply_to = X'626164' WHERE message_id = ?",
+            (bad_blob_reply_parent_msg.message_id,),
+        )
+        conn.execute(
             "UPDATE authority_message_metadata SET provenance_json = CAST(X'80' AS TEXT) WHERE message_id = ?",
             (bad_utf8_msg.message_id,),
         )
@@ -680,9 +729,9 @@ def test_corrupt_row_emits_typed_error_while_sibling_rows_still_print(
     expected_good_reply = _expected_message_dict(plane, good_reply.message_id)
 
     payload = _run_exchange(capsys, plane, recipient="codex")
-    assert payload["delivery_count"] == 10
-    assert payload["reply_count"] == 2
-    assert payload["error_count"] == 10
+    assert payload["delivery_count"] == 13
+    assert payload["reply_count"] == 3
+    assert payload["error_count"] == 14
 
     by_mid = {row["message_id"]: row for row in payload["deliveries"]}
     assert by_mid[good_msg.message_id]["ok"] is True
@@ -714,6 +763,11 @@ def test_corrupt_row_emits_typed_error_while_sibling_rows_still_print(
     assert by_mid[bad_prov_dup_key_msg.message_id]["error"] == "provenance_corrupt"
     assert by_mid[bad_prov_dup_key_msg.message_id]["message"] is None
 
+    for blob_msg in (bad_blob_sender_msg, bad_blob_meta_msg, bad_blob_foreign_delivery_msg):
+        assert by_mid[blob_msg.message_id]["ok"] is False
+        assert by_mid[blob_msg.message_id]["error"] == "message_row_corrupt"
+        assert by_mid[blob_msg.message_id]["message"] is None
+
     assert by_mid[bad_utf8_msg.message_id]["ok"] is False
     assert by_mid[bad_utf8_msg.message_id]["error"] == "provenance_corrupt"
     assert by_mid[bad_utf8_msg.message_id]["message"] is None
@@ -733,8 +787,13 @@ def test_corrupt_row_emits_typed_error_while_sibling_rows_still_print(
     assert replies_by_mid[reply_to_missing_meta.message_id]["reply_link_status"] == "unreadable_parent"
     assert replies_by_mid[reply_to_missing_meta.message_id]["error"] == "message_not_found"
     assert replies_by_mid[reply_to_missing_meta.message_id]["parent_conversation_id"] == missing_meta_parent.conversation_id
+    # BLOB in_reply_to fails closed as corrupt_reply rather than misreporting missing_parent with coerced bytes.
+    assert replies_by_mid[bad_blob_reply_parent_msg.message_id]["ok"] is False
+    assert replies_by_mid[bad_blob_reply_parent_msg.message_id]["reply_link_status"] == "corrupt_reply"
+    assert replies_by_mid[bad_blob_reply_parent_msg.message_id]["error"] == "message_row_corrupt"
+    assert replies_by_mid[bad_blob_reply_parent_msg.message_id]["message"] is None
 
-    # Boundary refusals still fail closed with typed JSON errors and exit 3 (F1, F9).
+    # Boundary refusals still fail closed with typed JSON errors and exit 3 (F1, F9, R1-F1).
     bad_since = _run_exchange(capsys, plane, recipient="codex", since="not-a-date", expected_rc=EXIT_ERROR)
     assert bad_since["error"] == "invalid_since"
     overflow_since = _run_exchange(
@@ -749,3 +808,26 @@ def test_corrupt_row_emits_typed_error_while_sibling_rows_still_print(
         capsys, plane.parent / "absent-plane", recipient="codex", expected_rc=EXIT_ERROR,
     )
     assert missing_store["error"] == "exchange_store_unavailable"
+
+    # Root-resolution refusals emit path-free JSON with exit 3 across --root and default/env forms.
+    checkout_root = plane.parent / "checkout-root"
+    (checkout_root / ".git").mkdir(parents=True)
+    assert _run_exchange(capsys, checkout_root, recipient="codex", expected_rc=EXIT_ERROR)["error"] == "plane_root_is_git_checkout"
+    assert _run_exchange(capsys, Path("~nonexistent_exchange_user_zzz"), recipient="codex", expected_rc=EXIT_ERROR)["error"] == "plane_root_unresolvable"
+    assert _run_exchange(capsys, "", recipient="codex", expected_rc=EXIT_ERROR)["error"] == "plane_root_unresolvable"
+
+    retired_root = plane.parent / "retired-plane"
+    retired_root.mkdir()
+    (retired_root / "READ_ME_CANONICAL_ON_JOB_HOST.txt").write_text("retired\n", encoding="utf-8")
+    with monkeypatch.context() as guard:
+        guard.delenv("FLEET_COMMS_ALLOW_LOCAL_SHADOW", raising=False)
+        guard.setattr("lu_machinery.fleet_comms.paths.configured_host_state_root", lambda: None)
+        assert _run_exchange(capsys, retired_root, recipient="codex", expected_rc=EXIT_ERROR)["error"] == "retired_local_plane"
+        guard.setenv("FLEET_COMMS_ROOT", str(retired_root))
+        assert _run_exchange(capsys, None, recipient="codex", expected_rc=EXIT_ERROR)["error"] == "retired_local_plane"
+        guard.setenv("FLEET_COMMS_ROOT", str(checkout_root))
+        assert _run_exchange(capsys, None, recipient="codex", expected_rc=EXIT_ERROR)["error"] == "plane_root_is_git_checkout"
+        guard.delenv("FLEET_COMMS_ROOT", raising=False)
+        guard.delenv("LU_STATE_ROOT", raising=False)
+        guard.setattr("lu_machinery.common.repo_root.configured_host_state_root", lambda *_a, **_kw: None)
+        assert _run_exchange(capsys, None, recipient="codex", expected_rc=EXIT_ERROR)["error"] == "exchange_store_unavailable"

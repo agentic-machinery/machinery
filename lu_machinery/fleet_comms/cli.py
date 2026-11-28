@@ -439,8 +439,16 @@ def cmd_fleet_exchange(args: argparse.Namespace) -> int:
         read_exchange_rows,
     )
 
+    raw_root = args.root
+    if raw_root is not None and not str(raw_root).strip():
+        sys.stdout.write(dump_exchange_json(exchange_error_payload("plane_root_unresolvable")))
+        return EXIT_ERROR
     try:
-        payload = read_exchange_rows(args.recipient, args.since, root=_authority_root(args))
+        payload = read_exchange_rows(
+            args.recipient,
+            args.since,
+            root=Path(raw_root) if raw_root is not None else None,
+        )
     except ExchangeRowsError as exc:
         sys.stdout.write(dump_exchange_json(exchange_error_payload(exc.code)))
         return EXIT_ERROR
@@ -1501,7 +1509,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Authority plane storage root (default: FLEET_COMMS_ROOT or shared plane root)",
     )
-    fleet_exchange.set_defaults(func=cmd_fleet_exchange)
+    fleet_exchange.set_defaults(func=cmd_fleet_exchange, _exchange_json_errors=True)
 
     formal = sub.add_parser(
         "formal-job",
@@ -1801,19 +1809,39 @@ def main(argv: list[str] | None = None) -> int:
     if func is None:
         parser.print_help(sys.stderr)
         return EXIT_USAGE
+    exchange_json_errors = bool(getattr(args, "_exchange_json_errors", False))
     try:
         if getattr(args, "root", None):
             validate_plane_root(Path(args.root))
         return int(func(args))
-    except MachineryConfigError as exc:
-        sys.stderr.write(str(exc) + "\n")
-        return EXIT_USAGE
+    except (PlaneRootAnchorError, MachineryConfigError, ValueError) as exc:
+        if exchange_json_errors:
+            from lu_machinery.fleet_comms.exchange_rows import (
+                dump_exchange_json,
+                exchange_error_payload,
+                plane_root_error_code,
+            )
+
+            sys.stdout.write(dump_exchange_json(exchange_error_payload(plane_root_error_code(exc))))
+            return EXIT_ERROR
+        if isinstance(exc, MachineryConfigError):
+            sys.stderr.write(str(exc) + "\n")
+            return EXIT_USAGE
+        if isinstance(exc, PlaneRootAnchorError):
+            # #7172: notebook plane-status must fail closed with the retire message,
+            # not a raw traceback (cli-help-standard).
+            sys.stderr.write(str(exc) + "\n")
+            return EXIT_ERROR
+        raise
     except FleetCommsCliError as exc:
-        sys.stderr.write(str(exc) + "\n")
-        return EXIT_ERROR
-    except PlaneRootAnchorError as exc:
-        # #7172: notebook plane-status must fail closed with the retire message,
-        # not a raw traceback (cli-help-standard).
+        if exchange_json_errors:
+            from lu_machinery.fleet_comms.exchange_rows import (
+                dump_exchange_json,
+                exchange_error_payload,
+            )
+
+            sys.stdout.write(dump_exchange_json(exchange_error_payload(str(exc) or "exchange_store_unavailable")))
+            return EXIT_ERROR
         sys.stderr.write(str(exc) + "\n")
         return EXIT_ERROR
 
