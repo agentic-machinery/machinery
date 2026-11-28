@@ -89,7 +89,7 @@ headroom. When a result is missed, fix the rule, skill, tool or check that allow
 - [ ] Localization claims trace locale selection in the rendering consumer or cite a test
       rendering the Ukrainian locale; a string table alone is insufficient.
 - [ ] The open mistakes-ledger entries checked as known traps.
-- [ ] Orders keep issue updates in the body and one closing comment; only the CTO files issues.
+- [ ] Orders keep issue updates in the body and one closing comment; only the CTO and eggbot file issues.
 - [ ] Every factual claim in a brief, an order, or a proposal the CTO endorses or relays is checked against its source text with one command, cited, beyond confirming the source exists.
 - [ ] A worker's claim goes into a brief, a report to the owner or the tracker only with its
       source and after the CTO checked it against code or tool output; a worker's claim the CTO

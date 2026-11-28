@@ -543,12 +543,12 @@ Every OPEN issue belongs to **exactly one stream epic**. The registry is
 `lu_machinery/config/issue_streams.yaml` (streams → epic numbers; mirrored in
 `docs/WORKSTREAMS.md` § Streams). This is how orchestrators stay on track and schedule:
 
-**Only the CTO opens GitHub issues.** Epic and lane drivers report findings to the CTO
+**Only the CTO and eggbot open GitHub issues.** Epic and lane drivers report findings to the CTO
 through Fleet Comms; the CTO opens, folds or drops them.
 
 - **Cold start**: your queue = YOUR stream's epic checklist/sub-issues, not the global
   issue list. Check `/api/issues/streams` (from `lu_machinery.orchestration.issue_stream_audit`) for drift.
-- **Before the CTO files (#10665)**: search open issues for duplicates by symptom AND by
+- **Before the CTO or eggbot files (#10665)**: search open issues for duplicates by symptom AND by
   affected file. When an open parent issue has the same outcome, add the finding there as
   a checklist item. Open a new linked issue only when the work needs its own PR or has a
   different outcome, and give it an owner and acceptance criteria. Security work and
@@ -593,7 +593,7 @@ default); unknown attribution or liveness always preserves them.
 
 Every task follows this workflow. No exceptions for non-trivial changes.
 
-1. **Use the CTO's issue** — only the CTO opens GitHub issues; epic and lane drivers
+1. **Use the CTO's issue** — only the CTO and eggbot open GitHub issues; epic and lane drivers
    report findings to the CTO through Fleet Comms. When the CTO orders a brief with no
    issue, use that brief as the card. The issue is linked to exactly one stream epic.
 2. **Review the plan** — obtain outside input and incorporate the disposition.
