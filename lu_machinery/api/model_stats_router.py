@@ -8,9 +8,11 @@ One read-only collector joins two durable sources:
   together with the merged delivery a task recorded itself.
 
 One refresh computes every window (24 hours, 7, 30, 90 days and all) and the ISO-week buckets; the route serves a
-window of that snapshot and ``ModelStatsCollector`` exposes the same snapshot on the Monitor's ``/metrics``.
-``/metrics`` keeps the four longer windows for its existing model stats and exports token gauges at 24 hours
-and seven days. ``view=page`` serves
+window of that snapshot. ``ModelStatsCollector`` exposes a second, public-scope snapshot on the Monitor's shared,
+unauthenticated ``/metrics``: the same collection over confirmed-public rows only (a row of a private or
+unclassified repository, or with a declared data class, is left out, fail closed) and merges of public
+repositories only. ``/metrics`` keeps the four longer windows for its model stats and exports token gauges at
+24 hours and seven days. ``view=page`` serves
 the same figures without the per-class tree and without reply text. ``view=samples`` serves that reply text
 alone, and the page asks for it on its own. Every figure
 splits by the concrete model id and the effective effort. Unknown effort is shown separately from model totals.
@@ -63,6 +65,7 @@ from lu_machinery.review.model_catalog import (
     VALID_REVIEW_PROFILES,
     VALID_RISKS,
 )
+from lu_machinery.telemetry.emit import record_visibility
 
 from . import planning
 from .model_stats_rows import (
@@ -2017,11 +2020,13 @@ def _weeks(groups: _Weeks) -> list[dict[str, Any]]:
 
 
 def collect(batch_state_dir: Path, primary_root: Path, now: datetime | None = None, *,
-            landing: Landing | None = None) -> dict[str, Any]:
+            landing: Landing | None = None, public_only: bool = False) -> dict[str, Any]:
     """One snapshot: every window and the ISO-week buckets, from the summary rows, the publication ledger, one landing
     scan and one read of the files changed between blocked and approved review heads.
 
     The catalogs are read afresh for each collection: no reading of an earlier one, failed or valid, is reused.
+    ``public_only`` keeps only confirmed-public rows (``telemetry.emit.record_visibility``) and merges of public
+    repositories: the scope the shared, unauthenticated ``/metrics`` may show.
     """
     refresh_readings()
     for reading in (_catalog_models, _known_models, _model_runtime_levels):
@@ -2036,6 +2041,9 @@ def collect(batch_state_dir: Path, primary_root: Path, now: datetime | None = No
         outcomes, outcome_counts = _Outcomes(), Counter({"registry_unreadable": 1})
     catalog = fleet_catalog()
     keys = repository_keys(catalog)
+    public_keys = frozenset(key for key, repo in (catalog or {}).items() if repo.authorized_visibility == "public")
+    if public_only:
+        raw_rows = [raw for raw in raw_rows if catalog and record_visibility(raw, catalog) == "public"]
     moments = [m for m in map(_moment, raw_rows) if m]
     first = min(moments, default=until)
     rows = [row for row in _rows(raw_rows, landing or Landing(), alias_resolver(raw_rows), publications, keys)
@@ -2055,7 +2063,8 @@ def collect(batch_state_dir: Path, primary_root: Path, now: datetime | None = No
     # Token spend covers every recorded model and effort, including historical routes absent from today's tables.
     token_rows = rows
     token_work = _token_work(token_rows)
-    merge_times = [pr.at for pr in landing.prs.values() if pr.at < until]
+    merge_times = [pr.at for (repo, _number), pr in landing.prs.items()
+                   if pr.at < until and (not public_only or repo in public_keys)]
     read_repositories = landing.repositories["read"]
     complete_landing = read_repositories > 0 and read_repositories == landing.repositories.total()
     rows = [replace(row, author=None, review_author=None)
@@ -2135,8 +2144,8 @@ def _cache_key(ctx: MonitorContext) -> str:
     return ctx_scoped_ttl_key(ctx, "model-stats", SCHEMA_VERSION)
 
 
-def _compute(ctx: MonitorContext) -> Callable[[], dict[str, Any]]:
-    return lambda: collect(ctx.roots.batch_state_dir, ctx.roots.live_repo_root)
+def _compute(ctx: MonitorContext, *, public_only: bool = False) -> Callable[[], dict[str, Any]]:
+    return lambda: collect(ctx.roots.batch_state_dir, ctx.roots.live_repo_root, public_only=public_only)
 
 
 _log = logging.getLogger(__name__)
@@ -2168,12 +2177,15 @@ def _refresh_off_loop(key: str, compute: Callable[[], dict[str, Any]]) -> None:
     threading.Thread(target=run, name="model-stats-refresh", daemon=True).start()
 
 
-def cached_snapshot(ctx: MonitorContext) -> tuple[dict[str, Any], float] | None:
-    """The stored snapshot and its age; starts the single-flight refresh when absent or older than 300 s."""
-    key = _cache_key(ctx)
+def cached_snapshot(ctx: MonitorContext, *, public_only: bool = False) -> tuple[dict[str, Any], float] | None:
+    """The stored snapshot and its age; starts the single-flight refresh when absent or older than 300 s.
+
+    ``public_only`` reads the separate public-scope snapshot that ``/metrics`` shows.
+    """
+    key = ctx_scoped_ttl_key(ctx, "model-stats-public", SCHEMA_VERSION) if public_only else _cache_key(ctx)
     stored = cache_get_stored(key)
     if stored is None or stored[1] >= REFRESH_SECONDS:
-        _refresh_off_loop(key, _compute(ctx))
+        _refresh_off_loop(key, _compute(ctx, public_only=public_only))
     return None if stored is None else (cast(dict[str, Any], stored[0]), stored[1])
 
 
@@ -2280,14 +2292,17 @@ def _gauge(name: str, help_text: str, labels: list[str]) -> GaugeMetricFamily:
 
 
 class ModelStatsCollector:
-    """Expose the route's cached snapshot on ``/metrics``; a scrape never computes, it only schedules a refresh."""
+    """Expose the public-scope snapshot on the shared ``/metrics``; a scrape never computes, it only schedules a refresh.
+
+    Only confirmed-public settlements feed it, so a private or unclassified settlement never moves a series.
+    """
 
     def __init__(self, context: MonitorContext) -> None:
         self.context = context
 
     def collect(self) -> Iterator[GaugeMetricFamily]:
         try:
-            stored = cached_snapshot(self.context)
+            stored = cached_snapshot(self.context, public_only=True)
         except Exception:  # an unusable context never breaks the scrape
             stored = None
         health = GaugeMetricFamily("lu_model_stats_collection_success", "Whether a model-stats snapshot exists.")

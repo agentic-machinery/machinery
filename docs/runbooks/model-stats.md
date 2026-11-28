@@ -14,7 +14,7 @@ the figures. It admits the metrics model and effort vocabularies, the page's fix
 `unrecognized`, the defined work and review classes, and configured repository keys in landing coverage.
 It groups other labels under `other`. The Monitor's `/metrics`
 exposes the four longer windows (`7d`, `30d`, `90d`, `all`)
-and ISO weeks as gauges for Grafana. The collector is `lu_machinery/api/model_stats_router.py`; it reads only, and
+and ISO weeks as gauges for Grafana, from public-scope settlements only (see [Metrics](#metrics-grafanas-contract)). The collector is `lu_machinery/api/model_stats_router.py`; it reads only, and
 `view=page` and `/metrics` report counts and model, effort, class, pool and repository labels, never prompts,
 bodies, paths, accounts, task ids or reply text.
 
@@ -256,9 +256,17 @@ first column stays visible.
 
 ## Metrics (Grafana's contract)
 
+The shared `/metrics` scrape is unauthenticated, so its gauges come from a separate public-scope snapshot: the
+same collection over confirmed-public rows only and merges of public repositories only. A row counts as public
+when it names exactly one registered repository whose visibility is `public` and declares no data class
+(`lu_machinery/telemetry/emit.py` `record_visibility`); a row of a private or unregistered repository, a row with
+no repository, conflicting declarations or an unreadable registry is left out (fail closed). A private settlement
+therefore moves no series on this scrape; the route and the page keep every row. Private figures on a scraped
+surface wait for trusted caller authorization (TRACETEL-1128 Slice 4).
+
 Prometheus keeps about 15 days, so long history comes from the `window="all"` and weekly gauges of the latest
-scrape, not from range queries. A scrape never computes: it reads the cached snapshot and schedules a refresh
-when the snapshot is older than 300 seconds. Label values come from finite sets: `window` is `7d`, `30d`, `90d` or
+scrape, not from range queries. A scrape never computes: it reads the cached public snapshot and schedules a
+refresh when the snapshot is older than 300 seconds. Label values come from finite sets: `window` is `7d`, `30d`, `90d` or
 `all`; `week` is an ISO week (`2026-W46`) since the first row; `model` is a catalog model id, a bare native alias
 (`opus`, `sonnet`, `haiku`, `fable`) whose version could not be determined, or `unknown`, and any other spelling
 is `other`; `effort` is a catalog effort word

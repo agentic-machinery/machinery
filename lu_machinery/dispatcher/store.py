@@ -394,6 +394,23 @@ def _write_atomic(path: Path, record: dict, exclusive: bool) -> None:
         Path(name).unlink(missing_ok=True)
     if record.get("status") not in ACTIVE:
         _record_summary_row(path, record, version)
+        _record_settlement_event(path, record)
+
+
+def _record_settlement_event(path: Path, record: dict) -> None:
+    """Append the settled record's ``telemetry-event.v2`` settlement event beside its task store; never raises.
+
+    Every terminal write re-emits it; readers deduplicate by ``(task_id, run_nonce)``. Like the model-stats row,
+    a record written outside a ``tasks`` store gets no event.
+    """
+    if path.parent.name != "tasks" or record.get("status") not in TERMINAL:
+        return
+    try:
+        from lu_machinery.telemetry import emit
+
+        emit.emit_settlement(record, path.parent.parent)
+    except Exception as exc:
+        logging.getLogger(__name__).warning("telemetry settlement event not written: %s", type(exc).__name__)
 
 
 def _record_summary_row(path: Path, record: dict, version: int) -> None:
