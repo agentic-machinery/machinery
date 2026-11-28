@@ -329,19 +329,24 @@ def _security_verdict_blocks(reply: str) -> bool:
     return any(_SECURITY_PASS.match(reply, match.end()) is None for match in _SECURITY_VERDICT.finditer(reply))
 
 
-# The one line a security sign-off adds to the review-loop reply, after SCORE and before the JSON fence.
+# The security sign-off: the first line of the sealed reply's ``overall.explanation`` is exactly this text.
+# Schema-bound review dispatch seals only the findings object (``dispatcher/worker.py``), so the sign-off
+# lives inside it.
 SECURITY_ATTESTATION = "SECURITY_VERDICT: PASS"
 
 
 @dataclass(frozen=True)
 class _SecuritySignals:
-    """What a reply states about security, read as the verdict reader reads it.
+    """What a reply states about security, read the way every verdict reader reads it.
 
-    ``texts`` is the reply's visible prose (code fences and top-level JSON values removed) and every
-    decoded string of its top-level JSON values, so a JSON escape cannot hide a declaration. ``None``
-    for ``texts`` means the reply's JSON cannot be decided.
+    ``payload`` is the reply as ``parse_reviewer_json`` reads it, else None. ``texts`` is the reply's
+    visible prose (code fences and top-level JSON values removed) and every decoded string of each
+    distinct JSON reading (``payload`` and the Markdown top-level values), so neither a JSON escape nor
+    an indented code block hides a declaration or a finding. ``None`` for ``texts`` means the reply's
+    JSON cannot be decided.
     """
 
+    payload: Mapping[str, Any] | None
     texts: tuple[str, ...] | None
     security_findings: tuple[str, ...]
 
@@ -357,41 +362,55 @@ class _SecuritySignals:
         return sum(len(_SECURITY_VERDICT.findall(text)) for text in self.texts or ())
 
 
+_UNDECIDABLE = _SecuritySignals(None, None, ())
+
+
 def _security_signals(reply: str) -> _SecuritySignals:
+    values: list[Any] = []
     try:
-        values = tuple(_top_level_json_values(reply))
+        payload: dict[str, Any] | None = parse_reviewer_json(reply)
+    except ContractError:
+        payload = None
+        # The verdict reader decodes a whole-JSON reply leniently (``_review_verdict_and_count``). One the
+        # strict reader refuses (a duplicate key, a non-JSON constant) cannot be decided.
+        try:
+            json_depth.loads(reply, max_depth=_JSON_MAX_DEPTH)
+        except ValueError:
+            pass
+        except RecursionError:
+            return _UNDECIDABLE
+        else:
+            return _UNDECIDABLE
+    else:
+        values.append(payload)
+    try:
+        values.extend(value for value in _top_level_json_values(reply) if value not in values)
         prose = _without_code_fences(_without_inline_json(reply), keep_unclosed=False)
     except (ValueError, RecursionError):
-        return _SecuritySignals(None, ())
-    findings = tuple(
+        return _UNDECIDABLE
+    findings = tuple(dict.fromkeys(
         str(finding.get("id"))
         for value in values
         if isinstance(value, Mapping) and isinstance(value.get("findings"), list)
         for finding in value["findings"]
         if isinstance(finding, Mapping) and finding.get("category") == SECURITY_CATEGORY
-    )
-    return _SecuritySignals((prose, *(text for value in values for text in _strings(value))), findings)
+    ))
+    return _SecuritySignals(payload, (prose, *(text for value in values for text in _strings(value))), findings)
 
 
-def _attested_on_designated_line(reply: str) -> bool:
-    """Whether the review-loop envelope carries ``SECURITY_ATTESTATION`` on a line after SCORE and before its fence.
+def _signed_off(reply: str, signals: _SecuritySignals) -> bool:
+    """Whether the reply is one JSON object whose ``overall.explanation`` opens with the one ``SECURITY_ATTESTATION``.
 
-    The envelope is the one ``parse_reviewer_json`` accepts (a VERDICT line, a SCORE line, one JSON fence).
+    The object is the reply as ``parse_reviewer_json`` reads it, bare or as one whole json fence; the review-loop
+    envelope carries text beside the object, so it never signs off. The declaration is counted across the visible
+    prose and every decoded string, and must be that line alone.
     """
-    if not reply.lstrip(" \t\r\n").startswith("VERDICT:"):
+    payload = signals.payload
+    if payload is None or reply.lstrip(" \t\r\n").startswith("VERDICT:") or signals.declarations != 1:
         return False
-    try:
-        parse_reviewer_json(reply)
-    except ContractError:
-        return False
-    from markdown_it import MarkdownIt
-
-    lines = _commonmark_lines(reply)
-    lines = lines[next(index for index, line in enumerate(lines) if line.strip(" \t")):]
-    fences = [token for token in MarkdownIt("commonmark").parse("\n".join(lines)) if token.type == "fence"]
-    if len(fences) != 1 or fences[0].map is None:
-        return False
-    return [line.rstrip(" \t") for line in lines[2:fences[0].map[0]]].count(SECURITY_ATTESTATION) == 1
+    overall = payload.get("overall")
+    explanation = overall.get("explanation") if isinstance(overall, Mapping) else None
+    return isinstance(explanation, str) and explanation.split("\n", 1)[0] == SECURITY_ATTESTATION
 
 
 def _critical_review_seat(task: Mapping[str, Any], model: str) -> bool:
@@ -401,14 +420,31 @@ def _critical_review_seat(task: Mapping[str, Any], model: str) -> bool:
 
 def _inherited_security_reviews(
     comments: Sequence[Mapping[str, Any]], login: str, *, task_root: Path, task_id: str, started: str,
+    repository: str, number: int, branch: str,
 ) -> tuple[str, ...]:
-    """The other recorded reviews on this PR whose sealed reply has an open security signal, or cannot be read.
+    """The other reviews of this PR whose sealed reply has an open security signal, or cannot be read.
 
-    A later reply that omits such a finding has not resolved it: only a security sign-off does. The sealed reply
-    is read from the task record of the run the marker names; without one, from the unedited comment when it
-    publishes the whole reply. A review with neither counts, because nothing shows it was clean.
+    A later reply that omits such a finding has not resolved it: only a security sign-off does. Two sources are
+    read, so a review counts whether or not its verdict was published:
+
+    - every finished review run of this PR (``review_lineage.lineage_runs``, hot and archived records), with
+      its sealed reply;
+    - every trusted verdict marker. Its reply is read from the task record of the run the marker names;
+      without one, from the unedited comment when it publishes the whole reply. A review with neither
+      counts, because nothing shows it was clean.
+
+    A task ledger that cannot be read refuses (``LineageRefused``).
     """
+    from lu_machinery.review.review_lineage import lineage_runs
+
     found: list[str] = []
+    for run in lineage_runs(task_root, repository=repository, number=number, branch=branch):
+        if run.record.get("status") != "done" or (run.task_id, _normalized_started(run.record)) == (task_id, started):
+            continue
+        if run.reply is None:
+            found.append(f"{run.task_id} (reply unavailable)")
+        elif _security_signals(run.reply).open:
+            found.append(run.task_id)
     for index, marker in _trusted_markers(comments, login):
         if (marker["task"], marker["started"]) == (task_id, started):
             continue
@@ -451,8 +487,8 @@ def _require_security_approval(
     """Refuse an approval an open security signal contradicts, or one that lacks a required security sign-off.
 
     The sign-off is required on a critical review (security path, critical risk or the security profile) and after
-    any other review on the PR raised a security finding: exactly one ``SECURITY_ATTESTATION`` line on the
-    envelope's designated line, from a ``critical_review`` seat.
+    any other review of the PR raised a security finding: the reply's ``overall.explanation`` opens with the one
+    ``SECURITY_ATTESTATION`` line (``_signed_off``), from a ``critical_review`` seat.
     """
     signals = _security_signals(reply)
     if signals.texts is None:
@@ -465,15 +501,15 @@ def _require_security_approval(
         raise RecordError("SECURITY_APPROVAL_REFUSED: the reply carries a security verdict that is not PASS")
     if not critical and not inherited:
         return
-    why = "critical review" if critical else "another review on this PR raised a security finding (" + (
+    why = "critical review" if critical else "another review of this PR raised a security finding (" + (
         ", ".join(inherited) + ")"
     )
     if not critical_seat:
         raise RecordError(f"SECURITY_APPROVAL_REFUSED: {why}: the sign-off needs a critical_review seat")
-    if signals.declarations != 1 or not _attested_on_designated_line(reply):
+    if not _signed_off(reply, signals):
         raise RecordError(
-            f"SECURITY_APPROVAL_REFUSED: {why}: APPROVE needs exactly one {SECURITY_ATTESTATION!r} line, "
-            "after the SCORE line and before the JSON fence"
+            f"SECURITY_APPROVAL_REFUSED: {why}: APPROVE needs a reply that is one JSON object whose "
+            f"overall.explanation opens with the line {SECURITY_ATTESTATION!r}, the only security verdict in the reply"
         )
 
 
@@ -4073,6 +4109,7 @@ def record(
                 critical_seat=_critical_review_seat(task, model),
                 inherited=_inherited_security_reviews(
                     comments, login, task_root=task_root, task_id=task_id, started=started,
+                    repository=repository, number=number, branch=branch,
                 ),
             )
         if repaired is not None and verdict == "APPROVED":
@@ -4568,8 +4605,8 @@ def main(argv: list[str] | None = None) -> int:
         "A security-sensitive review (profile security, a SECURITY_VERDICT or a security finding in the\n"
         "reply, or a security label on the PR or a linked issue) is published with its finding count only.\n"
         "A security finding at any priority never approves. APPROVE on a critical review, or after another\n"
-        f"review on the PR raised a security finding, needs one '{SECURITY_ATTESTATION}' line after SCORE\n"
-        "and before the JSON fence, from a critical_review seat.",
+        "review of the PR raised a security finding, needs a critical_review seat and a reply that is one JSON\n"
+        f"object whose overall.explanation opens with the line '{SECURITY_ATTESTATION}'.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=f"{RECORDER_EXAMPLES}  {RECORDER_COMMAND} --task-id review-unit --pr 1\n"
         f"  {RECORDER_COMMAND} --task-id review-unit --pr 1 "
