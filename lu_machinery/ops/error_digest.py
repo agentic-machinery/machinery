@@ -40,14 +40,13 @@ _EGRESS_TIMEOUT_S = 60
 _MICROSECOND = timedelta(microseconds=1)
 _VERSION = "v1"
 _LEDGER = "error-digest-kinds.v1.json"
-_PUBLISH_STATE = ".error-digest-publish.v1.json"
+_PUBLISH_STATE = ".error-digest-publish.v2.json"
 _REPORT_PREFIX = "error-digest-"
 _TOP_KINDS = 10
 _JOURNAL_HEADLINE_LIMIT = 140
 _JOURNAL_BODY_LIMIT = 2000
 _SIGNATURE = re.compile(r"[0-9a-f]{12}")
-_PROPOSAL_KEY = re.compile(r"error-digest:([0-9]{4}-[0-9]{2}-[0-9]{2})(?::[1-9][0-9]*)?")
-_SHA256 = re.compile(r"[0-9a-f]{64}")
+_PROPOSAL_KEY = re.compile(r"error-digest:([0-9]{4}-[0-9]{2}-[0-9]{2})")
 _SEVERITIES = ("error", "warning", "unparsed")
 _TIMESTAMP = re.compile(
     r"(?<!\w)\d{4}-\d\d-\d\d(?:[Tt ]\d\d:\d\d:\d\d(?:[.,]\d+)?(?:[Zz]|[+-]\d\d:?\d\d| UTC)?)?(?!\w)"
@@ -476,6 +475,17 @@ def _date_text(value: object) -> bool:
     return isinstance(value, str) and date.fromisoformat(value).isoformat() == value
 
 
+def _ledger_row(row: object, *, proposed: bool) -> bool:
+    return (
+        isinstance(row, dict) and _date_text(row["first_seen"])
+        and isinstance(row["template"], str) and isinstance(row["source"], str)
+        and row["severity"] in _SEVERITIES
+        and (not proposed or (
+            _date_text(row["proposal_day"]) and store.parse_utc_timestamp(row["proposed_at"]) is not None
+        ))
+    )
+
+
 def _load_ledger(path: Path) -> dict[str, Any]:
     """An absent ledger is empty. An invalid ledger blocks proposals."""
     try:
@@ -483,14 +493,7 @@ def _load_ledger(path: Path) -> dict[str, Any]:
         if not isinstance(records, dict):
             raise ValueError
         for sig, row in records.items():
-            if (
-                not _SIGNATURE.fullmatch(sig) or not isinstance(row, dict)
-                or not _date_text(row["first_seen"])
-                or not isinstance(row["template"], str) or not isinstance(row["source"], str)
-                or row["severity"] not in _SEVERITIES
-                or not _date_text(row["proposal_day"])
-                or store.parse_utc_timestamp(row["proposed_at"]) is None
-            ):
+            if not _SIGNATURE.fullmatch(sig) or not _ledger_row(row, proposed=True):
                 raise ValueError
     except FileNotFoundError:
         return {}
@@ -499,57 +502,67 @@ def _load_ledger(path: Path) -> dict[str, Any]:
     return records
 
 
-def _valid_attempt_key(key: str) -> bool:
-    match = _PROPOSAL_KEY.fullmatch(key)
-    return match is not None and _date_text(match[1])
+def _attempt_day(key: object) -> str:
+    match = _PROPOSAL_KEY.fullmatch(key) if isinstance(key, str) else None
+    if match is None or not _date_text(match[1]):
+        raise ValueError("invalid proposal key")
+    return match[1]
 
 
 def _load_publish_state(path: Path) -> dict[str, Any]:
+    """The pending proposal, kept until Fleet returns its receipt and the ledger records it."""
     try:
         state = json_depth.loads(path.read_text(), max_depth=4)
-        if not isinstance(state, dict) or not isinstance(state["delivery_unknown"], dict):
-            raise ValueError
-        unknown = state["delivery_unknown"]
-        if any(not _valid_attempt_key(key) or not _SHA256.fullmatch(body) for key, body in unknown.items()):
+        if not isinstance(state, dict) or set(state) != {"attempt"}:
             raise ValueError
         attempt = state["attempt"]
         if attempt is not None and (
-            not isinstance(attempt, dict) or not _valid_attempt_key(attempt["key"])
-            or attempt["key"] in unknown or not _SHA256.fullmatch(attempt["body_sha256"])
-            or not isinstance(attempt["kinds"], list) or not attempt["kinds"]
-            or not all(_SIGNATURE.fullmatch(sig) for sig in attempt["kinds"])
+            not isinstance(attempt, dict) or set(attempt) != {"key", "sender", "body", "proposed"}
+            or not _attempt_day(attempt["key"])
+            or not isinstance(attempt["sender"], str) or not attempt["sender"]
+            or not isinstance(attempt["body"], str) or not attempt["body"]
+            or not isinstance(attempt["proposed"], dict) or not attempt["proposed"]
+            or not all(
+                _SIGNATURE.fullmatch(sig) and _ledger_row(row, proposed=False)
+                for sig, row in attempt["proposed"].items()
+            )
         ):
             raise ValueError
     except FileNotFoundError:
-        return {"attempt": None, "delivery_unknown": {}}
+        return {"attempt": None}
     except (KeyError, TypeError, ValueError, RecursionError):
         raise DigestError("publish state: unavailable (invalid_state)") from None
     return state
 
 
-def _finish_attempt(state: dict, path: Path, *, delivered: bool) -> None:
+def _deliver(state: dict, state_path: Path, ledger: dict, ledger_path: Path, deadline: float) -> DigestError | None:
+    """Send the pending proposal, record its kinds, then clear it.
+
+    The proposal keeps its key and body across runs. When an earlier send
+    committed, Fleet returns that receipt and creates no second message.
+    """
     attempt = state["attempt"]
-    if not delivered:
-        state["delivery_unknown"][attempt["key"]] = attempt["body_sha256"]
+    try:
+        _publish_proposal(attempt["body"], attempt["sender"], attempt["key"], deadline - _EGRESS_TIMEOUT_S)
+    except DigestError as exc:
+        return exc
+    proposed_at = datetime.now(UTC).isoformat()
+    day = _attempt_day(attempt["key"])
+    for sig, row in attempt["proposed"].items():
+        ledger[sig] = {**row, "proposed_at": proposed_at, "proposal_day": day}
+    _write_state(ledger_path, _json_bytes(ledger), replace=True)
     state["attempt"] = None
-    _write_state(path, _json_bytes(state), replace=True)
+    _write_state(state_path, _json_bytes(state), replace=True)
+    return None
 
 
-def _unknown_notes(state: dict, day: date) -> str:
-    if not state:
+def _pending_note(state: dict) -> str:
+    if not (attempt := state.get("attempt")):
         return ""
-    base_key = f"error-digest:{day}"
-    attempts = {
-        int(key.removeprefix(base_key).removeprefix(":") or "0"): body_sha
-        for key, body_sha in state["delivery_unknown"].items()
-        if key == base_key or key.startswith(f"{base_key}:")
-    }
-    if not attempts:
-        return ""
-    latest = max(attempts)
+    body_sha = hashlib.sha256(attempt["body"].encode()).hexdigest()
     return (
-        f"Fleet delivery_unknown for {day} attempt {latest}, body SHA-256 {attempts[latest]}. "
-        f"Uncertain attempts on this day: {len(attempts)}."
+        f"Fleet proposal for {_attempt_day(attempt['key'])} not confirmed, body SHA-256 {body_sha}. "
+        "The next run resends it under the same key."
     )
 
 
@@ -729,7 +742,7 @@ def _collect_for_publish(
                 new_sigs.add(sig)
         count = None if ledger_error else len(new_sigs)
         if current in due and current != day:
-            banner = "\n".join(filter(None, (ledger_error, _unknown_notes(state, current))))
+            banner = "\n".join(filter(None, (ledger_error, _pending_note(state))))
             headline, body = _journal_summary(report, count, banner)
             _post_journal(cli, current, headline, body, sender, deadline)
     # The target is the last day in the collection. Its note includes the
@@ -793,38 +806,27 @@ def _publish_run(day: date, directory: Path, sender: str, *, backfill: bool, max
             state = _load_publish_state(state_path)
         except DigestError as exc:
             ledger_error = str(exc)
+        failure = DigestError(ledger_error) if ledger_error else None
         recovered_day = None
         if attempt := state.get("attempt"):
-            matched_day = attempt["key"].split(":")[1]
+            matched_day = _attempt_day(attempt["key"])
             recovered_day = date.fromisoformat(matched_day)
-            # The ledger replacement is atomic. If it did not commit, an
-            # interrupted attempt cannot establish delivery and its key is spent.
-            delivered = all(ledger.get(sig, {}).get("proposal_day") == matched_day for sig in attempt["kinds"])
-            _finish_attempt(state, state_path, delivered=delivered)
+            if all(ledger.get(sig, {}).get("proposal_day") == matched_day for sig in attempt["proposed"]):
+                # The ledger replacement is atomic and committed: only the clear is left.
+                state["attempt"] = None
+                _write_state(state_path, _json_bytes(state), replace=True)
+            else:
+                failure = _deliver(state, state_path, ledger, ledger_path, deadline)
         kinds, report, count = _collect_for_publish(
             directory, day, backfill=backfill, ledger=ledger, ledger_error=ledger_error,
             state=state, recovered_day=recovered_day, cli=cli, sender=sender, deadline=deadline,
         )
-        failure = DigestError(ledger_error) if ledger_error else None
         if not failure and kinds and not any(row["proposal_day"] == day.isoformat() for row in ledger.values()):
             body, proposed = _prepare_proposal(day, kinds, max_new)
-            sequence = len(state["delivery_unknown"])
-            key = f"error-digest:{day}:{sequence}" if sequence else f"error-digest:{day}"
-            state["attempt"] = {"key": key, "body_sha256": hashlib.sha256(body.encode()).hexdigest(),
-                                "kinds": list(proposed)}
+            state["attempt"] = {"key": f"error-digest:{day}", "sender": sender, "body": body, "proposed": proposed}
             _write_state(state_path, _json_bytes(state), replace=True)
-            try:
-                _publish_proposal(body, sender, key, deadline - _EGRESS_TIMEOUT_S)
-            except DigestError as exc:
-                _finish_attempt(state, state_path, delivered=False)
-                failure = exc
-            else:
-                proposed_at = datetime.now(UTC).isoformat()
-                for sig, row in proposed.items():
-                    ledger[sig] = {**row, "proposed_at": proposed_at, "proposal_day": day.isoformat()}
-                _write_state(ledger_path, _json_bytes(ledger), replace=True)
-                _finish_attempt(state, state_path, delivered=True)
-        banner = "\n".join(filter(None, (ledger_error, _unknown_notes(state, day))))
+            failure = _deliver(state, state_path, ledger, ledger_path, deadline)
+        banner = "\n".join(filter(None, (ledger_error, _pending_note(state))))
         headline, journal_body = _journal_summary(report, count, banner)
         _post_journal(cli, day, headline, journal_body, sender, deadline)
         if failure:

@@ -2252,6 +2252,7 @@ class AuthorityService:
         key = _nonempty(idempotency_key, field="idempotency_key")
         live_delivery = deliver and imported_source is None and imported_delivery_state is None
         channel_row = self._require_channel_tx(channel) if channel is not None else None
+        subscriber_fanout = imported_recipients is None and targets is None and channel_row is not None
         if imported_recipients is not None:
             # Historical records keep the recipients they were written with.
             recipients_norm = _normalize_recipients(imported_recipients)
@@ -2270,11 +2271,10 @@ class AuthorityService:
         else:
             recipients_norm = _normalize_recipients(require_admitted(target).recipient for target in targets or ())
             _refuse_session_cto_recipients(recipients_norm)
-            if live_delivery:
-                _require_readable_recipients(recipients_norm)
         supervisory_inbox = len(recipients_norm) == 1 and bool(_SUPERVISORY_RECIPIENT_RE.fullmatch(recipients_norm[0]))
         if live_delivery and kind_name == _SUPERVISORY_REQUEST_KIND and not supervisory_inbox:
             raise AuthorityServiceError("supervisory_recipient_required")
+        requested_revisions = self._normalize_context_revisions(context_revisions, None)
         revisions = self._normalize_context_revisions(context_revisions, channel_row)
         provenance_data = _safe_json_mapping(provenance)
         deadline = self._normalize_deadline(deadline_at)
@@ -2302,21 +2302,40 @@ class AuthorityService:
             "deadline_at": deadline or "",
             "imported_source": imported_source or "",
         }
+        # The key binds what the caller asked for. The channel's current context
+        # revision and its subscribers are store state that can change after a
+        # commit, so they stay out of the digest: a retry after a crash returns the
+        # original receipt (#1620). Rows written before then hold the digest of the
+        # whole payload, which still matches while that state is unchanged.
+        request = {
+            **payload,
+            "recipients": None if subscriber_fanout else payload["recipients"],
+            "context_revisions": requested_revisions,
+        }
         namespace = "message"
         if live_delivery and kind_name == "request" and len(recipients_norm) == 1 and not supervisory_inbox:
             # Reissue the same misrouted request as mail. Both records keep their key
             # and payload binding, and the old delivery keeps its original deadline.
-            legacy_sha = _sha256_json({**payload, "kind": _SUPERVISORY_REQUEST_KIND})
+            misrouted = (
+                _sha256_json({**request, "kind": _SUPERVISORY_REQUEST_KIND}),
+                _sha256_json({**payload, "kind": _SUPERVISORY_REQUEST_KIND}),
+            )
             if self._conn.execute(
                 """SELECT 1 FROM authority_idempotency
-                   WHERE namespace = 'message' AND idempotency_key = ? AND payload_sha256 = ?""",
-                (key, legacy_sha),
+                   WHERE namespace = 'message' AND idempotency_key = ? AND payload_sha256 IN (?, ?)""",
+                (key, *misrouted),
             ).fetchone() is not None:
                 namespace = "message:reclassified-request"
-        payload_sha = _sha256_json(payload)
-        existing_id = self._check_idempotency_tx(namespace, key, payload_sha)
+        payload_sha = _sha256_json(request)
+        existing_id = self._check_idempotency_tx(
+            namespace, key, payload_sha, legacy_sha256=_sha256_json(payload)
+        )
         if existing_id is not None:
             return self.get_message(existing_id)
+        if live_delivery and imported_recipients is None and not subscriber_fanout:
+            # A retry of a committed message returns its receipt above even when a
+            # recipient has since become unreadable; only a new message is refused.
+            _require_readable_recipients(recipients_norm)
 
         mid = message_id or new_id("message")
         if self._conn.execute("SELECT 1 FROM comms_messages WHERE message_id = ?", (mid,)).fetchone():
@@ -3178,7 +3197,14 @@ class AuthorityService:
             raise AuthorityServiceError("invalid_job_kind")
         return result
 
-    def _check_idempotency_tx(self, namespace: str, key: str, payload_sha256: str) -> str | None:
+    def _check_idempotency_tx(
+        self, namespace: str, key: str, payload_sha256: str, *, legacy_sha256: str | None = None
+    ) -> str | None:
+        """Return the subject a key already names, or refuse a different payload under it.
+
+        ``legacy_sha256`` is the digest an earlier record format stored for the
+        same request; it is accepted as well, never written.
+        """
         row = self._conn.execute(
             """SELECT payload_sha256, subject_id FROM authority_idempotency
                WHERE namespace = ? AND idempotency_key = ?""",
@@ -3186,7 +3212,7 @@ class AuthorityService:
         ).fetchone()
         if row is None:
             return None
-        if str(row["payload_sha256"]) != payload_sha256:
+        if str(row["payload_sha256"]) not in {payload_sha256, legacy_sha256}:
             raise AuthorityServiceError("idempotency_key_reused_with_different_payload")
         return str(row["subject_id"])
 
