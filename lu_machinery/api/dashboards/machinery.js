@@ -198,7 +198,7 @@
 
   function table(headers, rows, stacked = false) {
     if (!rows.length) return '<p class="muted">None.</p>';
-    return `<table><thead><tr>${headers.map(h => `<th>${escapeHtml(h)}</th>`).join("")}</tr></thead><tbody>`
+    return `<table><thead><tr>${headers.map(h => `<th scope="col">${escapeHtml(h)}</th>`).join("")}</tr></thead><tbody>`
       + rows.map(cells => `<tr>${stacked ? labelled(cells, headers) : cells.join("")}</tr>`).join("") + "</tbody></table>";
   }
 
@@ -298,7 +298,7 @@
     return {total: accounts.length, runsOut, unknownCount, deficitCount, healthyCount, signedOut};
   }
 
-  function subscriptionChips(subs, logins, href = "/subscriptions") {
+  function subscriptionChips(subs, logins, href = "/models#budget") {
     if (!subs) return [];
     const {runsOut, unknownCount, signedOut} = summarizeSubscriptions(subs, logins);
     const noun = runsOut === 1 ? "account runs out before reset" : "accounts run out before reset";

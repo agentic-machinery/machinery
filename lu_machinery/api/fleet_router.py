@@ -1487,15 +1487,30 @@ def fleet_seats(ctx: MonitorContext = Depends(get_ctx)) -> JSONResponse:
     )
 
 
+def _seat_ids_map(seats: list[_FleetSeat]) -> dict[str, str]:
+    recipient_counts = Counter(name for item in seats for name in item.recipients)
+    return {
+        name: item.seat
+        for item in seats
+        for name in item.recipients
+        if recipient_counts[name] == 1
+    }
+
+
+def _projected_sender(sender: object, seat_ids: dict[str, str]) -> str:
+    if not isinstance(sender, str):
+        return "other"
+    return "cto" if is_session_cto_recipient(sender) else seat_ids.get(sender, "other")
+
+
 def _delivery_item(row: sqlite3.Row, seat_ids: dict[str, str], now: datetime) -> dict[str, Any]:
     message_id = row["message_id"]
-    sender = row["sender"]
     created = _panel_datetime(row["created_at"])
     completed = _panel_datetime(row["completed_at"])
     end = now if row["completed_at"] is None else completed
     return {
         "message_id": message_id if isinstance(message_id, str) and AUTHORITY_MESSAGE_ID_RE.fullmatch(message_id) else None,
-        "sender": "cto" if is_session_cto_recipient(sender) else seat_ids.get(sender, "other"),
+        "sender": _projected_sender(row["sender"], seat_ids),
         "recipient": seat_ids.get(row["recipient"], "other"),
         "kind": panel_values.choice(row["kind"], _DELIVERY_KINDS, "other"),
         "state": panel_values.choice(row["state"], _DELIVERY_STATES, "other"),
@@ -1528,16 +1543,11 @@ def fleet_deliveries(
     elif since != "all" and since not in _DELIVERY_WINDOWS:
         raise HTTPException(status_code=422, detail="unknown_since")
 
-    recipient_counts = Counter(name for item in seats for name in item.recipients)
-    seat_ids = {
-        name: item.seat
-        for item in seats
-        for name in item.recipients
-        if recipient_counts[name] == 1
-    }
+    all_recipients = sorted({name for item in seats for name in item.recipients})
+    seat_ids = _seat_ids_map(seats)
     now = datetime.now(UTC)
     clauses = ["d.recipient IN (SELECT value FROM json_each(?))"]
-    params = [json.dumps(selected.recipients if selected is not None else list(recipient_counts))]
+    params = [json.dumps(selected.recipients if selected is not None else all_recipients)]
     if state is not None:
         clauses.append("d.state = ?")
         params.append(state)
@@ -2258,6 +2268,7 @@ def fleet_acp_conversation_detail(
 _MESSAGE_MAX_BODY_BYTES = 256 * 1024
 _MESSAGE_MAX_RESPONSE_BYTES = 512 * 1024
 _MESSAGE_MAX_ID = 128
+_MESSAGE_MAX_SENDER = 256
 _MESSAGE_MAX_SCOPE = 512
 _MESSAGE_READ_SLOTS = BoundedSemaphore(4)
 _VISIBLE_MESSAGE_FROM = """
@@ -2300,11 +2311,22 @@ def _message_id_valid(value: object) -> bool:
 
 
 def _message_thread(
-    connection: SQLiteConnection, recipients: str, scope: tuple[str, str, str | None], limit: int, offset: int
+    connection: SQLiteConnection,
+    recipients: str,
+    seat_ids: dict[str, str],
+    scope: tuple[str, str, str | None],
+    limit: int,
+    offset: int,
 ) -> JSONResponse:
+    max_sender = (
+        max(_MESSAGE_MAX_SENDER, *(len(name.encode("utf-8")) for name in seat_ids))
+        if seat_ids
+        else _MESSAGE_MAX_SENDER
+    )
     rows = connection.execute(
         """
         SELECT m.message_id,
+               CASE WHEN length(CAST(m.sender AS BLOB)) <= ? THEN m.sender END AS sender,
                CASE WHEN length(CAST(m.kind AS BLOB)) <= 40 THEN m.kind END AS kind,
                CASE WHEN length(CAST(meta.created_at AS BLOB)) <= 40 THEN meta.created_at END AS created_at
         """
@@ -2314,11 +2336,12 @@ def _message_thread(
         AND length(CAST(m.message_id AS BLOB)) <= ?
         ORDER BY meta.created_at, meta.message_id LIMIT ? OFFSET ?
         """,
-        (recipients, *scope, _MESSAGE_MAX_ID, limit + 1, offset),
+        (max_sender, recipients, *scope, _MESSAGE_MAX_ID, limit + 1, offset),
     ).fetchall()
     items = [
         {
             "message_id": row["message_id"],
+            "sender": _projected_sender(row["sender"], seat_ids),
             "kind": panel_values.choice(row["kind"], _DELIVERY_KINDS, "other"),
             "created_at": panel_values.timestamp(row["created_at"]),
         }
@@ -2370,6 +2393,7 @@ def _read_visible_message(
         if drivers != "available" or external != "available":
             return _message_not_available("roster_unavailable")
         recipients = json.dumps(sorted({name for seat in seats for name in seat.recipients}))
+        seat_ids = _seat_ids_map(seats)
         with _read_connection(ctx, plane_root=root) as (connection, availability):
             if connection is None:
                 return _message_not_available(availability)
@@ -2396,7 +2420,7 @@ def _read_visible_message(
             ):
                 return _message_response(422, state="missing_or_corrupt")
             if page is not None:
-                return _message_thread(connection, recipients, (thread, conversation, channel), *page)
+                return _message_thread(connection, recipients, seat_ids, (thread, conversation, channel), *page)
             return _message_body(connection, root, message_id)
     except PlaneRootAnchorError:
         return _message_not_available("plane_root_unavailable")

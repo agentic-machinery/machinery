@@ -346,6 +346,14 @@ def test_machinery_split_pages_contracts_shared_assets_and_scoped_reads():
         assert [href for href, attrs, _ in links if 'aria-current="page"' in attrs] == [page.url], page.file
         assert not any("product" in attrs for _, attrs, _ in links)
 
+    # Superseded pages have no redirects and answer 404.
+    from fastapi import HTTPException
+
+    for removed in ("subscriptions", "subscriptions.html", "routing", "routing.html", "model-stats", "model-stats.html"):
+        with pytest.raises(HTTPException) as missing:
+            main.serve_static(removed, request, context)
+        assert missing.value.status_code == 404, removed
+
     # Every page loads the shared stylesheet, script, landmarks, and only its own API endpoints.
     expected_apis = {
         "index.html": {
@@ -354,26 +362,29 @@ def test_machinery_split_pages_contracts_shared_assets_and_scoped_reads():
             "/api/runtime/logins",
             "/api/git/pull-requests",
         },
-        "subscriptions.html": {
-            "/api/state/routing-budget",
-            "/api/runtime/logins",
-        },
         "fleet.html": {
             "/api/delegate/active",
             "/api/delegate/recent",
-            "/api/comms/v1/metrics",
-            "/api/git/pull-requests",
             "/api/fleet/seats",
+            "/api/git/pull-requests",
+        },
+        "comms.html": {
             "/api/fleet/deliveries",
+            "/api/fleet/seats",
+            "/api/comms/v1/metrics",
             "/api/fleet/messages",
-            "/api/fleet/model-stats",
             "/api/fleet/acp/conversations",
             "/api/runtime/acp/conversations",
         },
         "pull-requests.html": {"/api/git/pull-requests"},
         "milestones.html": {"/api/milestones"},
-        "routing.html": {"/api/runtime/routing"},
-        "model-stats.html": {"/api/fleet/model-stats", "/api/fleet/model-stats/planning", "/api/state/routing-budget"},
+        "models.html": {
+            "/api/state/routing-budget",
+            "/api/runtime/logins",
+            "/api/fleet/model-stats/planning",
+            "/api/runtime/routing",
+            "/api/fleet/model-stats",
+        },
         "journal.html": {"/api/journal"},
     }
     assert set(expected_apis) == set(html_files)
@@ -612,7 +623,7 @@ assert.match(M.prChips(unknownTotalPrs).join(''), /<b>1<\/b> open PRs observed Â
   assert.doesNotMatch(afterFailure, /queued 1/);
   assert.match(afterFailure, /#42/);
 
-  // Defect classes: request on page load or poll, stale selection, and body content interpreted as HTML.
+  // Defect classes: request on page load or poll, stale selection, and body content interpreted as HTML (comms.html).
   {
     const listeners = new Map();
     const pending = new Map();
@@ -620,15 +631,19 @@ assert.match(M.prChips(unknownTotalPrs).join(''), /<b>1<\/b> open PRs observed Â
     const timers = [];
     const firstId = 'message_00000000000000000000000000000001';
     const secondId = 'message_00000000000000000000000000000002';
+    let headingFocused = 0;
     document.createElement = tag => ({
-      tag, children: [], dataset: {}, style: {}, textContent: '',
+      tag, children: [], dataset: {}, style: {}, textContent: '', attrs: {},
       set innerHTML(_) { assert.fail('Message reader inserted HTML'); },
+      setAttribute(k, v) { this.attrs[k] = v; },
       appendChild(child) { this.children.push(child); },
       addEventListener(type, listener) { this[type] = listener; },
     });
     for (const id of ['message-body', 'message-thread']) {
       document.getElementById(id).replaceChildren = function (...nodes) { this.children = nodes; };
     }
+    document.getElementById('comms-layout').classList = {add() {}, remove() {}};
+    document.getElementById('message-reader-heading').focus = () => { headingFocused += 1; };
     document.getElementById('message-reader').focus = () => {};
     document.addEventListener = (type, handler) => listeners.set(type, [...(listeners.get(type) || []), handler]);
     const fetchPanel = globalThis.fetch;
@@ -641,8 +656,9 @@ assert.match(M.prChips(unknownTotalPrs).join(''), /<b>1<\/b> open PRs observed Â
     const originalInterval = globalThis.setInterval;
     globalThis.setInterval = callback => timers.push(callback);
     try {
-      document._fleetFiltersBound = false;
-      new Function('Machinery', fleetBody + '\nrunner.start();')(M);
+      const commsBody = extractScript('comms.html', '\nrunner.start();');
+      document._commsControlsBound = false;
+      new Function('Machinery', commsBody + '\nrunner.start();')(M);
       await new Promise(resolve => setImmediate(resolve));
       assert.equal(pending.size, 0);
       assert.ok(requests.some(url => url.startsWith('/api/fleet/deliveries')));
@@ -663,10 +679,14 @@ assert.match(M.prChips(unknownTotalPrs).join(''), /<b>1<\/b> open PRs observed Â
         bodyUrl(firstId), threadUrl(firstId), bodyUrl(secondId), threadUrl(secondId),
       ]);
       assert.equal(document.getElementById('message-reader').hidden, false);
+      assert.equal(headingFocused, 2);
       const literalBody = '<img src=x onerror="window.executed=true">';
       resolve(bodyUrl(secondId), {state: 'ok', message_id: secondId, body: literalBody});
       resolve(threadUrl(secondId), {
-        messages: [{message_id: firstId, kind: 'message', created_at: '2026-11-26T11:00:01Z'}],
+        messages: [
+          {message_id: firstId, sender: 'cto', kind: 'request', created_at: '2026-11-26T11:00:01Z'},
+          {message_id: secondId, sender: 'driver', kind: 'message', created_at: '2026-11-26T11:05:01Z'},
+        ],
         limit: 50,
         next_offset: 50,
       });
@@ -674,13 +694,15 @@ assert.match(M.prChips(unknownTotalPrs).join(''), /<b>1<\/b> open PRs observed Â
       resolve(bodyUrl(firstId), {state: 'ok', message_id: firstId, body: 'late body'});
       resolve(threadUrl(firstId), {messages: [], limit: 50, next_offset: null});
       await new Promise(resolve => setImmediate(resolve));
-      const bodyNode = document.getElementById('message-body').children[1];
+      const bodyNode = document.getElementById('message-body').children[0];
       assert.equal(bodyNode.tag, 'pre');
       assert.equal(bodyNode.textContent, literalBody);
       assert.equal(document.getElementById('messages-status').textContent, 'Message loaded.');
       await timers[0]();
       assert.equal(pending.size, 0, 'A poll while the reader is open requests zero bodies and threads');
       const [members, next] = document.getElementById('message-thread').children;
+      assert.match(members.children[0].children[0].textContent, /11:00 request, cto/);
+      assert.match(members.children[1].children[0].textContent, /11:05 message, driver \(this\)/);
       members.children[0].children[0].click();
       assert.deepEqual([...pending.keys()], [bodyUrl(firstId)], 'A thread member loads only its own body');
       next.click();
@@ -689,7 +711,10 @@ assert.match(M.prChips(unknownTotalPrs).join(''), /<b>1<\/b> open PRs observed Â
       resolve(bodyUrl(firstId), {state: 'ok', message_id: firstId, body: 'first body'});
       resolve(nextPage, {messages: [], limit: 50, next_offset: null});
       await new Promise(resolve => setImmediate(resolve));
-      assert.equal(document.getElementById('message-body').children[1].textContent, 'first body');
+      assert.equal(document.getElementById('message-body').children[0].textContent, 'first body');
+      // Escape closes the reader.
+      listeners.get('keydown').forEach(listener => listener({key: 'Escape'}));
+      assert.equal(document.getElementById('message-reader').hidden, true);
     } finally {
       globalThis.setInterval = originalInterval;
       globalThis.fetch = fetchPanel;
@@ -933,7 +958,7 @@ assert.match(M.prChips(unknownTotalPrs).join(''), /<b>1<\/b> open PRs observed Â
     const clocks = [];
     globalThis.setInterval = (fn) => { clocks.push(fn); return clocks.length; };
     try {
-      const statsScript = extractScript('model-stats.html', '\n$("window").addEventListener');
+      const statsScript = extractScript('models.html', '\nrunner.start();');
       const stats = new Function('Machinery', statsScript + '\nreturn {load};')(M);
       const wallBefore = fakeNow;
       const monoBefore = monoNow;
@@ -987,6 +1012,119 @@ assert.match(M.prChips(unknownTotalPrs).join(''), /<b>1<\/b> open PRs observed Â
     Date.now = realDateNow;
     performance.now = realPerfNow;
   }
+})().catch(err => { console.error(err); process.exitCode = 1; });
+"""
+    ran = subprocess.run(
+        ["node", "-e", node_script, str(dashboards / "machinery.js")],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    assert ran.returncode == 0, ran.stderr
+
+
+def test_comms_page_loads_without_body_requests() -> None:
+    """Defect class: list load or polling on comms.html fetches message bodies or transcripts."""
+    import subprocess
+
+    from lu_machinery.common.repo_root import machinery_path
+
+    dashboards = machinery_path("api/dashboards")
+    node_script = r"""
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const path = require('node:path');
+const M = require(process.argv[1]);
+const dashboardsDir = path.dirname(process.argv[1]);
+
+const html = fs.readFileSync(path.join(dashboardsDir, 'comms.html'), 'utf8');
+const marker = '<script src="/machinery.js"></script>';
+const after = html.slice(html.indexOf(marker) + marker.length);
+const inline = after.slice(after.indexOf('<script>') + '<script>'.length, after.indexOf('</script>'));
+const body = inline.slice(0, inline.indexOf('\nrunner.start();'));
+
+const elements = new Map();
+const getEl = (id) => {
+  if (!elements.has(id)) {
+    elements.set(id, {
+      id, textContent: '', innerHTML: '', className: '', hidden: true, value: '', options: [],
+      dataset: {}, classList: {add() {}, remove() {}},
+      setAttribute() {}, addEventListener() {}, querySelector() { return null; },
+      replaceChildren() {},
+    });
+  }
+  return elements.get(id);
+};
+globalThis.location = {origin: 'http://127.0.0.1:8765', pathname: '/comms', search: '', hash: ''};
+globalThis.document = {
+  documentElement: {dataset: {}},
+  querySelectorAll() { return []; },
+  querySelector() { return null; },
+  addEventListener() {},
+  createElement(tag) { return {tag, children: [], dataset: {}, style: {}, textContent: '', setAttribute() {}, appendChild() {}, addEventListener() {}}; },
+  getElementById: getEl,
+};
+
+const requested = [];
+const timers = [];
+globalThis.setInterval = (fn) => { timers.push(fn); return timers.length; };
+globalThis.fetch = async (url) => {
+  const s = String(url);
+  requested.push(s);
+  if (s.startsWith('/api/fleet/deliveries')) {
+    return {
+      ok: true,
+      status: 200,
+      headers: {get: () => null},
+      text: async () => JSON.stringify({
+        availability: 'available',
+        driver_roster: 'available',
+        external_roster: 'available',
+        total: 3,
+        limit: 50,
+        offset: 0,
+        next_offset: null,
+        filters: {seat: null, state: null, since: '7d'},
+        deliveries: [
+          {message_id: 'message_0000000000000000000000000000000a', sender: 'cto', recipient: 'driver', kind: 'request', state: 'queued', attempt_count: 1, waited_s: 30, created_at: '2026-11-28T00:00:00Z'},
+          {message_id: 'message_0000000000000000000000000000000a', sender: 'cto', recipient: 'eggbot', kind: 'request', state: 'queued', attempt_count: 1, waited_s: 30, created_at: '2026-11-28T00:00:00Z'},
+          {message_id: 'message_0000000000000000000000000000000b', sender: 'driver', recipient: 'cto', kind: 'message', state: 'acknowledged', attempt_count: 1, waited_s: 5, created_at: '2026-11-28T00:01:00Z'},
+        ],
+      }),
+    };
+  }
+  return {
+    ok: true,
+    status: 200,
+    headers: {get: () => null},
+    text: async () => JSON.stringify({
+      availability: 'available', driver_roster: 'available', external_roster: 'available', seats: [],
+      source: 'authority', store: {reachable: true}, deliveries: {queued: 2}, jobs: {queued: 0},
+      failure_windows: {'24h': {dead_letters: {total: 0}, failed_deliveries: {total: 0}, failed_jobs: {total: 0}}},
+    }),
+  };
+};
+
+(async () => {
+  new Function('Machinery', body + '\nrunner.start();')(M);
+  await new Promise(resolve => setImmediate(resolve));
+  await new Promise(resolve => setImmediate(resolve));
+  assert.ok(requested.some(u => u.startsWith('/api/fleet/deliveries')));
+  assert.equal(requested.some(u => u.includes('/api/fleet/messages/')), false, `body/thread fetched on load: ${requested}`);
+  assert.equal(requested.some(u => u.includes('/transcript')), false, `transcript fetched on load: ${requested}`);
+
+  // Adjacent deliveries sharing message_id are grouped into one button row; pager counts deliveries.
+  const listHtml = getEl('messages-content').innerHTML;
+  assert.match(listHtml, /cto â†’ driver, eggbot/);
+  assert.match(listHtml, /Deliveries 1â€“3 of 3/);
+  assert.equal((listHtml.match(/data-open-message=/g) || []).length, 2);
+
+  // Two simulated polling ticks still make zero message body/thread/transcript requests.
+  await timers[0]();
+  await timers[0]();
+  assert.equal(requested.some(u => u.includes('/api/fleet/messages/')), false, `body/thread fetched on poll: ${requested}`);
+  assert.equal(requested.some(u => u.includes('/transcript')), false, `transcript fetched on poll: ${requested}`);
 })().catch(err => { console.error(err); process.exitCode = 1; });
 """
     ran = subprocess.run(
