@@ -3990,17 +3990,27 @@ def test_cap_continuation_grant_from_unverified_source_is_refused(monkeypatch, t
                 github_reader=pr_self_comment_gh,
             )
 
-    # 4. Wrong lane/kind/status, negative/fenced/free-text, or mismatched disposition target is refused (F1).
+    # 4. Wrong lane/kind/status, negative/fenced/hidden/CRLF-conflict, or mismatched disposition is refused (F1).
     auth_line = f"CAP_CONTINUATION: authorize repo={REPOSITORY} pr=#42 head={capped_head}"
+    deny_line = f"CAP_CONTINUATION: deny repo={REPOSITORY} pr=#42 head={capped_head}"
+    # CRLF and CR visible directives are recognized identically to LF (including denials).
+    assert recorder._cap_directive_actions(f"{auth_line}\r\n", stored_repo=REPOSITORY, number=42, capped_head=capped_head) == {"authorize"}
+    assert recorder._cap_directive_actions(f"{auth_line}\r", stored_repo=REPOSITORY, number=42, capped_head=capped_head) == {"authorize"}
     for bad_note in (
         {"id": "cto-cap-42", "lane": "other", "kind": "decision", "status": "active", "statement": auth_line},
         {"id": "cto-cap-42", "lane": "cto", "kind": "blocker", "status": "active", "statement": auth_line},
         {"id": "cto-cap-42", "lane": "cto", "kind": "decision", "status": "done", "statement": auth_line},
         {"id": "cto-cap-42", "lane": "cto", "kind": "decision", "status": ["active"], "statement": auth_line},
         {"id": "cto-cap-42", "lane": "cto", "kind": "decision", "status": "active", "statement": f"Denied {REPOSITORY} #42 {capped_head}"},
-        {"id": "cto-cap-42", "lane": "cto", "kind": "decision", "status": "active", "statement": f"CAP_CONTINUATION: deny repo={REPOSITORY} pr=#42 head={capped_head}"},
+        {"id": "cto-cap-42", "lane": "cto", "kind": "decision", "status": "active", "statement": deny_line},
         {"id": "cto-cap-42", "lane": "cto", "kind": "decision", "status": "active", "statement": f"```\n{auth_line}\n```"},
-        {"id": "cto-cap-42", "lane": "cto", "kind": "decision", "status": "active", "statement": f"{auth_line}\nCAP_CONTINUATION: deny repo={REPOSITORY} pr=#42 head={capped_head}"},
+        {"id": "cto-cap-42", "lane": "cto", "kind": "decision", "status": "active", "statement": f"<!--\n{auth_line}\n-->"},
+        {"id": "cto-cap-42", "lane": "cto", "kind": "decision", "status": "active", "statement": f"Note <!--\n{auth_line}\n-->"},
+        {"id": "cto-cap-42", "lane": "cto", "kind": "decision", "status": "active", "statement": f"`{auth_line}`"},
+        {"id": "cto-cap-42", "lane": "cto", "kind": "decision", "status": "active", "statement": f"> {auth_line}"},
+        {"id": "cto-cap-42", "lane": "cto", "kind": "decision", "status": "active", "statement": f"{auth_line}\n{deny_line}"},
+        {"id": "cto-cap-42", "lane": "cto", "kind": "decision", "status": "active", "statement": f"{auth_line}\n{deny_line}\r\n"},
+        {"id": "cto-cap-42", "lane": "cto", "kind": "decision", "status": "active", "statement": f"{auth_line}\r{deny_line}\r"},
         {"id": "cto-cap-42", "lane": "cto", "kind": "decision", "status": "active", "statement": f"CAP_CONTINUATION: authorize repo={REPOSITORY} pr=#99 head={capped_head}"},
         {"id": "cto-cap-42", "lane": "cto", "kind": "decision", "status": "active", "statement": f"CAP_CONTINUATION: authorize repo=other/repo pr=#42 head={capped_head}"},
     ):
@@ -4050,31 +4060,93 @@ def test_cap_continuation_grant_from_unverified_source_is_refused(monkeypatch, t
     state["head"] = capped_head
     assert recorder._read_cap_continuation(recorder._cap_continuation_receipts(tasks), repository=REPOSITORY, number=42) is None
 
-    # 6. Unexhausted budget and unknown PR tier (F3) are refused at issuance.
-    sub_tasks, _c, _calls, sub_heads, _st = _seed_capped_pr(monkeypatch, tmp_path / "sub", rounds=2)
-    sub_ds = lambda _id: {
-        "id": "cto-cap-42",
-        "lane": "cto",
-        "kind": "decision",
-        "status": "active",
-        "statement": f"CAP_CONTINUATION: authorize repo={REPOSITORY} pr=#42 head={sub_heads[-1]}",
-    }
-    with pytest.raises(recorder.CapContinuationRefused, match=r"CAP_CONTINUATION_REFUSED\[not_exhausted\]"):
-        recorder.grant_cap_continuation(
-            repository=REPOSITORY,
-            number=42,
-            capped_head=sub_heads[-1],
-            disposition_ref="driver-state:cto-cap-42",
-            authority="claude-cto",
-            task_root=sub_tasks,
-            lock_root=tmp_path / "sub" / "locks",
-            env=cto_env,
-            driver_state_reader=sub_ds,
+    # 6. Unknown/fallback PR tier (F3), malformed comment history (F7), and unexhausted budget are refused.
+    # Missing file status (would trigger classify_pr_files High fallback on a docs-only diff) is refused.
+    with monkeypatch.context() as mp:
+        mp.setattr(
+            recorder.GitHubAdapter, "pr_file_rows", lambda *_a, **_k: [{"filename": "README.md"}],
         )
-    monkeypatch.setattr(
-        recorder.GitHubAdapter, "pr_file_rows", lambda *_a, **_k: (_ for _ in ()).throw(sweep.SweepError("files unavailable")),
-    )
-    with pytest.raises(recorder.CapContinuationRefused, match=r"CAP_CONTINUATION_REFUSED\[pr\]"):
+        with pytest.raises(recorder.CapContinuationRefused, match=r"CAP_CONTINUATION_REFUSED\[pr\]"):
+            recorder.grant_cap_continuation(
+                repository=REPOSITORY,
+                number=42,
+                capped_head=capped_head,
+                disposition_ref="driver-state:cto-cap-42",
+                authority="claude-cto",
+                task_root=tasks,
+                lock_root=tmp_path / "locks",
+                env=cto_env,
+                driver_state_reader=valid_ds,
+            )
+    # Trivial diff whose learner-content policy lookup fails (High fallback in tiers.py) is refused.
+    with monkeypatch.context() as mp:
+        mp.setattr(
+            recorder.GitHubAdapter, "pr_file_rows", lambda *_a, **_k: [{"filename": "README.md", "status": "modified"}],
+        )
+        mp.setattr(
+            recorder.integration_sweep,
+            "changes_learner_content",
+            lambda _paths: (_ for _ in ()).throw(recorder.DeployPathsError("policy unavailable")),
+        )
+        with pytest.raises(recorder.CapContinuationRefused, match=r"CAP_CONTINUATION_REFUSED\[pr\]"):
+            recorder.grant_cap_continuation(
+                repository=REPOSITORY,
+                number=42,
+                capped_head=capped_head,
+                disposition_ref="driver-state:cto-cap-42",
+                authority="claude-cto",
+                task_root=tasks,
+                lock_root=tmp_path / "locks",
+                env=cto_env,
+                driver_state_reader=valid_ds,
+            )
+    # File lookup raising SweepError is refused.
+    with monkeypatch.context() as mp:
+        mp.setattr(
+            recorder.GitHubAdapter,
+            "pr_file_rows",
+            lambda *_a, **_k: (_ for _ in ()).throw(sweep.SweepError("files unavailable")),
+        )
+        with pytest.raises(recorder.CapContinuationRefused, match=r"CAP_CONTINUATION_REFUSED\[pr\]"):
+            recorder.grant_cap_continuation(
+                repository=REPOSITORY,
+                number=42,
+                capped_head=capped_head,
+                disposition_ref="driver-state:cto-cap-42",
+                authority="claude-cto",
+                task_root=tasks,
+                lock_root=tmp_path / "locks",
+                env=cto_env,
+                driver_state_reader=valid_ds,
+            )
+    # Malformed author_association on a historical comment raises typed refusal, never TypeError (F7).
+    bad_history = [*comments, {"id": 1000, "user": {"login": "fleet"}, "author_association": ["MEMBER"], "body": "x"}]
+    with monkeypatch.context() as mp:
+        mp.setattr(recorder.GitHubAdapter, "comments", lambda *_a, **_k: bad_history)
+        with pytest.raises(recorder.CapContinuationRefused, match=r"CAP_CONTINUATION_REFUSED\[pr\]"):
+            recorder.grant_cap_continuation(
+                repository=REPOSITORY,
+                number=42,
+                capped_head=capped_head,
+                disposition_ref="driver-state:cto-cap-42",
+                authority="claude-cto",
+                task_root=tasks,
+                lock_root=tmp_path / "locks",
+                env=cto_env,
+                driver_state_reader=valid_ds,
+            )
+    # Unexhausted budget (2 of 3 rounds used) is refused.
+    sub_tasks, _c, _calls, sub_heads, _st = _seed_capped_pr(monkeypatch, tmp_path / "sub", rounds=2)
+
+    def sub_ds(_id):
+        return {
+            "id": "cto-cap-42",
+            "lane": "cto",
+            "kind": "decision",
+            "status": "active",
+            "statement": f"CAP_CONTINUATION: authorize repo={REPOSITORY} pr=#42 head={sub_heads[-1]}",
+        }
+    with pytest.raises(recorder.CapContinuationRefused, match=r"CAP_CONTINUATION_REFUSED\[not_exhausted\]"):
         recorder.grant_cap_continuation(
             repository=REPOSITORY,
             number=42,
@@ -4201,6 +4273,50 @@ def test_replayed_or_concurrent_duplicate_cap_continuation_grant_is_refused(monk
         )
     store_entries = sorted(p.name for p in recorder._cap_continuation_receipts(tasks).iterdir())
     assert len(store_entries) == 1 and not store_entries[0].startswith(".")
+
+    # Post-link directory fsync failure rolls back cleanly so admission sees nothing and retry succeeds (F8);
+    # if rollback also fails, it surfaces typed durability_unknown rather than an uncaught OSError.
+    fsync_store = tmp_path / "fsync-store"
+    real_fsync = os.fsync
+    real_unlink = os.unlink
+    fsync_calls = {"count": 0}
+
+    def fail_dir_fsync(fd):
+        fsync_calls["count"] += 1
+        if fsync_calls["count"] == 2:
+            raise OSError(5, "I/O error")
+        return real_fsync(fd)
+
+    sample_receipt = dict(next(val for kind, val in outcomes if kind == "ok"))
+    with monkeypatch.context() as mp:
+        mp.setattr(os, "fsync", fail_dir_fsync)
+        with pytest.raises(recorder.CapContinuationRefused, match=r"CAP_CONTINUATION_REFUSED\[store\]"):
+            recorder._write_cap_continuation_exclusive(
+                fsync_store, primary_key="id:4242", stored_repo="org/repos", number=42, receipt=sample_receipt
+            )
+    assert list(fsync_store.iterdir()) == []
+    # Retry succeeds once directory sync recovers.
+    published = recorder._write_cap_continuation_exclusive(
+        fsync_store, primary_key="id:4242", stored_repo="org/repos", number=42, receipt=sample_receipt
+    )
+    assert published.is_file()
+
+    fsync_store2 = tmp_path / "fsync-store-rollback-fail"
+    fsync_calls["count"] = 0
+
+    def fail_final_unlink(path, *, dir_fd=None):
+        if isinstance(path, str) and not path.startswith("."):
+            raise OSError(5, "I/O error")
+        return real_unlink(path, dir_fd=dir_fd)
+
+    with monkeypatch.context() as mp:
+        mp.setattr(os, "fsync", fail_dir_fsync)
+        mp.setattr(os, "unlink", fail_final_unlink)
+        with pytest.raises(recorder.CapContinuationRefused, match=r"CAP_CONTINUATION_REFUSED\[durability_unknown\]"):
+            recorder._write_cap_continuation_exclusive(
+                fsync_store2, primary_key="id:4242", stored_repo="org/repos", number=42, receipt=sample_receipt
+            )
+    assert recorder._read_cap_continuation(fsync_store2, repository="org/repos", number=42) == sample_receipt
 
 
 @pytest.mark.usefixtures("configured_roots", "recorder_matcher", "agent_runtime_roots")

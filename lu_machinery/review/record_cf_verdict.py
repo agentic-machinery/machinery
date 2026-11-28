@@ -156,7 +156,16 @@ from lu_machinery.review.role_resolution import resolve_routing_reference
 from lu_machinery.review.security_paths import git_changed_paths, is_security_sensitive_change
 from lu_machinery.review.subject_seat import prepare_subject_exclusion
 from lu_machinery.review.target_resolution import TargetResolutionError, resolve_review_repository
-from lu_machinery.review.tiers import ReviewTier, classify_pr_files
+from lu_machinery.review.tiers import (
+    _STATUSES as _TIER_FILE_STATUSES,
+)
+from lu_machinery.review.tiers import (
+    ReviewTier,
+    classify_pr_files,
+)
+from lu_machinery.review.tiers import (
+    _load_table as _load_tier_table,
+)
 from lu_machinery.review.ukrainian_seats import (
     UKRAINIAN_SEAT_ROUTES,
     attested_author_families,
@@ -217,10 +226,9 @@ _CAP_DRIVER_STATE_TIMEOUT_S = 30
 _CAP_DRIVER_STATE_ACTIVE_STATUSES = frozenset({"open", "active"})
 _CAP_REPO_SLUG = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*\Z")
 _CAP_DIRECTIVE_LINE = re.compile(
-    r"^[ \t]*(?:[-*>]?[ \t]*)?CAP_CONTINUATION:[ \t]+(authorize|deny)[ \t]+"
+    r"^[ \t]*CAP_CONTINUATION:[ \t]+(authorize|deny)[ \t]+"
     r"repo=([A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*)[ \t]+"
-    r"pr=#([1-9][0-9]*)[ \t]+head=([0-9a-f]{40})[ \t]*$",
-    re.MULTILINE,
+    r"pr=#([1-9][0-9]*)[ \t]+head=([0-9a-f]{40})[ \t]*$"
 )
 _CAP_DRIVER_STATE_REF = re.compile(r"driver-state:([A-Za-z0-9][A-Za-z0-9._:-]{0,127})\Z")
 _CAP_GITHUB_ISSUE_REF = re.compile(
@@ -2400,7 +2408,12 @@ def _trusted_markers(
         body = item.get("body") if isinstance(item, Mapping) else None
         if not isinstance(body, str) or MARKER_PREFIX not in body:
             continue
-        if _author_login(item, rest_only=True) != login or item.get("author_association") not in TRUSTED_ASSOCIATIONS:
+        if _author_login(item, rest_only=True) != login:
+            continue
+        assoc = item.get("author_association")
+        if not isinstance(assoc, str) or assoc not in TRUSTED_ASSOCIATIONS:
+            if reject_malformed and not isinstance(assoc, str):
+                raise RecordError("malformed trusted verdict comment author_association")
             continue
         marker = parse_marker(body)
         if marker is None:
@@ -3088,10 +3101,15 @@ def _write_cap_continuation_exclusive(
         except OSError as exc:
             raise CapContinuationRefused("store", f"cannot stage cap-continuation receipt: {exc}") from None
         try:
-            with os.fdopen(fd, "wb") as stream:
-                stream.write(payload)
-                stream.flush()
-                os.fsync(stream.fileno())
+            try:
+                with os.fdopen(fd, "wb") as stream:
+                    stream.write(payload)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+            except OSError as exc:
+                raise CapContinuationRefused(
+                    "store", f"cannot write or sync staged cap-continuation receipt: {exc}"
+                ) from None
             try:
                 os.link(tmp_name, name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
             except FileExistsError:
@@ -3101,7 +3119,21 @@ def _write_cap_continuation_exclusive(
                 ) from None
             except OSError as exc:
                 raise CapContinuationRefused("store", f"cannot publish cap-continuation receipt: {exc}") from None
-            os.fsync(dir_fd)
+            try:
+                os.fsync(dir_fd)
+            except OSError as exc:
+                try:
+                    os.unlink(name, dir_fd=dir_fd)
+                except OSError as rollback_exc:
+                    raise CapContinuationRefused(
+                        "durability_unknown",
+                        f"cap-continuation receipt was linked at {name} before directory sync failed ({exc}) "
+                        f"and rollback failed ({rollback_exc}); receipt remains present on disk",
+                    ) from None
+                raise CapContinuationRefused(
+                    "store",
+                    f"cap-continuation store directory sync failed ({exc}); published receipt was rolled back",
+                ) from None
         finally:
             with suppress(OSError):
                 os.unlink(tmp_name, dir_fd=dir_fd)
@@ -3110,11 +3142,48 @@ def _write_cap_continuation_exclusive(
     return path
 
 
+def _cap_visible_lines(text: str) -> list[str]:
+    """Visible CommonMark lines of ``text``, normalizing LF/CRLF/CR and stripping quotes, code, and HTML comments."""
+    from markdown_it import MarkdownIt
+
+    lines = _commonmark_lines(text)
+    parser = MarkdownIt("commonmark")
+    tokens = parser.parse("\n".join(lines))
+    visible_lines: list[str] = []
+    blockquote_depth = 0
+    for token in tokens:
+        if token.type in {"list_item_open", "blockquote_open"} and token.level + 1 >= parser.options["maxNesting"]:
+            raise CapContinuationRefused("disposition", "disposition markdown nesting limit exceeded")
+        if token.type == "blockquote_open":
+            blockquote_depth += 1
+            continue
+        if token.type == "blockquote_close":
+            blockquote_depth = max(0, blockquote_depth - 1)
+            continue
+        if blockquote_depth > 0 or token.type != "inline":
+            continue
+        parts: list[str] = []
+        for child in token.children or ():
+            if child.type == "text":
+                parts.append(child.content)
+            elif child.type in {"softbreak", "hardbreak"}:
+                parts.append("\n")
+            elif child.type in {"html_inline", "code_inline"}:
+                parts.append("\x00")
+            elif child.markup:
+                parts.append(child.markup)
+        cleaned = re.sub(r"<!--[\s\S]*?(?:-->|\Z)", "", "".join(parts))
+        visible_lines.extend(cleaned.split("\n"))
+    return visible_lines
+
+
 def _cap_directive_actions(text: str, *, stored_repo: str, number: int, capped_head: str) -> set[str]:
-    """Structured CAP_CONTINUATION directive actions in ``text`` (outside code fences) bound to repo, PR and head."""
-    visible = _without_code_fences(text, keep_unclosed=False)
+    """Structured CAP_CONTINUATION directive actions in visible lines of ``text`` bound to repo, PR and head."""
     actions: set[str] = set()
-    for match in _CAP_DIRECTIVE_LINE.finditer(visible):
+    for line in _cap_visible_lines(text):
+        match = _CAP_DIRECTIVE_LINE.fullmatch(line)
+        if match is None:
+            continue
         action, repo_token, pr_token, head_token = match.groups()
         if (
             _same_cap_repository(repo_token, stored_repo)
@@ -3339,6 +3408,86 @@ def _verify_cap_disposition(
     )
 
 
+def _verified_pr_tier_for_grant(adapter: GitHubAdapter, repository: str, number: int) -> ReviewTier:
+    """Resolve the PR's review tier without accepting any unknown-input High fallback."""
+    try:
+        rows = adapter.pr_file_rows(repository, number)
+    except SweepError as exc:
+        raise CapContinuationRefused(
+            "pr", f"PR #{number} file list unavailable ({exc}); cannot establish budget exhaustion"
+        ) from None
+    try:
+        paths = pr_file_paths(rows)
+    except (ValueError, TypeError) as exc:
+        raise CapContinuationRefused(
+            "pr", f"PR #{number} file list malformed ({exc}); cannot verify review tier"
+        ) from None
+    if not paths or any(
+        path.startswith("/")
+        or "\\" in path
+        or any(part in {".", "..", ""} for part in path.split("/"))
+        or PurePosixPath(path).as_posix() != path
+        for path in paths
+    ):
+        raise CapContinuationRefused("pr", f"PR #{number} file paths invalid; cannot verify review tier")
+    table = _load_tier_table(None)
+    if table is None:
+        raise CapContinuationRefused("pr", f"review tier table unavailable; cannot verify PR #{number} tier")
+    for index, row in enumerate(rows):
+        status = row.get("status")
+        if not isinstance(status, str) or status not in _TIER_FILE_STATUSES:
+            raise CapContinuationRefused(
+                "pr", f"PR #{number} file row {index} has missing or invalid status; cannot verify review tier"
+            )
+    tier = classify_pr_files(rows)
+    if tier == "high":
+        from fnmatch import fnmatchcase
+
+        tiers_map = table["tiers"]
+        trivial_patterns = tiers_map["trivial"] if isinstance(tiers_map, Mapping) else ()
+        versions_map = table["release_version_files"]
+        version_paths = set(versions_map) if isinstance(versions_map, Mapping) else set()
+        if all(
+            path in version_paths or any(fnmatchcase(path, pattern) for pattern in trivial_patterns)
+            for path in paths
+        ) and not is_security_sensitive_change(paths):
+            try:
+                integration_sweep.changes_learner_content(paths)
+            except DeployPathsError as exc:
+                raise CapContinuationRefused(
+                    "pr", f"learner-content policy unavailable ({exc}); cannot verify PR #{number} tier"
+                ) from None
+    if tier == "trivial":
+        raise CapContinuationRefused("not_exhausted", f"PR #{number} is trivial tier and has no review cap")
+    return tier
+
+
+def _validate_pr_comments_for_grant(
+    comments: object, *, number: int, login: str
+) -> Sequence[Mapping[str, Any]]:
+    """Validate fetched PR comment shapes before verdict, capability-failure, and lineage accounting."""
+    if not isinstance(comments, Sequence) or isinstance(comments, (str, bytes)):
+        raise CapContinuationRefused("pr", f"PR #{number} comments response is malformed")
+    for index, item in enumerate(comments):
+        if not isinstance(item, Mapping):
+            raise CapContinuationRefused("pr", f"PR #{number} comment {index} is malformed")
+        body = item.get("body")
+        if not isinstance(body, str):
+            raise CapContinuationRefused("pr", f"PR #{number} comment {index} body is malformed")
+        assoc = item.get("author_association")
+        if assoc is not None and not isinstance(assoc, str):
+            raise CapContinuationRefused("pr", f"PR #{number} comment {index} has malformed author_association")
+        if (
+            _author_login(item, rest_only=True) == login
+            and assoc is None
+            and (MARKER_PREFIX in body or "<!-- review-capability-failure" in body)
+        ):
+            raise CapContinuationRefused(
+                "pr", f"PR #{number} trusted-login review comment {index} lacks author_association"
+            )
+    return comments
+
+
 def grant_cap_continuation(
     *,
     repository: str,
@@ -3439,23 +3588,14 @@ def grant_cap_continuation(
             )
         review_root = _review_repository_root(stored_repo, root or _repo_root())
         adapter = GitHubAdapter(review_root)
-        _, tier = _pr_files_and_tier(adapter, github.active, number)
-        if tier is None:
-            raise CapContinuationRefused(
-                "pr",
-                f"PR #{number} review tier is unavailable; cannot establish budget exhaustion",
-            )
-        if tier == "trivial":
-            raise CapContinuationRefused(
-                "not_exhausted",
-                f"PR #{number} is trivial tier and has no review cap",
-            )
+        tier = _verified_pr_tier_for_grant(adapter, github.active, number)
         base_budget = repository_review_rounds(stored_repo, tier=tier)
         login = adapter.identity()
         try:
-            comments = adapter.comments(github.active, number)
+            raw_comments = adapter.comments(github.active, number)
         except SweepError as exc:
             raise RecordError(f"comment lookup failed: {exc}") from exc
+        comments = _validate_pr_comments_for_grant(raw_comments, number=number, login=login)
         # Count every charged/reserved head without excluding capped_head, so issuance works whether
         # the PR still sits at its Nth reviewed head or already moved to the refused (N+1)th head.
         history = _charging(
@@ -3891,11 +4031,13 @@ def _post_verdict(repository: str, number: int, comment: str, login: str) -> dic
     if not isinstance(comment_id, int):
         raise RecordError("comment post response lacked id; retry to reconcile")
     readback = _run_json(Request("read-comment", repo=repository, number=comment_id))
+    readback_assoc = readback.get("author_association") if isinstance(readback, dict) else None
     if (
         not isinstance(readback, dict)
         or readback.get("body") != comment
         or _author_login(readback, rest_only=True) != login
-        or readback.get("author_association") not in TRUSTED_ASSOCIATIONS
+        or not isinstance(readback_assoc, str)
+        or readback_assoc not in TRUSTED_ASSOCIATIONS
         or readback.get("created_at") != readback.get("updated_at")
     ):
         raise RecordError("comment readback mismatch; publication state unknown")
@@ -4646,6 +4788,7 @@ def record(
                     and marker["sha"] == sha
                     and marker["task"] == task_id
                     and _author_login(item, rest_only=True) == login
+                    and isinstance(item.get("author_association"), str)
                     and item.get("author_association") in TRUSTED_ASSOCIATIONS
                 ):
                     if (
