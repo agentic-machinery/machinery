@@ -58,7 +58,7 @@ def _run(directory: Path) -> int:
     return digest.main(["--day", _DAY, "--report-dir", str(directory)])
 
 
-def test_signature_ignores_ids_times_paths():
+def test_signature_ignores_ids_times_paths(journal):
     """Volatile details and later traceback lines can split one kind."""
     first = (
         "2025-02-01T03:44:55.666+00:00 Failed #41 uuid b69be3b9-cad2-45aa-863e-8e83db33104d "
@@ -77,6 +77,17 @@ def test_signature_ignores_ids_times_paths():
     assert [digest.signature("journal", "writer.service", "error", template) for template in templates] == [
         "e872923fc557"
     ] * 2
+    github = "gh" + "p_" + "Ab2C" * 9
+    slack_tail = "abcdefghijklmnopqrstuvwxyz"
+    slack = "xox" + "b-" + "1234567890-2345678901-" + slack_tail
+    directory = journal([
+        _entry(PRIORITY="3", MESSAGE="padding " * 24 + github),
+        _entry(PRIORITY="3", MESSAGE=f"provider refused {slack}"),
+    ])
+    assert _run(directory) == 0
+    report = (directory / f"error-digest-{_DAY}.json").read_text()
+    assert "Ab2C" not in report
+    assert slack_tail not in report
 
 
 def test_task_ids_normalised_by_exact_set():
@@ -120,18 +131,28 @@ def test_partial_window_fails_closed(journal, monkeypatch, capsys):
 
 def test_untagged_unit_reported_unproven_not_zero(journal):
     """Child syslog priority cannot prove tagging for a unit's stdout."""
+    uid = str(os.getuid())
     directory = journal(
         [_entry(PRIORITY="6"), _entry(PRIORITY="5", _TRANSPORT="syslog"),
-         _entry("tagged.service", PRIORITY="6")],
+         _entry("tagged.service", PRIORITY="6"),
+         _entry("child.service", PRIORITY="3", _TRANSPORT="journal", _COMM="systemd",
+                _SYSTEMD_UNIT=f"user@{uid}.service", _UID=uid,
+                MESSAGE_ID=digest._UNIT_FAILURE, USER_UNIT="writer.service"),
+         _entry("init.scope", PRIORITY="6", _TRANSPORT="journal", _COMM="systemd",
+                _SYSTEMD_UNIT=f"user@{uid}.service", _UID=uid,
+                MESSAGE_ID=digest._UNIT_FAILURE, USER_UNIT="tagged.service")],
         coverage=[_entry("tagged.service", PRIORITY="7")],
     )
     assert _run(directory) == 0
     path = directory / f"error-digest-{_DAY}.json"
     first = path.read_bytes()
-    assert json.loads(first)["journal"]["units"] == [
-        {"family": "tagged.service", "coverage": "tagged", "error": 0, "warning": 0, "unparsed": 0},
+    report = json.loads(first)
+    assert report["journal"]["units"] == [
+        {"family": "child.service", "coverage": "severity unproven", "error": 1},
+        {"family": "tagged.service", "coverage": "tagged", "error": 1, "warning": 0, "unparsed": 0},
         {"family": "writer.service", "coverage": "severity unproven"},
     ]
+    assert [item["group"] for item in report["kinds"] if item["template"] == "unit-failed"] == [["tagged.service"]]
     journal(head=_START + 1)
     assert _run(directory) == 0
     assert path.read_bytes() == first
