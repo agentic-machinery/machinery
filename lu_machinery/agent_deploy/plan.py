@@ -38,6 +38,7 @@ from lu_machinery.common.repo_root import state_root
 from lu_machinery.common.safe_open import UnsafeEntryError, safe_open_below
 from lu_machinery.host_context import HostContextError, hook_interpreter
 from lu_machinery.lint.lint_agent_skills import _parse_frontmatter, metadata_errors
+from lu_machinery.state_paths import batch_state_rel
 
 DESCRIPTOR = "agents_extensions/deployment.v1.json"
 STATE = ".deploy-state/agent-deploy.v1.json"
@@ -1040,7 +1041,7 @@ def preflight(tree: Tree, plan: Plan, old: dict[str, Any], check: bool, *, works
 @contextlib.contextmanager
 def workspace_anchor(workspace: str) -> Iterator[tuple[Tree, str]]:
     root = state_root().resolve(strict=True)
-    records = "batch_state/agent-deploy"
+    records = batch_state_rel("agent-deploy").as_posix()
     if (root / records).is_relative_to(workspace):
         raise Invalid("workspace digest record requires a state root outside --project-root")
     fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)

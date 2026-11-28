@@ -28,6 +28,7 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from lu_machinery.common import json_depth
+from lu_machinery.state_paths import batch_state_dir
 
 SCHEMA = "machinery.host.v1"
 _SANDBOX_STATE_SCHEMA = "machinery.sandbox-state.v1"
@@ -243,7 +244,7 @@ def _parse(raw: Any) -> HostContext:
 
 
 def _state_assertions(root: Path) -> dict[str, Path]:
-    batch = root / "batch_state"
+    batch = batch_state_dir(root)
     return {
         "LU_STATE_ROOT": root,
         "LEARN_UKRAINIAN_STATE_ROOT": root,
