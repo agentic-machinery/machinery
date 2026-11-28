@@ -9,6 +9,27 @@ this file.
 
 ## [Unreleased]
 
+<a id="v0.1.86"></a>
+## [0.1.86] - 2026-11-28
+
+### Added
+
+- Add the no_live_trigger finding-outcome label ([#1618](https://github.com/agentic-machinery/machinery/pull/1618))
+
+### Changed
+
+- Adopt review policy v2.2 (A+B+C) and canonical sibling links ([#1610](https://github.com/agentic-machinery/machinery/pull/1610))
+
+### Fixed
+
+- Bind the leftover delivery recipes to LU_PYTHON ([#1636](https://github.com/agentic-machinery/machinery/pull/1636))
+- Publish a lease digest, never the holder envelope, in lease status ([#1635](https://github.com/agentic-machinery/machinery/pull/1635))
+- Bound Monitor telemetry, report and refresh routes; serve safe projections ([#1622](https://github.com/agentic-machinery/machinery/pull/1622))
+- Take the product interpreter from the host binding and alert on the runtime ([#1639](https://github.com/agentic-machinery/machinery/pull/1639))
+- Clear host-binding variables for the pytest session ([#1640](https://github.com/agentic-machinery/machinery/pull/1640))
+- Register epic coordination program 5 as an epics stream root ([#1641](https://github.com/agentic-machinery/machinery/pull/1641))
+- Approve only with a typed review_complete attestation ([#1633](https://github.com/agentic-machinery/machinery/pull/1633))
+
 <a id="v0.1.85"></a>
 ## [0.1.85] - 2026-11-28
 
@@ -1965,7 +1986,8 @@ First release: the machinery extracted from learn-ukrainian as the installable `
 - Rollover confirms replacement bindings without a self-answered quiz. ([#65](https://github.com/learn-ukrainian/machinery/pull/65))
 - Deploy derives release identity from packaged bytes. ([#145](https://github.com/learn-ukrainian/machinery/pull/145))
 
-[Unreleased]: https://github.com/agentic-machinery/machinery/compare/v0.1.85...HEAD
+[Unreleased]: https://github.com/agentic-machinery/machinery/compare/v0.1.86...HEAD
+[0.1.86]: https://github.com/agentic-machinery/machinery/compare/v0.1.85...v0.1.86
 [0.1.85]: https://github.com/agentic-machinery/machinery/compare/v0.1.84...v0.1.85
 [0.1.84]: https://github.com/agentic-machinery/machinery/compare/v0.1.83...v0.1.84
 [0.1.83]: https://github.com/agentic-machinery/machinery/compare/v0.1.82...v0.1.83
