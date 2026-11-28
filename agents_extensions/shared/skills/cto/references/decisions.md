@@ -91,6 +91,11 @@ headroom. When a result is missed, fix the rule, skill, tool or check that allow
 - [ ] The open mistakes-ledger entries checked as known traps.
 - [ ] Orders keep issue updates in the body and one closing comment; only the CTO files issues.
 - [ ] Every factual claim in a brief, an order, or a proposal the CTO endorses or relays is checked against its source text with one command, cited, beyond confirming the source exists.
+- [ ] A worker's claim goes into a brief, a report to the owner or the tracker only with its
+      source and after the CTO checked it against code or tool output; a worker's claim the CTO
+      has not checked is labelled as the worker's unverified claim. One claim relayed unchecked
+      said that landing refuses a review run at a lower risk than the tier; no landing check
+      compares the two.
 - [ ] A claim that something is absent from a file or tree comes from a whole-file search (`git grep -n`, `grep -n` on the full blob), never from a head, tail or line-range slice.
 - [ ] Anything not re-derived says NOT CHECKED with its command.
 - [ ] To the operator: answer a direct question first and honestly, then the action; a

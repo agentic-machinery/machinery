@@ -13,6 +13,9 @@ file only points there and adds what the CTO seat learned on top.
 - When the CTO rules that a PR must not land yet (for example until a review covers every item), it applies a hold the merge-queue keeper reads,
   the `hold` label (`HOLD_LABELS`) or the `[hold]` title marker (`HOLD_TITLE`) in `lu_machinery/orchestration/merge_queue_keeper.py`, in the same action
   as the ruling, and names the condition for removing it. An instruction to a lane alone does not stop the keeper.
+- Before closing a PR as superseded, confirm from each PR's own changes against current main
+  that the successor carries every change that is not a version pin; a newer release number
+  alone does not make a PR a successor.
 
 ## Publish orders
 
@@ -69,6 +72,17 @@ keeper waits for the published verdict.
 Name the commands the review route can run. See the [review brief's route table](../../review-loop/references/brief.md#commands-a-read-only-reviewer-can-run).
 Read attestation from the task JSON's top-level `resolved_model_known`, `resolved_model`
 and `resolved_model_source`; never grep nested status output for these fields.
+
+Review tools take the GitHub name: `closeout_cli resolve-reviewer` and `record_cf_verdict
+budget-check` take `--repository <owner>/<name>`, and recording a verdict reads it from the
+review task (`--task-id`); `--repo` is a fleet repository key (the dispatcher, `closeout_cli
+target`). A brief that said "review-loop with `--repo <key>`" made `resolve-reviewer` fail
+closed with `author task provenance conflicts with commit trailer`.
+Every brief takes its `--risk` from `lu_machinery.review.tiers` for the paths it expects to
+change. Edits to skill files rate medium; the release cut's follow-up PR (record the
+release, start the next version) rates high (machinery #1589, #1546), and the review policy
+requires high or critical risk for a High-tier change. No landing check compares the risk a
+review ran at with the tier, so the brief must set it.
 
 When a work item hits the review cap, record the
 [cap disposition](../../review-loop/references/policy.md#4-convergence) before dispatching any
