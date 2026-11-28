@@ -399,6 +399,138 @@ def test_token_matched_warm_hit_withdraws_when_cumulative_age_exceeds_bound(monk
     assert len(calls) == 1
 
 
+def test_cached_routing_budget_ages_api_account_balances(monkeypatch, tmp_path):
+    """Defect class: cached routing-budget responses return row and diagnostic ages unaged.
+
+    A warm cache hit (with or without include_subscriptions=true) must advance every
+    cached age field (api_accounts, agents, codex_accounts, nested codexbar, and
+    diagnostic max ages) by elapsed cache time without mutating the stored snapshot or
+    double-aging cursor/subscriptions.
+    """
+    _configure(monkeypatch, tmp_path, [])
+    ctx = fixture_context(tmp_path)
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(state_helpers, "_ttl_clock", lambda: clock["t"])
+    calls = []
+    stored_snapshot: dict = {}
+
+    def compute(**kwargs):
+        calls.append(1)
+        kwargs["task_generation"].append(state_router._tasks_content_token(kwargs["tasks_dir"]))
+        snapshot = {
+            "generated_at": "2026-11-28T06:00:00Z",
+            "agents": {
+                "codex": {
+                    "eligible": True,
+                    "status": "cool",
+                    "freshness": "fresh",
+                    "stale": False,
+                    "age_s": 500.0,
+                    "codexbar": {"freshness": "fresh", "stale": False, "age_s": 500.0},
+                },
+                "cursor": {
+                    "eligible": True,
+                    "status": "cool",
+                    "freshness": "fresh",
+                    "stale": False,
+                    "age_s": 600.0,
+                },
+            },
+            "codex_accounts": {
+                "codex:b": {
+                    "eligible": True,
+                    "status": "cool",
+                    "freshness": "fresh",
+                    "stale": False,
+                    "age_s": 650.0,
+                    "codexbar": {"freshness": "fresh", "stale": False, "age_s": 650.0},
+                },
+            },
+            "api_accounts": {
+                "deepseek": {
+                    "freshness": "fresh",
+                    "stale": False,
+                    "age_s": 599.0,
+                    "total_balance": 42.0,
+                    "currency": "USD",
+                },
+                "openrouter": {
+                    "freshness": "stale_last_good",
+                    "stale": True,
+                    "age_s": 120.0,
+                    "limit_remaining_usd": 15.0,
+                },
+            },
+            "subscriptions": {
+                "generated_at": "2026-11-28T06:00:00Z",
+                "stale_after_s": 900,
+                "sources": {"usage_cache": {"status": "ok"}},
+                "providers": [
+                    {
+                        "provider": "codex",
+                        "label": "Codex",
+                        "accounts": [
+                            {
+                                "account": "Codex a",
+                                "reading": {"status": "fresh", "age_s": 600.0, "read_at": "2026-11-28T05:50:00Z"},
+                            }
+                        ],
+                    }
+                ],
+            },
+            "recommendation": {"primary_agent_for_code": "codex", "warnings": []},
+            "diagnostics": {
+                "data_age_s": 10.0,
+                "codexbar_max_age_s": 500.0,
+                "notebook_report_max_age_s": 200.0,
+                "stale": False,
+                "stale_threshold_s": 900,
+            },
+            "ranked_by_headroom": [{"lane": "codex"}],
+        }
+        stored_snapshot.clear()
+        stored_snapshot.update(snapshot)
+        return snapshot
+
+    monkeypatch.setattr(state_router, "compute_routing_budget", compute)
+    monkeypatch.setattr(state_router, "schedule_cache_refresh", lambda *_a, **_kw: None)
+    app = FastAPI()
+    app.state.ctx = ctx
+    app.include_router(state_router.router, prefix="/api/state")
+    with TestClient(app) as client:
+        first = client.get("/api/state/routing-budget?include_subscriptions=true").json()
+        assert first["api_accounts"]["deepseek"]["age_s"] == 599.0
+        assert first["api_accounts"]["deepseek"]["freshness"] == "fresh"
+        clock["t"] += 306.0
+        with_subs = client.get("/api/state/routing-budget?include_subscriptions=true").json()
+        without_subs = client.get("/api/state/routing-budget").json()
+
+    assert len(calls) == 1
+    for body in (with_subs, without_subs):
+        assert body["api_accounts"]["deepseek"]["age_s"] == pytest.approx(905.0)
+        assert body["api_accounts"]["deepseek"]["freshness"] == "stale"
+        assert body["api_accounts"]["deepseek"]["stale"] is True
+        assert body["api_accounts"]["openrouter"]["age_s"] == pytest.approx(426.0)
+        assert body["api_accounts"]["openrouter"]["freshness"] == "stale_last_good"
+        assert body["agents"]["cursor"]["age_s"] == pytest.approx(906.0)
+        assert body["agents"]["cursor"]["freshness"] == "stale"
+        assert body["agents"]["cursor"]["stale"] is True
+        assert body["agents"]["codex"]["age_s"] == pytest.approx(806.0)
+        assert body["agents"]["codex"]["freshness"] == "fresh"
+        assert body["agents"]["codex"]["codexbar"]["age_s"] == pytest.approx(806.0)
+        assert body["codex_accounts"]["codex:b"]["age_s"] == pytest.approx(956.0)
+        assert body["codex_accounts"]["codex:b"]["freshness"] == "stale"
+        assert body["codex_accounts"]["codex:b"]["codexbar"]["age_s"] == pytest.approx(956.0)
+        assert body["diagnostics"]["codexbar_max_age_s"] == pytest.approx(806.0)
+        assert body["diagnostics"]["notebook_report_max_age_s"] == pytest.approx(506.0)
+    assert with_subs["subscriptions"]["providers"][0]["accounts"][0]["reading"]["age_s"] == pytest.approx(906.0)
+    assert with_subs["subscriptions"]["providers"][0]["accounts"][0]["reading"]["status"] == "stale"
+    assert "subscriptions" not in without_subs
+    assert stored_snapshot["api_accounts"]["deepseek"]["age_s"] == 599.0
+    assert stored_snapshot["api_accounts"]["deepseek"]["freshness"] == "fresh"
+    assert stored_snapshot["agents"]["cursor"]["age_s"] == 600.0
+
+
 def test_task_rewrite_serves_warm_snapshot_while_recompute_is_blocked(monkeypatch, tmp_path):
     """Task generation churn must not force a cold blocking routing request."""
     ctx = fixture_context(tmp_path)
