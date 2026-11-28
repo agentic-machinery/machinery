@@ -1956,6 +1956,8 @@ def test_critical_approval_needs_one_security_attestation_line(monkeypatch, tmp_
     for unfinished in (
         attested_approval("I could not finish the review."),
         attested_approval("Summary\nI could not finish the review."),
+        # Wrapped across lines after an unpunctuated line.
+        attested_approval("Summary\nI could not finish\nthe review."),
         "\n    " + attested_approval("I could not finish the review."),
         "```json\n" + attested_approval("I could not finish the review.") + "\n```\n",
     ):
@@ -1967,6 +1969,20 @@ def test_critical_approval_needs_one_security_attestation_line(monkeypatch, tmp_
         with pytest.raises(recorder.RecordError, match="inconclusive: reviewer declares an incomplete review"):
             recorder.record("review-one", pr_number=42, task_root=tasks, lock_root=tmp_path / "locks")
         assert comments == [] and calls == {"posts": 0, "statuses": 0}
+
+    # A completed review that quotes an admission as a fenced or indented code example still approves.
+    for example in (
+        "The test pins this text:\n\n```\nI could not finish the review.\n```\n\nAll good.",
+        "The fixture:\n\n    I could not finish the review.\n\nAll good.",
+    ):
+        reply = attested_approval(example)
+        assert sealed(reply) is not None and canonical_receipt_payload(reply)["overall"]["explanation"].endswith("good.")
+        write_task(tasks, reply=reply, **critical)
+        result = recorder.record("review-one", pr_number=42, task_root=tasks, lock_root=tmp_path / "locks")
+        assert result["verdict"] == "APPROVED" and statuses[-1]["state"] == "success", example
+        comments.clear()
+        statuses.clear()
+        calls.update(posts=0, statuses=0)
 
     # A reviewer's pretty-printed raw output, sealed by the worker, signs off.
     reply = sealed(json.dumps(attested_payload(), indent=2))

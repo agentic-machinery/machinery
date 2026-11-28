@@ -386,7 +386,7 @@ def invalid_findings_block(response: str, *, stated: str | None = None) -> str |
 
 # These are declarations by the reviewer about its own unfinished work, not
 # general uses of "incomplete" in findings about the code under review.
-# No catastrophic backtracking: on reviewer prose it starts only at ^ or [.!?:], and its repeated units are literal
+# No catastrophic backtracking: on reviewer prose it starts only at a line start or [.!?:], and its repeated units are literal
 # words split by \s+, which no word can match, so no span matches two ways (200k chars: <40 ms).
 _INCOMPLETE_REVIEW_RE = re.compile(  # nosemgrep: python.lang.security.audit.regex_dos
     r"(?:^|[.!?:]\s+)(?:(?:however|unfortunately),?\s+)?(?:"
@@ -397,7 +397,7 @@ _INCOMPLETE_REVIEW_RE = re.compile(  # nosemgrep: python.lang.security.audit.reg
     r"|(?:(?:the|this|my|our)\s+)?review\s+"
     r"(?:(?:is|was|remains?)\s+(?:incomplete|unfinished|not\s+(?:complete|completed|finished))|"
     r"(?:did\s+not|didn't|has\s+not|hasn't)\s+(?:finish(?:ed)?|complete(?:d)?))\b)",
-    re.IGNORECASE,
+    re.IGNORECASE | re.MULTILINE,
 )
 
 
@@ -454,10 +454,10 @@ def _completion_prose(response: str) -> list[str]:
                     lines.append(line)
                     continuations.append(line)
             for paragraphs in (lines, continuations):
-                prose.extend(
-                    paragraph.replace("\n", " ").strip()
-                    for paragraph in re.split(r"\n[ \t]*\n", "\n".join(paragraphs))
-                )
+                for paragraph in re.split(r"\n[ \t]*\n", "\n".join(paragraphs)):
+                    prose.append(paragraph.replace("\n", " ").strip())
+                    # Line starts kept: a line without closing punctuation cannot hide the declaration after it.
+                    prose.append(paragraph.strip())
     return prose
 
 
