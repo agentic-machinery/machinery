@@ -176,7 +176,7 @@ function planningAgeSeconds(planning, reading = null, now = Date.now()) {
 function analyzePlanning(planning, reading = null, now = Date.now()) {
   if (!planning || typeof planning !== "object" || !planning.issues || typeof planning.issues !== "object") {
     return {
-      usable: false, status: "unknown", ageS: null, workers: "unknown", coverage: {},
+      usable: false, complete: false, status: "unknown", ageS: null, workers: "unknown", coverage: {},
       blockedByRef: new Map(), readyByRef: new Map(), readyNowSet: new Set(),
       blockers: [], readyNow: [], blockedList: [], partialNote: null,
     };
@@ -204,7 +204,7 @@ function analyzePlanning(planning, reading = null, now = Date.now()) {
       blockedByRef.set(row.ref.toLowerCase(), {
         ref: row.ref,
         blocked_by: Array.isArray(row.blocked_by) ? row.blocked_by : [],
-        private_blockers: isNonNegInt(row.private_blockers) ? row.private_blockers : 0,
+        private_blockers: isNonNegInt(row.private_blockers) ? row.private_blockers : null,
       });
     }
     for (const row of Array.isArray(issues.ready) ? issues.ready : []) {
@@ -224,8 +224,12 @@ function analyzePlanning(planning, reading = null, now = Date.now()) {
       ? `partial: ${read} of ${total} repos`
       : "partial";
   }
+  // "ok" means every repository was read; graph-derived totals also need every dependency resolved
+  // (an unresolved issue has no verdict, and a blocked row can hide unresolved edges).
+  const complete = status === "ok" && isNonNegInt(coverage.dependency_unknown) && coverage.dependency_unknown === 0;
   return {
     usable,
+    complete,
     status,
     ageS,
     workers,
@@ -297,6 +301,13 @@ function isIssueReadyNow(enriched, plan) {
   return enriched.readyStatus === "ready_now" || (Boolean(enriched.key) && plan.readyNowSet.has(enriched.key));
 }
 
+// A row's private blocker count is exact only over complete Planning; an invalid count is unknown.
+function privateBlockersText(count, plan) {
+  if (!isNonNegInt(count)) return "private blockers unknown";
+  if (count === 0) return null;
+  return plan.complete ? `+${count} private` : "+private (count unknown)";
+}
+
 // The one expiry rule for a repository row: the snapshot's elapsed staleness, the row's own
 // stale flag, or the row's age plus the time since receipt past the bound.
 function repoExpired(repo, fresh) {
@@ -307,6 +318,21 @@ function repoExpired(repo, fresh) {
 // Planning results are live, but which milestone an issue belongs to comes from the milestone
 // snapshot. An expired repository gets no join, so no live result sits under stale membership.
 const EXPIRED_JOIN_PLAN = Object.freeze({...analyzePlanning(null), status: "milestones-stale"});
+
+// Everything the milestone render derives from elapsed time alone: each repository row's expiry
+// (the whole snapshot's included) and each due label. A tick repaints when it changes.
+function milestoneTimeKey(data, milestoneReading = null, now = Date.now()) {
+  if (!data || typeof data !== "object" || data.status === "pending") return "";
+  const fresh = milestoneFreshness(data, milestoneReading, now);
+  const repos = Array.isArray(data.repositories) ? data.repositories : [];
+  return JSON.stringify(repos.map(repo => {
+    if (!repo || typeof repo !== "object") return null;
+    const expired = repoExpired(repo, fresh);
+    const items = Array.isArray(repo.milestones) ? repo.milestones : [];
+    return [expired, items.map(item => (item && typeof item === "object"
+      ? dueDisplay(item.due_on, now, Boolean(repo.private), expired).label : null))];
+  }));
+}
 
 function completeMilestoneRepos(data, milestoneReading = null, now = Date.now()) {
   const complete = new Set();
@@ -403,6 +429,8 @@ function collectMilestones(data, globalPlan, now, milestoneReading = null) {
         blocked: blockedKnown,
         readyNow: blockedKnown && plan.workers === "ok",
         open: listComplete && (!plan.usable || verdictsComplete),
+        // Ready now and the rest split on worker paths too; unknown paths can move an issue across.
+        split: listComplete && (!plan.usable || (verdictsComplete && plan.workers === "ok")),
       };
       let blockedCell;
       let blockedCountKnown = null;
@@ -565,9 +593,8 @@ function renderMilestoneCard(entry) {
   if (plan.usable && entry.blockedIssues.length) {
     const rows = entry.blockedIssues.map(({issue, blockerInfo}) => {
       const depLinks = blockerInfo.blocked_by.map(ref => issueRefLink(ref, entry.repoSlug));
-      if (blockerInfo.private_blockers > 0) {
-        depLinks.push(`+${blockerInfo.private_blockers} private`);
-      }
+      const privateText = privateBlockersText(blockerInfo.private_blockers, plan);
+      if (privateText) depLinks.push(privateText);
       const depHtml = depLinks.length
         ? `<span class="bad">Blocked</span> by ${depLinks.join(", ")}`
         : '<span class="bad">Blocked</span>';
@@ -599,7 +626,7 @@ function renderMilestoneCard(entry) {
       if (otherOpenIssues.length) {
         const name = !plan.usable ? "Open issues"
           : (entry.blockedIssues.length || readyNowIssues.length) ? "Other open" : "Open";
-        parts.push(heading(name, otherOpenIssues.length, entry.counts.open));
+        parts.push(heading(name, otherOpenIssues.length, entry.counts.split));
         parts.push(renderIssueStatusTable(otherOpenIssues, plan));
       }
     }
@@ -625,8 +652,8 @@ function renderTopBlockers(plan) {
   if (plan.partialNote) {
     out.push(`<p class="warn">Planning coverage is ${escapeHtml(plan.partialNote)}.</p>`);
   }
-  // Rankings over partial coverage miss dependents in unread repositories, so their counts are unknown.
-  const complete = plan.status === "ok";
+  // Rankings over partial coverage or unresolved dependencies miss dependents, so their counts are unknown.
+  const complete = plan.complete;
   if (!plan.blockers.length) {
     out.push(complete
       ? '<p class="muted">No ranked blockers in the current snapshot.</p>'
@@ -659,7 +686,7 @@ function renderReadyNow(plan) {
     return out.join("");
   }
   // Card counts are exact only over complete Planning and worker coverage; otherwise no number.
-  const complete = plan.status === "ok" && plan.workers === "ok";
+  const complete = plan.complete && plan.workers === "ok";
   const cardNote = (count, many, some) => complete ? `${count} ${many}` : some;
   const notes = [];
   if (plan.partialNote) notes.push(`Planning coverage is ${plan.partialNote}.`);
@@ -698,23 +725,24 @@ function classifyUnmatchedBlocked(plan, shownRefs, completeRepos) {
   return {outside, unknownMembership};
 }
 
-function renderBlockedRefTable(list) {
+function renderBlockedRefTable(list, plan) {
   const rows = list.map(row => {
     const deps = (Array.isArray(row.blocked_by) ? row.blocked_by : []).map(ref => issueRefLink(ref));
-    if (isNonNegInt(row.private_blockers) && row.private_blockers > 0) {
-      deps.push(`+${row.private_blockers} private`);
-    }
+    const privateText = privateBlockersText(row.private_blockers, plan);
+    if (privateText) deps.push(privateText);
     return [td(issueRefLink(row.ref)), td(deps.join(", ") || "—")];
   });
   return renderTable(["Issue", "Open dependencies"], rows);
 }
 
-// The two disclosure summaries count Planning's blocked list, which is complete only when Planning is ok.
+// The two disclosure summaries count Planning's blocked list, which is complete only when Planning
+// is complete. Any issue of unknown membership may also lie outside open milestones, so the
+// outside count is exact only when that list is empty.
 function otherBlockedSummaries(plan, outside, unknownMembership) {
-  const count = list => (plan.status === "ok" ? String(list.length) : "count unknown");
+  const count = (list, known) => (known ? String(list.length) : "count unknown");
   return {
-    outside: `Blocked issues outside open milestones (${count(outside)})`,
-    unknownMembership: `Blocked issues (milestone membership unknown: ${count(unknownMembership)})`,
+    outside: `Blocked issues outside open milestones (${count(outside, plan.complete && !unknownMembership.length)})`,
+    unknownMembership: `Blocked issues (milestone membership unknown: ${count(unknownMembership, plan.complete)})`,
   };
 }
 
@@ -725,7 +753,7 @@ function renderOtherBlockedSections(plan, shownRefs, completeRepos) {
   if (outside.length) {
     out.push(
       `<details id="other-blocked"><summary>${escapeHtml(summaries.outside)}</summary>`
-      + renderBlockedRefTable(outside)
+      + renderBlockedRefTable(outside, plan)
       + "</details>"
     );
   }
@@ -733,7 +761,7 @@ function renderOtherBlockedSections(plan, shownRefs, completeRepos) {
     out.push(
       `<details id="unknown-milestone-blocked"><summary>${escapeHtml(summaries.unknownMembership)}</summary>`
       + '<p class="warn">Milestone coverage for these repositories is incomplete, stale, or unavailable.</p>'
-      + renderBlockedRefTable(unknownMembership)
+      + renderBlockedRefTable(unknownMembership, plan)
       + "</details>"
     );
   }
@@ -867,8 +895,7 @@ function renderMilestoneChips(latest, now = Date.now(), planningReading = null, 
     || collected.repos.some(repo => repo && !repo.private
       && (typeof repo.repository !== "string" || !complete.has(repo.repository.toLowerCase())))
     || collected.entries.some(entry => !entry.isPrivate && entry.unaccountedCount > 0);
-  const depsUnknown = isNonNegInt(plan.coverage.dependency_unknown) && plan.coverage.dependency_unknown > 0;
-  const planGap = plan.status === "partial" ? "partial" : (milestoneGap || depsUnknown) ? "incomplete" : null;
+  const planGap = plan.status === "partial" ? "partial" : (milestoneGap || !plan.complete) ? "incomplete" : null;
   // Planning lists only public blocked and ready-now issues; unless it reports no private open
   // issues, those counts cover public issues only and say so.
   const planScope = isNonNegInt(plan.coverage.private_open_issues) && plan.coverage.private_open_issues === 0
@@ -932,9 +959,13 @@ let latestPlanningReading = null;
 let latestMilestoneReading = null;
 let latestShownRefs = new Set();
 let latestCompleteRepos = new Set();
+let latestMilestoneTimeKey = "";
 let initialMilestonesSettled = false;
 let initialPlanningSettled = false;
+// fragmentLocked stops data repaints from re-aligning once the page settles; userScrolled records
+// that the reader moved away, after which nothing re-aligns until the next hash change.
 let fragmentLocked = false;
+let userScrolled = false;
 let lastStickyOffset = null;
 let fragmentRafId = null;
 
@@ -945,8 +976,8 @@ function currentHashId() {
   try { return decodeURIComponent(raw); } catch { return raw; }
 }
 
-function alignFragmentNow() {
-  if (fragmentLocked) return false;
+function alignFragmentNow(force = false) {
+  if (fragmentLocked && !force) return false;
   if (typeof document !== "object" || !document || typeof document.getElementById !== "function") return false;
   const id = currentHashId();
   if (!id) {
@@ -1016,7 +1047,7 @@ function updatePlanningDom(now = Date.now()) {
   syncDisclosure(
     "other-blocked",
     summaries.outside,
-    outside.length ? renderBlockedRefTable(outside) : "",
+    outside.length ? renderBlockedRefTable(outside, plan) : "",
     outside.length > 0,
   );
   syncDisclosure(
@@ -1024,7 +1055,7 @@ function updatePlanningDom(now = Date.now()) {
     summaries.unknownMembership,
     unknownMembership.length
       ? '<p class="warn">Milestone coverage for these repositories is incomplete, stale, or unavailable.</p>'
-        + renderBlockedRefTable(unknownMembership)
+        + renderBlockedRefTable(unknownMembership, plan)
       : "",
     unknownMembership.length > 0,
   );
@@ -1044,6 +1075,7 @@ function repaintMilestones(now = Date.now()) {
     );
     latestShownRefs = shownRefs;
     latestCompleteRepos = completeRepos;
+    latestMilestoneTimeKey = milestoneTimeKey(runner.latest.milestones, latestMilestoneReading, now);
     const content = document.getElementById("milestones-content");
     if (content && content.innerHTML !== html) content.innerHTML = html;
   } else {
@@ -1089,13 +1121,8 @@ function expireSnapshotsIfStale(panel, latest, _updateChips, now = Date.now()) {
       shouldRepaint = true;
     }
   }
-  const msReading = (Array.isArray(panel?.readings) && panel.readings[0]) || latestMilestoneReading;
-  if (latest?.milestones && msReading) {
-    const msFresh = milestoneFreshness(latest.milestones, msReading, now);
-    if (msFresh.stale && !msReading._expiredPainted) {
-      msReading._expiredPainted = true;
-      shouldRepaint = true;
-    }
+  if (latest?.milestones && milestoneTimeKey(latest.milestones, latestMilestoneReading, now) !== latestMilestoneTimeKey) {
+    shouldRepaint = true;
   }
   if (shouldRepaint) repaintMilestones(now);
 }
@@ -1114,8 +1141,11 @@ function updateStickyOffset(fromAlign = false) {
   document.documentElement?.style?.setProperty("--sticky-offset", `${offset}px`);
   const changed = lastStickyOffset !== null && offset !== lastStickyOffset;
   lastStickyOffset = offset;
-  if (!fromAlign && changed && !fragmentLocked && currentHashId()) {
-    scheduleFragmentAlignment();
+  // A header height change (resize, sticky again) moves the anchor under it; keep the anchor in view
+  // unless the reader has scrolled away.
+  if (!fromAlign && changed && !userScrolled && currentHashId()) {
+    if (fragmentLocked) alignFragmentNow(true);
+    else scheduleFragmentAlignment();
   }
 }
 
@@ -1130,6 +1160,7 @@ const PANELS = [{
     const {html, shownRefs, completeRepos} = renderMilestonesOverview(data, plan, renderNow, latestMilestoneReading);
     latestShownRefs = shownRefs;
     latestCompleteRepos = completeRepos;
+    latestMilestoneTimeKey = milestoneTimeKey(data, latestMilestoneReading, renderNow);
     return html;
   },
   onData: (data, _latest, readings, renderNow) => {
@@ -1161,17 +1192,18 @@ if (typeof ResizeObserver === "function" && typeof document === "object" && docu
 }
 if (typeof window === "object" && window && typeof window.addEventListener === "function") {
   window.addEventListener("resize", onHeaderResize);
-  const lockOnUserScroll = () => { fragmentLocked = true; };
+  const lockOnUserScroll = () => { fragmentLocked = true; userScrolled = true; };
   window.addEventListener("wheel", lockOnUserScroll, {passive: true});
   window.addEventListener("touchstart", lockOnUserScroll, {passive: true});
   window.addEventListener("pointerdown", lockOnUserScroll, {passive: true});
   window.addEventListener("keydown", event => {
     if (["ArrowDown", "ArrowUp", "PageDown", "PageUp", "Home", "End", " "].includes(event.key)) {
-      fragmentLocked = true;
+      lockOnUserScroll();
     }
   });
   window.addEventListener("hashchange", () => {
     fragmentLocked = false;
+    userScrolled = false;
     scheduleFragmentAlignment();
   });
 }

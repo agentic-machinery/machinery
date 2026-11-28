@@ -704,7 +704,8 @@ assert.match(partialSnapshotHtml, /broken: github unavailable/);
 const brokenBlocker = JSON.parse(JSON.stringify(completeWithOutside));
 brokenBlocker.issues.blocked.push({{ref: "fixture/broken#5", blocked_by: ["fixture/broken#4"], private_blockers: 0}});
 const mixedHtml = renderMilestones(partialSnapshot, brokenBlocker, now, null, partialReading);
-assert.match(mixedHtml, /Blocked issues outside open milestones \\(1\\)/);
+// An issue of unknown membership may also lie outside open milestones: the outside count is unknown.
+assert.match(mixedHtml, /Blocked issues outside open milestones \\(count unknown\\)/);
 assert.match(mixedHtml, /Blocked issues \\(milestone membership unknown: 1\\)/);
 const expiredPartialHtml = renderMilestones(partialSnapshot, completeWithOutside, now + 391000, null, partialReading);
 assert.match(expiredPartialHtml, /STALE/);
@@ -853,5 +854,54 @@ const partialEmptyHtml = renderMilestones(data, partialEmpty, now);
 assert.match(partialEmptyHtml, /No ranked blockers in the repositories read; the rest are unknown\\./);
 assert.match(partialEmptyHtml, /No ready-now issues in the results read; the rest are unknown\\./);
 assert.doesNotMatch(partialEmptyHtml, /in the current snapshot\\./);
+
+// Planning "ok" with unresolved dependencies (or no dependency tally) is not complete: graph-derived
+// numbers read unknown, and the header gap holds even when the tally field is missing.
+const unresolved = JSON.parse(JSON.stringify(completeWithOutside));
+unresolved.issues.coverage.dependency_unknown = 2;
+unresolved.issues.blockers = [{{ref: "fixture/machinery#1", direct: 2, total: 2}}];
+unresolved.issues.blocked[0].private_blockers = 1;
+const unresolvedHtml = renderMilestones(data, unresolved, now);
+assert.match(unresolvedHtml, /unblocks unknown \\(direct unknown\\)/);
+assert.match(unresolvedHtml, /Blocked issues outside open milestones \\(count unknown\\)/);
+assert.match(unresolvedHtml, /\\+private \\(count unknown\\)/);
+assert.doesNotMatch(unresolvedHtml, /\\+1 private/);
+assert.match(renderMilestoneChips({{milestones: data, planning: unresolved}}, now), /<b>unknown<\\/b> blocked \\(incomplete\\)/);
+const noTally = JSON.parse(JSON.stringify(completeWithOutside));
+delete noTally.issues.coverage.dependency_unknown;
+assert.match(renderMilestoneChips({{milestones: data, planning: noTally}}, now), /<b>unknown<\\/b> blocked \\(incomplete\\)/);
+const unresolvedEmpty = JSON.parse(JSON.stringify(unresolved));
+Object.assign(unresolvedEmpty.issues, {{blockers: [], ready_now: [], ready: []}});
+const unresolvedEmptyHtml = renderMilestones(data, unresolvedEmpty, now);
+assert.match(unresolvedEmptyHtml, /No ranked blockers in the repositories read; the rest are unknown\\./);
+assert.match(unresolvedEmptyHtml, /No ready-now issues in the results read; the rest are unknown\\./);
+const badPrivate = JSON.parse(JSON.stringify(completeWithOutside));
+badPrivate.issues.blocked[0].private_blockers = "1";
+assert.match(renderMilestones(data, badPrivate, now), /private blockers unknown/);
+
+// Unknown worker paths can move an issue between Ready now and the rest: both counts are unknown.
+const splitData = JSON.parse(JSON.stringify(data));
+splitData.repositories[0].milestones[0].issues.push({{
+  number: 11, title: "Task B", url: "https://github.com/fixture/machinery/issues/11", labels: [],
+}});
+const splitPlanning = JSON.parse(JSON.stringify(completeWithOutside));
+splitPlanning.issues.workers = "partial";
+splitPlanning.issues.ready.push({{ref: "fixture/machinery#11", path_status: "worker_scope_unknown"}});
+const splitHtml = renderMilestones(splitData, splitPlanning, now);
+assert.match(splitHtml, /<h4>Ready now \\(count unknown\\)<\\/h4>/);
+assert.match(splitHtml, /<h4>Other open \\(count unknown\\)<\\/h4>/);
+splitPlanning.issues.workers = "ok";
+splitPlanning.issues.ready[1].path_status = "path_conflicts";
+assert.match(renderMilestones(splitData, splitPlanning, now), /<h4>Other open \\(1\\)<\\/h4>/);
+
+// A repository row that expires before the snapshot changes the time key, so the tick repaints.
+const rowRace = JSON.parse(JSON.stringify(data));
+rowRace.age_seconds = 300;
+rowRace.repositories[0].age_seconds = 419.9;
+const rowRaceReading = {{data: rowRace, ageHeader: "300", boundHeader: "420", state: "fresh", receivedAt: now}};
+const keyBefore = milestoneTimeKey(rowRace, rowRaceReading, now);
+const keyAfter = milestoneTimeKey(rowRace, rowRaceReading, now + 150);
+assert.notEqual(keyBefore, keyAfter, "a row expiry with a fresh snapshot must change the time key");
+assert.equal(milestoneFreshness(rowRace, rowRaceReading, now + 150).stale, false);
 """
     _run_milestones_node(body)
