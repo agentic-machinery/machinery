@@ -1004,7 +1004,7 @@ assert.match(M.prChips(unknownTotalPrs).join(''), /<b>1<\/b> open PRs observed Â
     assert ran.returncode == 0, ran.stderr
 
 
-def test_unknown_browser_path_gets_html_404_with_nav(tmp_path):
+def test_unknown_browser_path_gets_html_404_with_nav(tmp_path, monkeypatch):
     """Defect class: a browser dead-ends on raw JSON for an unknown or trailing-slash page path, or an API client stops getting JSON."""
     from contextlib import asynccontextmanager
 
@@ -1098,3 +1098,103 @@ def test_unknown_browser_path_gets_html_404_with_nav(tmp_path):
             "/not-a-monitor-page",
             headers=[("Accept", "text/html;q=0"), ("Accept", "text/html;q=1")],
         ))
+        # A quoted or padded weight is not a qvalue. A more specific charset range
+        # outranks a generic type even when its q is lower. An escaped quote does
+        # not swallow the next range. Interior spaces in a quoted charset do not match.
+        assert_json_404(client.get(
+            "/not-a-monitor-page",
+            headers={"Accept": 'text/html;q="1", application/json;q=0.5'},
+        ))
+        assert_json_404(client.get(
+            "/not-a-monitor-page",
+            headers={"Accept": "text/html;q= 1, application/json;q=0.5"},
+        ))
+        assert_json_404(client.get(
+            "/not-a-monitor-page",
+            headers={"Accept": "application/json;q=0.5, text/html;q=0.9, text/html;charset=utf-8;q=0.2"},
+        ))
+        assert_json_404(client.get(
+            "/not-a-monitor-page",
+            headers={"Accept": 'text/html;charset=" utf-8 "'},
+        ))
+        assert_html_404(client.get(
+            "/not-a-monitor-page",
+            headers={"Accept": 'text/html;charset="utf-8"'},
+        ))
+        assert_html_404(client.get(
+            "/not-a-monitor-page",
+            headers={"Accept": r'application/json;profile="a\"b", text/html'},
+        ))
+        # ``/`` stays the page. A client collapses ``//`` onto ``/``, so that doubled
+        # slash is checked on the raw ASGI path below.
+        assert client.get("/", headers=browser).status_code == 200
+
+    # A product that owns the root still owns ``/`` and ``/index.html``. The slash
+    # on that file is not a second name for the Monitor overview.
+    from lu_machinery.api import main as api_main
+
+    product_root = tmp_path / "product"
+    product_root.mkdir()
+    product_home = product_root / "home.html"
+    product_home.write_text("product home", encoding="utf-8")
+    monkeypatch.setattr(api_main.config, "PRODUCT_ROOT", product_root)
+    owned = create_app(
+        fixture_context(tmp_path).with_roots(dashboards_dir=dashboards),
+        lifespan=no_lifespan,
+        product=ProductContribution(static_files={"index.html": product_home}),
+    )
+    with TestClient(owned) as owned_client:
+        assert "product home" in owned_client.get("/", headers=browser).text
+        assert "product home" in owned_client.get("/index.html", headers=browser).text
+        assert_html_404(owned_client.get("/index.html/", headers=browser))
+
+    import asyncio
+
+    async def raw_get(asgi_app, path: str) -> tuple[int, str, dict[str, str]]:
+        messages: list[dict] = []
+        scope = {
+            "type": "http",
+            "asgi": {"version": "3.0"},
+            "http_version": "1.1",
+            "method": "GET",
+            "scheme": "http",
+            "path": path,
+            "raw_path": path.encode(),
+            "query_string": b"",
+            "headers": [(b"accept", browser["Accept"].encode()), (b"host", b"test")],
+            "client": ("127.0.0.1", 1),
+            "server": ("127.0.0.1", 80),
+        }
+
+        requested = False
+
+        async def receive():
+            nonlocal requested
+            if not requested:
+                requested = True
+                return {"type": "http.request", "body": b"", "more_body": False}
+            return {"type": "http.disconnect"}
+
+        async def send(message):
+            messages.append(message)
+
+        await asgi_app(scope, receive, send)
+        start = next(message for message in messages if message["type"] == "http.response.start")
+        payload = b"".join(message.get("body", b"") for message in messages if message["type"] == "http.response.body")
+        headers = {name.decode(): value.decode() for name, value in start.get("headers", [])}
+        return start["status"], payload.decode(), headers
+
+    async def raw_pages() -> None:
+        async with app.router.lifespan_context(app):
+            status, _body, _headers = await raw_get(app, "/")
+            assert status == 200
+            status, body, _headers = await raw_get(app, "//")
+            assert status == 404
+            assert 'id="machinery-nav"' in body
+            assert "This page is not on the Monitor." in body
+        async with owned.router.lifespan_context(owned):
+            status, body, headers = await raw_get(owned, "//")
+            assert status == 200
+            assert "product home" in body or headers.get("content-length") == str(len(b"product home"))
+
+    asyncio.run(raw_pages())

@@ -257,11 +257,22 @@ _PAGE_CHARSETS = frozenset({"utf-8", "utf8"})
 
 
 def _split_outside_quotes(value: str, separator: str) -> list[str]:
-    """Split on ``separator`` only where it is not inside a quoted string."""
+    """Split on ``separator`` only where it is not inside a quoted string.
+
+    A backslash inside quotes consumes the next character (a quoted-pair), so an
+    escaped quote does not end the string or hide the next range.
+    """
     parts: list[str] = []
     buf: list[str] = []
     quoted = False
-    for char in value:
+    index = 0
+    while index < len(value):
+        char = value[index]
+        if quoted and char == "\\" and index + 1 < len(value):
+            buf.append(char)
+            buf.append(value[index + 1])
+            index += 2
+            continue
         if char == '"':
             quoted = not quoted
             buf.append(char)
@@ -270,32 +281,65 @@ def _split_outside_quotes(value: str, separator: str) -> list[str]:
             buf = []
         else:
             buf.append(char)
+        index += 1
     parts.append("".join(buf))
     return parts
 
 
+def _quoted_string(value: str) -> str | None:
+    """The decoded quoted-string, or ``None`` when ``value`` is not one.
+
+    Interior spaces stay. A quoted-pair is one character and does not end the string.
+    """
+    if len(value) < 2 or value[0] != '"' or value[-1] != '"':
+        return None
+    decoded: list[str] = []
+    index = 1
+    end = len(value) - 1
+    while index < end:
+        char = value[index]
+        if char == "\\" and index + 1 < end:
+            decoded.append(value[index + 1])
+            index += 2
+            continue
+        if char == '"':
+            return None
+        decoded.append(char)
+        index += 1
+    return "".join(decoded)
+
+
 def _accept_parameter(param: str) -> tuple[str, str | None]:
-    """One Accept parameter as ``(name, value)``. A weight with no value is ``("q", None)``."""
+    """One Accept parameter as ``(name, value)``.
+
+    A weight is the raw text after ``=``, with only trailing whitespace removed, so
+    quotes or a leading space cannot become a valid qvalue. A quoted media parameter
+    is decoded. A weight with no value is ``("q", None)``.
+    """
     if "=" not in param:
-        return param.lower(), None
+        name = param.strip().lower()
+        return name, None
     name, raw = param.split("=", 1)
-    value = raw.strip()
-    if len(value) >= 2 and value[0] == '"' and value[-1] == '"':
-        value = value[1:-1].strip()
-    return name.strip().lower(), value.lower()
+    name = name.strip().lower()
+    if name == "q":
+        return name, raw.rstrip()
+    token = raw.strip()
+    decoded = _quoted_string(token)
+    return name, (token if decoded is None else decoded).lower()
 
 
 def _accept_quality(header: str, media_type: str) -> float:
     """The q of the most specific range matching ``media_type``, or 0 when none matches.
 
-    An exact type beats ``type/*``, which beats ``*/*``. A missing weight is 1. A weight
-    that is not an HTTP qvalue, or a repeated weight on one range, is 0, so it cannot
-    prefer a page. A comma or semicolon inside quotes is not a separator. A range that
-    names any parameter other than ``q``, or a charset other than the UTF-8 page this
-    server sends, does not match that page.
+    An exact type beats ``type/*``, which beats ``*/*``. A matching parameter then beats
+    a range with fewer parameters, and only then does a higher q win. A missing weight
+    is 1. A weight that is not an HTTP qvalue, or a repeated weight on one range, is 0,
+    so it cannot prefer a page. A comma or semicolon inside quotes is not a separator.
+    A range that names any parameter other than ``q``, or a charset other than the
+    UTF-8 page this server sends, does not match that page.
     """
     wanted_type = media_type.split("/", 1)[0]
-    best: tuple[int, float] | None = None
+    best: tuple[int, int, float] | None = None
     for piece in _split_outside_quotes(header, ","):
         bits = [bit.strip() for bit in _split_outside_quotes(piece, ";") if bit.strip()]
         if not bits:
@@ -325,9 +369,10 @@ def _accept_quality(header: str, media_type: str) -> float:
             specificity = 0
         else:
             continue
-        if best is None or specificity > best[0] or (specificity == best[0] and quality > best[1]):
-            best = (specificity, quality)
-    return 0.0 if best is None else best[1]
+        rank = (specificity, len(extras), quality)
+        if best is None or rank > best:
+            best = rank
+    return 0.0 if best is None else best[2]
 
 
 def _prefers_html(request: Request) -> bool:
@@ -2009,19 +2054,32 @@ def _machinery_page_response(page: Path, current_file: str) -> HTMLResponse:
 
 
 def _slash_suffixed_page(dashboards_dir: Path, path: str, product: ProductContribution | None) -> bool:
-    """True when ``path`` is a known Monitor page with one trailing slash.
+    """True when ``path`` is a known Monitor page with a trailing slash.
 
-    The file lookup drops that slash, so ``/fleet.html/`` and the overview's
-    ``/machinery/`` spelling would otherwise be served as the page. A trailing
-    slash on a page is a missing address. ``/`` itself is the home, not a suffix.
+    The file lookup drops that slash, so ``/fleet.html/``, ``/index.html/`` and
+    the overview's ``/machinery/`` spelling would otherwise be served as the page.
+    A doubled slash is the same kind of missing address when it resolves to a
+    page. The empty capture of ``GET /`` is not a suffix.
     """
-    if not path.endswith("/") or path == "/":
+    if not path.endswith("/"):
+        return False
+
+    def is_page(candidate: str) -> bool:
+        found = _dashboard_file(dashboards_dir, candidate, product)
+        return found is not None and found.page is not None
+
+    # The lookup of the slashed path itself can still be the page: ``index.html/``
+    # collapses to the overview after the bare name has been left to a product.
+    if is_page(path):
+        return True
+    # A lone slash is the catch-all's capture of ``//``. It is not the empty
+    # capture of ``GET /``. When that slash is itself a page, it is a missing
+    # address; when a product owns ``/``, the lookup is not a page and the
+    # product file stays.
+    if path == "/":
         return False
     bare = path[:-1]
-    if not bare:
-        return False
-    found = _dashboard_file(dashboards_dir, bare, product)
-    return found is not None and found.page is not None
+    return bool(bare) and is_page(bare)
 
 
 @core_router.get("/{path:path}")
