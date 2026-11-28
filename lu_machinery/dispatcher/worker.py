@@ -2440,13 +2440,6 @@ def supervise(path: Path, options: dict | None = None, hard_timeout: float | Non
                 stdin.seek(0)
                 output_sizes = out.tell(), err.tell()
                 checkpoint()  # the last one before the provider starts: a cancelled run launches nothing
-                if spec.agent == "agy":
-                    from lu_machinery.dispatcher.providers.agy import invocation_log_path
-
-                    provider_log = invocation_log_path(invocation.argv)
-                    record["log_paths"]["provider"] = (
-                        str((spec.worktree / provider_log).absolute()) if provider_log is not None else None
-                    )
                 if _in_boundary(spec):
                     # Native reviewers run inside the OS boundary (#423, #100); there is no unsandboxed fallback.
                     # The launcher refuses with its receipt when the boundary cannot start. A relaunch always
@@ -2481,6 +2474,13 @@ def supervise(path: Path, options: dict | None = None, hard_timeout: float | Non
                     start_new_session=True,
                     pass_fds=() if draft_fd is None else (draft_fd,),
                 )
+                if spec.agent == "agy":
+                    from lu_machinery.dispatcher.providers.agy import invocation_log_path
+
+                    provider_log = invocation_log_path(invocation.argv)
+                    record["log_paths"]["provider"] = (
+                        str((spec.worktree / provider_log).absolute()) if provider_log is not None else None
+                    )
                 record.update(status="running", provider_pgid=child.pid)
                 store.replace(record, path, require_existing=True)
                 terminal_observer = getattr(provider, "terminal_result_observer", None)

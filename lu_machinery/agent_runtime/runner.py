@@ -2133,6 +2133,13 @@ def _execute_invocation_once(
             write_record(record)
             raise AgentUnavailableError(f"{agent_name!r} Popen failed: {type(exc).__name__}: {exc}") from exc
 
+        if agent_name == "agy" and entrypoint == "dispatch" and tool_config and tool_config.get("review_attempt_boundary"):
+            from lu_machinery.dispatcher.providers.agy import invocation_log_path
+            from lu_machinery.dispatcher.store import name_bound_provider_log
+
+            if (provider_log := invocation_log_path(plan.cmd)) is not None:
+                name_bound_provider_log(task_id, tool_config.get("run_nonce"), provider_log)
+
         liveness_paths = tuple(adapter.liveness_signal_paths(plan))
         if plan.output_file is not None and plan.output_file not in liveness_paths:
             liveness_paths = (*liveness_paths, plan.output_file)
