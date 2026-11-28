@@ -271,32 +271,45 @@ performance.now = () => monoNow;
 Date.now = () => fakeNow;
 let budgetFetches = 0;
 let poolMode = 'all_fresh';
+let apiFetchedAt = '2026-11-28T00:45:01Z';
+let generatedAt = '2026-11-28T01:00:00Z';
+let cachedDataAgeS = 0;
+let cachedApiAgeS = 899;
 globalThis.fetch = async (url) => {
   const s = String(url);
   if (s.startsWith('/api/state/routing-budget')) {
     budgetFetches += 1;
     const agents = poolMode === 'all_fresh'
       ? {
-          claude: {freshness: 'fresh', age_s: 899, status: 'ok', stale: false},
-          cursor: {freshness: 'fresh', age_s: 899, status: 'ok', stale: false, provider_windows: {auto: {remaining_pct: 82}, api: {remaining_pct: 64}}},
+          claude: {freshness: 'fresh', age_s: 899, status: 'cool', stale: false},
+          cursor: {freshness: 'fresh', age_s: 899, status: 'cool', stale: false, provider_windows: {auto: {remaining_pct: 82}, api: {remaining_pct: 64}}},
         }
       : poolMode === 'mixed'
       ? {
-          claude: {freshness: 'fresh', age_s: 60, status: 'ok', stale: false},
-          codex: {freshness: 'stale', age_s: 1200, status: 'ok', stale: true},
+          claude: {freshness: 'fresh', age_s: 60, status: 'cool', stale: false},
+          codex: {freshness: 'stale', age_s: 1200, status: 'cool', stale: true},
+        }
+      : poolMode === 'need_login_only'
+      ? {
+          cursor: {freshness: 'fresh', age_s: 30, status: 'need_login', login_state: 'NEED_LOGIN', probe_state: 'NEED_LOGIN', stale: false},
+        }
+      : poolMode === 'need_login_mixed'
+      ? {
+          claude: {freshness: 'fresh', age_s: 30, status: 'cool', stale: false},
+          cursor: {freshness: 'fresh', age_s: 30, status: 'need_login', login_state: 'NEED_LOGIN', probe_state: 'NEED_LOGIN', stale: false},
         }
       : {
-          claude: {freshness: 'stale', age_s: 1200, status: 'ok', stale: true},
-          codex: {freshness: 'unknown', age_s: null, status: 'unknown', stale: false},
+          claude: {freshness: 'fresh', age_s: 599, status: 'cool', stale: false},
         };
     return {
       ok: true,
       status: 200,
       headers: {get: () => null},
       text: async () => JSON.stringify({
-        diagnostics: {stale_threshold_s: 900},
+        generated_at: generatedAt,
+        diagnostics: {stale_threshold_s: 900, data_age_s: cachedDataAgeS, codexbar_data_available: true, codexbar_max_age_s: 0},
         agents,
-        api_accounts: {FixtureAPI: {freshness: 'fresh', age_s: 899, total_balance: 55, currency: 'USD', usage_weekly_usd: 12}},
+        api_accounts: {FixtureAPI: {freshness: 'fresh', age_s: cachedApiAgeS, fetched_at: apiFetchedAt, total_balance: 55, currency: 'USD', usage_weekly_usd: 12}},
         subscriptions: {
           stale_after_s: 900,
           providers: [{
@@ -363,8 +376,38 @@ const models = (() => {
     models.PANELS[0].onTick(models.PANELS[0], models.runner.latest, updateChips, fakeNow);
     assert.doesNotMatch(document.getElementById('usage-content').innerHTML, /73%|55\.00/);
 
+    // F3 cached-poll revival guard: a 599s API reading expires after 306s and stays hidden when
+    // the next poll returns the same cached generation (same generated_at/fetched_at, same age_s=599).
+    monoNow = 20000;
+    poolMode = 'cached_api';
+    generatedAt = '2026-11-28T01:05:00Z';
+    apiFetchedAt = '2026-11-28T00:55:01Z';
+    cachedApiAgeS = 599;
+    cachedDataAgeS = 0;
+    await models.runner.loadPanel(models.PANELS[0]);
+    updateChips();
+    assert.match(document.getElementById('usage-content').innerHTML, /55\.00 USD balance/);
+    monoNow += 306000;
+    models.PANELS[0].onTick(models.PANELS[0], models.runner.latest, updateChips, fakeNow);
+    assert.doesNotMatch(document.getElementById('usage-content').innerHTML, /55\.00|12\.00/);
+    cachedDataAgeS = 306;
+    await models.runner.loadPanel(models.PANELS[0]);
+    updateChips();
+    assert.doesNotMatch(document.getElementById('usage-content').innerHTML, /55\.00|12\.00/, 'F3: cached poll must not revive expired API balance');
+    // Even a fresh observation whose server cache lag already puts it past 900s is hidden on first paint.
+    generatedAt = '2026-11-28T01:10:00Z';
+    apiFetchedAt = '2026-11-28T01:00:01Z';
+    cachedApiAgeS = 599;
+    cachedDataAgeS = 306;
+    await models.runner.loadPanel(models.PANELS[0]);
+    assert.doesNotMatch(document.getElementById('usage-content').innerHTML, /55\.00|12\.00/, 'F3: pre-aged cached server snapshot hides expired balance immediately');
+
     // F7: Mixed 1 fresh cool pool + 1 stale pool qualifies chip as "0 pools near cap (1 unknown)" with warn tone,
-    // and missing sign-in renders "? sign-in unknown".
+    // missing sign-in renders "? sign-in unknown", and fresh NEED_LOGIN pools count as unknown coverage.
+    cachedDataAgeS = 0;
+    cachedApiAgeS = 60;
+    apiFetchedAt = '2026-11-28T01:14:00Z';
+    generatedAt = '2026-11-28T01:15:00Z';
     poolMode = 'mixed';
     await models.runner.loadPanel(models.PANELS[0]);
     updateChips();
@@ -372,11 +415,26 @@ const models = (() => {
     assert.match(mixedChips, /chip warn[^>]*><b>0<\/b> pools near cap \(1 unknown\)/);
     assert.match(mixedChips, /chip warn[^>]*><b>\?<\/b> sign-in unknown/);
 
+    poolMode = 'need_login_only';
+    await models.runner.loadPanel(models.PANELS[0]);
+    updateChips();
+    assert.match(document.getElementById('chips').innerHTML, /chip warn[^>]*><b>\?<\/b> pools near cap unknown/);
+    assert.doesNotMatch(document.getElementById('chips').innerHTML, /<b>0<\/b> pools near cap/);
+
+    poolMode = 'need_login_mixed';
+    await models.runner.loadPanel(models.PANELS[0]);
+    updateChips();
+    assert.match(document.getElementById('chips').innerHTML, /chip warn[^>]*><b>0<\/b> pools near cap \(1 unknown\)/);
+
     // Non-finite monotonic clock withdraws figures as unknown rather than keeping stale fresh values.
     poolMode = 'all_fresh';
+    cachedApiAgeS = 899;
+    apiFetchedAt = '2026-11-28T01:20:00Z';
+    generatedAt = '2026-11-28T01:20:00Z';
     await models.runner.loadPanel(models.PANELS[0]);
     updateChips();
     assert.match(document.getElementById('usage-content').innerHTML, /73%/);
+    assert.match(document.getElementById('usage-content').innerHTML, /55\.00 USD balance/);
     performance.now = () => Number.NaN;
     models.PANELS[0].onTick(models.PANELS[0], models.runner.latest, updateChips, fakeNow);
     assert.doesNotMatch(document.getElementById('usage-content').innerHTML, /73%|82% left|55\.00/);

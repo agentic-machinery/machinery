@@ -1490,6 +1490,10 @@ def fleet_seats(ctx: MonitorContext = Depends(get_ctx)) -> JSONResponse:
 _MESSAGE_MAX_SENDER = 256
 
 
+def _normalize_sender_alias(name: str) -> str:
+    return " ".join(name.split())
+
+
 def _seat_ids_map(seats: list[_FleetSeat]) -> tuple[dict[str, str], frozenset[str]]:
     recipient_counts = Counter(name for item in seats for name in item.recipients)
     seat_ids = {
@@ -1498,9 +1502,13 @@ def _seat_ids_map(seats: list[_FleetSeat]) -> tuple[dict[str, str], frozenset[st
         for name in item.recipients
         if recipient_counts[name] == 1
     }
-    ambiguous = frozenset(
-        " ".join(name.split()) for name, count in recipient_counts.items() if count > 1
-    )
+    normalized_owners: dict[str, set[str]] = {}
+    for item in seats:
+        for name in item.recipients:
+            normalized = _normalize_sender_alias(name)
+            if normalized:
+                normalized_owners.setdefault(normalized, set()).add(item.seat)
+    ambiguous = frozenset(name for name, owners in normalized_owners.items() if len(owners) > 1)
     return seat_ids, ambiguous
 
 
@@ -1511,9 +1519,10 @@ def _projected_sender(
 ) -> str:
     if not isinstance(sender, str) or len(sender.encode("utf-8")) > _MESSAGE_MAX_SENDER:
         return "other"
-    if sender in ambiguous or " ".join(sender.split()) in ambiguous:
+    normalized = _normalize_sender_alias(sender)
+    if not normalized or normalized in ambiguous:
         return "other"
-    return "cto" if is_session_cto_recipient(sender) else seat_ids.get(sender, "other")
+    return "cto" if is_session_cto_recipient(normalized) else seat_ids.get(sender, "other")
 
 
 def _delivery_item(
