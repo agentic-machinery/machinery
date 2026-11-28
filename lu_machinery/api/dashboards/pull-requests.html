@@ -83,6 +83,8 @@ function renderPrs(prs, prState = null) {
       : repo.open_total > list.length
         ? `<p class="warn">Showing newest ${list.length} of ${repo.open_total} open PRs; older open PRs are not listed.</p>`
         : "";
+    // A private project's titles and ages are withheld by the Monitor; the row says so.
+    const absent = text(repo.private === true ? "withheld (private)" : null, "muted");
     const rows = list.map(pr => {
       const [ci, ciClass] = ciLabel(pr.ci);
       const [review, reviewClass] = reviewLabel(pr.review);
@@ -90,15 +92,16 @@ function renderPrs(prs, prState = null) {
       const safe = safeHttpUrl(pr.url);
       return [
         td(pr.number === null ? "private PR" : safe ? `<a href="${escapeHtml(safe)}">#${escapeHtml(pr.number)}</a>` : `#${escapeHtml(pr.number)}`),
+        pr.title ? text(pr.title) : absent,
+        pr.created_at ? text(ageSpan(pr.created_at), "num") : absent,
         name,
         text(ci, ciClass),
         text(review, reviewClass),
         pr.queue ? text(`position ${pr.queue.position ?? "?"}${pr.queue.state ? ` · ${pr.queue.state.replaceAll("_", " ")}` : ""}${expired ? " (cached)" : ""}`, expired ? "warn" : "ok")
           : text(null, "muted"),
-        text(ageSpan(pr.created_at), "num"),
       ];
     });
-    return title + truncatedNote + table(["PR", "State", "CI", "Review", "Queue", "Age"], rows);
+    return title + truncatedNote + table(["PR", "Title", "Age", "State", "CI", "Review", "Queue"], rows);
   }).join("");
 }
 
