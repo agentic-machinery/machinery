@@ -7428,11 +7428,6 @@
       "message": "Incompatible return value type (got \"tuple[None | str, None | ReviewEvidence]\", expected \"tuple[str, Any]\")"
     },
     {
-      "path": "lu_machinery/review/verdict_parser.py",
-      "code": "var-annotated",
-      "message": "Need type annotation for \"prose\" (hint: \"prose: list[<type>] = ...\")"
-    },
-    {
       "path": "lu_machinery/secret_redactor.py",
       "code": "misc",
       "message": "Incompatible types in \"yield\" (actual type \"Match[str] | None\", expected type \"Match[str]\")"
