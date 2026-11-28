@@ -75,8 +75,7 @@ def test_machinery_path_serves_machinery_home_when_product_owns_root(tmp_path, m
     request = Request({"type": "http", "app": SimpleNamespace(state=SimpleNamespace(product=product))})
     context = SimpleNamespace(roots=SimpleNamespace(dashboards_dir=tmp_path))
     assert main.serve_static("", request, context).path == product_index
-    for path in ("machinery", "machinery/"):
-        assert main.serve_static(path, request, context).body == b"machinery home"
+    assert main.serve_static("machinery", request, context).body == b"machinery home"
 
     # A path the machinery dashboards do not hold still reaches the product's declared file.
     empty_dashboards = tmp_path / "empty"
@@ -85,6 +84,36 @@ def test_machinery_path_serves_machinery_home_when_product_owns_root(tmp_path, m
     declared_product = ProductContribution(static_files={"index": product_index})
     declared_request = Request({"type": "http", "app": SimpleNamespace(state=SimpleNamespace(product=declared_product))})
     assert main.serve_static("index", declared_request, bare).path == product_index
+
+
+def test_unknown_browser_path_gets_html_404_with_nav(tmp_path):
+    """Defect class: a browser dead-ends on raw JSON for an unknown or trailing-slash page path,
+    or an /api/ client stops getting JSON."""
+    import re
+
+    from fastapi.testclient import TestClient
+
+    from lu_machinery.api import main, route_contracts
+    from lu_machinery.api.monitor_context import fixture_context
+    from lu_machinery.api.product_contribution import EMPTY
+
+    (tmp_path / "dashboards").mkdir()
+    for page in route_contracts.PAGE_CONTRACTS:
+        (tmp_path / "dashboards" / page.file).write_text(f"<p>{page.file}</p>")
+    client = TestClient(main.create_app(fixture_context(tmp_path), product=EMPTY))
+    browser = {"accept": "text/html,application/xhtml+xml,*/*;q=0.8"}
+    assert client.get("/fleet", headers=browser).text == "<p>fleet.html</p>"
+    links = [page.url for page in route_contracts.PAGE_CONTRACTS] + ["/"]
+    for path in ("/not-a-monitor-page", "/a/b/", "/fleet/", "/fleet.html/", "/machinery/", "/index.html/"):
+        response = client.get(path, headers=browser)
+        assert (response.status_code, response.headers["content-type"]) == (404, "text/html; charset=utf-8"), path
+        assert re.findall(r'<a href="([^"]*)"', response.text) == links, path
+        assert "not-a-monitor-page" not in response.text
+    # The API keeps its JSON error whatever the client accepts.
+    for path in ("/api/not-a-route", "/api/fleet/not-a-route/"):
+        for headers in (browser, {"accept": "application/json"}):
+            response = client.get(path, headers=headers)
+            assert (response.status_code, response.json()["error"]) == (404, "http_error"), path
 
 
 def test_monitor_navigation_lists_the_pages_the_product_declares(tmp_path, monkeypatch):
