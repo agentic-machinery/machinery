@@ -500,8 +500,9 @@ def test_cursor_auto_incoming_writer_adds_only_cursor_family(repo, tasks):
     assert resolution.selected.name == "gemini-4-neon-high"
     trace = {entry.name: entry for entry in resolution.trace}
     assert "grok-4.7" not in trace
-    assert "grok-4.7-cursor-fallback" not in trace
-    assert all(entry.transport != "cursor" for entry in resolution.trace)
+    assert trace["grok-4.7-cursor-fallback"].status == "excluded"
+    assert "Cursor-as-reviewer is ineligible" in trace["grok-4.7-cursor-fallback"].reason
+    assert resolution.selected.transport != "cursor"
 
 
 @pytest.mark.parametrize(

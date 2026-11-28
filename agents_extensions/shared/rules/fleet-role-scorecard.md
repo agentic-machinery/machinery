@@ -49,7 +49,7 @@
 | **GPT-6 Luna** | Fast bounded implementation, recon, and mechanical checks | Never sole architecture/security/language/release authority | OpenAI / native Codex | Bounded worker / recon @ high |
 | **Claude Haiku** | Fast cheap recon/triage on Anthropic lane; good for log/search skim | Never sole architecture/security/language/release authority | Anthropic | Recon (with Luna / 3.5 Flash) |
 | **Sonnet 5.5** | Well-scoped everyday coding and bug fixes; polished English reports, runbooks, write-ups, PR/issue prose, decks, spreadsheets, design review of pages/artifacts; faster and uses fewer tokens than Sonnet 5 | Weaker than Opus 5.5 on complex, open-ended work; security-sensitive code authoring (hooks/guards, launchers, credentials/secrets, dispatch admission, sandbox/permissions) goes to Opus 5.5, Codex Sol or Gemini 4 Neon High; Ukrainian curriculum content stays with sanctioned language lanes (Opus 5.5 for Claude); escalate hard judgment to Opus 5.5 / Sol 6.2; designated approval remains separate | Anthropic | Provisional practical worker: after 10 recorded Sonnet 5.5 review or implementation outcomes, adopt or demote with evidence (#9111) |
-| **Grok 4.7** | Strong coding agent; token-efficient; good CF review value | No driver or high/critical review seat; formal review requires the exact Cursor pin and runtime attestation | xAI; SuperGrok Heavy = capacity entitlement (re-verify) | Worker; eligible for low/medium code/infra CF review through attested Cursor `grok-4.7-high` when admitted by the resolver; outside the ordinary review ladders (C-5307) |
+| **Grok 4.7** | Strong coding agent; token-efficient; good CF review value | No driver seat and no critical or security final sign-off; formal review requires the exact Cursor pin and runtime attestation | xAI; SuperGrok Heavy = capacity entitlement (re-verify) | Worker; low/medium/high code/infra CF reviewer through attested Cursor `grok-4.7-high`, in the review rotation (REVIEW-ROTATION-GROK-1127; `model-assignment.md`) |
 | **Gemini 3.8 Flash High** | Multilingual / designated UA language seat; semantic review | Not bulk CRUD default; language outputs need sources | Google / AGY | Language lane (3.1 Pro is retired, not subscribed, operator 2026-10-23) |
 | **K3** | Retired (OO-58, #11327) | No executable route and no substitution | Moonshot | Not a lane |
 | **GLM-5.3** | Deep bug/security; large-context code coherence | Weak UA pedagogy; **LOCAL-ONLY** China-egress | Zhipu / opencode local | Local CF code only; never CI |
@@ -60,16 +60,16 @@
 
 ## 3. Author-family-conditional CF review (required)
 
-Never use a fixed unordered list that can pick the author’s family.
+Never use a fixed unordered list that can pick the author’s family. For a formal code/infra review of record the reviewer resolver picks from the review rotation in `model-assignment.md`; this table lists only the seats that rotation can return per author family.
 
-| Author family | Prefer CF reviewers (code/infra) | Avoid as sole CF |
+| Author family | Code/infra CF seats the resolver can return | Avoid as sole CF |
 |---|---|---|
-| Anthropic (Opus/Sonnet; Fable parked) | Grok, GPT-6.2 Sol, GLM local, Gemini | Sonnet/Opus self-family |
-| OpenAI (GPT-6.2 Sol, GPT-6 Luna) | Grok, Opus/Sonnet, GLM local, Gemini; security-sensitive diffs are raised to `--risk critical`, which excludes Sonnet 5.5 (resolver floor, #9125) | GPT-6 self-family |
-| xAI (Grok) | Opus/Sonnet, GPT-6.2 Sol, GLM local, Gemini; security-sensitive diffs are raised to `--risk critical`, which excludes Sonnet 5.5 (resolver floor, #9125) | Grok self-family |
-| Google (Gemini via AGY) | Grok, OpenAI, Anthropic, GLM local | Gemini self-family alone for CF of Gemini-authored infra |
-| Moonshot (K3 retired, Cursor Composer) | Grok, OpenAI, Anthropic, GLM local, Gemini | Composer self-family; K3 is not a reviewer |
-| Zhipu (GLM) | Grok, OpenAI, Anthropic, Gemini | GLM self-family |
+| Anthropic (Opus/Sonnet; Fable parked) | GPT-6.2 Sol, Gemini 4 Neon High, Grok 4.7 (critical: Sol or Neon) | Sonnet/Opus self-family |
+| OpenAI (GPT-6.2 Sol, GPT-6 Luna) | Opus 5.5, Gemini 4 Neon High, Grok 4.7; Sonnet 5.5 as the medium/low fallback (critical: Opus or Neon; security-sensitive diffs are raised to `--risk critical`, #9125) | GPT-6 self-family |
+| xAI (Grok) | GPT-6.2 Sol, Opus 5.5, Gemini 4 Neon High; Sonnet 5.5 as the medium/low fallback (critical: Sol, Opus or Neon) | Grok self-family |
+| Google (Gemini via AGY) | GPT-6.2 Sol, Opus 5.5, Grok 4.7; Sonnet 5.5 as the medium/low fallback (critical: Sol or Opus) | Gemini self-family alone for CF of Gemini-authored infra |
+| Moonshot (K3 retired, Cursor Composer) | GPT-6.2 Sol, Opus 5.5, Gemini 4 Neon High; Sonnet 5.5 as the medium/low fallback (no Cursor seat; critical: Sol, Opus or Neon) | Composer self-family; K3 is not a reviewer |
+| Zhipu (GLM) | GPT-6.2 Sol, Opus 5.5, Gemini 4 Neon High, Grok 4.7; Sonnet 5.5 as the medium/low fallback (critical: Sol, Opus or Neon) | GLM self-family |
 
 **Task-family qualification overrides:** language CF must be LANGUAGE-LANES-qualified; FOLK uses the review-loop ukrainian seats, with no Claude seat, per the folk rubric.
 
@@ -162,7 +162,8 @@ Hard code                 → GPT-6.2 Sol high | Claude Opus 5.5 high | Gemini 4
 Orchestrate stream        → GPT-6.2 Sol high | Claude Opus 5.5 high | Gemini 4 Neon High (exactly one)
 UI / visual product       → Opus/Sol design → K3 or Sol/Opus/Grok implement web/UI code → Opus/Sol first if systems-hard
 UA language                 → fresh-build writer gemini-4-neon-high (AGY); writer alternatives Sol 6.2 / Opus 5.5; review per LANGUAGE-LANES + VESUM/sources
-Security/bug CF             → author-family-conditional (Grok/GLM/Opus/…)
+Security CF                 → resolver at `critical`: Sol 6.2, Opus 5.5 or Gemini 4 Neon High outside the author's family (never Grok)
+Code/bug CF                 → resolver at the change's risk: the review rotation in model-assignment.md (security paths are raised to `critical`)
 Architecture decision       → Opus/Sol advice → designated approval (operator, or Opus 5.5 + Sol 6.2: the non-author's approval when one authored it, both otherwise) → orchestrator integrates
 Recon                     → GPT-6 Luna high (Sol envelope) | Claude Haiku | Gemini 4 Hydrogen (Sol envelope)
 ```

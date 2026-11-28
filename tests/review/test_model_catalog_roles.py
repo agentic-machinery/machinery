@@ -464,3 +464,491 @@ def test_frozen_complete_reviewer_receipts(index, tmp_path, monkeypatch):
     expected = deepcopy(APPROVED_BASELINE["reviewer"][index])
     expected["value"]["catalog_reviewed_on"] = CURRENT_CATALOG_REVIEW_DATE
     assert res == expected
+
+
+def test_review_rotation_grok_1127_equal_peer_group_and_rotation():
+    """Defect class: catalog order pinning one reviewer or leaking author/capped/excluded seats."""
+    from lu_machinery.review.reviewer_resolver import REVIEW_CANDIDATES, candidate_dispatch_model
+
+    fresh = {"freshness": "fresh", "age_s": 10}
+    snapshot = {
+        "diagnostics": {"stale": False},
+        "agents": {
+            "claude": {"status": "cool", "remaining_pct": 60, "health": {"healthy": True}, "codexbar": {**fresh, "weekly_remaining_pct": 60, "primary_remaining_pct": 60}},
+            "agy": {"status": "cool", "health": {"healthy": True}},
+            "cursor": {"status": "cool", "health": {"healthy": True}},
+            "codex": {"status": "near_cap", "remaining_pct": 3, "health": {"healthy": True}, "codexbar": {**fresh, "weekly_remaining_pct": 3}},
+        },
+        "codex_accounts": {
+            "codex:b": {"status": "cool", "remaining_pct": 63, "health": {"healthy": True}, "codexbar": {**fresh, "weekly_remaining_pct": 63}},
+            "codex:a": {"status": "near_cap", "remaining_pct": 3, "health": {"healthy": True}, "codexbar": {**fresh, "weekly_remaining_pct": 3}},
+        },
+    }
+    expected_cycle = {
+        "anthropic": ["openai_frontier_b", "gemini-4-neon-high", "grok-4.7-cursor-fallback"],
+        "openai": ["claude-opus-5-5", "gemini-4-neon-high", "grok-4.7-cursor-fallback"],
+        "google": ["openai_frontier_b", "claude-opus-5-5", "grok-4.7-cursor-fallback"],
+        "xai": ["openai_frontier_b", "claude-opus-5-5", "gemini-4-neon-high"],
+    }
+    authors = {
+        "anthropic": "claude-opus-5-5",
+        "openai": CURRENT_SOL,
+        "google": "gemini-4-neon",
+        "xai": "grok-4.7",
+    }
+    for risk in ("critical", "high", "medium", "low"):
+        for profile in ("code", "infra"):
+            for family, author in authors.items():
+                counts: dict[str, int] = {}
+                picks: list[str] = []
+                for _ in range(8):
+                    res = resolve_reviewer(
+                        ResolverInputs(
+                            author_model=author,
+                            review_profile=profile,
+                            domain=profile,
+                            risk=risk,
+                            routing_snapshot=snapshot,
+                            claude_account=HOST_ACCOUNT,
+                        ),
+                        recent_review_counts=counts,
+                    )
+                    assert res.selected is not None, (risk, profile, family, res.fail_closed_reason)
+                    assert res.selected.family != family
+                    assert res.selected.name != "openai_frontier"  # codex:a yields to funded codex:b
+                    if res.selected.family == "xai":
+                        assert res.selected.transport == "cursor"
+                        assert candidate_dispatch_model(REVIEW_CANDIDATES[res.selected.name]) == "grok-4.7-high"
+                    picks.append(res.selected.name)
+                    counts[res.selected.concrete_model] = counts.get(res.selected.concrete_model, 0) + 1
+                # Critical and security sign-off stay Sol, Opus and Neon: Grok rotates below critical only.
+                cycle = [
+                    name for name in expected_cycle[family]
+                    if risk != "critical" or name != "grok-4.7-cursor-fallback"
+                ]
+                assert picks == [cycle[i % len(cycle)] for i in range(8)], (risk, profile, family)
+
+    # Equal recent counts break strictly by catalog order even when scheduler workload/inflight differ (F2).
+    unequal_load = deepcopy(snapshot)
+    unequal_load["agents"]["claude"]["scheduler"] = {"completed_input_bytes": 100, "inflight": 3, "failures": 1}
+    unequal_load["agents"]["agy"]["scheduler"] = {"completed_input_bytes": 10, "inflight": 1, "failures": 0}
+    unequal_load["agents"]["cursor"]["scheduler"] = {"completed_input_bytes": 5, "inflight": 0, "failures": 0}
+    tied_counts = {"claude-opus-5-5": 2, "gemini-4-neon": 2, "grok-4.7": 2}
+    for risk in ("critical", "high", "medium", "low"):
+        for profile in ("code", "infra"):
+            tied = resolve_reviewer(
+                ResolverInputs(
+                    author_model=CURRENT_SOL,
+                    review_profile=profile,
+                    domain=profile,
+                    risk=risk,
+                    routing_snapshot=unequal_load,
+                    claude_account=HOST_ACCOUNT,
+                ),
+                recent_review_counts=tied_counts,
+            )
+            assert tied.selected is not None and tied.selected.name == "claude-opus-5-5", (risk, profile)
+
+    # Capped Claude pool (with AGY down so Opus-AGY cannot stand in) and excluded Codex account a are never selected.
+    capped = deepcopy(snapshot)
+    capped["agents"]["claude"]["remaining_pct"] = 5
+    capped["agents"]["claude"]["codexbar"]["weekly_remaining_pct"] = 5
+    capped["agents"]["agy"]["status"] = "unhealthy"
+    capped["codex_accounts"]["codex:b"]["remaining_pct"] = 0
+    res_capped = resolve_reviewer(
+        ResolverInputs(author_model="gemini-4-neon", risk="high", routing_snapshot=capped, claude_account=HOST_ACCOUNT),
+        excluded_quota_buckets=frozenset({"codex:a"}),
+        recent_review_counts={"grok-4.7": 99},
+    )
+    assert res_capped.selected is not None and res_capped.selected.name == "grok-4.7-cursor-fallback"
+    trace_by_name = {entry.name: entry for entry in res_capped.trace}
+    assert trace_by_name["claude-opus-5-5"].status == "excluded"
+    assert trace_by_name["openai_frontier"].status == "excluded"
+    assert trace_by_name["openai_frontier_b"].status == "excluded"
+    # The same capped bench at critical fails closed instead of falling to Grok.
+    res_capped_critical = resolve_reviewer(
+        ResolverInputs(author_model="gemini-4-neon", risk="critical", routing_snapshot=capped, claude_account=HOST_ACCOUNT),
+        excluded_quota_buckets=frozenset({"codex:a"}),
+        recent_review_counts={},
+    )
+    assert res_capped_critical.selected is None
+    assert "grok-4.7-cursor-fallback" not in {entry.name for entry in res_capped_critical.trace if entry.status == "eligible"}
+
+
+@pytest.mark.parametrize("profile", ["code", "infra"])
+@pytest.mark.parametrize("requested_risk", ["low", "medium", "high"])
+def test_security_path_review_never_selects_grok(profile, requested_risk):
+    """Defect class: Grok seated as critical or security final sign-off (REVIEW-ROTATION-GROK-1127 scope)."""
+    fresh = {"freshness": "fresh", "age_s": 10}
+    healthy = {"status": "cool", "remaining_pct": 60, "health": {"healthy": True}}
+    snapshot = {
+        "diagnostics": {"stale": False},
+        "agents": {
+            "claude": {**healthy, "codexbar": {**fresh, "weekly_remaining_pct": 60, "primary_remaining_pct": 60}},
+            "agy": {"status": "cool", "health": {"healthy": True}},
+            "cursor": {"status": "cool", "health": {"healthy": True}},
+            "codex": {**healthy, "codexbar": {**fresh, "weekly_remaining_pct": 60}},
+        },
+        "codex_accounts": {"codex:b": {**healthy, "codexbar": {**fresh, "weekly_remaining_pct": 63}}},
+    }
+    # Grok has the fewest recent reviews, so only the risk floor can keep it off the seat.
+    counts = {CURRENT_SOL: 9, "claude-opus-5-5": 9, "gemini-4-neon": 9, "grok-4.7": 0}
+    for author in ("claude-opus-5-5", CURRENT_SOL, "gemini-4-neon"):
+        res = resolve_reviewer(
+            ResolverInputs(
+                author_model=author,
+                review_profile=profile,
+                domain=profile,
+                risk=requested_risk,
+                changed_paths=(".github/workflows/ci-gate.yml",),
+                routing_snapshot=snapshot,
+                claude_account=HOST_ACCOUNT,
+            ),
+            recent_review_counts=counts,
+        )
+        assert res.selected is not None, (author, res.fail_closed_reason)
+        assert res.selected.family != "xai", (author, requested_risk)
+        assert res.selected.concrete_model in {CURRENT_SOL, "claude-opus-5-5", "gemini-4-neon"}
+        assert not [entry for entry in res.trace if entry.family == "xai" and entry.status in {"eligible", "selected"}]
+        # Below the floor the same counts do pick Grok, so the test can fail for a real defect.
+        plain = resolve_reviewer(
+            ResolverInputs(
+                author_model=author,
+                review_profile=profile,
+                domain=profile,
+                risk=requested_risk,
+                changed_paths=("lu_machinery/common/json_depth.py",),
+                routing_snapshot=snapshot,
+                claude_account=HOST_ACCOUNT,
+            ),
+            recent_review_counts=counts,
+        )
+        assert plain.selected is not None and plain.selected.family == "xai", (author, requested_risk)
+
+
+def test_recent_review_counts_reads_published_code_infra_records_and_fails_closed(tmp_path, monkeypatch):
+    """Defect class: rotation miscounting expired, future, malformed, superseded, mismatched, or unsafe records."""
+    import os
+    from datetime import UTC, datetime
+
+    from lu_machinery.review import reviewer_resolver
+
+    stats = tmp_path / "model-stats"
+    stats.mkdir()
+    now = datetime(2026, 11, 27, 16, 0, tzinfo=UTC)
+    repo_slug = "agentic-machinery/machinery"
+    valid_tokens = {"fresh_input": 100, "cached_input": 50, "output": 25}
+    sha_sol = "a" * 40
+    sha_grok = "b" * 40
+    sha_old = "c" * 40
+    sha_uk = "d" * 40
+    sha_future = "e" * 40
+    sha_mismatch = "f" * 40
+    sha_superseded = "1" * 40
+    sha_unclassified = "2" * 40
+    sha_bad_selector = "3" * 40
+    sha_other_repo = "4" * 40
+
+    def make_row(**overrides):
+        base = {
+            "schema": "model-stats-row.v1",
+            "harness": "codex",
+            "effort": "high",
+            "status": "done",
+            "repo": "machinery",
+            "repository": repo_slug,
+            "tokens": valid_tokens,
+        }
+        base.update(overrides)
+        return base
+
+    pubs = [
+        {"schema": "review-publication.v1", "task_id": "t-sol", "repository": repo_slug, "pr": 1, "head": sha_sol, "verdict": "APPROVED", "published_at": "2026-11-26T12:00:00Z"},
+        # F5: newer future-dated publication for the same target must NOT hide the valid in-window publication above.
+        {"schema": "review-publication.v1", "task_id": "t-sol", "repository": repo_slug, "pr": 1, "head": sha_sol, "verdict": "APPROVED", "published_at": "2026-12-27T12:00:00Z"},
+        {"schema": "review-publication.v1", "task_id": "t-grok", "repository": repo_slug, "pr": 2, "head": sha_grok, "verdict": "CHANGES_REQUESTED", "published_at": "2026-11-27T12:00:00Z"},
+        {"schema": "review-publication.v1", "task_id": "t-old", "repository": repo_slug, "pr": 3, "head": sha_old, "verdict": "APPROVED", "published_at": "2026-11-10T12:00:00Z"},
+        {"schema": "review-publication.v1", "task_id": "t-uk", "repository": repo_slug, "pr": 4, "head": sha_uk, "verdict": "APPROVED", "published_at": "2026-11-27T10:00:00Z"},
+        # F1: malformed non-string verdict (list/dict) must be skipped, never TypeError.
+        {"schema": "review-publication.v1", "task_id": "t-bad-verdict", "repository": repo_slug, "pr": 5, "head": sha_sol, "verdict": ["APPROVED"], "published_at": "2026-11-27T11:00:00Z"},
+        # F3: publication with malformed fleet_repo_selector receipt must be rejected by canonical validator.
+        {"schema": "review-publication.v1", "task_id": "t-bad-selector", "repository": repo_slug, "pr": 11, "head": sha_bad_selector, "verdict": "APPROVED", "published_at": "2026-11-27T11:00:00Z", "fleet_repo_selector": {"selector_value": "bad", "selector_sha256": "not-a-sha"}},
+        # F5: future-only publication timestamp must be excluded.
+        {"schema": "review-publication.v1", "task_id": "t-future", "repository": repo_slug, "pr": 6, "head": sha_future, "verdict": "APPROVED", "published_at": "2026-12-27T12:00:00Z"},
+        # F3: publication for a different head must not match the row.
+        {"schema": "review-publication.v1", "task_id": "t-mismatch", "repository": repo_slug, "pr": 7, "head": "9" * 40, "verdict": "APPROVED", "published_at": "2026-11-27T11:00:00Z"},
+        # F3: superseded task whose latest valid review row names another head.
+        {"schema": "review-publication.v1", "task_id": "t-superseded", "repository": repo_slug, "pr": 8, "head": sha_superseded, "verdict": "APPROVED", "published_at": "2026-11-27T11:00:00Z"},
+        # F3: unclassified review class must not be counted.
+        {"schema": "review-publication.v1", "task_id": "t-unclassified", "repository": repo_slug, "pr": 9, "head": sha_unclassified, "verdict": "APPROVED", "published_at": "2026-11-27T11:00:00Z"},
+        # F10: a publication on another repository earns no credit for the same task id, PR and head.
+        {"schema": "review-publication.v1", "task_id": "t-other-repo", "repository": "agentic-machinery/machinery-infra", "pr": 12, "head": sha_other_repo, "verdict": "APPROVED", "published_at": "2026-11-27T11:00:00Z"},
+    ]
+    rows = [
+        make_row(task_id="t-sol", role="review", model=CURRENT_SOL, **{"class": "infra/critical"}, pr=1, pinned_head=sha_sol),
+        # F3: damaged later row missing its labels must be rejected by _persisted_row_shape, preserving Sol credit.
+        {"schema": "model-stats-row.v1", "task_id": "t-sol", "role": "review", "model": "grok-4.7", "class": "infra/critical", "repo": "machinery", "pr": 1, "pinned_head": sha_sol},
+        # Branch-only review row (pr: None) still matches matching repo + head.
+        make_row(task_id="t-grok", role="review", model="grok-4.7", **{"class": "code/high"}, pr=None, pinned_head=sha_grok),
+        make_row(task_id="t-old", role="review", model="claude-opus-5-5", **{"class": "code/medium"}, pr=3, pinned_head=sha_old),
+        make_row(task_id="t-uk", role="review", model="gemini-4-neon", **{"class": "ukrainian/high"}, pr=4, pinned_head=sha_uk),
+        make_row(task_id="t-unpub", role="review", model="gemini-4-neon", **{"class": "code/high"}, pr=10, pinned_head=sha_sol),
+        make_row(task_id="t-bad-selector", role="review", model="claude-opus-5-5", **{"class": "code/high"}, pr=11, pinned_head=sha_bad_selector),
+        make_row(task_id="t-future", role="review", model="claude-opus-5-5", **{"class": "code/high"}, pr=6, pinned_head=sha_future),
+        make_row(task_id="t-mismatch", role="review", model="claude-opus-5-5", **{"class": "code/high"}, pr=7, pinned_head=sha_mismatch),
+        make_row(task_id="t-superseded", role="review", model="claude-opus-5-5", **{"class": "code/high"}, pr=8, pinned_head=sha_superseded),
+        make_row(task_id="t-superseded", role="review", model="claude-opus-5-5", **{"class": "code/high"}, pr=8, pinned_head=sha_mismatch),
+        make_row(task_id="t-unclassified", role="review", model="claude-opus-5-5", **{"class": "unclassified"}, pr=9, pinned_head=sha_unclassified),
+        make_row(task_id="t-other-repo", role="review", model="claude-opus-5-5", **{"class": "code/high"}, pr=12, pinned_head=sha_other_repo),
+    ]
+    (stats / "publications.jsonl").write_text("\n".join(json.dumps(p) for p in pubs) + "\n", encoding="utf-8")
+    (stats / "rows.jsonl").write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
+
+    counts = reviewer_resolver.read_recent_review_counts(tmp_path, window_days=7, now=now)
+    assert counts == {CURRENT_SOL: 1, "grok-4.7": 1}
+    assert reviewer_resolver.read_recent_review_counts(tmp_path / "missing") == {}
+
+    # F5: forward expiry AND clock rollback across publication/expiry timestamps always reflect current clock.
+    clock_state = {"now": datetime(2026, 11, 26, 12, 0, 0, tzinfo=UTC)}
+
+    class _ControlledDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return clock_state["now"] if tz is None else clock_state["now"].astimezone(tz)
+
+    monkeypatch.setattr(reviewer_resolver, "datetime", _ControlledDatetime)
+    assert reviewer_resolver.read_recent_review_counts(tmp_path, window_days=7) == {CURRENT_SOL: 1}
+    # Roll clock back 1 second before t-sol publication timestamp -> must drop to {}.
+    clock_state["now"] = datetime(2026, 11, 26, 11, 59, 59, tzinfo=UTC)
+    assert reviewer_resolver.read_recent_review_counts(tmp_path, window_days=7) == {}
+    # Advance to just before t-sol expiry, then past it, then roll back 1 second across expiry.
+    clock_state["now"] = datetime(2026, 12, 3, 11, 59, 59, tzinfo=UTC)
+    assert reviewer_resolver.read_recent_review_counts(tmp_path, window_days=7) == {CURRENT_SOL: 1, "grok-4.7": 1}
+    clock_state["now"] = datetime(2026, 12, 3, 12, 0, 1, tzinfo=UTC)
+    assert reviewer_resolver.read_recent_review_counts(tmp_path, window_days=7) == {"grok-4.7": 1}
+    clock_state["now"] = datetime(2026, 12, 3, 11, 59, 59, tzinfo=UTC)
+    assert reviewer_resolver.read_recent_review_counts(tmp_path, window_days=7) == {CURRENT_SOL: 1, "grok-4.7": 1}
+    clock_state["now"] = datetime(2026, 12, 4, 12, 0, 0, 1, tzinfo=UTC)
+    assert reviewer_resolver.read_recent_review_counts(tmp_path, window_days=7) == {}
+    monkeypatch.undo()
+
+    # F4: symlinked model-stats directory, directory at ledger filename, and FIFO fail closed to {}.
+    linked_root = tmp_path / "linked-root"
+    linked_root.mkdir()
+    os.symlink(stats, linked_root / "model-stats")
+    assert reviewer_resolver.read_recent_review_counts(linked_root, window_days=7, now=now) == {}
+
+    dir_ledger_root = tmp_path / "dir-ledger"
+    (dir_ledger_root / "model-stats" / "publications.jsonl").mkdir(parents=True)
+    (dir_ledger_root / "model-stats" / "rows.jsonl").write_text("", encoding="utf-8")
+    assert reviewer_resolver.read_recent_review_counts(dir_ledger_root, window_days=7, now=now) == {}
+
+    fifo_root = tmp_path / "fifo-root"
+    (fifo_root / "model-stats").mkdir(parents=True)
+    os.mkfifo(fifo_root / "model-stats" / "publications.jsonl")
+    (fifo_root / "model-stats" / "rows.jsonl").write_text("", encoding="utf-8")
+    assert reviewer_resolver.read_recent_review_counts(fifo_root, window_days=7, now=now) == {}
+
+    with pytest.raises(ValueError, match="window_days"):
+        reviewer_resolver.read_recent_review_counts(tmp_path, window_days=0, now=now)
+    with pytest.raises(ValueError, match="non-negative integer"):
+        resolve_reviewer(
+            ResolverInputs(author_model="claude-opus-5-5", risk="high", claude_account=HOST_ACCOUNT),
+            recent_review_counts={CURRENT_SOL: -1},
+        )
+    with pytest.raises(ValueError, match="non-negative integer"):
+        resolve_reviewer(
+            ResolverInputs(author_model="claude-opus-5-5", risk="high", claude_account=HOST_ACCOUNT),
+            recent_review_counts={CURRENT_SOL: True},
+        )
+
+
+def _nested(levels: int) -> object:
+    value: object = 0
+    for _ in range(levels):
+        value = {"x": value}
+    return value
+
+
+_ROTATION_SHA = "a" * 40
+_ROTATION_VALID_ROW = {
+    "schema": "model-stats-row.v1",
+    "task_id": "t-sol",
+    "harness": "codex",
+    "model": CURRENT_SOL,
+    "effort": "high",
+    "role": "review",
+    "class": "code/high",
+    "status": "done",
+    "repo": "machinery",
+    "repository": "agentic-machinery/machinery",
+    "tokens": {"fresh_input": 100, "cached_input": 50, "output": 25},
+    "pr": 1,
+    "pinned_head": _ROTATION_SHA,
+}
+
+
+@pytest.mark.parametrize(
+    ("later", "expected", "publication_suffix"),
+    [
+        # Malformed top-level labels: skipped, never coerced to "unknown" over the valid row.
+        ({"role": ["review"]}, "sol", ""),
+        ({"repo": ["machinery"]}, "sol", ""),
+        ({"class": {"code": "high"}}, "sol", ""),
+        ({"model": True}, "sol", ""),
+        ({"status": 5}, "sol", ""),
+        ({"status": "done; rm"}, "sol", ""),
+        ({"harness": "bad label!"}, "sol", ""),
+        ({"harness": None}, "sol", ""),
+        ({"effort": ["high"]}, "sol", ""),
+        ({"repo": None}, "sol", ""),
+        ({"author_model": ["gpt"]}, "sol", ""),
+        ({"data_class": {"public": True}}, "sol", ""),
+        # Labels that are well spelled but break the persisted role, class-shape or settled-status contract.
+        ({"role": "revieww"}, "sol", ""),
+        ({"class": "code"}, "sol", ""),
+        ({"role": "write", "class": "code/high"}, "sol", ""),
+        ({"status": "running"}, "sol", ""),
+        # A PR of 0, a misspelled risk or a number that overflows to infinity is not a persisted row.
+        ({"pr": 0}, "sol", ""),
+        # Values only the canonical row validator refuses: a PR past the signed 64-bit bound, a non-object tokens field.
+        ({"pr": 2**63}, "sol", ""),
+        ({"tokens": []}, "sol", ""),
+        ({"class": "code/hihg"}, "sol", ""),
+        (', "extra": 1e9999', "sol", ""),
+        # Frozen 16-level nesting contract: a depth-17 later row is skipped; depth 16 still supersedes.
+        ({"extra": _nested(16)}, "sol", ""),
+        ({"extra": _nested(15)}, "grok", ""),
+        # Strict JSON: a duplicate member or a NaN extension makes the later row unreadable, not a replacement.
+        (', "model": "grok-4.7"', "sol", ""),
+        (', "extra": NaN', "sol", ""),
+        # A publication with a duplicate verdict member is unreadable, whichever value comes last.
+        ({}, None, ', "verdict": "APPROVED"'),
+        # A valid later review row for the same task supersedes; naming another head drops its credit.
+        ({}, "grok", ""),
+        ({"pinned_head": "b" * 40}, None, ""),
+    ],
+)
+def test_recent_review_counts_malformed_later_row_never_replaces_valid_row(
+    tmp_path, later, expected, publication_suffix
+):
+    """Defect class: a later malformed, ambiguous or over-deep ledger line erasing or transferring review credit."""
+    from datetime import UTC, datetime
+
+    from lu_machinery.review import reviewer_resolver
+
+    stats = tmp_path / "model-stats"
+    stats.mkdir()
+    publication = {
+        "schema": "review-publication.v1",
+        "task_id": "t-sol",
+        "repository": "agentic-machinery/machinery",
+        "pr": 1,
+        "head": _ROTATION_SHA,
+        "verdict": ["APPROVED"] if publication_suffix else "APPROVED",
+        "published_at": "2026-11-26T12:00:00Z",
+    }
+    superseding = {**_ROTATION_VALID_ROW, "model": "grok-4.7", "harness": "cursor"}
+    if isinstance(later, dict):
+        superseding_line = json.dumps({**superseding, **later})
+    else:
+        superseding_line = json.dumps(superseding)[:-1] + later + "}"
+    (stats / "publications.jsonl").write_text(
+        json.dumps(publication)[:-1] + publication_suffix + "}\n", encoding="utf-8"
+    )
+    (stats / "rows.jsonl").write_text(json.dumps(_ROTATION_VALID_ROW) + "\n" + superseding_line + "\n", encoding="utf-8")
+
+    counts = reviewer_resolver.read_recent_review_counts(
+        tmp_path, window_days=7, now=datetime(2026, 11, 27, 16, 0, tzinfo=UTC)
+    )
+    assert counts == {None: {}, "sol": {CURRENT_SOL: 1}, "grok": {"grok-4.7": 1}}[expected]
+
+
+def test_recent_review_counts_skips_oversized_ledger_lines_and_keeps_reading(tmp_path):
+    """Defect class: an unbounded ledger line read whole, or a drained line hiding the records after it."""
+    from datetime import UTC, datetime
+
+    from lu_machinery.review import reviewer_resolver
+
+    limit = reviewer_resolver._RECENT_REVIEW_MAX_LINE_BYTES
+    stats = tmp_path / "model-stats"
+    stats.mkdir()
+    publication = {
+        "schema": "review-publication.v1",
+        "task_id": "t-sol",
+        "repository": "agentic-machinery/machinery",
+        "pr": 1,
+        "head": _ROTATION_SHA,
+        "verdict": "APPROVED",
+        "published_at": "2026-11-26T12:00:00Z",
+    }
+    oversized_publication = {**publication, "pad": "x" * limit}
+    oversized_row = {**_ROTATION_VALID_ROW, "model": "grok-4.7", "harness": "cursor", "pad": "x" * limit}
+    # An oversized line first in each ledger, then valid records that must still be read.
+    (stats / "publications.jsonl").write_text(
+        json.dumps(oversized_publication) + "\n" + json.dumps(publication) + "\n", encoding="utf-8"
+    )
+    # A superseding oversized row is skipped, so the earlier valid Sol row keeps its credit.
+    (stats / "rows.jsonl").write_text(
+        json.dumps(oversized_row) + "\n" + json.dumps(_ROTATION_VALID_ROW) + "\n" + json.dumps(oversized_row) + "\n",
+        encoding="utf-8",
+    )
+    now = datetime(2026, 11, 27, 16, 0, tzinfo=UTC)
+    assert reviewer_resolver.read_recent_review_counts(tmp_path, window_days=7, now=now) == {CURRENT_SOL: 1}
+    # An oversized final line with no newline is drained to end of file without failing.
+    with (stats / "rows.jsonl").open("a", encoding="utf-8") as handle:
+        handle.write("x" * (limit + 10))
+    assert reviewer_resolver.read_recent_review_counts(tmp_path, window_days=7, now=now) == {CURRENT_SOL: 1}
+
+
+def test_rotation_counts_need_no_catalog_lookup(tmp_path, monkeypatch):
+    """Defect class: a model or fleet catalog read failure changing review credit."""
+    from datetime import UTC, datetime
+
+    from lu_machinery.api import model_stats_rows
+    from lu_machinery.review import model_catalog, reviewer_resolver
+
+    stats = tmp_path / "model-stats"
+    stats.mkdir()
+    grok_head = "b" * 40
+    publications = [
+        {"schema": "review-publication.v1", "task_id": task, "repository": "agentic-machinery/machinery",
+         "pr": pr, "head": head, "verdict": "APPROVED", "published_at": "2026-11-26T12:00:00Z"}
+        for task, pr, head in (("t-sol", 1, _ROTATION_SHA), ("t-grok", 2, grok_head))
+    ]
+    # The writer stores the recorded spelling when its own catalog read fails (``model_id``).
+    grok_row = {**_ROTATION_VALID_ROW, "task_id": "t-grok", "harness": "cursor", "model": "grok-4.7-high",
+                "pr": 2, "pinned_head": grok_head}
+    (stats / "publications.jsonl").write_text("".join(json.dumps(p) + "\n" for p in publications), encoding="utf-8")
+    (stats / "rows.jsonl").write_text(
+        json.dumps(_ROTATION_VALID_ROW) + "\n" + json.dumps(grok_row) + "\n", encoding="utf-8"
+    )
+    now = datetime(2026, 11, 27, 16, 0, tzinfo=UTC)
+    expected = {CURRENT_SOL: 1, "grok-4.7-high": 1}
+    assert reviewer_resolver.read_recent_review_counts(tmp_path, window_days=7, now=now) == expected
+
+    calls: list[str] = []
+
+    def unreadable(name):
+        def read(*_args, **_kwargs):
+            calls.append(name)
+            raise OSError(f"{name} unreadable")
+
+        return read
+
+    with monkeypatch.context() as patched:
+        for module, name in (
+            (model_stats_rows, "load_model_catalog"),
+            (model_stats_rows, "model_catalog_reading"),
+            (model_stats_rows, "load_fleet_repos"),
+            (model_stats_rows, "fleet_catalog"),
+            (model_stats_rows, "_fleet_repo_visibility"),
+            (model_stats_rows, "_public_data_classes"),
+            (model_catalog, "load_model_catalog"),
+            (reviewer_resolver, "load_model_catalog"),
+        ):
+            patched.setattr(module, name, unreadable(name))
+        assert reviewer_resolver.read_recent_review_counts(tmp_path, window_days=7, now=now) == expected
+    assert calls == []
+    # The resolver maps the stored labels onto its own candidates, so the raw spelling credits Grok.
+    assert reviewer_resolver._normalize_recent_review_counts(expected) == {CURRENT_SOL: 1, "grok-4.7": 1}

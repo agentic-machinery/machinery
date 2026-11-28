@@ -13,9 +13,10 @@ the observed Codex account. Claude retains its existing account cap protection.
 The model inventory, candidate routes, and risk ladders are loaded from the
 versioned ``scripts/config/model_catalog.yaml`` catalog at import time
 (``REVIEW_CANDIDATES`` / ``REVIEW_LADDERS`` via ``_catalog_candidate`` /
-``_catalog_ladder``). Policy changes belong in YAML: critical admits Sol / Opus / Grok;
-Fable holds no review role (#9583); native and runtime-attested Cursor Grok are
-regular code/infra reviewers at every risk (operator decision 2026-10-05, #9769).
+``_catalog_ladder``). Policy changes belong in YAML. Reviewer order follows the
+review rotation rule at the top of ``agents_extensions/shared/rules/model-assignment.md``
+(REVIEW-ROTATION-GROK-1127); ``read_recent_review_counts`` supplies its recent-review
+counts. Fable holds no review role (#9583).
 A formal review at high or critical risk is performed only by the models
 ``review_scheduler.risk_reviewer_models`` lists; that is an
 eligibility gate, so it binds explicit pins and custom ladders too.
@@ -31,17 +32,22 @@ selection unchanged. Ambiguous path inference fails closed instead of guessing.
 
 from __future__ import annotations
 
+import math
 import os
 import re
 import shlex
-from collections.abc import Iterable, Mapping
+import stat
+from collections import Counter
+from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass, field, replace
+from datetime import UTC, datetime, timedelta
 from fnmatch import fnmatchcase
 from pathlib import Path
-from typing import Literal
+from typing import Any, BinaryIO, Literal
 
 from lu_machinery.agent_runtime.adapters.acpx import ACPX_PARTICIPANT_CATALOG_TRANSPORTS, ACPX_SUPPORTED_PARTICIPANTS
 from lu_machinery.agent_runtime.agent_identity import resolve_retired_agent_alias
+from lu_machinery.common import json_depth
 from lu_machinery.fleet import credit_lane
 from lu_machinery.fleet.claude_account_lane import ClaudeAccount, bind_snapshot, require_account
 from lu_machinery.review.app_bot_authorship import VERIFIED_APP_BOT
@@ -60,7 +66,6 @@ from lu_machinery.review.reviewer_scheduler import (
     _route_record,
     circuit_exclusion_reason,
     codex_account_key,
-    selection_key,
 )
 from lu_machinery.review.security_paths import effective_review_risk, is_security_sensitive_change
 from lu_machinery.review.subject_seat import prepare_subject_exclusion, subject_exclusion_reason
@@ -72,6 +77,251 @@ _SEALED_REVIEW_EXECUTABLE = "agent_runtime.runner:invoke_inter_agent"
 # from this module's unresolved location, so a symlinked package keeps its checkout name
 # and a short import spelling (the package directory on ``sys.path``) cannot shorten it.
 _NATIVE_REVIEW_EXECUTABLE = f"{Path(os.path.abspath(__file__)).parents[1].name}/dispatch.py"
+RECENT_REVIEW_WINDOW_DAYS = 7
+# Frozen input contract for both rotation ledgers: a deeper line is skipped, never parsed.
+_RECENT_REVIEW_JSON_MAX_DEPTH = 16
+# Longest ledger line read whole. A publication is a flat record of short fields, and a
+# summary_row has fixed fields, a sample of at most 200 characters and one 16-hex digest per
+# blocking finding, so written lines stay a few KiB. A longer line is drained and skipped.
+_RECENT_REVIEW_MAX_LINE_BYTES = 1024 * 1024
+_CODE_INFRA_REVIEW_CLASSES = frozenset(
+    f"{profile}/{risk}" for profile in VALID_REVIEW_PROFILES for risk in (*VALID_RISKS, "unknown")
+)
+
+
+def _reject_duplicate_members(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    members = dict(pairs)
+    if len(members) != len(pairs):
+        raise ValueError("duplicate JSON object member")
+    return members
+
+
+def _reject_json_constant(token: str) -> object:
+    raise ValueError(f"non-JSON constant {token}")
+
+
+def _finite_float(token: str) -> float:
+    value = float(token)
+    if not math.isfinite(value):
+        raise ValueError(f"JSON number {token} is not finite")
+    return value
+
+
+def _bounded_ledger_lines(stream: BinaryIO) -> Iterator[bytes]:
+    """Each ledger line of at most the byte limit; a longer line is drained in bounded chunks and skipped."""
+    limit = _RECENT_REVIEW_MAX_LINE_BYTES
+    while line := stream.readline(limit + 1):
+        if len(line) <= limit:
+            yield line
+            continue
+        while not line.endswith(b"\n"):
+            line = stream.readline(limit + 1)
+            if not line:
+                break
+
+
+def _load_ledger_line(line: bytes) -> Any:
+    """One rotation-ledger line as strict JSON.
+
+    The line must be UTF-8 (both writers emit ASCII JSON), at most 16 levels deep, with no
+    duplicate members, no NaN/Infinity and no number that overflows to infinity (``1e9999``).
+    """
+    return json_depth.loads(
+        line.decode("utf-8"),
+        max_depth=_RECENT_REVIEW_JSON_MAX_DEPTH,
+        object_pairs_hook=_reject_duplicate_members,
+        parse_constant=_reject_json_constant,
+        parse_float=_finite_float,
+    )
+
+
+def _persisted_row_shape(row: Mapping[str, object]) -> bool:
+    """Whether a row is a settled code/infra review row as ``model_stats_rows.summary_row`` persists it.
+
+    Only the stored fields are read, never a catalog, so a catalog that cannot be read can
+    never change which rows count. Every label must already be in the form the writer stores:
+    what the canonical sanitiser keeps, with the effort lowercase, as ``effective_effort``
+    writes it on every path. The role is ``review``; the class is ``profile/risk`` with a
+    code/infra profile and a supported risk, or the ``unknown`` risk the writer records when a
+    task named none; the PR is absent or a positive integer; the pinned head is absent or a
+    commit SHA; the status is settled. The caller applies this before supersession, so a row that fails it
+    is skipped and can never replace an earlier valid row.
+    """
+    from lu_machinery.api import model_stats_rows
+
+    labels = model_stats_rows._LABEL_FIELDS
+    optional_labels = ("author_model", "data_class")
+    sanitised = model_stats_rows._sanitised({name: row.get(name) for name in (*labels, *optional_labels)})
+    if not all(type(row.get(name)) is str and sanitised[name] == row[name] for name in labels):
+        return False
+    if not all(
+        row.get(name) is None or (type(row[name]) is str and sanitised[name] == row[name]) for name in optional_labels
+    ):
+        return False
+    pr = row.get("pr")
+    return (
+        row["effort"] == str(row["effort"]).lower()
+        and row["role"] == "review"
+        and row["class"] in _CODE_INFRA_REVIEW_CLASSES
+        and (pr is None or (type(pr) is int and pr > 0))
+        and (row.get("pinned_head") is None or model_stats_rows._sha(row["pinned_head"]))
+        and row["status"] not in model_stats_rows.ACTIVE
+    )
+
+
+def _open_regular_in_dir(dir_fd: int, filename: str) -> int | None:
+    try:
+        fd = os.open(filename, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=dir_fd)
+    except OSError:
+        return None
+    try:
+        file_stat = os.fstat(fd)
+    except OSError:
+        os.close(fd)
+        return None
+    if not stat.S_ISREG(file_stat.st_mode):
+        os.close(fd)
+        return None
+    return fd
+
+
+def read_recent_review_counts(
+    batch_state_dir: Path | None = None,
+    *,
+    window_days: int = RECENT_REVIEW_WINDOW_DAYS,
+    now: datetime | None = None,
+) -> dict[str, int]:
+    """Count recent published code/infra reviews of record per stored model label.
+
+    Reads ``<batch_state>/model-stats/publications.jsonl`` (the published-verdict
+    ledger written by ``record_cf_verdict``) over the trailing ``window_days``
+    ``[now - window_days, now]`` and joins each publication to the latest valid
+    ``rows.jsonl`` row of the same task id, on the row's repository (the GitHub
+    owner/name ``summary_row`` stores at record time; a row without one earns no
+    credit), its pinned head and, when the row names one, its PR. The counts depend
+    on those two files alone: no model or fleet catalog is read, so a catalog read
+    failure never changes review credit.
+    Keys are the model labels the writer stored (``summary_row`` writes the catalog
+    id at record time); ``resolve_reviewer`` maps them onto its candidates. Missing
+    or unsafe state paths fail closed to ``{}``.
+    """
+    if isinstance(window_days, bool) or not isinstance(window_days, int) or window_days < 1:
+        raise ValueError("window_days must be a positive integer")
+    if batch_state_dir is None:
+        from lu_machinery.common.repo_root import MachineryConfigError
+        from lu_machinery.common.task_store_paths import tasks_dir
+
+        try:
+            batch_state_dir = tasks_dir().parent
+        except (MachineryConfigError, OSError):
+            return {}
+
+    from lu_machinery.api import model_stats_rows
+
+    stats_dir = batch_state_dir / model_stats_rows.ROWS_DIR
+    try:
+        dir_fd = os.open(stats_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except OSError:
+        return {}
+
+    try:
+        reference_now = (
+            (now.astimezone(UTC) if now.tzinfo else now.replace(tzinfo=UTC))
+            if now is not None
+            else datetime.now(UTC)
+        )
+        cutoff = reference_now - timedelta(days=window_days)
+
+        pubs_fd = _open_regular_in_dir(dir_fd, model_stats_rows.PUBLICATIONS_FILE)
+        if pubs_fd is None:
+            return {}
+        # Each task's in-window published targets, as (repository, PR, head).
+        published: dict[str, set[tuple[str, int, str]]] = {}
+        try:
+            with os.fdopen(pubs_fd, "rb") as stream:
+                for line in _bounded_ledger_lines(stream):
+                    try:
+                        entry = _load_ledger_line(line)
+                    except (ValueError, RecursionError):
+                        continue
+                    if not model_stats_rows._publication_ok(entry):
+                        continue
+                    published_at = model_stats_rows.timestamp(entry["published_at"])
+                    # Filter to the trailing window before target matching so a newer
+                    # future-dated publication can never hide an in-window publication.
+                    if published_at is None or not (cutoff <= published_at <= reference_now):
+                        continue
+                    published.setdefault(entry["task_id"], set()).add(
+                        (entry["repository"].lower(), entry["pr"], entry["head"])
+                    )
+        except OSError:
+            return {}
+
+        rows_fd = _open_regular_in_dir(dir_fd, model_stats_rows.ROWS_FILE)
+        if rows_fd is None:
+            return {}
+        if not published:
+            os.close(rows_fd)
+            return {}
+
+        latest_rows: dict[str, dict[str, object]] = {}
+        try:
+            with os.fdopen(rows_fd, "rb") as stream:
+                for line in _bounded_ledger_lines(stream):
+                    try:
+                        row = _load_ledger_line(line)
+                    except (ValueError, RecursionError):
+                        continue
+                    if not isinstance(row, dict) or row.get("schema") != model_stats_rows.ROW_SCHEMA:
+                        continue
+                    tid = row.get("task_id")
+                    if (
+                        not isinstance(tid, str)
+                        or tid not in published
+                        or not model_stats_rows.valid_task_id(tid)
+                        or not model_stats_rows._well_formed(row, check_sample_visibility=False)
+                        or not _persisted_row_shape(row)
+                    ):
+                        continue
+                    # Last row wins only among rows that pass every check above, so a later
+                    # code/infra review row drops stale credit and any other row never
+                    # replaces an earlier valid one.
+                    latest_rows[tid] = row
+        except OSError:
+            return {}
+    finally:
+        os.close(dir_fd)
+
+    counts: Counter[str] = Counter()
+    for tid, row in latest_rows.items():
+        repository, row_pr, pinned_head = row.get("repository"), row.get("pr"), row.get("pinned_head")
+        if not isinstance(repository, str):
+            continue
+        # Both slugs passed the ASCII owner/name grammar, so lower() is GitHub's case-insensitive match.
+        if any(
+            repo == repository.lower() and head == pinned_head and row_pr in (None, pr)
+            for repo, pr, head in published[tid]
+        ):
+            counts[str(row["model"])] += 1  # a stored model label, checked by _persisted_row_shape
+    return dict(counts)
+
+
+def _normalize_recent_review_counts(counts: Mapping[str, int]) -> dict[str, int]:
+    if not isinstance(counts, Mapping):
+        raise ValueError("recent_review_counts must be a mapping")
+    normalized: dict[str, int] = {}
+    for key, value in counts.items():
+        if not isinstance(key, str) or not key.strip():
+            raise ValueError("recent_review_counts keys must be non-empty strings")
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError(f"recent_review_counts[{key!r}] must be a non-negative integer")
+        stripped = key.strip()
+        if stripped in REVIEW_CANDIDATES:
+            model = REVIEW_CANDIDATES[stripped].concrete_model
+        else:
+            model = resolve_catalog_model_id(stripped, _MODEL_CATALOG) or stripped
+        normalized[model] = normalized.get(model, 0) + value
+    return normalized
 
 
 def normalize_review_task_id(task_id: str, *, agent: str = "") -> str:
@@ -1434,6 +1684,7 @@ def resolve_reviewer(
     runtime_state: Mapping[str, object] | None = None,
     excluded_quota_buckets: frozenset[str] = frozenset(),
     review_mode: str = "cross_family",
+    recent_review_counts: Mapping[str, int] | None = None,
 ) -> ReviewerResolution:
     """Apply hard policy then balance the best eligible quality tier.
 
@@ -1453,6 +1704,11 @@ def resolve_reviewer(
     """
     if review_mode not in {"cross_family", "red_team"}:
         raise ValueError("unsupported review mode")
+    review_counts = _normalize_recent_review_counts(
+        recent_review_counts
+        if recent_review_counts is not None
+        else ({} if inputs.structural else read_recent_review_counts())
+    )
     resolution_type = RedTeamResolution if review_mode == "red_team" else ReviewerResolution
     if review_mode == "red_team":
         # Its outside-family probes retain whole-branch exclusions, without the new pair partition.
@@ -1687,7 +1943,7 @@ def resolve_reviewer(
     }
 
     for rung_index, rung in enumerate(active_ladder):
-        for candidate in rung:
+        for candidate_index, candidate in enumerate(rung):
             result = _evaluate_candidate(candidate, inputs, author_family=author_family, review_mode=review_mode)
             if result.status == "eligible":
                 eligible_quota_buckets.add(candidate.quota_bucket)
@@ -1717,11 +1973,10 @@ def resolve_reviewer(
             if result.status == "eligible":
                 result = replace(
                     result,
-                    selection_score=selection_key(
-                        candidate,
-                        snapshot=inputs.routing_snapshot,
-                        exact_head=inputs.exact_head,
-                        policy_version=_SCHEDULER_POLICY_VERSION,
+                    selection_score=(
+                        review_counts.get(candidate.concrete_model, 0),
+                        rung_index,
+                        candidate_index,
                     ),
                 )
             trace.append(result)
