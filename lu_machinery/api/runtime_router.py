@@ -2735,6 +2735,8 @@ async def runtime_routing(ctx: MonitorContext = Depends(get_ctx)) -> JSONRespons
         decisions = {"status": decisions.get("status"), "reason": decisions.get("reason"), "as_of": last_as_of}
     scanned = _routing_started(decisions.get("as_of")) if stored else None
     # The scan's age counts from when it read the store, not from when its result was cached.
+    # Millisecond display, the same quantum ``X-Snapshot-Age-S`` prints. ``as_of`` is
+    # ``isoformat`` (microseconds kept). Nearest rounding is at most 0.0005 s above that elapsed time.
     age = round(max((datetime.now(UTC) - scanned).total_seconds(), 0.0), 3) if scanned is not None else None
     payload = {
         "pools": [{"pool": meter, "label": label} for meter, label in ROUTING_POOLS],

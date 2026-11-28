@@ -13,6 +13,9 @@ file only points there and adds what the CTO seat learned on top.
 - When the CTO rules that a PR must not land yet (for example until a review covers every item), it applies a hold the merge-queue keeper reads,
   the `hold` label (`HOLD_LABELS`) or the `[hold]` title marker (`HOLD_TITLE`) in `lu_machinery/orchestration/merge_queue_keeper.py`, in the same action
   as the ruling, and names the condition for removing it. An instruction to a lane alone does not stop the keeper.
+- Before closing a PR as superseded, confirm from each PR's own changes against current main
+  that the successor carries every change that is not a version pin; a newer release number
+  alone does not make a PR a successor.
 
 ## Publish orders
 
@@ -70,6 +73,19 @@ Name the commands the review route can run. See the [review brief's route table]
 Read attestation from the task JSON's top-level `resolved_model_known`, `resolved_model`
 and `resolved_model_source`; never grep nested status output for these fields.
 
+Review tools take the GitHub name: `closeout_cli resolve-reviewer` and `record_cf_verdict
+budget-check` take `--repository <owner>/<name>`, and recording a verdict reads it from the
+review task (`--task-id`); `--repo` is a fleet repository key (the dispatcher, `closeout_cli
+target`). A brief that said "review-loop with `--repo <key>`" made `resolve-reviewer` fail
+closed with `author task provenance conflicts with commit trailer`.
+Every brief has the review take its `--risk` from `lu_machinery.review.tiers` at the pushed
+head, as `review-loop` does before round 1, never from the paths the brief expects to change;
+the resolver may still raise it. Edits to the `cto` skill's reference Markdown rated medium for
+#1593; the release cut's follow-up PR (record the release, start the next version) rates high
+(machinery #1589, #1546), and the review policy requires high or critical risk for a High-tier
+change. No landing check compares the risk a review ran at with the tier, so the review must
+use the pushed head's tier.
+
 When a work item hits the review cap, record the
 [cap disposition](../../review-loop/references/policy.md#4-convergence) before dispatching any
 replacement. Confirm the predecessor task has settled before dispatch. Use the same parent
@@ -119,6 +135,10 @@ guarded remover.
 - Read the provider's full docs (`llms-full.txt` or equivalent) before the first paid call and put its request and response rules in the brief.
 - Binding facts and rulings for a worker go in its brief or in a successor task, unless they answer a question it asked; a message to a live worker is only such an answer, because workers may never read other mid-task messages.
 - Get a PR's branch with `gh pr view <PR> --json headRefName` in the same script that writes the brief.
+- Before dispatching an author onto an existing branch or PR, work out at the change's risk the full review plan the
+  branch will need once the new author's family has committed to it, including both seats of a mixed-family pair, and
+  pick an author only when every seat of that plan is eligible. A resolver preview that only adds the new author's
+  family can return a different plan, so it does not settle this.
 
 Record each new in-flight task with `lu-driver-state add --lane cto --kind inflight`, its
 owner and done condition. Attach its task ID with `link <id> task <task-id>` and record the
@@ -133,13 +153,16 @@ Run Claude-account dispatches from the seat as `env -u CLAUDE_CONFIG_DIR "$LEARN
 while that ambient value is set (`claude_account_ambient_conflict`).
 CTO dispatches omit `--claude-account` unless a current order names an exception: the saved
 dispatch default account carries the active account order, and an explicit account overrides it.
+Before any read of `origin/main` below, fetch and pin it: `git fetch origin`, then
+`BASE_SHA="$(git rev-parse origin/main)"`. Use `$BASE_SHA` for git log and diffs.
+`--base` stays `origin/main`: a commit SHA is refused.
 Dispatch a takeover that continues the existing PR with `--branch <the PR's head branch>` together with
 `--base origin/main`, never the PR branch as base; the `takeover` skill checks out the PR branch.
 A same-PR successor dispatched without `--branch` is refused by `lu_machinery.orchestration.pr_ownership accept`
 with `publish_branch_required` and stops.
 For a replacement authorized after the cap, dispatch on a fresh branch. Grant the paths the
-replacement will change relative to `origin/main`, including any inherited changes it keeps.
-The same-PR successor's owned paths must cover the original PR's full diff against `origin/main`,
+replacement will change relative to `$BASE_SHA`, including any inherited changes it keeps.
+The same-PR successor's owned paths must cover the original PR's full diff against `$BASE_SHA`,
 not only its own fixes, because `delivered_paths` counts the PR's inherited commits as the
 successor's changes.
 `delivered_paths` in `lu_machinery/dispatcher/ownership.py` excludes commits reachable from the
@@ -155,7 +178,7 @@ passes sets `--hard-timeout 14400`, because the dispatcher default is 7200 secon
 `--silence-timeout` (default 3600 seconds) applies separately, so a quiet wait can still end after 3600 seconds of silence.
 Use exact owned file paths; never claim a shared subtree for an optional edit.
 Before dispatch, check every owned path in the brief and the `--owned-path` flags with `git ls-files --error-unmatch <path>`, or mark it in the brief as a new file the worker creates.
-Before dispatching an open issue, run `git log origin/main --oneline --grep='#<N>'` and read the issue's linked PRs; if fixes already landed, verify the acceptance criteria on main and close or narrow the issue instead of dispatching.
+Before dispatching an open issue, run `git log "$BASE_SHA" --oneline --grep='#<N>'` on the SHA pinned above and read the issue's linked PRs; if fixes already landed, verify the acceptance criteria on main and close or narrow the issue instead of dispatching.
 Before briefing a fix for a refusal or a fail-closed check, confirm that the state after the fix is allowed by policy (attested model and variant, operator keep-list, honest provenance); a census or residual that names such a blocker stops the dispatch, and the item is recorded as blocked instead.
 Before choosing owned paths, `git grep` the changed modules' names in `tests/`, including the
 root `tests/*.py` files, and make every file that matches an owned path, so the worker can

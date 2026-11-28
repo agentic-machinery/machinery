@@ -48,12 +48,10 @@ policy:
       review through the existing Cursor transport, on trial (C-5308).
       Native Grok remains available for coding. Older Grok models remain
       historical identities.
-      Grok has no driver, Ukrainian, or critical/security final-signoff
-      authority; REVIEW-ROTATION-GROK-1127 admits Grok through its pinned
-      Cursor route grok-4.7-high as an equal formal code/infra reviewer
-      alongside Sol, Opus and Neon at low, medium and high risk. Critical and
-      security sign-off stay Sol, Opus and Neon pending planted-defect data
-      (operator decides).
+      Grok has no driver or Ukrainian review role. The 2026-11-28 operator
+      decision extends REVIEW-ROTATION-GROK-1127 to all risks. The pinned Cursor
+      route grok-4.7-high reviews code and infra alongside Sol, Opus and Neon,
+      including critical risk and security paths.
     - >-
       Kimi models are retired (OO-58, #11327, 2026-10-21; unused since
       2026-10-13, reconfirmed 2026-10-18 and 2026-10-21). Dispatch refuses
@@ -111,10 +109,8 @@ review_scheduler:
   profile_risk_role_order:
     code:
       critical: [critical_review]
-      # REVIEW-ROTATION-GROK-1127 (operator 2026-11-27): Sol 6.2, Opus 5.5,
-      # Neon High and pinned Cursor Grok 4.7 High all hold standard_review and
-      # rank equally at low, medium and high. Critical keeps critical_review
-      # only (Sol, Opus and Neon; Grok holds no critical_review).
+      # The rotation peers tie on standard_review below critical and on
+      # critical_review at critical risk.
       high: [standard_review, critical_review, strong_review, long_context_review]
       medium: [standard_review, critical_review, strong_review, long_context_review, routine_review]
       low: [standard_review, critical_review, routine_review, strong_review, long_context_review]
@@ -158,10 +154,7 @@ review_scheduler:
   # performed only by these models, on any catalogued review route (Opus 5.5
   # natively; no Claude model through Cursor, #10464). This is an eligibility gate: ladders, explicit
   # pins, custom ladders and delegate review admission all apply it.
-  # REVIEW-ROTATION-GROK-1127 (operator 2026-11-27): Sol 6.2, Opus 5.5,
-  # Gemini 4 Neon High and pinned Cursor Grok 4.7 High are one equal formal
-  # code/infra reviewer group at low, medium and high risk. Critical and
-  # security sign-off stay Sol 6.2, Opus 5.5 and Neon High (no Grok).
+  # At critical risk, the resolver and admission require critical_review.
   risk_reviewer_models:
     high:
     - {role: openai_frontier_coder}
@@ -999,27 +992,23 @@ models:
     family: xai
     tier: frontier_authority
     lifecycle: active
-    # C-5307 reverses GROK-CANCEL-1110 for this model; REVIEW-ROTATION-GROK-1127
-    # places pinned Cursor grok-4.7-high in the equal formal code/infra review
-    # group at low, medium and high risk alongside Sol 6.2, Opus 5.5 and Neon High.
+    # C-5307 reverses GROK-CANCEL-1110 for this model. Pinned Cursor Grok
+    # joins the code/infra review rotation at every risk (operator 2026-11-28).
     # Native CLI selector: grok-4.7; attested modelUsage id: grok-4.7-build.
     # Formal Cursor reviews use the exact high-effort wire pin.
     routing_wire_ids: {native_grok: grok-4.7, cursor: grok-4.7-high}
     aliases: [grok-4.7-build, grok-4.7-high]
     runtime_model_ids: [grok-4.7-build]
-    roles: [coding, standard_review]
+    roles: [coding, standard_review, critical_review]
     transports: [native_grok, cursor]
     strengths: [strong_coding, sharp_review, agentic_work, residual_positional_review]
     weaknesses: [native_subscription_window]
     notes: >-
-      Operator order C-5307 restores native coding and Cursor review;
-      REVIEW-ROTATION-GROK-1127 admits pinned Cursor grok-4.7-high as an equal
-      formal code/infra reviewer at low, medium and high risk alongside Sol 6.2,
-      Opus 5.5 and Neon High. The native read-only canary accepts grok-4.7 and
-      attests grok-4.7-build. It holds no driver, Ukrainian, or critical/security
-      final-signoff role. Formal reviews use
-      the existing Cursor provider at grok-4.7-high. The native runtime transport
-      supports coding; no native dispatcher provider exists.
+      Operator order C-5307 restores native coding and Cursor review.
+      Formal code and infra reviews at every risk use the Cursor provider at
+      grok-4.7-high with runtime attestation. The native read-only canary
+      accepts grok-4.7 and attests grok-4.7-build. The native runtime transport
+      supports coding. Grok has no driver or Ukrainian review role.
     sources:
       - https://docs.x.ai/docs/models
   grok-4.6:
@@ -1465,10 +1454,8 @@ formal_cf_defaults:
 
 review_ladders:
   # Hard filters precede last-resort preference, then suitability and quality.
-  # REVIEW-ROTATION-GROK-1127 (operator 2026-11-27): at low, medium and high
-  # risk, Sol, Opus, Neon and pinned Cursor Grok (grok-4.7-high) are one equal
-  # group; critical holds Sol, Opus and Neon only. Reviewer order follows the
-  # review rotation rule at the top of agents_extensions/shared/rules/model-assignment.md.
+  # Sol, Opus, Neon and pinned Cursor Grok (grok-4.7-high) share the first
+  # rung at every risk. Reviewer order follows the rotation in model-assignment.md.
   # No Claude model reviews through Cursor (D-129, #10464).
   # Unsubscribed models have no review candidates. Fable holds no review role (#9583).
   critical:
@@ -1477,6 +1464,7 @@ review_ladders:
       - {role: anthropic_authority_reviewer, seat: anthropic_authority, route_name: native, field: legacy_label}
       - {role: anthropic_authority_reviewer, seat: anthropic_authority, route_name: agy, field: legacy_label}
       - {role: legacy_reviewers, seat: google_bounded, route_name: native, field: legacy_label}
+      - {role: legacy_reviewers, seat: xai_reviewer, route_name: cursor_fallback, field: legacy_label}
   # High lists only review_scheduler.risk_reviewer_models.high (#9538): when
   # no seat is eligible the resolver returns no reviewer with a stated reason.
   high:
@@ -1527,7 +1515,7 @@ seats:
       cursor_fallback:
         legacy_name: grok-4.7-cursor-fallback
         effort: high
-        suitability_roles: [standard_review]
+        suitability_roles: [standard_review, critical_review]
         route: cursor
         transport: cursor
         invocation: .venv/bin/python -m lu_machinery.dispatch dispatch --agent cursor --model {wire_id} --effort high
@@ -1751,6 +1739,7 @@ roles:
     - anthropic_authority/native
     - anthropic_authority/agy
     - google_bounded/native
+    - xai_reviewer/cursor_fallback
     cardinality: many
     risk: critical
     required_model_roles:

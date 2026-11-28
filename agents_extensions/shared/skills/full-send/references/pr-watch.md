@@ -94,7 +94,7 @@ from the receipt (delivery.md, hand-off record); it never restarts them.
   push with `--force-with-lease=<branch>:<observed head>`; the new head needs a delta review
   and fresh CI.
 - If another PR makes this one obsolete, stop and report it with evidence. Closing the PR is
-  a driver act; closing an issue is the CTO's.
+  a driver act; closing an issue is the CTO's or eggbot's.
 
 ## Merge-queue kicks
 

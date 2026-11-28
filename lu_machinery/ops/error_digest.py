@@ -40,14 +40,15 @@ _EGRESS_TIMEOUT_S = 60
 _MICROSECOND = timedelta(microseconds=1)
 _VERSION = "v1"
 _LEDGER = "error-digest-kinds.v1.json"
-_PUBLISH_STATE = ".error-digest-publish.v1.json"
+_PUBLISH_STATE = ".error-digest-publish.v2.json"
 _REPORT_PREFIX = "error-digest-"
 _TOP_KINDS = 10
 _JOURNAL_HEADLINE_LIMIT = 140
 _JOURNAL_BODY_LIMIT = 2000
 _SIGNATURE = re.compile(r"[0-9a-f]{12}")
-_PROPOSAL_KEY = re.compile(r"error-digest:([0-9]{4}-[0-9]{2}-[0-9]{2})(?::[1-9][0-9]*)?")
-_SHA256 = re.compile(r"[0-9a-f]{64}")
+_KIND_FIELDS = frozenset({"first_seen", "source", "severity", "template"})
+_LEDGER_FIELDS = _KIND_FIELDS | {"proposed_at", "proposal_day"}
+_PENDING_KIND_FIELDS = _KIND_FIELDS | {"sig", "count", "group"}
 _SEVERITIES = ("error", "warning", "unparsed")
 _TIMESTAMP = re.compile(
     r"(?<!\w)\d{4}-\d\d-\d\d(?:[Tt ]\d\d:\d\d:\d\d(?:[.,]\d+)?(?:[Zz]|[+-]\d\d:?\d\d| UTC)?)?(?!\w)"
@@ -476,6 +477,38 @@ def _date_text(value: object) -> bool:
     return isinstance(value, str) and date.fromisoformat(value).isoformat() == value
 
 
+def _utf8_text(value: object, *, required: bool = False) -> bool:
+    """A string that encodes as UTF-8; a JSON string can hold a lone surrogate."""
+    if not isinstance(value, str) or (required and not value):
+        return False
+    try:
+        value.encode()
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
+def _valid_sender(value: object) -> bool:
+    """A sender Fleet may record as is: it passes the egress check unchanged."""
+    return (
+        isinstance(value, str) and _utf8_text(value, required=True) and value == value.strip()
+        and not any(ord(ch) < 32 or ord(ch) == 127 for ch in value)
+        and redact_text(value) == value and not scan_text(value)
+    )
+
+
+def _ledger_row(row: object, *, proposed: bool) -> bool:
+    """A kind row exactly as the publisher writes it, pending (``proposed=False``) or recorded."""
+    return (
+        isinstance(row, dict) and set(row) == (_LEDGER_FIELDS if proposed else _KIND_FIELDS)
+        and _date_text(row["first_seen"]) and _utf8_text(row["template"]) and _utf8_text(row["source"])
+        and row["severity"] in _SEVERITIES
+        and (not proposed or (
+            _date_text(row["proposal_day"]) and store.parse_utc_timestamp(row["proposed_at"]) is not None
+        ))
+    )
+
+
 def _load_ledger(path: Path) -> dict[str, Any]:
     """An absent ledger is empty. An invalid ledger blocks proposals."""
     try:
@@ -483,14 +516,7 @@ def _load_ledger(path: Path) -> dict[str, Any]:
         if not isinstance(records, dict):
             raise ValueError
         for sig, row in records.items():
-            if (
-                not _SIGNATURE.fullmatch(sig) or not isinstance(row, dict)
-                or not _date_text(row["first_seen"])
-                or not isinstance(row["template"], str) or not isinstance(row["source"], str)
-                or row["severity"] not in _SEVERITIES
-                or not _date_text(row["proposal_day"])
-                or store.parse_utc_timestamp(row["proposed_at"]) is None
-            ):
+            if not _SIGNATURE.fullmatch(sig) or not _ledger_row(row, proposed=True):
                 raise ValueError
     except FileNotFoundError:
         return {}
@@ -499,57 +525,105 @@ def _load_ledger(path: Path) -> dict[str, Any]:
     return records
 
 
-def _valid_attempt_key(key: str) -> bool:
-    match = _PROPOSAL_KEY.fullmatch(key)
-    return match is not None and _date_text(match[1])
+def _pending_kind(kind: object, day: str) -> bool:
+    """A candidate kind exactly as the publisher collects it for ``day``."""
+    return (
+        isinstance(kind, dict) and set(kind) == _PENDING_KIND_FIELDS
+        and isinstance(kind["sig"], str) and _SIGNATURE.fullmatch(kind["sig"]) is not None
+        and type(kind["count"]) is int and kind["count"] >= 1
+        and isinstance(kind["group"], list) and all(_utf8_text(part) for part in kind["group"])
+        and _ledger_row({field: kind[field] for field in _KIND_FIELDS}, proposed=False)
+        and kind["first_seen"] <= day
+    )
 
 
 def _load_publish_state(path: Path) -> dict[str, Any]:
+    """The pending proposal, kept until Fleet returns its receipt and the ledger records it.
+
+    The attempt stores the collected kinds only; its body, kind rows and Fleet key
+    are derived from them on every send, so they cannot disagree.
+    """
     try:
-        state = json_depth.loads(path.read_text(), max_depth=4)
-        if not isinstance(state, dict) or not isinstance(state["delivery_unknown"], dict):
+        state = json_depth.loads(path.read_text(), max_depth=5)
+        if not isinstance(state, dict) or set(state) != {"attempt"}:
             raise ValueError
-        unknown = state["delivery_unknown"]
-        if any(not _valid_attempt_key(key) or not _SHA256.fullmatch(body) for key, body in unknown.items()):
-            raise ValueError
-        attempt = state["attempt"]
-        if attempt is not None and (
-            not isinstance(attempt, dict) or not _valid_attempt_key(attempt["key"])
-            or attempt["key"] in unknown or not _SHA256.fullmatch(attempt["body_sha256"])
-            or not isinstance(attempt["kinds"], list) or not attempt["kinds"]
-            or not all(_SIGNATURE.fullmatch(sig) for sig in attempt["kinds"])
-        ):
+        if state["attempt"] is not None and not _valid_attempt(state["attempt"]):
             raise ValueError
     except FileNotFoundError:
-        return {"attempt": None, "delivery_unknown": {}}
+        return {"attempt": None}
     except (KeyError, TypeError, ValueError, RecursionError):
         raise DigestError("publish state: unavailable (invalid_state)") from None
     return state
 
 
-def _finish_attempt(state: dict, path: Path, *, delivered: bool) -> None:
+def _valid_attempt(attempt: object) -> bool:
+    """A pending attempt the loader accepts; the writer checks the same rules before persisting."""
+    try:
+        if not isinstance(attempt, dict) or set(attempt) != {"day", "sender", "max_new", "kinds"}:
+            return False
+        day, kinds = attempt["day"], attempt["kinds"]
+        return (
+            _date_text(day) and date.min < date.fromisoformat(day) < datetime.now(UTC).date()
+            and _valid_sender(attempt["sender"])
+            and type(attempt["max_new"]) is int and attempt["max_new"] >= 1
+            and isinstance(kinds, list) and bool(kinds)
+            and all(_pending_kind(kind, day) for kind in kinds)
+            and len({kind["sig"] for kind in kinds}) == len(kinds)
+        )
+    except (KeyError, TypeError, ValueError):
+        return False
+
+
+def _proposal_key(day: str, sender: str, body: str) -> str:
+    """The one Fleet key for this proposal.
+
+    It is bound to the day, sender and body, so it never names another payload:
+    not a key the v1 digest spent, nor a key another report directory used.
+    """
+    digest = hashlib.sha256(f"{sender}\n{body}".encode()).hexdigest()
+    return f"error-digest:v2:{day}:{digest}"
+
+
+def _deliver(state: dict, state_path: Path, ledger: dict, ledger_path: Path, deadline: float) -> DigestError | None:
+    """Send the pending proposal, record its kinds, then clear it.
+
+    A resend derives the same body and key. When an earlier send committed,
+    Fleet returns that receipt and creates no second message.
+    """
     attempt = state["attempt"]
-    if not delivered:
-        state["delivery_unknown"][attempt["key"]] = attempt["body_sha256"]
+    day = attempt["day"]
+    try:
+        body, proposed = _prepare_proposal(date.fromisoformat(day), attempt["kinds"], attempt["max_new"])
+        _publish_proposal(body, attempt["sender"], _proposal_key(day, attempt["sender"], body),
+                          deadline - _EGRESS_TIMEOUT_S)
+    except DigestError as exc:
+        return exc
+    proposed_at = datetime.now(UTC).isoformat()
+    for sig, row in proposed.items():
+        ledger[sig] = {**row, "proposed_at": proposed_at, "proposal_day": day}
+    _write_state(ledger_path, _json_bytes(ledger), replace=True)
     state["attempt"] = None
-    _write_state(path, _json_bytes(state), replace=True)
+    _write_state(state_path, _json_bytes(state), replace=True)
+    return None
 
 
-def _unknown_notes(state: dict, day: date) -> str:
-    if not state:
+def _recorded(ledger: dict, attempt: dict) -> bool:
+    """The ledger already holds every kind row this attempt proposes, for its day."""
+    rows = _kind_rows(_listed_kinds(attempt["kinds"], attempt["max_new"]))
+    return all(
+        (entry := ledger.get(sig)) is not None and entry["proposal_day"] == attempt["day"]
+        and {field: entry[field] for field in _KIND_FIELDS} == row
+        for sig, row in rows.items()
+    )
+
+
+def _pending_note(state: dict) -> str:
+    if not (attempt := state.get("attempt")):
         return ""
-    base_key = f"error-digest:{day}"
-    attempts = {
-        int(key.removeprefix(base_key).removeprefix(":") or "0"): body_sha
-        for key, body_sha in state["delivery_unknown"].items()
-        if key == base_key or key.startswith(f"{base_key}:")
-    }
-    if not attempts:
-        return ""
-    latest = max(attempts)
+    count = len(_listed_kinds(attempt["kinds"], attempt["max_new"]))
     return (
-        f"Fleet delivery_unknown for {day} attempt {latest}, body SHA-256 {attempts[latest]}. "
-        f"Uncertain attempts on this day: {len(attempts)}."
+        f"Fleet proposal for {attempt['day']} ({count} kinds) not confirmed. "
+        "The next run resends it under the same key."
     )
 
 
@@ -729,7 +803,7 @@ def _collect_for_publish(
                 new_sigs.add(sig)
         count = None if ledger_error else len(new_sigs)
         if current in due and current != day:
-            banner = "\n".join(filter(None, (ledger_error, _unknown_notes(state, current))))
+            banner = "\n".join(filter(None, (ledger_error, _pending_note(state))))
             headline, body = _journal_summary(report, count, banner)
             _post_journal(cli, current, headline, body, sender, deadline)
     # The target is the last day in the collection. Its note includes the
@@ -751,13 +825,19 @@ def _prepare_proposal(day: date, kinds: list[dict[str, Any]], max_new: int) -> t
             f"- {_cell(group)}: {distinct} new kinds, {occurrences} occurrences"
             for group, (distinct, occurrences) in sorted(groups.items())
         )
-        kinds = kinds[:_TOP_KINDS]
+        kinds = _listed_kinds(kinds, max_new)
         lines.append("")
     lines.extend(_kind_line(kind) for kind in kinds)
-    return _safe_output("\n".join(lines)), {
-        kind["sig"]: {key: kind[key] for key in ("first_seen", "source", "severity", "template")}
-        for kind in kinds
-    }
+    return _safe_output("\n".join(lines)), _kind_rows(kinds)
+
+
+def _listed_kinds(kinds: list[dict[str, Any]], max_new: int) -> list[dict[str, Any]]:
+    """The kinds a proposal lists line by line: all of them, or the top ones after an overflow."""
+    return kinds[:_TOP_KINDS] if len(kinds) > max_new else kinds
+
+
+def _kind_rows(kinds: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    return {kind["sig"]: {field: kind[field] for field in sorted(_KIND_FIELDS)} for kind in kinds}
 
 
 def _publish_proposal(body: str, sender: str, key: str, deadline: float) -> None:
@@ -767,7 +847,8 @@ def _publish_proposal(body: str, sender: str, key: str, deadline: float) -> None
         else [sys.executable, "-I", "-m", "lu_machinery.fleet_comms"]
     )
     _send(
-        [*command, "channel", "publish", "cto", "-", "--sender", sender,
+        # One word per option value: a stored sender can start with "-".
+        [*command, "channel", "publish", "cto", "-", f"--sender={sender}",
          "--recipient", "claude-cto", "--kind", "proposal", "--idempotency-key", key],
         "Fleet publish", deadline, input=body.encode(),
     )
@@ -793,38 +874,35 @@ def _publish_run(day: date, directory: Path, sender: str, *, backfill: bool, max
             state = _load_publish_state(state_path)
         except DigestError as exc:
             ledger_error = str(exc)
+        failure = DigestError(ledger_error) if ledger_error else None
         recovered_day = None
         if attempt := state.get("attempt"):
-            matched_day = attempt["key"].split(":")[1]
-            recovered_day = date.fromisoformat(matched_day)
-            # The ledger replacement is atomic. If it did not commit, an
-            # interrupted attempt cannot establish delivery and its key is spent.
-            delivered = all(ledger.get(sig, {}).get("proposal_day") == matched_day for sig in attempt["kinds"])
-            _finish_attempt(state, state_path, delivered=delivered)
+            recovered_day = date.fromisoformat(attempt["day"])
+            if _recorded(ledger, attempt):
+                # The ledger replacement is atomic and committed: only the clear is left.
+                state["attempt"] = None
+                _write_state(state_path, _json_bytes(state), replace=True)
+            else:
+                failure = _deliver(state, state_path, ledger, ledger_path, deadline)
         kinds, report, count = _collect_for_publish(
             directory, day, backfill=backfill, ledger=ledger, ledger_error=ledger_error,
             state=state, recovered_day=recovered_day, cli=cli, sender=sender, deadline=deadline,
         )
-        failure = DigestError(ledger_error) if ledger_error else None
         if not failure and kinds and not any(row["proposal_day"] == day.isoformat() for row in ledger.values()):
-            body, proposed = _prepare_proposal(day, kinds, max_new)
-            sequence = len(state["delivery_unknown"])
-            key = f"error-digest:{day}:{sequence}" if sequence else f"error-digest:{day}"
-            state["attempt"] = {"key": key, "body_sha256": hashlib.sha256(body.encode()).hexdigest(),
-                                "kinds": list(proposed)}
-            _write_state(state_path, _json_bytes(state), replace=True)
-            try:
-                _publish_proposal(body, sender, key, deadline - _EGRESS_TIMEOUT_S)
-            except DigestError as exc:
-                _finish_attempt(state, state_path, delivered=False)
-                failure = exc
+            # A saved report kind can carry extra fields or text the loader refuses;
+            # store only the pending fields, and nothing the next run would reject.
+            attempt = {
+                "day": day.isoformat(), "sender": sender, "max_new": max_new,
+                "kinds": [{field: kind.get(field) for field in sorted(_PENDING_KIND_FIELDS)} for kind in kinds],
+            }
+            if not _valid_attempt(attempt):
+                failure = DigestError("publish state: refused (invalid_attempt)")
             else:
-                proposed_at = datetime.now(UTC).isoformat()
-                for sig, row in proposed.items():
-                    ledger[sig] = {**row, "proposed_at": proposed_at, "proposal_day": day.isoformat()}
-                _write_state(ledger_path, _json_bytes(ledger), replace=True)
-                _finish_attempt(state, state_path, delivered=True)
-        banner = "\n".join(filter(None, (ledger_error, _unknown_notes(state, day))))
+                _prepare_proposal(day, attempt["kinds"], max_new)  # an egress refusal stores no attempt
+                state["attempt"] = attempt
+                _write_state(state_path, _json_bytes(state), replace=True)
+                failure = _deliver(state, state_path, ledger, ledger_path, deadline)
+        banner = "\n".join(filter(None, (ledger_error, _pending_note(state))))
         headline, journal_body = _journal_summary(report, count, banner)
         _post_journal(cli, day, headline, journal_body, sender, deadline)
         if failure:
@@ -859,6 +937,8 @@ def main(argv: list[str] | None = None) -> int:
                         help="journal author and Fleet sender seat (default: devops)")
     args = parser.parse_args(argv)
     day = args.day or today - timedelta(days=1)
+    if not _valid_sender(args.sender):
+        parser.error("--sender must be a name without surrounding spaces, control characters or flagged text")
     if not date.min < day < today:
         parser.error("--day must be a completed, representable UTC day")
     try:

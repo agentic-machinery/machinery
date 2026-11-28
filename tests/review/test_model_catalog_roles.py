@@ -521,11 +521,7 @@ def test_review_rotation_grok_1127_equal_peer_group_and_rotation():
                         assert candidate_dispatch_model(REVIEW_CANDIDATES[res.selected.name]) == "grok-4.7-high"
                     picks.append(res.selected.name)
                     counts[res.selected.concrete_model] = counts.get(res.selected.concrete_model, 0) + 1
-                # Critical and security sign-off stay Sol, Opus and Neon: Grok rotates below critical only.
-                cycle = [
-                    name for name in expected_cycle[family]
-                    if risk != "critical" or name != "grok-4.7-cursor-fallback"
-                ]
+                cycle = expected_cycle[family]
                 assert picks == [cycle[i % len(cycle)] for i in range(8)], (risk, profile, family)
 
     # Equal recent counts break strictly by catalog order even when scheduler workload/inflight differ (F2).
@@ -565,20 +561,20 @@ def test_review_rotation_grok_1127_equal_peer_group_and_rotation():
     assert trace_by_name["claude-opus-5-5"].status == "excluded"
     assert trace_by_name["openai_frontier"].status == "excluded"
     assert trace_by_name["openai_frontier_b"].status == "excluded"
-    # The same capped bench at critical fails closed instead of falling to Grok.
+    # The same capped bench at critical retains the attested Cursor seat.
     res_capped_critical = resolve_reviewer(
         ResolverInputs(author_model="gemini-4-neon", risk="critical", routing_snapshot=capped, claude_account=HOST_ACCOUNT),
         excluded_quota_buckets=frozenset({"codex:a"}),
         recent_review_counts={},
     )
-    assert res_capped_critical.selected is None
-    assert "grok-4.7-cursor-fallback" not in {entry.name for entry in res_capped_critical.trace if entry.status == "eligible"}
+    assert res_capped_critical.selected is not None
+    assert res_capped_critical.selected.name == "grok-4.7-cursor-fallback"
 
 
 @pytest.mark.parametrize("profile", ["code", "infra"])
 @pytest.mark.parametrize("requested_risk", ["low", "medium", "high"])
-def test_security_path_review_never_selects_grok(profile, requested_risk):
-    """Defect class: Grok seated as critical or security final sign-off (REVIEW-ROTATION-GROK-1127 scope)."""
+def test_security_path_review_preserves_grok_rotation_at_critical(profile, requested_risk):
+    """Security paths raise the risk floor and still rotate the least-used eligible reviewer."""
     fresh = {"freshness": "fresh", "age_s": 10}
     healthy = {"status": "cool", "remaining_pct": 60, "health": {"healthy": True}}
     snapshot = {
@@ -591,7 +587,7 @@ def test_security_path_review_never_selects_grok(profile, requested_risk):
         },
         "codex_accounts": {"codex:b": {**healthy, "codexbar": {**fresh, "weekly_remaining_pct": 63}}},
     }
-    # Grok has the fewest recent reviews, so only the risk floor can keep it off the seat.
+    # Grok has the fewest recent reviews among the rotation peers.
     counts = {CURRENT_SOL: 9, "claude-opus-5-5": 9, "gemini-4-neon": 9, "grok-4.7": 0}
     for author in ("claude-opus-5-5", CURRENT_SOL, "gemini-4-neon"):
         res = resolve_reviewer(
@@ -607,10 +603,9 @@ def test_security_path_review_never_selects_grok(profile, requested_risk):
             recent_review_counts=counts,
         )
         assert res.selected is not None, (author, res.fail_closed_reason)
-        assert res.selected.family != "xai", (author, requested_risk)
-        assert res.selected.concrete_model in {CURRENT_SOL, "claude-opus-5-5", "gemini-4-neon"}
-        assert not [entry for entry in res.trace if entry.family == "xai" and entry.status in {"eligible", "selected"}]
-        # Below the floor the same counts do pick Grok, so the test can fail for a real defect.
+        assert res.resolved_risk == "critical"
+        assert res.selected.name == "grok-4.7-cursor-fallback", (author, requested_risk)
+        # An ordinary path retains the requested risk and picks the same peer.
         plain = resolve_reviewer(
             ResolverInputs(
                 author_model=author,
@@ -624,6 +619,7 @@ def test_security_path_review_never_selects_grok(profile, requested_risk):
             recent_review_counts=counts,
         )
         assert plain.selected is not None and plain.selected.family == "xai", (author, requested_risk)
+        assert plain.resolved_risk == requested_risk
 
 
 def test_recent_review_counts_reads_published_code_infra_records_and_fails_closed(tmp_path, monkeypatch):

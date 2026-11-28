@@ -59,7 +59,7 @@ def _findings(captured):
     return [json.loads(line) for line in captured.err.splitlines() if line.startswith("{")]
 
 
-def test_bench_health_default_snapshot_closes_the_anthropic_shortfall_below_critical():
+def test_bench_health_default_snapshot_closes_the_anthropic_shortfall():
     snapshot = {
         "agents": {
             name: {"status": "cool", "health": {"healthy": True}}
@@ -72,10 +72,9 @@ def test_bench_health_default_snapshot_closes_the_anthropic_shortfall_below_crit
         assert len(results[family]) >= 2, f"Family {family} has < 2 eligible seats: {results[family]}"
         assert all(REVIEW_CANDIDATES[name].family != family for name in results[family])
         assert not set(results[family]) & {"composer-2.5", "pool", "pool-xs"}
-    # REVIEW-ROTATION-GROK-1127: critical and security sign-off stay Sol, Opus and Neon (no Grok).
     critical = check_bench_health(routing_snapshot=snapshot, data_egress_policy="local_interactive", risk="critical")
-    assert critical["anthropic"] == ["openai_frontier", "gemini-4-neon-high"]
-    assert GROK not in {name for seats in critical.values() for name in seats}
+    assert critical["anthropic"] == [GROK, "openai_frontier", "gemini-4-neon-high"]
+    assert GROK not in critical["xai"]
     automatic = resolve_reviewer(ResolverInputs(author_model="claude", data_egress_policy="local_interactive", routing_snapshot=snapshot, claude_account=HOST_ACCOUNT))
     assert automatic.selected.name == "openai_frontier"
     assert "glm-5.3" not in {entry.name for entry in automatic.trace}
@@ -107,7 +106,7 @@ def test_bench_exclusions_match_automatic_resolver(risk, profile, capsys):
             )
         )
         assert set(seats) == {entry.name for entry in resolution.trace if entry.status in {"selected", "eligible"}}
-    if risk == "high":
+    if risk in {"high", "critical"}:
         assert {family: results[family] for family in ("anthropic", "openai")} == {
             "anthropic": [GROK, "openai_frontier", *neon],
             "openai": [GROK, "claude-opus-5-5", "claude-opus-5-5-agy", *neon],
@@ -116,18 +115,13 @@ def test_bench_exclusions_match_automatic_resolver(risk, profile, capsys):
             grok_seat = [] if family in {"xai", "moonshot"} else [GROK]
             own = [] if family == "google" else neon
             assert results[family] == [*grok_seat, "openai_frontier", "claude-opus-5-5", "claude-opus-5-5-agy", *own]
-        # The resolver names the single eligibility rule, not a bench-local list.
+    if risk == "high":
         rule = f"performed only by {CURRENT_SOL}, claude-opus-5-5, gemini-4-neon, grok-4.7"
         assert rule in exclusions["openai"]["claude-sonnet-5-5"]
-        return
-    if risk != "critical":
-        return
-    # REVIEW-ROTATION-GROK-1127: critical keeps Sol, Opus and Neon; Grok lacks critical_review.
-    assert results["anthropic"] == ["openai_frontier", "gemini-4-neon-high"]
-    assert results["openai"] == ["claude-opus-5-5", "claude-opus-5-5-agy", "gemini-4-neon-high"]
-    assert set(exclusions["anthropic"]) == set(REVIEW_CANDIDATES) - {"openai_frontier", "gemini-4-neon-high"}
-    assert not {"glm-5.3", "composer-2.5", "pool", "pool-xs"} & set(exclusions["anthropic"])
-    assert "missing required review role suitability" in exclusions["anthropic"][GROK]
+    if risk == "critical":
+        assert set(exclusions["anthropic"]) == set(REVIEW_CANDIDATES) - set(results["anthropic"])
+        assert not {"glm-5.3", "composer-2.5", "pool", "pool-xs"} & set(exclusions["anthropic"])
+        assert "Sonnet is excluded" in exclusions["openai"]["claude-sonnet-5-5"]
 
 
 @pytest.mark.parametrize("risk", ["low", "medium", "high", "critical"])
@@ -297,39 +291,22 @@ def test_accepted_single_seat_still_requires_available_reviewer(risk, status, ro
     if route == "claude":
         data["agents"]["agy"] = {"status": "unhealthy"}
     # Neon on AGY still reviews Anthropic-authored high and critical work when Codex is out (NEON-SOLTIER-1120).
-    # REVIEW-ROTATION-GROK-1127: pinned Cursor Grok also remains eligible on non-Claude near_cap
-    # below critical; critical and security sign-off stay Sol, Opus and Neon.
     neon_fills = route == "codex"
-    grok_fills = status == "near_cap" and risk != "critical"
-    expected_exit = 0 if neon_fills else (1 if status == "unhealthy" or route == "claude" else 0)
+    expected_exit = 0 if neon_fills else 1
     assert main(["--risk", risk], routing_snapshot=data) == expected_exit
     captured = capsys.readouterr()
     neon = ["gemini-4-neon-high"] if neon_fills else []
-    grok_seat = [GROK] if grok_fills else []
     if status == "near_cap":
         results = check_bench_health(routing_snapshot=data, risk=risk)
-        assert results[family] == ([*grok_seat, "openai_frontier", *neon] if route == "codex" else grok_seat)
+        assert results[family] == ([GROK, "openai_frontier", *neon] if neon_fills else [GROK])
         findings = _findings(captured)
-        if route == "claude" and grok_fills:
+        if route == "claude":
             # Claude's cap drops Opus; non-Claude near_cap leaves Cursor Grok eligible for every
             # non-{xai,moonshot} family (1 seat for openai = accepted single seat; 2 seats for other
             # families; xai and moonshot keep openai_frontier only -> 1 < 2 shortfall).
             assert {finding["author_family"] for finding in findings} == {"xai", "moonshot"}
             for finding in findings:
                 assert (finding["minimum"], finding["counted_seats"]) == (2, ["openai_frontier"])
-                assert finding["excluded_seats"]["claude-opus-5-5"] == (
-                    "quota bucket is near cap — automatic assignments are prohibited"
-                )
-            assert "BENCH HEALTH FAIL" in captured.err
-        elif route == "claude":
-            # At critical Cursor Grok holds no seat: Claude's cap leaves OpenAI authors with no
-            # reviewer and every other non-Anthropic family below its two-seat minimum.
-            assert {finding["author_family"] for finding in findings} == set(AUTHOR_FAMILIES) - {"anthropic"}
-            for finding in findings:
-                if finding["author_family"] == "openai":
-                    assert (finding["minimum"], finding["counted_seats"]) == (1, [])
-                else:
-                    assert (finding["minimum"], finding["counted_seats"]) == (2, ["openai_frontier"])
                 assert finding["excluded_seats"]["claude-opus-5-5"] == (
                     "quota bucket is near cap — automatic assignments are prohibited"
                 )

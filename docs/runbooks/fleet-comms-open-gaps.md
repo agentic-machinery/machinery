@@ -204,8 +204,8 @@ not erase routing evidence.
 
 Do **not** write `laguna-s2`, `laguna.s2`, or `laguna.m1` as IDs — hyphens and the `m.1` minor are load-bearing.
 
-- Resolve-reviewer: use the live `lu_machinery/config/model_catalog.yaml` ladders. **Critical** keeps Sol and Opus 5.5 authority first, adds Gemini 4 Neon High after them (NEON-SOLTIER-1120), and excludes Sonnet 5.5; Fable holds no review role at any risk (#9583); **high** holds Sol, Opus 5.5 and Gemini 4 Neon High (alongside the Opus seats) for code and infra (#9538, NEON-SOLTIER-1120), and returns no reviewer when none is eligible; **medium/low** walk Sol → Opus 5.5 → Sonnet 5.5 before later practical and volume rungs.
-- Grok uses the proven exact-head source-blind ACP path. Kimi is retired and refused by `retired_seat_admission`. AGY's text-only ACP wrapper cannot consume the parent-owned sealed MCP; legacy native-isolation helpers stay unsupported.
+- Resolve code and infra reviewers from the live catalog and the rotation in [model assignment](../../agents_extensions/shared/rules/model-assignment.md). Security paths raise the risk to `critical`.
+- Formal Grok review uses the attested Cursor CLI pin `grok-4.7-high`. Kimi is retired and refused by `retired_seat_admission`. AGY's text-only ACP wrapper cannot consume the parent-owned sealed MCP. Legacy native-isolation helpers stay unsupported.
 - Isolation runbooks: `docs/runbooks/agy-formal-cf-isolation.md` · `grok-formal-cf-isolation.md`
 
 ## Closeout checklist

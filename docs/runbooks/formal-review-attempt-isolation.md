@@ -375,10 +375,9 @@ At high and critical risk the automatic bench (`lu_machinery.review.bench_health
 Anthropic-authored and OpenAI-authored code (`ACCEPTED_SINGLE_SEAT_BENCHES`,
 #9423 AC-02). The allowance is set by author family and risk, not by which seat
 fills it; the seats come from the catalog and the review rotation in
-`model-assignment.md`. Critical counts only `critical_review` seats: Sol, Opus and
-Gemini 4 Neon High (#9538, NEON-SOLTIER-1120, #9583). High also counts Cursor Grok
-4.7 High (`grok-4.7-cursor-fallback`) outside xAI and Moonshot
-(REVIEW-ROTATION-GROK-1127). Cursor never seats Claude, Gemini, DeepSeek or
+`model-assignment.md`. Critical counts only `critical_review` seats. At both risks,
+the bench counts Sol, Opus, native AGY Neon and pinned Cursor Grok 4.7 High
+where author and subject exclusions permit. Cursor never seats Claude, Gemini, DeepSeek or
 Moonshot models as formal reviewers (#9488), so those families count only through
 their native routes. A bench at that minimum displays `[EXPECTED single seat]`. Zero seats or any other
 shortfall below the default two-seat minimum still exits 1; explicit-pin

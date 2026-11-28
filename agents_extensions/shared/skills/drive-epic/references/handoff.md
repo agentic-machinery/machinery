@@ -59,7 +59,7 @@ copies such as `.claude/skills/` are overwritten on the next deploy.
 | **Driver-state database** (`lu-driver-state`) | Work items, evidence, history, one `handoff_note` | Durable lane handoff |
 | **Pointer and durable brief** (`.claude/<lane>-epic/DRIVER-STATE.md`; rules core P7 brief) | Pinned provider facts and render/check instructions; supplemental continuity | Local pointer / brief |
 | **Fleet-comms channel** | Issue and PR numbers only | Plane authority |
-| **GitHub issues** | Residual and next work (the CTO files them) | Public queue |
+| **GitHub issues** | Residual and next work (the CTO or eggbot files them) | Public queue |
 
 ```bash
 # Fleet receipt: issue/PR numbers only (no residual tables, no secrets)

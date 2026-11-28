@@ -1442,6 +1442,48 @@ def test_record_stores_a_contest_only_against_the_previous_blocking_round(monkey
 
 @pytest.mark.usefixtures('configured_roots', 'recorder_matcher')
 @pytest.mark.usefixtures("agent_runtime_roots")
+def test_unknown_outcome_label_holds_its_finding_key(monkeypatch, tmp_path):
+    """Defect class: a well-formed label line whose label this release does not know (a newer release wrote it, then
+    the host rolled back) read as damaged, so the writer accepts a second, different label for its finding and the
+    statistics attribute that second label to the reviewer. Controls: a known label is still attributed, a damaged
+    label is still malformed, and no writer path writes an unknown label."""
+    from lu_machinery.api import model_stats_rows
+
+    monkeypatch.setenv("LEARN_UKRAINIAN_DISPATCH_TASK_ID", "author-task")
+    tasks, _comments, _calls = setup_record(monkeypatch, tmp_path)
+    write_task(tasks, reply=_blocking_reply(["P1", "P1", "P1"]))
+    assert recorder.record("review-one", pr_number=42, task_root=tasks, lock_root=tmp_path / "locks")["verdict"] == (
+        "CHANGES_REQUESTED")
+    started = "2026-09-23T12:00:00.000001+00:00"
+    newer = {
+        "schema": "review-finding-outcome.v1", "kind": "label", "task_id": "review-one", "repository": "owner/repo",
+        "pr": 42, "finding_id": "F1", "head": SHA, "started_at": started, "reviewer_model": CURRENT_SOL,
+        "label": "future_label", "evidence_sha256": hashlib.sha256(b"a newer release's evidence").hexdigest(),
+        "recorded_by": "author-task", "recorded_at": "2026-09-23T13:30:00+00:00",
+    }
+    damaged = {**newer, "finding_id": "F3", "label": "Not A Label"}
+    ledger = tmp_path / "model-stats" / "finding-outcomes.jsonl"
+    ledger.parent.mkdir(parents=True, exist_ok=True)
+    ledger.write_text(json.dumps(newer) + "\n" + json.dumps(damaged) + "\n")
+
+    with pytest.raises(recorder.RecordError, match="already labelled future_label: a finding takes one label"):
+        recorder.record_finding_outcome("review-one", pr_number=42, finding_id="F1", label="fixed", evidence=None,
+                                        task_root=tasks)
+    assert recorder.record_finding_outcome("review-one", pr_number=42, finding_id="F2", label="fixed", evidence=None,
+                                           task_root=tasks)["status"] == "recorded"
+    with pytest.raises(ValueError, match="wrong shape"):
+        model_stats_rows.record_finding_outcomes(tmp_path, [{**newer, "finding_id": "F4"}])
+    assert [line["finding_id"] for line in _outcomes(tmp_path)] == ["F1", "F3", "F2"]
+
+    labels, _contests, counts = model_stats_rows.read_finding_outcomes(tmp_path)
+    f2 = ("review-one", model_stats_rows.repository_identity("owner/repo"), 42, "F2", SHA,
+          model_stats_rows.timestamp(started))
+    assert list(labels) == [f2] and labels[f2][:2] == (CURRENT_SOL, "fixed")
+    assert counts == {"lines": 2, "unknown_labels": 1, "malformed_lines": 1}
+
+
+@pytest.mark.usefixtures('configured_roots', 'recorder_matcher')
+@pytest.mark.usefixtures("agent_runtime_roots")
 def test_unwritable_publication_marker_never_undoes_the_publication(monkeypatch, tmp_path):
     """Defect class: a marker write failure hides the posted verdict, retries the post, or passes silently; the
     receipt must name the failure and a recovery that still works once the PR has moved on (a rerun of record

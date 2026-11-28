@@ -21,7 +21,9 @@ names it.
 ``finding-outcomes.jsonl`` is the finding-outcome ledger, under the same lock with the same one writer: one line per
 author label of a blocking finding of a published review (``fixed``, ``wrong``, ``invented``, ``no_live_trigger``,
 ``out_of_scope``, ``duplicate``; the evidence line as its SHA-256 only) and one per later review that contested a
-label.
+label. A well-formed label line whose label this release does not know (a newer release wrote it) still holds its
+finding: no other label is written for that finding, and the statistics count it in ``unknown_labels``, attributed
+to no reviewer.
 """
 
 from __future__ import annotations
@@ -1109,6 +1111,8 @@ def read_publications(batch_state_dir: Path) -> tuple[dict[str, list[dict[str, A
 OUTCOME_SCHEMA = "review-finding-outcome.v1"
 OUTCOMES_FILE = "finding-outcomes.jsonl"
 _FINDING_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,63}\Z")
+# The shape of any outcome label, including one a newer release adds to FINDING_OUTCOME_LABELS.
+_OUTCOME_LABEL = re.compile(r"[a-z][a-z0-9_]{0,63}\Z")
 _GIT_HEAD_SHA = re.compile(r"[0-9a-f]{40}\Z")
 _OUTCOME_REVIEWER_MODEL = "reviewer_model"
 _OUTCOME_RUN_KEYS = frozenset({"head", "started_at"})
@@ -1120,7 +1124,10 @@ _OUTCOME_KEYS = {
 }
 
 
-def _outcome_ok(entry: object, *, require_run_binding: bool = False) -> bool:
+def _outcome_ok(entry: object, *, require_run_binding: bool = False, any_label: bool = False) -> bool:
+    """Whether ``entry`` has the writer's shape. A label must be one of FINDING_OUTCOME_LABELS, with the evidence
+    that label needs; ``any_label`` (reading the ledger) also admits a well-formed label this release does not know,
+    so a line a newer release wrote keeps holding its finding instead of reading as damaged."""
     # Every membership test below reads a string first: a list or object in a damaged line is unhashable.
     if not isinstance(entry, dict):
         return False
@@ -1154,7 +1161,8 @@ def _outcome_ok(entry: object, *, require_run_binding: bool = False) -> bool:
     if kind == "contest":
         return valid_task_id(entry["contested_by"]) and entry["contested_by"] != entry["task_id"]
     evidence, label = entry["evidence_sha256"], entry["label"]
-    return (isinstance(label, str) and label in FINDING_OUTCOME_LABELS
+    known = isinstance(label, str) and label in FINDING_OUTCOME_LABELS
+    return ((known or (any_label and isinstance(label, str) and _OUTCOME_LABEL.fullmatch(label) is not None))
             and (evidence is None or (isinstance(evidence, str) and _SHA256.fullmatch(evidence) is not None))
             and (evidence is not None or label not in EVIDENCED_OUTCOME_LABELS)
             and (entry["recorded_by"] is None or valid_task_id(entry["recorded_by"])))
@@ -1197,7 +1205,7 @@ def _outcome_lines(path: Path, counts: Counter[str]) -> list[dict[str, Any]]:
                 entry = _load_line(line)
             except (ValueError, RecursionError):
                 entry = None
-            if not _outcome_ok(entry):
+            if not _outcome_ok(entry, any_label=True):
                 counts["malformed_lines"] += 1
                 continue
             entries.append(entry)
@@ -1290,10 +1298,12 @@ def read_finding_outcomes(batch_state_dir: Path) -> tuple[
     started_at) to (reviewer model, label, recorded time)), the earliest contest time of each run-bound contested
     finding, and read counts. A missing ledger gives none. Legacy lines written without ``reviewer_model`` or run
     binding (``head`` and ``started_at``) are not malformed and count in ``unattributed_labels`` or
-    ``unbound_contests`` without joining another ledger or suppressing another run. FleetRepoError when the fleet
-    registry cannot be read."""
+    ``unbound_contests`` without joining another ledger or suppressing another run. A run-bound label this release
+    does not know counts in ``unknown_labels``, is attributed to no reviewer, and holds its finding like any first
+    label. FleetRepoError when the fleet registry cannot be read."""
     counts: Counter[str] = Counter()
     labels: dict[OutcomeFindingKey, tuple[str, str, datetime]] = {}
+    unknown: set[OutcomeFindingKey] = set()
     contests: dict[OutcomeFindingKey, datetime] = {}
     for entry in _outcome_lines(batch_state_dir / ROWS_DIR / OUTCOMES_FILE, counts):
         repo_id = repository_identity(entry["repository"])
@@ -1307,7 +1317,12 @@ def read_finding_outcomes(batch_state_dir: Path) -> tuple[
                 entry["task_id"], repo_id, entry["pr"], entry["finding_id"],
                 entry["head"], cast(datetime, timestamp(entry["started_at"])),
             )
-            labels.setdefault(finding_key, (model_id(reviewer), entry["label"], moment))
+            if entry["label"] not in FINDING_OUTCOME_LABELS:
+                counts["unknown_labels"] += 1
+                if finding_key not in labels:
+                    unknown.add(finding_key)
+            elif finding_key not in unknown:
+                labels.setdefault(finding_key, (model_id(reviewer), entry["label"], moment))
         else:
             if "head" not in entry:
                 counts["unbound_contests"] += 1

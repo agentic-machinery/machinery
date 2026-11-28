@@ -450,3 +450,82 @@ def test_cli_collectors_emit_store_not_db_path(
         assert payload["store"]["kind"] == "comms-plane"
         assert payload["store"]["reachable"] is False
         assert "db_path" not in payload
+
+
+def _publish_receipt(capsys, argv: list[str], expected: int = EXIT_OK) -> dict | None:
+    assert main(argv) == expected
+    output = capsys.readouterr()
+    return json.loads(output.out) if expected == EXIT_OK else None
+
+
+@pytest.mark.usefixtures("placeholder_seats_registered")
+def test_publish_retry_after_context_revision_returns_original_receipt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    """Defect class: a same-key retry is refused after store state the caller never sent changes.
+
+    A publisher that crashed after commit retries with the same key and payload.
+    The channel's context revision and its subscribers change in between; the
+    retry must return the original receipt, field for field, never a refusal or
+    a second message.
+    """
+    from lu_machinery.fleet_comms.authority import AuthorityService
+
+    root = tmp_path / "plane"
+    monkeypatch.setenv("FLEET_COMMS_ROOT", str(root))
+    monkeypatch.delenv("LU_WRITE_BOUNDARY_BROKER", raising=False)
+    assert main(["channel", "create", "cto", "--subscriber", "codex"]) == EXIT_OK
+    assert main(["channel", "context", "cto", "context revision one"]) == EXIT_OK
+    capsys.readouterr()
+    direct = ["channel", "publish", "cto", "digest proposal", "--sender", "devops", "--recipient", "other",
+              "--recipient", "codex", "--correlation-id", "", "--kind", "proposal", "--idempotency-key", "retry-direct"]
+    fanout = ["channel", "publish", "cto", "fan-out notice", "--sender", "devops", "--idempotency-key", "retry-fanout"]
+    receipts = [_publish_receipt(capsys, argv) for argv in (direct, fanout)]
+
+    # The publisher crashes here, after commit; the channel then moves on.
+    assert main(["channel", "context", "cto", "context revision two"]) == EXIT_OK
+    assert main(["channel", "subscribe", "cto", "agy"]) == EXIT_OK
+    capsys.readouterr()
+
+    assert [_publish_receipt(capsys, argv) for argv in (direct, fanout)] == receipts
+    with AuthorityService(root=root) as service:
+        connection = service.store.connection
+        assert connection.execute("SELECT COUNT(*) FROM comms_messages").fetchone()[0] == 2
+        assert sorted(
+            row[0] for row in connection.execute("SELECT recipient FROM authority_deliveries")
+        ) == ["codex", "codex", "other"]
+
+
+@pytest.mark.usefixtures("placeholder_seats_registered")
+def test_publish_same_key_different_payload_still_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    """Control: a different message, recipient or context pin under a used key is still refused."""
+    from lu_machinery.fleet_comms.authority import AuthorityService, AuthorityServiceError
+
+    root = tmp_path / "plane"
+    monkeypatch.setenv("FLEET_COMMS_ROOT", str(root))
+    monkeypatch.delenv("LU_WRITE_BOUNDARY_BROKER", raising=False)
+    assert main(["channel", "create", "cto", "--subscriber", "codex"]) == EXIT_OK
+    assert main(["channel", "context", "cto", "context revision one"]) == EXIT_OK
+    capsys.readouterr()
+    base = ["channel", "publish", "cto", "--sender", "devops", "--idempotency-key", "retry-control"]
+    original = _publish_receipt(capsys, [*base[:3], "digest proposal", *base[3:], "--recipient", "other"])
+    assert original is not None
+    for argv in (
+        [*base[:3], "another proposal", *base[3:], "--recipient", "other"],
+        [*base[:3], "digest proposal", *base[3:], "--recipient", "codex"],
+        [*base[:3], "digest proposal", *base[3:]],
+    ):
+        assert main(argv) == EXIT_ERROR
+        assert "idempotency_key_reused_with_different_payload" in capsys.readouterr().err
+    with AuthorityService(root=root) as service:
+        message = service.get_message(original["message_id"])
+        with pytest.raises(AuthorityServiceError, match="idempotency_key_reused_with_different_payload"):
+            service.publish_message(
+                sender="devops", body="digest proposal", channel="cto", recipients=("other",),
+                provenance={"Source": "operator", "Agent": "devops", "Via": "fleet-comms"},
+                context_revisions={"pinned": message.context_revisions["channel"]},
+                idempotency_key="retry-control",
+            )
+        assert service.store.connection.execute("SELECT COUNT(*) FROM comms_messages").fetchone()[0] == 1
