@@ -320,8 +320,26 @@ globalThis.fetch = async (url) => {
         }
       : poolMode === 'shared_grok_cursor_near_cap'
       ? {
-          grok: {freshness: 'fresh', age_s: 30, status: 'near_cap', stale: false, remaining_pct: 0, pool_pace: {pool: 'grok', status: 'near_cap', stale: false}},
-          cursor: {freshness: 'fresh', age_s: 30, status: 'near_cap', stale: false, probe_state: 'NEED_PROBE', provider_windows: {auto: {used_pct: null, remaining_pct: null}, api: {used_pct: null, remaining_pct: null}}, pool_pace: {pool: 'grok', status: 'near_cap', stale: false}},
+          grok: {freshness: 'fresh', age_s: 30, status: 'near_cap', stale: false, remaining_pct: 0, pool_pace: {pool: 'grok', status: 'near_cap', stale: false, age_s: 30}},
+          cursor: {freshness: 'fresh', age_s: 30, status: 'near_cap', stale: false, probe_state: 'NEED_PROBE', provider_windows: {auto: {used_pct: null, remaining_pct: null}, api: {used_pct: null, remaining_pct: null}}, pool_pace: {pool: 'grok', status: 'near_cap', stale: false, age_s: 30}},
+        }
+      : poolMode === 'stale_pool_pace_fresh_cursor'
+      ? {
+          cursor: {
+            freshness: 'fresh', age_s: 30, status: 'near_cap', lane_status: 'cool', stale: false,
+            login_state: 'authenticated', probe_state: 'healthy', remaining_pct: 70,
+            provider_windows: {auto: {used_pct: 30, remaining_pct: 70}, api: {used_pct: 20, remaining_pct: 80}},
+            pool_pace: {pool: 'grok', status: 'near_cap', stale: true, age_s: 901},
+          },
+        }
+      : poolMode === 'expiring_pool_pace_only'
+      ? {
+          cursor: {
+            freshness: 'fresh', age_s: 30, status: 'near_cap', lane_status: 'unknown', stale: false,
+            login_state: 'authenticated', probe_state: 'NEED_PROBE',
+            provider_windows: {auto: {used_pct: null, remaining_pct: null}, api: {used_pct: null, remaining_pct: null}},
+            pool_pace: {pool: 'grok', status: 'near_cap', stale: false, age_s: 899},
+          },
         }
       : {
           claude: {freshness: 'fresh', age_s: 599, status: 'cool', stale: false},
@@ -490,6 +508,26 @@ const models = (() => {
     updateChips();
     assert.match(document.getElementById('chips').innerHTML, /chip warn[^>]*><b>1<\/b> pool near cap<\/a>/);
     assert.doesNotMatch(document.getElementById('chips').innerHTML, /<b>2<\/b> pools near cap/);
+
+    // PR1569-F7: Stale Grok+Cursor pool_pace copied onto a fresh 70%-remaining Cursor lane must NOT show 1 pool near cap.
+    poolMode = 'stale_pool_pace_fresh_cursor';
+    generatedAt = '2026-11-28T01:16:00Z';
+    await models.runner.loadPanel(models.PANELS[0]);
+    updateChips();
+    assert.match(document.getElementById('chips').innerHTML, /<b>0<\/b> pools near cap<\/a>/);
+    assert.doesNotMatch(document.getElementById('chips').innerHTML, /<b>1<\/b> pool near cap/);
+
+    // PR1569-F7: Fresh pool_pace at 899s on NEED_PROBE Cursor expires to unknown after +2s monotonic tick.
+    poolMode = 'expiring_pool_pace_only';
+    monoNow = 500000;
+    generatedAt = '2026-11-28T01:17:00Z';
+    await models.runner.loadPanel(models.PANELS[0]);
+    updateChips();
+    assert.match(document.getElementById('chips').innerHTML, /<b>1<\/b> pool near cap<\/a>/);
+    monoNow += 2000;
+    models.PANELS[0].onTick(models.PANELS[0], models.runner.latest, updateChips, fakeNow);
+    assert.match(document.getElementById('chips').innerHTML, /<b>\?<\/b> pools near cap unknown/);
+    assert.doesNotMatch(document.getElementById('chips').innerHTML, /<b>1<\/b> pool near cap/);
 
     // Non-finite monotonic clock withdraws figures as unknown rather than keeping stale fresh values.
     poolMode = 'all_fresh';

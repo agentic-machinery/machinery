@@ -432,7 +432,19 @@ const LANE_POOL_IDS = {
   cursor: "grok",
   gemini: "agy:gemini",
 };
-const budgetClock = {receivedAt: null, receivedMono: null, heldElapsed: 0, paintedKey: "", apiObs: new Map(), agentObs: new Map()};
+const ACCOUNT_POOL_IDS = {
+  "Claude a": "claude:a",
+  "Claude b": "claude:b",
+  "Codex a": "codex:a",
+  "Codex b": "codex:b",
+  "AGY Gemini": "agy:gemini",
+  "AGY Claude/GPT": "agy:claude_gpt",
+  "Grok+Cursor": "grok",
+};
+const budgetClock = {
+  receivedAt: null, receivedMono: null, heldElapsed: 0, paintedKey: "",
+  apiObs: new Map(), agentObs: new Map(), poolPaceObs: new Map(),
+};
 
 function lanePoolId(name, info) {
   if (typeof info?.pool_pace?.pool === "string" && info.pool_pace.pool) return info.pool_pace.pool;
@@ -454,13 +466,63 @@ function budgetPoolEntries(budget) {
   return entries;
 }
 
+function subscriptionRowForPool(budget, poolId) {
+  const subs = budget?.subscriptions;
+  if (!subs || typeof subs !== "object") return null;
+  for (const provider of Array.isArray(subs.providers) ? subs.providers : []) {
+    for (const row of Array.isArray(provider.accounts) ? provider.accounts : []) {
+      if (row && ACCOUNT_POOL_IDS[row.account] === poolId) return row;
+    }
+  }
+  return null;
+}
+
+function poolPaceFreshStatus(poolId, info, budget, elapsedS, laneFresh, now = Date.now()) {
+  const poolPace = info?.pool_pace && typeof info.pool_pace === "object" ? info.pool_pace : null;
+  if (!poolPace) return {present: false, fresh: false, status: null};
+  if (poolPace.stale === true || typeof elapsedS !== "number" || !Number.isFinite(elapsedS)) {
+    return {present: true, fresh: false, status: null};
+  }
+  const threshold = budget?.diagnostics?.stale_threshold_s;
+  const hasOwnAge = typeof poolPace.age_s === "number" && Number.isFinite(poolPace.age_s) && poolPace.age_s >= 0;
+  if (hasOwnAge) {
+    const aged = effectiveObservedAgeS(budgetClock.poolPaceObs, poolId, poolPace, budget, elapsedS, now);
+    if (readingState("fresh", aged, threshold) !== "fresh") return {present: true, fresh: false, status: null};
+  }
+  const subRow = subscriptionRowForPool(budget, poolId);
+  if (subRow) {
+    const staleAfter = budget?.subscriptions?.stale_after_s ?? threshold;
+    if (readingState(subRow.reading?.status, agedSeconds(subRow.reading?.age_s, elapsedS), staleAfter) !== "fresh") {
+      return {present: true, fresh: false, status: null};
+    }
+  }
+  if (!hasOwnAge && !subRow && !laneFresh) return {present: true, fresh: false, status: null};
+  const status = typeof poolPace.status === "string" && MEASURED_CAP_STATUSES.has(poolPace.status) ? poolPace.status : null;
+  return {present: true, fresh: true, status};
+}
+
 function hasMeasuredProviderWindows(info) {
   const pw = info?.provider_windows;
   if (!pw || typeof pw !== "object") return false;
   return Object.values(pw).some(w => w && typeof w === "object" && (validPct(w.remaining_pct) || validPct(w.used_pct)));
 }
 
-function laneMeasuredCapStatus(info) {
+function independentLaneCapStatus(info) {
+  const remainings = [];
+  if (info?.provider_windows && typeof info.provider_windows === "object") {
+    for (const w of Object.values(info.provider_windows)) {
+      if (!w || typeof w !== "object") continue;
+      if (validPct(w.remaining_pct)) remainings.push(w.remaining_pct);
+      else if (validPct(w.used_pct)) remainings.push(100 - w.used_pct);
+    }
+  }
+  if (validPct(info?.remaining_pct)) remainings.push(info.remaining_pct);
+  else if (validPct(info?.burn_pct_7d)) remainings.push(100 - info.burn_pct_7d);
+  if (!remainings.length) return null;
+  return Math.min(...remainings) <= 1 ? "near_cap" : "cool";
+}
+
+function laneMeasuredCapStatus(info, poolPaceInfo = null) {
   if (!info || typeof info !== "object") return null;
   if (info.probe_state === "NEED_PROBE" || info.codexbar?.probe_state === "NEED_PROBE") return null;
   const hasProviderWindowsObj = Boolean(info.provider_windows && typeof info.provider_windows === "object");
@@ -472,6 +534,12 @@ function laneMeasuredCapStatus(info) {
   const hasQuotaPct = validPct(info.remaining_pct) || validPct(info.burn_pct_7d) || measuredProviderWindows;
   if (info.runtime?.headroom_blocked === true && !hasQuotaPct) return null;
   if (info.status_source === "ledger_burn" && !hasQuotaPct) return null;
+  if (typeof info.lane_status === "string") {
+    return MEASURED_CAP_STATUSES.has(info.lane_status) ? info.lane_status : null;
+  }
+  if (poolPaceInfo?.present && !poolPaceInfo.fresh) {
+    return independentLaneCapStatus(info);
+  }
   return typeof info.status === "string" && MEASURED_CAP_STATUSES.has(info.status) ? info.status : null;
 }
 
@@ -561,7 +629,20 @@ function recordObservationMap(map, entries, budget, reading, renderNow, kind) {
 function recordBudgetObservations(budget, reading, renderNow = Date.now()) {
   if (!budget || typeof budget !== "object") return;
   recordObservationMap(budgetClock.apiObs, Object.entries(budget.api_accounts || {}), budget, reading, renderNow, "api");
-  recordObservationMap(budgetClock.agentObs, budgetPoolEntries(budget), budget, reading, renderNow, "agent");
+  const poolEntries = budgetPoolEntries(budget);
+  recordObservationMap(budgetClock.agentObs, poolEntries, budget, reading, renderNow, "agent");
+  const poolPaceEntries = [];
+  const seenPools = new Set();
+  for (const [name, info] of poolEntries) {
+    if (info?.pool_pace && typeof info.pool_pace === "object") {
+      const poolId = lanePoolId(name, info);
+      if (!seenPools.has(poolId)) {
+        seenPools.add(poolId);
+        poolPaceEntries.push([poolId, info.pool_pace]);
+      }
+    }
+  }
+  recordObservationMap(budgetClock.poolPaceObs, poolPaceEntries, budget, reading, renderNow, "pool");
 }
 
 function effectiveObservedAgeS(obsMap, name, row, budget, elapsedS = 0, now = Date.now()) {
@@ -720,7 +801,11 @@ function budgetFreshnessKey(budget, elapsedS = 0) {
   }
   for (const [name, info] of budgetPoolEntries(budget)) {
     const effectiveAge = effectiveObservedAgeS(budgetClock.agentObs, name, info, budget, elapsedS);
-    parts.push(`p:${name}:${readingState(info?.freshness, effectiveAge, threshold)}`);
+    const st = readingState(info?.freshness, effectiveAge, threshold);
+    const laneFresh = st === "fresh" && !info?.stale;
+    const poolId = lanePoolId(name, info);
+    const pp = poolPaceFreshStatus(poolId, info, budget, elapsedS, laneFresh);
+    parts.push(`p:${name}:${st}:${pp.present ? (pp.fresh ? (pp.status || "none") : "stale") : "none"}`);
   }
   return parts.join("|");
 }
@@ -991,15 +1076,13 @@ function renderChips(latest, now = Date.now()) {
       const effectiveAge = effectiveObservedAgeS(budgetClock.agentObs, name, info, budget, elapsed, now);
       const st = readingState(info.freshness, effectiveAge, threshold);
       const needsLogin = info.probe_state === "NEED_LOGIN" || info.login_state === "NEED_LOGIN";
-      if (st === "fresh" && !info.stale && !needsLogin) {
-        const poolPace = info.pool_pace && typeof info.pool_pace === "object" ? info.pool_pace : null;
-        const poolPaceStatus = poolPace && !poolPace.stale && typeof poolPace.status === "string"
-          && MEASURED_CAP_STATUSES.has(poolPace.status) ? poolPace.status : null;
-        const laneStatus = laneMeasuredCapStatus(info);
-        if (poolPaceStatus || laneStatus) {
-          record.verified = true;
-          if (poolPaceStatus === "near_cap" || laneStatus === "near_cap") record.nearCap = true;
-        }
+      const laneFresh = st === "fresh" && !info.stale && !needsLogin;
+      const poolPaceInfo = poolPaceFreshStatus(poolId, info, budget, elapsed, laneFresh, now);
+      const poolPaceStatus = poolPaceInfo.fresh ? poolPaceInfo.status : null;
+      const laneStatus = laneFresh ? laneMeasuredCapStatus(info, poolPaceInfo) : null;
+      if (poolPaceStatus || laneStatus) {
+        record.verified = true;
+        if (poolPaceStatus === "near_cap" || laneStatus === "near_cap") record.nearCap = true;
       }
       pools.set(poolId, record);
     }

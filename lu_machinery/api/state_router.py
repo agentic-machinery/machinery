@@ -820,9 +820,21 @@ def _pool_pace(current_time: datetime) -> dict[str, Any]:
         snapshot = subscriptions.subscriptions_snapshot(now=current_time)
     except Exception as exc:  # the page reader must never break routing
         logging.getLogger("state_router").warning("pool pace unreadable: %s", type(exc).__name__)
-        return {"source": "unreadable", "pools": subscriptions.pool_statuses({})}
+        return {"source": "unreadable", "pools": subscriptions.pool_statuses({}), "pool_ages": {}}
+    pool_ages: dict[str, float] = {}
+    for provider in snapshot.get("providers") or []:
+        if not isinstance(provider, Mapping):
+            continue
+        for account_row in provider.get("accounts") or []:
+            if not isinstance(account_row, Mapping):
+                continue
+            pool_id = subscriptions.POOL_IDS.get(str(account_row.get("account") or ""))
+            reading = account_row.get("reading")
+            age = reading.get("age_s") if isinstance(reading, Mapping) else None
+            if pool_id and isinstance(age, (int, float)) and not isinstance(age, bool) and age >= 0:
+                pool_ages[pool_id] = float(age)
     return {"source": snapshot["sources"]["usage_cache"]["status"], "pools": subscriptions.pool_statuses(snapshot),
-            "subscriptions": snapshot}
+            "pool_ages": pool_ages, "subscriptions": snapshot}
 
 
 def _apply_pool_pace(records: Mapping[str, Any], pool_pace: Mapping[str, Any], warnings: list[str]) -> None:
@@ -834,13 +846,19 @@ def _apply_pool_pace(records: Mapping[str, Any], pool_pace: Mapping[str, Any], w
     """
     if pool_pace.get("source") != "ok":
         return
+    pool_ages = pool_pace.get("pool_ages") if isinstance(pool_pace.get("pool_ages"), Mapping) else {}
     for lane, record in records.items():
         pool = _LANE_POOLS.get(lane)
         verdict = pool_pace["pools"].get(pool) if pool else None
         if not isinstance(record, dict) or not isinstance(verdict, Mapping):
             continue
-        record["pool_pace"] = {"pool": pool, **verdict}
+        pace_entry: dict[str, Any] = {"pool": pool, **verdict}
+        pool_age = pool_ages.get(pool) if pool else None
+        if isinstance(pool_age, (int, float)) and not isinstance(pool_age, bool) and pool_age >= 0:
+            pace_entry["age_s"] = float(pool_age)
+        record["pool_pace"] = pace_entry
         current, wanted = record.get("status"), verdict["status"]
+        record.setdefault("lane_status", current)
         if wanted == "unknown":
             new = "unknown" if current in {"cool", "warm"} else current
         elif wanted in {"hot", "near_cap"} and current in _POOL_OVERRIDABLE:
@@ -2345,9 +2363,10 @@ def _age_cached_row(row: Any, delta_s: float, *, threshold: float) -> Any:
                 updated["freshness"] = "stale"
             if updated.get("stale") is False:
                 updated["stale"] = True
-    nested = updated.get("codexbar")
-    if isinstance(nested, dict):
-        updated["codexbar"] = _age_cached_row(nested, delta_s, threshold=threshold)
+    for nested_key in ("codexbar", "pool_pace"):
+        nested = updated.get(nested_key)
+        if isinstance(nested, dict):
+            updated[nested_key] = _age_cached_row(nested, delta_s, threshold=threshold)
     return updated
 
 
@@ -2588,9 +2607,13 @@ _CREDIT_STATES = {
     credit_lane.CREDIT_BALANCE_PRESENT, credit_lane.CREDITS_EXHAUSTED, credit_lane.CREDITS_UNVERIFIED,
     credit_lane.CREDIT_USE_UNCONFIRMED,
 }
+_STATUS_ENUM = {
+    "cool", "warm", "hot", "near_cap", "unknown", "unavailable", "pre_launch", "need_login",
+    "ok", "fresh", "stale", "blocked", "eligible", "expired", "pending", "avoid", "credit",
+}
 _ROUTING_ENUMS = {
-    "status": {"cool", "warm", "hot", "near_cap", "unknown", "unavailable", "pre_launch", "need_login",
-               "ok", "fresh", "stale", "blocked", "eligible", "expired", "pending", "avoid", "credit"},
+    "status": _STATUS_ENUM,
+    "lane_status": _STATUS_ENUM,
     "freshness": {"fresh", "stale", "stale_last_good", "unavailable", "unknown"},
     "failure_kind": _ROUTING_FAILURE_KINDS,
     "probe_state": {"healthy", "NEED_LOGIN", "NEED_KEY", "NEED_PROBE", "unknown", "unavailable", "error", "ok"},
