@@ -489,9 +489,11 @@ def _utf8_text(value: object, *, required: bool = False) -> bool:
 
 
 def _valid_sender(value: object) -> bool:
+    """A sender Fleet may record as is: it passes the egress check unchanged."""
     return (
         isinstance(value, str) and _utf8_text(value, required=True) and value == value.strip()
         and not any(ord(ch) < 32 or ord(ch) == 127 for ch in value)
+        and redact_text(value) == value and not scan_text(value)
     )
 
 
@@ -936,7 +938,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     day = args.day or today - timedelta(days=1)
     if not _valid_sender(args.sender):
-        parser.error("--sender must be a name without surrounding spaces or control characters")
+        parser.error("--sender must be a name without surrounding spaces, control characters or flagged text")
     if not date.min < day < today:
         parser.error("--day must be a completed, representable UTC day")
     try:

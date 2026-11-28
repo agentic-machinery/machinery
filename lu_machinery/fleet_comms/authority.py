@@ -2292,8 +2292,13 @@ class AuthorityService:
         # state that can change after a commit, so a retry after a crash finds its
         # receipt before any of them is read. The format tag keeps this digest
         # disjoint from the whole-payload digest that rows written earlier hold.
+        # Omitted and empty reply ids behave differently (an empty parent is refused,
+        # an omitted conversation is inherited), so the request digest keeps them apart.
         request = {
             **caller_fields,
+            "conversation_id": conversation_id,
+            "thread_id": thread_id,
+            "in_reply_to": in_reply_to,
             "digest_format": "caller-request.v1",
             "recipients": None if subscriber_fanout else list(explicit_recipients),
             "context_revisions": requested_revisions,
