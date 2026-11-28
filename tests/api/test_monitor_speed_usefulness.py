@@ -17,7 +17,7 @@ from lu_machinery.orchestration import fleet_repos
 
 
 def _node(script: str) -> None:
-    result = subprocess.run(["node", "-e", script], capture_output=True, text=True, timeout=15)
+    result = subprocess.run(["node", "-"], input=script, capture_output=True, text=True, timeout=15)
     assert result.returncode == 0, result.stderr
 
 
@@ -341,9 +341,124 @@ globalThis.fetch = async (url) => {
             pool_pace: {pool: 'grok', status: 'near_cap', stale: false, age_s: 899},
           },
         }
+      : poolMode === 'seven_canonical_pools'
+      ? {
+          claude: {freshness: 'fresh', age_s: 30, stale_threshold_s: 810, status: 'cool', stale: false, remaining_pct: 73},
+          codex: {freshness: 'fresh', age_s: 30, stale_threshold_s: 810, status: 'cool', stale: false, remaining_pct: 80},
+          gemini: {freshness: 'fresh', age_s: 30, stale_threshold_s: 810, status: 'cool', stale: false, remaining_pct: 85},
+          grok: {freshness: 'fresh', age_s: 30, stale_threshold_s: 810, status: 'cool', stale: false, remaining_pct: 90},
+          cursor: {freshness: 'fresh', age_s: 30, stale_threshold_s: 600, status: 'cool', stale: false, provider_windows: {auto: {remaining_pct: 90}, api: {remaining_pct: 88}}},
+        }
+      : poolMode === 'source_ttl_expiry'
+      ? {
+          codex: {freshness: 'fresh', age_s: 809, stale_threshold_s: 810, status: 'cool', stale: false, remaining_pct: 75},
+          cursor: {freshness: 'fresh', age_s: 599, stale_threshold_s: 600, status: 'cool', stale: false, provider_windows: {auto: {remaining_pct: 82}, api: {remaining_pct: 64}}},
+        }
       : {
           claude: {freshness: 'fresh', age_s: 599, status: 'cool', stale: false},
         };
+    const codexAccounts = poolMode === 'seven_canonical_pools'
+      ? {
+          'codex:a': {freshness: 'fresh', age_s: 30, stale_threshold_s: 810, status: 'cool', stale: false, remaining_pct: 80},
+          'codex:b': {freshness: 'fresh', age_s: 30, stale_threshold_s: 810, status: 'cool', stale: false, remaining_pct: 70},
+        }
+      : undefined;
+    const isolatedCursorModes = new Set([
+      'need_login_only', 'need_probe_hot_only', 'shared_grok_cursor_near_cap',
+      'stale_pool_pace_fresh_cursor', 'expiring_pool_pace_only', 'source_ttl_expiry',
+    ]);
+    const subProviders = isolatedCursorModes.has(poolMode)
+      ? []
+      : poolMode === 'seven_canonical_pools'
+      ? [
+          {
+            provider: 'claude',
+            label: 'Claude',
+            accounts: [
+              {
+                account: 'Claude a',
+                reading: {status: 'fresh', age_s: 30, read_at: '2026-11-28T01:00:00Z'},
+                weekly: {status: 'ok', used_pct: 27, left_pct: 73, resets_at: subResetAt},
+                pace: {status: 'ok', state: 'reserve', headroom_pct: 14, lasts_to_reset: true},
+                plan: {status: 'ok'},
+              },
+              {
+                account: 'Claude b',
+                reading: {status: 'fresh', age_s: 899, read_at: '2026-11-28T00:45:01Z'},
+                weekly: {status: 'ok', used_pct: 100, left_pct: 0, resets_at: subResetAt},
+                pace: {status: 'ok', state: 'deficit', headroom_pct: -30, lasts_to_reset: false, runs_out_in_s: 0},
+                plan: {status: 'ok'},
+              },
+            ],
+          },
+          {
+            provider: 'codex',
+            label: 'Codex',
+            accounts: [
+              {
+                account: 'Codex a',
+                reading: {status: 'fresh', age_s: 30, read_at: '2026-11-28T01:00:00Z'},
+                weekly: {status: 'ok', used_pct: 20, left_pct: 80, resets_at: subResetAt},
+                pace: {status: 'ok', state: 'on_pace', headroom_pct: 0, lasts_to_reset: true},
+                plan: {status: 'ok'},
+              },
+              {
+                account: 'Codex b',
+                reading: {status: 'fresh', age_s: 30, read_at: '2026-11-28T01:00:00Z'},
+                weekly: {status: 'ok', used_pct: 30, left_pct: 70, resets_at: subResetAt},
+                pace: {status: 'ok', state: 'on_pace', headroom_pct: 0, lasts_to_reset: true},
+                plan: {status: 'ok'},
+              },
+            ],
+          },
+          {
+            provider: 'agy',
+            label: 'AGY',
+            accounts: [
+              {
+                account: 'AGY Gemini',
+                reading: {status: 'fresh', age_s: 30, read_at: '2026-11-28T01:00:00Z'},
+                weekly: {status: 'ok', used_pct: 15, left_pct: 85, resets_at: subResetAt},
+                pace: {status: 'ok', state: 'reserve', headroom_pct: 10, lasts_to_reset: true},
+                plan: {status: 'ok'},
+              },
+              {
+                account: 'AGY Claude/GPT',
+                reading: {status: 'fresh', age_s: 30, read_at: '2026-11-28T01:00:00Z'},
+                weekly: {status: 'ok', used_pct: 99.5, left_pct: 0.5, resets_at: subResetAt},
+                pace: {status: 'ok', state: 'deficit', headroom_pct: -20, lasts_to_reset: false, runs_out_in_s: 0},
+                plan: {status: 'ok'},
+              },
+            ],
+          },
+          {
+            provider: 'grok',
+            label: 'Grok',
+            accounts: [
+              {
+                account: 'Grok+Cursor',
+                reading: {status: 'fresh', age_s: 30, read_at: '2026-11-28T01:00:00Z'},
+                weekly: {status: 'ok', used_pct: 10, left_pct: 90, resets_at: subResetAt},
+                pace: {status: 'ok', state: 'reserve', headroom_pct: 20, lasts_to_reset: true},
+                plan: {status: 'ok'},
+              },
+            ],
+          },
+        ]
+      : [{
+          provider: 'claude',
+          label: 'Claude',
+          accounts: [{
+            account: 'Claude a',
+            reading: {status: 'fresh', age_s: 899, read_at: '2026-11-28T00:45:01Z'},
+            weekly: {status: 'ok', left_pct: 73, resets_at: subResetAt},
+            pace: {status: 'ok', state: 'reserve', headroom_pct: 14, lasts_to_reset: true},
+            plan: {status: 'ok'},
+          }],
+        }];
+    const apiAccounts = poolMode === 'source_ttl_expiry'
+      ? {FixtureAPI: {freshness: 'fresh', age_s: 599, stale_threshold_s: 600, fetched_at: apiFetchedAt, total_balance: 55, currency: 'USD', usage_weekly_usd: 12}}
+      : {FixtureAPI: {freshness: 'fresh', age_s: cachedApiAgeS, fetched_at: apiFetchedAt, total_balance: 55, currency: 'USD', usage_weekly_usd: 12}};
     return {
       ok: true,
       status: 200,
@@ -352,20 +467,11 @@ globalThis.fetch = async (url) => {
         generated_at: generatedAt,
         diagnostics: {stale_threshold_s: 900, data_age_s: cachedDataAgeS, codexbar_data_available: true, codexbar_max_age_s: 0},
         agents,
-        api_accounts: {FixtureAPI: {freshness: 'fresh', age_s: cachedApiAgeS, fetched_at: apiFetchedAt, total_balance: 55, currency: 'USD', usage_weekly_usd: 12}},
+        ...(codexAccounts ? {codex_accounts: codexAccounts} : {}),
+        api_accounts: apiAccounts,
         subscriptions: {
           stale_after_s: 900,
-          providers: [{
-            provider: 'claude',
-            label: 'Claude',
-            accounts: [{
-              account: 'Claude a',
-              reading: {status: 'fresh', age_s: 899, read_at: '2026-11-28T00:45:01Z'},
-              weekly: {status: 'ok', left_pct: 73, resets_at: subResetAt},
-              pace: {status: 'ok', state: 'reserve', headroom_pct: 14, lasts_to_reset: true},
-              plan: {status: 'ok'},
-            }],
-          }],
+          providers: subProviders,
         },
       }),
     };
@@ -528,6 +634,37 @@ const models = (() => {
     models.PANELS[0].onTick(models.PANELS[0], models.runner.latest, updateChips, fakeNow);
     assert.match(document.getElementById('chips').innerHTML, /<b>\?<\/b> pools near cap unknown/);
     assert.doesNotMatch(document.getElementById('chips').innerHTML, /<b>1<\/b> pool near cap/);
+
+    // PR1569-F7: Canonical subscription pools without routing lanes (Claude b, AGY Claude/GPT) enter the near-cap chip.
+    poolMode = 'seven_canonical_pools';
+    monoNow = 550000;
+    generatedAt = '2026-11-28T01:18:00Z';
+    await models.runner.loadPanel(models.PANELS[0]);
+    updateChips();
+    assert.match(document.getElementById('chips').innerHTML, /chip warn[^>]*><b>2<\/b> pools near cap<\/a>/);
+    assert.doesNotMatch(document.getElementById('chips').innerHTML, /<b>0<\/b> pools near cap/);
+    // When Claude b crosses 900s on a browser tick, chip drops it to unknown while keeping AGY Claude/GPT near cap.
+    monoNow += 2000;
+    models.PANELS[0].onTick(models.PANELS[0], models.runner.latest, updateChips, fakeNow);
+    assert.match(document.getElementById('chips').innerHTML, /chip warn[^>]*><b>1<\/b> pool near cap \(1 unknown\)<\/a>/);
+
+    // F1: Browser 1s ticks enforce each observation's source freshness limit (600s API/Cursor, 810s CodexBar)
+    // even while the aggregate snapshot remains under 900s.
+    poolMode = 'source_ttl_expiry';
+    monoNow = 600000;
+    generatedAt = '2026-11-28T01:19:00Z';
+    apiFetchedAt = '2026-11-28T01:09:01Z';
+    await models.runner.loadPanel(models.PANELS[0]);
+    updateChips();
+    assert.match(document.getElementById('usage-content').innerHTML, /55\.00 USD balance/);
+    assert.match(document.getElementById('usage-content').innerHTML, /82% left/);
+    assert.match(document.getElementById('usage-content').innerHTML, /64% left/);
+    assert.match(document.getElementById('chips').innerHTML, /<b>0<\/b> pools near cap<\/a>/);
+    monoNow += 2000;
+    models.PANELS[0].onTick(models.PANELS[0], models.runner.latest, updateChips, fakeNow);
+    const sourceExpiredHtml = document.getElementById('usage-content').innerHTML;
+    assert.doesNotMatch(sourceExpiredHtml, /55\.00|12\.00|82% left|64% left/, 'F1: API & Cursor figures withdraw at 600s source limit');
+    assert.match(document.getElementById('chips').innerHTML, /<b>\?<\/b> pools near cap unknown/, 'F1: Cursor (600s) and Codex (810s) both withdraw at their source limits');
 
     // Non-finite monotonic clock withdraws figures as unknown rather than keeping stale fresh values.
     poolMode = 'all_fresh';

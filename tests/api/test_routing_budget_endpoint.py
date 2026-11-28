@@ -434,11 +434,20 @@ def test_cached_routing_budget_ages_api_account_balances(monkeypatch, tmp_path):
                     "lane_status": "cool",
                     "freshness": "fresh",
                     "stale": False,
-                    "age_s": 600.0,
+                    "age_s": 599.0,
+                    "codexbar": {"freshness": "fresh", "stale": False, "age_s": 599.0},
                     "pool_pace": {"pool": "grok", "status": "near_cap", "stale": False, "age_s": 600.0},
                 },
             },
             "codex_accounts": {
+                "codex:a": {
+                    "eligible": True,
+                    "status": "cool",
+                    "freshness": "fresh",
+                    "stale": False,
+                    "age_s": 500.0,
+                    "codexbar": {"freshness": "fresh", "stale": False, "age_s": 500.0},
+                },
                 "codex:b": {
                     "eligible": True,
                     "status": "cool",
@@ -503,9 +512,47 @@ def test_cached_routing_budget_ages_api_account_balances(monkeypatch, tmp_path):
         first = client.get("/api/state/routing-budget?include_subscriptions=true").json()
         assert first["api_accounts"]["deepseek"]["age_s"] == 599.0
         assert first["api_accounts"]["deepseek"]["freshness"] == "fresh"
-        clock["t"] += 306.0
+        # F1: +2s crosses the 600s default source freshness limit for prepaid API accounts and Cursor,
+        # while Codex/CodexBar (810s), pool_pace (900s), and the aggregate snapshot (900s) remain fresh.
+        clock["t"] += 2.0
+        at_601 = client.get("/api/state/routing-budget?include_subscriptions=true").json()
+        assert at_601["api_accounts"]["deepseek"]["age_s"] == pytest.approx(601.0)
+        assert at_601["api_accounts"]["deepseek"]["freshness"] == "stale"
+        assert at_601["api_accounts"]["deepseek"]["stale"] is True
+        assert at_601["api_accounts"]["deepseek"]["stale_threshold_s"] == pytest.approx(600.0)
+        assert at_601["agents"]["cursor"]["age_s"] == pytest.approx(601.0)
+        assert at_601["agents"]["cursor"]["freshness"] == "stale"
+        assert at_601["agents"]["cursor"]["stale"] is True
+        assert at_601["agents"]["cursor"]["stale_threshold_s"] == pytest.approx(600.0)
+        assert at_601["agents"]["cursor"]["codexbar"]["freshness"] == "stale"
+        assert at_601["agents"]["cursor"]["codexbar"]["stale"] is True
+        assert at_601["agents"]["cursor"]["pool_pace"]["age_s"] == pytest.approx(602.0)
+        assert at_601["agents"]["cursor"]["pool_pace"]["stale"] is False
+        assert at_601["agents"]["codex"]["age_s"] == pytest.approx(502.0)
+        assert at_601["agents"]["codex"]["freshness"] == "fresh"
+        assert at_601["agents"]["codex"]["stale_threshold_s"] == pytest.approx(810.0)
+        assert at_601["codex_accounts"]["codex:a"]["freshness"] == "fresh"
+        assert at_601["codex_accounts"]["codex:b"]["freshness"] == "fresh"
+        assert at_601["diagnostics"]["stale"] is False
+
+        # +304s more (total +306s): codex (806s) still under 810s CodexBar TTL; codex:b (956s) and pool_pace (906s) stale.
+        clock["t"] += 304.0
         with_subs = client.get("/api/state/routing-budget?include_subscriptions=true").json()
         without_subs = client.get("/api/state/routing-budget").json()
+
+        # +5s more (total +311s): codex and codex:a cross 810s CodexBar TTL (811s) while aggregate stays under 900s.
+        clock["t"] += 5.0
+        at_811 = client.get("/api/state/routing-budget").json()
+        assert at_811["agents"]["codex"]["age_s"] == pytest.approx(811.0)
+        assert at_811["agents"]["codex"]["freshness"] == "stale"
+        assert at_811["agents"]["codex"]["stale"] is True
+        assert at_811["agents"]["codex"]["codexbar"]["freshness"] == "stale"
+        assert at_811["agents"]["codex"]["codexbar"]["stale"] is True
+        assert at_811["codex_accounts"]["codex:a"]["age_s"] == pytest.approx(811.0)
+        assert at_811["codex_accounts"]["codex:a"]["freshness"] == "stale"
+        assert at_811["codex_accounts"]["codex:a"]["stale"] is True
+        assert at_811["codex_accounts"]["codex:b"]["freshness"] == "stale"
+        assert at_811["diagnostics"]["stale"] is False
 
     assert len(calls) == 1
     for body in (with_subs, without_subs):
@@ -514,7 +561,7 @@ def test_cached_routing_budget_ages_api_account_balances(monkeypatch, tmp_path):
         assert body["api_accounts"]["deepseek"]["stale"] is True
         assert body["api_accounts"]["openrouter"]["age_s"] == pytest.approx(426.0)
         assert body["api_accounts"]["openrouter"]["freshness"] == "stale_last_good"
-        assert body["agents"]["cursor"]["age_s"] == pytest.approx(906.0)
+        assert body["agents"]["cursor"]["age_s"] == pytest.approx(905.0)
         assert body["agents"]["cursor"]["freshness"] == "stale"
         assert body["agents"]["cursor"]["stale"] is True
         assert body["agents"]["cursor"]["lane_status"] == "cool"
@@ -533,7 +580,7 @@ def test_cached_routing_budget_ages_api_account_balances(monkeypatch, tmp_path):
     assert "subscriptions" not in without_subs
     assert stored_snapshot["api_accounts"]["deepseek"]["age_s"] == 599.0
     assert stored_snapshot["api_accounts"]["deepseek"]["freshness"] == "fresh"
-    assert stored_snapshot["agents"]["cursor"]["age_s"] == 600.0
+    assert stored_snapshot["agents"]["cursor"]["age_s"] == 599.0
 
 
 def test_task_rewrite_serves_warm_snapshot_while_recompute_is_blocked(monkeypatch, tmp_path):

@@ -73,6 +73,9 @@ from .state_helpers import (
 )
 from .subscription_usage import (
     _api_account_cache_ttl_s,
+    _codexbar_cache_ttl_s,
+    _cursor_cache_ttl_s,
+    _cursor_need_login_cache_ttl_s,
     compute_usage_pace,
 )
 from .telemetry.response import add_json_telemetry, session_id_from_request
@@ -833,8 +836,14 @@ def _pool_pace(current_time: datetime) -> dict[str, Any]:
             age = reading.get("age_s") if isinstance(reading, Mapping) else None
             if pool_id and isinstance(age, (int, float)) and not isinstance(age, bool) and age >= 0:
                 pool_ages[pool_id] = float(age)
+    stale_after = snapshot.get("stale_after_s")
+    stale_after_s = (
+        float(stale_after)
+        if isinstance(stale_after, (int, float)) and not isinstance(stale_after, bool) and stale_after > 0
+        else float(subscriptions.STALE_AFTER_S)
+    )
     return {"source": snapshot["sources"]["usage_cache"]["status"], "pools": subscriptions.pool_statuses(snapshot),
-            "pool_ages": pool_ages, "subscriptions": snapshot}
+            "pool_ages": pool_ages, "stale_after_s": stale_after_s, "subscriptions": snapshot}
 
 
 def _apply_pool_pace(records: Mapping[str, Any], pool_pace: Mapping[str, Any], warnings: list[str]) -> None:
@@ -848,12 +857,18 @@ def _apply_pool_pace(records: Mapping[str, Any], pool_pace: Mapping[str, Any], w
         return
     raw_pool_ages = pool_pace.get("pool_ages")
     pool_ages: Mapping[str, Any] = raw_pool_ages if isinstance(raw_pool_ages, Mapping) else {}
+    raw_stale_after = pool_pace.get("stale_after_s")
+    stale_after_s = (
+        float(raw_stale_after)
+        if isinstance(raw_stale_after, (int, float)) and not isinstance(raw_stale_after, bool) and raw_stale_after > 0
+        else float(subscriptions.STALE_AFTER_S)
+    )
     for lane, record in records.items():
         pool = _LANE_POOLS.get(lane)
         verdict = pool_pace["pools"].get(pool) if pool else None
         if not isinstance(record, dict) or not isinstance(verdict, Mapping):
             continue
-        pace_entry: dict[str, Any] = {"pool": pool, **verdict}
+        pace_entry: dict[str, Any] = {"pool": pool, **verdict, "stale_threshold_s": stale_after_s}
         pool_age = pool_ages.get(pool) if pool else None
         if isinstance(pool_age, (int, float)) and not isinstance(pool_age, bool) and pool_age >= 0:
             pace_entry["age_s"] = float(pool_age)
@@ -914,6 +929,7 @@ def _overlay_notebook_lane_usage(
         agents[lane]["notebook_report"] = {
             "source": "notebook-report",
             "age_s": freshest.age_s,
+            "stale_threshold_s": float(REPORT_TTL_SECONDS),
             "weekly_used_pct": weekly_used,
             "weekly_remaining_pct": max(0.0, min(100.0, 100.0 - weekly_used)),
             "weekly_resets_at": resets_at,
@@ -1041,6 +1057,7 @@ def _build_api_accounts_payload(
         # (capacity_pick) never see spawn-phase failures (#8514).
         if accounts[lane].get("auth_error"):
             accounts[lane]["auth_error"] = "provider_error"
+        accounts[lane]["stale_threshold_s"] = _api_account_cache_ttl_s()
         accounts[lane]["health"] = _lane_health_record(health_records, lane)
     return accounts
 
@@ -1350,6 +1367,10 @@ def _compute_dispatch_routing_budget(
                 agents[lane][field] = cb_data.get(field)
             agents[lane]["freshness"] = cb_data.get("freshness", "unavailable")
             agents[lane]["age_s"] = cb_data.get("age_s")
+            agents[lane]["stale_threshold_s"] = cast(
+                Any,
+                _row_stale_threshold_s("agents", lane, cb_data, fallback=ROUTING_BUDGET_MAX_AGE_S),
+            )
             # Per-product percents are display-only and Grok-only (#10864); the
             # lane record keeps them even when the credit window is absent.
             if lane == "grok" and isinstance(cb_data.get("product_usage"), list):
@@ -1438,6 +1459,7 @@ def _compute_dispatch_routing_budget(
                 "stale": cb_data.get("stale", False),
                 "freshness": _probe_freshness_label(cb_data),
                 "age_s": cb_data.get("age_s"),
+                "stale_threshold_s": agents[lane].get("stale_threshold_s"),
                 "fetched_at": cb_data.get("fetched_at"),
                 "failure_kind": cb_data.get("failure_kind"),
                 "last_failure_at": cb_data.get("last_failure_at"),
@@ -2112,10 +2134,12 @@ def _codex_account_probe_row(
         row["status_source"] = "weekly_pace"
     if probe.get("weekly_resets_at"):
         row["resets_at"] = probe["weekly_resets_at"]
-    row["codexbar"] = {key: probe.get(key) for key in _CODEXBAR_PUBLIC_FIELDS}
+    cb_ttl = _codexbar_cache_ttl_s()
+    row["codexbar"] = {**{key: probe.get(key) for key in _CODEXBAR_PUBLIC_FIELDS}, "stale_threshold_s": cb_ttl}
     row["freshness"] = probe.get("freshness", "unavailable")
     row["age_s"] = probe.get("age_s")
     row["stale"] = bool(probe.get("stale"))
+    row["stale_threshold_s"] = cb_ttl
     for name in ("credit_balance", "reset_credits"):
         row[name] = probe.get(name)
     return row
@@ -2350,32 +2374,74 @@ def _with_live_codex_failures(payload: dict[str, Any]) -> dict[str, Any]:
     return payload
 
 
-def _age_cached_row(row: Any, delta_s: float, *, threshold: float) -> Any:
+def _row_stale_threshold_s(section: str, name: str, row: Mapping[str, Any], *, fallback: float) -> float:
+    """Resolve one observation row's source freshness limit (falling back to the aggregate threshold)."""
+    raw = row.get("stale_threshold_s")
+    if isinstance(raw, (int, float)) and not isinstance(raw, bool) and math.isfinite(raw) and raw > 0:
+        return float(raw)
+    if section == "api_accounts":
+        return _api_account_cache_ttl_s()
+    if section == "agents" and name == "cursor":
+        if row.get("probe_state") == "NEED_LOGIN" or row.get("login_state") == "NEED_LOGIN":
+            return _cursor_need_login_cache_ttl_s()
+        return _cursor_cache_ttl_s()
+    if section in {"agents", "codex_accounts", "codexbar"}:
+        return _codexbar_cache_ttl_s()
+    if section == "pool_pace":
+        return float(subscriptions.STALE_AFTER_S)
+    if section == "notebook_report":
+        return float(REPORT_TTL_SECONDS)
+    return fallback
+
+
+def _age_cached_row(
+    row: Any,
+    delta_s: float,
+    *,
+    threshold: float,
+    section: str = "",
+    name: str = "",
+) -> Any:
     """Return a copy of one cached routing-budget row with its age advanced by ``delta_s``."""
     if not isinstance(row, dict):
         return row
     updated = dict(row)
     raw_age = updated.get("age_s")
     if isinstance(raw_age, (int, float)) and not isinstance(raw_age, bool) and raw_age >= 0:
+        row_threshold = _row_stale_threshold_s(section, name, updated, fallback=threshold)
+        if section in {"api_accounts", "agents", "codex_accounts", "codexbar", "pool_pace", "notebook_report"}:
+            updated["stale_threshold_s"] = row_threshold
         aged = float(raw_age) + delta_s
         updated["age_s"] = aged
-        if aged > threshold:
+        strict_ttl = section in {"api_accounts", "agents", "codex_accounts", "codexbar"}
+        expired = aged >= row_threshold if strict_ttl else aged > row_threshold
+        if expired:
             if updated.get("freshness") == "fresh":
                 updated["freshness"] = "stale"
             if updated.get("stale") is False:
                 updated["stale"] = True
-    for nested_key in ("codexbar", "pool_pace"):
+    for nested_key in ("codexbar", "pool_pace", "notebook_report"):
         nested = updated.get(nested_key)
         if isinstance(nested, dict):
-            updated[nested_key] = _age_cached_row(nested, delta_s, threshold=threshold)
+            nested_section = section if (nested_key == "codexbar" and section == "agents" and name == "cursor") else nested_key
+            updated[nested_key] = _age_cached_row(
+                nested,
+                delta_s,
+                threshold=threshold,
+                section=nested_section,
+                name=name if nested_section == "agents" else nested_key,
+            )
     return updated
 
 
-def _age_cached_rows(rows: Any, delta_s: float, *, threshold: float) -> Any:
+def _age_cached_rows(rows: Any, delta_s: float, *, threshold: float, section: str = "") -> Any:
     """Advance ``age_s`` on every mapping entry without mutating the cached snapshot."""
     if not isinstance(rows, dict):
         return rows
-    return {name: _age_cached_row(row, delta_s, threshold=threshold) for name, row in rows.items()}
+    return {
+        name: _age_cached_row(row, delta_s, threshold=threshold, section=section, name=str(name))
+        for name, row in rows.items()
+    }
 
 
 def _aged_routing_budget(
@@ -2416,7 +2482,7 @@ def _aged_routing_budget(
         served["diagnostics"] = diagnostics
     for section in ("api_accounts", "agents", "codex_accounts"):
         if section in served:
-            served[section] = _age_cached_rows(served[section], delta, threshold=threshold)
+            served[section] = _age_cached_rows(served[section], delta, threshold=threshold, section=section)
     if reported_age <= threshold:
         return served
     return _withdraw_routing_authorization(served)

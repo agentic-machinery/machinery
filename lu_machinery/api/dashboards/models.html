@@ -477,13 +477,67 @@ function subscriptionRowForPool(budget, poolId) {
   return null;
 }
 
+function rowReadingState(freshness, ageS, row, budget) {
+  const ownLimit = typeof row?.stale_threshold_s === "number" && Number.isFinite(row.stale_threshold_s) && row.stale_threshold_s > 0
+    ? row.stale_threshold_s : null;
+  if (ownLimit !== null) {
+    if (freshness === "fresh" && typeof ageS === "number" && Number.isFinite(ageS) && ageS >= ownLimit) {
+      return "stale";
+    }
+    return readingState(freshness, ageS, ownLimit);
+  }
+  return readingState(freshness, ageS, budget?.diagnostics?.stale_threshold_s);
+}
+
+function subscriptionPoolCapStatus(row, staleAfter, elapsedS = 0) {
+  if (!row || typeof row !== "object" || row.plan?.ended) return null;
+  if (readingState(row.reading?.status, agedSeconds(row.reading?.age_s, elapsedS), staleAfter) !== "fresh") return null;
+  const weekly = row.weekly || {};
+  if (weekly.status !== "ok") return null;
+  const used = validPct(weekly.used_pct) ? weekly.used_pct
+    : validPct(weekly.left_pct) ? 100 - weekly.left_pct : null;
+  if (used === null) return null;
+  const pace = row.pace || {};
+  if (pace.status === "ok") {
+    const headroom = pace.headroom_pct;
+    const expected = pace.expected_used_pct;
+    if (typeof headroom !== "number" || !Number.isFinite(headroom) || headroom < -100 || headroom > 100) return null;
+    if (expected != null && !validPct(expected)) return null;
+  }
+  if (used >= 99 && pace.lasts_to_reset !== true) return "near_cap";
+  if (pace.status !== "ok") {
+    if (pace.reason_code === "too_early_in_window" || pace.reason === "too_early_in_window") return "cool";
+    if (used >= 99 && pace.lasts_to_reset === true) return "cool";
+    return null;
+  }
+  if (pace.lasts_to_reset === true) return "cool";
+  if (pace.lasts_to_reset === false) {
+    const delta = pace.state === "on_pace" ? 0
+      : pace.state === "deficit" ? 2.1
+      : pace.state === "reserve" ? -2.1
+      : typeof pace.headroom_pct === "number" && Number.isFinite(pace.headroom_pct) ? -pace.headroom_pct : null;
+    if (delta !== null && Math.abs(delta) <= 2) return "cool";
+    if (delta !== null && delta < -2) return "cool";
+    if (delta !== null && delta > 2 && (pace.state === "deficit" || pace.expected_used_pct != null)) {
+      if (typeof pace.runs_out_in_s === "number" && Number.isInteger(pace.runs_out_in_s) && pace.runs_out_in_s <= 0) {
+        return "near_cap";
+      }
+      return "hot";
+    }
+    return null;
+  }
+  return null;
+}
+
 function poolPaceFreshStatus(poolId, info, budget, elapsedS, laneFresh, now = Date.now()) {
   const poolPace = info?.pool_pace && typeof info.pool_pace === "object" ? info.pool_pace : null;
   if (!poolPace) return {present: false, fresh: false, status: null};
   if (poolPace.stale === true || typeof elapsedS !== "number" || !Number.isFinite(elapsedS)) {
     return {present: true, fresh: false, status: null};
   }
-  const threshold = budget?.diagnostics?.stale_threshold_s;
+  const threshold = typeof poolPace.stale_threshold_s === "number" && Number.isFinite(poolPace.stale_threshold_s) && poolPace.stale_threshold_s > 0
+    ? poolPace.stale_threshold_s
+    : (budget?.subscriptions?.stale_after_s ?? budget?.diagnostics?.stale_threshold_s);
   const hasOwnAge = typeof poolPace.age_s === "number" && Number.isFinite(poolPace.age_s) && poolPace.age_s >= 0;
   if (hasOwnAge) {
     const aged = effectiveObservedAgeS(budgetClock.poolPaceObs, poolId, poolPace, budget, elapsedS, now);
@@ -715,7 +769,7 @@ function apiRows(budget, elapsedS = 0) {
   const accounts = budget.api_accounts || {};
   return Object.entries(accounts).map(([name, row]) => {
     const effectiveAge = effectiveObservedAgeS(budgetClock.apiObs, name, row, budget, elapsedS);
-    const state = readingState(row.freshness, effectiveAge, budget.diagnostics?.stale_threshold_s);
+    const state = rowReadingState(row.freshness, effectiveAge, row, budget);
     const balance = typeof row.total_balance === "number" ? `${row.total_balance.toFixed(2)} ${row.currency || ""}`.trim() + " balance"
       : typeof row.limit_remaining_usd === "number" ? `$${row.limit_remaining_usd.toFixed(2)} left` : null;
     const spent = typeof row.usage_weekly_usd === "number" ? `$${row.usage_weekly_usd.toFixed(2)} this week` : null;
@@ -739,7 +793,7 @@ function apiRows(budget, elapsedS = 0) {
 function cursorUsage(budget, elapsedS = 0) {
   const cursor = budget?.agents?.cursor;
   const effectiveAge = effectiveObservedAgeS(budgetClock.agentObs, "cursor", cursor, budget, elapsedS);
-  const freshness = readingState(cursor?.freshness, effectiveAge, budget?.diagnostics?.stale_threshold_s);
+  const freshness = rowReadingState(cursor?.freshness, effectiveAge, cursor, budget);
   const needsLogin = cursor?.probe_state === "NEED_LOGIN" || cursor?.login_state === "NEED_LOGIN";
   const reason = !budget ? "routing budget did not answer"
     : needsLogin ? "sign-in required"
@@ -794,14 +848,13 @@ function budgetFreshnessKey(budget, elapsedS = 0) {
       parts.push(`s:${row.account}:${readingState(row.reading?.status, agedSeconds(row.reading?.age_s, elapsedS), staleAfter)}`);
     }
   }
-  const threshold = budget.diagnostics?.stale_threshold_s;
   for (const [name, row] of Object.entries(budget.api_accounts || {})) {
     const effectiveAge = effectiveObservedAgeS(budgetClock.apiObs, name, row, budget, elapsedS);
-    parts.push(`a:${name}:${readingState(row?.freshness, effectiveAge, threshold)}`);
+    parts.push(`a:${name}:${rowReadingState(row?.freshness, effectiveAge, row, budget)}`);
   }
   for (const [name, info] of budgetPoolEntries(budget)) {
     const effectiveAge = effectiveObservedAgeS(budgetClock.agentObs, name, info, budget, elapsedS);
-    const st = readingState(info?.freshness, effectiveAge, threshold);
+    const st = rowReadingState(info?.freshness, effectiveAge, info, budget);
     const laneFresh = st === "fresh" && !info?.stale;
     const poolId = lanePoolId(name, info);
     const pp = poolPaceFreshStatus(poolId, info, budget, elapsedS, laneFresh);
@@ -1068,13 +1121,29 @@ function renderChips(latest, now = Date.now()) {
     }
   }
   if (budget) {
-    const threshold = budget.diagnostics?.stale_threshold_s;
     const pools = new Map();
+    if (subs && typeof subs === "object") {
+      const staleAfter = subs.stale_after_s ?? budget.diagnostics?.stale_threshold_s;
+      for (const provider of Array.isArray(subs.providers) ? subs.providers : []) {
+        for (const row of Array.isArray(provider.accounts) ? provider.accounts : []) {
+          if (!row || row.plan?.ended) continue;
+          const poolId = ACCOUNT_POOL_IDS[row.account];
+          if (!poolId) continue;
+          const record = pools.get(poolId) || {verified: false, nearCap: false};
+          const subStatus = subscriptionPoolCapStatus(row, staleAfter, elapsed);
+          if (subStatus && MEASURED_CAP_STATUSES.has(subStatus)) {
+            record.verified = true;
+            if (subStatus === "near_cap") record.nearCap = true;
+          }
+          pools.set(poolId, record);
+        }
+      }
+    }
     for (const [name, info] of budgetPoolEntries(budget)) {
       const poolId = lanePoolId(name, info);
       const record = pools.get(poolId) || {verified: false, nearCap: false};
       const effectiveAge = effectiveObservedAgeS(budgetClock.agentObs, name, info, budget, elapsed, now);
-      const st = readingState(info.freshness, effectiveAge, threshold);
+      const st = rowReadingState(info.freshness, effectiveAge, info, budget);
       const needsLogin = info.probe_state === "NEED_LOGIN" || info.login_state === "NEED_LOGIN";
       const laneFresh = st === "fresh" && !info.stale && !needsLogin;
       const poolPaceInfo = poolPaceFreshStatus(poolId, info, budget, elapsed, laneFresh, now);
