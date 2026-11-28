@@ -902,7 +902,7 @@ import sys
 
 
 def test_boundary(capfd):
-    subprocess.run([sys.executable, "-c", "print('captured child')"], check=True)
+    subprocess.run([sys.executable, "-c", "print('captured child')"], check=True, timeout=30)
     assert capfd.readouterr().out == "captured child\\n"
     with open("/dev/null", "rb+") as device:
         assert device.read(1) == b""
@@ -940,7 +940,7 @@ cache = Path(os.environ["npm_config_cache"])
 cache.mkdir()
 (cache / "cache-probe").touch()
 with tempfile.TemporaryFile() as scratch:
-    subprocess.run([python, "-c", "print('npm child')"], stdout=scratch, check=True)
+    subprocess.run([python, "-c", "print('npm child')"], stdout=scratch, check=True, timeout=30)
     scratch.seek(0)
     assert scratch.read() == b"npm child\\n"
 Path("deployed").write_text("npm child")
