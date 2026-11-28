@@ -348,7 +348,7 @@ function setChoice(id, value) {
 }
 
 function fillSeatOptions(payload = latestSeatsPayload) {
-  if (payload) latestSeatsPayload = payload;
+  if (rosterReady(payload)) latestSeatsPayload = payload;
   const select = selectable("filter-seat");
   if (!select) return;
   const current = pageQuery().get("seat") || "";
@@ -375,12 +375,13 @@ function fillSeatOptions(payload = latestSeatsPayload) {
   finally { applyingFilters = false; }
 }
 
-let seatsLoaded = false;
+let seatsInFlight = false;
 function loadSeatOptions() {
-  fetchJson(SEATS_URL).then(reading => {
-    seatsLoaded = true;
-    fillSeatOptions(reading.data);
-  }).catch(() => {});
+  if (seatsInFlight) return Promise.resolve();
+  seatsInFlight = true;
+  return fetchJson(SEATS_URL).then(reading => {
+    if (rosterReady(reading.data)) fillSeatOptions(reading.data);
+  }).catch(() => {}).finally(() => { seatsInFlight = false; });
 }
 
 function syncAppliedFilters(payload) {
@@ -664,9 +665,9 @@ function renderChips(latest) {
     const failedDeliv = typeof day.failed_deliveries?.total === "number" ? day.failed_deliveries.total : null;
     const failedJobs = typeof day.failed_jobs?.total === "number" ? day.failed_jobs.total : null;
     const failed = failedDeliv !== null && failedJobs !== null ? failedDeliv + failedJobs : failedDeliv;
-    out.push(chip("/comms?state=queued", queued ?? "?", "queued", queued === null || queued > 0 ? "warn" : ""));
-    out.push(chip("#health", dead ?? "?", "dead letters / 24 h", dead === null || dead > 0 ? "warn" : ""));
-    out.push(chip("#health", failed ?? "?", "failed / 24 h", failed === null || failed > 0 ? "warn" : ""));
+    out.push(chip("/comms?state=queued", queued ?? "?", "queued", queued === null || queued > 0 ? "warn" : "", "queued"));
+    out.push(chip("#health", dead ?? "?", "dead letters / 24 h", dead === null || dead > 0 ? "warn" : "", "dead-letters"));
+    out.push(chip("#health", failed ?? "?", "failed / 24 h", failed === null || failed > 0 ? "warn" : "", "failed"));
   }
   return out.join("");
 }
@@ -1217,18 +1218,20 @@ async function loadDiscussionsList() {
     if (!response.ok) {
       discussionStatus(`Discussions unavailable (HTTP ${response.status}).`);
       setNodeChildren(container, [discussionEl("p", "error", `Discussions unavailable (HTTP ${response.status}).`)]);
-      return;
+      return false;
     }
     let payload;
     try { payload = JSON.parse(await response.text()); } catch { payload = null; }
-    if (seq !== discussionsListSeq) return;
+    if (seq !== discussionsListSeq) return false;
     renderDiscussionsListDom(payload);
     const count = Array.isArray(payload?.conversations) ? payload.conversations.length : 0;
     discussionStatus(`Loaded ${count} discussion${count === 1 ? "" : "s"}.`);
+    return true;
   } catch {
-    if (seq !== discussionsListSeq) return;
+    if (seq !== discussionsListSeq) return false;
     discussionStatus("Discussions could not load.");
     setNodeChildren(container, [discussionEl("p", "error", "Discussions could not load.")]);
+    return false;
   }
 }
 
@@ -1282,15 +1285,13 @@ function bindDiscussionsPanel() {
   let loadedOnce = false;
   disclosure.addEventListener("toggle", () => {
     if (disclosure.open && !loadedOnce) {
-      loadedOnce = true;
-      loadDiscussionsList();
+      loadDiscussionsList().then(ok => { if (ok) loadedOnce = true; });
     }
   });
   const refreshBtn = document.getElementById("discussions-refresh");
   if (refreshBtn && typeof refreshBtn.addEventListener === "function") {
     refreshBtn.addEventListener("click", () => {
-      loadedOnce = true;
-      loadDiscussionsList();
+      loadDiscussionsList().then(ok => { if (ok) loadedOnce = true; });
     });
   }
   const listBox = document.getElementById("discussions-list");
@@ -1313,7 +1314,6 @@ const PANELS = [
     render: renderMessages,
     onData: () => {
       restoreListFocus();
-      if (!seatsLoaded) loadSeatOptions();
     },
     onError: () => {
       restoreListFocus(true);
@@ -1322,7 +1322,7 @@ const PANELS = [
   {id: "comms", label: "Delivery health", urls: ["/api/comms/v1/metrics"], render: renderComms},
 ];
 
-const runner = createPanelRunner({panels: PANELS, renderChips});
+const runner = createPanelRunner({panels: PANELS, renderChips, onRefresh: loadSeatOptions});
 bindMessageControls();
 bindDiscussionsPanel();
 if (typeof location === "object" && location?.hash === "#health") {

@@ -430,10 +430,12 @@ def test_cached_routing_budget_ages_api_account_balances(monkeypatch, tmp_path):
                 },
                 "cursor": {
                     "eligible": True,
-                    "status": "cool",
+                    "status": "near_cap",
+                    "lane_status": "cool",
                     "freshness": "fresh",
                     "stale": False,
                     "age_s": 600.0,
+                    "pool_pace": {"pool": "grok", "status": "near_cap", "stale": False, "age_s": 600.0},
                 },
             },
             "codex_accounts": {
@@ -515,6 +517,9 @@ def test_cached_routing_budget_ages_api_account_balances(monkeypatch, tmp_path):
         assert body["agents"]["cursor"]["age_s"] == pytest.approx(906.0)
         assert body["agents"]["cursor"]["freshness"] == "stale"
         assert body["agents"]["cursor"]["stale"] is True
+        assert body["agents"]["cursor"]["lane_status"] == "cool"
+        assert body["agents"]["cursor"]["pool_pace"]["age_s"] == pytest.approx(906.0)
+        assert body["agents"]["cursor"]["pool_pace"]["stale"] is True
         assert body["agents"]["codex"]["age_s"] == pytest.approx(806.0)
         assert body["agents"]["codex"]["freshness"] == "fresh"
         assert body["agents"]["codex"]["codexbar"]["age_s"] == pytest.approx(806.0)

@@ -198,8 +198,9 @@
   const unknown = reason => `<p class="muted">Unknown: ${escapeHtml(String(reason || "no reason given").replaceAll("_", " "))}.</p>`;
   const clockUtc = (moment = Date.now()) => new Date(moment).toISOString().slice(11, 19) + " UTC";
 
-  function chip(href, count, label, cls = "") {
-    return `<a class="chip${cls ? ` ${cls}` : ""}" href="${escapeHtml(href)}"><b>${escapeHtml(count)}</b> ${escapeHtml(label)}</a>`;
+  function chip(href, count, label, cls = "", key = "") {
+    const keyAttr = key ? ` data-chip-key="${escapeHtml(key)}"` : "";
+    return `<a class="chip${cls ? ` ${cls}` : ""}"${keyAttr} href="${escapeHtml(href)}"><b>${escapeHtml(count)}</b> ${escapeHtml(label)}</a>`;
   }
 
   // ---- Shared domain helpers (subscriptions & PRs) ----
@@ -575,6 +576,7 @@
     const optionalUrls = options?.optionalUrls || DEFAULT_OPTIONAL;
     const renderChips = typeof options?.renderChips === "function" ? options.renderChips : null;
     const onAfterLoad = typeof options?.onAfterLoad === "function" ? options.onAfterLoad : null;
+    const onRefresh = typeof options?.onRefresh === "function" ? options.onRefresh : null;
     const fetchImpl = typeof options?.fetchJson === "function" ? options.fetchJson : fetchJson;
     const latest = {};
     const inFlight = new Set();
@@ -591,7 +593,41 @@
     function updateChips() {
       if (!renderChips) return;
       const box = document.getElementById("chips");
-      if (box) box.innerHTML = renderChips(latest);
+      if (!box) return;
+      const nextHtml = renderChips(latest);
+      if (box.innerHTML === nextHtml) return;
+      const active = typeof document === "object" && document ? document.activeElement : null;
+      let focusState = null;
+      if (active && typeof box.contains === "function" && box.contains(active)) {
+        const currentChips = typeof box.querySelectorAll === "function" ? [...box.querySelectorAll("a.chip")] : [];
+        const chipKey = active.dataset?.chipKey || "";
+        const href = typeof active.getAttribute === "function" ? (active.getAttribute("href") || "") : "";
+        const sameHref = href ? currentChips.filter(node => typeof node.getAttribute === "function" && node.getAttribute("href") === href) : [];
+        focusState = {
+          chipKey,
+          href,
+          sameHrefIndex: sameHref.indexOf(active),
+          chipIndex: currentChips.indexOf(active),
+        };
+      }
+      box.innerHTML = nextHtml;
+      if (focusState && typeof box.querySelectorAll === "function") {
+        const rebuilt = [...box.querySelectorAll("a.chip")];
+        let target = null;
+        if (focusState.chipKey) {
+          target = rebuilt.find(node => node.dataset?.chipKey === focusState.chipKey) || null;
+        }
+        if (!target && focusState.href) {
+          const sameHref = rebuilt.filter(node => typeof node.getAttribute === "function" && node.getAttribute("href") === focusState.href);
+          target = sameHref[focusState.sameHrefIndex] || sameHref[0] || null;
+        }
+        if (!target && rebuilt.length && focusState.chipIndex >= 0) {
+          target = rebuilt[Math.min(focusState.chipIndex, rebuilt.length - 1)] || null;
+        }
+        if (target && typeof target.focus === "function") {
+          try { target.focus({preventScroll: true}); } catch { target.focus(); }
+        }
+      }
     }
 
     async function loadPanel(panel) {
@@ -655,6 +691,7 @@
 
     async function refreshAll() {
       loadVersion();
+      if (onRefresh) onRefresh();
       await Promise.all(panels.map(loadPanel));
       updateChips();
       showRefresh(panels);

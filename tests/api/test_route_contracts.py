@@ -666,6 +666,44 @@ assert.match(M.prChips(unknownTotalPrs).join(''), /<b>1<\/b> open PRs observed Â
     let nextRowIds = [firstId, secondId];
     const filterSeatEl = document.getElementById('filter-seat');
     filterSeatEl.focus = () => { document.activeElement = filterSeatEl; focusedTargets.push('filter-seat'); };
+    filterSeatEl.add = () => {};
+    filterSeatEl.replaceChildren = function () { this.options = []; };
+    filterSeatEl.append = function (opt) { this.options.push(opt); };
+    const chipsEl = document.getElementById('chips');
+    let chipsHtml = '';
+    let chipNodes = [];
+    const parseChips = html => {
+      const parsed = [];
+      const rx = /<a\b([^>]*)>([\s\S]*?)<\/a>/g;
+      let match;
+      while ((match = rx.exec(html)) !== null) {
+        const attrs = match[1];
+        const keyM = attrs.match(/data-chip-key="([^"]*)"/);
+        const hrefM = attrs.match(/href="([^"]*)"/);
+        const node = {
+          dataset: keyM ? {chipKey: keyM[1]} : {},
+          href: hrefM ? hrefM[1] : '',
+          getAttribute(name) { return name === 'href' ? this.href : null; },
+          focus() { document.activeElement = node; focusedTargets.push(`chip:${node.dataset.chipKey || node.href}`); },
+        };
+        parsed.push(node);
+      }
+      return parsed;
+    };
+    Object.defineProperty(chipsEl, 'innerHTML', {
+      get() { return chipsHtml; },
+      set(val) {
+        chipsHtml = val;
+        const hadChip = chipNodes.includes(document.activeElement);
+        chipNodes = parseChips(val);
+        if (hadChip) document.activeElement = null;
+      },
+    });
+    chipsEl.contains = node => chipNodes.includes(node);
+    chipsEl.querySelectorAll = selector => selector === 'a.chip' ? [...chipNodes] : [];
+    let seatsMode = 'unavailable';
+    let deliveriesStatus = 200;
+    let metricsDeadCount = 0;
     const messagesContentEl = document.getElementById('messages-content');
     const setListRows = ids => {
       listButtons.length = 0;
@@ -683,8 +721,9 @@ assert.match(M.prChips(unknownTotalPrs).join(''), /<b>1<\/b> open PRs observed Â
       get() { return messagesHtml; },
       set(val) {
         messagesHtml = val;
+        const hadListFocus = listButtons.includes(document.activeElement);
         setListRows(nextRowIds);
-        if (document.activeElement && !listButtons.includes(document.activeElement)) {
+        if (hadListFocus) {
           document.activeElement = null;
         }
       },
@@ -739,6 +778,23 @@ assert.match(M.prChips(unknownTotalPrs).join(''), /<b>1<\/b> open PRs observed Â
     const fetchPanel = globalThis.fetch;
     globalThis.fetch = (url, options) => {
       requests.push(url);
+      if (url === '/api/fleet/seats') {
+        const payload = seatsMode === 'available'
+          ? {driver_roster: 'available', external_roster: 'available', seats: [{seat: 'cto'}, {seat: 'driver'}]}
+          : {driver_roster: 'unavailable', external_roster: 'unavailable', seats: []};
+        return Promise.resolve({ok: true, status: 200, text: async () => JSON.stringify(payload), headers: {get: () => null}});
+      }
+      if (url === '/api/comms/v1/metrics') {
+        const payload = {
+          source: 'authority', store: {reachable: true},
+          deliveries: {queued: 1},
+          failure_windows: {'24h': {dead_letters: {total: metricsDeadCount}, failed_deliveries: {total: 2}, failed_jobs: {total: 0}}},
+        };
+        return Promise.resolve({ok: true, status: 200, text: async () => JSON.stringify(payload), headers: {get: () => null}});
+      }
+      if (url.startsWith('/api/fleet/deliveries') && deliveriesStatus === 422) {
+        return Promise.resolve({ok: false, status: 422, text: async () => JSON.stringify({detail: 'unknown seat'}), headers: {get: () => null}});
+      }
       if (!url.startsWith('/api/fleet/messages/')) return fetchPanel(url);
       assert.equal(options.cache, 'no-store');
       return new Promise(resolve => pending.set(url, resolve));
@@ -857,6 +913,30 @@ assert.match(M.prChips(unknownTotalPrs).join(''), /<b>1<\/b> open PRs observed Â
       listeners.get('keydown').forEach(listener => listener({key: 'Escape'}));
       assert.equal(document.getElementById('message-reader').hidden, true);
       assert.deepEqual(focusedTargets, [`row:${firstId}`], 'F6: closing the reader falls back cleanly when original row disappeared');
+
+      // PR1569-F6: Comms header shortcut chips keep keyboard focus across 30s refreshes (both unchanged and changed counts),
+      // distinguishing both #health shortcuts via stable data-chip-key.
+      assert.equal(chipNodes.length, 3);
+      assert.deepEqual(chipNodes.map(n => n.dataset.chipKey), ['queued', 'dead-letters', 'failed']);
+      chipNodes[2].focus();
+      focusedTargets.length = 0;
+      await timers[0]();
+      assert.equal(document.activeElement, chipNodes[2], 'F6: unchanged chip refresh keeps mounted #health chip focused');
+      assert.deepEqual(focusedTargets, [], 'F6: unchanged chip HTML skips DOM replacement');
+      metricsDeadCount = 3;
+      await timers[0]();
+      assert.equal(document.activeElement.dataset.chipKey, 'failed', 'F6: changed chip refresh restores focus to exact #health shortcut');
+      assert.deepEqual(focusedTargets, ['chip:failed']);
+
+      // F1: Seat filter recovers on refresh after initial HTTP 200 unavailable roster AND loads even when deliveries returns 422.
+      assert.deepEqual(filterSeatEl.options.map(o => o.value), [''], 'F1: unavailable roster keeps only All seats');
+      seatsMode = 'available';
+      deliveriesStatus = 422;
+      await timers[0]();
+      await new Promise(resolve => setImmediate(resolve));
+      assert.deepEqual(filterSeatEl.options.map(o => o.value), ['', 'cto', 'driver'],
+        'F1: seat filter refreshes after roster recovery even when /api/fleet/deliveries returns 422');
+      deliveriesStatus = 200;
     } finally {
       globalThis.setInterval = originalInterval;
       globalThis.fetch = fetchPanel;
