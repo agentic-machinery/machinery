@@ -977,8 +977,9 @@ _PAGE_SENTENCES = frozenset({
     "a fix made in a different file counts as dismissed. Only verdicts the recorder published "
     "count; a blocking reply with no recorded publication (an unpublished run, or one from "
     "before the publication ledger and not imported) is of unknown publication and left out. "
-    "Real precision uses the author's recorded label instead (fixed over fixed, wrong and "
-    "invented); a label is the author's word unless a later review contested it.",
+    "Real precision uses the author's recorded label instead (fixed over fixed, wrong, "
+    "invented and no live trigger); a label is the author's word unless a later review "
+    "contested it.",
     "No planted-defect result is recorded in the summary rows.",
     "This snapshot does not include task ids.",
     "An allowance reading is the whole pool, not the one model. Overlapping tasks are charged "
@@ -2145,7 +2146,7 @@ def test_finding_outcome_labels_count_per_reviewer_and_a_contest_holds_the_label
 
     snapshot = stats.collect(batch_state, tmp_path, NOW, landing=stats.Landing())
     assert snapshot["coverage"]["finding_outcomes"] == {"lines": 21, "unattributed_labels": 1, "unbound_contests": 1}
-    zero = dict.fromkeys(("fixed", "wrong", "invented", "out_of_scope", "duplicate", "contested"), 0)
+    zero = dict.fromkeys(("fixed", "wrong", "invented", "no_live_trigger", "out_of_scope", "duplicate", "contested"), 0)
     full_7d = {row["model"]: row for row in snapshot["windows"]["7d"]["reviewer_accuracy"]["labels"]}
     assert set(full_7d) == {"claude-opus-5-5", "gpt-6.2-sol", "grok-4.7", "custom-reviewer"}
     assert full_7d["claude-opus-5-5"]["labels"] == {
@@ -2172,6 +2173,127 @@ def test_finding_outcome_labels_count_per_reviewer_and_a_contest_holds_the_label
     assert "reviewer_miss_proxy" not in snapshot["page_windows"]["30d"]
 
 
+def test_no_live_trigger_counts_in_precision_denominator_not_numerator(tmp_path):
+    """Defect class: a finding whose trigger cannot occur on the real system either has no label (refused as wrong
+    shape), counts as a real error (in the numerator: 2/2), or leaves real precision untouched (outside the
+    denominator: 1/1). One fixed plus one no_live_trigger label must read 1/2 with the matching interval."""
+    batch_state, _ = _state(tmp_path)
+    assert _label(batch_state, "o1-review", 1, "F0", "fixed") == 1
+    assert _label(batch_state, "o1-review", 1, "F1", "no_live_trigger", "only main() calls it, after the guard") == 1
+    snapshot = stats.collect(batch_state, tmp_path, NOW, landing=stats.Landing())
+    [row] = snapshot["windows"]["7d"]["reviewer_accuracy"]["labels"]
+    assert row["labels"]["fixed"] == 1 and row["labels"]["no_live_trigger"] == 1
+    assert row["real_precision"] == stats._rate(1, 2)
+    assert row["real_precision_ci"] == stats._wilson(1, 2)
+
+
+# tag v0.1.84. The changed-test job fetches full history, so this commit is in the checkout without the tag ref.
+_PRIOR_RELEASE_ROWS = "0152786d592213efee20cd453e9a147f62398253"
+
+
+def _prior_release_rows(tmp_path: Path):
+    """The finding-outcome writer from release 0.1.84, with that release's label vocabulary."""
+    import importlib.util
+
+    root = Path(__file__).parents[2]
+    source = subprocess.check_output(
+        ["git", "show", f"{_PRIOR_RELEASE_ROWS}:lu_machinery/api/model_stats_rows.py"], cwd=root, timeout=30)
+    blob = tmp_path / "model_stats_rows_0184.py"
+    blob.write_bytes(source)
+    spec = importlib.util.spec_from_file_location("model_stats_rows_0184", blob)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    module.FINDING_OUTCOME_LABELS = {
+        "fixed": "a real error; the author changed the code",
+        "wrong": "the code was already correct",
+        "invented": "the finding cites a file, line, symbol or behaviour that does not exist",
+        "out_of_scope": "outside the change's frozen obligation",
+        "duplicate": "another finding of the same review names the same defect",
+    }
+    return module
+
+
+def _prior_release_fixed(old, batch_state: Path, finding_id: str, *, head: str, started_at: str) -> None:
+    """What release 0.1.84 does with a ``fixed`` label for one run."""
+    old.record_finding_outcomes(batch_state, [old.finding_outcome(
+        kind="label", task_id="o1-review", repository="learn-ukrainian/machinery", pr=1,
+        finding_id=finding_id, head=head, started_at=started_at, reviewer_model="claude-opus-5-5",
+        label="fixed", recorded_by="author-task", recorded_at=_at(0.25))])
+
+
+def test_rollback_and_roll_forward_keep_one_label_for_one_finding(tmp_path):
+    """Defect class: rolling a finding-outcome label back to a writer whose vocabulary does not include it appends a
+    second label for that finding, and rolling forward shows the other label.
+
+    Release 0.1.84 admits only ``fixed``, ``wrong``, ``invented``, ``out_of_scope`` and ``duplicate``. A
+    ``no_live_trigger`` line is invisible to that writer's conflict check. An occupying line that is not bound to
+    the run shares one legacy key with every earlier line for that finding, so a later run of the same task and
+    finding appends ``fixed`` and that reader attributes it.
+    """
+    prior = frozenset({"fixed", "wrong", "invented", "out_of_scope", "duplicate"})
+    batch_state, _ = _state(tmp_path)
+    assert _label(batch_state, "o1-review", 1, "F1", "no_live_trigger",
+                  "only main() calls it, after the guard") == 1
+    path = batch_state / rows.ROWS_DIR / rows.OUTCOMES_FILE
+    # An earlier unbound compatibility row, and an earlier legacy label, both recorded before a later run of the
+    # same task and finding. The later run has to keep its own label when rolled back.
+    later = _at(0.5)
+    earlier = {
+        "schema": rows.OUTCOME_SCHEMA, "kind": "label", "task_id": "o1-review",
+        "repository": "learn-ukrainian/machinery", "pr": 1, "recorded_by": "author-task", "recorded_at": _at(3),
+    }
+    planted = [
+        {**earlier, "finding_id": "F2", "label": "duplicate",
+         "evidence_sha256": hashlib.sha256(b"prior-release finding-outcome hold").hexdigest()},
+        {**earlier, "finding_id": "F3", "label": "fixed", "evidence_sha256": None},
+    ]
+    with path.open("ab") as stream:
+        stream.write(b"".join(json.dumps(line).encode() + b"\n" for line in planted))
+    evidence = "only main() calls it, after the guard"
+    assert _label(batch_state, "o1-review", 1, "F2", "no_live_trigger", evidence,
+                  head=_HEAD_B, started_at=later, recorded_at=_at(0.25)) == 1
+    assert _label(batch_state, "o1-review", 1, "F3", "no_live_trigger", evidence,
+                  head=_HEAD_B, started_at=later, recorded_at=_at(0.25)) == 1
+    old = _prior_release_rows(tmp_path)
+    for finding_id in ("F1", "F2", "F3"):
+        head, started = (_HEAD_A, _START_A) if finding_id == "F1" else (_HEAD_B, later)
+        with pytest.raises(old.OutcomeConflict):
+            _prior_release_fixed(old, batch_state, finding_id, head=head, started_at=started)
+    assert [json.loads(line)["finding_id"] for line in path.read_bytes().splitlines()
+            if json.loads(line).get("label") == "fixed" and json.loads(line).get("head") == _HEAD_B] == []
+    finding = [json.loads(line) for line in path.read_bytes().splitlines()
+               if json.loads(line).get("finding_id") == "F1"]
+    visible = [line for line in finding if line.get("kind") == "label" and line.get("label") in prior
+               and line.get("head") == _HEAD_A and line.get("started_at") == _START_A
+               and "reviewer_model" not in line]
+    assert len(visible) == 1
+    assert rows.timestamp(visible[0]["recorded_at"]) >= rows.timestamp(_START_A)
+    assert visible[0]["label"] != "fixed"
+    with pytest.raises(rows.OutcomeConflict):
+        _label(batch_state, "o1-review", 1, "F1", "fixed")
+    finding = [json.loads(line) for line in path.read_bytes().splitlines()
+               if json.loads(line).get("finding_id") == "F1"]
+    assert [line["label"] for line in finding if line.get("label") == "fixed"] == []
+    repo = rows.repository_identity("learn-ukrainian/machinery")
+    key = ("o1-review", repo, 1, "F1", _HEAD_A, rows.timestamp(_START_A))
+    labels, _, counts = rows.read_finding_outcomes(batch_state)
+    assert labels[key][1] == "no_live_trigger"
+    later_key = ("o1-review", repo, 1, "F2", _HEAD_B, rows.timestamp(later))
+    assert labels[later_key][1] == "no_live_trigger"
+    assert labels[("o1-review", repo, 1, "F3", _HEAD_B, rows.timestamp(later))][1] == "no_live_trigger"
+    assert counts.get("conflicting_labels", 0) == 0
+    # A second run-bound label, the line 0.1.84 appends when it cannot see the new one. Roll-forward keeps the
+    # original label and counts the extra line instead of switching to it.
+    original = next(line for line in finding if line.get("label") == "no_live_trigger")
+    damaged = {**original, "label": "fixed", "evidence_sha256": None}
+    with path.open("ab") as stream:
+        stream.write(json.dumps(damaged).encode() + b"\n")
+    labels, _, counts = rows.read_finding_outcomes(batch_state)
+    assert labels[key][1] == "no_live_trigger"
+    assert counts["conflicting_labels"] == 1
+
+
 def test_finding_outcome_ledger_keeps_one_label_per_finding_and_skips_damaged_lines(tmp_path):
     """Defect class: a relabel, a same-label retry refused for its new evidence, a repeated contest, a label or
     contest without required run binding (head and started_at) or reviewer_model, a half-bound line accepted, a
@@ -2192,7 +2314,7 @@ def test_finding_outcome_ledger_keeps_one_label_per_finding_and_skips_damaged_li
     assert _label(batch_state, "o1-review", 1, "F0", "fixed", repository="agentic-machinery/machinery") == 0
     assert _label(batch_state, "o1-review", 1, "F0", "wrong", "already correct", repository="other/repo") == 1
     # Every label but fixed needs its evidence; every new line needs head + started_at; labels need reviewer_model.
-    for label in ("wrong", "invented", "out_of_scope", "duplicate"):
+    for label in ("wrong", "invented", "no_live_trigger", "out_of_scope", "duplicate"):
         with pytest.raises(ValueError, match="wrong shape"):
             _label(batch_state, "o1-review", 1, "F1", label)
     for bad_model in (None, "", "unknown", "has space", "../escape"):
