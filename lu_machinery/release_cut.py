@@ -42,7 +42,14 @@ from typing import Literal
 from lu_machinery import host_context
 from lu_machinery.common import json_depth
 from lu_machinery.common.git_context import sanitized_git_env
-from lu_machinery.common.repo_root import ENV_ALIASES, MACHINERY_ENV_VARS, PRIMARY_ROOT_ENV, PRODUCT_ROOT_ENV
+from lu_machinery.common.repo_root import (
+    ENV_ALIASES,
+    INTERPRETER_ENV,
+    LU_INTERPRETER_ENV,
+    MACHINERY_ENV_VARS,
+    PRIMARY_ROOT_ENV,
+    PRODUCT_ROOT_ENV,
+)
 
 # The post-release PR's title. A range holding only these PRs is unchanged.
 BUMP_TITLE = "chore(release): record {released} and start {next}"
@@ -673,6 +680,8 @@ class Cut:
     machinery_milestone: str | None = None
     product_milestone: str | None = None
     publisher_python: Path | None = None
+    # The bound machinery runtime (``runtime.python``); ``None`` without a host binding.
+    runtime_python: Path | None = None
     _consumer_lock: Path | None = field(default=None, init=False)
 
     # Plumbing
@@ -725,7 +734,12 @@ class Cut:
         env = {key: value for key, value in sanitized_git_env(strip_config_injection=True).items()
                if key not in {"PYTHONPATH", "PYTHONHOME"}}
         extra.setdefault(PRIMARY_ROOT_ENV, str(self.primary))
-        if not env.get(PRODUCT_ROOT_ENV):
+        if self.runtime_python is not None:
+            # A host binding asserts the interpreter is the machinery runtime and the product root is its own
+            # product checkout: an inherited product interpreter or the colocated default refuses every child.
+            env.pop(INTERPRETER_ENV, None)
+            env[LU_INTERPRETER_ENV] = str(self.runtime_python)
+        elif not env.get(PRODUCT_ROOT_ENV):
             env[PRODUCT_ROOT_ENV] = str(self.primary)  # Legacy colocated cut.
         for setting, alias in ENV_ALIASES.items():
             if setting in extra:
@@ -800,7 +814,8 @@ class Cut:
             return
         # The plane root resolves from cwd; the work directory is not a checkout, so anchor at the primary.
         self.run(
-            [self.host_python, "-I", "-m", "lu_machinery.fleet_comms", "channel", "publish", "cto", "-",
+            [self.runtime_python or self.host_python, "-I", "-m", "lu_machinery.fleet_comms", "channel", "publish",
+             "cto", "-",
              "--sender", "release-cut", "--source", "release", "--recipient", ALERT_RECIPIENT,
              "--idempotency-key", key],
             cwd=self.primary, stdin=body.encode(), timeout=120,
@@ -1572,7 +1587,8 @@ class Cut:
     def _recovery_env_prefix(self) -> str:
         from lu_machinery.common.git_credentials import SELECTOR_ENV
 
-        env = self.env(LU_PYTHON=str(self.host_python.absolute()))
+        # Under a host binding env() already names the runtime; the resumed cut reads the product from the binding.
+        env = self.env() if self.runtime_python is not None else self.env(LU_PYTHON=str(self.host_python.absolute()))
         context = (PRODUCT_ROOT_ENV, SELECTOR_ENV, "LU_TASKS_DIR", *MACHINERY_ENV_VARS)
         argv = ["env"]
         for key in context:
@@ -2004,6 +2020,23 @@ def _release_remote(flag: str, remote: str | None, row: Mapping[str, object]) ->
     raise CutError(f"{flag} is neither a local path nor an origin of its repository's active GitHub slug")
 
 
+def _bound_interpreters() -> tuple[Path, Path] | None:
+    """``(products[default_product].python, runtime.python)`` from a validated host binding.
+
+    ``None`` only when no binding exists and none is named; any other binding failure refuses the cut, so a
+    bound host never falls back to ``project_interpreter()`` and its interpreter variables.
+    """
+    try:
+        context = host_context.load_host_context(role="all")
+    except host_context.HostContextError as error:
+        if error.code == "missing_context" and host_context.CONTEXT_ENV not in os.environ:
+            return None
+        raise CutError(f"host context invalid ({error.code}): {error}") from error
+    if not isinstance(context, host_context.HostContext):
+        raise CutError("host context requires a full host binding")
+    return context.products[context.default_product].python, context.runtime.python
+
+
 def _run(args: argparse.Namespace) -> int:
     from lu_machinery.common.git_credentials import SelectorError, active_slug
     from lu_machinery.common.repo_root import primary_root, project_interpreter
@@ -2023,6 +2056,12 @@ def _run(args: argparse.Namespace) -> int:
     except (SelectorError, ValueError, OSError) as exc:
         print(f"release cut refused: fleet repository selector: {exc}", file=sys.stderr)
         return 1
+    try:
+        bound = _bound_interpreters()
+    except CutError as exc:
+        print(f"release cut refused: {exc}", file=sys.stderr)
+        return 1
+    host_python, runtime_python = bound if bound is not None else (project_interpreter(), None)
     try:
         machinery_milestone = configured_release_milestone(machinery, repo_label=f"machinery ({machinery_repo})")
         product_milestone = configured_release_milestone(product, repo_label=f"product ({product_repo})")
@@ -2044,8 +2083,8 @@ def _run(args: argparse.Namespace) -> int:
     cut = Cut(work=work, dry_run=dry_run,
               machinery_remote=machinery_override or f"https://github.com/{machinery_repo}.git",
               product_remote=product_override or f"https://github.com/{product_repo}.git",
-              machinery_repo=machinery_repo, product_repo=product_repo, host_python=project_interpreter(),
-              primary=primary_root(), alert=not args.no_alert, x_agent=args.x_agent,
+              machinery_repo=machinery_repo, product_repo=product_repo, host_python=host_python,
+              runtime_python=runtime_python, primary=primary_root(), alert=not args.no_alert, x_agent=args.x_agent,
               machinery_milestone=machinery_milestone, product_milestone=product_milestone)
     name, email = (cut.git(machinery_checkout, "config", "--get", key, check=False) for key in ("user.name", "user.email"))
     if name and email:

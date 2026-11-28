@@ -463,6 +463,41 @@ SESSION_IDENTITY_ENV_VARS = (
 )
 
 
+# Every name lu_machinery.host_context._assert_legacy compares with the host
+# binding (plus LU_PYTHON's alias pair). A bound host's worker session carries
+# them; CI's ``env -i`` run has none. pytest_configure clears them per session.
+HOST_BINDING_ENV_VARS = (
+    "LU_STATE_ROOT",
+    "LEARN_UKRAINIAN_STATE_ROOT",
+    "LU_TASKS_DIR",
+    "LEARN_UKRAINIAN_BATCH_STATE_DIR",
+    "FLEET_COMMS_ROOT",
+    "LEARN_UKRAINIAN_OWNERSHIP_LEDGER",
+    "LU_GITHUB_CACHE_DIR",
+    "LU_GITHUB_SLUG",
+    "LEARN_UKRAINIAN_GITHUB_SLUG",
+    "LU_PRIMARY_REPO_ROOT",
+    "LEARN_UKRAINIAN_PRIMARY_REPO_ROOT",
+    "LU_PRODUCT_ROOT",
+    "LEARN_UK_REPO_ROOT",
+    "LU_PYTHON",
+    "LEARN_UKRAINIAN_PYTHON",
+    "LEARN_UKRAINIAN_INFRA_PRIVATE_ROOT",
+    "LU_FLEET_REPO_SELECTOR_FILE",
+    "MONITOR_PROJECT_STATE_URL",
+    "LU_PROFILE_PATH",
+    "LU_MONITOR_LOOPBACK",
+    "MONITOR_API_BASE_URL",
+    "MONITOR_API_URL",
+    "AB_MONITOR_URL",
+    "MONITOR_API_URLS",
+    "AB_MONITOR_URLS",
+    "MONITOR_BASE_URLS",
+    "DELEGATE_MONITOR_API",
+    "LU_REPOS_ROOT",
+)
+
+
 _FUNCTOOLS_CACHE_TYPE = type(functools.lru_cache(maxsize=1)(lambda: None))
 
 
@@ -3046,6 +3081,14 @@ def pytest_configure(config: pytest.Config) -> None:
     config.add_cleanup(host_binding_dir.cleanup)
     fleet_env.delenv(host_context.CONTEXT_ENV, raising=False)
     fleet_env.setattr(host_context, "DEFAULT_PATH", Path(host_binding_dir.name) / "host.v1.json")
+    # CI runs pytest under ``env -i`` with only the test interpreter set. A
+    # dispatch worker inherits the host binding's interpreter, repository,
+    # state, selector and Monitor names instead; tests that set only one name
+    # of an alias pair then refuse as "both set to different values". Clear
+    # them for the whole session and set the interpreter as CI does.
+    for name in HOST_BINDING_ENV_VARS:
+        fleet_env.delenv(name, raising=False)
+    fleet_env.setenv("LEARN_UKRAINIAN_PYTHON", sys.executable)
     fleet_env.setenv("FLEET_COMMS_ROOT", str(config._fleet_comms_root))
     fleet_env.setenv("LEARN_UKRAINIAN_PRIMARY_REPO_ROOT", str(primary))
     fleet_env.setenv("LU_STATE_ROOT", str(primary))
