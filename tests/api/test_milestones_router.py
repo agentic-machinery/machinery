@@ -733,6 +733,45 @@ assert.match(emptyExpiredChips, /<b>unknown<\\/b> open \\(stale\\)/);
 const emptyExpiredHtml = renderMilestones(emptyData, okPlanning, now + 1000, null, emptyReading);
 assert.doesNotMatch(emptyExpiredHtml, /No open milestones\\./);
 assert.match(emptyExpiredHtml, /Open milestones unknown: the milestone snapshot is stale/);
+// Planning zeros are proven only by complete, current milestone coverage: fresh and complete they
+// stay 0; expired, missing or failed coverage makes them unknown.
+assert.match(emptyFreshChips, /<b>0<\\/b> blocked<\\/a>/);
+assert.match(emptyFreshChips, /<b>0<\\/b> ready now<\\/a>/);
+assert.match(emptyExpiredChips, /<b>unknown<\\/b> blocked \\(incomplete\\)/);
+assert.match(emptyExpiredChips, /<b>unknown<\\/b> ready now \\(incomplete\\)/);
+for (const absent of [null, {{status: "pending", repositories: []}}]) {{
+  const absentChips = renderMilestoneChips({{milestones: absent, planning: okPlanning}}, now);
+  assert.match(absentChips, /<b>unknown<\\/b> blocked \\(incomplete\\)/);
+  assert.match(absentChips, /<b>unknown<\\/b> ready now \\(incomplete\\)/);
+}}
+const failedRepoChips = renderMilestoneChips({{milestones: {{...emptyData, status: "partial", repositories: [
+  ...emptyData.repositories, {{repository: "fixture/broken", private: false, status: "unknown", stale: false, milestones: []}},
+]}}, planning: okPlanning}}, now);
+assert.match(failedRepoChips, /<b>unknown<\\/b> blocked \\(incomplete\\)/);
+// A listed open issue beside a cached zero count keeps the gap after expiry (no flip to 0).
+const raceData = JSON.parse(JSON.stringify(data));
+raceData.repositories[0].milestones[0].open_issues = 0;
+const raceReading = {{data: raceData, ageHeader: "418", boundHeader: "420", state: "fresh", receivedAt: now}};
+const raceFresh = renderMilestoneChips({{milestones: raceData, planning: okPlanning}}, now, null, raceReading);
+assert.match(raceFresh, /<b>unknown<\\/b> blocked \\(incomplete\\)/);
+const raceExpired = renderMilestoneChips({{milestones: raceData, planning: okPlanning}}, now + 5000, null, raceReading);
+assert.match(raceExpired, /<b>unknown<\\/b> blocked \\(incomplete\\)/);
+assert.match(raceExpired, /<b>unknown<\\/b> ready now \\(incomplete\\)/);
+// The contradicted zero count itself reads unknown in the Open and Overdue cells.
+const raceOverdue = JSON.parse(JSON.stringify(raceData));
+raceOverdue.repositories[0].milestones[0].due_on = "2030-01-05T00:00:00Z";
+const raceCells = summaryCellsFor(renderMilestones(raceOverdue, okPlanning, now), "v0.4.0");
+assert.equal(raceCells[2], "unknown");
+assert.equal(raceCells[4], "unknown");
+// An expired card says its empty list and counts are last known.
+const emptyCardData = JSON.parse(JSON.stringify(data));
+emptyCardData.repositories[0].milestones[0].issues = [];
+emptyCardData.repositories[0].milestones[0].open_issues = 0;
+const emptyCardReading = {{data: emptyCardData, ageHeader: "60", boundHeader: "420", state: "fresh", receivedAt: now}};
+const emptyCardExpired = renderMilestones(emptyCardData, okPlanning, now + 400000, null, emptyCardReading);
+assert.match(emptyCardExpired, /No open issues in the last known snapshot\\./);
+assert.match(emptyCardExpired, /8 of 8 closed \\(last known\\)/);
+assert.doesNotMatch(emptyCardExpired, /<p class="muted">No open issues\\.<\\/p>/);
 
 // A live Planning match never stays under expired membership: fresh, the blocked issue sits in its
 // milestone; expired, the card and the Blocked cell say unknown and the issue joins membership unknown.

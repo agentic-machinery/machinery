@@ -359,7 +359,10 @@ function collectMilestones(data, globalPlan, now, milestoneReading = null) {
       }
       const rawIssues = !isPrivate && Array.isArray(item.issues) ? item.issues : [];
       const issuesStatus = isPrivate ? "withheld" : String(item.issues_status || "unknown");
-      const openCount = isNonNegInt(item.open_issues) ? item.open_issues : null;
+      // GitHub's open count includes pull requests, so it is never below the listed open issues;
+      // a count its own list contradicts (counts and lists are read separately) is unknown.
+      const listedOpen = rawIssues.filter(issue => issue && typeof issue === "object").length;
+      const openCount = isNonNegInt(item.open_issues) && item.open_issues >= listedOpen ? item.open_issues : null;
       const closedCount = isNonNegInt(item.closed_issues) ? item.closed_issues : null;
 
       const blockedIssues = [];
@@ -438,7 +441,6 @@ function collectMilestones(data, globalPlan, now, milestoneReading = null) {
         blockedCell,
         overdueCell,
         blockedCountKnown,
-        issuesIncomplete: incompleteIssues,
         membershipExpired: expired,
         plan,
         item,
@@ -518,7 +520,7 @@ function renderMilestoneCard(entry) {
     `<h3>${escapeHtml(entry.titlePlain)} <span class="muted">· ${escapeHtml(entry.repoLabel)} · </span><span${dueClass}>${escapeHtml(entry.due.detail)}</span></h3>`,
     closedLink,
     `</div>`,
-    `<p class="milestone-counts">${escapeHtml(closedCountText(entry.openCount, entry.closedCount))}</p>`,
+    `<p class="milestone-counts">${escapeHtml(closedCountText(entry.openCount, entry.closedCount))}${entry.membershipExpired ? " (last known)" : ""}</p>`,
   ];
   if (entry.description) {
     parts.push(`<p class="muted">${escapeHtml(entry.description)}</p>`);
@@ -588,7 +590,9 @@ function renderMilestoneCard(entry) {
       }
     }
   } else if (entry.issuesStatus === "ok" && !entry.blockedIssues.length) {
-    parts.push('<p class="muted">No open issues.</p>');
+    parts.push(entry.membershipExpired
+      ? '<p class="warn">No open issues in the last known snapshot.</p>'
+      : '<p class="muted">No open issues.</p>');
   }
 
   parts.push("</article>");
@@ -816,11 +820,14 @@ function renderMilestoneChips(latest, now = Date.now(), planningReading = null, 
   const plan = analyzePlanning(latest?.planning, planningReading, now);
   const hasMilestones = Boolean(data && data.status !== "pending");
   const collected = hasMilestones ? collectMilestones(data, plan, now, milestoneReading) : null;
-  // The same per-milestone gaps the cards report: open issues without a planning verdict, an
-  // issue list that is incomplete, or expired membership, while the milestone has open issues.
-  const milestoneGap = Boolean(collected) && collected.entries.some(entry => !entry.isPrivate && (
-    entry.unaccountedCount > 0 || entry.issuesIncomplete
-    || (entry.membershipExpired && (entry.openCount === null || entry.openCount > 0))));
+  // A Planning zero is proven only where the milestone cross-check is complete: every public
+  // repository fresh, readable and fully listed (the same set the outside-milestones list uses),
+  // and every listed open issue has a Planning verdict. Missing or expired milestone data is a gap.
+  const complete = collected ? completeMilestoneRepos(data, milestoneReading, now) : null;
+  const milestoneGap = !collected
+    || collected.repos.some(repo => repo && !repo.private
+      && (typeof repo.repository !== "string" || !complete.has(repo.repository.toLowerCase())))
+    || collected.entries.some(entry => !entry.isPrivate && entry.unaccountedCount > 0);
   const depsUnknown = isNonNegInt(plan.coverage.dependency_unknown) && plan.coverage.dependency_unknown > 0;
   const planGap = plan.status === "partial" ? "partial" : (milestoneGap || depsUnknown) ? "incomplete" : null;
   const out = [];
