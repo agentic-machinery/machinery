@@ -30,7 +30,7 @@ from lu_machinery.api import planning
 from lu_machinery.api.delegate_router import active_snapshot
 from lu_machinery.api.monitor_context import fixture_context, get_ctx
 from lu_machinery.api.state_helpers import cache_get_or_compute, cache_invalidate, ctx_scoped_ttl_key
-from lu_machinery.common import git_credentials
+from lu_machinery.common import git_credentials, github_client
 from lu_machinery.common.repo_root import machinery_path
 from lu_machinery.dispatcher import store, worker
 from lu_machinery.github_rest_cache import RestPage, RestResult
@@ -2609,3 +2609,345 @@ def test_publication_ledger_writes_only_well_formed_lines_and_trusts_no_damaged_
     # Leave no reading of the scratch catalog to later tests.
     monkeypatch.undo()
     rows.refresh_readings()
+
+
+# Report-only Ruff check-attempt statistics (#1615): classification, the attempt ledger, settlement attribution and
+# the forward-only collector against a fake GitHub. Approved by claude-cto for issue #1615 (AC-01 to AC-14).
+RUFF_REPO = "org/repo"
+RUFF_REPO_ID = 77
+PILOT = NOW - timedelta(days=2)
+_SETUP_STEPS = ("Set up job", "Run actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+                "Run ./.github/actions/uv-python", "Install Ruff (uv.lock lint group)")
+
+
+def _ruff_steps(*, setup: str = "success", lint: str = "success", guards: tuple[str, ...] = ("success",) * 3,
+                truncated: bool = False) -> list[dict]:
+    """The CI Gate ``Ruff`` job's steps (.github/workflows/ci-gate.yml); a failed setup step skips every later one."""
+    names = [*_SETUP_STEPS, rows.RUFF_STEP, *rows.GUARD_STEPS]
+    conclusions = (["success", setup] + ["skipped"] * 6 if setup != "success"
+                   else ["success"] * 4 + [lint, *guards])
+    steps = [{"number": index, "name": name, "status": "completed", "conclusion": conclusion}
+             for index, (name, conclusion) in enumerate(zip(names, conclusions, strict=True), start=1)]
+    if truncated:
+        steps[-1] = {**steps[-1], "status": "in_progress", "conclusion": None}
+    return steps
+
+
+def _ruff_receipt(**fields) -> dict:
+    receipt = {
+        "schema": rows.RUFF_SCHEMA, "repository": RUFF_REPO, "repository_id": RUFF_REPO_ID, "pr": 7,
+        "measured_head_sha": "a" * 40, "check_name": "Ruff", "check_run_id": 9001, "run_id": 501, "run_attempt": 1,
+        "started_at": (NOW - timedelta(hours=3)).isoformat(), "completed_at": (NOW - timedelta(hours=3)).isoformat(),
+        "status": "completed", "conclusion": "success", "steps": _ruff_steps(), "findings": None,
+        "base_sha": "0" * 40, "tested_sha": None, "head_commits": ["1" * 40], "diff_size": 12,
+        "check_version": "ruff-attempt.v1:ci-gate.yml", "observed_at": (NOW - timedelta(hours=2)).isoformat(),
+    }
+    receipt.update(fields)
+    return receipt
+
+
+def _failed_lint(*origins: str, **fields) -> dict:
+    return _ruff_receipt(conclusion="failure", steps=_ruff_steps(lint="failure", guards=("skipped",) * 3),
+                         findings=[{"code": "F401", "origin": origin} for origin in origins], **fields)
+
+
+@pytest.mark.parametrize(("receipt", "bucket"), [
+    # AC-03: a proven pre-Ruff setup failure is known not-executed, even with no findings at all.
+    (_ruff_receipt(conclusion="failure", steps=_ruff_steps(setup="failure")), "infrastructure_failure"),
+    (_ruff_receipt(steps=None), "missing_or_reused_evidence"),
+    (_ruff_receipt(steps=_ruff_steps(truncated=True)), "missing_or_reused_evidence"),
+    (_ruff_receipt(conclusion="skipped", steps=[]), "missing_or_reused_evidence"),
+    # AC-04: the lint succeeded and a guard failed: a guard failure only.
+    *((_ruff_receipt(conclusion="failure", steps=_ruff_steps(guards=tuple(
+        "failure" if index == failed else "success" if index < failed else "skipped" for index in range(3)))),
+       "guard_failure") for failed in range(3)),
+    # AC-06: a pass needs positive evidence for the lint and every guard.
+    (_ruff_receipt(), "ruff_pass"),
+    (_ruff_receipt(steps=_ruff_steps(guards=("success", "success", "skipped"))), "missing_or_reused_evidence"),
+    (_failed_lint("pr", "unresolved"), "ruff_code_failure"),
+    (_failed_lint("base", "base"), "base_only_ruff_failure"),
+    # AC-05 / A1: complete findings with unresolved attribution are ambiguous, never missing evidence.
+    (_failed_lint("base", "unresolved"), "ambiguous_base_or_merge_context"),
+    (_failed_lint(), "missing_or_reused_evidence"),
+    (_ruff_receipt(conclusion="failure", steps=_ruff_steps(lint="failure", guards=("skipped",) * 3)),
+     "missing_or_reused_evidence"),
+    (_ruff_receipt(conclusion="cancelled", steps=None), "cancelled_or_superseded"),
+], ids=["setup-failure", "no-steps", "truncated-steps", "main-proof-reuse", "guard-json", "guard-paths",
+        "guard-changelog", "pass", "guard-skipped", "pr-finding", "base-only", "ambiguous", "no-findings",
+        "findings-unread", "cancelled"])
+def test_ruff_attempts_take_the_first_bucket_their_own_evidence_proves(receipt, bucket):
+    """Defect class: an attempt counted in a Ruff outcome its evidence does not prove (a pass without step proof, a
+    guard failure as a pass, a setup failure or unresolved base attribution masked as missing evidence)."""
+    assert rows._ruff_ok(receipt)
+    assert rows.classify_ruff_attempt(receipt) == bucket
+    assert rows.ruff_complete(receipt) is (bucket != "missing_or_reused_evidence")
+
+
+@pytest.mark.parametrize("complete", [
+    _ruff_receipt(), _ruff_receipt(conclusion="failure", steps=_ruff_steps(setup="failure")),
+    _failed_lint("base", "unresolved"),
+], ids=["pass", "checkout-failure", "ambiguous"])
+def test_ruff_ledger_keeps_one_complete_observation_through_incomplete_complete_and_replay(tmp_path, complete):
+    """Defect class: a late base or tested SHA or a replayed incomplete receipt duplicating or downgrading a
+    complete attempt (AC-07, A1 replay fixture)."""
+    batch_state, _ = _state(tmp_path)
+    incomplete = {**complete, "base_sha": None, "steps": _ruff_steps(truncated=True), "findings": None,
+                  "observed_at": (NOW - timedelta(hours=3)).isoformat()}
+    late = {**complete, "base_sha": "9" * 40, "tested_sha": "8" * 40}
+    assert not rows.ruff_complete(incomplete) and rows.ruff_complete(late)
+    for batch, winner in (([incomplete], incomplete), ([late], late), ([incomplete, late], late),
+                          ([late, incomplete], late)):
+        rows.record_ruff_attempts(batch_state, batch)
+        attempts, counts = rows.read_ruff_attempts(batch_state)
+        assert (attempts, counts["attempts"]) == ([winner], 1)
+    assert len(rows.ruff_path(batch_state).read_bytes().splitlines()) == 2
+    assert rows.record_ruff_attempts(batch_state, [incomplete, late]) == 0
+    # A revisit that observed the same attempt again is no new observation either.
+    assert rows.record_ruff_attempts(batch_state, [{**late, "observed_at": NOW.isoformat()}]) == 0
+
+
+def _credited_row(tasks: Path, task_id: str, model: str, commits: list[str], **fields) -> None:
+    _record(tasks, task_id, **{
+        "resolved_model": model, "resolved_model_known": True, "repository": RUFF_REPO,
+        "run_nonce": hashlib.sha256(task_id.encode()).hexdigest()[:32], "credited_commits": commits,
+        "research_task_family": "bounded_implementation", **fields})
+
+
+def test_ruff_head_credit_needs_every_commit_in_one_models_settled_credited_sets(tmp_path):
+    """Defect class: a head credited to a model on anything but dispatcher-computed settlement sets bound to the
+    repository, writer task, run nonce and a runtime-observed model (AC-08 to AC-12): main imports, another
+    branch's commits, hook-only or trailer-only commits, takeover predecessors and copied trailers."""
+    batch_state, tasks = _state(tmp_path)
+    own, pred, other, imported, hook_only = "1" * 40, "2" * 40, "3" * 40, "4" * 40, "5" * 40
+    _credited_row(tasks, "writer-sol", "gpt-6.2-sol", [own])
+    _credited_row(tasks, "pred-sol", "gpt-6.2-sol", [pred])
+    _credited_row(tasks, "pred-opus", "claude-opus-5-5", [other])
+    # Settlement records missing one binding each never credit their commits.
+    _credited_row(tasks, "no-nonce", "gpt-6.2-sol", [imported], run_nonce=None)
+    _credited_row(tasks, "requested-only", "gpt-6.2-sol", [imported], resolved_model_known=False)
+    _credited_row(tasks, "no-repository", "gpt-6.2-sol", [imported], repository=None)
+    _record(tasks, "no-credited-set", resolved_model="gpt-6.2-sol", resolved_model_known=True, repository=RUFF_REPO,
+            run_nonce="f" * 32)
+    rows.backfill(tasks, batch_state)
+    stored, _ = rows.read_rows(batch_state)
+    assert {row["task_id"]: row["credited_commits"] for row in stored}["writer-sol"] == [own]
+    heads = {
+        9001: ([own], "model"), 9002: ([own, pred], "model"), 9003: ([own, other], "joint"),
+        9004: ([own, imported], "unknown"), 9005: ([own, hook_only], "unknown"), 9006: (None, "unknown"),
+    }
+    rows.record_ruff_attempts(batch_state, [
+        _failed_lint("pr", check_run_id=run, head_commits=commits) if run == 9003 else
+        _ruff_receipt(check_run_id=run, head_commits=commits) for run, (commits, _) in heads.items()])
+    (batch_state / "model-stats" / rows.RUFF_STATE_FILE).write_text(json.dumps({
+        "schema": rows.RUFF_STATE_SCHEMA, "repository": RUFF_REPO, "pilot_window_start": PILOT.isoformat(),
+        "watermark": None, "incomplete_intervals": [], "known_runs": {}}))
+    quality = stats.ruff_quality(batch_state, stored)
+    assert quality["attribution"] == {"model": 2, "joint": 1, "unknown": 3}
+    assert [(model["model"], model["attempts"], model["ruff_code_failure_rate"]) for model in quality["models"]] == [
+        ("gpt-6.2-sol", 2, {"numerator": 0, "denominator": 2})]
+    assert quality["joint"] == {"attempts": 1, "buckets": {**dict.fromkeys(rows.RUFF_BUCKETS, 0),
+                                                           "ruff_code_failure": 1}}
+    assert quality["unknown"]["attempts"] == 3 and quality["unknown"]["buckets"]["ruff_pass"] == 3
+    assert quality["denominator"] == 6 and quality["ruff_code_failure_rate"] == {"numerator": 0, "denominator": 2}
+
+
+def test_red_first_head_is_kept_beside_the_green_head_that_followed_it(tmp_path):
+    """Defect class: a PR's red first head overwritten as a pass by its later green head (AC-01)."""
+    batch_state, _ = _state(tmp_path)
+    rows.record_ruff_attempts(batch_state, [
+        _failed_lint("pr", measured_head_sha="a" * 40, check_run_id=9001),
+        _ruff_receipt(measured_head_sha="b" * 40, check_run_id=9101)])
+    (batch_state / "model-stats" / rows.RUFF_STATE_FILE).write_text(json.dumps({
+        "schema": rows.RUFF_STATE_SCHEMA, "repository": RUFF_REPO, "pilot_window_start": PILOT.isoformat(),
+        "watermark": None, "incomplete_intervals": [], "known_runs": {}}))
+    buckets = stats.ruff_quality(batch_state, [])["buckets"]
+    assert (buckets["ruff_code_failure"], buckets["ruff_pass"]) == (1, 1)
+
+
+_PATCH = "@@ -10,2 +10,3 @@\n context\n+import os\n context"
+
+
+@pytest.mark.parametrize(("annotation", "files", "base_files", "origin"), [
+    ({"path": "lu_machinery/x.py", "start_line": 11, "title": "ruff (F401)"}, [("lu_machinery/x.py", _PATCH)], [],
+     "pr"),
+    ({"path": "lu_machinery/y.py", "start_line": 3, "title": "Ruff (E501)"}, [("lu_machinery/x.py", _PATCH)], [],
+     "base"),
+    ({"path": "lu_machinery/y.py", "start_line": 3, "title": "ruff (E501)"}, [("lu_machinery/x.py", _PATCH)],
+     ["lu_machinery/y.py"], "base"),
+    ({"path": "lu_machinery/x.py", "start_line": 10, "title": "ruff (F401)"}, [("lu_machinery/x.py", _PATCH)], [],
+     "unresolved"),
+    # The base changed the file too: the merge tree's line numbers are not the pull request's.
+    ({"path": "lu_machinery/x.py", "start_line": 11, "title": "ruff (F401)"}, [("lu_machinery/x.py", _PATCH)],
+     ["lu_machinery/x.py"], "unresolved"),
+    ({"path": "lu_machinery/x.py", "start_line": 11, "title": "ruff (F401)"}, [("lu_machinery/x.py", _PATCH)],
+     None, "unresolved"),
+    ({"path": "lu_machinery/x.py", "start_line": 11, "title": "ruff (F401)"}, [("lu_machinery/x.py", _PATCH)],
+     [f"lu_machinery/f{index}.py" for index in range(300)], "unresolved"),
+    ({"path": "lu_machinery/y.py", "start_line": 3, "title": "ruff (E501)"},
+     [("lu_machinery/x.py", _PATCH), ("pyproject.toml", None)], [], "unresolved"),
+    ({"path": "lu_machinery/y.py", "start_line": 3, "title": "ruff (E501)"},
+     [(f"lu_machinery/f{index}.py", None) for index in range(300)], [], "unresolved"),
+    ({"path": "/home/runner/work/lu_machinery/y.py", "start_line": 3, "title": "ruff (E501)"},
+     [("lu_machinery/x.py", _PATCH)], [], "unresolved"),
+    ({"path": "lu_machinery/x.py", "start_line": 11, "title": "ruff (F401)"}, [("lu_machinery/x.py", None)], [],
+     "unresolved"),
+], ids=["added-line", "untouched-file", "untouched-file-base-changed", "unchanged-line", "both-changed",
+        "base-side-unread", "base-side-capped", "config-changed", "file-list-capped", "outside-tree", "no-patch"])
+def test_ruff_findings_are_attributed_to_the_pr_only_on_lines_it_added(annotation, files, base_files, origin):
+    """Defect class: a Ruff finding blamed on the pull request, or cleared as a base finding, without whole
+    comparisons that prove where it came from in the merge tree the job linted (AC-05, AC-06)."""
+    comparison = {"total_commits": 1, "commits": [{"sha": "1" * 40}],
+                  "files": [{"filename": name, "additions": 1, "deletions": 0, "patch": patch}
+                            for name, patch in files]}
+    base_side = None if base_files is None else {
+        "total_commits": 1, "commits": [{"sha": "2" * 40}],
+        "files": [{"filename": name, "additions": 1, "deletions": 0, "patch": None} for name in base_files]}
+    noise = {"path": ".github", "start_line": 66, "title": ""}  # the step's exit-code annotation, not a finding
+    assert rows.finding_origins([noise, annotation], comparison, base_side) == [
+        {"code": annotation["title"].split("(")[1].rstrip(")"), "origin": origin}]
+    assert rows.finding_origins([annotation], None, base_side)[0]["origin"] == "unresolved"
+
+
+def test_a_later_receipt_with_less_evidence_never_replaces_a_proved_outcome(tmp_path):
+    """Defect class: a later read of one attempt that lost its comparison (no head commits, unresolved findings)
+    outranking the receipt that proved a PR-introduced failure and its attribution (round 1 F1, AC-01, AC-07)."""
+    batch_state, _ = _state(tmp_path)
+    proved = _failed_lint("pr", observed_at=(NOW - timedelta(hours=3)).isoformat())
+    weaker = _failed_lint("unresolved", head_commits=None, observed_at=(NOW - timedelta(hours=1)).isoformat())
+    assert rows.classify_ruff_attempt(weaker) == "ambiguous_base_or_merge_context" and rows.ruff_complete(weaker)
+    for batch in ([proved, weaker], [weaker, proved]):
+        rows.record_ruff_attempts(batch_state, batch)
+        assert rows.read_ruff_attempts(batch_state)[0] == [proved]
+
+
+class _RuffGitHub:
+    """GitHub's REST answers for one repository's CI ``Ruff`` attempts; records every endpoint it served."""
+
+    def __init__(self, documents: dict[str, object]):
+        self.documents = documents
+        self.sent: list[str] = []
+
+    def __call__(self, method, endpoint, headers, body, timeout):
+        assert method == "GET" and body is None, endpoint
+        self.sent.append(endpoint)
+        parts = urlsplit(endpoint)
+        key = parts.path.removeprefix("/")
+        query = parse_qs(parts.query)
+        if key.endswith("/actions/workflows/ci-gate.yml/runs"):
+            assert query["event"] == ["pull_request"] and query["created"][0].startswith(">="), query
+            key += "?inventory"
+        budget = {"X-RateLimit-Resource": "core", "X-RateLimit-Remaining": "4000",
+                  "X-RateLimit-Reset": str(int(time.time()) + 1800)}
+        value = self.documents.get(key)
+        if value is None:
+            return github_client.Response(404, budget, b'{"message": "Not Found"}')
+        return github_client.Response(200, budget, json.dumps(value).encode())
+
+
+def _run(run_id: int, head: str, attempts: int, created: datetime, pulls: list | None = None) -> dict:
+    return {"id": run_id, "event": "pull_request", "head_sha": head, "head_branch": "feat", "run_attempt": attempts,
+            "created_at": created.isoformat(), "repository": {"id": RUFF_REPO_ID}, "pull_requests": pulls or []}
+
+
+def _job(job_id: int, started: datetime, *, lint: str) -> dict:
+    steps = _ruff_steps(lint=lint, guards=("success",) * 3 if lint == "success" else ("skipped",) * 3)
+    return {"id": job_id, "name": "Ruff", "status": "completed", "started_at": started.isoformat(),
+            "completed_at": started.isoformat(), "conclusion": lint, "steps": steps}
+
+
+def _check_run(check_run_id: int, run_id: int, head: str) -> dict:
+    return {"id": check_run_id, "name": "Ruff", "head_sha": head, "app": {"id": 15368, "slug": "github-actions"},
+            "details_url": f"https://github.com/{RUFF_REPO}/actions/runs/{run_id}/job/{check_run_id}",
+            "check_suite": {"id": run_id * 10}, "status": "completed", "conclusion": "success"}
+
+
+def test_ruff_collector_reads_forward_every_attempt_and_reports_incomplete_intervals(tmp_path, monkeypatch):
+    """Defect class: attempts lost to latest-run collapse, to a force push between two collections, to a pre-pilot
+    attempt entering the denominator, or to a read that silently stopped short (AC-02, AC-14)."""
+    batch_state, _ = _state(tmp_path)
+    head_a, head_b, head_c, base = "a" * 40, "b" * 40, "c" * 40, "0" * 40
+    root = f"repos/{RUFF_REPO}"
+    after = PILOT + timedelta(hours=1)
+    patch = "@@ -0,0 +1,3 @@\n+import os\n+import sys\n+x = 1"
+    compare = {"total_commits": 1, "commits": [{"sha": "1" * 40}],
+               "files": [{"filename": "lu_machinery/x.py", "additions": 3, "deletions": 0, "patch": patch}]}
+    documents: dict[str, object] = {
+        # Red head A, rerun green on the same head, then force-pushed to green head B: only B is the PR's head now.
+        f"{root}/actions/workflows/ci-gate.yml/runs?inventory": {"total_count": 2, "workflow_runs": [
+            _run(501, head_a, 2, after), _run(502, head_b, 1, after + timedelta(minutes=5))]},
+        f"{root}/pulls": [
+            {"number": 7, "updated_at": (after + timedelta(minutes=5)).isoformat(),
+             "head": {"ref": "feat", "sha": head_b, "repo": {"full_name": RUFF_REPO}}, "base": {"sha": base}},
+            {"number": 3, "updated_at": (PILOT - timedelta(days=9)).isoformat(),
+             "head": {"ref": "old", "sha": head_c, "repo": {"full_name": RUFF_REPO}}, "base": {"sha": base}}],
+        f"{root}/actions/runs/501/attempts/1/jobs": {"total_count": 1, "jobs": [_job(9001, after, lint="failure")]},
+        f"{root}/actions/runs/501/attempts/2/jobs": {"total_count": 1, "jobs": [
+            _job(9002, after + timedelta(minutes=2), lint="success")]},
+        f"{root}/actions/runs/502/attempts/1/jobs": {"total_count": 1, "jobs": [
+            _job(9101, after + timedelta(minutes=5), lint="success")]},
+        f"{root}/check-runs/9001": {"output": {"annotations_count": 2}},
+        f"{root}/check-runs/9001/annotations": [
+            {"path": "lu_machinery/x.py", "start_line": 2, "title": "ruff (F401)"},
+            {"path": ".github", "start_line": 1, "title": ""}],
+        f"{root}/compare/{base}...{head_a}": compare, f"{root}/compare/{base}...{head_b}": compare,
+        # What the base changed since the merge-base (the lint ran on the merge): nothing here.
+        f"{root}/compare/{head_a}...{base}": {"total_commits": 0, "commits": [], "files": []},
+        f"{root}/compare/{head_b}...{base}": {"total_commits": 0, "commits": [], "files": []},
+        f"{root}/commits/{head_a}/check-runs": {"total_count": 2, "check_runs": [
+            _check_run(9001, 501, head_a), _check_run(9002, 501, head_a)]},
+        # Head B also carries a rerun of a run created before the pilot: one attempt before it, one after.
+        f"{root}/commits/{head_b}/check-runs": {"total_count": 2, "check_runs": [
+            _check_run(9101, 502, head_b), _check_run(9301, 503, head_b)]},
+        f"{root}/actions/runs/503": _run(503, head_b, 2, PILOT - timedelta(hours=5)),
+        f"{root}/actions/runs/503/attempts/1/jobs": {"total_count": 1, "jobs": [
+            _job(9300, PILOT - timedelta(hours=5), lint="failure")]},
+        f"{root}/actions/runs/503/attempts/2/jobs": {"total_count": 1, "jobs": [
+            _job(9301, after + timedelta(minutes=9), lint="success")]},
+        f"{root}/check-runs/9300": {"output": {"annotations_count": 0}},
+        f"{root}/check-runs/9300/annotations": [],
+    }
+    fake = _RuffGitHub(documents)
+    client = github_client.GitHubClient(cache_dir=tmp_path / "github-cache", transport=fake,
+                                        env={"GH_HOST": "github.com", "GH_TOKEN": "fixture-token"})
+    counts = rows.import_ruff_attempts(batch_state, client, repository=RUFF_REPO, pilot_window_start=PILOT, now=NOW)
+    assert counts["receipts_observed"] == 5 and counts["incomplete_intervals"] == 0, counts
+    paths = [urlsplit(endpoint).path for endpoint in fake.sent]
+    assert all("filter=all" in endpoint for endpoint in fake.sent if "/check-runs?" in endpoint)
+    assert any("sort=updated" in endpoint for endpoint in fake.sent if urlsplit(endpoint).path.endswith("/pulls"))
+    assert f"/{root}/actions/runs" not in paths and f"{root}/actions/runs" not in paths  # no backfill search
+    attempts, _ = rows.read_ruff_attempts(batch_state)
+    by_id = {receipt["check_run_id"]: receipt for receipt in attempts}
+    assert sorted(by_id) == [9001, 9002, 9101, 9300, 9301]
+    assert by_id[9001]["measured_head_sha"] == by_id[9002]["measured_head_sha"] == head_a
+    assert by_id[9001]["pr"] == 7 and by_id[9001]["findings"] == [{"code": "F401", "origin": "pr"}]
+    assert [rows.classify_ruff_attempt(by_id[key]) for key in (9001, 9002, 9101)] == [
+        "ruff_code_failure", "ruff_pass", "ruff_pass"]
+    quality = stats.collect(batch_state, tmp_path, NOW, landing=stats.Landing())["ruff_quality"]
+    assert quality["pilot_window_start"] == PILOT.isoformat() and quality["incomplete_intervals"] == []
+    assert quality["denominator"] == 4 and quality["coverage"]["before_pilot"] == 1
+    assert quality["buckets"]["ruff_code_failure"] == 1 and quality["buckets"]["ruff_pass"] == 3
+
+    # The pilot start is frozen.
+    with pytest.raises(ValueError, match="frozen"):
+        rows.import_ruff_attempts(batch_state, client, repository=RUFF_REPO,
+                                  pilot_window_start=PILOT + timedelta(hours=1), now=NOW)
+    # An inventory GitHub cannot prove whole leaves the watermark and is reported as an incomplete interval.
+    documents[f"{root}/actions/workflows/ci-gate.yml/runs?inventory"] = {"total_count": 3, "workflow_runs": []}
+    later = NOW + timedelta(hours=1)
+    # A revisit that cannot read a run's comparison records nothing for that run (round 1 F1).
+    del documents[f"{root}/compare/{base}...{head_b}"]
+    revisit = rows.import_ruff_attempts(batch_state, client, repository=RUFF_REPO, now=later)
+    assert (revisit["receipts_observed"], revisit["runs_deferred"]) == (0, 1), revisit
+    assert len(rows.read_ruff_attempts(batch_state)[0]) == 5
+    state = rows.read_ruff_state(batch_state)
+    assert state["watermark"] == NOW.isoformat()
+    assert state["incomplete_intervals"] == [
+        {"since": NOW.isoformat(), "until": later.isoformat(), "reason": "github_collection_incomplete"}]
+    snapshot = stats.collect(batch_state, tmp_path, later, landing=stats.Landing())
+    with _serve(snapshot, tmp_path, monkeypatch) as served:
+        full = served.get("/api/fleet/model-stats?window=7d&view=full").json()
+        page = served.get("/api/fleet/model-stats?window=7d&view=page").json()
+    assert full["ruff_quality"]["incomplete_intervals"] == state["incomplete_intervals"]
+    assert full["ruff_quality"]["report_only"] is True and "ruff_quality" not in page
+    # The existing figures are still served beside it (AC-13).
+    assert {"models", "coverage", "weeks", "first_record"} <= set(full) and "models" in page

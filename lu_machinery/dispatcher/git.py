@@ -1034,6 +1034,75 @@ def _batch_blobs(local, oids: list[str]) -> list[bytes]:
     return blobs
 
 
+_OBJECT_NAME = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
+
+
+def task_start_remote_refs(task_id: str, remote: str) -> list[str]:
+    """The distinct commits every branch of the recorded remote pointed at before the writer starts, sorted (#1615).
+
+    The read runs in the ownership verifier's private Git namespace, never in the writer's worktree. Only the tip
+    commits are kept: settlement needs what was reachable, not the branch names. Any failure raises: the caller
+    then stores no start refs, and settlement credits the task with nothing.
+    """
+    with _private_remote_git(task_id + "-start-refs", remote) as (run, _):
+        listing = run("ls-remote", "--heads", "--", "origin")
+    refs: dict[str, str] = {}
+    for line in listing.splitlines():
+        sha, _, ref = line.partition("\t")
+        if not _OBJECT_NAME.fullmatch(sha) or not ref.startswith("refs/heads/") or ref in refs:
+            raise ValueError("remote branch advertisement is malformed")
+        refs[ref] = sha
+    if not refs:
+        raise ValueError("remote advertises no branch")
+    return sorted(set(refs.values()))
+
+
+def credited_commits(record: dict, head: str) -> tuple[list[str] | None, str]:
+    """The commits this run wrote, as ``(sorted SHAs, "computed")``, else ``(None, reason)`` (#1615).
+
+    Credited commits are ``worktree_start_sha..head`` minus every commit reachable from the remote base branch at
+    settlement or from any branch tip commit the remote advertised at task start (``task_start_remote_refs``): a merge or
+    fast-forward from main, another unmerged branch and a takeover predecessor's commits all stay with whoever
+    wrote them. The walk uses only objects fetched from the recorded remote URL into the verifier's private
+    namespace (commits only, ``--filter=tree:0``); no worktree object, configuration, hook or commit trailer is
+    read. Absent start refs or any failed fetch or walk credit nothing.
+    """
+    tips = record.get("task_start_remote_refs")
+    if not isinstance(tips, list) or not tips or not all(
+            isinstance(sha, str) and _OBJECT_NAME.fullmatch(sha) for sha in tips):
+        return None, "task_start_remote_refs_absent"
+    remote = record.get("worktree_remote_url")
+    start = record.get("worktree_start_sha") or record.get("worktree_base_sha")
+    if not isinstance(remote, str) or not remote:
+        return None, "remote_unrecorded"
+    if not isinstance(start, str) or not _OBJECT_NAME.fullmatch(start) or not _OBJECT_NAME.fullmatch(head):
+        return None, "start_or_head_unrecorded"
+    try:
+        base = verifiable_origin_base(str(record.get("worktree_base_ref") or "")).removeprefix("origin/")
+    except OriginBaseRequired:
+        return None, "base_unverifiable"
+    tips = sorted(set(tips))
+    refspecs = [f"+{head}:refs/credit/head", f"+{start}:refs/credit/start", f"+refs/heads/{base}:refs/credit/base",
+                *(f"+{sha}:refs/credit/tip/{index}" for index, sha in enumerate(tips))]
+    try:
+        with _private_remote_git(record["task_id"] + "-credit", remote) as (run, _):
+            run("check-ref-format", f"refs/heads/{base}")
+            run("fetch", "--no-tags", "--no-write-fetch-head", "--filter=tree:0", "--", "origin", *refspecs,
+                timeout=VERIFICATION_FETCH_TIMEOUT)
+            if run("rev-parse", "--verify", "refs/credit/head^{commit}") != head:
+                return None, "remote_head_mismatch"
+            listing = run("rev-list", "refs/credit/head", "^refs/credit/start", "^refs/credit/base",
+                          *(f"^refs/credit/tip/{index}" for index in range(len(tips))))
+    except VerificationFetchError as exc:
+        return None, f"fetch_failed:{exc.reason}"
+    except (OSError, ValueError, subprocess.SubprocessError, TaskScratchError):
+        return None, "walk_failed"
+    commits = listing.split()
+    if not all(_OBJECT_NAME.fullmatch(sha) for sha in commits):
+        return None, "walk_failed"
+    return sorted(commits), "computed"
+
+
 def snapshot_delivery(spec: TaskSpec, record: dict) -> dict:
     from lu_machinery.dispatcher import ownership
 
@@ -1099,6 +1168,11 @@ def snapshot_delivery(spec: TaskSpec, record: dict) -> dict:
     if spec.mode != "read-only" and delivery["worktree_dirty_on_exit"]:
         delivery["push_state"] = "unpushed"
         delivery["push_state_reason"] = "dirty_worktree"
+    if spec.mode == "workspace-write" and "task_start_remote_refs" in record:
+        # Statistics attribution only (#1615): it never changes the delivery or push state above.
+        delivery["credited_commits"], delivery["credited_commits_reason"] = (
+            credited_commits(record, delivery["head_sha"]) if delivery["head_sha"]
+            else (None, "head_unobserved"))
     return delivery
 
 

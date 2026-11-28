@@ -229,6 +229,27 @@ def new_record(
     return record
 
 
+def capture_task_start_remote_refs(record: dict) -> None:
+    """Store the remote's branch tips on a workspace-write record before its writer starts (#1615).
+
+    Read through the dispatcher's private Git namespace from the recorded remote URL, never the writer's worktree.
+    A record with no recorded remote, or a failed read, stores None, and settlement then credits no commit to it.
+    """
+    if record.get("mode") != "workspace-write":
+        return
+    from lu_machinery.common.task_scratch import TaskScratchError
+    from lu_machinery.dispatcher.git import task_start_remote_refs
+
+    record["task_start_remote_refs"] = None
+    remote = record.get("worktree_remote_url")
+    if not remote:
+        return
+    try:
+        record["task_start_remote_refs"] = task_start_remote_refs(record["task_id"], remote)
+    except (OSError, ValueError, subprocess.SubprocessError, TaskScratchError) as exc:
+        logging.getLogger(__name__).warning("task start remote refs not captured: %s", type(exc).__name__)
+
+
 def record_path(task_id: str) -> Path:
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", task_id) or ".." in task_id:
         raise ValueError("task id must contain only letters, digits, underscores, hyphens and dots")

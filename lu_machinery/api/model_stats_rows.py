@@ -23,6 +23,11 @@ author label of a blocking finding of a published review (``fixed``, ``wrong``, 
 ``duplicate``; the evidence line as its SHA-256 only) and one per later review that contested a label. A well-formed
 label line whose label this release does not know (a newer release wrote it) still holds its finding: no other label
 is written for that finding, and the statistics count it in ``unknown_labels``, attributed to no reviewer.
+
+``ruff-attempts.jsonl`` and ``ruff-collector.json`` are the report-only Ruff check-attempt ledger and its collector
+state (#1615), written by the scheduled ``import-ruff-attempts`` subcommand only; see ``RUFF_SCHEMA``. Rows also carry
+the settlement attribution the ledger is joined on: ``run_nonce``, ``resolved_model_known``, the runtime-observed
+``resolved_model`` and the dispatcher-computed ``credited_commits`` (None when settlement computed none).
 """
 
 from __future__ import annotations
@@ -42,14 +47,14 @@ import unicodedata
 from collections import Counter
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import contextmanager
-from datetime import UTC, datetime
-from functools import lru_cache
+from datetime import UTC, datetime, timedelta
+from functools import lru_cache, partial
 from pathlib import Path
 from typing import Any, cast
 
 from lu_machinery.agent_runtime.attempt_boundary import CLAUDE_SUBSCRIPTION_ACCOUNT_LABELS
 from lu_machinery.api.opsec_scan import scan_text
-from lu_machinery.common import json_depth
+from lu_machinery.common import github_client, json_depth
 from lu_machinery.common.git_credentials import _is_valid_slug as _is_selector_slug
 from lu_machinery.common.task_store_paths import read_cached_task_record, tasks_dir
 from lu_machinery.dispatcher.admission import review_typed
@@ -59,6 +64,7 @@ from lu_machinery.fleet_comms.review_publication import (
     ReviewPublicationError,
     normalize_verdict,
 )
+from lu_machinery.github_check_rollup import check_run_attempts
 from lu_machinery.model_families import canonical_cursor_model
 from lu_machinery.orchestration.fleet_repos import (
     FleetRepo,
@@ -118,6 +124,7 @@ _LABEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:\-]{0,63}\Z")
 _MODEL_LABEL = re.compile(
     r"[A-Za-z0-9][A-Za-z0-9._:\-]{0,63}(?:/[A-Za-z0-9][A-Za-z0-9._:\-]{0,63})?\Z")
 _SHA = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?\Z")
+_RUN_NONCE = re.compile(r"[0-9a-f]{32}\Z")
 # The dispatcher's task-id grammar (dispatcher.store.record_path); a legacy record's id is not checked on read.
 _TASK_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\Z")
 _EFFORT_SUFFIX = re.compile(rf"-({VARIANT_SUFFIX.pattern})\Z")
@@ -869,8 +876,23 @@ def summary_row(path: Path, record: Mapping[str, Any], source_mtime_ns: int | No
         "pinned_head": head if isinstance(head, str) and _SHA.fullmatch(head) else None,
         "author_model": model_id(author) if author else None,
         "landing": _landing(record),
+        # Settlement attribution (#1615): the dispatcher-computed commits this run wrote, bound to the run and to
+        # the model the runtime observed. A reader credits a commit only from a row that carries all of them.
+        "run_nonce": run_nonce if isinstance(run_nonce := record.get("run_nonce"), str)
+        and _RUN_NONCE.fullmatch(run_nonce) else None,
+        "resolved_model_known": record.get("resolved_model_known") is True,
+        "resolved_model": model_id(record.get("resolved_model")) if record.get("resolved_model_known") is True
+        else None,
+        "credited_commits": _credited(record.get("credited_commits")),
         "source_mtime_ns": source_mtime_ns,
     }
+
+
+def _credited(value: object) -> list[str] | None:
+    """A dispatcher-computed credited set, sorted; anything but a list of full SHAs is no set at all."""
+    if not isinstance(value, list) or not all(isinstance(sha, str) and _SHA.fullmatch(sha) for sha in value):
+        return None
+    return sorted(set(value))
 
 
 def rows_path(batch_state_dir: Path) -> Path:
@@ -1399,6 +1421,8 @@ def _sanitised(row: dict[str, Any]) -> dict[str, Any]:
             row[name] = label(value)
     author = row.get("author_model")
     row["author_model"] = model_label(author) if author is not None else None
+    resolved = row.get("resolved_model")
+    row["resolved_model"] = model_label(resolved) if resolved is not None else None
     data_class = row.get("data_class")
     row["data_class"] = label(data_class) if data_class is not None else None
     return row
@@ -1514,6 +1538,10 @@ def _well_formed(row: Mapping[str, Any], *, check_sample_visibility: bool = True
         _optional(landing, lambda d: isinstance(d, dict) and d.keys() == {"pr", "merge_sha"}
                   and _count_value(d["pr"]) and _sha(d["merge_sha"])),
         _optional(row.get("source_mtime_ns"), _count_value),
+        _optional(row.get("run_nonce"), lambda v: isinstance(v, str) and _RUN_NONCE.fullmatch(v) is not None),
+        _optional(row.get("resolved_model_known"), lambda v: type(v) is bool),
+        _optional(row.get("resolved_model"), lambda v: isinstance(v, str) and row.get("resolved_model_known") is True),
+        _optional(row.get("credited_commits"), lambda v: isinstance(v, list) and all(_sha(sha) for sha in v)),
     ))
 
 
@@ -1581,7 +1609,7 @@ def _stale(present: Mapping[str, Any] | None, candidate: Mapping[str, Any]) -> b
         return True
     return stored == source and any(present.get(key) != candidate.get(key) for key in (
         "role", "class", "review", "effort", "pinned_head", "never_started_reason", "no_deliverable_cause",
-        "review_evidence_absent", "usage_known", "implementation", "tokens",
+        "review_evidence_absent", "usage_known", "implementation", "tokens", "credited_commits",
     ))
 
 
@@ -1644,6 +1672,602 @@ def backfill(tasks_dir: Path, batch_state_dir: Path, *, dry_run: bool = False) -
     return dict(sorted(counts.items()))
 
 
+# The Ruff check-attempt ledger (#1615, report-only). ``ruff-attempts.jsonl`` holds one receipt line per observed
+# version of a CI ``Ruff`` check-run attempt; ``ruff-collector.json`` holds the collector's frozen
+# ``pilot_window_start``, its last clean watermark, the runs it still revisits and every interval it could not read
+# whole. Their one writer is the scheduled ``import-ruff-attempts`` subcommand (receipts and state are written under
+# ``rows.lock``; ``ruff-collector.lock`` keeps two collectors apart); the Monitor route only reads them and never
+# reaches GitHub. Receipts carry labels, counts, timestamps, PR numbers, commit SHAs and Ruff rule codes: no file
+# path, message or log text. Nothing here gates a merge.
+RUFF_SCHEMA = "ruff-attempt.v1"
+RUFF_STATE_SCHEMA = "ruff-collector.v1"
+RUFF_FILE = "ruff-attempts.jsonl"
+RUFF_STATE_FILE = "ruff-collector.json"
+RUFF_COLLECTOR_LOCK = "ruff-collector.lock"
+RUFF_CHECK_NAME = "Ruff"
+RUFF_WORKFLOW = "ci-gate.yml"
+# The step names of the CI Gate ``Ruff`` job (.github/workflows/ci-gate.yml): setup, then the lint, then the guards.
+RUFF_STEP = "Ruff check lu_machinery/"
+GUARD_STEPS = ("Refuse unbounded JSON readers", "Refuse new state path literals",
+               "Refuse non-empty CHANGELOG.md Unreleased section")
+# A change to one of these files can change what Ruff reports in files the pull request never touched.
+RUFF_CONFIG_FILES = frozenset({"pyproject.toml", "ruff.toml", ".ruff.toml"})
+# Precedence order: an attempt takes the first bucket whose evidence it has.
+RUFF_BUCKETS = ("cancelled_or_superseded", "infrastructure_failure", "missing_or_reused_evidence", "guard_failure",
+                "ruff_code_failure", "base_only_ruff_failure", "ambiguous_base_or_merge_context", "ruff_pass")
+FINDING_ORIGINS = frozenset({"pr", "base", "unresolved"})
+# Ruff's GitHub output titles an annotation ``ruff (I001)`` (CI Gate, Ruff 0.15); a rule name such as
+# ``invalid-syntax`` takes the code's place for a parse error.
+_RUFF_CODE = re.compile(r"[A-Za-z][A-Za-z0-9-]{0,39}\Z")
+_RULE_TITLE = re.compile(r"[Rr]uff \(([A-Za-z][A-Za-z0-9-]{0,39})\)\Z")
+# ``ruff check lu_machinery`` reports repository-relative paths under the checked tree; anything else is unresolved.
+_LINTED_PATH = re.compile(r"lu_machinery/(?:[^/\x00]+/)*[^/\x00]+\Z")
+_RUFF_KEYS = frozenset({
+    "schema", "repository", "repository_id", "pr", "measured_head_sha", "check_name", "check_run_id", "run_id",
+    "run_attempt", "started_at", "completed_at", "status", "conclusion", "steps", "findings", "base_sha",
+    "tested_sha", "head_commits", "diff_size", "check_version", "observed_at",
+})
+
+
+def ruff_identity(receipt: Mapping[str, Any]) -> tuple[int, int, str, str, int]:
+    """The stable attempt identity; a late ``base_sha`` or ``tested_sha`` never makes a second attempt."""
+    return (receipt["repository_id"], receipt["pr"], receipt["measured_head_sha"], receipt["check_name"],
+            receipt["check_run_id"])
+
+
+def _steps_ok(steps: object) -> bool:
+    return steps is None or (isinstance(steps, list) and all(
+        isinstance(step, dict) and step.keys() == {"number", "name", "status", "conclusion"}
+        and _count_value(step["number"]) and isinstance(step["name"], str) and len(step["name"]) <= 200
+        and isinstance(step["status"], str) and _optional(step["conclusion"], lambda v: isinstance(v, str))
+        for step in steps))
+
+
+def _findings_ok(findings: object) -> bool:
+    return findings is None or (isinstance(findings, list) and all(
+        isinstance(item, dict) and item.keys() == {"code", "origin"} and isinstance(item["code"], str)
+        and _RUFF_CODE.fullmatch(item["code"]) is not None and item["origin"] in FINDING_ORIGINS
+        for item in findings))
+
+
+def _ruff_ok(receipt: object) -> bool:
+    if not isinstance(receipt, dict) or receipt.keys() != _RUFF_KEYS or receipt["schema"] != RUFF_SCHEMA:
+        return False
+    return all((
+        isinstance(receipt["repository"], str) and REPOSITORY_SLUG.fullmatch(receipt["repository"]) is not None,
+        _count_value(receipt["repository_id"]), _count_value(receipt["pr"]), _sha(receipt["measured_head_sha"]),
+        isinstance(receipt["check_name"], str) and _LABEL.fullmatch(receipt["check_name"]) is not None,
+        _count_value(receipt["check_run_id"]), _optional(receipt["run_id"], _count_value),
+        _optional(receipt["run_attempt"], _count_value),
+        all(_optional(receipt[name], lambda v: timestamp(v) is not None)
+            for name in ("started_at", "completed_at", "observed_at")),
+        receipt["observed_at"] is not None,
+        isinstance(receipt["status"], str) and _LABEL.fullmatch(receipt["status"]) is not None,
+        _optional(receipt["conclusion"], lambda v: isinstance(v, str) and _LABEL.fullmatch(v) is not None),
+        _steps_ok(receipt["steps"]), _findings_ok(receipt["findings"]),
+        _optional(receipt["base_sha"], _sha), _optional(receipt["tested_sha"], _sha),
+        _optional(receipt["head_commits"], lambda v: isinstance(v, list) and all(_sha(sha) for sha in v)),
+        _optional(receipt["diff_size"], _count_value),
+        _optional(receipt["check_version"], lambda v: isinstance(v, str) and _LABEL.fullmatch(v) is not None),
+    ))
+
+
+def classify_ruff_attempt(receipt: Mapping[str, Any]) -> str:
+    """The one bucket of an attempt, in ``RUFF_BUCKETS`` precedence; each outcome needs only its own evidence.
+
+    A proven setup failure before the lint is ``infrastructure_failure`` even without findings, and a lint failure
+    with complete findings whose base attribution is unresolved is ``ambiguous_base_or_merge_context``, never
+    missing evidence. ``ruff_pass`` needs positive step evidence: the lint step and every guard step succeeded.
+    """
+    conclusion = receipt.get("conclusion")
+    if receipt.get("status") == "completed" and conclusion in {"cancelled", "stale"}:
+        return "cancelled_or_superseded"
+    steps = receipt.get("steps")
+    if receipt.get("status") != "completed" or conclusion == "skipped" or not steps or any(
+            step["status"] != "completed" for step in steps):
+        # Still running, skipped because main-proof reused a tree, or step evidence missing or truncated.
+        return "missing_or_reused_evidence"
+    named = Counter(step["name"] for step in steps)
+    lint = [step for step in steps if step["name"] == RUFF_STEP]
+    if named[RUFF_STEP] != 1 or any(named[name] > 1 for name in GUARD_STEPS):
+        return "missing_or_reused_evidence"
+    lint_step = lint[0]
+    if lint_step["conclusion"] == "skipped" and any(
+            step["number"] < lint_step["number"] and step["conclusion"] == "failure" for step in steps):
+        return "infrastructure_failure"
+    if lint_step["conclusion"] == "success":
+        guards = {step["name"]: step["conclusion"] for step in steps if step["name"] in GUARD_STEPS}
+        if any(value == "failure" for value in guards.values()):
+            return "guard_failure"
+        if len(guards) == len(GUARD_STEPS) and all(value == "success" for value in guards.values()):
+            return "ruff_pass"
+        return "missing_or_reused_evidence"
+    findings = receipt.get("findings")
+    if lint_step["conclusion"] != "failure" or not findings:
+        return "missing_or_reused_evidence"
+    origins = {finding["origin"] for finding in findings}
+    if "pr" in origins:
+        return "ruff_code_failure"
+    if origins == {"base"}:
+        return "base_only_ruff_failure"
+    return "ambiguous_base_or_merge_context"
+
+
+def ruff_complete(receipt: Mapping[str, Any]) -> bool:
+    """Whether the receipt carries the evidence its own outcome needs."""
+    return classify_ruff_attempt(receipt) != "missing_or_reused_evidence"
+
+
+def _ruff_rank(receipt: Mapping[str, Any]) -> tuple[bool, bool, int, str, str]:
+    """Complete beats incomplete; then more evidence (a head commit list, then more resolved finding origins), so a
+    later read that lost the comparison never replaces a proved outcome; then the later observation; then the line
+    digest, so any order of the same lines selects the same receipt."""
+    resolved = sum(finding["origin"] != "unresolved" for finding in receipt["findings"] or [])
+    return (ruff_complete(receipt), receipt["head_commits"] is not None, resolved, receipt["observed_at"],
+            hashlib.sha256(_line(receipt)).hexdigest())
+
+
+def ruff_path(batch_state_dir: Path) -> Path:
+    return batch_state_dir / ROWS_DIR / RUFF_FILE
+
+
+def _ruff_lines(path: Path, counts: Counter[str]) -> list[dict[str, Any]]:
+    try:
+        fd = _open(path, os.O_RDONLY)
+    except FileNotFoundError:
+        counts["missing"] += 1
+        return []
+    lines = []
+    with os.fdopen(fd, "rb") as stream:
+        for raw in stream:
+            try:
+                receipt = _load_line(raw)
+            except (ValueError, RecursionError):
+                counts["malformed_lines"] += 1
+                continue
+            if not _ruff_ok(receipt):
+                counts["malformed_lines"] += 1
+                continue
+            counts["lines"] += 1
+            lines.append(receipt)
+    return lines
+
+
+def read_ruff_attempts(batch_state_dir: Path) -> tuple[list[dict[str, Any]], Counter[str]]:
+    """One winning receipt per stable attempt identity (``_ruff_rank``), and read counts."""
+    counts: Counter[str] = Counter()
+    winners: dict[tuple[int, int, str, str, int], dict[str, Any]] = {}
+    for receipt in _ruff_lines(ruff_path(batch_state_dir), counts):
+        key = ruff_identity(receipt)
+        if key not in winners or _ruff_rank(receipt) > _ruff_rank(winners[key]):
+            winners[key] = receipt
+    counts["attempts"] = len(winners)
+    return [winners[key] for key in sorted(winners)], counts
+
+
+def _observation(receipt: Mapping[str, Any]) -> bytes:
+    """What a receipt observed: its line without ``observed_at``, so re-reading an unchanged attempt is no news."""
+    return _line({key: value for key, value in receipt.items() if key != "observed_at"})
+
+
+def record_ruff_attempts(batch_state_dir: Path, receipts: Iterable[Mapping[str, Any]]) -> int:
+    """Append each well-formed receipt whose observation the ledger does not already hold; returns the lines added.
+
+    Append-only: a replayed receipt, or a revisit that saw the same attempt again, adds nothing, and an incomplete
+    receipt never replaces a complete one because the reader, not the writer, selects the winner.
+    """
+    receipts = list(receipts)
+    if not all(_ruff_ok(receipt) for receipt in receipts):
+        raise ValueError("malformed Ruff attempt receipt")
+    with _locked(batch_state_dir):
+        path = ruff_path(batch_state_dir)
+        present = {_observation(receipt) for receipt in _ruff_lines(path, Counter())}
+        added = 0
+        for receipt in receipts:
+            observed = _observation(receipt)
+            if observed not in present:
+                _append_line(path, _line(receipt))
+                present.add(observed)
+                added += 1
+        return added
+
+
+def _state_path(batch_state_dir: Path) -> Path:
+    return batch_state_dir / ROWS_DIR / RUFF_STATE_FILE
+
+
+def _interval_ok(item: object) -> bool:
+    return (isinstance(item, dict) and item.keys() == {"since", "until", "reason"}
+            and timestamp(item["since"]) is not None and timestamp(item["until"]) is not None
+            and isinstance(item["reason"], str) and _LABEL.fullmatch(item["reason"]) is not None)
+
+
+def _known_run_ok(item: object) -> bool:
+    return (isinstance(item, dict) and item.keys() == {"created_at", "done", "pr", "base_sha", "attempts"}
+            and timestamp(item["created_at"]) is not None and type(item["done"]) is bool
+            and _optional(item["pr"], _count_value) and _optional(item["base_sha"], _sha)
+            and _count_value(item["attempts"]))
+
+
+def read_ruff_state(batch_state_dir: Path) -> dict[str, Any] | None:
+    """The collector state, or None when absent; a damaged state raises ValueError (it is never guessed)."""
+    try:
+        fd = _open(_state_path(batch_state_dir), os.O_RDONLY)
+    except FileNotFoundError:
+        return None
+    with os.fdopen(fd, "rb") as stream:
+        raw = stream.read(MAX_RESULT_BYTES + 1)
+    if len(raw) > MAX_RESULT_BYTES:
+        raise ValueError("the Ruff collector state is too large")
+    state = _load_line(raw)
+    if not (isinstance(state, dict) and state.get("schema") == RUFF_STATE_SCHEMA
+            and isinstance(state.get("repository"), str) and REPOSITORY_SLUG.fullmatch(state["repository"])
+            and timestamp(state.get("pilot_window_start")) is not None
+            and _optional(state.get("watermark"), lambda v: timestamp(v) is not None)
+            and isinstance(state.get("incomplete_intervals"), list)
+            and all(_interval_ok(item) for item in state["incomplete_intervals"])
+            and isinstance(state.get("known_runs"), dict)
+            and all(key.isdigit() and _known_run_ok(item) for key, item in state["known_runs"].items())):
+        raise ValueError("the Ruff collector state is malformed")
+    return state
+
+
+def _write_state(batch_state_dir: Path, state: Mapping[str, Any]) -> None:
+    with _locked(batch_state_dir) as rows_file:
+        path = rows_file.with_name(RUFF_STATE_FILE)
+        temporary = path.with_name(f".{RUFF_STATE_FILE}.{os.getpid()}.{time.time_ns()}.tmp")
+        try:
+            with os.fdopen(_open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL), "wb") as stream:
+                stream.write(_line(state))
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, path)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+
+def added_lines(patch: object) -> set[int] | None:
+    """The new-side line numbers a unified-diff patch adds, or None when there is no readable patch."""
+    if not isinstance(patch, str):
+        return None
+    added: set[int] = set()
+    line_no = None
+    for line in patch.splitlines():
+        if line.startswith("@@"):
+            match = re.match(r"@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@", line)
+            if match is None:
+                return None
+            line_no = int(match[1])
+        elif line_no is None or line.startswith("\\"):
+            continue
+        elif line.startswith("+"):
+            added.add(line_no)
+            line_no += 1
+        elif not line.startswith("-"):
+            line_no += 1
+    return added
+
+
+def _whole_files(comparison: Mapping[str, Any] | None) -> dict[str, Mapping[str, Any]] | None:
+    """A comparison's files by name, or None unless the list is provably whole (GitHub stops at 300, silently)."""
+    if comparison is None:
+        return None
+    files: dict[str, Mapping[str, Any]] = {item["filename"]: item for item in comparison["files"]
+                                           if isinstance(item, dict) and isinstance(item.get("filename"), str)}
+    return files if len(comparison["files"]) < 300 and len(files) == len(comparison["files"]) else None
+
+
+def finding_origins(annotations: list[Mapping[str, Any]], comparison: Mapping[str, Any] | None,
+                    base_side: Mapping[str, Any] | None) -> list[dict[str, str]]:
+    """Each Ruff annotation as ``{code, origin}``.
+
+    The CI job lints the pull request's merge with its base, so an annotation's line is a line of the merge tree.
+    ``comparison`` is ``base...head`` (what the pull request changed since the merge-base) and ``base_side`` is
+    ``head...base`` (what the base changed since then). A file the base left alone has the pull request's lines in
+    the merge tree, so a finding on a line the pull request added there is ``pr``. A file the pull request left
+    alone is the base's copy, so its finding is ``base`` (when the file list is whole and no Ruff configuration
+    changed). Anything else, including any file both sides changed, is ``unresolved``.
+    """
+    files: dict[str, Mapping[str, Any]] = {}
+    if comparison is not None:
+        files = {item["filename"]: item for item in comparison["files"]
+                 if isinstance(item, dict) and isinstance(item.get("filename"), str)}
+    whole = _whole_files(comparison) is not None
+    base_changed = _whole_files(base_side)
+    config_changed = any(_basename(name) in RUFF_CONFIG_FILES for name in files)
+    findings = []
+    for annotation in annotations:
+        match = _RULE_TITLE.fullmatch(str(annotation.get("title") or ""))
+        if match is None:
+            continue
+        path, line = annotation.get("path"), annotation.get("start_line")
+        origin = "unresolved"
+        if (comparison is not None and isinstance(path, str) and _LINTED_PATH.fullmatch(path)
+                and ".." not in path.split("/") and type(line) is int):
+            changed = files.get(path)
+            if changed is None:
+                origin = "base" if whole and not config_changed else "unresolved"
+            elif (base_changed is not None and path not in base_changed
+                  and (lines := added_lines(changed.get("patch"))) is not None and line in lines):
+                origin = "pr"
+        findings.append({"code": match[1], "origin": origin})
+    return findings
+
+
+def _basename(name: str) -> str:
+    return name.rsplit("/", 1)[-1]
+
+
+def _steps(job: Mapping[str, Any]) -> list[dict[str, Any]] | None:
+    steps = job.get("steps")
+    if not isinstance(steps, list) or not all(
+            isinstance(step, dict) and _count_value(step.get("number")) and isinstance(step.get("name"), str)
+            and isinstance(step.get("status"), str) for step in steps):
+        return None
+    return [{"number": step["number"], "name": step["name"][:200], "status": label(step["status"]),
+             "conclusion": label(step["conclusion"]) if isinstance(step.get("conclusion"), str) else None}
+            for step in steps]
+
+
+def _head_commits(comparison: Mapping[str, Any] | None) -> list[str] | None:
+    """Every commit of ``base..head``, or None unless GitHub returned all ``total_commits`` of them."""
+    if comparison is None:
+        return None
+    shas = [item.get("sha") if isinstance(item, dict) else None for item in comparison["commits"]]
+    if len(shas) != comparison["total_commits"] or not all(isinstance(sha, str) and _SHA.fullmatch(sha)
+                                                           for sha in shas):
+        return None
+    return sorted(set(cast(list[str], shas)))
+
+
+def _diff_size(comparison: Mapping[str, Any] | None) -> int | None:
+    if comparison is None:
+        return None
+    files = comparison["files"]
+    if _whole_files(comparison) is None or not all(_count_value(item.get("additions"))
+                                                   and _count_value(item.get("deletions")) for item in files):
+        return None
+    total: int = sum(item["additions"] + item["deletions"] for item in files)
+    return total
+
+
+def _run_pr(run: Mapping[str, Any], pulls: list[Mapping[str, Any]], repository: str,
+            known: Mapping[str, Any] | None) -> tuple[int | None, str | None]:
+    """The pull request a ``pull_request`` run measured, and its base commit.
+
+    The run's own association first, then the one same-repository pull request whose head branch is the run's, then
+    what an earlier collection recorded: a force-pushed head drops out of both GitHub lists.
+    """
+    head = run.get("head_sha")
+    entries = [item for item in run.get("pull_requests") or [] if isinstance(item, dict)
+               and _count_value(item.get("number")) and isinstance(item.get("head"), dict)
+               and item["head"].get("sha") == head]
+    if len(entries) == 1:
+        base = entries[0].get("base")
+        base_sha = base.get("sha") if isinstance(base, dict) else None
+        return entries[0]["number"], base_sha if isinstance(base_sha, str) and _SHA.fullmatch(base_sha) else None
+    matches = [pull for pull in pulls if isinstance(pull.get("head"), dict)
+               and pull["head"].get("ref") == run.get("head_branch")
+               and isinstance(pull["head"].get("repo"), dict)
+               and pull["head"]["repo"].get("full_name") == repository]
+    if len(matches) == 1:
+        base = matches[0].get("base")
+        base_sha = base.get("sha") if isinstance(base, dict) else None
+        return matches[0]["number"], base_sha if isinstance(base_sha, str) and _SHA.fullmatch(base_sha) else None
+    if known is not None and known["pr"] is not None:
+        return known["pr"], known["base_sha"]
+    return None, None
+
+
+def _lint_failed(steps: list[dict[str, Any]] | None) -> bool:
+    return bool(steps) and any(step["name"] == RUFF_STEP and step["conclusion"] == "failure"
+                               for step in cast(list[dict[str, Any]], steps))
+
+
+def _utc_iso(moment: datetime) -> str:
+    return moment.astimezone(UTC).isoformat()
+
+
+@contextmanager
+def _collector_lock(batch_state_dir: Path) -> Iterator[None]:
+    directory = batch_state_dir / ROWS_DIR
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    fd = _open(directory / RUFF_COLLECTOR_LOCK, os.O_WRONLY | os.O_CREAT | os.O_APPEND)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise TimeoutError("another Ruff attempt collector is running") from None
+        yield
+    finally:
+        os.close(fd)
+
+
+def import_ruff_attempts(batch_state_dir: Path, client: Any, *, repository: str,
+                         pilot_window_start: datetime | None = None, workflow: str = RUFF_WORKFLOW,
+                         check_name: str = RUFF_CHECK_NAME, revisit_days: float = 3.0,
+                         overlap_minutes: float = 10.0, now: datetime | None = None) -> dict[str, int]:
+    """One forward-only collection of CI ``Ruff`` attempts since the last clean watermark; returns counts.
+
+    Revisions come from the CI workflow's own ``pull_request`` run inventory, so a red head force-pushed to a green
+    one between two collections keeps its run. Updated pull requests' heads are read with ``filter=all`` to find
+    attempts of runs outside the inventory window, and every known run is revisited for ``revisit_days`` for new
+    attempts. A failed inventory, pull-request or check-run read records ``[watermark, now)`` as incomplete and keeps
+    the watermark; a run still unresolved when its revisit window closes becomes a zero-length incomplete interval at
+    its creation time. A later clean collection from the same watermark re-reads, and clears, a failed interval.
+    """
+    with _collector_lock(batch_state_dir):
+        moment = now or datetime.now(UTC)
+        state = read_ruff_state(batch_state_dir)
+        if state is None:
+            if pilot_window_start is None:
+                raise ValueError("the first collection needs --pilot-window-start")
+            state = {"schema": RUFF_STATE_SCHEMA, "repository": repository,
+                     "pilot_window_start": _utc_iso(pilot_window_start), "watermark": None,
+                     "incomplete_intervals": [], "known_runs": {}}
+        elif state["repository"] != repository:
+            raise ValueError("the Ruff collector state belongs to another repository")
+        elif pilot_window_start is not None and timestamp(state["pilot_window_start"]) != pilot_window_start:
+            raise ValueError("pilot_window_start is frozen; it cannot change after the first collection")
+        since = timestamp(state["watermark"] or state["pilot_window_start"])
+        assert since is not None
+        read_since = since - timedelta(minutes=overlap_minutes)
+        counts: Counter[str] = Counter()
+        failures: list[str] = []
+
+        def read(call: Callable[[], Any], counter: str, *, interval: bool) -> Any:
+            try:
+                return call()
+            except github_client.GitHubIncompleteRead as exc:
+                counts[counter] += 1
+                if interval:
+                    failures.append(label(exc.reason, "github_read_incomplete"))
+                return None
+
+        runs = read(partial(github_client.workflow_runs_created_since, client, repository, workflow, read_since),
+                    "inventory_unreadable", interval=True) or []
+        pulls = read(partial(github_client.pulls_updated_since, client, repository, read_since),
+                     "pulls_unreadable", interval=True) or []
+        documents = {run["id"]: run for run in runs if isinstance(run, dict) and _count_value(run.get("id"))}
+        counts["inventory_runs"] = len(documents)
+        counts["updated_pulls"] = len(pulls)
+        known = state["known_runs"]
+        revisit_after = moment - timedelta(days=revisit_days)
+        pending = {int(key) for key, item in known.items()
+                   if int(key) not in documents and (not item["done"]
+                                                     or cast(datetime, timestamp(item["created_at"])) >= revisit_after)}
+        heads = {run.get("head_sha") for run in documents.values()}
+        heads |= {pull["head"].get("sha") for pull in pulls if isinstance(pull.get("head"), dict)}
+        for head in sorted(sha for sha in heads if isinstance(sha, str) and _GIT_HEAD_SHA.fullmatch(sha)):
+            rows = read(partial(github_client.check_runs_all, client, repository, head),
+                        "check_runs_unreadable", interval=True)
+            for seen in check_run_attempts(rows or [], head, repository, check_name):
+                if seen["run_id"] is not None and seen["run_id"] not in documents:
+                    pending.add(seen["run_id"])
+        for run_id in sorted(pending):
+            document = read(partial(github_client.workflow_run, client, repository, run_id),
+                            "runs_unreadable", interval=False)
+            if document is not None:
+                documents[run_id] = document
+            elif str(run_id) in known:
+                known[str(run_id)]["done"] = False
+            else:
+                # Seen on a head but unreadable: revisited, then reported as an incomplete interval.
+                known[str(run_id)] = {"created_at": _utc_iso(moment), "done": False, "pr": None, "base_sha": None,
+                                      "attempts": 0}
+        receipts = []
+        comparisons: dict[tuple[str, str], Any] = {}
+        observed_at = _utc_iso(moment)
+        for run_id, run in sorted(documents.items()):
+            if run.get("event") != "pull_request" or not _GIT_HEAD_SHA.fullmatch(str(run.get("head_sha"))):
+                continue
+            head = run["head_sha"]
+            entry = known.get(str(run_id))
+            pr, base_sha = _run_pr(run, pulls, repository, entry)
+            created = timestamp(run.get("created_at"))
+            repository_value = run.get("repository")
+            repository_id = repository_value.get("id") if isinstance(repository_value, dict) else None
+            if pr is None or created is None or not _count_value(repository_id) or not _count_value(
+                    run.get("run_attempt")):
+                # Kept and revisited; still unmapped when its window closes, it is reported as an incomplete interval.
+                counts["unmapped_runs"] += 1
+                known[str(run_id)] = {"created_at": _utc_iso(created) if created else observed_at, "done": False,
+                                      "pr": entry["pr"] if entry else None,
+                                      "base_sha": entry["base_sha"] if entry else None,
+                                      "attempts": entry["attempts"] if entry else 0}
+                continue
+            if entry is not None and entry["done"] and entry["attempts"] == run["run_attempt"]:
+                # Every attempt of this run is already recorded complete; only a new attempt needs its jobs.
+                counts["runs_unchanged"] += 1
+                continue
+            if base_sha is not None and (base_sha, head) not in comparisons:
+                comparisons[(base_sha, head)] = read(
+                    partial(github_client.compare_commits, client, repository, base_sha, head),
+                    "compares_unreadable", interval=False)
+            comparison = comparisons.get((base_sha, head)) if base_sha is not None else None
+            if base_sha is not None and comparison is None:
+                # A receipt without its comparison would carry less evidence than one an earlier read may have stored:
+                # record nothing for this run now and read it again on the next collection.
+                counts["runs_deferred"] += 1
+                known[str(run_id)] = {"created_at": _utc_iso(created), "done": False, "pr": pr, "base_sha": base_sha,
+                                      "attempts": entry["attempts"] if entry else 0}
+                continue
+            done, deferred, run_receipts = True, False, []
+            for attempt in range(1, run["run_attempt"] + 1):
+                jobs = read(partial(github_client.attempt_jobs, client, repository, run_id, attempt),
+                            "jobs_unreadable", interval=False)
+                if jobs is None:
+                    done = False
+                    continue
+                named = [job for job in jobs if isinstance(job, dict) and job.get("name") == check_name
+                         and _count_value(job.get("id"))]
+                if len(named) != 1:
+                    done = done and not named
+                    continue
+                job = named[0]
+                steps = _steps(job)
+                findings = None
+                if _lint_failed(steps):
+                    annotations = read(partial(github_client.check_run_annotations, client, repository, job["id"]),
+                                       "annotations_unreadable", interval=False)
+                    base_side = None
+                    if base_sha is not None:
+                        if (head, base_sha) not in comparisons:
+                            comparisons[(head, base_sha)] = read(
+                                partial(github_client.compare_commits, client, repository, head, base_sha),
+                                "compares_unreadable", interval=False)
+                        base_side = comparisons[(head, base_sha)]
+                        if base_side is None:
+                            deferred = True
+                            break
+                    findings = None if annotations is None else finding_origins(annotations, comparison, base_side)
+                receipt = {
+                    "schema": RUFF_SCHEMA, "repository": repository, "repository_id": repository_id, "pr": pr,
+                    "measured_head_sha": head, "check_name": check_name, "check_run_id": job["id"],
+                    "run_id": run_id, "run_attempt": attempt,
+                    "started_at": _iso(job.get("started_at")),
+                    "completed_at": _iso(job.get("completed_at")),
+                    "status": label(job.get("status"), "unknown"),
+                    "conclusion": label(job["conclusion"]) if isinstance(job.get("conclusion"), str) else None,
+                    "steps": steps, "findings": findings, "base_sha": base_sha, "tested_sha": None,
+                    "head_commits": _head_commits(comparison), "diff_size": _diff_size(comparison),
+                    "check_version": label(f"{RUFF_SCHEMA}:{workflow}", "unknown"), "observed_at": observed_at,
+                }
+                run_receipts.append(receipt)
+                done = done and ruff_complete(receipt)
+            if deferred:
+                counts["runs_deferred"] += 1
+                known[str(run_id)] = {"created_at": _utc_iso(created), "done": False, "pr": pr, "base_sha": base_sha,
+                                      "attempts": entry["attempts"] if entry else 0}
+                continue
+            receipts.extend(run_receipts)
+            known[str(run_id)] = {"created_at": _utc_iso(created), "done": done and comparison is not None, "pr": pr,
+                                  "base_sha": base_sha, "attempts": run["run_attempt"]}
+        intervals = state["incomplete_intervals"]
+        for key, item in list(known.items()):
+            if cast(datetime, timestamp(item["created_at"])) < revisit_after:
+                if not item["done"]:
+                    intervals.append({"since": item["created_at"], "until": item["created_at"],
+                                      "reason": "run_unresolved"})
+                    counts["runs_closed_unresolved"] += 1
+                del known[key]
+        if failures:
+            # The watermark stays, so the next collection re-reads this whole interval.
+            intervals[:] = [item for item in intervals
+                            if not (item["reason"] != "run_unresolved" and timestamp(item["since"]) == since)]
+            intervals.append({"since": _utc_iso(since), "until": observed_at, "reason": failures[0]})
+        else:
+            # A clean read from the watermark covers every failed interval that started there.
+            intervals[:] = [item for item in intervals if item["reason"] == "run_unresolved"
+                            or cast(datetime, timestamp(item["since"])) < since]
+            state["watermark"] = observed_at
+        counts["receipts_added"] = record_ruff_attempts(batch_state_dir, receipts)
+        counts["receipts_observed"] = len(receipts)
+        counts["incomplete_intervals"] = len(intervals)
+        _write_state(batch_state_dir, state)
+        return dict(sorted(counts.items()))
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m lu_machinery.api.model_stats_rows",
@@ -1668,7 +2292,7 @@ def _parser() -> argparse.ArgumentParser:
             "Related: lu_machinery/api/model_stats_router.py, docs/runbooks/model-stats.md, issue #581."
         ),
     )
-    commands = parser.add_subparsers(dest="command", required=True, metavar="backfill")
+    commands = parser.add_subparsers(dest="command", required=True, metavar="{backfill,import-ruff-attempts}")
     run = commands.add_parser(
         "backfill", help="Add a summary row for every settled task record that has none (idempotent).",
         description="Add a summary row for every settled task record (hot directory, then archive) that has none.",
@@ -1682,12 +2306,90 @@ def _parser() -> argparse.ArgumentParser:
         "--dry-run", action="store_true",
         help="Count the rows that would be added or refreshed and write nothing (default: write).",
     )
+    ruff = commands.add_parser(
+        "import-ruff-attempts", formatter_class=argparse.RawDescriptionHelpFormatter,
+        help="Collect CI Ruff check-run attempts since the last clean watermark (report-only, #1615).",
+        description=(
+            "Forward-only, off-request collection of every CI Gate 'Ruff' check-run attempt on pull requests, for\n"
+            "the report-only Ruff statistics of /api/fleet/model-stats. Run it on a schedule; the Monitor route\n"
+            "never calls GitHub. Reads the CI workflow's pull_request runs created since the watermark, pull\n"
+            "requests updated since then, every check run of their heads (filter=all), each attempt's job steps,\n"
+            "the lint's annotations and base...head comparisons. Nothing it records gates a merge."
+        ),
+        epilog=(
+            "Examples:\n"
+            "  .venv/bin/python -m lu_machinery.api.model_stats_rows import-ruff-attempts \\\n"
+            "      --repository agentic-machinery/machinery --pilot-window-start 2026-11-29T00:00:00Z\n"
+            "  .venv/bin/python -m lu_machinery.api.model_stats_rows import-ruff-attempts \\\n"
+            "      --repository agentic-machinery/machinery\n\n"
+            "Outputs: appends new receipt lines to <batch-state-dir>/model-stats/ruff-attempts.jsonl, rewrites\n"
+            "<batch-state-dir>/model-stats/ruff-collector.json (frozen pilot_window_start, watermark, runs being\n"
+            "revisited, incomplete intervals), both under rows.lock, and prints one JSON object of counts.\n\n"
+            "Exit codes: 0 collected (an unreadable interval is recorded as incomplete, not an error); 1 the state\n"
+            "is malformed, belongs to another repository, the pilot start would change, another collector is\n"
+            "running, or the files could not be written.\n\n"
+            "Related: lu_machinery/api/model_stats_router.py, issue #1615."
+        ),
+    )
+    ruff.add_argument("--batch-state-dir", type=Path, default=None,
+                      help="The batch_state directory holding model-stats/ (default: the dispatch task store's "
+                           "parent). Example: --batch-state-dir batch_state")
+    ruff.add_argument("--repository", required=True,
+                      help="The GitHub owner/name whose pull requests are measured. "
+                           "Example: --repository agentic-machinery/machinery")
+    ruff.add_argument("--pilot-window-start", type=_aware_time, default=None,
+                      help="ISO 8601 start of the pilot window; required on the first collection, frozen after it "
+                           "(default: the stored value). Example: --pilot-window-start 2026-11-29T00:00:00Z")
+    ruff.add_argument("--workflow", default=RUFF_WORKFLOW,
+                      help=f"The CI workflow file whose runs are inventoried (default: {RUFF_WORKFLOW}).")
+    ruff.add_argument("--check-name", default=RUFF_CHECK_NAME,
+                      help=f"The check-run and job name of the lint (default: {RUFF_CHECK_NAME}).")
+    ruff.add_argument("--revisit-days", type=_positive, default=3.0,
+                      help="Days a known run is revisited for new attempts (default: 3).")
+    ruff.add_argument("--overlap-minutes", type=_non_negative, default=10.0,
+                      help="Minutes each read reaches back before the watermark, for late-listed runs (default: 10).")
     return parser
+
+
+def _aware_time(raw: str) -> datetime:
+    moment = timestamp(raw)
+    if moment is None or "T" not in raw:
+        raise argparse.ArgumentTypeError("expected an ISO 8601 date and time, such as 2026-11-29T00:00:00Z")
+    return moment
+
+
+def _positive(raw: str) -> float:
+    value = float(raw)
+    if not math.isfinite(value) or value <= 0:
+        raise argparse.ArgumentTypeError("expected a positive number")
+    return value
+
+
+def _non_negative(raw: str) -> float:
+    value = float(raw)
+    if not math.isfinite(value) or value < 0:
+        raise argparse.ArgumentTypeError("expected a number of zero or more")
+    return value
 
 
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     batch_state_dir = args.batch_state_dir if args.batch_state_dir is not None else tasks_dir().parent
+    if args.command == "import-ruff-attempts":
+        if not REPOSITORY_SLUG.fullmatch(args.repository):
+            print(json.dumps({"error": "repository must be owner/name"}), file=sys.stderr)
+            return 1
+        try:
+            counts = import_ruff_attempts(
+                batch_state_dir, github_client.GitHubClient(), repository=args.repository,
+                pilot_window_start=args.pilot_window_start, workflow=args.workflow, check_name=args.check_name,
+                revisit_days=args.revisit_days, overlap_minutes=args.overlap_minutes)
+        except (OSError, ValueError, TimeoutError) as exc:
+            print(json.dumps({"error": str(exc) if isinstance(exc, ValueError | TimeoutError)
+                              else f"model-stats files unavailable: {type(exc).__name__}"}), file=sys.stderr)
+            return 1
+        print(json.dumps(counts, sort_keys=True))
+        return 0
     tasks = batch_state_dir / "tasks"
     if not tasks.is_dir():
         print(json.dumps({"error": "task store not found"}), file=sys.stderr)
