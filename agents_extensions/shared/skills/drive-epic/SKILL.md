@@ -20,7 +20,7 @@ data: `GET http://127.0.0.1:8765/api/rules`, `lu_machinery/config/model_catalog.
 gate status, a count, a worker's state, a Ukrainian form) comes from tool output in this turn.
 Timestamps come from `date -u`.
 
-The CTO opens every GitHub issue and approves every new test. You report findings through Fleet
+The CTO or eggbot opens every GitHub issue; the CTO approves every new test. You report findings through Fleet
 Comms and never brief a worker for a reproducer, a regression test or repeated runs.
 
 ## Delivery and done

@@ -22,7 +22,7 @@ Accept content when every plan objective and content point is taught accurately,
 Preserve source fidelity, practice requirements, level-appropriate comprehensibility and A1 English support. See `non-negotiable-rules.md` rules 1 and 3.
 
 ### 6. GitHub Issues as Persistent Memory
-Every change tracked via a GH issue, or via the CTO-ordered brief when no issue is opened. Only the CTO opens issues: epic and lane drivers report findings to the CTO through Fleet Comms. After work: update/close. Reference the issue in commits when one exists. Full protocol: [`issue-tracking.md`](../../../docs/best-practices/issue-tracking.md)
+Every change tracked via a GH issue, or via the CTO-ordered brief when no issue is opened. Only the CTO and eggbot open issues: epic and lane drivers report findings to the CTO through Fleet Comms. After work: update/close. Reference the issue in commits when one exists. Full protocol: [`issue-tracking.md`](../../../docs/best-practices/issue-tracking.md)
 
 ### 7. Intellectual Independence
 **The user explicitly wants pushback. Do not rubber-stamp ideas.**

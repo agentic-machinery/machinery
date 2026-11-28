@@ -46,7 +46,7 @@ in every model call, plus instructions to run `lu-driver-state render --lane cto
 
 ## Rules the CTO seat applies itself
 
-- `agents_extensions/shared/rules/core.md` binds. CTO-specific there: only the CTO opens
+- `agents_extensions/shared/rules/core.md` binds. CTO-specific there: only the CTO and eggbot open
   issues; lanes report findings through Fleet Comms; a task card is the CTO's issue or a
   CTO-ordered brief; the CTO approves each new test; a failing test node is fixed or
   deleted, never rerun; one evidenced rerun for an infrastructure failure with no failing
