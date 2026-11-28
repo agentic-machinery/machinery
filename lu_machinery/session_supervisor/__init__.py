@@ -26,7 +26,7 @@ if __package__ in (None, ""):  # run as a file: put the repository root on sys.p
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     __package__ = "lu_machinery.session_supervisor"
 
-from lu_machinery.session_streams.db import SessionStreamDatabase
+from lu_machinery.session_streams.db import SessionStreamDatabase, SessionStreamDatabaseError
 from lu_machinery.session_streams.handoff import diagnose_handoff, remote_lease_reason
 from lu_machinery.session_streams.hooks import clean_exit_hook, lease_from_environment
 from lu_machinery.session_streams.model import (
@@ -388,33 +388,62 @@ class SessionSupervisor:
             digest_limit=digest_limit,
         )
 
-    def release_driver(
+    def release_driver(self, *, role: LaunchRole | str, lease: Lease) -> dict[str, Any]:
+        self._require_driver(role)
+        if self.remote is None:
+            state = self.close_driver(role=role, lease=lease)
+            return {"action": "release", "state": state, "stream_id": lease.stream_id}
+        return self.remote.release(lease)
+
+    def force_release_driver(
         self,
         *,
         role: LaunchRole | str,
-        lease: Lease | None = None,
-        stream_id: str | None = None,
-        force: bool = False,
-        actor_agent: str | None = None,
-        actor_host_id: str | None = None,
-        reason: str | None = None,
+        stream_id: str | None,
+        actor_agent: str | None,
+        actor_host_id: str | None,
+        reason: str | None,
     ) -> dict[str, Any]:
+        """Release a stream's active Monitor lease as an attributed operator action.
+
+        Monitor's HTTP API refuses force release: a loopback peer is any local process, not an operator.
+        This writes Monitor's own lease store on the Monitor host, with the operator receipt Monitor records,
+        and refuses where that store is absent (machinery-infra#1659).
+        """
+        from lu_machinery.api.occupancy_sanitize import (  # lazy-ok: API sanitizers only for --force
+            opaque_host_id,
+            safe_field,
+        )
+
         self._require_driver(role)
         if self.remote is None:
-            if force:
-                raise SupervisorError("--force release requires the remote Monitor API")
-            if lease is None:
-                raise SupervisorError("release requires the exact lease")
-            state = self.close_driver(role=role, lease=lease)
-            return {"action": "release", "state": state, "stream_id": lease.stream_id}
-        return self.remote.release(
-            lease,
+            raise SupervisorError("--force release acts on the Monitor host's lease store; drop --local")
+        if not stream_id:
+            raise SupervisorError("--force requires --stream")
+        if not (isinstance(actor_agent, str) and actor_agent and safe_field(actor_agent, role="task_id") == actor_agent):
+            raise SupervisorError("--force requires a valid --actor-agent")
+        if not isinstance(actor_host_id, str) or not opaque_host_id(actor_host_id):
+            raise SupervisorError("--force requires an opaque --actor-host-id")
+        if not isinstance(reason, str) or not reason.strip():
+            raise SupervisorError("--force requires --reason")
+        try:
+            database = SessionStreamDatabase()
+        except SessionStreamDatabaseError as exc:
+            raise SupervisorError(f"--force release cannot locate the Monitor lease store: {exc}") from exc
+        if not database.path.is_file():
+            raise SupervisorError("--force release runs only on the Monitor host: its lease store is absent here")
+        released = SessionStreamStore(database).force_release_remote_session(
             stream_id=stream_id,
-            force=force,
             actor_agent=actor_agent,
             actor_host_id=actor_host_id,
-            reason=reason,
+            reason=reason.strip(),
         )
+        return {
+            "action": "release",
+            "outcome": "force_released",
+            "stream_id": released.stream_id,
+            "generation": released.generation,
+        }
 
     def recover_expired_driver(
         self,
@@ -618,7 +647,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     release = commands.add_parser("release", help="Release an exact lease or an explicitly attributed force lease.")
     release.add_argument("--role", required=True, choices=tuple(LaunchRole))
-    release.add_argument("--force", action="store_true")
+    release.add_argument(
+        "--force",
+        action="store_true",
+        help="Attributed operator release of the stream's active lease; runs only on the Monitor host.",
+    )
     release.add_argument("--stream", default=None)
     release.add_argument("--actor-agent", default=None)
     release.add_argument("--actor-host-id", default=None)
@@ -727,10 +760,9 @@ def main(argv: list[str] | None = None) -> int:
             )
         elif args.command == "release":
             if args.force:
-                payload = supervisor.release_driver(
+                payload = supervisor.force_release_driver(
                     role=args.role,
                     stream_id=args.stream,
-                    force=True,
                     actor_agent=args.actor_agent,
                     actor_host_id=args.actor_host_id,
                     reason=args.reason,
@@ -744,7 +776,7 @@ def main(argv: list[str] | None = None) -> int:
                 digest_limit=args.digest_limit,
                 lease=lease_from_environment() if args.role == LaunchRole.DRIVER else None,
             ).as_dict()
-    except (SessionStreamError, SupervisorError, RemoteSupervisorError, ValueError) as exc:
+    except (SessionStreamError, SessionStreamDatabaseError, SupervisorError, RemoteSupervisorError, ValueError) as exc:
         print(f"session-supervisor: {exc}", file=sys.stderr)
         return 4
     print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))

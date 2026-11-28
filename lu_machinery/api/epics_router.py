@@ -52,6 +52,9 @@ router = APIRouter()
 logger = logging.getLogger(__name__)
 
 SCHEMA = "remote-epic-lifecycle.v1"
+FORCE_RELEASE_REFUSAL = (
+    "force release is operator-only: run `session_supervisor release --force` on the Monitor host"
+)
 _EPIC_LIST_TTL_S = 5.0
 
 
@@ -1065,32 +1068,13 @@ def remote_release(
     denied = _check_mutation_peer(request)
     if denied is not None:
         return denied
+    if "force" in body:
+        # A loopback peer is any local process, not an operator: force release is an attributed operator
+        # action and runs only through the session supervisor CLI on the Monitor host (machinery-infra#1659).
+        return _error(403, FORCE_RELEASE_REFUSAL)
     try:
         stream_id = _epic_stream(stream_id)
         store = _store(ctx)
-        if body.get("force") is True:
-            actor_agent = _token(body.get("actor_agent"), "actor_agent")
-            actor_host_id = _host(body.get("actor_host_id"))
-            reason = body.get("reason")
-            if not isinstance(reason, str) or not reason.strip():
-                raise ValueError("reason is required")
-            validate_entry_body(reason.strip())
-            released = store.force_release_remote_session(
-                stream_id=stream_id,
-                actor_agent=actor_agent,
-                actor_host_id=actor_host_id,
-                reason=reason.strip(),
-            )
-            return JSONResponse(
-                content={
-                    "schema": SCHEMA,
-                    "outcome": "force_released",
-                    "lease": _lease_payload(
-                        released, projection_state="released", session_state="closed", now=utc_now()
-                    ),
-                },
-                headers={"Cache-Control": "no-store"},
-            )
         lease = _lease_from_payload({**body, "stream_id": stream_id})
         if lease.stream_id != stream_id:
             raise ValueError("stream mismatch")

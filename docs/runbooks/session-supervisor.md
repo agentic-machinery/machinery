@@ -282,6 +282,11 @@ once that successor claim commits. Remote unavailability fails closed.
 
 Clean exits release only their exact lease envelope. Attributed `release --force`
 is an exceptional, separately authorized operator action, never automatic recovery.
+It runs only on the Monitor host: the CLI writes Monitor's own lease store
+(the canonical session-stream database) with the `force_closed` operator receipt,
+and refuses with exit 4 where that store is absent or with `--local`. Monitor's
+HTTP release route refuses any request carrying `force` with 403, because a
+loopback peer is any local process, not an operator.
 
 ### Dispatch-turn lease recovery (DRIVERS-1122)
 
