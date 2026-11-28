@@ -2874,10 +2874,44 @@ class AuthorityService:
         )
         return True
 
+    @staticmethod
+    def _session_only_launcher_inbox(name: str) -> bool:
+        """True when a drain reads ``name`` only while a launcher session is up.
+
+        That is a registry slot, a recipient alias (``resolve_recipient_alias``
+        returns another name), or a driver-lane sender. A bare static identity
+        that is none of those stays with the standing check. An unreadable
+        slot registry, alias roster, or lane registry fails closed: the notice
+        is not queued back to ``name``.
+        """
+        from lu_machinery import agent_identity
+        from lu_machinery.ops import driver_lanes
+
+        try:
+            slots = set(agent_identity._load_registry_slots(strict=True))
+        except Exception as exc:
+            _LOG.warning("launcher inbox check unreadable: %s", type(exc).__name__)
+            return True
+        if name in slots:
+            return True
+        try:
+            resolved = agent_identity.resolve_recipient_alias(name, strict=True)
+        except Exception as exc:
+            _LOG.warning("launcher inbox check unreadable: %s", type(exc).__name__)
+            return True
+        if resolved != name:
+            return True
+        try:
+            senders = {lane.sender for lane in driver_lanes.load_registry().lanes}
+        except Exception as exc:
+            _LOG.warning("launcher inbox check unreadable: %s", type(exc).__name__)
+            return True
+        return name in senders
+
     def _notify_coordinator_reply_failure_tx(
         self, delivery_id: str, *, reason_code: str, session_via_durable_cto: bool = False,
     ) -> bool:
-        """Notify both parties of a failed coordinator reply.
+        """Notify the durable CTO, and the original recipient when a drain still reads it.
 
         With ``session_via_durable_cto`` a stored session-specific CTO recipient,
         which admission refuses as a new target, is notified only through the
@@ -2899,10 +2933,13 @@ class AuthorityService:
             return True
         # Notifications have a different sender, so their own expiry cannot recurse.
         # The original recipient is told only if a drain still reads it (#594).
+        # A launcher slot is registered, but nothing reads it between sessions, so
+        # a copy queued there is the next week's dead letter (machinery-infra#1628).
         recipient = str(row["recipient"])
+        standing = _recipient_standing(recipient, _load_recipient_roster())
         if session_via_durable_cto and is_session_cto_recipient(recipient):
             parties: tuple[str, ...] = (DURABLE_CTO_RECIPIENT,)
-        elif _recipient_standing(recipient, _load_recipient_roster()) in {"registered", "live_task"}:
+        elif standing == "live_task" or (standing == "registered" and not self._session_only_launcher_inbox(recipient)):
             parties = (recipient, DURABLE_CTO_RECIPIENT)
         else:
             parties = (DURABLE_CTO_RECIPIENT,)
