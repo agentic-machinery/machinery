@@ -10,6 +10,7 @@ import unicodedata
 import uuid
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager, suppress
+from dataclasses import replace
 from datetime import datetime, timedelta
 from functools import lru_cache
 from pathlib import Path
@@ -993,8 +994,12 @@ class SessionStreamStore:
         lease: Lease,
         *,
         now: datetime | None = None,
-    ) -> SessionState:
-        """Release an exact remote lease, fencing historical predecessors."""
+    ) -> Lease:
+        """Release an exact remote lease, fencing historical predecessors.
+
+        Returns the released lease as this transaction left it, a replay included.
+        The supplied lease is identity only: its timestamps are never returned.
+        """
         lease.holder.validate()
         current_time = now or utc_now()
         timestamp = isoformat_z(current_time)
@@ -1023,7 +1028,7 @@ class SessionStreamStore:
             if not matches:
                 raise LeaseConflictError("supplied remote lease is not the current fenced lease")
             if row["state"] == "released":
-                return SessionState.CLOSED
+                return self._lease_from_row(row)
             release_proof = {
                 "kind": "remote_epic_release.v1",
                 "session_id": lease.session_id,
@@ -1060,7 +1065,8 @@ class SessionStreamStore:
                 "WHERE stream_id = ? AND session_id = ?",
                 (timestamp, timestamp, lease.stream_id, lease.session_id),
             )
-        return SessionState.CLOSED
+            released = replace(self._lease_from_row(row), version=int(row["version"]) + 1)
+        return released
 
     def heartbeat(
         self,

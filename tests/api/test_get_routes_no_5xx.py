@@ -28,12 +28,13 @@ import time
 from collections.abc import Iterator
 from contextlib import asynccontextmanager
 from pathlib import Path
+from urllib.parse import quote, urljoin
 
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from lu_machinery.api import config, epics_router
+from lu_machinery.api import config, docs_router, epics_router
 from lu_machinery.api.epics_router import seed_manifest_inventory
 from lu_machinery.api.fleet_workers_collect import reset_workers_payload_cache
 from lu_machinery.api.fleet_workers_router import workers_snapshot
@@ -337,3 +338,92 @@ def test_parameter_free_get_on_a_never_fetched_checkout_is_not_5xx(
     if expected is not None:
         dialed = sockets.dialed[start:]
         assert set(dialed) == {expected}, f"{route} dialed {dialed}, expected port {expected}"
+
+
+def test_artifacts_listing_is_paginated(tmp_path: Path) -> None:
+    """Defect class: a listing returns everything in one response, or its pager skips, repeats or breaks links."""
+    reports = tmp_path / "docs" / "reports"
+    reports.mkdir(parents=True)
+    page = docs_router.LISTING_PAGE_SIZE
+    names = [f"report-{number:04}.md" for number in range(2 * page + 5)]
+    for name in (*names, ".hidden.md"):
+        (reports / name).write_text("# report\n", encoding="utf-8")
+    ctx = fixture_context(tmp_path).with_roots(effective_roots={"docs/reports": reports})
+    app = create_app(ctx, lifespan=_no_lifespan, product=ProductContribution())
+    client = TestClient(app)
+
+    for first in ("/artifacts/docs/reports?format=json", "/files/docs/reports"):
+        url = first
+        pages = [client.get(url).json()]
+        urls = [url]
+        while pages[-1]["next"] is not None:
+            url = urljoin(url, pages[-1]["next"])
+            pages.append(client.get(url).json())
+            urls.append(url)
+        assert [(row["offset"], row["items_count"], row["total"]) for row in pages] == [
+            (0, page, len(names)), (page, page, len(names)), (2 * page, 5, len(names)),
+        ]
+        assert [item["name"] for row in pages for item in row["items"]] == names
+        assert pages[0]["previous"] is None
+        for cur_url, later, earlier in zip(urls[:0:-1], pages[:0:-1], pages[-2::-1], strict=True):
+            assert client.get(urljoin(cur_url, later["previous"])).json()["items"] == earlier["items"]
+
+    # Pages sit on one grid: "previous" then "next" restores the same page at the same size.
+    mid_url = "/files/docs/reports?limit=3&offset=6"
+    middle = client.get(mid_url).json()
+    prev_url = urljoin(mid_url, middle["previous"])
+    prev_page = client.get(prev_url).json()
+    restored = client.get(urljoin(prev_url, prev_page["next"])).json()
+    assert restored == middle
+    # Past the end, aligned: "previous" is the last page with rows (205 rows end at offset 204).
+    for offset in (207, 999):
+        beyond_url = f"/files/docs/reports?limit=3&offset={offset}"
+        beyond = client.get(beyond_url).json()
+        back = client.get(urljoin(beyond_url, beyond["previous"])).json()
+        assert (beyond["items_count"], beyond["next"], back["offset"]) == (0, None, 204), offset
+        assert [item["name"] for item in back["items"]] == names[204:], offset
+    # An offset off the grid is refused with its reason on both mounts, never served as a page of another size.
+    for base in ("/files/docs/reports?", "/artifacts/docs/reports?format=json&"):
+        for query in ("limit=3&offset=1", "limit=3&offset=4", "offset=1"):
+            refused = client.get(f"{base}{query}")
+            assert (refused.status_code, refused.json()["detail"]) == (422, "offset must be a multiple of limit"), (base, query)
+
+    for query in (f"limit={docs_router.LISTING_PAGE_MAX + 1}", "limit=0", "offset=-1"):
+        assert client.get(f"/files/docs/reports?{query}").status_code == 422, query
+
+    complete = docs_router.collect_artifacts(ctx=ctx)
+    assert (complete["total"], len(complete["artifacts"])) == (len(names), len(names))
+    parts = [docs_router.collect_artifacts(limit=page, offset=at, ctx=ctx) for at in range(0, len(names), page)]
+    assert [part["total"] for part in parts] == [len(names)] * 3
+    assert [row for part in parts for row in part["artifacts"]] == complete["artifacts"]
+    unaligned = docs_router.collect_artifacts(limit=3, offset=1, ctx=ctx)
+    assert (unaligned["total"], unaligned["artifacts"]) == (len(names), complete["artifacts"][1:4])
+    with pytest.raises(ValueError, match="limit must be at least 1"):
+        docs_router.collect_artifacts(limit=0, ctx=ctx)
+
+    # Query-only relative links survive production OPSEC sanitization on delimiter/root-like paths
+    # and never echo arbitrary extra query parameters.
+    for rel_dir in ("Q?A #1 100%", "Résumé/tmp/notes", "100%/home/notes"):
+        sub = reports / rel_dir
+        sub.mkdir(parents=True)
+        for number in range(3):
+            (sub / f"{number}.md").write_text("# report\n", encoding="utf-8")
+        encoded_rel = "/".join(quote(part, safe="") for part in rel_dir.split("/"))
+        for prefix, fmt in (("/files", None), ("/artifacts", "json")):
+            fmt_q = f"format={fmt}&" if fmt else ""
+            cur = f"{prefix}/docs/reports/{encoded_rel}?{fmt_q}limit=1&offset=1&extra=/tmp/leak"
+            resp = client.get(cur)
+            assert resp.status_code == 200, (cur, resp.text)
+            body = resp.json()
+            assert body["previous"] == f"?{fmt_q}limit=1&offset=0", (cur, body["previous"])
+            assert body["next"] == f"?{fmt_q}limit=1&offset=2", (cur, body["next"])
+            for link, expected_offset, expected_name in (
+                (body["previous"], 0, "0.md"),
+                (body["next"], 2, "2.md"),
+            ):
+                follow = client.get(urljoin(cur, link))
+                assert follow.status_code == 200, (cur, link, follow.text)
+                followed = follow.json()
+                assert (followed["offset"], [item["name"] for item in followed["items"]]) == (
+                    expected_offset, [expected_name],
+                )

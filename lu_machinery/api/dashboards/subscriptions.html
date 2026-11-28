@@ -46,16 +46,22 @@ const {
   subscriptionChips, createPanelRunner,
 } = Machinery;
 
+// A provider's unset reset time arrives as the Unix epoch: at or before it, no reset was reported.
+function reportedReset(value) {
+  const moment = toDate(value);
+  return moment && moment.getTime() > 0 ? moment : null;
+}
+
 function resetText(window) {
   if (!window || window.status !== "ok") return null;
-  if (!toDate(window.resets_at)) return "reset not reported";
+  if (!reportedReset(window.resets_at)) return "reset not reported";
   if (window.reset_passed || toDate(window.resets_at) <= Date.now()) return `${utc(window.resets_at)} (passed; awaiting a new reading)`;
   return `${utc(window.resets_at)} (${relative(window.resets_at)})`;
 }
 
 function weeklyResetCell(window) {
   if (!window || window.status !== "ok") return text("unknown", "muted");
-  if (!toDate(window.resets_at)) return text("not reported", "muted");
+  if (!reportedReset(window.resets_at)) return text("reset not reported", "muted");
   if (window.reset_passed || toDate(window.resets_at) <= Date.now()) return text(`passed; awaiting a new reading (${utc(window.resets_at)})`, "warn");
   return td(`<strong>${escapeHtml(relative(window.resets_at))}</strong> <br><span class="muted">${escapeHtml(utc(window.resets_at))}</span>`);
 }
