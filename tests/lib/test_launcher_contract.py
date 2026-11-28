@@ -47,7 +47,12 @@ from tests.rules_core_view import (
 
 CURRENT_SOL = current_sol()
 
-pytestmark = [pytest.mark.usefixtures("configured_roots"), pytest.mark.usefixtures("hermetic_monitor"), pytest.mark.usefixtures("isolated_monitor_state")]
+pytestmark = [
+    pytest.mark.usefixtures("configured_roots", "hermetic_monitor", "isolated_monitor_state"),
+    # Keep CI's timeout budget, but report an ordinary failure if it expires.
+    # pytest-timeout's thread method exits the entire xdist worker.
+    pytest.mark.timeout(method="signal"),
+]
 
 REPO = Path(__file__).resolve().parents[2]
 # The checkout run_launcher starts launchers from; rules_core_absent tests get a
@@ -69,6 +74,32 @@ PUBLIC = (
 def _install_claude_usage_fixture(root: Path) -> None:
     """Supply usage only in copied fixtures; production has no test bypass."""
     (root / "lu_machinery/lib/claude_weekly_used.py").write_text("print('0')\n", encoding="utf-8")
+
+
+def _run_launcher_process(
+    command: list[str],
+    *,
+    env: dict[str, str],
+    timeout: float,
+    cwd: Path | None = None,
+) -> subprocess.CompletedProcess[str]:
+    """Keep launcher group signals and timeout cleanup away from pytest."""
+    with subprocess.Popen(
+        command,
+        cwd=cwd,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    ) as process:
+        try:
+            stdout, stderr = process.communicate(timeout=timeout)
+        except BaseException:
+            with suppress(ProcessLookupError):
+                os.killpg(process.pid, signal.SIGKILL)
+            raise
+    return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
 
 
 def run_launcher(
@@ -116,13 +147,10 @@ def run_launcher(
             rest = path[len(prefix) :]
             launch_env["PATH"] = f"{prefix}{manager_guard(Path(guard) / 'bin')}{os.pathsep}{rest}"
             launch_env["LU_TEST_REAL_MANAGER_CONTACT"] = str(contact)
-        result = subprocess.run(
+        result = _run_launcher_process(
             [str(launch_root / name), *args],
             cwd=launch_root,
             env=launch_env,
-            text=True,
-            capture_output=True,
-            check=False,
             timeout=30,
         )
         if contact.exists():
@@ -416,13 +444,10 @@ launcher_adapter_exec() { printf 'PROVIDER_EXEC\\n'; }
 def test_canary_failure_closes_lease_and_refuses_driver_launch(tmp_path: Path) -> None:
     launcher, claim_marker, close_marker = _core_canary_failure_fixture(tmp_path)
     env = launcher_environment()
-    result = subprocess.run(
+    result = _run_launcher_process(
         ["bash", os.fspath(launcher), "--epic", "devops"],
         cwd=launcher.parent,
         env=env,
-        capture_output=True,
-        text=True,
-        check=False,
         timeout=30,
     )
 
@@ -477,8 +502,8 @@ def _wait_for_launcher_readiness(
         if process.poll() is not None:
             break
         time.sleep(0.05)
-    if process.poll() is None:
-        process.kill()
+    with suppress(ProcessLookupError):
+        os.killpg(process.pid, signal.SIGKILL)
     stdout, stderr = process.communicate(timeout=10)
     missing = ", ".join(os.fspath(path) for path in ready_paths if not path.is_file())
     pytest.fail(
@@ -690,6 +715,10 @@ def test_restarted_watcher_retains_same_delivery_until_successor_cli_recovers(tm
     events = tmp_path / "events"
     ready = tmp_path / "ready"
     polls = tmp_path / "polls"
+    state = tmp_path / "state"
+    state.mkdir(mode=0o700)
+    binding = tmp_path / "watcher-state.json"
+    binding.write_text(json.dumps({"schema": "machinery.sandbox-state.v1", "state_root": str(state)}))
     plane = tmp_path / "fleet"
     cli = tmp_path / "bin with spaces" / "fixture-cli"
     cli.parent.mkdir()
@@ -713,12 +742,14 @@ while :; do sleep 0.05; done
     harness.write_text(
         f"""import sys, time
 from datetime import UTC, datetime, timedelta
+from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 sys.path.insert(0, {str(REPO)!r})
 sys.path.insert(0, {str(REPO / "lu_machinery")!r})
 from lu_machinery.ai_agent_bridge import _inbox_watch
+from lu_machinery.fleet_comms.authority import AuthorityService
 
 ready = Path({str(ready)!r})
 while not ready.exists(): time.sleep(0.01)
@@ -745,6 +776,8 @@ def tick(*args, **kwargs):
 with (
     patch('lu_machinery.session_streams.hooks.lease_from_environment', return_value=lease),
     patch('lu_machinery.session_supervisor.SessionSupervisor', return_value=supervisor),
+    patch('lu_machinery.fleet_comms.authority.AuthorityService',
+          partial(AuthorityService, root=Path({str(plane)!r}))),
     patch.object(_inbox_watch, 'consume_supervisory_event', side_effect=tick),
 ):
     raise SystemExit(_inbox_watch.run_live_supervisory_watcher(interval_seconds=0.05))
@@ -775,12 +808,13 @@ launcher_exec_command fixture-cli
         **launcher_environment(),
         "HOME": str(tmp_path / "home"),
         "PATH": f"{cli.parent}{os.pathsep}{launcher_toolchain_path()}",
-        "FLEET_COMMS_ROOT": str(plane),
-        "LU_STATE_ROOT": str(tmp_path),
+        "LU_HOST_CONTEXT": str(binding),
         "LU_PYTHON": sys.executable,
         "LEARN_UKRAINIAN_PRIMARY_REPO_ROOT": os.environ["LEARN_UKRAINIAN_PRIMARY_REPO_ROOT"],
         "LU_PRODUCT_ROOT": os.environ["LU_PRODUCT_ROOT"],
     }
+    for key in ("FLEET_COMMS_ROOT", "LU_TASKS_DIR", "LU_GITHUB_CACHE_DIR"):
+        del env[key]
     with AuthorityService(root=plane) as service:
         did = service.publish_message(
             sender="fixture-operator",
@@ -831,13 +865,10 @@ def test_driver_normal_exit_closes_with_bounded_idempotent_retry(tmp_path: Path)
         failed_close_attempts=1,
     )
     env = launcher_environment()
-    result = subprocess.run(
+    result = _run_launcher_process(
         ["bash", os.fspath(launcher), "--epic", "devops"],
         cwd=launcher.parent,
         env=env,
-        capture_output=True,
-        text=True,
-        check=False,
         timeout=30,
     )
 
@@ -867,17 +898,24 @@ def test_driver_termination_forwards_signal_and_closes_exact_lease(
     env = launcher_environment()
     original_handler = signal.signal(termination_signal, signal.SIG_DFL)
     try:
-        process = subprocess.Popen(
+        with subprocess.Popen(
             ["bash", os.fspath(launcher), "--epic", "devops"],
             cwd=launcher.parent,
             env=env,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-        )
-        _wait_for_launcher_readiness(process, [child_ready, forward_ready])
-        process.send_signal(termination_signal)
-        stdout, stderr = process.communicate(timeout=_LAUNCHER_READY_TIMEOUT_S)
+            start_new_session=True,
+        ) as process:
+            try:
+                _wait_for_launcher_readiness(process, [child_ready, forward_ready])
+                process.send_signal(termination_signal)
+                stdout, stderr = process.communicate(timeout=_LAUNCHER_READY_TIMEOUT_S)
+            except BaseException:
+                if process.returncode is None:
+                    with suppress(ProcessLookupError):
+                        os.killpg(process.pid, signal.SIGKILL)
+                raise
         assert signal_marker.is_file(), (
             f"provider child never received forwarded signal (rc={process.returncode}):\n{stdout}{stderr}"
         )
@@ -905,13 +943,10 @@ def test_missing_close_environment_fails_fast_without_raw_stderr(
         close_stderr=hostile_stderr,
     )
     env = launcher_environment()
-    result = subprocess.run(
+    result = _run_launcher_process(
         ["bash", os.fspath(launcher), "--epic", "devops"],
         cwd=launcher.parent,
         env=env,
-        capture_output=True,
-        text=True,
-        check=False,
         timeout=30,
     )
 
@@ -937,13 +972,10 @@ def test_provider_nonzero_with_close_failure_keeps_provider_exit_and_classifies(
         close_stderr=hostile_stderr,
     )
     env = launcher_environment()
-    result = subprocess.run(
+    result = _run_launcher_process(
         ["bash", os.fspath(launcher), "--epic", "devops"],
         cwd=launcher.parent,
         env=env,
-        capture_output=True,
-        text=True,
-        check=False,
         timeout=30,
     )
 
@@ -980,17 +1012,24 @@ def test_signal_forwarding_with_close_failure_keeps_signal_exit_and_classifies(
     env["LC_DRIVER_CLOSE_RETRY_SECONDS"] = "1"
     original_handler = signal.signal(termination_signal, signal.SIG_DFL)
     try:
-        process = subprocess.Popen(
+        with subprocess.Popen(
             ["bash", os.fspath(launcher), "--epic", "devops"],
             cwd=launcher.parent,
             env=env,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-        )
-        _wait_for_launcher_readiness(process, [child_ready, forward_ready])
-        process.send_signal(termination_signal)
-        stdout, stderr = process.communicate(timeout=_LAUNCHER_READY_TIMEOUT_S)
+            start_new_session=True,
+        ) as process:
+            try:
+                _wait_for_launcher_readiness(process, [child_ready, forward_ready])
+                process.send_signal(termination_signal)
+                stdout, stderr = process.communicate(timeout=_LAUNCHER_READY_TIMEOUT_S)
+            except BaseException:
+                if process.returncode is None:
+                    with suppress(ProcessLookupError):
+                        os.killpg(process.pid, signal.SIGKILL)
+                raise
         assert signal_marker.is_file(), (
             f"provider child never received forwarded signal (rc={process.returncode}):\n{stdout}{stderr}"
         )
@@ -1128,13 +1167,10 @@ launcher_adapter_exec() {{ launcher_exec_command {os.fspath(provider)!r}; }}
     with epics_monitor_stub(store) as monitor_url:
         env["LU_MONITOR_LOOPBACK"] = env["DELEGATE_MONITOR_API"] = monitor_url
         bound = bind_launcher_environment(root, env)
-        result = subprocess.run(
+        result = _run_launcher_process(
             ["bash", os.fspath(root / "start-claude-driver.sh"), "--epic", "devops"],
             cwd=root,
             env=bound,
-            capture_output=True,
-            text=True,
-            check=False,
             timeout=30,
         )
     assert result.returncode == 0, result.stderr + result.stdout
@@ -1219,7 +1255,7 @@ LC_DURABLE_HELPER_ROOT={helper_root}
 source {machinery_path('lib/launcher_core.sh')}
 launcher_close_driver_lease
 """
-    result = subprocess.run(["bash", "-c", script], text=True, capture_output=True, check=False, timeout=30, env=launcher_environment(LU_PYTHON=str(stub)))
+    result = _run_launcher_process(["bash", "-c", script], timeout=30, env=launcher_environment(LU_PYTHON=str(stub)))
     assert result.returncode == 0, result.stderr
     body = log.read_text(encoding="utf-8")
     assert "-m\nlu_machinery.session_supervisor\nclose\n--role\ndriver\n" in body
@@ -1656,7 +1692,10 @@ SECONDS=0
 sleep() {{ printf 'delay=%s\n' "$1"; SECONDS=$((SECONDS + $1)); }}
 launcher_close_driver_lease
 """
-    result = subprocess.run(["bash", "-c", script], cwd=REPO, capture_output=True, text=True, timeout=10, env=launcher_environment(LU_PYTHON=str(launcher.parent / ".venv/bin/python")))
+    result = _run_launcher_process(
+        ["bash", "-c", script], cwd=REPO, timeout=10,
+        env=launcher_environment(LU_PYTHON=str(launcher.parent / ".venv/bin/python")),
+    )
     assert result.returncode == (0 if recover else 1), result.stderr
     delays = [int(line.split("=")[1]) for line in result.stdout.splitlines()]
     assert delays[:6] == [1, 2, 4, 8, 16, 30]
@@ -1696,11 +1735,9 @@ def test_watcher_exit_recovery_preserves_provider_and_rejects_false_wakes(
         f"if [ -f {str(first)!r} ]; then touch {str(restarted)!r}; exec sleep 300; fi\n"
         f"touch {str(first)!r}\n" + ('kill -USR1 "$PPID"\n' if notify else "") + f"exit {watcher_exit}\n",
     )
-    result = subprocess.run(
+    result = _run_launcher_process(
         ["bash", str(launcher), "--epic", "devops"],
         cwd=launcher.parent,
-        capture_output=True,
-        text=True,
         timeout=10,
         env=launcher_environment(),
     )
@@ -1751,7 +1788,9 @@ fi
             assert process.poll() is None
             time.sleep(0.05)
         assert heartbeats.exists() and owner.exists()
-        os.kill(int(owner.read_text()), signal.SIGKILL)
+        launcher_pid = int(owner.read_text())
+        assert launcher_pid > 1 and os.getsid(launcher_pid) == process.pid
+        os.kill(launcher_pid, signal.SIGKILL)
         assert process.wait(timeout=10) == 137
         # Give an in-flight request time to finish, then observe two intervals.
         time.sleep(0.3)
