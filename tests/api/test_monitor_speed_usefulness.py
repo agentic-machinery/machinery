@@ -275,6 +275,7 @@ let apiFetchedAt = '2026-11-28T00:45:01Z';
 let generatedAt = '2026-11-28T01:00:00Z';
 let cachedDataAgeS = 0;
 let cachedApiAgeS = 899;
+let subResetAt = '2099-01-02T03:04:00Z';
 globalThis.fetch = async (url) => {
   const s = String(url);
   if (s.startsWith('/api/state/routing-budget')) {
@@ -298,6 +299,30 @@ globalThis.fetch = async (url) => {
           claude: {freshness: 'fresh', age_s: 30, status: 'cool', stale: false},
           cursor: {freshness: 'fresh', age_s: 30, status: 'need_login', login_state: 'NEED_LOGIN', probe_state: 'NEED_LOGIN', stale: false},
         }
+      : poolMode === 'need_probe_hot_only'
+      ? {
+          cursor: {
+            freshness: 'fresh', age_s: 30, status: 'hot', stale: false,
+            login_state: 'authenticated', probe_state: 'NEED_PROBE',
+            provider_windows: {auto: {used_pct: null, remaining_pct: null}, api: {used_pct: null, remaining_pct: null}},
+            runtime: {headroom_blocked: true},
+          },
+        }
+      : poolMode === 'need_probe_hot_mixed'
+      ? {
+          claude: {freshness: 'fresh', age_s: 30, status: 'cool', stale: false, remaining_pct: 70},
+          cursor: {
+            freshness: 'fresh', age_s: 30, status: 'hot', stale: false,
+            login_state: 'authenticated', probe_state: 'NEED_PROBE',
+            provider_windows: {auto: {used_pct: null, remaining_pct: null}, api: {used_pct: null, remaining_pct: null}},
+            runtime: {headroom_blocked: true},
+          },
+        }
+      : poolMode === 'shared_grok_cursor_near_cap'
+      ? {
+          grok: {freshness: 'fresh', age_s: 30, status: 'near_cap', stale: false, remaining_pct: 0, pool_pace: {pool: 'grok', status: 'near_cap', stale: false}},
+          cursor: {freshness: 'fresh', age_s: 30, status: 'near_cap', stale: false, probe_state: 'NEED_PROBE', provider_windows: {auto: {used_pct: null, remaining_pct: null}, api: {used_pct: null, remaining_pct: null}}, pool_pace: {pool: 'grok', status: 'near_cap', stale: false}},
+        }
       : {
           claude: {freshness: 'fresh', age_s: 599, status: 'cool', stale: false},
         };
@@ -318,7 +343,7 @@ globalThis.fetch = async (url) => {
             accounts: [{
               account: 'Claude a',
               reading: {status: 'fresh', age_s: 899, read_at: '2026-11-28T00:45:01Z'},
-              weekly: {status: 'ok', left_pct: 73, resets_at: '2099-01-02T03:04:00Z'},
+              weekly: {status: 'ok', left_pct: 73, resets_at: subResetAt},
               pace: {status: 'ok', state: 'reserve', headroom_pct: 14, lasts_to_reset: true},
               plan: {status: 'ok'},
             }],
@@ -391,19 +416,42 @@ const models = (() => {
     models.PANELS[0].onTick(models.PANELS[0], models.runner.latest, updateChips, fakeNow);
     assert.doesNotMatch(document.getElementById('usage-content').innerHTML, /55\.00|12\.00/);
     cachedDataAgeS = 306;
+    cachedApiAgeS = 905;
     await models.runner.loadPanel(models.PANELS[0]);
     updateChips();
     assert.doesNotMatch(document.getElementById('usage-content').innerHTML, /55\.00|12\.00/, 'F3: cached poll must not revive expired API balance');
-    // Even a fresh observation whose server cache lag already puts it past 900s is hidden on first paint.
+    // Server-aged cached snapshot hides expired balance immediately on first paint.
     generatedAt = '2026-11-28T01:10:00Z';
     apiFetchedAt = '2026-11-28T01:00:01Z';
-    cachedApiAgeS = 599;
+    cachedApiAgeS = 905;
     cachedDataAgeS = 306;
     await models.runner.loadPanel(models.PANELS[0]);
     assert.doesNotMatch(document.getElementById('usage-content').innerHTML, /55\.00|12\.00/, 'F3: pre-aged cached server snapshot hides expired balance immediately');
+    // F3 cross-generation guard: switching generated_at while diagnostics jumps from 1s ledger to 401s CodexBar
+    // must NOT over-age a 550s -> 582s API reading past 900s.
+    monoNow = 400000;
+    generatedAt = '2026-11-28T01:11:00Z';
+    apiFetchedAt = '2026-11-28T01:01:50Z';
+    cachedApiAgeS = 550;
+    cachedDataAgeS = 1;
+    await models.runner.loadPanel(models.PANELS[0]);
+    assert.match(document.getElementById('usage-content').innerHTML, /55\.00 USD balance/);
+    monoNow += 32000;
+    generatedAt = '2026-11-28T01:11:32Z';
+    cachedApiAgeS = 582;
+    cachedDataAgeS = 401;
+    await models.runner.loadPanel(models.PANELS[0]);
+    assert.match(document.getElementById('usage-content').innerHTML, /55\.00 USD balance/, 'F3: cross-generation diag jump must not suppress fresh API balance');
+    // #1574 Unix-epoch reset guard carried onto models.html.
+    subResetAt = '1970-01-01T00:00:00Z';
+    await models.runner.loadPanel(models.PANELS[0]);
+    assert.match(document.getElementById('usage-content').innerHTML, /reset not reported/);
+    assert.doesNotMatch(document.getElementById('usage-content').innerHTML, /1970-01-01/);
+    subResetAt = '2099-01-02T03:04:00Z';
 
     // F7: Mixed 1 fresh cool pool + 1 stale pool qualifies chip as "0 pools near cap (1 unknown)" with warn tone,
-    // missing sign-in renders "? sign-in unknown", and fresh NEED_LOGIN pools count as unknown coverage.
+    // missing sign-in renders "? sign-in unknown", fresh NEED_LOGIN and authenticated NEED_PROBE with empty
+    // windows + runtime hot count as unknown coverage, and shared Grok+Cursor pool counts once.
     cachedDataAgeS = 0;
     cachedApiAgeS = 60;
     apiFetchedAt = '2026-11-28T01:14:00Z';
@@ -425,6 +473,23 @@ const models = (() => {
     await models.runner.loadPanel(models.PANELS[0]);
     updateChips();
     assert.match(document.getElementById('chips').innerHTML, /chip warn[^>]*><b>0<\/b> pools near cap \(1 unknown\)/);
+
+    poolMode = 'need_probe_hot_only';
+    await models.runner.loadPanel(models.PANELS[0]);
+    updateChips();
+    assert.match(document.getElementById('chips').innerHTML, /chip warn[^>]*><b>\?<\/b> pools near cap unknown/);
+    assert.doesNotMatch(document.getElementById('chips').innerHTML, /<b>0<\/b> pools near cap/);
+
+    poolMode = 'need_probe_hot_mixed';
+    await models.runner.loadPanel(models.PANELS[0]);
+    updateChips();
+    assert.match(document.getElementById('chips').innerHTML, /chip warn[^>]*><b>0<\/b> pools near cap \(1 unknown\)/);
+
+    poolMode = 'shared_grok_cursor_near_cap';
+    await models.runner.loadPanel(models.PANELS[0]);
+    updateChips();
+    assert.match(document.getElementById('chips').innerHTML, /chip warn[^>]*><b>1<\/b> pool near cap<\/a>/);
+    assert.doesNotMatch(document.getElementById('chips').innerHTML, /<b>2<\/b> pools near cap/);
 
     // Non-finite monotonic clock withdraws figures as unknown rather than keeping stale fresh values.
     poolMode = 'all_fresh';

@@ -166,7 +166,7 @@
     <p class="muted" id="subq-credit-balance"><strong>SubQ credit balance.</strong> Not available from the provider.</p>
     <h3 id="capacity">Capacity forecast <span class="age" id="capacity-age">Loading…</span></h3>
     <p id="capacity-status" class="visually-hidden" aria-live="polite" aria-atomic="true"></p>
-    <p class="note">Projected unused allowance assumes the measured burn continues until reset. Additional workers are estimated from write-task allowance readings over seven days.</p>
+    <p class="note">Projected unused allowance assumes the measured burn continues until reset. Additional workers are estimated from write-task allowance readings over seven days. Top blockers, ready-now cards, and blocked issues moved to <a href="/milestones">Milestones</a>.</p>
     <div id="capacity-content">Loading…</div>
   </section>
 
@@ -358,16 +358,22 @@ const {
 
 // ---- Budget now (subscriptions, API balances, Cursor windows, capacity forecast) ----
 
+// A provider's unset reset time arrives as the Unix epoch: at or before it, no reset was reported.
+function reportedReset(value) {
+  const moment = toDate(value);
+  return moment && moment.getTime() > 0 ? moment : null;
+}
+
 function resetText(window) {
   if (!window || window.status !== "ok") return null;
-  if (!toDate(window.resets_at)) return "reset not reported";
+  if (!reportedReset(window.resets_at)) return "reset not reported";
   if (window.reset_passed || toDate(window.resets_at) <= Date.now()) return `${utc(window.resets_at)} (passed; awaiting a new reading)`;
   return `${utc(window.resets_at)} (${relative(window.resets_at)})`;
 }
 
 function weeklyResetCell(window) {
   if (!window || window.status !== "ok") return text("unknown", "muted");
-  if (!toDate(window.resets_at)) return text("not reported", "muted");
+  if (!reportedReset(window.resets_at)) return text("reset not reported", "muted");
   if (window.reset_passed || toDate(window.resets_at) <= Date.now()) return text(`passed; awaiting a new reading (${utc(window.resets_at)})`, "warn");
   return td(`<strong>${escapeHtml(relative(window.resets_at))}</strong> <br><span class="muted">${escapeHtml(utc(window.resets_at))}</span>`);
 }
@@ -417,7 +423,57 @@ const SUBSCRIPTION_HEADERS = ["Account", "Weekly resets", "Weekly left", "Pace",
   "Credits", "Banked resets", "Plan · renews or ends", "Sign-in", "Reading"];
 
 const MEASURED_CAP_STATUSES = new Set(["cool", "warm", "hot", "near_cap"]);
+const LANE_POOL_IDS = {
+  claude: "claude:a",
+  codex: "codex:a",
+  "codex:a": "codex:a",
+  "codex:b": "codex:b",
+  grok: "grok",
+  cursor: "grok",
+  gemini: "agy:gemini",
+};
 const budgetClock = {receivedAt: null, receivedMono: null, heldElapsed: 0, paintedKey: "", apiObs: new Map(), agentObs: new Map()};
+
+function lanePoolId(name, info) {
+  if (typeof info?.pool_pace?.pool === "string" && info.pool_pace.pool) return info.pool_pace.pool;
+  return LANE_POOL_IDS[name] || name;
+}
+
+function budgetPoolEntries(budget) {
+  const entries = [];
+  if (budget?.agents && typeof budget.agents === "object") {
+    for (const [name, info] of Object.entries(budget.agents)) {
+      if (info && typeof info === "object") entries.push([name, info]);
+    }
+  }
+  if (budget?.codex_accounts && typeof budget.codex_accounts === "object") {
+    for (const [name, info] of Object.entries(budget.codex_accounts)) {
+      if (info && typeof info === "object") entries.push([name, info]);
+    }
+  }
+  return entries;
+}
+
+function hasMeasuredProviderWindows(info) {
+  const pw = info?.provider_windows;
+  if (!pw || typeof pw !== "object") return false;
+  return Object.values(pw).some(w => w && typeof w === "object" && (validPct(w.remaining_pct) || validPct(w.used_pct)));
+}
+
+function laneMeasuredCapStatus(info) {
+  if (!info || typeof info !== "object") return null;
+  if (info.probe_state === "NEED_PROBE" || info.codexbar?.probe_state === "NEED_PROBE") return null;
+  const hasProviderWindowsObj = Boolean(info.provider_windows && typeof info.provider_windows === "object");
+  const measuredProviderWindows = hasProviderWindowsObj && hasMeasuredProviderWindows(info);
+  if (hasProviderWindowsObj && !measuredProviderWindows) return null;
+  if (info.codexbar && typeof info.codexbar === "object" && ["unavailable", "unknown", "need_login"].includes(info.codexbar.status)) {
+    return null;
+  }
+  const hasQuotaPct = validPct(info.remaining_pct) || validPct(info.burn_pct_7d) || measuredProviderWindows;
+  if (info.runtime?.headroom_blocked === true && !hasQuotaPct) return null;
+  if (info.status_source === "ledger_burn" && !hasQuotaPct) return null;
+  return typeof info.status === "string" && MEASURED_CAP_STATUSES.has(info.status) ? info.status : null;
+}
 
 function resetBudgetClock(reading = null) {
   budgetClock.receivedAt = typeof reading?.receivedAt === "number" ? reading.receivedAt : null;
@@ -452,22 +508,9 @@ function agedReading(reading, elapsedS = 0) {
   return {...reading, age_s: agedSeconds(reading.age_s, elapsedS)};
 }
 
-function serverCacheLagS(budget) {
-  const diag = budget?.diagnostics;
-  if (!diag || typeof diag !== "object") return 0;
-  const dataAge = diag.data_age_s;
-  if (typeof dataAge !== "number" || !Number.isFinite(dataAge) || dataAge < 0) return 0;
-  if (diag.codexbar_data_available === true && typeof diag.codexbar_max_age_s === "number"
-    && Number.isFinite(diag.codexbar_max_age_s) && diag.codexbar_max_age_s >= 0) {
-    return Math.max(0, dataAge - diag.codexbar_max_age_s);
-  }
-  if (diag.budget_ledger_empty === true || (diag.codexbar_data_available !== true && !diag.records_loaded)) return dataAge;
-  return 0;
-}
-
 function observationKey(budget, row, kind) {
   if (typeof row?.fetched_at === "string" && row.fetched_at) return `f:${row.fetched_at}`;
-  if (typeof budget?.generated_at === "string" && budget.generated_at) return `g:${budget.generated_at}:${row?.age_s ?? ""}`;
+  if (typeof budget?.generated_at === "string" && budget.generated_at) return `g:${budget.generated_at}`;
   if (kind === "api") {
     return `a:${row?.freshness ?? ""}:${row?.age_s ?? ""}:${row?.total_balance ?? ""}:${row?.limit_remaining_usd ?? ""}:${row?.usage_weekly_usd ?? ""}:${row?.balance_probe_state ?? ""}`;
   }
@@ -475,24 +518,33 @@ function observationKey(budget, row, kind) {
 }
 
 function recordObservationMap(map, entries, budget, reading, renderNow, kind) {
+  const gen = typeof budget?.generated_at === "string" && budget.generated_at ? budget.generated_at : null;
   const dataAge = typeof budget?.diagnostics?.data_age_s === "number" && Number.isFinite(budget.diagnostics.data_age_s)
     ? budget.diagnostics.data_age_s : null;
-  const cacheLag = serverCacheLagS(budget);
   const activeNames = new Set();
   for (const [name, row] of entries) {
     if (!row || typeof row !== "object") continue;
     activeNames.add(name);
     const key = observationKey(budget, row, kind);
-    const rowLag = kind === "agent" && name === "cursor" ? 0 : cacheLag;
-    const incomingAge = agedSeconds(row.age_s, rowLag);
+    const incomingAge = row.age_s;
     const prev = map.get(name);
-    if (prev && prev.key === key && typeof incomingAge === "number" && Number.isFinite(incomingAge)) {
-      const diagDelta = dataAge !== null && prev.baseDataAge !== null ? Math.max(0, dataAge - prev.baseDataAge) : 0;
-      prev.minAge = Math.max(prev.minAge, incomingAge, prev.baseAge + diagDelta);
+    if (prev && prev.key === key && typeof incomingAge === "number" && Number.isFinite(incomingAge) && incomingAge >= 0) {
+      const sameGen = gen !== null && prev.gen === gen;
+      if (sameGen) {
+        const diagDelta = dataAge !== null && prev.baseDataAge !== null ? Math.max(0, dataAge - prev.baseDataAge) : 0;
+        prev.minAge = Math.max(prev.minAge, incomingAge, prev.genBaseAge + diagDelta);
+      } else {
+        prev.gen = gen;
+        prev.genBaseAge = incomingAge;
+        prev.baseDataAge = dataAge;
+        prev.minAge = Math.max(prev.minAge, incomingAge);
+      }
     } else {
       map.set(name, {
         key,
+        gen,
         baseAge: incomingAge,
+        genBaseAge: incomingAge,
         minAge: incomingAge,
         startMono: reading && Object.hasOwn(reading, "receivedMono") ? reading.receivedMono : null,
         startWall: typeof reading?.receivedAt === "number" ? reading.receivedAt : renderNow,
@@ -509,14 +561,13 @@ function recordObservationMap(map, entries, budget, reading, renderNow, kind) {
 function recordBudgetObservations(budget, reading, renderNow = Date.now()) {
   if (!budget || typeof budget !== "object") return;
   recordObservationMap(budgetClock.apiObs, Object.entries(budget.api_accounts || {}), budget, reading, renderNow, "api");
-  recordObservationMap(budgetClock.agentObs, Object.entries(budget.agents || {}), budget, reading, renderNow, "agent");
+  recordObservationMap(budgetClock.agentObs, budgetPoolEntries(budget), budget, reading, renderNow, "agent");
 }
 
-function effectiveObservedAgeS(obsMap, name, row, budget, elapsedS = 0, includeCacheLag = true, now = Date.now()) {
+function effectiveObservedAgeS(obsMap, name, row, budget, elapsedS = 0, now = Date.now()) {
   if (typeof row?.age_s !== "number" || !Number.isFinite(row.age_s) || row.age_s < 0) return row?.age_s;
   if (typeof elapsedS !== "number" || !Number.isFinite(elapsedS)) return Number.NaN;
-  const lag = includeCacheLag ? serverCacheLagS(budget) : 0;
-  let effective = agedSeconds(row.age_s, lag + elapsedS);
+  let effective = agedSeconds(row.age_s, elapsedS);
   const entry = obsMap.get(name);
   if (entry && typeof entry.baseAge === "number" && Number.isFinite(entry.baseAge)) {
     let obsElapsed = 0;
@@ -582,7 +633,7 @@ function probeReason(state) {
 function apiRows(budget, elapsedS = 0) {
   const accounts = budget.api_accounts || {};
   return Object.entries(accounts).map(([name, row]) => {
-    const effectiveAge = effectiveObservedAgeS(budgetClock.apiObs, name, row, budget, elapsedS, true);
+    const effectiveAge = effectiveObservedAgeS(budgetClock.apiObs, name, row, budget, elapsedS);
     const state = readingState(row.freshness, effectiveAge, budget.diagnostics?.stale_threshold_s);
     const balance = typeof row.total_balance === "number" ? `${row.total_balance.toFixed(2)} ${row.currency || ""}`.trim() + " balance"
       : typeof row.limit_remaining_usd === "number" ? `$${row.limit_remaining_usd.toFixed(2)} left` : null;
@@ -606,7 +657,7 @@ function apiRows(budget, elapsedS = 0) {
 
 function cursorUsage(budget, elapsedS = 0) {
   const cursor = budget?.agents?.cursor;
-  const effectiveAge = effectiveObservedAgeS(budgetClock.agentObs, "cursor", cursor, budget, elapsedS, false);
+  const effectiveAge = effectiveObservedAgeS(budgetClock.agentObs, "cursor", cursor, budget, elapsedS);
   const freshness = readingState(cursor?.freshness, effectiveAge, budget?.diagnostics?.stale_threshold_s);
   const needsLogin = cursor?.probe_state === "NEED_LOGIN" || cursor?.login_state === "NEED_LOGIN";
   const reason = !budget ? "routing budget did not answer"
@@ -664,11 +715,11 @@ function budgetFreshnessKey(budget, elapsedS = 0) {
   }
   const threshold = budget.diagnostics?.stale_threshold_s;
   for (const [name, row] of Object.entries(budget.api_accounts || {})) {
-    const effectiveAge = effectiveObservedAgeS(budgetClock.apiObs, name, row, budget, elapsedS, true);
+    const effectiveAge = effectiveObservedAgeS(budgetClock.apiObs, name, row, budget, elapsedS);
     parts.push(`a:${name}:${readingState(row?.freshness, effectiveAge, threshold)}`);
   }
-  for (const [name, info] of Object.entries(budget.agents || {})) {
-    const effectiveAge = effectiveObservedAgeS(budgetClock.agentObs, name, info, budget, elapsedS, name !== "cursor");
+  for (const [name, info] of budgetPoolEntries(budget)) {
+    const effectiveAge = effectiveObservedAgeS(budgetClock.agentObs, name, info, budget, elapsedS);
     parts.push(`p:${name}:${readingState(info?.freshness, effectiveAge, threshold)}`);
   }
   return parts.join("|");
@@ -933,16 +984,30 @@ function renderChips(latest, now = Date.now()) {
   }
   if (budget) {
     const threshold = budget.diagnostics?.stale_threshold_s;
-    const agents = budget.agents && typeof budget.agents === "object" ? Object.entries(budget.agents) : [];
-    let verified = 0, nearCap = 0, unknownPools = 0;
-    for (const [name, info] of agents) {
-      if (!info || typeof info !== "object") continue;
-      const effectiveAge = effectiveObservedAgeS(budgetClock.agentObs, name, info, budget, elapsed, name !== "cursor", now);
+    const pools = new Map();
+    for (const [name, info] of budgetPoolEntries(budget)) {
+      const poolId = lanePoolId(name, info);
+      const record = pools.get(poolId) || {verified: false, nearCap: false};
+      const effectiveAge = effectiveObservedAgeS(budgetClock.agentObs, name, info, budget, elapsed, now);
       const st = readingState(info.freshness, effectiveAge, threshold);
       const needsLogin = info.probe_state === "NEED_LOGIN" || info.login_state === "NEED_LOGIN";
-      if (st === "fresh" && !info.stale && !needsLogin && typeof info.status === "string" && MEASURED_CAP_STATUSES.has(info.status)) {
+      if (st === "fresh" && !info.stale && !needsLogin) {
+        const poolPace = info.pool_pace && typeof info.pool_pace === "object" ? info.pool_pace : null;
+        const poolPaceStatus = poolPace && !poolPace.stale && typeof poolPace.status === "string"
+          && MEASURED_CAP_STATUSES.has(poolPace.status) ? poolPace.status : null;
+        const laneStatus = laneMeasuredCapStatus(info);
+        if (poolPaceStatus || laneStatus) {
+          record.verified = true;
+          if (poolPaceStatus === "near_cap" || laneStatus === "near_cap") record.nearCap = true;
+        }
+      }
+      pools.set(poolId, record);
+    }
+    let verified = 0, nearCap = 0, unknownPools = 0;
+    for (const record of pools.values()) {
+      if (record.verified) {
         verified += 1;
-        if (info.status === "near_cap") nearCap += 1;
+        if (record.nearCap) nearCap += 1;
       } else {
         unknownPools += 1;
       }

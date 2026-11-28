@@ -2331,6 +2331,33 @@ def _with_live_codex_failures(payload: dict[str, Any]) -> dict[str, Any]:
     return payload
 
 
+def _age_cached_row(row: Any, delta_s: float, *, threshold: float) -> Any:
+    """Return a copy of one cached routing-budget row with its age advanced by ``delta_s``."""
+    if not isinstance(row, dict):
+        return row
+    updated = dict(row)
+    raw_age = updated.get("age_s")
+    if isinstance(raw_age, (int, float)) and not isinstance(raw_age, bool) and raw_age >= 0:
+        aged = float(raw_age) + delta_s
+        updated["age_s"] = aged
+        if aged > threshold:
+            if updated.get("freshness") == "fresh":
+                updated["freshness"] = "stale"
+            if updated.get("stale") is False:
+                updated["stale"] = True
+    nested = updated.get("codexbar")
+    if isinstance(nested, dict):
+        updated["codexbar"] = _age_cached_row(nested, delta_s, threshold=threshold)
+    return updated
+
+
+def _age_cached_rows(rows: Any, delta_s: float, *, threshold: float) -> Any:
+    """Advance ``age_s`` on every mapping entry without mutating the cached snapshot."""
+    if not isinstance(rows, dict):
+        return rows
+    return {name: _age_cached_row(row, delta_s, threshold=threshold) for name, row in rows.items()}
+
+
 def _aged_routing_budget(
     payload: object,
     age_s: float,
@@ -2349,6 +2376,7 @@ def _aged_routing_budget(
     served = _with_live_codex_failures(
         {**payload, **(claude_account_routing_fields() if claude_fields is None else claude_fields)}
     )
+    delta = max(0.0, float(age_s))
     diagnostics = payload.get("diagnostics")
     threshold = ROUTING_BUDGET_MAX_AGE_S
     reported_age = age_s
@@ -2360,8 +2388,15 @@ def _aged_routing_budget(
         extra = float(prior) if isinstance(prior, (int, float)) else 0.0
         reported_age = extra + age_s
         diagnostics["data_age_s"] = round(reported_age, 1)
+        for key in ("codexbar_max_age_s", "notebook_report_max_age_s"):
+            val = diagnostics.get(key)
+            if isinstance(val, (int, float)) and not isinstance(val, bool) and val >= 0:
+                diagnostics[key] = round(float(val) + delta, 1)
         diagnostics["stale"] = bool(diagnostics.get("stale")) or reported_age > threshold
         served["diagnostics"] = diagnostics
+    for section in ("api_accounts", "agents", "codex_accounts"):
+        if section in served:
+            served[section] = _age_cached_rows(served[section], delta, threshold=threshold)
     if reported_age <= threshold:
         return served
     return _withdraw_routing_authorization(served)
@@ -2615,10 +2650,6 @@ def _public_routing_budget(raw: object, *, subscription_age_s: float | None = No
             _public_subscriptions(subscriptions.age_snapshot(snapshot, subscription_age_s))
             if isinstance(snapshot, dict) else None
         )
-        cursor = panel_values.mapping(panel_values.mapping(out.get("agents")).get("cursor"))
-        cursor_age = panel_values.number(cursor.get("age_s"))
-        if cursor_age is not None and cursor_age >= 0:
-            cursor["age_s"] = cursor_age + subscription_age_s
     if "covered_by" in row:
         values = row["covered_by"] if isinstance(row["covered_by"], list) else []
         out["covered_by"] = [value for value in values[:8]
