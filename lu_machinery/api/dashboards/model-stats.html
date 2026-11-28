@@ -189,15 +189,9 @@
   <section><h2>Reviewer strictness <span class="meta" id="review-meta"></span></h2>
     <p class="note">Higher points approve more often, and points farther right report more P0–P2 findings per review with a findings count. Compare similar assignments and read the intervals before calling a reviewer strict or lenient.</p>
     <div id="strictness">Loading…</div></section>
-  <section class="wide" id="planning-section"><h2>Planning</h2>
-    <p class="note" id="planning-coverage" role="status">Loading planning data…</p>
-    <h3>Top blockers</h3>
-    <div id="planning-blockers"></div>
-    <h3>Ready now</h3>
-    <div id="planning-ready"></div>
-    <details><summary>Blocked issues</summary><div id="planning-blocked"></div></details>
-    <h3>Capacity forecast</h3>
-    <p class="note">Projected unused allowance assumes the measured burn continues until reset. Additional workers are estimated from write-task allowance readings over seven days.</p>
+  <section class="wide" id="planning-section"><h2>Capacity forecast</h2>
+    <p class="note">Projected unused allowance assumes the measured burn continues until reset. Additional workers are estimated from write-task allowance readings over seven days. Top blockers, ready-now cards, and blocked issues moved to <a href="/milestones">Milestones</a>.</p>
+    <p class="note" id="planning-coverage" role="status">Loading capacity forecast…</p>
     <div id="planning-pools"></div>
   </section>
   <section id="pools-section"><h2>Pool allowance</h2>
@@ -1216,68 +1210,37 @@ async function loadPools(allowance, generation) {
   }
   updateTableScroll();
 }
-function planningIssue(issue) {
-  if (issue.ref === null) return "Private issue";
-  const label = esc(issue.ref);
-  if (!/^[\w.-]+\/[\w.-]+#[1-9][0-9]*$/.test(issue.ref)) return label;
-  const [repo, number] = issue.ref.split("#");
-  return `<a href="https://github.com/${esc(repo)}/issues/${esc(number)}">${label}</a>`;
-}
 function renderPlanning(data) {
-  const issues = data.issues || {};
-  const coverage = issues.coverage || {};
-  const notes = issues.status === "pending" ? ["Issue data is loading."] :
-    issues.status === "unknown" ? ["Issue data is unavailable."] : [
-      `${num(coverage.repositories_read)} of ${num(coverage.repositories_total)} repositories read. ` +
-      `${num(coverage.open_issues)} open issues examined.`,
-      `${num(coverage.dependency_unknown)} issues have unresolved dependencies.`,
-    ];
-  if (coverage.private_open_issues) notes.push("Private issue details are withheld.");
-  if (issues.status === "stale") notes.push("The issue snapshot is stale.");
-  if (issues.workers === "unknown") notes.push("Worker paths are unavailable. Ready-now results are withheld.");
-  if (issues.workers === "partial") notes.push("Some worker paths are unknown. Affected ready-now results are withheld.");
-  if (coverage.path_conflicts) notes.push(`${num(coverage.path_conflicts)} ready cards overlap a live worker.`);
-  if (coverage.scope_unknown) notes.push(`${num(coverage.scope_unknown)} ready cards have no comparable scope paths. Use explicit file paths or end directory paths with a slash.`);
-  $("planning-coverage").textContent = notes.join(" ");
-  const fill = (id, columns, rows, empty, textColumns) => {
-    $(id).innerHTML = rows.length ? table(columns, rows, textColumns) : `<p class="muted">${esc(empty)}</p>`;
-  };
-  fill("planning-blockers", ["Issue", "Directly blocked", "Total blocked"], (issues.blockers || [])
-    .map(row => `<tr><td>${planningIssue(row)}</td>${cell(row.direct)}${cell(row.total)}</tr>`),
-    "No ranked blockers in the current snapshot.", [0]);
-  fill("planning-ready", ["Issue"], (issues.ready_now || [])
-    .map(row => `<tr><td>${planningIssue(row)}</td></tr>`),
-    "No public issues with closed dependencies and clear paths in the current snapshot.", [0]);
-  fill("planning-blocked", ["Issue", "Open dependencies"], (issues.blocked || [])
-    .map(row => `<tr><td>${planningIssue(row)}</td><td>${row.blocked_by.map(ref => planningIssue({ref})).join(", ")}` +
-      `${row.private_blockers ? ` ${num(row.private_blockers)} private` : ""}</td></tr>`),
-    "No public blocked issues in the current snapshot.", [0, 1]);
-  const pools = data.capacity || [];
-  const pct = value => typeof value === "number" ? `${num(value, 1)}%` : "Unknown";
-  const pace = value => typeof value === "number" ? `${num(value, 2)}%/h` : "Unknown";
-  fill("planning-pools", ["Pool", "Remaining", "Reset (UTC)", "Burn", "Burn needed", "Unused at reset",
-    "Additional workers", "Measured writes"], pools.map(row =>
-    `<tr><td>${esc(row.pool)}</td>${cell(pct(row.remaining_pct))}<td>${esc(row.reset_at || "Unknown")}</td>` +
-    `${cell(pace(row.burn_pct_per_hour))}${cell(pace(row.sustainable_pct_per_hour))}` +
-    `${cell(pct(row.unused_pct))}${cell(row.workers_needed ?? "Unknown")}${cell(row.worker_samples ?? "Unknown")}</tr>`),
-    "Capacity forecast is loading.", [0, 2]);
+  const pools = Array.isArray(data?.capacity) ? data.capacity : [];
+  const pct = value => typeof value === "number" && Number.isFinite(value) ? `${num(value, 1)}%` : "Unknown";
+  const pace = value => typeof value === "number" && Number.isFinite(value) ? `${num(value, 2)}%/h` : "Unknown";
+  $("planning-coverage").textContent = pools.length ? "" : "Capacity forecast is loading.";
+  if (pools.length) {
+    $("planning-pools").innerHTML = table(
+      ["Pool", "Remaining", "Reset (UTC)", "Burn", "Burn needed", "Unused at reset",
+        "Additional workers", "Measured writes"],
+      pools.map(row =>
+        `<tr><td>${esc(row.pool)}</td>${cell(pct(row.remaining_pct))}<td>${esc(row.reset_at || "Unknown")}</td>` +
+        `${cell(pace(row.burn_pct_per_hour))}${cell(pace(row.sustainable_pct_per_hour))}` +
+        `${cell(pct(row.unused_pct))}${cell(row.workers_needed ?? "Unknown")}${cell(row.worker_samples ?? "Unknown")}</tr>`),
+      [0, 2],
+    );
+  } else {
+    $("planning-pools").replaceChildren();
+  }
   updateTableScroll();
 }
 async function loadPlanning() {
-  let next = 30000;
   try {
     const response = await fetch("/api/fleet/model-stats/planning", {cache: "no-store"});
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     const data = await response.json();
     renderPlanning(data);
-    if (data.issues?.status === "pending") next = 3000;
   } catch {
-    $("planning-coverage").textContent = "Planning data is unavailable.";
-    for (const id of ["planning-blockers", "planning-ready", "planning-blocked", "planning-pools"]) {
-      $(id).replaceChildren();
-    }
+    $("planning-coverage").textContent = "Capacity forecast is unavailable.";
+    $("planning-pools").replaceChildren();
   }
-  setTimeout(loadPlanning, next);
+  setTimeout(loadPlanning, 30000);
 }
 function sampleStamp(window) {
   if (!window || typeof window.name !== "string" || typeof window.until !== "string" || window.until === "") return null;
