@@ -866,6 +866,9 @@ assert.match(unresolvedHtml, /unblocks unknown \\(direct unknown\\)/);
 assert.match(unresolvedHtml, /Blocked issues outside open milestones \\(count unknown\\)/);
 assert.match(unresolvedHtml, /\\+private \\(count unknown\\)/);
 assert.doesNotMatch(unresolvedHtml, /\\+1 private/);
+const unresolvedZero = JSON.parse(JSON.stringify(unresolved));
+unresolvedZero.issues.blocked[0].private_blockers = 0;
+assert.match(renderMilestones(data, unresolvedZero, now), /other blockers unknown/, "zero known private blockers is no proof");
 assert.match(renderMilestoneChips({{milestones: data, planning: unresolved}}, now), /<b>unknown<\\/b> blocked \\(incomplete\\)/);
 const noTally = JSON.parse(JSON.stringify(completeWithOutside));
 delete noTally.issues.coverage.dependency_unknown;
@@ -899,9 +902,24 @@ const rowRace = JSON.parse(JSON.stringify(data));
 rowRace.age_seconds = 300;
 rowRace.repositories[0].age_seconds = 419.9;
 const rowRaceReading = {{data: rowRace, ageHeader: "300", boundHeader: "420", state: "fresh", receivedAt: now}};
-const keyBefore = milestoneTimeKey(rowRace, rowRaceReading, now);
-const keyAfter = milestoneTimeKey(rowRace, rowRaceReading, now + 150);
-assert.notEqual(keyBefore, keyAfter, "a row expiry with a fresh snapshot must change the time key");
 assert.equal(milestoneFreshness(rowRace, rowRaceReading, now + 150).stale, false);
+// The tick itself repaints the rendered page: the row's counts read unknown 150 ms later, and an
+// empty registry-unavailable snapshot gains its STALE label once it expires.
+const els = {{}};
+document.getElementById = id => (els[id] ??= {{innerHTML: "", textContent: "", hidden: false}});
+const runner = {{latest: {{milestones: rowRace, planning: okPlanning}}}};
+// (A new reading object: panelAgeSeconds holds the largest elapsed time seen on a reading.)
+latestMilestoneReading = {{data: rowRace, ageHeader: "300", boundHeader: "420", state: "fresh", receivedAt: now}};
+repaintMilestones(now);
+assert.equal(summaryCellsFor(els["milestones-content"].innerHTML, "v0.4.0")[4], "2");
+expireSnapshotsIfStale(null, runner.latest, null, now + 150);
+assert.equal(summaryCellsFor(els["milestones-content"].innerHTML, "v0.4.0")[4], "unknown");
+const noRows = {{status: "unknown", reason: "registry_unavailable", age_seconds: 400, stale: false, repositories: []}};
+runner.latest.milestones = noRows;
+latestMilestoneReading = {{data: noRows, ageHeader: "400", boundHeader: "420", state: "unavailable", receivedAt: now}};
+repaintMilestones(now);
+assert.doesNotMatch(els["milestones-content"].innerHTML, /STALE/);
+expireSnapshotsIfStale(null, runner.latest, null, now + 30000);
+assert.match(els["milestones-content"].innerHTML, /STALE/);
 """
     _run_milestones_node(body)
