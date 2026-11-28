@@ -145,7 +145,8 @@ items:
     area: ci-release-deps
     check: >-
       A data, rules, config or script file changes. Tests that read it as text are not import-selected
-      by PR CI. Did the PR `git grep` tests/ for its path and basename and run the tests that name it?
+      by PR CI. Did the PR `git grep` tests/ for its path and basename, and `git grep` tests/ for its
+      directory so a directory-walking reader is included, and run the tests that name it?
     incident: "lessons source-text-tests-escape-pr-ci, run-indirect-tests-before-enqueue"
     triggers:
       - paths: ["**/*.md", "**/*.yaml", "**/*.yml", "**/*.json", "**/*.toml", "**/*.sh", "**/*.txt", "**/*.tsv"]

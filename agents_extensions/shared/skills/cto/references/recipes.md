@@ -153,13 +153,16 @@ Run Claude-account dispatches from the seat as `env -u CLAUDE_CONFIG_DIR "$LEARN
 while that ambient value is set (`claude_account_ambient_conflict`).
 CTO dispatches omit `--claude-account` unless a current order names an exception: the saved
 dispatch default account carries the active account order, and an explicit account overrides it.
+Before any read of `origin/main` below, fetch and pin it: `git fetch origin`, then
+`BASE_SHA="$(git rev-parse origin/main)"`. Use `$BASE_SHA` for git log and diffs.
+`--base` stays `origin/main`: a commit SHA is refused.
 Dispatch a takeover that continues the existing PR with `--branch <the PR's head branch>` together with
 `--base origin/main`, never the PR branch as base; the `takeover` skill checks out the PR branch.
 A same-PR successor dispatched without `--branch` is refused by `lu_machinery.orchestration.pr_ownership accept`
 with `publish_branch_required` and stops.
 For a replacement authorized after the cap, dispatch on a fresh branch. Grant the paths the
-replacement will change relative to `origin/main`, including any inherited changes it keeps.
-The same-PR successor's owned paths must cover the original PR's full diff against `origin/main`,
+replacement will change relative to `$BASE_SHA`, including any inherited changes it keeps.
+The same-PR successor's owned paths must cover the original PR's full diff against `$BASE_SHA`,
 not only its own fixes, because `delivered_paths` counts the PR's inherited commits as the
 successor's changes.
 `delivered_paths` in `lu_machinery/dispatcher/ownership.py` excludes commits reachable from the
@@ -175,7 +178,7 @@ passes sets `--hard-timeout 14400`, because the dispatcher default is 7200 secon
 `--silence-timeout` (default 3600 seconds) applies separately, so a quiet wait can still end after 3600 seconds of silence.
 Use exact owned file paths; never claim a shared subtree for an optional edit.
 Before dispatch, check every owned path in the brief and the `--owned-path` flags with `git ls-files --error-unmatch <path>`, or mark it in the brief as a new file the worker creates.
-Before dispatching an open issue, run `git log origin/main --oneline --grep='#<N>'` and read the issue's linked PRs; if fixes already landed, verify the acceptance criteria on main and close or narrow the issue instead of dispatching.
+Before dispatching an open issue, run `git log "$BASE_SHA" --oneline --grep='#<N>'` on the SHA pinned above and read the issue's linked PRs; if fixes already landed, verify the acceptance criteria on main and close or narrow the issue instead of dispatching.
 Before briefing a fix for a refusal or a fail-closed check, confirm that the state after the fix is allowed by policy (attested model and variant, operator keep-list, honest provenance); a census or residual that names such a blocker stops the dispatch, and the item is recorded as blocked instead.
 Before choosing owned paths, `git grep` the changed modules' names in `tests/`, including the
 root `tests/*.py` files, and make every file that matches an owned path, so the worker can
