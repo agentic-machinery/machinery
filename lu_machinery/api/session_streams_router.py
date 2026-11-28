@@ -31,6 +31,19 @@ def _store(ctx: MonitorContext) -> SessionStreamStore:
     return store
 
 
+# A holder's identity in its lease envelope. Monitor never serves the envelope's random lease_id; these are
+# withheld too, as defense in depth, like the epics lease projection (machinery-infra#1659).
+_HOLDER_IDENTITY_FIELDS = ("session_id", "holder_instance_id", "holder_process_id")
+
+
+def _public_status(status: dict[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in status.items() if key not in _HOLDER_IDENTITY_FIELDS}
+
+
+def _public_entry(entry: Any) -> dict[str, Any]:
+    return {**entry_as_dict(entry), "session_id": "[redacted]"}
+
+
 def _store_health(ctx: MonitorContext) -> dict[str, Any]:
     """Return store reachability and migration versions without its path."""
     connection = None
@@ -82,7 +95,7 @@ def session_stream_status(
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except Exception as exc:  # pragma: no cover - defensive API boundary
         raise HTTPException(status_code=500, detail="status_failed") from exc
-    return status.as_dict()
+    return _public_status(status.as_dict())
 
 
 @router.get("/v1/digest/{stream_id:path}")
@@ -103,8 +116,8 @@ def session_stream_digest(
     return {
         "stream_id": stream_id,
         "limit": limit,
-        "pinned": [entry_as_dict(e) for e in digest.pinned],
-        "recent": [entry_as_dict(e) for e in digest.recent],
+        "pinned": [_public_entry(e) for e in digest.pinned],
+        "recent": [_public_entry(e) for e in digest.recent],
         "pinned_count": len(digest.pinned),
         "recent_count": len(digest.recent),
     }

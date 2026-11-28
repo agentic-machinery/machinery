@@ -926,11 +926,32 @@ def list_delegate_tasks(
 def _public_task_metadata(task: dict[str, Any]) -> dict[str, Any]:
     """Keep accounting facts; selectors and substitution diagnostics are private.
 
-    A dispatch turn's lease envelope (``TURN_LEASE_KEY``) is the proof of holding its stream lease: any loopback
-    reader of this route could renew or release that lease with it (machinery-infra#1659). The record keeps it.
+    A stream lease's ``lease_id`` is the one random part of its exact envelope, so no served record carries one
+    at any depth: a dispatch turn's envelope (``TURN_LEASE_KEY``), and any receipt that copied a lease, would let a
+    loopback reader of this route renew or release that lease (machinery-infra#1659). The record keeps them.
     """
     private = {"substitution", "requested_selector", TURN_LEASE_KEY}
-    return {key: value for key, value in task.items() if key not in private}
+    public: dict[str, Any] = _without_lease_ids({key: value for key, value in task.items() if key not in private})
+    return public
+
+
+def _without_lease_ids(value: Any) -> Any:
+    """``value`` with every ``lease_id`` key dropped at any depth, keys in order; iterative, so depth is unbounded."""
+    root: list[Any] = [None]
+    pending: list[tuple[Any, Any, Any]] = [(value, root, 0)]
+    while pending:
+        item, parent, slot = pending.pop()
+        if isinstance(item, dict):
+            kept: dict[Any, Any] = {key: None for key in item if key != "lease_id"}
+            parent[slot] = kept
+            pending.extend((item[key], kept, key) for key in kept)
+        elif isinstance(item, list):
+            items: list[Any] = [None] * len(item)
+            parent[slot] = items
+            pending.extend((entry, items, index) for index, entry in enumerate(item))
+        else:
+            parent[slot] = item
+    return root[0]
 
 
 def get_delegate_task_detail(

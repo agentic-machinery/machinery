@@ -528,7 +528,18 @@ holder's envelope, and dispatch turns derived their lease ids from a published r
 lease claimed before the upgrade may be known to other local readers. After the upgrade window
 restarts Monitor, relaunch every driver so each holds a lease claimed after the upgrade, and
 confirm with the runbook recipe that no dispatch-turn lease claimed before the upgrade is still
-held (release it through the recipe if one is).
+held (release it through the recipe if one is). Right after Monitor restarts, before any driver
+relaunch or dispatch, `GET /api/epics/v1` lists every unreleased lease, and each one was claimed
+before the upgrade. The cutover is complete only when each of them is cleared:
+
+- a driver lease: the driver exits cleanly, which releases its exact lease, and relaunches;
+- a held `dispatch-turn` lease whose turn record keeps `turn_lease`: the recipe above, once the
+  lease is `expired`;
+- an unexpired held turn lease, or one with no turn record (its claim answer was lost): the
+  cutover stays blocked until the operator force-releases it with the attributed
+  `session_supervisor release --force` on the Monitor host, with dispatch stopped and no driver
+  launching on that stream, so no successor can claim it between the check and the release (the
+  exclusion the warning below requires for unfenced `--force`).
 
 Do **not** run the exact-envelope recipe on an `active` (unexpired) lease, and do **not**
 use `session_supervisor release --force` for `dispatch-turn` lease recovery while
