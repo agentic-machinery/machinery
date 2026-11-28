@@ -41,6 +41,98 @@ def _loopback_client(target_app=app) -> TestClient:
     )
 
 
+@pytest.mark.parametrize(
+    ("method", "path", "headerless_status"),
+    [
+        ("POST", "/api/comms/cleanup", 410),
+        ("POST", "/api/comms/acknowledge/1", 410),
+        ("POST", "/api/comms/channels/sample/post", 422),
+        ("POST", "/api/epics/v1/sample/claim", 422),
+        ("POST", "/api/epics/v1/sample/heartbeat", 422),
+        ("POST", "/api/epics/v1/sample/handoff", 422),
+        ("POST", "/api/epics/v1/sample/release", 422),
+        ("POST", "/api/fleet/projects/v1/report", 422),
+        ("POST", "/api/observer/presence", 422),
+        ("POST", "/api/telemetry/tool-timings", 422),
+        ("GET", "/api/delegate/tasks/sample", 404),
+    ],
+)
+def test_monitor_refuses_cross_site_browser_requests(
+    tmp_path: Path, method: str, path: str, headerless_status: int
+) -> None:
+    """Defect class: cross-site browser requests reach local Monitor handlers."""
+    client = _loopback_client(create_app(fixture_context(tmp_path), product=EMPTY))
+    baseline = client.request(method, path)
+    assert baseline.status_code == headerless_status
+    if headerless_status == 404:
+        assert baseline.json()["detail"] == "Task not found: sample"
+    for headers, reason in (
+        ({"Origin": "https://other.example"}, "invalid_origin"),
+        ({"Sec-Fetch-Site": "cross-site"}, "cross_site_request"),
+        ({"Origin": _LISTENER_ORIGIN, "Sec-Fetch-Site": "same-site"}, "cross_site_request"),
+    ):
+        response = client.request(method, path, headers=headers)
+        assert response.status_code == 403
+        assert response.json() == {"detail": "Forbidden", "reason": reason}
+        assert response.headers["cache-control"] == "no-store"
+        assert "access-control-allow-origin" not in response.headers
+
+
+def test_monitor_preserves_local_and_same_origin_access(tmp_path: Path) -> None:
+    """Defect class: a browser request guard rejects local tools or the Monitor's own pages."""
+    ctx = fixture_context(tmp_path)
+    tasks = ctx.roots.batch_state_dir / "tasks"
+    tasks.mkdir(parents=True)
+    result_file = tasks / "sample.result"
+    result_file.write_text("fixture result", encoding="utf-8")
+    (tasks / "sample.json").write_text(
+        json.dumps({"task_id": "sample", "status": "done", "result_file": str(result_file)}),
+        encoding="utf-8",
+    )
+    client = _loopback_client(create_app(ctx, product=EMPTY))
+    assert client.get("/docs", headers={"Sec-Fetch-Site": "none"}).status_code == 200
+    timing = {"ts": "2026-01-01T00:00:00Z", "tool_name": "fixture", "duration_ms": 1}
+    for headers in ({}, {"Origin": _LISTENER_ORIGIN, "Sec-Fetch-Site": "same-origin"}):
+        result = client.get("/api/delegate/tasks/sample", headers=headers)
+        assert result.status_code == 200
+        assert result.json()["result"] == "fixture result"
+        assert client.post("/api/telemetry/tool-timings", headers=headers, json=timing).json() == {"ok": True}
+
+
+def test_monitor_cross_origin_preflight_has_no_cors_headers(tmp_path: Path) -> None:
+    """Defect class: Monitor sends a CORS grant to a different browser origin."""
+    client = _loopback_client(create_app(fixture_context(tmp_path), product=EMPTY))
+    response = client.options(
+        "/api/telemetry/tool-timings",
+        headers={
+            "Origin": "https://other.example",
+            "Access-Control-Request-Method": "POST",
+            "Access-Control-Request-Headers": "content-type",
+        },
+    )
+    assert response.status_code == 403
+    assert not any(name.startswith("access-control-allow-") for name in response.headers)
+
+
+def test_monitor_browser_requests_require_an_accepted_host(tmp_path: Path, monkeypatch) -> None:
+    """Defect class: a browser request reaches the API through an unlisted authority."""
+    allowed_host = "monitor.example"
+    unlisted_host = "unlisted.example"
+    monkeypatch.setenv("LU_MONITOR_ALLOWED_HOSTS", allowed_host)
+    client = _loopback_client(create_app(fixture_context(tmp_path), product=EMPTY))
+    path = "/api/health"
+    for metadata in (
+        {"Origin": f"http://{unlisted_host}"},
+        {"Sec-Fetch-Site": "same-origin"},
+        {"Sec-Fetch-Mode": "navigate"},
+    ):
+        denied = client.get(path, headers={"Host": unlisted_host, **metadata})
+        assert denied.status_code == 403
+        assert denied.json() == {"detail": "Forbidden", "reason": "invalid_host"}
+    assert client.get(path, headers={"Host": unlisted_host}).status_code == 200
+    assert client.get(path, headers={"Host": allowed_host, "Origin": f"http://{allowed_host}"}).status_code == 200
+
+
 def _seed_conversation(
     root: Path,
     *,
