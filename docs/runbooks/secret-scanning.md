@@ -480,24 +480,29 @@ a location or changes a flow, the alert needs fresh reviewed triage. A final
 preflight re-read rejects alert, instance or current-triage-head changes during
 validation.
 
-For an **open-PR-only alert** (open PR path), the linked PR must be open,
-unmerged and non-draft. Every active open instance of the alert (ignoring only
-verified closed or merged `refs/pull/<n>/merge` refs) must lie on that linked
-PR's `refs/pull/<pr>/merge` ref; any open instance on the default branch,
-another branch or another open PR refuses and requires the merged-PR path. The
-alert must not be fixed or dismissed (`state` is `null` as GitHub returns for
-PR-only alerts, or `"open"`). The publisher reads this runbook at the PR's
-exact head SHA (`head.sha`), confirms the PR diff adds the byte-identical row
-with no duplicate or contradicting row on that head, and verifies an unedited
-recorded cross-family `APPROVE` from the trusted recorder login for that exact
-`head.sha` (concrete attested author families distinct from the reviewer's
-family; `red_team`, same-family, stale-head, unattested-author or rejected
-heads are refused). Each open instance on `refs/pull/<pr>/merge` must match the
-row's `path:line`, have an analyzed commit bound to `head.sha` (either
-`head.sha` directly or a two-parent PR merge commit whose second parent is
-`head.sha`), and match the analysis's SARIF rule and location. A final
-preflight re-read rejects alert, instance, PR head/state, comment or skipped-PR
-changes during validation.
+For an **open-PR-only alert** (open PR path), the linked PR must be explicitly
+open, unmerged, non-draft (`draft: false`), and same-repository (both `head.repo`
+and `base.repo` matching the target repository). Every instance state must be
+in GitHub's supported set (`open`, `dismissed`, `fixed`), and every active open
+instance (ignoring only verified closed or merged `refs/pull/<n>/merge` refs)
+must lie on that linked PR's `refs/pull/<pr>/merge` ref; any open instance on
+the default branch, another branch or another open PR refuses and requires the
+merged-PR path. The alert must explicitly carry `state` (`null` as GitHub
+returns for PR-only alerts, or `"open"`), `dismissed_at: null`, and
+`fixed_at: null`. The publisher reads this runbook at the PR's immutable
+`head.sha` and `base.sha` (verifying the row was absent at `base.sha`, added by
+the PR diff, and uniquely present with no duplicate or contradicting row at
+`head.sha`), and verifies an unedited recorded cross-family `APPROVE` from the
+trusted recorder login for that exact `head.sha` (concrete attested author
+families distinct from the reviewer's family; `red_team`, same-family,
+stale-head, unattested-author or rejected heads are refused). Each open
+instance on `refs/pull/<pr>/merge` must match the row's `path:line`, have an
+analyzed commit bound to `head.sha` (either `head.sha` directly or a two-parent
+PR merge commit whose second parent is `head.sha`), and match the analysis's
+SARIF rule and location. A final preflight re-read rejects alert, instance,
+comment, or skipped-PR changes, then re-validates the PR's identity,
+same-repository head/base, `base.sha`, `head.sha`, and non-draft open state
+immediately before sending the PATCH.
 
 The only mutation is one PATCH of the numbered alert with `state=dismissed`,
 its reason and the scanned comment. The publisher reports success only after

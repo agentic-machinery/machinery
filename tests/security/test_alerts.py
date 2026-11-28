@@ -1607,8 +1607,8 @@ def _dismiss_fixture(
         "draft": False,
         "merge_commit_sha": merge_sha,
         "html_url": f"https://github.com/unit/public/pull/{pr_number}",
-        "head": {"sha": head_sha, "ref": "feature/triage"},
-        "base": {"ref": "main", "sha": base_sha},
+        "head": {"sha": head_sha, "ref": "feature/triage", "repo": {"full_name": "unit/public"}},
+        "base": {"ref": "main", "sha": base_sha, "repo": {"full_name": "unit/public"}},
     }
     encoded_ref = ref.replace("/", "%2F")
     triage_ref = merge_sha if merged else head_sha
@@ -1619,6 +1619,7 @@ def _dismiss_fixture(
         f"pulls/{pr_number}/files?per_page=100": [
             [{"filename": pub._DISMISS_TRIAGE_PATH, "status": "modified", "patch": "+" + triage_row}]
         ],
+        f"contents/{pub._DISMISS_TRIAGE_PATH}?ref={base_sha}": "| Alert | Rule | Reviewed location | Disposition |\n",
         f"contents/{pub._DISMISS_TRIAGE_PATH}?ref={triage_ref}": triage_row + "\n",
         f"issues/{pr_number}/comments?per_page=100": [[_cf_verdict_comment(head_sha)]],
         f"commits/{merge_sha}": {"sha": merge_sha, "parents": [{"sha": base_sha}, {"sha": head_sha}]},
@@ -1670,7 +1671,9 @@ def _dismiss_fixture(
             }
             return subprocess.CompletedProcess(argv, 0, json.dumps(dismissed), "")
         if suffix not in documents:
-            return subprocess.CompletedProcess(argv, 1, "", "not found")
+            missing = subprocess.CompletedProcess(argv, 1, "", "not found")
+            missing.github_result = github_client.Result(status=404)  # type: ignore[attr-defined]
+            return missing
         doc = documents[suffix]
         return subprocess.CompletedProcess(argv, 0, doc if isinstance(doc, str) else json.dumps(doc), "")
 
@@ -1715,6 +1718,9 @@ def test_dismiss_admits_pr_only_alert_with_approved_triage_row(
         "dismissed_comment": comment,
     }
     assert json.loads(answer.stdout)["state"] == "dismissed"
+    # Final PR re-read must occur immediately before PATCH (after final alert, instance, and comment reads).
+    patch_index = next(i for i, argv in enumerate(calls) if argv[argv.index("--method") + 1] == "PATCH")
+    assert calls[patch_index - 1][:5] == ["gh", "api", "--method", "GET", "repos/unit/public/pulls/1622"]
 
     # Also admit when alert state is "open", analysis ran directly on head_sha, and a stale closed PR instance exists.
     writes.clear()
@@ -1811,6 +1817,7 @@ def test_dismiss_admits_pr_only_alert_with_approved_triage_row(
     [
         "no-row",
         "moved-unchanged-row",
+        "row-already-on-base-sha",
         "duplicate-row-on-head",
         "unapproved-head",
         "stale-head",
@@ -1823,13 +1830,23 @@ def test_dismiss_admits_pr_only_alert_with_approved_triage_row(
         "untrusted-commenter",
         "closed-unmerged-pr",
         "draft-pr",
+        "missing-draft-flag",
+        "fork-pr",
+        "missing-head-repo",
+        "missing-base-repo",
         "stale-analysis-commit",
         "unreadable-analysis-commit",
         "alert-already-fixed",
+        "missing-alert-state",
+        "missing-alert-timestamps",
+        "unknown-instance-state",
         "other-open-pr-instance",
         "different-pr-linked",
         "pr-only-alert-with-merged-pr",
         "pr-head-moved-during-preflight",
+        "pr-base-sha-changed-during-preflight",
+        "pr-draft-missing-on-reread",
+        "pr-head-repo-changed-on-reread",
         "comments-changed-during-preflight",
         "unreadable-identity",
         "unreadable-comments",
@@ -1865,6 +1882,9 @@ def test_dismiss_refuses_pr_only_alert_without_approved_row(
     elif case == "moved-unchanged-row":
         row = documents[f"contents/{pub._DISMISS_TRIAGE_PATH}?ref={shas['head']}"].strip()
         documents["pulls/1622/files?per_page=100"][0][0]["patch"] = f"+{row}\n-{row}"
+    elif case == "row-already-on-base-sha":
+        row = documents[f"contents/{pub._DISMISS_TRIAGE_PATH}?ref={shas['head']}"].strip()
+        documents[f"contents/{pub._DISMISS_TRIAGE_PATH}?ref={shas['base']}"] += row + "\n"
     elif case == "duplicate-row-on-head":
         key = f"contents/{pub._DISMISS_TRIAGE_PATH}?ref={shas['head']}"
         documents[key] += "71 | `py/polynomial-redos` | `lu_machinery/common/json_depth.py:86` | Real.\n"
@@ -1921,12 +1941,28 @@ def test_dismiss_refuses_pr_only_alert_without_approved_row(
         documents["pulls/1622"]["state"] = "closed"
     elif case == "draft-pr":
         documents["pulls/1622"]["draft"] = True
+    elif case == "missing-draft-flag":
+        del documents["pulls/1622"]["draft"]
+    elif case == "fork-pr":
+        documents["pulls/1622"]["head"]["repo"]["full_name"] = "forker/public"
+    elif case == "missing-head-repo":
+        del documents["pulls/1622"]["head"]["repo"]
+    elif case == "missing-base-repo":
+        del documents["pulls/1622"]["base"]["repo"]
     elif case == "stale-analysis-commit":
         documents[f"commits/{shas['merge']}"]["parents"][1]["sha"] = "9" * 40
     elif case == "unreadable-analysis-commit":
         del documents[f"commits/{shas['merge']}"]
     elif case == "alert-already-fixed":
         documents["code-scanning/alerts/71"]["state"] = "fixed"
+    elif case == "missing-alert-state":
+        del documents["code-scanning/alerts/71"]["state"]
+    elif case == "missing-alert-timestamps":
+        del documents["code-scanning/alerts/71"]["dismissed_at"]
+    elif case == "unknown-instance-state":
+        unknown_main = deepcopy(documents["code-scanning/alerts/71/instances?per_page=100"][0][0])
+        unknown_main.update(ref="refs/heads/main", state="pending")
+        documents["code-scanning/alerts/71/instances?per_page=100"][0].append(unknown_main)
     elif case == "other-open-pr-instance":
         other = deepcopy(documents["code-scanning/alerts/71/instances?per_page=100"][0][0])
         other["ref"] = "refs/pull/1625/merge"
@@ -1945,7 +1981,12 @@ def test_dismiss_refuses_pr_only_alert_without_approved_row(
             "merged": False,
             "url": "https://github.com/unit/public/pull/1625",
         }
-    elif case == "pr-head-moved-during-preflight":
+    elif case in {
+        "pr-head-moved-during-preflight",
+        "pr-base-sha-changed-during-preflight",
+        "pr-draft-missing-on-reread",
+        "pr-head-repo-changed-on-reread",
+    }:
         def moving_pr(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
             nonlocal pr_reads
             res = sender(argv, **kwargs)
@@ -1953,7 +1994,14 @@ def test_dismiss_refuses_pr_only_alert_without_approved_row(
                 pr_reads += 1
                 if pr_reads == 2:
                     moved = json.loads(res.stdout)
-                    moved["head"]["sha"] = "f" * 40
+                    if case == "pr-head-moved-during-preflight":
+                        moved["head"]["sha"] = "f" * 40
+                    elif case == "pr-base-sha-changed-during-preflight":
+                        moved["base"]["sha"] = "2" * 40
+                    elif case == "pr-draft-missing-on-reread":
+                        del moved["draft"]
+                    else:
+                        moved["head"]["repo"]["full_name"] = "forker/public"
                     res.stdout = json.dumps(moved)
             return res
 
@@ -1995,7 +2043,12 @@ def test_dismiss_refuses_pr_only_alert_without_approved_row(
             runner=runner,
         )
     assert writes == []
-    if case == "pr-head-moved-during-preflight":
+    if case in {
+        "pr-head-moved-during-preflight",
+        "pr-base-sha-changed-during-preflight",
+        "pr-draft-missing-on-reread",
+        "pr-head-repo-changed-on-reread",
+    }:
         assert pr_reads == 2
     if case == "comments-changed-during-preflight":
         assert comment_reads == 2

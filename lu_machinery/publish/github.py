@@ -3685,6 +3685,7 @@ _DISMISS_ANALYSIS_PER_PAGE = 100
 _DISMISS_ANALYSIS_MAX_PAGES = 20
 _DISMISS_ANALYSIS_CLOCK_SKEW = timedelta(minutes=5)
 _DISMISS_PR_BATCH_SIZE = 100
+_DISMISS_INSTANCE_STATES = frozenset({"open", "dismissed", "fixed"})
 
 
 def _parse_utc_timestamp(value):
@@ -3829,6 +3830,76 @@ def _dismiss_sarif_result(document, number):
 
 class _DismissalRefused(ValueError):
     """Fail-closed dismissal refusal carrying a fixed, OPSEC-safe reason."""
+
+
+def _dismiss_absent(runner, endpoint, cwd, environment, *, raw_http=False):
+    """Return True only when GitHub answers 404 for ``endpoint``; any other answer fails closed."""
+    if raw_http:
+        client = github_client.GitHubClient(env=gate.internal_environment(environment), cwd=cwd)
+        observation = client.request("GET", endpoint, timeout=30, fresh=True, raw_response=True)
+        if observation.stale:
+            raise github_client.GitHubRateLimited(observation.reset_at, observation.reason)
+        refusal = github_client.refusal_of(observation)
+        if refusal is not None:
+            raise refusal
+        if observation.status == 404:
+            return True
+        if observation.error or not (200 <= observation.status < 300):
+            raise _DismissalRefused("base triage absence is unverified")
+        return False
+    return _absent(runner, endpoint, cwd, environment)
+
+
+def _validate_open_pr(
+    pr,
+    *,
+    pr_number,
+    gh_repo,
+    expected_html_url=None,
+    expected_head_sha=None,
+    expected_base_ref=None,
+    expected_base_sha=None,
+):
+    """Validate an open, unmerged, non-draft same-repository PR snapshot."""
+    if not isinstance(pr, dict):
+        raise _DismissalRefused("linked PR is unreadable")
+    if pr.get("merged") is not False or pr.get("state") != "open":
+        raise _DismissalRefused("linked PR is neither merged nor open")
+    if pr.get("draft") is not False:
+        raise _DismissalRefused("draft or unknown-draft PR cannot authorize dismissal")
+    if type(pr.get("number")) is not int or pr["number"] != pr_number:
+        raise _DismissalRefused("linked PR identity changed")
+    html_url = pr.get("html_url")
+    if html_url not in _repository_urls(gh_repo, f"pull/{pr_number}"):
+        raise _DismissalRefused("linked PR identity changed")
+    if expected_html_url is not None and html_url != expected_html_url:
+        raise _DismissalRefused("linked PR identity changed")
+    head = pr.get("head")
+    head_sha = head.get("sha") if isinstance(head, dict) else None
+    if not isinstance(head_sha, str) or not re.fullmatch(r"[0-9a-f]{40}", head_sha):
+        raise _DismissalRefused("open PR head SHA is unreadable")
+    if expected_head_sha is not None and head_sha != expected_head_sha:
+        raise _DismissalRefused("open PR head changed during preflight")
+    head_repo = head.get("repo") if isinstance(head, dict) else None
+    head_slug = head_repo.get("full_name") if isinstance(head_repo, dict) else None
+    if not isinstance(head_slug, str) or not same_repository(head_slug, gh_repo):
+        raise _DismissalRefused("open PR head repository is missing or cross-repository")
+    base = pr.get("base")
+    base_ref = base.get("ref") if isinstance(base, dict) else None
+    base_sha = base.get("sha") if isinstance(base, dict) else None
+    if not isinstance(base_ref, str) or not re.fullmatch(PATTERNS["ref"], base_ref):
+        raise _DismissalRefused("invalid triage branch")
+    if expected_base_ref is not None and base_ref != expected_base_ref:
+        raise _DismissalRefused("open PR base branch changed during preflight")
+    if not isinstance(base_sha, str) or not re.fullmatch(r"[0-9a-f]{40}", base_sha):
+        raise _DismissalRefused("open PR base SHA is unreadable")
+    if expected_base_sha is not None and base_sha != expected_base_sha:
+        raise _DismissalRefused("open PR base SHA changed during preflight")
+    base_repo = base.get("repo") if isinstance(base, dict) else None
+    base_slug = base_repo.get("full_name") if isinstance(base_repo, dict) else None
+    if not isinstance(base_slug, str) or not same_repository(base_slug, gh_repo):
+        raise _DismissalRefused("open PR base repository is missing or mismatched")
+    return head_sha, base_ref, base_sha
 
 
 def _verify_open_pr_cross_family_approval(comments, head_sha, verdict_login):
@@ -4027,6 +4098,7 @@ def _dismiss_preflight(fields, gh_repo, dest, runner, cwd, environment, *, temp=
     merge = None
     merge_cutoff = None
     head_sha = None
+    base_sha = None
     if merged_pr:
         merge = pr["merge_commit_sha"]
         if not isinstance(merge, str) or not re.fullmatch(PATTERNS["sha"], merge):
@@ -4036,20 +4108,13 @@ def _dismiss_preflight(fields, gh_repo, dest, runner, cwd, environment, *, temp=
             if "merged_at" in pr else None
         )
         triage_ref = merge
+        base = pr.get("base")
+        base_ref = base.get("ref") if isinstance(base, dict) else None
+        if not isinstance(base_ref, str) or not re.fullmatch(PATTERNS["ref"], base_ref):
+            raise _DismissalRefused("invalid triage branch")
     else:
-        if pr.get("merged") is not False or pr.get("state") != "open":
-            raise _DismissalRefused("linked PR is neither merged nor open")
-        if "draft" in pr and pr["draft"] is not False:
-            raise _DismissalRefused("draft PR cannot authorize dismissal")
-        head = pr.get("head")
-        head_sha = head.get("sha") if isinstance(head, dict) else None
-        if not isinstance(head_sha, str) or not re.fullmatch(r"[0-9a-f]{40}", head_sha):
-            raise _DismissalRefused("open PR head SHA is unreadable")
+        head_sha, base_ref, base_sha = _validate_open_pr(pr, pr_number=pr_number, gh_repo=gh_repo)
         triage_ref = head_sha
-    base = pr.get("base")
-    base_ref = base.get("ref") if isinstance(base, dict) else None
-    if not isinstance(base_ref, str) or not re.fullmatch(PATTERNS["ref"], base_ref):
-        raise _DismissalRefused("invalid triage branch")
     files = get(f"pulls/{pr_number}/files?per_page=100", pages=True)
     if not merged_pr:
         from lu_machinery.orchestration.integration_sweep import PR_FILES_LIMIT
@@ -4094,6 +4159,16 @@ def _dismiss_preflight(fields, gh_repo, dest, runner, cwd, environment, *, temp=
                      and line.strip().removeprefix("|").split("|", 1)[0].strip() == str(number)]
         if head_rows != [triage_line]:
             raise _DismissalRefused("triage row is duplicated or malformed on the open PR head")
+        # Bind the row-addition proof to immutable base_sha and head_sha blobs, not only the mutable PR diff.
+        if triage_files[0].get("status") == "added":
+            if not _dismiss_absent(
+                runner, f"{root}/contents/{_DISMISS_TRIAGE_PATH}?ref={base_sha}", cwd, environment, raw_http=raw_graphql,
+            ):
+                raise _DismissalRefused("triage file already existed at the open PR base commit")
+        else:
+            base_triage = get(f"contents/{_DISMISS_TRIAGE_PATH}?ref={base_sha}", raw=True)
+            if triage_line in base_triage.splitlines():
+                raise _DismissalRefused("triage row was already present at the open PR base commit")
         entry = _fleet_catalog_entry(dest, environment)
         configured_login = entry[1].get("verdict_recorder_login") if entry else None
         if configured_login is not None and (
@@ -4124,11 +4199,14 @@ def _dismiss_preflight(fields, gh_repo, dest, runner, cwd, environment, *, temp=
             raise _DismissalRefused("alert identity or state changed")
     else:
         if (
-            alert.get("state") not in {"open", None}
-            or alert.get("dismissed_at") is not None
-            or alert.get("fixed_at") is not None
+            "state" not in alert
+            or alert["state"] not in {"open", None}
+            or "dismissed_at" not in alert
+            or alert["dismissed_at"] is not None
+            or "fixed_at" not in alert
+            or alert["fixed_at"] is not None
         ):
-            raise _DismissalRefused("alert is already dismissed, fixed, or in an unknown state")
+            raise _DismissalRefused("alert is already dismissed, fixed, or missing required state fields")
     if row[1].strip() != f"`{alert['rule']['id']}`":
         raise _DismissalRefused("rule changed")
     tool_query = ""
@@ -4140,9 +4218,13 @@ def _dismiss_preflight(fields, gh_repo, dest, runner, cwd, environment, *, temp=
         tool_query = f"&tool_name={quote(tool_name, safe='')}"
     get_instances = get(f"code-scanning/alerts/{number}/instances?per_page=100", pages=True)
     if not isinstance(get_instances, list) or any(
-        not isinstance(item, dict) or not isinstance(item.get("state"), str) for item in get_instances
+        not isinstance(item, dict)
+        or "state" not in item
+        or not isinstance(item["state"], str)
+        or item["state"] not in _DISMISS_INSTANCE_STATES
+        for item in get_instances
     ):
-        raise _DismissalRefused("alert instances are unreadable")
+        raise _DismissalRefused("alert instances are unreadable or carry an unsupported state")
     instances = [item for item in get_instances if item["state"] == "open"]
     if not instances:
         raise _DismissalRefused("no open instances")
@@ -4361,25 +4443,24 @@ def _dismiss_preflight(fields, gh_repo, dest, runner, cwd, environment, *, temp=
         if (physical["artifactLocation"]["uri"] != location["path"]
                 or physical["region"]["startLine"] != location["start_line"]):
             raise _DismissalRefused("instance does not match SARIF")
-    # Close the evidence/read race before the one write, without retrying.
-    fresh_pr = get(f"pulls/{pr_number}")
+    # Close the evidence/read race before the one write, verifying the PR last.
     if (
         get(f"code-scanning/alerts/{number}") != alert
         or get(f"code-scanning/alerts/{number}/instances?per_page=100", pages=True) != get_instances
-        or not isinstance(fresh_pr, dict)
-        or fresh_pr.get("state") != "open"
-        or fresh_pr.get("merged") is not False
-        or ("draft" in fresh_pr and fresh_pr["draft"] is not False)
-        or ("number" in fresh_pr and (type(fresh_pr["number"]) is not int or fresh_pr["number"] != pr_number))
-        or fresh_pr.get("html_url") != pr["html_url"]
-        or not isinstance(fresh_pr.get("head"), dict)
-        or fresh_pr["head"].get("sha") != head_sha
-        or not isinstance(fresh_pr.get("base"), dict)
-        or fresh_pr["base"].get("ref") != base_ref
         or get(f"issues/{pr_number}/comments?per_page=100", pages=True) != comments
         or (skipped_prs and pull_states(skipped_prs) != skipped_prs)
     ):
-        raise _DismissalRefused("alert, PR head, or review evidence changed during preflight")
+        raise _DismissalRefused("alert or review evidence changed during preflight")
+    fresh_pr = get(f"pulls/{pr_number}")
+    _validate_open_pr(
+        fresh_pr,
+        pr_number=pr_number,
+        gh_repo=gh_repo,
+        expected_html_url=pr["html_url"],
+        expected_head_sha=head_sha,
+        expected_base_ref=base_ref,
+        expected_base_sha=base_sha,
+    )
     return alert
 
 
