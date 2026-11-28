@@ -701,8 +701,37 @@ assert.match(M.prChips(unknownTotalPrs).join(''), /<b>1<\/b> open PRs observed Â
       focus() { document.activeElement = this; focusedTargets.push(`el:${this.dataset.threadMessage || this.textContent || tag}`); },
     });
     for (const id of ['message-body', 'message-thread']) {
-      document.getElementById(id).replaceChildren = function (...nodes) { this.children = nodes; };
+      const box = document.getElementById(id);
+      box.children = [];
+      box.replaceChildren = function (...nodes) {
+        const hadFocus = id === 'message-thread' && this.contains(document.activeElement);
+        this.children = nodes;
+        if (hadFocus && !this.contains(document.activeElement)) {
+          document.activeElement = null;
+        }
+      };
+      box.appendChild = function (node) { this.children.push(node); };
+      box.contains = function (target) {
+        const walk = list => list.some(n => n === target || (Array.isArray(n.children) && walk(n.children)));
+        return Boolean(target && walk(this.children));
+      };
+      box.querySelector = function (selector) {
+        const walk = list => {
+          for (const n of list) {
+            if (selector === 'button' && n.tag === 'button') return n;
+            if (selector === '[data-thread-status]' && n.dataset?.threadStatus) return n;
+            if (Array.isArray(n.children)) {
+              const hit = walk(n.children);
+              if (hit) return hit;
+            }
+          }
+          return null;
+        };
+        return walk(this.children);
+      };
     }
+    const readerBackEl = document.getElementById('reader-back');
+    readerBackEl.focus = () => { document.activeElement = readerBackEl; focusedTargets.push('reader-back'); };
     document.getElementById('comms-layout').classList = {add() {}, remove() {}};
     document.getElementById('message-reader-heading').focus = () => { headingFocused += 1; focusedTargets.push('reader-heading'); };
     document.getElementById('message-reader').focus = () => {};
@@ -785,15 +814,43 @@ assert.match(M.prChips(unknownTotalPrs).join(''), /<b>1<\/b> open PRs observed Â
       members.children[0].children[0].click();
       assert.deepEqual([...pending.keys()], [bodyUrl(firstId)], 'A thread member loads only its own body');
       assert.deepEqual(focusedTargets, [`el:${firstId}`], 'F6: clicking a thread member preserves focus on its rebuilt button');
-      focusedTargets.length = 0;
-      next.click();
+      // F6: Thread pagination keeps pager mounted while loading, preserves pager on failure,
+      // does not steal focus when the user moved to Back to list while pending, and restores
+      // focus to the first rebuilt button when focus remained inside #message-thread.
       const nextPage = `/api/fleet/messages/${secondId}/thread?offset=50`;
+      const threadBox = document.getElementById('message-thread');
+      const currentNext = threadBox.children[1];
+      currentNext.focus();
+      focusedTargets.length = 0;
+      currentNext.click();
+      assert.equal(document.activeElement, currentNext, 'F6: activating Next keeps Next mounted and focused while loading');
+      assert.equal(threadBox.contains(currentNext), true, 'F6: thread controls remain mounted while paging');
       assert.deepEqual([...pending.keys()], [bodyUrl(firstId), nextPage]);
+      // Simulate failed thread page: Next stays mounted & focused, error note appears, and retry works.
+      pending.get(nextPage)({ok: false, status: 503, json: async () => ({state: 'error'})});
+      pending.delete(nextPage);
+      await new Promise(resolve => setImmediate(resolve));
+      assert.equal(document.activeElement, currentNext, 'F6: failed thread page keeps focus on mounted Next button');
+      assert.equal(threadBox.querySelector('[data-thread-status]').textContent, 'Thread could not load.');
+      // Retry Next, then move focus to Back to list while pending: late success must not steal focus.
+      currentNext.click();
+      readerBackEl.focus();
+      focusedTargets.length = 0;
       resolve(bodyUrl(firstId), {state: 'ok', message_id: firstId, body: 'first body'});
-      resolve(nextPage, {messages: [{message_id: firstId, sender: 'cto', kind: 'request', created_at: '2026-11-26T11:00:01Z'}], limit: 50, next_offset: null});
+      resolve(nextPage, {messages: [{message_id: firstId, sender: 'cto', kind: 'request', created_at: '2026-11-26T11:00:01Z'}], limit: 50, next_offset: 100});
       await new Promise(resolve => setImmediate(resolve));
       assert.equal(document.getElementById('message-body').children[0].textContent, 'first body');
-      assert.deepEqual(focusedTargets, [`el:${firstId}`], 'F6: paging the thread moves focus to the first rebuilt thread button');
+      assert.equal(document.activeElement, readerBackEl, 'F6: late thread response must not steal focus from Back to list');
+      assert.deepEqual(focusedTargets, [], 'F6: no focus hijack when user left thread before completion');
+      // Now paginate while focus stays on Next inside #message-thread: focus moves cleanly to first rebuilt thread button.
+      const nextAfter = threadBox.children.find(n => n.tag === 'button' && n.textContent === 'Next');
+      nextAfter.focus();
+      focusedTargets.length = 0;
+      nextAfter.click();
+      const thirdPage = `/api/fleet/messages/${secondId}/thread?offset=100`;
+      resolve(thirdPage, {messages: [{message_id: firstId, sender: 'cto', kind: 'request', created_at: '2026-11-26T11:00:01Z'}], limit: 50, next_offset: null});
+      await new Promise(resolve => setImmediate(resolve));
+      assert.deepEqual(focusedTargets, [`el:${firstId}`], 'F6: paging while focused in thread moves focus to first rebuilt thread button');
       // Escape closes the reader and falls back cleanly if the previously opened row is no longer in the list.
       setListRows([firstId]);
       focusedTargets.length = 0;
