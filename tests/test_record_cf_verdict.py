@@ -3556,3 +3556,828 @@ def test_publication_ledger_keeps_the_selector_receipt_and_still_reads_legacy_li
     published, counts = model_stats_rows.read_publications(tmp_path)
     assert sorted(published["prior-review"], key=lambda line: line["pr"]) == [legacy, entry]
     assert counts == Counter({"lines": 2, "malformed_lines": 1, "tasks": 1})
+
+
+def _seed_capped_pr(monkeypatch, tmp_path, *, repository=None, rounds=3, live_head=None):
+    """Set up an open PR with ``rounds`` CHANGES_REQUESTED verdicts on distinct heads."""
+    from tests.review.record_support import BRANCH, REPOSITORY, facts_for, recorded_verdict
+
+    repo = repository or REPOSITORY
+    heads = [f"{i:040x}" for i in range(1, rounds + 1)]
+    state = {"head": live_head or heads[-1]}
+    tasks, comments, calls = setup_record(monkeypatch, tmp_path, head=state["head"])
+    facts = facts_for({"google"}, changed_paths=("lu_machinery/common/unit.py",))
+    monkeypatch.setattr(recorder, "pr_review_facts", lambda *_a, **_k: facts)
+    monkeypatch.setenv("LU_TASKS_DIR", str(tasks))
+    monkeypatch.setattr(
+        recorder,
+        "_pr",
+        lambda *_a, **_k: {"number": 42, "headRefName": BRANCH, "headRefOid": state["head"], "state": "OPEN"},
+    )
+
+    orig_run_json = recorder._run_json
+
+    def run_json(cmd, **kwargs):
+        if isinstance(cmd, list) and cmd[:3] == ["gh", "pr", "view"]:
+            return {"headRefOid": state["head"], "headRefName": BRANCH, "state": "OPEN"}
+        if isinstance(cmd, list) and cmd[:3] == ["gh", "api", f"repos/{repo}/issues/100"]:
+            return {
+                "number": 100,
+                "user": {"login": "fleet"},
+                "author_association": "MEMBER",
+                "body": f"CTO cap disposition:\nCAP_CONTINUATION: authorize repo={repo} pr=#42 head={state['head']}\n",
+            }
+        return orig_run_json(cmd, **kwargs)
+
+    monkeypatch.setattr(recorder, "_run_json", run_json)
+    for index, head in enumerate(heads, start=1):
+        task_id = f"previous-{index}"
+        write_task(
+            tasks,
+            task_id=task_id,
+            pr=42,
+            repository=repo,
+            worktree_base_sha=head,
+            agent="claude",
+            model="claude-opus-5-5",
+            reply="VERDICT: REQUEST_CHANGES\nBlocking defect.",
+        )
+        comments.append(recorded_verdict(head, "CHANGES_REQUESTED", task_id=task_id))
+    return tasks, comments, calls, heads, state
+
+
+@pytest.mark.usefixtures("configured_roots", "recorder_matcher", "agent_runtime_roots")
+def test_verified_cap_continuation_grant_admits_exactly_one_extra_round(monkeypatch, tmp_path, capsys):
+    """Defect class: a verified CTO cap-continuation grant fails to admit one shared cumulative extra round
+    across dispatch and publication (preserving reservations and exemptions), or admits more than one."""
+    from types import SimpleNamespace
+
+    from lu_machinery.dispatcher import checks
+    from tests.review.record_support import BRANCH, REPOSITORY, recorded_verdict
+
+    tasks, comments, calls, heads, state = _seed_capped_pr(monkeypatch, tmp_path, rounds=3)
+    capped_head = heads[-1]
+    head4 = f"{4:040x}"
+    head5 = f"{5:040x}"
+
+    # Before grant: round 4 at head4 is refused across budget-check, dispatch, and record.
+    state["head"] = head4
+    assert recorder.budget_check_main(["--repository", REPOSITORY, "--pr", "42"]) == 1
+    assert "REVIEW_BUDGET_EXHAUSTED" in json.loads(capsys.readouterr().out)["refusal"]
+    with pytest.raises(ValueError, match="REVIEW_BUDGET_EXHAUSTED"):
+        checks.check_review_budget(SimpleNamespace(pr=42, branch=BRANCH), {"github": REPOSITORY}, head4)
+
+    # Issue verified CTO grant at live capped head via CLI and fake lu-driver-state script.
+    state["head"] = capped_head
+    fake_cli = tmp_path / "fake-driver-state.py"
+    fake_cli.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, sys\n"
+        f"print(json.dumps({{'id': 'cto-cap-42', 'lane': 'cto', 'kind': 'decision', 'status': 'active', "
+        f"'statement': 'CAP_CONTINUATION: authorize repo={REPOSITORY} pr=#42 head={capped_head}'}}))\n"
+    )
+    fake_cli.chmod(0o755)
+    monkeypatch.delenv("LEARN_UKRAINIAN_DISPATCH_TASK_ID", raising=False)
+    monkeypatch.delenv("LU_WRITE_BOUNDARY_BROKER", raising=False)
+    monkeypatch.setenv("SESSION_SEAT", "cto")
+    monkeypatch.setenv("SESSION_HANDOFF_AGENT", "claude-cto")
+    monkeypatch.setenv("LU_DRIVER_STATE_CLI", str(fake_cli))
+
+    rc = recorder.grant_continuation_main([
+        "--repository", REPOSITORY,
+        "--pr", "42",
+        "--capped-head", capped_head,
+        "--disposition-ref", "driver-state:cto-cap-42",
+        "--authority", "claude-cto",
+    ])
+    granted = json.loads(capsys.readouterr().out)
+    assert rc == 0 and granted["granted"] is True
+    assert granted["extra_rounds"] == 1 and granted["base_budget"] == 3
+    assert granted["authority"] == "claude-cto" and granted["actor_authenticated"] is False
+    assert granted["threat_model"] == recorder.CAP_CONTINUATION_THREAT_MODEL
+    assert granted["capped_head"] == capped_head and granted["disposition_ref"] == "driver-state:cto-cap-42"
+
+    # Round 4 at head4 is admitted by budget-check and dispatch.
+    state["head"] = head4
+    assert recorder.budget_check_main(["--repository", REPOSITORY, "--pr", "42"]) == 0
+    preflight = json.loads(capsys.readouterr().out)
+    assert preflight["admitted"] is True and preflight["budget"] == 4 and preflight["base_budget"] == 3
+    assert preflight["cap_continuation"]["disposition_ref"] == "driver-state:cto-cap-42"
+    checks.check_review_budget(SimpleNamespace(pr=42, branch=BRANCH), {"github": REPOSITORY}, head4)
+
+    # Reservation check: once head4 has an in-flight review task, a competing head5 is refused.
+    write_task(
+        tasks,
+        task_id="review-4",
+        pr=42,
+        worktree_base_sha=head4,
+        status="running",
+        agent="claude",
+        model="claude-opus-5-5",
+        reply="",
+    )
+    state["head"] = head5
+    with pytest.raises(ValueError, match="REVIEW_BUDGET_EXHAUSTED"):
+        checks.check_review_budget(SimpleNamespace(pr=42, branch=BRANCH), {"github": REPOSITORY}, head5)
+
+    # Publication of review-4 at head4 succeeds and records cap_continuation in the receipt.
+    state["head"] = head4
+    write_task(
+        tasks,
+        task_id="review-4",
+        pr=42,
+        worktree_base_sha=head4,
+        status="done",
+        agent="claude",
+        model="claude-opus-5-5",
+        reply="VERDICT: REQUEST_CHANGES\nStill one defect.",
+    )
+    published = recorder.record("review-4", pr_number=42, task_root=tasks, lock_root=tmp_path / "locks")
+    assert published["comment"] == "posted" and calls["posts"] == 1
+    assert published["cap_continuation"]["disposition_ref"] == "driver-state:cto-cap-42"
+
+    # Round 5 at head5 is refused across budget-check, dispatch, and record (strictly +1 round).
+    state["head"] = head5
+    assert recorder.budget_check_main(["--repository", REPOSITORY, "--pr", "42"]) == 1
+    refused = json.loads(capsys.readouterr().out)
+    assert "REVIEW_BUDGET_EXHAUSTED" in refused["refusal"]
+    assert "budget is 4 rounds" in refused["refusal"]
+    assert "1 CTO cap-continuation round" in refused["refusal"]
+    with pytest.raises(ValueError, match="REVIEW_BUDGET_EXHAUSTED"):
+        checks.check_review_budget(SimpleNamespace(pr=42, branch=BRANCH), {"github": REPOSITORY}, head5)
+    write_task(
+        tasks,
+        task_id="review-5",
+        pr=42,
+        worktree_base_sha=head5,
+        agent="claude",
+        model="claude-opus-5-5",
+        reply="VERDICT: APPROVE\nLooks good.",
+    )
+    with pytest.raises(recorder.RecordError, match="REVIEW_BUDGET_EXHAUSTED"):
+        recorder.record("review-5", pr_number=42, task_root=tasks, lock_root=tmp_path / "locks")
+    assert calls["posts"] == 1
+
+    # Clean-base-merge and repair exemptions are evaluated BEFORE charging the extra round at the base cap (F5),
+    # and after an approved cap-continuation round.
+    cap_grant = preflight["cap_continuation"]
+    base_approved = [*comments[:2], recorded_verdict(capped_head, "APPROVED", task_id="previous-3")]
+    base_merge = recorder.require_review_round_within_budget(
+        base_approved,
+        head4,
+        "fleet",
+        budget=3,
+        pr=42,
+        prove_merge_only=lambda anchor, candidate: ["b" * 40] if (anchor, candidate) == (capped_head, head4) else None,
+        cap_continuation=cap_grant,
+    )
+    assert base_merge["budget_exemption"]["reason"] == recorder.CLEAN_BASE_MERGE
+    assert "cap_continuation" not in base_merge
+    base_repair = recorder.require_review_round_within_budget(
+        base_approved,
+        head4,
+        "fleet",
+        budget=3,
+        pr=42,
+        repair=lambda: {"class": "ci-fix", "delta_sha256": "a" * 64},
+        cap_continuation=cap_grant,
+    )
+    assert base_repair["repair_round"]["class"] == "ci-fix"
+    assert "cap_continuation" not in base_repair
+
+    # Capability-failure replacement seat lock is preserved when both the grant and exemption are needed (F4).
+    cap_fail_head = f"{6:040x}"
+    cap_exemption = {
+        "task": "r4-cap-fail",
+        "started": "2026-11-28T08:00:00.000000+00:00",
+        "run_nonce": "nonce-4",
+        "head": cap_fail_head,
+        "seat": ("anthropic", "code"),
+        "source": "capability-failure-event",
+        "second_review": False,
+    }
+    with pytest.raises(recorder.RecordError, match="CAPABILITY_REPLACEMENT_REFUSED"):
+        recorder.require_review_round_within_budget(
+            comments[:3],
+            head4,
+            "fleet",
+            budget=3,
+            pr=42,
+            exemption=lambda: cap_exemption,
+            recording_seat=("openai", "code"),
+            cap_continuation=cap_grant,
+        )
+    both_receipts = recorder.require_review_round_within_budget(
+        comments[:3],
+        head4,
+        "fleet",
+        budget=3,
+        pr=42,
+        exemption=lambda: cap_exemption,
+        recording_seat=("anthropic", "code"),
+        cap_continuation=cap_grant,
+    )
+    assert "cap_continuation" in both_receipts and "capability_exemption" in both_receipts
+
+    approved_comments = [*comments[:-1], recorded_verdict(head4, "APPROVED", task_id="review-4")]
+    exempt_receipt = recorder.require_review_round_within_budget(
+        approved_comments,
+        head5,
+        "fleet",
+        budget=3,
+        pr=42,
+        prove_merge_only=lambda anchor, candidate: ["b" * 40] if (anchor, candidate) == (head4, head5) else None,
+        cap_continuation=cap_grant,
+    )
+    assert exempt_receipt["budget_exemption"]["reason"] == recorder.CLEAN_BASE_MERGE
+
+
+@pytest.mark.usefixtures("configured_roots", "recorder_matcher", "agent_runtime_roots")
+def test_second_cap_continuation_grant_is_refused(monkeypatch, tmp_path):
+    """Defect class: a PR accepts a second CTO cap-continuation grant (including via a repository alias or
+    after moving to a new head), allowing more than one extra charged round."""
+    _transferred(monkeypatch, "neworg/repos")
+    tasks, _comments, _calls, heads, state = _seed_capped_pr(monkeypatch, tmp_path, repository="org/repos", rounds=3)
+    capped_head = heads[-1]
+    cto_env = {"SESSION_SEAT": "cto", "SESSION_HANDOFF_AGENT": "claude-cto"}
+
+    def ds_reader(_item_id):
+        return {
+            "id": "cto-cap-alias",
+            "lane": "cto",
+            "kind": "decision",
+            "status": "active",
+            "statement": f"CAP_CONTINUATION: authorize repo=org/repos pr=#42 head={state['head']}",
+        }
+
+    def gh_reader(cmd):
+        if cmd[:3] == ["gh", "pr", "view"]:
+            return {"headRefOid": state["head"], "headRefName": "codex/42", "state": "OPEN"}
+        raise AssertionError(f"unexpected gh_reader: {cmd!r}")
+
+    first = recorder.grant_cap_continuation(
+        repository="org/repos",
+        number=42,
+        capped_head=capped_head,
+        disposition_ref="driver-state:cto-cap-alias",
+        authority="claude-cto",
+        task_root=tasks,
+        lock_root=tmp_path / "locks",
+        env=cto_env,
+        driver_state_reader=ds_reader,
+        github_reader=gh_reader,
+    )
+    assert first["extra_rounds"] == 1
+
+    # Second grant on same slug, different alias, uppercase alias, or moved head is refused.
+    for repo_spelling, next_head in (
+        ("org/repos", capped_head),
+        ("neworg/repos", capped_head),
+        ("NEWORG/REPOS", f"{4:040x}"),
+    ):
+        state["head"] = next_head
+        with pytest.raises(recorder.CapContinuationRefused, match=r"CAP_CONTINUATION_REFUSED\[duplicate\]"):
+            recorder.grant_cap_continuation(
+                repository=repo_spelling,
+                number=42,
+                capped_head=next_head,
+                disposition_ref="driver-state:cto-cap-alias",
+                authority="claude-cto",
+                task_root=tasks,
+                lock_root=tmp_path / "locks",
+                env=cto_env,
+                driver_state_reader=ds_reader,
+                github_reader=gh_reader,
+            )
+    stored_files = list(recorder._cap_continuation_receipts(tasks).glob("*.json"))
+    assert len(stored_files) == 1
+
+
+@pytest.mark.usefixtures("configured_roots", "recorder_matcher", "agent_runtime_roots")
+def test_cap_continuation_grant_from_unverified_source_is_refused(monkeypatch, tmp_path, capsys):
+    """Defect class: a cap-continuation grant is accepted or issued from a worker-marked caller, unverified
+    authority, public PR comment, stale head, unexhausted budget, mismatched disposition, or tampered receipt."""
+    from lu_machinery.dispatcher import write_boundary
+    from tests.review.record_support import REPOSITORY
+
+    tasks, comments, _calls, heads, state = _seed_capped_pr(monkeypatch, tmp_path, rounds=3)
+    capped_head = heads[-1]
+    cto_env = {"SESSION_SEAT": "cto", "SESSION_HANDOFF_AGENT": "claude-cto"}
+
+    def valid_ds(_item_id):
+        return {
+            "id": "cto-cap-42",
+            "lane": "cto",
+            "kind": "decision",
+            "status": "active",
+            "statement": f"CAP_CONTINUATION: authorize repo={REPOSITORY} pr=#42 head={capped_head}",
+        }
+
+    # 1. Worker-marked callers are refused even when explicit CTO env and --authority claude-cto are passed.
+    for worker_env in (
+        {"LEARN_UKRAINIAN_DISPATCH_TASK_ID": "worker-99", "SESSION_SEAT": "cto"},
+        {"LU_WRITE_BOUNDARY_BROKER": "/run/lu-write-boundary/broker.sock", "SESSION_SEAT": "cto"},
+    ):
+        with pytest.raises(recorder.CapContinuationRefused, match=r"CAP_CONTINUATION_REFUSED\[worker_caller\]"):
+            recorder.grant_cap_continuation(
+                repository=REPOSITORY,
+                number=42,
+                capped_head=capped_head,
+                disposition_ref="driver-state:cto-cap-42",
+                authority="claude-cto",
+                task_root=tasks,
+                lock_root=tmp_path / "locks",
+                env=worker_env,
+                driver_state_reader=valid_ds,
+            )
+
+    # 2. Wrong/unhashable authority or missing/mismatched CTO seat binding is refused (F7).
+    for bad_authority, bad_env in (
+        ("worker-seat", cto_env),
+        (["claude-cto"], cto_env),
+        ("claude-cto", {}),
+        ("claude-cto", {"SESSION_SEAT": "worker", "SESSION_EPIC": "epics"}),
+    ):
+        with pytest.raises(recorder.CapContinuationRefused, match=r"CAP_CONTINUATION_REFUSED\[authority\]"):
+            recorder.grant_cap_continuation(
+                repository=REPOSITORY,
+                number=42,
+                capped_head=capped_head,
+                disposition_ref="driver-state:cto-cap-42",
+                authority=bad_authority,  # type: ignore[arg-type]
+                task_root=tasks,
+                lock_root=tmp_path / "locks",
+                env=bad_env,
+                driver_state_reader=valid_ds,
+            )
+
+    # 3. A public PR comment alone grants no round, and PR/untrusted/unhashable GitHub dispositions are refused.
+    comments.append({
+        "id": 999,
+        "user": {"login": "fleet"},
+        "author_association": "MEMBER",
+        "body": f"CAP_CONTINUATION: authorize repo={REPOSITORY} pr=#42 head={capped_head}",
+    })
+    state["head"] = f"{4:040x}"
+    assert recorder.budget_check_main(["--repository", REPOSITORY, "--pr", "42"]) == 1
+    assert "REVIEW_BUDGET_EXHAUSTED" in json.loads(capsys.readouterr().out)["refusal"]
+    state["head"] = capped_head
+
+    def pr_self_comment_gh(cmd):
+        if cmd[:3] == ["gh", "pr", "view"]:
+            return {"headRefOid": capped_head, "headRefName": "codex/42", "state": "OPEN"}
+        if cmd[:3] == ["gh", "api", f"repos/{REPOSITORY}/issues/comments/555"]:
+            return {
+                "id": 555,
+                "user": {"login": "fleet"},
+                "author_association": "MEMBER",
+                "issue_url": f"https://api.github.com/repos/{REPOSITORY}/issues/42",
+                "html_url": f"https://github.com/{REPOSITORY}/pull/42#issuecomment-555",
+                "body": f"CAP_CONTINUATION: authorize repo={REPOSITORY} pr=#42 head={capped_head}",
+            }
+        if cmd[:3] == ["gh", "api", f"repos/{REPOSITORY}/issues/comments/556"]:
+            return {
+                "id": 556,
+                "user": {"login": "fleet"},
+                "author_association": ["MEMBER"],
+                "issue_url": f"https://api.github.com/repos/{REPOSITORY}/issues/100",
+                "html_url": f"https://github.com/{REPOSITORY}/issues/100#issuecomment-556",
+                "body": f"CAP_CONTINUATION: authorize repo={REPOSITORY} pr=#42 head={capped_head}",
+            }
+        if cmd[:3] == ["gh", "api", f"repos/{REPOSITORY}/issues/42"]:
+            return {
+                "number": 42,
+                "pull_request": {"url": f"https://api.github.com/repos/{REPOSITORY}/pulls/42"},
+                "user": {"login": "fleet"},
+                "author_association": "MEMBER",
+                "body": f"CAP_CONTINUATION: authorize repo={REPOSITORY} pr=#42 head={capped_head}",
+            }
+        if cmd[:3] == ["gh", "api", f"repos/{REPOSITORY}/issues/101"]:
+            return {
+                "number": 101,
+                "user": {"login": "fleet"},
+                "author_association": {"role": "MEMBER"},
+                "body": f"CAP_CONTINUATION: authorize repo={REPOSITORY} pr=#42 head={capped_head}",
+            }
+        if cmd[:3] == ["gh", "api", f"repos/{REPOSITORY}/issues/102"]:
+            return {
+                "number": 102,
+                "user": {"login": "fleet"},
+                "author_association": "MEMBER",
+                "body": f"Denied continuation for {REPOSITORY} PR #42 at {capped_head}.\n"
+                        f"CAP_CONTINUATION: deny repo={REPOSITORY} pr=#42 head={capped_head}",
+            }
+        raise AssertionError(f"unexpected gh cmd: {cmd!r}")
+
+    for bad_ref in (
+        f"github:comment:{REPOSITORY}#555",
+        f"github:comment:{REPOSITORY}#556",
+        f"github:issue:{REPOSITORY}#42",
+        f"github:issue:{REPOSITORY}#101",
+        f"github:issue:{REPOSITORY}#102",
+        "freeform:nope",
+    ):
+        with pytest.raises(recorder.CapContinuationRefused, match=r"CAP_CONTINUATION_REFUSED\[disposition\]"):
+            recorder.grant_cap_continuation(
+                repository=REPOSITORY,
+                number=42,
+                capped_head=capped_head,
+                disposition_ref=bad_ref,
+                authority="claude-cto",
+                task_root=tasks,
+                lock_root=tmp_path / "locks",
+                env=cto_env,
+                github_reader=pr_self_comment_gh,
+            )
+
+    # 4. Wrong lane/kind/status, negative/fenced/hidden/CRLF-conflict, or mismatched disposition is refused (F1).
+    auth_line = f"CAP_CONTINUATION: authorize repo={REPOSITORY} pr=#42 head={capped_head}"
+    deny_line = f"CAP_CONTINUATION: deny repo={REPOSITORY} pr=#42 head={capped_head}"
+    # CRLF and CR visible directives are recognized identically to LF (including denials).
+    assert recorder._cap_directive_actions(f"{auth_line}\r\n", stored_repo=REPOSITORY, number=42, capped_head=capped_head) == {"authorize"}
+    assert recorder._cap_directive_actions(f"{auth_line}\r", stored_repo=REPOSITORY, number=42, capped_head=capped_head) == {"authorize"}
+    for bad_note in (
+        {"id": "cto-cap-42", "lane": "other", "kind": "decision", "status": "active", "statement": auth_line},
+        {"id": "cto-cap-42", "lane": "cto", "kind": "blocker", "status": "active", "statement": auth_line},
+        {"id": "cto-cap-42", "lane": "cto", "kind": "decision", "status": "done", "statement": auth_line},
+        {"id": "cto-cap-42", "lane": "cto", "kind": "decision", "status": ["active"], "statement": auth_line},
+        {"id": "cto-cap-42", "lane": "cto", "kind": "decision", "status": "active", "statement": f"Denied {REPOSITORY} #42 {capped_head}"},
+        {"id": "cto-cap-42", "lane": "cto", "kind": "decision", "status": "active", "statement": deny_line},
+        {"id": "cto-cap-42", "lane": "cto", "kind": "decision", "status": "active", "statement": f"```\n{auth_line}\n```"},
+        {"id": "cto-cap-42", "lane": "cto", "kind": "decision", "status": "active", "statement": f"<!--\n{auth_line}\n-->"},
+        {"id": "cto-cap-42", "lane": "cto", "kind": "decision", "status": "active", "statement": f"Note <!--\n{auth_line}\n-->"},
+        {"id": "cto-cap-42", "lane": "cto", "kind": "decision", "status": "active", "statement": f"`{auth_line}`"},
+        {"id": "cto-cap-42", "lane": "cto", "kind": "decision", "status": "active", "statement": f"> {auth_line}"},
+        {"id": "cto-cap-42", "lane": "cto", "kind": "decision", "status": "active", "statement": f"{auth_line}\n{deny_line}"},
+        {"id": "cto-cap-42", "lane": "cto", "kind": "decision", "status": "active", "statement": f"{auth_line}\n{deny_line}\r\n"},
+        {"id": "cto-cap-42", "lane": "cto", "kind": "decision", "status": "active", "statement": f"{auth_line}\r{deny_line}\r"},
+        {"id": "cto-cap-42", "lane": "cto", "kind": "decision", "status": "active", "statement": f"CAP_CONTINUATION: authorize repo={REPOSITORY} pr=#99 head={capped_head}"},
+        {"id": "cto-cap-42", "lane": "cto", "kind": "decision", "status": "active", "statement": f"CAP_CONTINUATION: authorize repo=other/repo pr=#42 head={capped_head}"},
+    ):
+        with pytest.raises(recorder.CapContinuationRefused, match=r"CAP_CONTINUATION_REFUSED\[disposition\]"):
+            recorder.grant_cap_continuation(
+                repository=REPOSITORY,
+                number=42,
+                capped_head=capped_head,
+                disposition_ref="driver-state:cto-cap-42",
+                authority="claude-cto",
+                task_root=tasks,
+                lock_root=tmp_path / "locks",
+                env=cto_env,
+                driver_state_reader=lambda _id, note=bad_note: note,
+            )
+
+    # 5. Stale head at issuance (both initially and advancing mid-issuance during disposition read, F2) is refused.
+    with pytest.raises(recorder.CapContinuationRefused, match=r"CAP_CONTINUATION_REFUSED\[stale_head\]"):
+        recorder.grant_cap_continuation(
+            repository=REPOSITORY,
+            number=42,
+            capped_head="e" * 40,
+            disposition_ref="driver-state:cto-cap-42",
+            authority="claude-cto",
+            task_root=tasks,
+            lock_root=tmp_path / "locks",
+            env=cto_env,
+            driver_state_reader=valid_ds,
+        )
+
+    def moving_ds(_item_id):
+        state["head"] = f"{9:040x}"
+        return valid_ds(_item_id)
+
+    with pytest.raises(recorder.CapContinuationRefused, match=r"CAP_CONTINUATION_REFUSED\[stale_head\]"):
+        recorder.grant_cap_continuation(
+            repository=REPOSITORY,
+            number=42,
+            capped_head=capped_head,
+            disposition_ref="driver-state:cto-cap-42",
+            authority="claude-cto",
+            task_root=tasks,
+            lock_root=tmp_path / "locks",
+            env=cto_env,
+            driver_state_reader=moving_ds,
+        )
+    state["head"] = capped_head
+    assert recorder._read_cap_continuation(recorder._cap_continuation_receipts(tasks), repository=REPOSITORY, number=42) is None
+
+    # 6. Unknown/fallback PR tier (F3), malformed comment history (F7), and unexhausted budget are refused.
+    # Missing file status (would trigger classify_pr_files High fallback on a docs-only diff) is refused.
+    with monkeypatch.context() as mp:
+        mp.setattr(
+            recorder.GitHubAdapter, "pr_file_rows", lambda *_a, **_k: [{"filename": "README.md"}],
+        )
+        with pytest.raises(recorder.CapContinuationRefused, match=r"CAP_CONTINUATION_REFUSED\[pr\]"):
+            recorder.grant_cap_continuation(
+                repository=REPOSITORY,
+                number=42,
+                capped_head=capped_head,
+                disposition_ref="driver-state:cto-cap-42",
+                authority="claude-cto",
+                task_root=tasks,
+                lock_root=tmp_path / "locks",
+                env=cto_env,
+                driver_state_reader=valid_ds,
+            )
+    # Trivial diff whose learner-content policy lookup fails (High fallback in tiers.py) is refused.
+    with monkeypatch.context() as mp:
+        mp.setattr(
+            recorder.GitHubAdapter, "pr_file_rows", lambda *_a, **_k: [{"filename": "README.md", "status": "modified"}],
+        )
+        mp.setattr(
+            recorder.integration_sweep,
+            "changes_learner_content",
+            lambda _paths: (_ for _ in ()).throw(recorder.DeployPathsError("policy unavailable")),
+        )
+        with pytest.raises(recorder.CapContinuationRefused, match=r"CAP_CONTINUATION_REFUSED\[pr\]"):
+            recorder.grant_cap_continuation(
+                repository=REPOSITORY,
+                number=42,
+                capped_head=capped_head,
+                disposition_ref="driver-state:cto-cap-42",
+                authority="claude-cto",
+                task_root=tasks,
+                lock_root=tmp_path / "locks",
+                env=cto_env,
+                driver_state_reader=valid_ds,
+            )
+    # File lookup raising SweepError is refused.
+    with monkeypatch.context() as mp:
+        mp.setattr(
+            recorder.GitHubAdapter,
+            "pr_file_rows",
+            lambda *_a, **_k: (_ for _ in ()).throw(sweep.SweepError("files unavailable")),
+        )
+        with pytest.raises(recorder.CapContinuationRefused, match=r"CAP_CONTINUATION_REFUSED\[pr\]"):
+            recorder.grant_cap_continuation(
+                repository=REPOSITORY,
+                number=42,
+                capped_head=capped_head,
+                disposition_ref="driver-state:cto-cap-42",
+                authority="claude-cto",
+                task_root=tasks,
+                lock_root=tmp_path / "locks",
+                env=cto_env,
+                driver_state_reader=valid_ds,
+            )
+    # Malformed author_association on a historical comment raises typed refusal, never TypeError (F7).
+    bad_history = [*comments, {"id": 1000, "user": {"login": "fleet"}, "author_association": ["MEMBER"], "body": "x"}]
+    with monkeypatch.context() as mp:
+        mp.setattr(recorder.GitHubAdapter, "comments", lambda *_a, **_k: bad_history)
+        with pytest.raises(recorder.CapContinuationRefused, match=r"CAP_CONTINUATION_REFUSED\[pr\]"):
+            recorder.grant_cap_continuation(
+                repository=REPOSITORY,
+                number=42,
+                capped_head=capped_head,
+                disposition_ref="driver-state:cto-cap-42",
+                authority="claude-cto",
+                task_root=tasks,
+                lock_root=tmp_path / "locks",
+                env=cto_env,
+                driver_state_reader=valid_ds,
+            )
+    # Unexhausted budget (2 of 3 rounds used) is refused.
+    sub_tasks, _c, _calls, sub_heads, _st = _seed_capped_pr(monkeypatch, tmp_path / "sub", rounds=2)
+
+    def sub_ds(_id):
+        return {
+            "id": "cto-cap-42",
+            "lane": "cto",
+            "kind": "decision",
+            "status": "active",
+            "statement": f"CAP_CONTINUATION: authorize repo={REPOSITORY} pr=#42 head={sub_heads[-1]}",
+        }
+    with pytest.raises(recorder.CapContinuationRefused, match=r"CAP_CONTINUATION_REFUSED\[not_exhausted\]"):
+        recorder.grant_cap_continuation(
+            repository=REPOSITORY,
+            number=42,
+            capped_head=sub_heads[-1],
+            disposition_ref="driver-state:cto-cap-42",
+            authority="claude-cto",
+            task_root=sub_tasks,
+            lock_root=tmp_path / "sub" / "locks",
+            env=cto_env,
+            driver_state_reader=sub_ds,
+        )
+
+    # 7. Tampered, unhashable-authority (F7), or symlinked receipt fails closed; store sits under batch_state.
+    store = recorder._cap_continuation_receipts(tasks)
+    store.mkdir(parents=True, exist_ok=True)
+    receipt_path = store / recorder._cap_grant_filename(REPOSITORY.lower(), 42)
+    receipt_path.write_text(json.dumps({"schema": recorder.CAP_CONTINUATION_SCHEMA, "extra_rounds": 2}))
+    with pytest.raises(recorder.CapContinuationRefused, match=r"CAP_CONTINUATION_REFUSED\[store\]"):
+        recorder._read_cap_continuation(store, repository=REPOSITORY, number=42)
+    bad_auth_receipt = {
+        "schema": recorder.CAP_CONTINUATION_SCHEMA,
+        "repository": REPOSITORY,
+        "canonical_repository": REPOSITORY.lower(),
+        "repository_id": None,
+        "pr": 42,
+        "capped_head": capped_head,
+        "disposition_ref": "driver-state:cto-cap-42",
+        "disposition_sha256": "a" * 64,
+        "base_budget": 3,
+        "extra_rounds": 1,
+        "authority": ["claude-cto"],
+        "actor": "claude-cto",
+        "actor_task": None,
+        "actor_seat": "cto",
+        "actor_authenticated": False,
+        "threat_model": recorder.CAP_CONTINUATION_THREAT_MODEL,
+        "issued_at": "2026-11-28T08:00:00Z",
+    }
+    receipt_path.write_text(json.dumps(bad_auth_receipt))
+    with pytest.raises(recorder.CapContinuationRefused, match=r"CAP_CONTINUATION_REFUSED\[store\]"):
+        recorder._read_cap_continuation(store, repository=REPOSITORY, number=42)
+    receipt_path.unlink()
+    target = tmp_path / "outside.json"
+    target.write_text("{}")
+    receipt_path.symlink_to(target)
+    with pytest.raises(recorder.CapContinuationRefused, match=r"CAP_CONTINUATION_REFUSED\[store\]"):
+        recorder._read_cap_continuation(store, repository=REPOSITORY, number=42)
+    assert "batch_state" in write_boundary._CHECKOUT_PRIVATE
+    assert store.parent == tasks.parent
+
+
+@pytest.mark.usefixtures("configured_roots", "recorder_matcher", "agent_runtime_roots")
+def test_replayed_or_concurrent_duplicate_cap_continuation_grant_is_refused(monkeypatch, tmp_path):
+    """Defect class: concurrent cap-continuation grant requests (including across repository aliases) or an
+    exact replay both succeed instead of atomically admitting one receipt and refusing duplicates."""
+    import threading
+
+    _transferred(monkeypatch, "neworg/repos")
+    tasks, _comments, _calls, heads, state = _seed_capped_pr(monkeypatch, tmp_path, repository="org/repos", rounds=3)
+    capped_head = heads[-1]
+    cto_env = {"SESSION_SEAT": "cto", "SESSION_HANDOFF_AGENT": "claude-cto"}
+    barrier = threading.Barrier(2)
+    outcomes: list[tuple[str, object]] = []
+    lock = threading.Lock()
+
+    def ds_reader(_item_id):
+        return {
+            "id": "cto-cap-race",
+            "lane": "cto",
+            "kind": "decision",
+            "status": "active",
+            "statement": f"CAP_CONTINUATION: authorize repo=org/repos pr=#42 head={capped_head}",
+        }
+
+    def gh_reader(cmd):
+        if cmd[:3] == ["gh", "pr", "view"]:
+            return {"headRefOid": state["head"], "headRefName": "codex/42", "state": "OPEN"}
+        raise AssertionError(f"unexpected gh_reader: {cmd!r}")
+
+    def worker(repo_spelling: str) -> None:
+        barrier.wait(timeout=5)
+        try:
+            receipt = recorder.grant_cap_continuation(
+                repository=repo_spelling,
+                number=42,
+                capped_head=capped_head,
+                disposition_ref="driver-state:cto-cap-race",
+                authority="claude-cto",
+                task_root=tasks,
+                lock_root=tmp_path / "locks",
+                env=cto_env,
+                driver_state_reader=ds_reader,
+                github_reader=gh_reader,
+            )
+            outcome: tuple[str, object] = ("ok", receipt)
+        except recorder.CapContinuationRefused as exc:
+            outcome = (exc.reason, str(exc))
+        with lock:
+            outcomes.append(outcome)
+
+    threads = [
+        threading.Thread(target=worker, args=("org/repos",)),
+        threading.Thread(target=worker, args=("neworg/repos",)),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+    assert sorted(kind for kind, _ in outcomes) == ["duplicate", "ok"]
+
+    # Exact replay of the winning call is also refused, and no staging temp file remains (F6).
+    with pytest.raises(recorder.CapContinuationRefused, match=r"CAP_CONTINUATION_REFUSED\[duplicate\]"):
+        recorder.grant_cap_continuation(
+            repository="org/repos",
+            number=42,
+            capped_head=capped_head,
+            disposition_ref="driver-state:cto-cap-race",
+            authority="claude-cto",
+            task_root=tasks,
+            lock_root=tmp_path / "locks",
+            env=cto_env,
+            driver_state_reader=ds_reader,
+            github_reader=gh_reader,
+        )
+    store_entries = sorted(p.name for p in recorder._cap_continuation_receipts(tasks).iterdir())
+    assert len(store_entries) == 1 and not store_entries[0].startswith(".")
+
+    # Post-link directory fsync failure rolls back cleanly so admission sees nothing and retry succeeds (F8);
+    # if rollback also fails, it surfaces typed durability_unknown rather than an uncaught OSError.
+    fsync_store = tmp_path / "fsync-store"
+    real_fsync = os.fsync
+    real_unlink = os.unlink
+    fsync_calls = {"count": 0}
+
+    def fail_dir_fsync(fd):
+        fsync_calls["count"] += 1
+        if fsync_calls["count"] == 2:
+            raise OSError(5, "I/O error")
+        return real_fsync(fd)
+
+    sample_receipt = dict(next(val for kind, val in outcomes if kind == "ok"))
+    with monkeypatch.context() as mp:
+        mp.setattr(os, "fsync", fail_dir_fsync)
+        with pytest.raises(recorder.CapContinuationRefused, match=r"CAP_CONTINUATION_REFUSED\[store\]"):
+            recorder._write_cap_continuation_exclusive(
+                fsync_store, primary_key="id:4242", stored_repo="org/repos", number=42, receipt=sample_receipt
+            )
+    assert list(fsync_store.iterdir()) == []
+    # Retry succeeds once directory sync recovers.
+    published = recorder._write_cap_continuation_exclusive(
+        fsync_store, primary_key="id:4242", stored_repo="org/repos", number=42, receipt=sample_receipt
+    )
+    assert published.is_file()
+
+    fsync_store2 = tmp_path / "fsync-store-rollback-fail"
+    fsync_calls["count"] = 0
+
+    def fail_final_unlink(path, *, dir_fd=None):
+        if isinstance(path, str) and not path.startswith("."):
+            raise OSError(5, "I/O error")
+        return real_unlink(path, dir_fd=dir_fd)
+
+    with monkeypatch.context() as mp:
+        mp.setattr(os, "fsync", fail_dir_fsync)
+        mp.setattr(os, "unlink", fail_final_unlink)
+        with pytest.raises(recorder.CapContinuationRefused, match=r"CAP_CONTINUATION_REFUSED\[durability_unknown\]"):
+            recorder._write_cap_continuation_exclusive(
+                fsync_store2, primary_key="id:4242", stored_repo="org/repos", number=42, receipt=sample_receipt
+            )
+    assert recorder._read_cap_continuation(fsync_store2, repository="org/repos", number=42) == sample_receipt
+
+
+@pytest.mark.usefixtures("configured_roots", "recorder_matcher", "agent_runtime_roots")
+def test_stale_head_or_ineligible_verdict_after_cap_continuation_grant_is_refused(monkeypatch, tmp_path):
+    """Defect class: after a valid CTO cap-continuation grant opens the extra round, a verdict at a stale
+    head or from an ineligible (same-family) reviewer is admitted instead of refused."""
+    from tests.review.record_support import REPOSITORY, facts_for
+
+    tasks, _comments, calls, heads, state = _seed_capped_pr(monkeypatch, tmp_path, rounds=3)
+    capped_head = heads[-1]
+    head4 = f"{4:040x}"
+    head5 = f"{5:040x}"
+    cto_env = {"SESSION_SEAT": "cto", "SESSION_HANDOFF_AGENT": "claude-cto"}
+
+    recorder.grant_cap_continuation(
+        repository=REPOSITORY,
+        number=42,
+        capped_head=capped_head,
+        disposition_ref=f"github:issue:{REPOSITORY}#100",
+        authority="claude-cto",
+        task_root=tasks,
+        lock_root=tmp_path / "locks",
+        env=cto_env,
+    )
+
+    # 1. Stale head after grant: review pinned to head4, PR moved to head5 -> refused.
+    write_task(
+        tasks,
+        task_id="review-4-stale",
+        pr=42,
+        worktree_base_sha=head4,
+        agent="claude",
+        model="claude-opus-5-5",
+        reply="VERDICT: APPROVE\nVerified.",
+    )
+    state["head"] = head5
+    with pytest.raises(recorder.RecordError, match="PR head moved"):
+        recorder.record("review-4-stale", pr_number=42, task_root=tasks, lock_root=tmp_path / "locks")
+    assert calls["posts"] == 0
+
+    # 2. Ineligible (same-family) reviewer at exact live head4 -> refused.
+    state["head"] = head4
+    monkeypatch.setattr(
+        recorder,
+        "pr_review_facts",
+        lambda *_a, **_k: facts_for({"anthropic"}, changed_paths=("lu_machinery/common/unit.py",)),
+    )
+    with pytest.raises(recorder.RecordError, match="reviewer family equals an author family"):
+        recorder.record("review-4-stale", pr_number=42, task_root=tasks, lock_root=tmp_path / "locks")
+    assert calls["posts"] == 0
+
+    # 3. Eligible outside-family reviewer at exact live head4 succeeds using the granted round.
+    write_task(
+        tasks,
+        task_id="review-4-eligible",
+        pr=42,
+        worktree_base_sha=head4,
+        agent="codex",
+        model=CURRENT_SOL,
+        reply="VERDICT: APPROVE\nVerified exact head.",
+    )
+    published = recorder.record("review-4-eligible", pr_number=42, task_root=tasks, lock_root=tmp_path / "locks")
+    assert published["verdict"] == "APPROVED" and calls["posts"] == 1
+    assert published["cap_continuation"]["disposition_ref"] == f"github:issue:{REPOSITORY}#100"

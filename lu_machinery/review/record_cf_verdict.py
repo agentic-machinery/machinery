@@ -9,12 +9,14 @@ import hashlib
 import json
 import os
 import re
+import secrets
+import shutil
 import stat
 import subprocess
 import sys
 import time
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack, contextmanager, suppress
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from functools import cache, partial
@@ -52,6 +54,7 @@ from lu_machinery.ci.deploy_paths import DeployPathsError
 from lu_machinery.common import json_depth
 from lu_machinery.common.jsonl import jsonl_lines
 from lu_machinery.common.repo_root import machinery_path
+from lu_machinery.cto_safe_mode import is_cto_caller, is_worker
 from lu_machinery.fleet.claude_account_lane import ClaudeAccount, account_from_record
 from lu_machinery.fleet_comms.review_publication import (
     DEFAULT_STATUS_CONTEXT,
@@ -153,7 +156,16 @@ from lu_machinery.review.role_resolution import resolve_routing_reference
 from lu_machinery.review.security_paths import git_changed_paths, is_security_sensitive_change
 from lu_machinery.review.subject_seat import prepare_subject_exclusion
 from lu_machinery.review.target_resolution import TargetResolutionError, resolve_review_repository
-from lu_machinery.review.tiers import ReviewTier, classify_pr_files
+from lu_machinery.review.tiers import (
+    _STATUSES as _TIER_FILE_STATUSES,
+)
+from lu_machinery.review.tiers import (
+    ReviewTier,
+    classify_pr_files,
+)
+from lu_machinery.review.tiers import (
+    _load_table as _load_tier_table,
+)
 from lu_machinery.review.ukrainian_seats import (
     UKRAINIAN_SEAT_ROUTES,
     attested_author_families,
@@ -199,10 +211,65 @@ DEFAULT_REVIEW_ROUNDS = 3
 MAX_DECLARED_REVIEW_ROUNDS = 5
 # A target repository whose own review policy sets another automatic budget declares it here (#12584).
 REVIEW_BUDGET_POLICY = machinery_path("config/review_budget_policy.yaml")
+# CTO cap-continuation grant store (sibling of tasks/ and review-repair-rounds/ under batch_state/).
+# OS-contained read-only reviewers (write_boundary / agy_sandbox) cannot write host batch_state;
+# workspace-write workers share the OS user under NO-WORKER-SANDBOX-1115, so worker-marker checks
+# are accident guards and same-user attribution is recorded as unauthenticated.
+CAP_CONTINUATION_DIR = "review-cap-continuations"
+CAP_CONTINUATION_SCHEMA = "review-cap-continuation.v1"
+CAP_CONTINUATION_AUTHORITIES = frozenset({"claude-cto"})
+CAP_CONTINUATION_MAX_BYTES = 64 * 1024
+CAP_CONTINUATION_THREAT_MODEL = "cooperative_same_os_user"
+_CAP_DRIVER_STATE_CLI_ENV = "LU_DRIVER_STATE_CLI"
+_CAP_DRIVER_STATE_CLI_DEFAULT = "lu-driver-state"
+_CAP_DRIVER_STATE_TIMEOUT_S = 30
+_CAP_DRIVER_STATE_ACTIVE_STATUSES = frozenset({"open", "active"})
+_CAP_REPO_SLUG = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*\Z")
+_CAP_DIRECTIVE_LINE = re.compile(
+    r"^[ \t]*CAP_CONTINUATION:[ \t]+(authorize|deny)[ \t]+"
+    r"repo=([A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*)[ \t]+"
+    r"pr=#([1-9][0-9]*)[ \t]+head=([0-9a-f]{40})[ \t]*$"
+)
+_CAP_DRIVER_STATE_REF = re.compile(r"driver-state:([A-Za-z0-9][A-Za-z0-9._:-]{0,127})\Z")
+_CAP_GITHUB_ISSUE_REF = re.compile(
+    r"github:issue:([A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*)#([1-9][0-9]*)\Z"
+)
+_CAP_GITHUB_COMMENT_REF = re.compile(
+    r"github:comment:([A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*)#([1-9][0-9]*)\Z"
+)
+_CAP_DIGEST = re.compile(r"[0-9a-f]{64}\Z")
+_CAP_RECEIPT_FIELDS = frozenset({
+    "schema",
+    "repository",
+    "canonical_repository",
+    "repository_id",
+    "pr",
+    "capped_head",
+    "disposition_ref",
+    "disposition_sha256",
+    "base_budget",
+    "extra_rounds",
+    "authority",
+    "actor",
+    "actor_task",
+    "actor_seat",
+    "actor_authenticated",
+    "threat_model",
+    "issued_at",
+})
 
 
 class RecordError(RuntimeError):
     """A review cannot be bound to a trustworthy exact-head verdict."""
+
+
+class CapContinuationRefused(RecordError):
+    """A CTO cap-continuation grant condition failed; ``reason`` names which one."""
+
+    def __init__(self, reason: str, detail: str) -> None:
+        super().__init__(f"CAP_CONTINUATION_REFUSED[{reason}]: {detail}")
+        self.reason = reason
+        self.detail = detail
 
 
 NESTED_TOO_DEEPLY = "review reply is nested too deeply to read its verdict"
@@ -1719,15 +1786,17 @@ def _repo_root() -> Path:
 @contextmanager
 def pr_lock(repository: str, number: int, lock_root: Path):
     """Serialize publication on one PR across its heads, so the comments a poster checked still hold."""
-    repositories = {repository}
+    repositories = {repository, repository.lower()}
     try:
         aliases = repository_slugs(repository)
         identity = repository_identity(repository) if aliases else None
     except FleetRepoError as exc:
         raise RecordError("fleet repository identity is unavailable") from exc
+    if aliases:
+        repositories.update(aliases)
+        repositories.update(alias.lower() for alias in aliases)
     if isinstance(identity, int):
         # An older recorder still locks the slug it knows. Hold those files in the same order.
-        repositories.update(aliases)
         repositories.add(str(identity))
     lock_root.mkdir(parents=True, exist_ok=True)
     with ExitStack() as locks:
@@ -2339,7 +2408,12 @@ def _trusted_markers(
         body = item.get("body") if isinstance(item, Mapping) else None
         if not isinstance(body, str) or MARKER_PREFIX not in body:
             continue
-        if _author_login(item, rest_only=True) != login or item.get("author_association") not in TRUSTED_ASSOCIATIONS:
+        if _author_login(item, rest_only=True) != login:
+            continue
+        assoc = item.get("author_association")
+        if not isinstance(assoc, str) or assoc not in TRUSTED_ASSOCIATIONS:
+            if reject_malformed and not isinstance(assoc, str):
+                raise RecordError("malformed trusted verdict comment author_association")
             continue
         marker = parse_marker(body)
         if marker is None:
@@ -2548,6 +2622,7 @@ def require_review_round_within_budget(
     recording_seat: tuple[str, str] | None = None,
     recording_run: tuple[str, str] | None = None,
     approval_context: Callable[[str], dict[str, Any]] | None = None,
+    cap_continuation: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Refuse a verdict that would open a review round beyond this PR's budget.
 
@@ -2563,10 +2638,13 @@ def require_review_round_within_budget(
     A head that only merges the base branch cleanly after the last fully
     approved head consumes no round (:func:`budget_exempt_heads`, proven with
     ``prove_merge_only``); it is checked only once the counted heads reach the
-    budget. No grant or request adds a round. The lineage's one
-    repair-verification round (``scripts/review/repair_round.py``) is outside
-    the budget: ``repair`` returns its receipt or refuses, and ``repair_heads``
-    names the heads it already admitted, which count as no budgeted round.
+    effective budget. A verified CTO cap-continuation receipt (``cap_continuation``)
+    adds strictly one charged round to the cumulative allowance, at most once per
+    PR, while keeping every prior round, reservation, exemption, and exact-head
+    rule intact. The lineage's one repair-verification round
+    (``scripts/review/repair_round.py``) is outside the budget: ``repair`` returns
+    its receipt or refuses, and ``repair_heads`` names the heads it already
+    admitted, which count as no budgeted round.
 
     The lineage's one uncharged capability failure (``exemption`` returns it, or None; #12717)
     opens no round: its run is left out of ``dispatched_heads`` and its published verdict, if any,
@@ -2590,9 +2668,20 @@ def require_review_round_within_budget(
     if sha in recorded or (uncharged is not None and recording_run == (uncharged["task"], uncharged["run_nonce"])):
         return {}
     heads = recorded | (dispatched_heads() if dispatched_heads is not None else frozenset())
+    effective_budget = budget + (1 if cap_continuation is not None else 0)
     decide = partial(
-        _round_decision, comments, sha, login, budget=budget, pr=pr, prove_merge_only=prove_merge_only,
-        repair=repair, repair_heads=repair_heads, approval_context=approval_context,
+        _round_decision,
+        comments,
+        sha,
+        login,
+        budget=effective_budget,
+        base_budget=budget,
+        pr=pr,
+        prove_merge_only=prove_merge_only,
+        repair=repair,
+        repair_heads=repair_heads,
+        approval_context=approval_context,
+        cap_continuation=cap_continuation,
     )
     receipt = decide(recorded, heads, exempt_key)
     if uncharged is None or uncharged["head"] == sha or uncharged["head"] in heads:
@@ -2623,24 +2712,29 @@ def _round_decision(
     exempt_key: tuple[str, str] | None,
     *,
     budget: int,
+    base_budget: int | None = None,
     pr: int,
     prove_merge_only: Callable[[str, str], list[str] | None] | None,
     repair: Callable[[], dict[str, Any] | None] | None,
     repair_heads: frozenset[str],
     approval_context: Callable[[str], dict[str, Any]] | None = None,
+    cap_continuation: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """:func:`require_review_round_within_budget`'s decision for one count of the charged heads."""
-    if len(heads) < budget:
+    base = budget if base_budget is None else base_budget
+    if len(heads) < base:
         return {}
     exempt = (
-        budget_exempt_heads(comments, sha, login, prove=prove_merge_only, unrecorded=heads - recorded, approval_context=approval_context)
+        budget_exempt_heads(
+            comments, sha, login, prove=prove_merge_only, unrecorded=heads - recorded, approval_context=approval_context
+        )
         if prove_merge_only
         else {}
     )
     if sha in exempt:
         return {"budget_exemption": {"reason": CLEAN_BASE_MERGE, **exempt[sha]}}
     counted = heads - set(exempt) - repair_heads
-    if len(counted) < budget:
+    if len(counted) < base:
         return {}
     unrecorded = sorted(counted - recorded)
     if unrecorded:
@@ -2652,18 +2746,25 @@ def _round_decision(
         note += f" (and {len(exempt)} clean base merge head(s), which consume no round)"
     if exempt_key is not None:
         note += f" (the capability failure of {exempt_key[0]} consumes no round; its one replacement is spent)"
+    if cap_continuation is not None:
+        note += " (including 1 CTO cap-continuation round)"
     exhausted = (
         f"REVIEW_BUDGET_EXHAUSTED: PR #{pr} already has verdicts at {len(counted)} heads{note} and its budget "
         f"is {budget} rounds; budget end is never approval, escalate instead of recording round {len(counted) + 1}"
     )
-    # Once per lineage: only a retry of the round already admitted at this head may run it again.
+    # Once per lineage: evaluate a qualifying repair before charging the CTO cap-continuation round
+    # so a repair keeps its repair receipt and REPAIR_VERIFIED attestation rather than consuming the extra round.
     if repair is not None and not repair_heads - {sha}:
         try:
             receipt = repair()
         except RecordError as exc:
+            if cap_continuation is not None and len(counted) < budget:
+                return {"cap_continuation": dict(cap_continuation)}
             raise RecordError(f"{exhausted}; {exc}") from None
         if receipt is not None:
             return {"repair_round": receipt}
+    if cap_continuation is not None and len(counted) < budget:
+        return {"cap_continuation": dict(cap_continuation)}
     raise RecordError(exhausted)
 
 
@@ -2772,6 +2873,819 @@ def _repair_receipts(task_root: Path) -> Path:
     return task_root.parent / RECEIPT_DIR
 
 
+def _cap_continuation_receipts(task_root: Path) -> Path:
+    """Where CTO cap-continuation receipts live: beside the task ledger, masked inside read-only boundaries."""
+    return task_root.parent / CAP_CONTINUATION_DIR
+
+
+def _validate_cap_repo_slug(repository: object) -> str:
+    if (
+        not isinstance(repository, str)
+        or not _CAP_REPO_SLUG.fullmatch(repository)
+        or any(part in {".", ".."} or ".." in part for part in repository.split("/"))
+    ):
+        raise CapContinuationRefused("repository", f"invalid repository slug {repository!r}")
+    return repository
+
+
+def _cap_repo_keys(repository: str) -> tuple[str, str, int | None, tuple[str, ...]]:
+    """Canonical registry slug, primary dedup key, optional repository id, and all alias keys."""
+    slug = _validate_cap_repo_slug(repository)
+    try:
+        repos = load_fleet_repos()
+    except FleetRepoError as exc:
+        raise CapContinuationRefused("repository", f"fleet repository registry is unreadable: {exc}") from None
+    try:
+        row = resolve_fleet_repo_by_slug(slug, repos=repos)
+    except FleetRepoError:
+        key = slug.lower()
+        return slug, key, None, (key,)
+    stored = row.github
+    repo_id = row.repository_id if type(row.repository_id) is int else None
+    primary = f"id:{repo_id}" if repo_id is not None else stored.lower()
+    aliases = tuple(dict.fromkeys([primary, stored.lower(), *(item.lower() for item in row.slugs)]))
+    return stored, primary, repo_id, aliases
+
+
+def _same_cap_repository(left: object, right: str) -> bool:
+    if not isinstance(left, str) or not _CAP_REPO_SLUG.fullmatch(left):
+        return False
+    if same_repository(left, right):
+        return True
+    try:
+        repos = load_fleet_repos()
+    except FleetRepoError:
+        return False
+    for candidate in (left, right):
+        try:
+            resolve_fleet_repo_by_slug(candidate, repos=repos)
+        except FleetRepoError:
+            continue
+        return False  # at least one is registered and same_repository already refused
+    return left.lower() == right.lower()
+
+
+def _cap_grant_filename(repo_key: str, number: int) -> str:
+    return hashlib.sha256(f"{repo_key}\0pr\0{number}".encode()).hexdigest() + ".json"
+
+
+def _valid_cap_disposition_ref(ref: object) -> bool:
+    if not isinstance(ref, str) or not ref:
+        return False
+    return bool(
+        _CAP_DRIVER_STATE_REF.fullmatch(ref)
+        or _CAP_GITHUB_ISSUE_REF.fullmatch(ref)
+        or _CAP_GITHUB_COMMENT_REF.fullmatch(ref)
+    )
+
+
+def _cap_parse_iso_utc(value: object) -> datetime | None:
+    if not isinstance(value, str) or not re.fullmatch(
+        r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,6})?(?:Z|\+00:00)\Z",
+        value,
+    ):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else None
+
+
+def _clean_actor_token(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    cleaned = " ".join(value.split())
+    if not cleaned or len(cleaned) > 128 or not cleaned.isascii() or any(ord(ch) < 32 or ord(ch) == 127 for ch in cleaned):
+        return None
+    return cleaned
+
+
+def _validate_cap_continuation_receipt(
+    data: object,
+    *,
+    stored_repo: str,
+    repo_id: int | None,
+    all_keys: tuple[str, ...],
+    number: int,
+    filename: str,
+) -> dict[str, Any]:
+    if not isinstance(data, dict) or set(data) != _CAP_RECEIPT_FIELDS:
+        raise CapContinuationRefused("store", f"cap-continuation receipt {filename} has invalid schema or fields")
+    if data["schema"] != CAP_CONTINUATION_SCHEMA:
+        raise CapContinuationRefused("store", f"cap-continuation receipt {filename} has unsupported schema")
+    if not _same_cap_repository(data["repository"], stored_repo):
+        raise CapContinuationRefused("store", f"cap-continuation receipt {filename} repository mismatch")
+    if not isinstance(data["canonical_repository"], str) or data["canonical_repository"] not in all_keys:
+        raise CapContinuationRefused("store", f"cap-continuation receipt {filename} canonical repository mismatch")
+    stored_id = data["repository_id"]
+    if stored_id is not None and type(stored_id) is not int:
+        raise CapContinuationRefused("store", f"cap-continuation receipt {filename} has invalid repository_id")
+    if repo_id is not None and stored_id is not None and stored_id != repo_id:
+        raise CapContinuationRefused("store", f"cap-continuation receipt {filename} repository_id mismatch")
+    if type(data["pr"]) is not int or data["pr"] != number:
+        raise CapContinuationRefused("store", f"cap-continuation receipt {filename} PR mismatch")
+    if not isinstance(data["capped_head"], str) or not SHA.fullmatch(data["capped_head"]):
+        raise CapContinuationRefused("store", f"cap-continuation receipt {filename} has invalid capped_head")
+    if not _valid_cap_disposition_ref(data["disposition_ref"]):
+        raise CapContinuationRefused("store", f"cap-continuation receipt {filename} has invalid disposition_ref")
+    if not isinstance(data["disposition_sha256"], str) or not _CAP_DIGEST.fullmatch(data["disposition_sha256"]):
+        raise CapContinuationRefused("store", f"cap-continuation receipt {filename} has invalid disposition_sha256")
+    if type(data["base_budget"]) is not int or not 1 <= data["base_budget"] <= MAX_DECLARED_REVIEW_ROUNDS:
+        raise CapContinuationRefused("store", f"cap-continuation receipt {filename} has invalid base_budget")
+    if type(data["extra_rounds"]) is not int or data["extra_rounds"] != 1:
+        raise CapContinuationRefused("store", f"cap-continuation receipt {filename} must grant exactly 1 extra round")
+    if not isinstance(data["authority"], str) or data["authority"] not in CAP_CONTINUATION_AUTHORITIES:
+        raise CapContinuationRefused("store", f"cap-continuation receipt {filename} has untrusted authority")
+    if _clean_actor_token(data["actor"]) is None:
+        raise CapContinuationRefused("store", f"cap-continuation receipt {filename} has invalid actor")
+    if data["actor_task"] is not None and _clean_actor_token(data["actor_task"]) is None:
+        raise CapContinuationRefused("store", f"cap-continuation receipt {filename} has invalid actor_task")
+    if _clean_actor_token(data["actor_seat"]) is None:
+        raise CapContinuationRefused("store", f"cap-continuation receipt {filename} has invalid actor_seat")
+    if data["actor_authenticated"] is not False:
+        raise CapContinuationRefused("store", f"cap-continuation receipt {filename} must record unauthenticated actor")
+    if data["threat_model"] != CAP_CONTINUATION_THREAT_MODEL:
+        raise CapContinuationRefused("store", f"cap-continuation receipt {filename} has invalid threat_model")
+    if _cap_parse_iso_utc(data["issued_at"]) is None:
+        raise CapContinuationRefused("store", f"cap-continuation receipt {filename} has invalid issued_at")
+    return dict(data)
+
+
+def _read_cap_continuation(
+    receipt_root: Path, *, repository: str, number: int
+) -> dict[str, Any] | None:
+    """Read and strictly validate the PR's one CTO cap-continuation receipt, if present. Fails closed."""
+    if type(number) is not int or number < 1:
+        raise CapContinuationRefused("pr", f"invalid PR number {number!r}")
+    stored, _primary, repo_id, all_keys = _cap_repo_keys(repository)
+    dir_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        dir_fd = os.open(receipt_root, dir_flags)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise CapContinuationRefused("store", f"cap-continuation store must be a real readable directory: {exc}") from None
+    found: list[dict[str, Any]] = []
+    try:
+        for key in all_keys:
+            name = _cap_grant_filename(key, number)
+            flags = os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+            try:
+                fd = os.open(name, flags, dir_fd=dir_fd)
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                raise CapContinuationRefused("store", f"cap-continuation receipt {name} unreadable: {exc}") from None
+            try:
+                st = os.fstat(fd)
+            except OSError as exc:
+                os.close(fd)
+                raise CapContinuationRefused("store", f"cap-continuation receipt {name} stat failed: {exc}") from None
+            if not stat.S_ISREG(st.st_mode):
+                os.close(fd)
+                raise CapContinuationRefused("store", f"cap-continuation receipt {name} is not a regular file")
+            try:
+                with os.fdopen(fd, "rb") as stream:
+                    raw = stream.read(CAP_CONTINUATION_MAX_BYTES + 1)
+            except OSError as exc:
+                raise CapContinuationRefused("store", f"cap-continuation receipt {name} read failed: {exc}") from None
+            if len(raw) > CAP_CONTINUATION_MAX_BYTES:
+                raise CapContinuationRefused("store", f"cap-continuation receipt {name} exceeds maximum size")
+            try:
+                parsed = json_depth.loads(
+                    raw.decode("utf-8"),
+                    max_depth=32,
+                    object_pairs_hook=_unique_keys,
+                    parse_constant=_not_json_constant,
+                )
+            except (UnicodeDecodeError, ValueError, RecursionError) as exc:
+                raise CapContinuationRefused("store", f"cap-continuation receipt {name} is malformed JSON: {exc}") from None
+            found.append(
+                _validate_cap_continuation_receipt(
+                    parsed,
+                    stored_repo=stored,
+                    repo_id=repo_id,
+                    all_keys=all_keys,
+                    number=number,
+                    filename=name,
+                )
+            )
+    finally:
+        os.close(dir_fd)
+    if len(found) > 1:
+        raise CapContinuationRefused("store", f"conflicting cap-continuation receipts exist for PR #{number}")
+    return found[0] if found else None
+
+
+def _write_cap_continuation_exclusive(
+    receipt_root: Path, *, primary_key: str, stored_repo: str, number: int, receipt: Mapping[str, Any]
+) -> Path:
+    """Write and fsync a temp file in the receipt directory, then publish atomically without replacing."""
+    if receipt_root.is_symlink():
+        raise CapContinuationRefused("store", "cap-continuation store must not be a symlink")
+    receipt_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    dir_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        dir_fd = os.open(receipt_root, dir_flags)
+    except OSError as exc:
+        raise CapContinuationRefused("store", f"cap-continuation store must be a real directory: {exc}") from None
+    name = _cap_grant_filename(primary_key, number)
+    tmp_name = f".{name}.tmp.{os.getpid()}.{secrets.token_hex(8)}"
+    path = receipt_root / name
+    payload = (json.dumps(receipt, sort_keys=True, indent=2) + "\n").encode("utf-8")
+    tmp_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        try:
+            fd = os.open(tmp_name, tmp_flags, 0o600, dir_fd=dir_fd)
+        except OSError as exc:
+            raise CapContinuationRefused("store", f"cannot stage cap-continuation receipt: {exc}") from None
+        try:
+            try:
+                with os.fdopen(fd, "wb") as stream:
+                    stream.write(payload)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+            except OSError as exc:
+                raise CapContinuationRefused(
+                    "store", f"cannot write or sync staged cap-continuation receipt: {exc}"
+                ) from None
+            try:
+                os.link(tmp_name, name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+            except FileExistsError:
+                raise CapContinuationRefused(
+                    "duplicate",
+                    f"PR #{number} in {stored_repo} already used its one CTO cap-continuation grant",
+                ) from None
+            except OSError as exc:
+                raise CapContinuationRefused("store", f"cannot publish cap-continuation receipt: {exc}") from None
+            try:
+                os.fsync(dir_fd)
+            except OSError as exc:
+                try:
+                    os.unlink(name, dir_fd=dir_fd)
+                except OSError as rollback_exc:
+                    raise CapContinuationRefused(
+                        "durability_unknown",
+                        f"cap-continuation receipt was linked at {name} before directory sync failed ({exc}) "
+                        f"and rollback failed ({rollback_exc}); receipt remains present on disk",
+                    ) from None
+                raise CapContinuationRefused(
+                    "store",
+                    f"cap-continuation store directory sync failed ({exc}); published receipt was rolled back",
+                ) from None
+        finally:
+            with suppress(OSError):
+                os.unlink(tmp_name, dir_fd=dir_fd)
+    finally:
+        os.close(dir_fd)
+    return path
+
+
+def _cap_visible_lines(text: str) -> list[str]:
+    """Visible CommonMark lines of ``text``, normalizing LF/CRLF/CR and stripping quotes, code, and HTML comments."""
+    from markdown_it import MarkdownIt
+
+    lines = _commonmark_lines(text)
+    parser = MarkdownIt("commonmark")
+    tokens = parser.parse("\n".join(lines))
+    visible_lines: list[str] = []
+    blockquote_depth = 0
+    for token in tokens:
+        if token.type in {"list_item_open", "blockquote_open"} and token.level + 1 >= parser.options["maxNesting"]:
+            raise CapContinuationRefused("disposition", "disposition markdown nesting limit exceeded")
+        if token.type == "blockquote_open":
+            blockquote_depth += 1
+            continue
+        if token.type == "blockquote_close":
+            blockquote_depth = max(0, blockquote_depth - 1)
+            continue
+        if blockquote_depth > 0 or token.type != "inline":
+            continue
+        parts: list[str] = []
+        for child in token.children or ():
+            if child.type == "text":
+                parts.append(child.content)
+            elif child.type in {"softbreak", "hardbreak"}:
+                parts.append("\n")
+            elif child.type in {"html_inline", "code_inline"}:
+                parts.append("\x00")
+            elif child.markup:
+                parts.append(child.markup)
+        cleaned = re.sub(r"<!--[\s\S]*?(?:-->|\Z)", "", "".join(parts))
+        visible_lines.extend(cleaned.split("\n"))
+    return visible_lines
+
+
+def _cap_directive_actions(text: str, *, stored_repo: str, number: int, capped_head: str) -> set[str]:
+    """Structured CAP_CONTINUATION directive actions in visible lines of ``text`` bound to repo, PR and head."""
+    actions: set[str] = set()
+    for line in _cap_visible_lines(text):
+        match = _CAP_DIRECTIVE_LINE.fullmatch(line)
+        if match is None:
+            continue
+        action, repo_token, pr_token, head_token = match.groups()
+        if (
+            _same_cap_repository(repo_token, stored_repo)
+            and int(pr_token) == number
+            and head_token == capped_head
+        ):
+            actions.add(action)
+    return actions
+
+
+def _driver_state_decision_texts(note: Mapping[str, Any]) -> list[str]:
+    """Text entries of a driver-state decision record (statement, body, and individual notes)."""
+    texts: list[str] = []
+    for field in ("statement", "body"):
+        val = note.get(field)
+        if isinstance(val, str) and val:
+            texts.append(val)
+    notes = note.get("notes")
+    if isinstance(notes, list):
+        for entry in notes:
+            if isinstance(entry, str) and entry:
+                texts.append(entry)
+            elif isinstance(entry, Mapping):
+                for key in ("text", "body", "note"):
+                    item = entry.get(key)
+                    if isinstance(item, str) and item:
+                        texts.append(item)
+    return texts
+
+
+def _default_driver_state_show(item_id: str, environment: Mapping[str, str]) -> dict[str, Any]:
+    cli_name = environment.get(_CAP_DRIVER_STATE_CLI_ENV, _CAP_DRIVER_STATE_CLI_DEFAULT)
+    cli = shutil.which(cli_name) if cli_name else None
+    if not cli:
+        raise CapContinuationRefused("disposition", "lu-driver-state CLI is unavailable")
+    try:
+        completed = subprocess.run(  # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit
+            [cli, "show", "--", item_id],
+            capture_output=True,
+            text=True,
+            timeout=_CAP_DRIVER_STATE_TIMEOUT_S,
+            check=False,
+        )
+    except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
+        raise CapContinuationRefused(
+            "disposition", f"lu-driver-state show failed ({type(exc).__name__})"
+        ) from None
+    if completed.returncode != 0:
+        raise CapContinuationRefused(
+            "disposition", f"lu-driver-state show exited {completed.returncode} for {item_id}"
+        )
+    try:
+        parsed = json_depth.loads(
+            completed.stdout,
+            max_depth=64,
+            object_pairs_hook=_unique_keys,
+            parse_constant=_not_json_constant,
+        )
+    except (ValueError, RecursionError) as exc:
+        raise CapContinuationRefused("disposition", f"lu-driver-state show returned invalid JSON: {exc}") from None
+    if not isinstance(parsed, dict):
+        raise CapContinuationRefused("disposition", "lu-driver-state show did not return an object")
+    return parsed
+
+
+def _verify_cap_disposition(
+    disposition_ref: str,
+    *,
+    stored_repo: str,
+    number: int,
+    capped_head: str,
+    login: str,
+    environment: Mapping[str, str],
+    driver_state_reader: Callable[[str], Mapping[str, Any]] | None = None,
+    github_reader: Callable[[list[str]], Any] | None = None,
+) -> str:
+    """Verify the referenced CTO cap disposition exists and binds repo, PR and capped head; return its SHA-256."""
+    if not isinstance(disposition_ref, str) or not disposition_ref:
+        raise CapContinuationRefused("disposition", "disposition reference is required")
+    gh_read = _run_json if github_reader is None else github_reader
+
+    ds_match = _CAP_DRIVER_STATE_REF.fullmatch(disposition_ref)
+    if ds_match is not None:
+        item_id = ds_match.group(1)
+        note = (
+            _default_driver_state_show(item_id, environment)
+            if driver_state_reader is None
+            else driver_state_reader(item_id)
+        )
+        if not isinstance(note, Mapping):
+            raise CapContinuationRefused("disposition", f"driver-state record {item_id} is malformed")
+        valid_ids = {v for v in (note.get("id"), note.get("alias")) if isinstance(v, str) and v}
+        if item_id not in valid_ids:
+            raise CapContinuationRefused("disposition", f"driver-state record identity does not match {item_id}")
+        if note.get("lane") != "cto":
+            raise CapContinuationRefused(
+                "disposition", f"driver-state record {item_id} lane is {note.get('lane')!r}, expected 'cto'"
+            )
+        kind = note.get("kind")
+        if not isinstance(kind, str) or kind != "decision":
+            raise CapContinuationRefused(
+                "disposition", f"driver-state record {item_id} kind is {kind!r}, expected 'decision'"
+            )
+        status = note.get("status")
+        if not isinstance(status, str) or status not in _CAP_DRIVER_STATE_ACTIVE_STATUSES:
+            raise CapContinuationRefused(
+                "disposition",
+                f"driver-state record {item_id} status {status!r} is not an active decision status "
+                f"({sorted(_CAP_DRIVER_STATE_ACTIVE_STATUSES)})",
+            )
+        actions: set[str] = set()
+        for entry_text in _driver_state_decision_texts(note):
+            actions.update(
+                _cap_directive_actions(
+                    entry_text, stored_repo=stored_repo, number=number, capped_head=capped_head
+                )
+            )
+        if actions != {"authorize"}:
+            raise CapContinuationRefused(
+                "disposition",
+                f"driver-state decision {item_id} lacks an uncontested affirmative directive "
+                f"'CAP_CONTINUATION: authorize repo={stored_repo} pr=#{number} head={capped_head}'",
+            )
+        canonical_payload = json.dumps(dict(note), sort_keys=True, separators=(",", ":")).encode("utf-8")
+        return hashlib.sha256(canonical_payload).hexdigest()
+
+    issue_match = _CAP_GITHUB_ISSUE_REF.fullmatch(disposition_ref)
+    if issue_match is not None:
+        issue_repo = _validate_cap_repo_slug(issue_match.group(1))
+        issue_num = int(issue_match.group(2))
+        issue_github = _review_github(issue_repo)
+        issue = gh_read(["gh", "api", f"repos/{issue_github.active}/issues/{issue_num}"])
+        if not isinstance(issue, Mapping) or type(issue.get("number")) is not int or issue["number"] != issue_num:
+            raise CapContinuationRefused("disposition", f"parent issue {disposition_ref} could not be verified")
+        if "pull_request" in issue:
+            raise CapContinuationRefused(
+                "disposition",
+                f"{disposition_ref} is a pull request, not a parent CTO disposition issue",
+            )
+        issue_assoc = issue.get("author_association")
+        if (
+            _author_login(issue, rest_only=True) != login
+            or not isinstance(issue_assoc, str)
+            or issue_assoc not in TRUSTED_ASSOCIATIONS
+        ):
+            raise CapContinuationRefused("disposition", f"parent issue {disposition_ref} author is not trusted")
+        body = issue.get("body")
+        if not isinstance(body, str):
+            raise CapContinuationRefused("disposition", f"parent issue {disposition_ref} body is unavailable")
+        if _cap_directive_actions(body, stored_repo=stored_repo, number=number, capped_head=capped_head) != {"authorize"}:
+            raise CapContinuationRefused(
+                "disposition",
+                f"parent issue {disposition_ref} lacks an uncontested affirmative directive "
+                f"'CAP_CONTINUATION: authorize repo={stored_repo} pr=#{number} head={capped_head}'",
+            )
+        return hashlib.sha256(body.encode("utf-8")).hexdigest()
+
+    comment_match = _CAP_GITHUB_COMMENT_REF.fullmatch(disposition_ref)
+    if comment_match is not None:
+        issue_repo = _validate_cap_repo_slug(comment_match.group(1))
+        comment_id = int(comment_match.group(2))
+        issue_github = _review_github(issue_repo)
+        comment = gh_read(["gh", "api", f"repos/{issue_github.active}/issues/comments/{comment_id}"])
+        if not isinstance(comment, Mapping) or type(comment.get("id")) is not int or comment["id"] != comment_id:
+            raise CapContinuationRefused("disposition", f"disposition comment {disposition_ref} could not be verified")
+        comment_assoc = comment.get("author_association")
+        if (
+            _author_login(comment, rest_only=True) != login
+            or not isinstance(comment_assoc, str)
+            or comment_assoc not in TRUSTED_ASSOCIATIONS
+        ):
+            raise CapContinuationRefused("disposition", f"disposition comment {disposition_ref} author is not trusted")
+        issue_url = comment.get("issue_url")
+        if not isinstance(issue_url, str) or not issue_url:
+            raise CapContinuationRefused("disposition", f"disposition comment {disposition_ref} lacks issue_url")
+        url_match = re.fullmatch(
+            r"https://api\.github\.com/repos/([A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*)/issues/([1-9][0-9]*)",
+            issue_url,
+        )
+        if url_match is None or not _same_cap_repository(url_match.group(1), issue_github.stored):
+            raise CapContinuationRefused("disposition", f"disposition comment {disposition_ref} issue_url mismatch")
+        html_url = comment.get("html_url")
+        html_match = (
+            re.fullmatch(
+                r"https://github\.com/([A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*)/issues/([1-9][0-9]*)#issuecomment-([1-9][0-9]*)",
+                html_url,
+            )
+            if isinstance(html_url, str)
+            else None
+        )
+        if (
+            html_match is None
+            or not _same_cap_repository(html_match.group(1), issue_github.stored)
+            or html_match.group(2) != url_match.group(2)
+            or int(html_match.group(3)) != comment_id
+        ):
+            raise CapContinuationRefused(
+                "disposition",
+                f"comment {disposition_ref} is not a verified parent issue comment (pull request comments are informational only)",
+            )
+        same_repo = _same_cap_repository(issue_github.stored, stored_repo)
+        if same_repo and int(url_match.group(2)) == number:
+            raise CapContinuationRefused(
+                "disposition",
+                f"comment {disposition_ref} on PR #{number} itself is informational only, not a parent CTO disposition",
+            )
+        body = comment.get("body")
+        if not isinstance(body, str):
+            raise CapContinuationRefused("disposition", f"disposition comment {disposition_ref} body is unavailable")
+        if _cap_directive_actions(body, stored_repo=stored_repo, number=number, capped_head=capped_head) != {"authorize"}:
+            raise CapContinuationRefused(
+                "disposition",
+                f"disposition comment {disposition_ref} lacks an uncontested affirmative directive "
+                f"'CAP_CONTINUATION: authorize repo={stored_repo} pr=#{number} head={capped_head}'",
+            )
+        return hashlib.sha256(body.encode("utf-8")).hexdigest()
+
+    raise CapContinuationRefused(
+        "disposition",
+        f"unsupported disposition reference {disposition_ref!r}; use driver-state:<id>, "
+        "github:issue:<owner/repo>#<N>, or github:comment:<owner/repo>#<id>",
+    )
+
+
+def _verified_pr_tier_for_grant(adapter: GitHubAdapter, repository: str, number: int) -> ReviewTier:
+    """Resolve the PR's review tier without accepting any unknown-input High fallback."""
+    try:
+        rows = adapter.pr_file_rows(repository, number)
+    except SweepError as exc:
+        raise CapContinuationRefused(
+            "pr", f"PR #{number} file list unavailable ({exc}); cannot establish budget exhaustion"
+        ) from None
+    try:
+        paths = pr_file_paths(rows)
+    except (ValueError, TypeError) as exc:
+        raise CapContinuationRefused(
+            "pr", f"PR #{number} file list malformed ({exc}); cannot verify review tier"
+        ) from None
+    if not paths or any(
+        path.startswith("/")
+        or "\\" in path
+        or any(part in {".", "..", ""} for part in path.split("/"))
+        or PurePosixPath(path).as_posix() != path
+        for path in paths
+    ):
+        raise CapContinuationRefused("pr", f"PR #{number} file paths invalid; cannot verify review tier")
+    table = _load_tier_table(None)
+    if table is None:
+        raise CapContinuationRefused("pr", f"review tier table unavailable; cannot verify PR #{number} tier")
+    for index, row in enumerate(rows):
+        status = row.get("status")
+        if not isinstance(status, str) or status not in _TIER_FILE_STATUSES:
+            raise CapContinuationRefused(
+                "pr", f"PR #{number} file row {index} has missing or invalid status; cannot verify review tier"
+            )
+    tier = classify_pr_files(rows)
+    if tier == "high":
+        from fnmatch import fnmatchcase
+
+        tiers_map = table["tiers"]
+        trivial_patterns = tiers_map["trivial"] if isinstance(tiers_map, Mapping) else ()
+        versions_map = table["release_version_files"]
+        version_paths = set(versions_map) if isinstance(versions_map, Mapping) else set()
+        if all(
+            path in version_paths or any(fnmatchcase(path, pattern) for pattern in trivial_patterns)
+            for path in paths
+        ) and not is_security_sensitive_change(paths):
+            try:
+                integration_sweep.changes_learner_content(paths)
+            except DeployPathsError as exc:
+                raise CapContinuationRefused(
+                    "pr", f"learner-content policy unavailable ({exc}); cannot verify PR #{number} tier"
+                ) from None
+    if tier == "trivial":
+        raise CapContinuationRefused("not_exhausted", f"PR #{number} is trivial tier and has no review cap")
+    return tier
+
+
+def _validate_pr_comments_for_grant(
+    comments: object, *, number: int, login: str
+) -> Sequence[Mapping[str, Any]]:
+    """Validate fetched PR comment shapes before verdict, capability-failure, and lineage accounting."""
+    if not isinstance(comments, Sequence) or isinstance(comments, (str, bytes)):
+        raise CapContinuationRefused("pr", f"PR #{number} comments response is malformed")
+    for index, item in enumerate(comments):
+        if not isinstance(item, Mapping):
+            raise CapContinuationRefused("pr", f"PR #{number} comment {index} is malformed")
+        body = item.get("body")
+        if not isinstance(body, str):
+            raise CapContinuationRefused("pr", f"PR #{number} comment {index} body is malformed")
+        assoc = item.get("author_association")
+        if assoc is not None and not isinstance(assoc, str):
+            raise CapContinuationRefused("pr", f"PR #{number} comment {index} has malformed author_association")
+        if (
+            _author_login(item, rest_only=True) == login
+            and assoc is None
+            and (MARKER_PREFIX in body or "<!-- review-capability-failure" in body)
+        ):
+            raise CapContinuationRefused(
+                "pr", f"PR #{number} trusted-login review comment {index} lacks author_association"
+            )
+    return comments
+
+
+def grant_cap_continuation(
+    *,
+    repository: str,
+    number: int,
+    capped_head: str,
+    disposition_ref: str,
+    authority: str,
+    task_root: Path | None = None,
+    lock_root: Path | None = None,
+    root: Path | None = None,
+    env: Mapping[str, str] | None = None,
+    driver_state_reader: Callable[[str], Mapping[str, Any]] | None = None,
+    github_reader: Callable[[list[str]], Any] | None = None,
+) -> dict[str, Any]:
+    """Issue a PR's single CTO cap-continuation receipt, adding strictly +1 charged round.
+
+    Threat model (cooperative_same_os_user): OS-contained read-only reviewers
+    (``write_boundary`` / ``agy_sandbox``) cannot modify the host receipt store
+    under ``batch_state/``. Workspace-write workers share the OS user under
+    NO-WORKER-SANDBOX-1115, so worker-marker and seat-environment checks are
+    accident guards and same-user actor attribution is recorded as
+    ``actor_authenticated: false``.
+    """
+    environment = os.environ if env is None else env
+    if is_worker(environment):
+        task_marker = _clean_actor_token(environment.get("LEARN_UKRAINIAN_DISPATCH_TASK_ID"))
+        detail = (
+            f"dispatched worker (task={task_marker}) cannot issue a cap-continuation grant"
+            if task_marker
+            else "worker/boundary-marked caller cannot issue a cap-continuation grant"
+        )
+        raise CapContinuationRefused("worker_caller", detail)
+    if not isinstance(authority, str) or authority not in CAP_CONTINUATION_AUTHORITIES:
+        raise CapContinuationRefused(
+            "authority", f"{authority!r} is not an allowed authority ({sorted(CAP_CONTINUATION_AUTHORITIES)})"
+        )
+    seat_env = environment.get("SESSION_SEAT")
+    if seat_env is not None and (not isinstance(seat_env, str) or seat_env != "cto"):
+        raise CapContinuationRefused("authority", f"SESSION_SEAT={seat_env!r} is not the CTO seat")
+    if not is_cto_caller(environment):
+        raise CapContinuationRefused(
+            "authority",
+            "caller environment lacks CTO seat binding (SESSION_SEAT=cto or SESSION_EPIC=epics)",
+        )
+    if type(number) is not int or number < 1:
+        raise CapContinuationRefused("pr", f"PR number must be a positive integer, got {number!r}")
+    if not isinstance(capped_head, str) or not SHA.fullmatch(capped_head):
+        raise CapContinuationRefused("stale_head", f"capped head must be a 40-character lowercase SHA, got {capped_head!r}")
+    if not _valid_cap_disposition_ref(disposition_ref):
+        raise CapContinuationRefused(
+            "disposition",
+            f"unsupported disposition reference {disposition_ref!r}; use driver-state:<id>, "
+            "github:issue:<owner/repo>#<N>, or github:comment:<owner/repo>#<id>",
+        )
+
+    from lu_machinery.common.task_store_paths import tasks_dir
+
+    task_root = task_root or tasks_dir()
+    lock_root = lock_root or task_root.parent / "locks"
+    grants_root = _cap_continuation_receipts(task_root)
+
+    stored_repo, primary_key, repo_id, _all_keys = _cap_repo_keys(repository)
+    github = _review_github(stored_repo)
+    stored_repo = github.stored
+    stored_repo, primary_key, repo_id, _all_keys = _cap_repo_keys(stored_repo)
+    gh_read = _run_json if github_reader is None else github_reader
+
+    actor = (
+        _clean_actor_token(environment.get("SESSION_HANDOFF_AGENT"))
+        or _clean_actor_token(environment.get("LU_INBOX_WORKER"))
+        or authority
+    )
+    actor_task = _clean_actor_token(
+        environment.get("LEARN_UKRAINIAN_DISPATCH_TASK_ID") or environment.get("SESSION_STREAM_ID")
+    )
+    actor_seat = "cto" if seat_env == "cto" else "epics"
+
+    with pr_lock(stored_repo, number, lock_root):
+        existing = _read_cap_continuation(grants_root, repository=stored_repo, number=number)
+        if existing is not None:
+            raise CapContinuationRefused(
+                "duplicate",
+                f"PR #{number} in {stored_repo} already used its one CTO cap-continuation grant "
+                f"(issued at {existing['issued_at']} for head {existing['capped_head'][:12]})",
+            )
+        pr = gh_read(
+            ["gh", "pr", "view", str(number), "--repo", github.active, "--json", "headRefOid,headRefName,state"]
+        )
+        if not isinstance(pr, Mapping) or pr.get("state") != "OPEN":
+            raise CapContinuationRefused("pr", f"PR #{number} in {github.active} is not open")
+        live_sha, branch = pr.get("headRefOid"), pr.get("headRefName")
+        if not isinstance(live_sha, str) or not SHA.fullmatch(live_sha) or not isinstance(branch, str) or not branch:
+            raise CapContinuationRefused("pr", f"PR #{number} live head or branch is unavailable")
+        if live_sha != capped_head:
+            raise CapContinuationRefused(
+                "stale_head",
+                f"PR #{number} live head is {live_sha[:12]}, not capped head {capped_head[:12]}",
+            )
+        review_root = _review_repository_root(stored_repo, root or _repo_root())
+        adapter = GitHubAdapter(review_root)
+        tier = _verified_pr_tier_for_grant(adapter, github.active, number)
+        base_budget = repository_review_rounds(stored_repo, tier=tier)
+        login = adapter.identity()
+        try:
+            raw_comments = adapter.comments(github.active, number)
+        except SweepError as exc:
+            raise RecordError(f"comment lookup failed: {exc}") from exc
+        comments = _validate_pr_comments_for_grant(raw_comments, number=number, login=login)
+        # Count every charged/reserved head without excluding capped_head, so issuance works whether
+        # the PR still sits at its Nth reviewed head or already moved to the refused (N+1)th head.
+        history = _charging(
+            task_root=task_root,
+            repository=stored_repo,
+            number=number,
+            branch=branch,
+            comments=comments,
+            login=login,
+            sha="",
+        )
+        uncharged = history.exemption
+        exempt_key = (uncharged["task"], uncharged["started"]) if uncharged is not None else None
+        recorded = {
+            marker["sha"]
+            for _, marker in _trusted_markers(comments, login)
+            if (marker["task"], marker["started"]) != exempt_key
+        }
+        all_heads = recorded | frozenset(history.rounds)
+        from lu_machinery.review.repair_round import repair_heads as load_repair_heads
+
+        repaired = load_repair_heads(_repair_receipts(task_root), repository=stored_repo, number=number, branch=branch)
+        exempt = budget_exempt_heads(
+            comments,
+            capped_head,
+            login,
+            prove=_clean_merge_descent_prover(review_root, capped_head, fetch=False),
+            unrecorded=all_heads - recorded,
+            approval_context=cache(partial(head_approval_context, review_root, repository=stored_repo, fetch=False)),
+        )
+        counted = all_heads - set(exempt) - repaired
+        if len(counted) < base_budget:
+            raise CapContinuationRefused(
+                "not_exhausted",
+                f"PR #{number} has {len(counted)} counted review round(s) against base budget {base_budget}; "
+                "cap continuation is only issued once the budget is exhausted",
+            )
+        disposition_sha256 = _verify_cap_disposition(
+            disposition_ref,
+            stored_repo=stored_repo,
+            number=number,
+            capped_head=capped_head,
+            login=login,
+            environment=environment,
+            driver_state_reader=driver_state_reader,
+            github_reader=gh_read,
+        )
+        # Re-read the live PR immediately before publishing the receipt: a remote push can advance
+        # the head during file, comment, lineage, or disposition reads.
+        rechecked = gh_read(
+            ["gh", "pr", "view", str(number), "--repo", github.active, "--json", "headRefOid,headRefName,state"]
+        )
+        if not isinstance(rechecked, Mapping) or rechecked.get("state") != "OPEN":
+            raise CapContinuationRefused("pr", f"PR #{number} in {github.active} is no longer open")
+        rechecked_sha, rechecked_branch = rechecked.get("headRefOid"), rechecked.get("headRefName")
+        if rechecked_branch != branch:
+            raise CapContinuationRefused(
+                "pr", f"PR #{number} branch changed from {branch!r} to {rechecked_branch!r} before grant publication"
+            )
+        if rechecked_sha != capped_head:
+            rechecked_label = rechecked_sha[:12] if isinstance(rechecked_sha, str) else repr(rechecked_sha)
+            raise CapContinuationRefused(
+                "stale_head",
+                f"PR #{number} head moved to {rechecked_label} before grant publication; expected {capped_head[:12]}",
+            )
+        receipt: dict[str, Any] = {
+            "schema": CAP_CONTINUATION_SCHEMA,
+            "repository": stored_repo,
+            "canonical_repository": primary_key,
+            "repository_id": repo_id,
+            "pr": number,
+            "capped_head": capped_head,
+            "disposition_ref": disposition_ref,
+            "disposition_sha256": disposition_sha256,
+            "base_budget": base_budget,
+            "extra_rounds": 1,
+            "authority": authority,
+            "actor": actor,
+            "actor_task": actor_task,
+            "actor_seat": actor_seat,
+            "actor_authenticated": False,
+            "threat_model": CAP_CONTINUATION_THREAT_MODEL,
+            "issued_at": datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z"),
+        }
+        _write_cap_continuation_exclusive(
+            grants_root, primary_key=primary_key, stored_repo=stored_repo, number=number, receipt=receipt
+        )
+    return receipt
+
+
 def budget_admission(
     *,
     repository: str,
@@ -2819,6 +3733,9 @@ def budget_admission(
         # A live recovery blocks a duplicate dispatch even at an already reviewed head.
         charged_heads()
     receipts = _repair_receipts(task_root)
+    cap_grant = _read_cap_continuation(
+        _cap_continuation_receipts(task_root), repository=repository, number=number
+    )
     receipt = require_review_round_within_budget(
         comments,
         sha,
@@ -2845,6 +3762,7 @@ def budget_admission(
         exemption=lambda: rounds().exemption,
         recording_seat=recording_seat,
         recording_run=recording_run,
+        cap_continuation=cap_grant,
     )
     if recovery is not None:
         receipt["provider_crash_recovery"] = recovery
@@ -3113,11 +4031,13 @@ def _post_verdict(repository: str, number: int, comment: str, login: str) -> dic
     if not isinstance(comment_id, int):
         raise RecordError("comment post response lacked id; retry to reconcile")
     readback = _run_json(Request("read-comment", repo=repository, number=comment_id))
+    readback_assoc = readback.get("author_association") if isinstance(readback, dict) else None
     if (
         not isinstance(readback, dict)
         or readback.get("body") != comment
         or _author_login(readback, rest_only=True) != login
-        or readback.get("author_association") not in TRUSTED_ASSOCIATIONS
+        or not isinstance(readback_assoc, str)
+        or readback_assoc not in TRUSTED_ASSOCIATIONS
         or readback.get("created_at") != readback.get("updated_at")
     ):
         raise RecordError("comment readback mismatch; publication state unknown")
@@ -3868,6 +4788,7 @@ def record(
                     and marker["sha"] == sha
                     and marker["task"] == task_id
                     and _author_login(item, rest_only=True) == login
+                    and isinstance(item.get("author_association"), str)
                     and item.get("author_association") in TRUSTED_ASSOCIATIONS
                 ):
                     if (
@@ -4070,16 +4991,23 @@ def budget_check(
              if (marker["task"], marker["started"]) != exempt_key}
     already = sha in heads
     unrecorded = {head: tasks for head, tasks in charging().rounds.items() if head not in heads}
+    cap_grant = receipt.get("cap_continuation") or _read_cap_continuation(
+        _cap_continuation_receipts(task_root), repository=repository, number=number
+    )
+    effective_budget = budget + (1 if cap_grant is not None else 0)
     result = {
         "pr": number,
         "head": sha,
         "admitted": True,
         "reviewed_heads": len(heads | set(unrecorded)),
         "unrecorded_rounds": [{"head": head, "tasks": tasks} for head, tasks in sorted(unrecorded.items())],
-        "budget": budget,
+        "budget": effective_budget,
         "head_already_reviewed": already,
         **receipt,
     }
+    if cap_grant is not None:
+        result["base_budget"] = budget
+        result.setdefault("cap_continuation", cap_grant)
     if uncharged is not None:
         result["uncharged_capability_failure"] = uncharged
     return result
@@ -4363,11 +5291,57 @@ def republish_withheld_main(argv: list[str]) -> int:
     return 0
 
 
+def grant_continuation_main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(
+        prog="record_cf_verdict.py grant-continuation",
+        description="Issue a PR's single CTO cap-continuation receipt after its review budget is exhausted.\n"
+        "Adds strictly one charged review round to the cumulative PR allowance, bound to the live\n"
+        "capped head and a verified CTO disposition record. Refuses worker-marked callers, stale\n"
+        "heads, unexhausted budgets, unverified dispositions, and duplicate or replayed requests.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=f"{RECORDER_EXAMPLES}  {RECORDER_COMMAND} grant-continuation "
+        "--repository agentic-machinery/machinery --pr 42 --capped-head <40-hex-sha> "
+        "--disposition-ref driver-state:item-id --authority claude-cto\n"
+        "Outputs: JSON receipt on stdout.\n"
+        "Exit codes: 0: granted; 1: refused; 2: primary bootstrap refused.\n"
+        "Related: agents_extensions/shared/skills/review-loop/references/policy.md",
+    )
+    parser.add_argument("--repository", required=True, help="GitHub owner/name of the capped PR")
+    parser.add_argument("--pr", type=int, required=True, help="Open PR number")
+    parser.add_argument("--capped-head", required=True, help="Exact live 40-hex head SHA of the capped PR")
+    parser.add_argument(
+        "--disposition-ref",
+        required=True,
+        help="Verified CTO disposition reference (driver-state:<id>, github:issue:<repo>#<N>, or github:comment:<repo>#<id>)",
+    )
+    parser.add_argument(
+        "--authority",
+        required=True,
+        help=f"Issuing authority, one of {sorted(CAP_CONTINUATION_AUTHORITIES)}",
+    )
+    args = parser.parse_args(argv)
+    try:
+        result = grant_cap_continuation(
+            repository=args.repository,
+            number=args.pr,
+            capped_head=args.capped_head,
+            disposition_ref=args.disposition_ref,
+            authority=args.authority,
+        )
+    except (RecordError, SweepError, ValueError) as exc:
+        print(json.dumps({"pr": args.pr, "granted": False, "refusal": str(exc)}, sort_keys=True))
+        return 1
+    print(json.dumps({"granted": True, **result}, sort_keys=True))
+    return 0
+
+
 @publication_cli(RecordError)
 def main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else argv
     if argv[:1] == ["budget-check"]:
         return budget_check_main(argv[1:])
+    if argv[:1] == ["grant-continuation"]:
+        return grant_continuation_main(argv[1:])
     if argv[:1] == ["republish-withheld"]:
         return republish_withheld_main(argv[1:])
     if argv[:1] == ["import-publications"]:
@@ -4390,6 +5364,9 @@ def main(argv: list[str] | None = None) -> int:
         "--review-mode red_team --red-team-prompt brief.md\n"
         f"  {RECORDER_COMMAND} budget-check --repository owner/name --pr 1\n"
         "    (whether the next review round is admitted, before dispatch; see budget-check --help)\n"
+        f"  {RECORDER_COMMAND} grant-continuation --repository owner/name --pr 1 --capped-head <sha> "
+        "--disposition-ref driver-state:<id> --authority claude-cto\n"
+        "    (grant one extra charged review round after cap; see grant-continuation --help)\n"
         f"  {RECORDER_COMMAND} republish-withheld --task-id review-unit --pr 1\n"
         "    (publish findings held back at record time, including a security-sensitive verdict;\n"
         "    see republish-withheld --help)\n"

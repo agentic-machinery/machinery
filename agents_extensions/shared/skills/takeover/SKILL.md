@@ -54,17 +54,18 @@ PY="$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")/.venv/
    ```
 
    Unrelated changes mixed into the source that cannot be separated cleanly are a stop.
-4. **Choose the continuation.** Continue in place on the same branch when the brief authorizes
-   it. Otherwise open a replacement branch that imports the original commits unchanged
-   (`git cherry-pick` keeps their authors) and adds your fixes as separate commits. Do not
-   overwrite unrelated work. The finding ledger carries forward. A successor on the same PR
-   also inherits its remaining review budget.
-   A worker pushing to an existing PR branch is dispatched with `--branch <PR head branch>`.
-   If the predecessor capped, follow the recorded
-   [CTO disposition](../review-loop/references/policy.md#4-convergence) on a fresh branch.
-   Import only changes within the authorized scope and keep the original authorship. Check
-   each predecessor's unresolved blockers against the disposition. Carry each one with its
-   source PR and finding ID, even when its resolution belongs to other named work.
+4. **Choose the continuation.** Continue fixes in place on the same PR and branch whenever safe
+   continuation on the original branch is possible. A worker pushing to an existing PR branch is
+   dispatched with `--branch <PR head branch>` (with `--base origin/main`). The finding ledger
+   carries forward, and a successor on the same PR inherits its remaining review budget (or the
+   PR's single verified CTO cap-continuation round after the cap). Open a replacement branch and PR
+   only when the CTO has recorded why safe continuation on the original branch is impossible in the
+   [CTO disposition](../review-loop/references/policy.md#4-convergence) and link that disposition
+   in the successor PR body as `Supersedes #N (reason: ...)`. For an authorized replacement, import
+   the original commits unchanged (`git cherry-pick` keeps their authors) within the authorized
+   scope, add your fixes as separate commits, and do not overwrite unrelated work. Check each
+   predecessor's unresolved blockers against the disposition and carry each one with its source PR
+   and finding ID, even when its resolution belongs to other named work.
    For a fresh PR, use the lifecycle issue and ledger named in the replacement brief if a
    [scope transfer](../full-send/references/delivery.md#hand-off-record) was required.
    When the issue already has a task-lifecycle ledger from another identity (`init` refuses it

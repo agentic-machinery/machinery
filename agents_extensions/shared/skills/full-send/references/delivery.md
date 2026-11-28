@@ -53,7 +53,7 @@ handoff:
     profile: code|infra
     rounds_used: {full: 0, delta: 0}
     ledger: []
-    cap_disposition: "<CTO decision reference, if replacing a capped PR>"
+    cap_disposition: "<CTO decision reference, if continuing or replacing a capped PR>"
   landing_state: {hold: false, queued: false, auto_merge: false}
 ```
 
@@ -84,11 +84,15 @@ proof, catalog risk and rounds used, the finding ledger (including any optional 
 pre-check dispositions), public predecessor PRs and heads, and credit. Worktree paths, host
 details and private task metadata stay in the task result (rules core P8).
 
-On the same PR, each hand-off preserves the ledger, the rounds used and the head's CI rerun
-allowance (infrastructure failures only, never a failing test node). A new reviewer, session or
-accepted successor (`pr_ownership accept`) inherits those limits.
+On the same PR, each hand-off preserves the ledger, the cumulative rounds used (including any
+verified CTO cap-continuation grant, at most one extra charged round per PR) and the head's CI
+rerun allowance (infrastructure failures only, never a failing test node). A new reviewer, session
+or accepted successor (`pr_ownership accept`) inherits those limits.
 
-For a replacement after the cap, the decision reference points to the existing parent record.
+Continue fixes on the same PR and branch. Open a replacement PR only when the CTO has recorded why
+safe continuation on the original branch is impossible in the parent disposition record, and link
+that disposition from the successor PR body as `Supersedes #N (reason: ...)`. For an authorized
+replacement, the decision reference points to the existing parent record.
 Carry every unresolved blocker in `review.ledger`, identified by its source PR and finding ID,
 with its owner and disposition. Keep findings assigned elsewhere open in the parent record.
 The new reviewer verifies the disposition of the inherited blockers against the replacement

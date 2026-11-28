@@ -114,18 +114,30 @@ P0-P2 finding with its owner, and the smallest viable continuation. If none is a
 record what the work is waiting for or why it ends. Update that record if a later continuation
 also caps. Keep the earlier decisions and ledgers linked.
 
-Continuing requires explicit CTO authorization, a fresh branch and a replacement PR. The
-replacement brief carries the ledger, predecessor rounds used and cap decision forward. The
-authorized replacement starts at round 1 of its own configured PR budget. Record earlier
-rounds as history. The capped PR remains capped.
+Continue fixes on the same PR and branch. After the cap is reached, the CTO may authorize at
+most one additional charged review round on that same PR through the verified cap disposition
+(recording `CAP_CONTINUATION: authorize repo=<owner/name> pr=#<N> head=<40-hex-sha>` in a CTO
+`decision` item or parent issue/issue comment and issuing `record_cf_verdict.py grant-continuation
+--repository <owner/name> --pr <N> --capped-head <sha> --disposition-ref <ref> --authority
+claude-cto`), adding strictly one round to the PR's
+cumulative allowance while preserving the findings ledger, reservations, exemptions, exact-head
+independence requirements, and required CI (both same-head PR CI and merge-group CI). A second
+continuation grant on the same PR is refused; if the PR still blocks after the additional round,
+re-slot or redesign the card.
 
-A replacement gets a full pass on its own candidate and authorized scope. It carries
-predecessor IDs and dispositions and verifies inherited blockers on its exact head. Settled
-classes reopen only on new material evidence. Keep blockers assigned to other named work open
-with their owners in the parent record. They still block the replacement until the reviewer
-confirms on its exact head that the defect is fixed or that the replacement neither carries
-the defective change nor exposes or worsens the defect. The rule for unresolved security
-findings in [Findings](#3-findings) still applies.
+Allow a replacement PR only when the CTO records why safe continuation on the original branch is
+impossible (for example unrelated commits that cannot be separated or a history rewrite required
+by an OPSEC or secret hit; a deployment refusal alone does not establish that the branch is
+unrecoverable) and links that disposition from the successor PR body as
+`Supersedes #N (reason: <reason>)`. The replacement brief carries the ledger, predecessor rounds
+used and cap decision forward. An authorized replacement starts at round 1 of its own configured
+PR budget, records earlier rounds as history, and gets a full pass on its own candidate and
+authorized scope. It carries predecessor IDs and dispositions and verifies inherited blockers on
+its exact head. Settled classes reopen only on new material evidence. Keep blockers assigned to
+other named work open with their owners in the parent record. They still block the replacement
+until the reviewer confirms on its exact head that the defect is fixed or that the replacement
+neither carries the defective change nor exposes or worsens the defect. The rule for unresolved
+security findings in [Findings](#3-findings) still applies.
 The replacement needs its own CI under the [delivery gate](../../full-send/references/delivery.md#the-gate).
 
 ## 5. Recovery over gates
@@ -151,7 +163,9 @@ The recorder implements the rounds above. Resolve `PRIMARY_REPO` and `PY` as in 
   pair counts as one round.
 - **Ask before each round:** `record_cf_verdict.py budget-check --repository <owner/name>
   --pr <N>` admits or refuses it and writes nothing. The dispatcher and the recorder refuse a
-  round past the budget. A head that only merges the base cleanly costs no round, and one CI
+  round past the budget. After the cap, the CTO may grant at most one additional charged round
+  on the same PR with `record_cf_verdict.py grant-continuation` bound to the live capped head
+  and verified cap disposition. A head that only merges the base cleanly costs no round, and one CI
   fix or conflict resolution after approval gets one repair round, whose APPROVE carries
   `REPAIR_VERIFIED: <delta_sha256>`. A repository with its own budget declares `review_rounds`
   in `lu_machinery/config/review_budget_policy.yaml`.
