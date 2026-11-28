@@ -98,6 +98,12 @@ def test_fresh_refusal_id_record_carries_trace_identity(batch_state: Path, tmp_p
                                    trace={**TRACE, "parent_span_id": OTHER["span_id"]})
     child = [e for e in _events(batch_state) if e["span_id"] == TRACE["span_id"] and e["trace_id"] is None]
     assert len(child) == 1
+    joined = {"task_id": "task-j", "run_nonce": "j" * 32, "status": "done", "repo": "pub", **TRACE,
+              "options": {**TRACE, "parent_span_id": OTHER["span_id"]}}  # the parent named on the options copy only
+    assert emit.settlement_event(joined, repos=REPOS)["trace_id"] is None
+    review = emit.review_round_event(joined, pr=7, reviewed_sha=HEAD, review_round=1, verdict="APPROVED", repos=REPOS)
+    assert (review["visibility"], review["trace_id"], review["parent_span_id"]) == ("public", None, None)
+    assert emit.settlement_event({**joined, "options": {}}, repos=REPOS)["trace_id"] == TRACE["trace_id"]  # own root
 
 
 @pytest.mark.parametrize("value", [
@@ -167,12 +173,14 @@ MERGE = "d" * 40  # the merge commit a pull-request run checks out
 
 
 def _owner(trace: dict, pr: int = 7, head: str = HEAD, **extra) -> dict:
-    return {**trace, "pr": pr, "head_sha": head, **extra}
+    """An owner is a task record (here a public one) that owned ``(pr, head)``."""
+    return {"task_id": f"owner-{trace['span_id']}", "repo": "pub", **trace, "pr": pr, "head_sha": head, **extra}
 
 
 def _ci(**kwargs) -> dict:
     values = {"repo": "pub", "visibility": "public", "pr": 7, "pr_head_sha": HEAD, "runs": [_run()],
-              "tested_sha": MERGE, "jobs": _jobs(), "owners": [_owner(TRACE)], "now": NOW, **kwargs}
+              "tested_sha": MERGE, "jobs": _jobs(), "jobs_attempt": 1, "owners": [_owner(TRACE)], "now": NOW,
+              "repos": REPOS, **kwargs}
     event = emit.ci_result_event(**values)
     assert emit.validate_event(event) is None
     return event
@@ -197,9 +205,15 @@ def test_rebase_does_not_attach_old_ci_to_the_new_head() -> None:
 def test_rerun_attempt_two_joins_only_its_own_attempt_jobs(batch_state: Path) -> None:
     """Defect class: a rerun (run_attempt 2) is judged by run-level jobs instead of that attempt's own jobs."""
     rerun = _run(run_attempt=2, conclusion="failure")
-    stale = _ci(runs=[rerun], jobs=_jobs(attempt=1))
-    assert (stale["ci_binding"], stale.get("failed_jobs")) == ("ambiguous", None)
-    own = _ci(runs=[rerun], jobs=_jobs(attempt=2, conclusion="failure"))
+    stale = _ci(runs=[rerun], jobs=_jobs(attempt=1), jobs_attempt=1)
+    assert (stale["ci_binding"], stale["conclusion"], stale.get("failed_jobs")) == ("ambiguous", "unknown", None)
+    unproven = _ci(runs=[rerun], jobs=_jobs(attempt=1), jobs_attempt=None)  # run-level read: no provenance
+    assert unproven["ci_binding"] == "ambiguous"
+    endpoint_rows = [{key: value for key, value in job.items() if key != "run_attempt"}
+                     for job in _jobs(attempt=2, conclusion="failure")]  # the attempt endpoint may omit run_attempt
+    assert _ci(runs=[rerun], jobs=endpoint_rows, jobs_attempt=2)["ci_binding"] == "exact"
+    assert _ci(runs=[rerun], jobs=endpoint_rows, jobs_attempt=None)["ci_binding"] == "ambiguous"
+    own = _ci(runs=[rerun], jobs=_jobs(attempt=2, conclusion="failure"), jobs_attempt=2)
     assert (own["ci_binding"], own["conclusion"], own["run_attempt"], own["failed_jobs"]) == ("exact", "failure", 2, 1)
 
     calls: list[tuple[str, int, int | None]] = []
@@ -213,14 +227,15 @@ def test_rerun_attempt_two_joins_only_its_own_attempt_jobs(batch_state: Path) ->
 
         def attempt_jobs(self, run_id: int, attempt: int) -> list[dict]:
             calls.append(("attempt", run_id, attempt))
-            return _jobs(run_id, attempt=attempt, conclusion="failure", head=CANDIDATE)
+            return [{key: value for key, value in job.items() if key != "run_attempt"}
+                    for job in _jobs(run_id, attempt=attempt, conclusion="failure", head=CANDIDATE)]
 
     group_run = _run(id=9002, run_attempt=2, head_sha=CANDIDATE, conclusion="failure")
     assert merge_queue_keeper._emit_merge_group_result(FakeGitHub(), group_run) == "written"
     assert calls == [("attempt", 9002, 2)]
     (event,) = _events(batch_state)
-    assert (event["event_type"], event["run_attempt"], event["ci_binding"], event["conclusion"]) == (
-        "merge_group.result", 2, "exact", "failure")
+    assert (event["event_type"], event["run_attempt"], event["ci_binding"], event["conclusion"],
+            event["failed_jobs"]) == ("merge_group.result", 2, "exact", "failure", 1)
 
 
 def test_multi_pr_merge_group_records_pr_head_receipt_and_span_links() -> None:
@@ -229,20 +244,23 @@ def test_multi_pr_merge_group_records_pr_head_receipt_and_span_links() -> None:
     receipt = {"tested_sha": CANDIDATE, "entries": entries}
     third = {"trace_id": "1" * 32, "span_id": "2" * 16}
     owners = [_owner(OTHER, pr=5, head=OLD_HEAD), _owner(TRACE), _owner(third, head=OLD_HEAD),  # PR 7's old head
-              _owner({"trace_id": "3" * 32, "span_id": "4" * 16}, pr=5, head=OLD_HEAD, parent_task_id="private-1")]
+              _owner({"trace_id": "3" * 32, "span_id": "4" * 16}, pr=5, head=OLD_HEAD, parent_task_id="private-1"),
+              _owner({"trace_id": "5" * 32, "span_id": "6" * 16}, pr=5, head=OLD_HEAD,
+                     options={"parent_span_id": "7" * 16}),  # inherited, named only on the options copy
+              _owner({"trace_id": "8" * 32, "span_id": "9" * 16}, data_class="private-ops")]  # a private task
     run = _run(id=9003, head_sha=CANDIDATE)
-    event = emit.merge_group_event(repo="pub", visibility="public", run=run, jobs=_jobs(9003, head=CANDIDATE),
-                                   receipt=receipt, owners=owners, now=NOW)
+    event = emit.merge_group_event(jobs_attempt=1, repo="pub", visibility="public", run=run, jobs=_jobs(9003, head=CANDIDATE),
+                                   receipt=receipt, owners=owners, now=NOW, repos=REPOS)
     assert emit.validate_event(event) is None
     assert (event["tested_sha"], event["receipt_state"], event["receipts"]) == (CANDIDATE, "recorded", entries)
     assert event["span_links"] == [{**OTHER, "pr": 5, "head_sha": OLD_HEAD}, {**TRACE, "pr": 7, "head_sha": HEAD}]
-    private = emit.merge_group_event(repo="priv", visibility="private", run=run, jobs=_jobs(9003, head=CANDIDATE),
-                                     receipt=receipt, owners=owners, now=NOW)
-    assert len(private["span_links"]) == 3  # the inherited owner links only in the private scope
+    private = emit.merge_group_event(jobs_attempt=1, repo="priv", visibility="private", run=run, jobs=_jobs(9003, head=CANDIDATE),
+                                     receipt=receipt, owners=owners, now=NOW, repos=REPOS)
+    assert len(private["span_links"]) == 5  # inherited and private owners link only in the private scope
     for bad in (None, {"tested_sha": OLD_HEAD, "entries": entries}, {"tested_sha": CANDIDATE, "entries": [
             *entries, {"pr": 7, "head_sha": OLD_HEAD}]}):
-        unproven = emit.merge_group_event(repo="pub", visibility="public", run=run, jobs=_jobs(9003, head=CANDIDATE),
-                                          receipt=bad, owners=owners, now=NOW)
+        unproven = emit.merge_group_event(jobs_attempt=1, repo="pub", visibility="public", run=run, jobs=_jobs(9003, head=CANDIDATE),
+                                          receipt=bad, owners=owners, now=NOW, repos=REPOS)
         assert (unproven["receipts"], unproven["span_links"]) == (None, None)
         assert unproven["receipt_state"] == ("mismatch" if bad and bad["tested_sha"] == OLD_HEAD else "missing")
         assert emit.validate_event(unproven) is None
@@ -255,7 +273,7 @@ def test_unattributable_group_failure_is_not_blamed_on_one_pr(batch_state: Path)
     group = [{"pr": 5, "head_sha": OLD_HEAD}, {"pr": 7, "head_sha": HEAD}]
 
     def event(receipt: object, job_rows: object = jobs) -> dict:
-        built = emit.merge_group_event(repo="pub", visibility="public", run=failing, jobs=job_rows, receipt=receipt,
+        built = emit.merge_group_event(jobs_attempt=1, repo="pub", visibility="public", run=failing, jobs=job_rows, receipt=receipt,
                                        now=NOW)
         assert emit.validate_event(built) is None
         return built
@@ -287,16 +305,20 @@ def test_ownership_transfer_cancellation_and_missing_or_ambiguous_ci_are_explici
     assert (transferred["ownership"], transferred.get("trace_id")) == ("transferred", None)
     assert [link["trace_id"] for link in transferred["span_links"]] == [OTHER["trace_id"], TRACE["trace_id"]]
     assert _ci(owners=[])["ownership"] == "unknown"
+    hidden = _ci(owners=[_owner(OTHER, data_class="private-ops"), _owner(TRACE)])  # one owner is a private task
+    assert (hidden["ownership"], hidden["trace_id"], hidden.get("span_links")) == ("single", TRACE["trace_id"], None)
     single = _ci()
     assert (single["ownership"], single["trace_id"], single["span_id"]) == ("single", TRACE["trace_id"],
                                                                              TRACE["span_id"])
 
     cancelled = _ci(runs=[_run(conclusion="cancelled")])
     assert (cancelled["ci_binding"], cancelled["conclusion"]) == ("exact", "cancelled")
+    for unproven_success in (_ci(jobs=None), _ci(tested_sha=None), _ci(jobs=_jobs(attempt=1), jobs_attempt=2)):
+        assert (unproven_success["ci_binding"], unproven_success["conclusion"]) == ("ambiguous", "unknown")
     for unread in (None, []):  # the cancellation stays visible when that attempt's jobs cannot be read
         assert (_ci(runs=[_run(conclusion="cancelled")], jobs=unread)["ci_binding"],
                 _ci(runs=[_run(conclusion="cancelled")], jobs=unread)["conclusion"]) == ("ambiguous", "cancelled")
-        group = emit.merge_group_event(repo="pub", visibility="public", jobs=unread, receipt=None, now=NOW,
+        group = emit.merge_group_event(jobs_attempt=1, repo="pub", visibility="public", jobs=unread, receipt=None, now=NOW,
                                        run=_run(id=9006, head_sha=CANDIDATE, conclusion="cancelled"))
         assert (group["ci_binding"], group["conclusion"], group["attribution"]) == ("ambiguous", "cancelled",
                                                                                     "candidate_only")
@@ -309,7 +331,10 @@ def test_ownership_transfer_cancellation_and_missing_or_ambiguous_ci_are_explici
     assert (_ci(runs=[_run(id=[1])])["ci_binding"], _ci(runs=[_run(id=[1])])["conclusion"]) == ("ambiguous",
                                                                                                 "unknown")
     odd_jobs = _ci(jobs=[{**_jobs()[0], "conclusion": ["failure"]}])  # malformed JSON never raises
-    assert (odd_jobs["ci_binding"], odd_jobs["failed_jobs"]) == ("exact", 0)
-    odd_group = emit.merge_group_event(repo="pub", visibility="public", jobs=None, receipt=None, now=NOW,
+    assert (odd_jobs["ci_binding"], odd_jobs["failed_jobs"]) == ("exact", None)  # no count from malformed rows
+    assert _ci(runs=[_run(status=["completed"])])["conclusion"] == "unknown"
+    odd_head = _ci(runs=[_run(head_sha=["x"])])
+    assert (odd_head["ci_binding"], odd_head["conclusion"]) == ("ambiguous", "unknown")
+    odd_group = emit.merge_group_event(jobs_attempt=1, repo="pub", visibility="public", jobs=None, receipt=None, now=NOW,
                                        run={**_run(id=[1], head_sha=CANDIDATE)})
     assert emit.validate_event(odd_group) is None and odd_group["run_id"] is None

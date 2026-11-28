@@ -2446,7 +2446,8 @@ def _emit_merge_group_result(gh: Any, run: Mapping[str, Any]) -> str:
                 jobs = gh.attempt_jobs(run["id"], attempt)
         if key is None:
             return "unregistered"
-        event = emit.merge_group_event(repo=key, visibility=visibility, run=run, jobs=jobs, receipt=None)
+        event = emit.merge_group_event(repo=key, visibility=visibility, run=run, jobs=jobs,
+                                       jobs_attempt=attempt if jobs is not None else None, receipt=None)
         return emit.emit_v2(event)
     except Exception as exc:  # telemetry never changes the diagnosis
         return f"error: {type(exc).__name__}"

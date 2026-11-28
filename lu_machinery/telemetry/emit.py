@@ -826,9 +826,28 @@ def check_traceparent(environ: Mapping[str, str], trace: Mapping[str, Any]) -> N
 # the record and in private events. Join rule: every identity is matched exactly, never by PR number alone.
 
 
+_PARENT_FIELDS = ("parent_task_id", "parent_run_nonce", "parent_span_id")
+
+
 def inherited_linkage(source: Mapping[str, Any]) -> bool:
-    """True when ``source`` names a parent task or span: its trace id may be another (possibly private) task's."""
-    return any(source.get(name) is not None for name in ("parent_task_id", "parent_run_nonce", "parent_span_id"))
+    """True unless ``source`` (a task record) proves its trace is its own root trace.
+
+    Any parent field on the record or on its ``options`` copy (the dispatcher persists the trace in both) means the
+    trace id may be another, possibly private, task's. A record whose trace fields are not one valid pair proves
+    nothing either (fail closed).
+    """
+    raw = source.get("options")
+    options: Mapping[str, Any] = raw if isinstance(raw, Mapping) else {}
+    return trace_of(source) is None or any(copy.get(name) is not None for copy in (source, options)
+                                           for name in _PARENT_FIELDS)
+
+
+def public_trace_of(source: Mapping[str, Any], repos: Mapping[str, Any] | None = None) -> dict[str, str] | None:
+    """The record's own trace when it may appear in a public event: the record is itself public (registry
+    classification, no data class) and its trace is its own root trace. None otherwise."""
+    if inherited_linkage(source) or record_visibility(source, repos) != PUBLIC:
+        return None
+    return trace_of(source)
 
 
 def _now_ts(now: datetime | None) -> str:
@@ -855,7 +874,7 @@ def review_round_event(record: Mapping[str, Any], *, pr: int, reviewed_sha: str,
         "reviewed_sha": reviewed_sha, "review_round": review_round, "verdict": verdict,
     }
     private = visibility != PUBLIC
-    for name in ("parent_task_id", "parent_run_nonce", "parent_span_id"):
+    for name in _PARENT_FIELDS:
         event[name] = _valid_or_none(name, record.get(name)) if private else None
     trace = trace_of(record)
     event["span_id"] = trace["span_id"] if trace else None
@@ -863,68 +882,106 @@ def review_round_event(record: Mapping[str, Any], *, pr: int, reviewed_sha: str,
     return event
 
 
-def _completed_conclusion(run: Mapping[str, Any]) -> str:
-    """The run's own conclusion for its current attempt: ``pending`` until it completes, ``unknown`` if malformed."""
-    if run.get("status") != "completed":
-        return "pending"
-    value = run.get("conclusion")
-    return value if isinstance(value, str) and value in CI_CONCLUSIONS - {"pending", "missing", "unknown"} else "unknown"
+_RUN_STATUSES_PENDING = frozenset({"queued", "in_progress", "waiting", "requested", "pending"})
+# Without bound evidence only these run-state facts are published; success and failure need an exact binding.
+_UNBOUND_CONCLUSIONS = frozenset({"pending", "cancelled"})
 
 
-def attempt_jobs_bound(run: Mapping[str, Any], jobs: object) -> bool:
-    """True when every job is provably the run's own current attempt's (GitHub's attempt-specific jobs read).
+def _run_conclusion(run: Mapping[str, Any], *, bound: bool) -> str:
+    """The run's own conclusion for its current attempt: ``pending`` while a recognized status runs, the completed
+    conclusion when the attempt's evidence is bound, and only a cancellation or ``pending`` when it is not;
+    anything malformed or unproven is ``unknown``."""
+    status = run.get("status")
+    if isinstance(status, str) and status in _RUN_STATUSES_PENDING:
+        value = "pending"
+    elif status == "completed":
+        raw = run.get("conclusion")
+        value = raw if isinstance(raw, str) and raw in CI_CONCLUSIONS - {"pending", "missing", "unknown"} else "unknown"
+    else:
+        value = "unknown"
+    return value if bound or value in _UNBOUND_CONCLUSIONS else "unknown"
 
-    Each job names the run's id, its attempt and its head commit. The run-level jobs read lists the latest
-    attempt's jobs without saying so; a rerun's earlier attempt, another run's jobs, or a job of another head
-    never bind. An empty, oversized or unreadable list does not either.
+
+_JOB_CONCLUSIONS = frozenset({"success", "failure", "neutral", "cancelled", "skipped", "timed_out", "action_required",
+                              "startup_failure", "stale"})
+
+
+def attempt_jobs_bound(run: Mapping[str, Any], jobs: object, read_attempt: int | None) -> bool:
+    """True when every job is provably the run's own current attempt's.
+
+    ``read_attempt`` is the attempt the caller read ``jobs`` for with GitHub's attempt-specific endpoint (its
+    provenance), or None for jobs of unknown provenance. With provenance it must be the run's current attempt and a
+    job may omit ``run_attempt`` (the endpoint names the attempt), but a job naming another attempt refuses;
+    without it every job must name the attempt. Each job names the run's id and head commit. A rerun's earlier
+    attempt, another run's jobs, a job of another head, or an empty, oversized or unreadable list never bind.
     """
     run_id, attempt, head = run.get("id"), run.get("run_attempt"), run.get("head_sha")
     if not (_int_in(run_id, 1, 2**63 - 1) and _int_in(attempt, 1, MAX_RUN_ATTEMPT) and _field_ok("head_sha", head)):
         return False
-    return (isinstance(jobs, list) and bool(jobs) and len(jobs) <= MAX_JOBS
-            and all(isinstance(job, Mapping) and type(job.get("run_id")) is int and job["run_id"] == run_id
-                    and type(job.get("run_attempt")) is int and job["run_attempt"] == attempt
-                    and isinstance(job.get("head_sha"), str) and job["head_sha"] == head for job in jobs))
+    if read_attempt is not None and (type(read_attempt) is not int or read_attempt != attempt):
+        return False
+
+    def own(job: object) -> bool:
+        if not (isinstance(job, Mapping) and type(job.get("run_id")) is int and job["run_id"] == run_id
+                and isinstance(job.get("head_sha"), str) and job["head_sha"] == head):
+            return False
+        if "run_attempt" not in job:
+            return read_attempt is not None
+        return type(job["run_attempt"]) is int and job["run_attempt"] == attempt
+
+    return isinstance(jobs, list) and bool(jobs) and len(jobs) <= MAX_JOBS and all(own(job) for job in jobs)
 
 
-def _failed_jobs(jobs: Sequence[Mapping[str, Any]]) -> int:
-    return sum(1 for job in jobs if isinstance(job.get("conclusion"), str)
-               and job["conclusion"] in {"failure", "timed_out", "startup_failure"})
+def _failed_jobs(jobs: Sequence[Mapping[str, Any]]) -> int | None:
+    """Failed jobs of a bound attempt; None (no count) when any job conclusion is malformed. A null conclusion is a
+    job still running."""
+    conclusions = [job.get("conclusion") for job in jobs]
+    if any(value is not None and not (isinstance(value, str) and value in _JOB_CONCLUSIONS) for value in conclusions):
+        return None
+    return sum(1 for value in conclusions if value in {"failure", "timed_out", "startup_failure"})
 
 
-def _owner_links(owners: Sequence[Mapping[str, Any]], pr: int, head_sha: str, visibility: str) -> list[dict[str, Any]]:
-    """Span links of the owners recorded for exactly ``(pr, head_sha)``; in the public scope, uninherited ones only.
+def _eligible_owners(owners: Sequence[Mapping[str, Any]], pr: int, head_sha: str, visibility: str,
+                     repos: Mapping[str, Any] | None) -> list[dict[str, Any]]:
+    """The owners recorded for exactly ``(pr, head_sha)`` that this scope may name, as their ``{trace_id, span_id}``.
 
-    An owner is one task's ``{pr, head_sha, trace_id, span_id}`` (plus its parent fields, if any). An owner of
-    another PR or another head is not this head's owner and is never relabelled as one.
+    An owner is one task record carrying ``pr`` and ``head_sha`` (the head it owned). An owner of another PR or
+    another head is never relabelled as this head's. In the public scope only owners that ``public_trace_of``
+    proves public with their own root trace count, so a private owner is neither linked nor counted.
     """
-    links = []
+    eligible = []
     for owner in owners:
         if not isinstance(owner, Mapping) or owner.get("pr") != pr or owner.get("head_sha") != head_sha:
             continue
-        valid = trace_of(owner)
-        if valid is not None and (visibility != PUBLIC or not inherited_linkage(owner)):
-            links.append({**valid, "pr": pr, "head_sha": head_sha})
-    return links
+        trace = trace_of(owner) if visibility != PUBLIC else public_trace_of(owner, repos)
+        eligible.append({"trace": trace})
+    return eligible if visibility != PUBLIC else [item for item in eligible if item["trace"] is not None]
+
+
+def _owner_links(owners: Sequence[Mapping[str, Any]], pr: int, head_sha: str, visibility: str,
+                 repos: Mapping[str, Any] | None) -> list[dict[str, Any]]:
+    return [{**item["trace"], "pr": pr, "head_sha": head_sha}
+            for item in _eligible_owners(owners, pr, head_sha, visibility, repos) if item["trace"] is not None]
 
 
 def ci_result_event(*, repo: str, visibility: str, pr: int, pr_head_sha: str, runs: Sequence[Mapping[str, Any]],
-                    tested_sha: str | None, jobs: object, owners: Sequence[Mapping[str, Any]],
-                    now: datetime | None = None) -> dict[str, Any]:
+                    tested_sha: str | None, jobs: object, jobs_attempt: int | None,
+                    owners: Sequence[Mapping[str, Any]], now: datetime | None = None,
+                    repos: Mapping[str, Any] | None = None) -> dict[str, Any]:
     """The ``ci.result`` event joining a PR head to its CI run by ``(repo, pr_head_sha, tested_sha, run_id,
     run_attempt)``.
 
     ``runs`` are the PR workflow's runs found for the PR; a run's ``head_sha`` is the PR head it ran for.
     ``tested_sha`` is the commit that attempt checked out (a pull-request run tests GitHub's merge commit, not the
     head), from attempt-bound checkout evidence, or None when the caller has none. ``jobs`` are that attempt's own
-    jobs; ``owners`` the recorded owners (``{pr, head_sha, trace_id, span_id}``) of PR heads.
+    jobs, read for ``jobs_attempt`` (``attempt_jobs_bound``); ``owners`` the task records that owned PR heads.
 
-    Binding: no run is ``missing``; several runs or a malformed run id are ``ambiguous``; a run for another head (a
-    rebase or push since) is ``stale_head``; unbound jobs or no tested commit are ``ambiguous``; only a run for this
-    head with its attempt's jobs and a tested commit is ``exact``. The conclusion is that one run's own for its
-    current attempt when it ran for this head, so a cancellation stays visible; otherwise ``missing`` or
-    ``unknown``, never a success. One owner of this exact head binds the event to its span; several (an ownership
-    transfer) are span links instead; none is ``unknown``.
+    Binding: no run is ``missing``; several runs, a malformed run id or a malformed head are ``ambiguous``; a run
+    for another valid head (a rebase or push since) is ``stale_head``; unbound jobs or no tested commit are
+    ``ambiguous``; only a run for this head with its attempt's jobs and a tested commit is ``exact``. Success and
+    failure are published only for ``exact``; otherwise only a cancellation or ``pending`` stays visible, else
+    ``unknown`` or ``missing``. One eligible owner of this exact head binds the event to its span; several (an
+    ownership transfer) are span links instead; none is ``unknown``.
     """
     event: dict[str, Any] = {
         "schema": EVENT_SCHEMA_V2, "event_type": CI_EVENT, "ts": _now_ts(now), "visibility": visibility,
@@ -938,16 +995,18 @@ def ci_result_event(*, repo: str, visibility: str, pr: int, pr_head_sha: str, ru
     else:
         event.update(run_id=run["id"], run_attempt=_valid_or_none("run_attempt", run.get("run_attempt")),
                      tested_sha=_valid_or_none("tested_sha", tested_sha))
-        if run.get("head_sha") != pr_head_sha:
+        head = run.get("head_sha")
+        if not _field_ok("head_sha", head):
+            event.update(ci_binding="ambiguous", conclusion="unknown")
+        elif head != pr_head_sha:
             event.update(ci_binding="stale_head", conclusion="unknown")
         else:
-            bound = attempt_jobs_bound(run, jobs) and event["tested_sha"] is not None
-            event.update(ci_binding="exact" if bound else "ambiguous", conclusion=_completed_conclusion(run))
+            bound = attempt_jobs_bound(run, jobs, jobs_attempt) and event["tested_sha"] is not None
+            event.update(ci_binding="exact" if bound else "ambiguous", conclusion=_run_conclusion(run, bound=bound))
             if bound and isinstance(jobs, list):
                 event["failed_jobs"] = _failed_jobs(jobs)
-    owned = [owner for owner in owners
-             if isinstance(owner, Mapping) and owner.get("pr") == pr and owner.get("head_sha") == pr_head_sha]
-    links = _owner_links(owned, pr, pr_head_sha, visibility)
+    owned = _eligible_owners(owners, pr, pr_head_sha, visibility, repos)
+    links = _owner_links(owners, pr, pr_head_sha, visibility, repos)
     if len(owned) == 1 and len(links) == 1:
         event.update(ownership="single", trace_id=links[0]["trace_id"], span_id=links[0]["span_id"])
     elif len(owned) > 1:
@@ -957,25 +1016,25 @@ def ci_result_event(*, repo: str, visibility: str, pr: int, pr_head_sha: str, ru
     return event
 
 
-def merge_group_event(*, repo: str, visibility: str, run: Mapping[str, Any], jobs: object,
+def merge_group_event(*, repo: str, visibility: str, run: Mapping[str, Any], jobs: object, jobs_attempt: int | None,
                       receipt: Mapping[str, Any] | None, owners: Sequence[Mapping[str, Any]] = (),
-                      now: datetime | None = None) -> dict[str, Any]:
+                      now: datetime | None = None, repos: Mapping[str, Any] | None = None) -> dict[str, Any]:
     """The ``merge_group.result`` event of one merge-group run attempt.
 
     ``receipt`` is the explicit record ``{tested_sha, entries: [{pr, head_sha}, ...]}`` binding each constituent PR
     head to the candidate commit; it counts only when its ``tested_sha`` is the run's own head commit (else
     ``mismatch``). Span links come only from it, for owners of exactly a receipt entry's ``(pr, head_sha)``. A
     failure is pinned on a PR (``attribution: "pr"``) only when that receipt names exactly one constituent and the
-    attempt's own jobs read it; any other failure stays ``candidate_only`` and blames no PR. The conclusion is the
-    run's own for its current attempt.
+    attempt's own jobs read it; any other failure stays ``candidate_only`` and blames no PR. The conclusion follows
+    ``ci_result_event``'s rule: success and failure only with the attempt's bound jobs.
     """
     event: dict[str, Any] = {
         "schema": EVENT_SCHEMA_V2, "event_type": MERGE_GROUP_EVENT, "ts": _now_ts(now), "visibility": visibility,
         "repo": repo, "tested_sha": _valid_or_none("tested_sha", run.get("head_sha")),
         "run_id": _valid_or_none("run_id", run.get("id")), "run_attempt": _valid_or_none("run_attempt", run.get("run_attempt")),
     }
-    bound = attempt_jobs_bound(run, jobs)  # False for a malformed run id, attempt or head: typed ambiguous
-    event.update(ci_binding="exact" if bound else "ambiguous", conclusion=_completed_conclusion(run))
+    bound = attempt_jobs_bound(run, jobs, jobs_attempt)  # False for a malformed run id, attempt or head
+    event.update(ci_binding="exact" if bound else "ambiguous", conclusion=_run_conclusion(run, bound=bound))
     if bound and isinstance(jobs, list):
         event["failed_jobs"] = _failed_jobs(jobs)
     entries: list[dict[str, Any]] | None = None
@@ -996,7 +1055,8 @@ def merge_group_event(*, repo: str, visibility: str, run: Mapping[str, Any], job
     if entries is None:
         event.update(receipt_state=state, receipts=None, span_links=None)
     else:
-        links = [link for item in entries for link in _owner_links(owners, item["pr"], item["head_sha"], visibility)]
+        links = [link for item in entries
+                 for link in _owner_links(owners, item["pr"], item["head_sha"], visibility, repos)]
         event.update(receipt_state=state, receipts=entries, span_links=links[:MAX_GROUP_LINKS])
     if bound and entries is not None and len(entries) == 1 and event["conclusion"] == "failure":
         event.update(attribution="pr", blamed_pr=entries[0]["pr"])
