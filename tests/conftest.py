@@ -4190,7 +4190,9 @@ def low_review(monkeypatch, tmp_path):
         "started_at": "2026-09-23T12:00:00.000001+00:00",
     }
     (tasks / "review-one.json").write_text(json.dumps(task))
-    (tasks / "review-one.result").write_text("VERDICT: APPROVE")
+    from tests.review.record_support import APPROVAL_REPLY
+
+    (tasks / "review-one.result").write_text(APPROVAL_REPLY)
     files = [{"filename": "tests/example.py", "status": "modified"}]
     facts = recorder.BranchReviewFacts(
         repository=REPOSITORY, base_tip_sha=BASE, head_sha=HEAD, merge_base_sha=BASE,

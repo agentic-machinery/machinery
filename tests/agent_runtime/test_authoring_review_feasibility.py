@@ -307,7 +307,8 @@ def signed_off_reply(explanation: str) -> str:
     """A sealed approval whose ``overall.explanation`` opens with the security sign-off line (as the worker seals it)."""
     return json.dumps({
         "schema_version": "code-review-findings.v1", "findings": [],
-        "overall": {"correctness": "correct", "explanation": f"SECURITY_VERDICT: PASS\n{explanation}", "confidence": 0.9},
+        "overall": {"correctness": "correct", "explanation": f"SECURITY_VERDICT: PASS\n{explanation}", "confidence": 0.9,
+                    "review_complete": True},
     }, ensure_ascii=False)
 
 
@@ -412,7 +413,11 @@ def test_single_family_branch_agrees_across_selector_and_recorder(repo, tasks, m
     assert record_verdict(
         monkeypatch, tmp_path, repo, agent="codex", model=CURRENT_SOL, review_risk="medium", comments=posted,
         _caller=provenance, _cli=True, _task_id="review-public",
-        _reply=f"Checked `{repo.root}/docs/a.md`.\n\nVERDICT: APPROVE\n",
+        _reply=json.dumps({
+            "schema_version": "code-review-findings.v1", "findings": [],
+            "overall": {"correctness": "correct", "explanation": f"Checked `{repo.root}/docs/a.md`.", "confidence": 0.9,
+                        "review_complete": True},
+        }),
     ) == 0
     assert json.loads(capsys.readouterr().out)["verdict"] == "APPROVED"
     assert str(repo.root) not in posted[-1]["body"] and str(provenance) not in posted[-1]["body"]

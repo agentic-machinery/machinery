@@ -82,7 +82,7 @@ def test_schemaless_reviewer_missing_verdict_gets_one_correction_turn(sandbox, s
     catalog_path.write_text(yaml.safe_dump(catalog, sort_keys=False))
     findings = (
         '{"schema_version":"code-review-findings.v1",'
-        '"overall":{"correctness":"correct","explanation":"No defects.","confidence":0.9},'
+        '"overall":{"correctness":"correct","explanation":"No defects.","confidence":0.9,"review_complete":true},'
         '"findings":[]}'
     )
     other = findings.replace('"correctness":"correct"', '"correctness":"incorrect"', 1)

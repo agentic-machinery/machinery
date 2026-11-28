@@ -26,6 +26,12 @@ CURRENT_SOL = current_sol()
 
 
 SHA = "a" * 40
+# A sealed code-review approval: the canonical findings object, with its completion attestation.
+APPROVAL_REPLY = json.dumps({
+    "schema_version": "code-review-findings.v1",
+    "overall": {"correctness": "correct", "explanation": "No defect found.", "confidence": 0.9, "review_complete": True},
+    "findings": [],
+})
 
 
 OTHER = "b" * 40
@@ -59,7 +65,7 @@ def task(**updates):
     return data
 
 
-def write_task(root: Path, *, task_id="review-one", reply="VERDICT: APPROVE", **updates):
+def write_task(root: Path, *, task_id="review-one", reply=APPROVAL_REPLY, **updates):
     root.mkdir(parents=True, exist_ok=True)
     (root / task_id).parent.mkdir(parents=True, exist_ok=True)
     record = task(**updates)
