@@ -824,7 +824,7 @@ function renderMilestoneChips(latest, now = Date.now(), planningReading = null, 
   // repository fresh, readable and fully listed (the same set the outside-milestones list uses),
   // and every listed open issue has a Planning verdict. Missing or expired milestone data is a gap.
   const complete = collected ? completeMilestoneRepos(data, milestoneReading, now) : null;
-  const milestoneGap = !collected
+  const milestoneGap = !collected || !collected.repos.length
     || collected.repos.some(repo => repo && !repo.private
       && (typeof repo.repository !== "string" || !complete.has(repo.repository.toLowerCase())))
     || collected.entries.some(entry => !entry.isPrivate && entry.unaccountedCount > 0);

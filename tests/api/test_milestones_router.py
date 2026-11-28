@@ -739,7 +739,8 @@ assert.match(emptyFreshChips, /<b>0<\\/b> blocked<\\/a>/);
 assert.match(emptyFreshChips, /<b>0<\\/b> ready now<\\/a>/);
 assert.match(emptyExpiredChips, /<b>unknown<\\/b> blocked \\(incomplete\\)/);
 assert.match(emptyExpiredChips, /<b>unknown<\\/b> ready now \\(incomplete\\)/);
-for (const absent of [null, {{status: "pending", repositories: []}}]) {{
+for (const absent of [null, {{status: "pending", repositories: []}},
+  {{status: "unknown", reason: "registry_unavailable", repositories: []}}, {{status: "ok"}}]) {{
   const absentChips = renderMilestoneChips({{milestones: absent, planning: okPlanning}}, now);
   assert.match(absentChips, /<b>unknown<\\/b> blocked \\(incomplete\\)/);
   assert.match(absentChips, /<b>unknown<\\/b> ready now \\(incomplete\\)/);
