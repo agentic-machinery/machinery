@@ -2325,6 +2325,10 @@ class AuthorityService:
         supervisory_inbox = len(recipients_norm) == 1 and bool(_SUPERVISORY_RECIPIENT_RE.fullmatch(recipients_norm[0]))
         if live_delivery and kind_name == _SUPERVISORY_REQUEST_KIND and not supervisory_inbox:
             raise AuthorityServiceError("supervisory_recipient_required")
+        if live_delivery and not subscriber_fanout:
+            # Only an exact caller-request hit above skips admission; a new message
+            # or a row in the earlier format still needs a readable recipient.
+            _require_readable_recipients(recipients_norm)
         revisions = self._normalize_context_revisions(context_revisions, channel_row)
         # The whole-payload digest that rows written before #1620 hold.
         payload = {
@@ -2350,10 +2354,14 @@ class AuthorityService:
             namespace, key, payload_sha, legacy_sha256=_sha256_json(payload)
         )
         if existing_id is not None:
-            return self.get_message(existing_id)
-        if live_delivery and not subscriber_fanout:
-            # Only a new message to an unreadable recipient is refused.
-            _require_readable_recipients(recipients_norm)
+            existing = self.get_message(existing_id)
+            # The earlier format did not bind the delivery mode. A queue-only message
+            # has no deliveries, a live one to explicit recipients has one each.
+            if (not deliver and existing.delivery_ids) or (
+                live_delivery and not subscriber_fanout and len(existing.delivery_ids) != len(recipients_norm)
+            ):
+                raise AuthorityServiceError("idempotency_key_reused_with_different_payload")
+            return existing
 
         mid = message_id or new_id("message")
         if self._conn.execute("SELECT 1 FROM comms_messages WHERE message_id = ?", (mid,)).fetchone():
