@@ -187,6 +187,8 @@ def _validate_raw_message_row(conn: SQLiteConnection, message_id: str) -> None:
     ).fetchone()
     if row is None:
         return
+    if row["message_id"] != message_id:
+        raise AuthorityServiceError("message_row_corrupt")
     for column in _REQUIRED_MESSAGE_TEXT_FIELDS:
         _as_nonempty_str(row[column], error_code="message_row_corrupt")
     for column in _OPTIONAL_MESSAGE_TEXT_FIELDS:
@@ -264,8 +266,12 @@ def _read_message_cached(
     if cached is not None:
         return cached
     try:
+        if _nonempty(message_id, field="message_id") != message_id:
+            raise AuthorityServiceError("message_row_corrupt")
         _validate_raw_message_row(conn, message_id)
         message = service.get_message(message_id)
+        if message.message_id != message_id:
+            raise AuthorityServiceError("message_row_corrupt")
         result: tuple[dict[str, Any] | None, str | None] = (_message_to_dict(message), None)
     except AuthorityServiceError as exc:
         result = (None, str(exc))

@@ -623,6 +623,37 @@ def test_corrupt_row_emits_typed_error_while_sibling_rows_still_print(
             created_at="2026-11-28T01:01:18.400000Z",
             idempotency_key="corrupt-sibling-bad-blob-reply-parent",
         )
+        padded_delivery_msg = service.publish_message(
+            sender="operator",
+            body=f"padded delivery {BODY_SENTINEL}",
+            recipients=("codex",),
+            created_at="2026-11-28T01:01:18.500000Z",
+            idempotency_key="corrupt-sibling-padded-delivery",
+        )
+        padded_reply_id_msg = service.publish_message(
+            sender="codex",
+            body=f"padded reply id {BODY_SENTINEL}",
+            recipients=("claude-cto",),
+            in_reply_to=good_msg.message_id,
+            created_at="2026-11-28T01:01:18.600000Z",
+            idempotency_key="corrupt-sibling-padded-reply-id",
+        )
+        padded_parent_msg = service.publish_message(
+            sender="operator",
+            body=f"padded parent {BODY_SENTINEL}",
+            recipients=("codex",),
+            conversation_id=good_msg.conversation_id,
+            created_at="2026-11-28T01:01:18.650000Z",
+            idempotency_key="corrupt-sibling-padded-parent",
+        )
+        reply_to_padded_parent_msg = service.publish_message(
+            sender="codex",
+            body=f"reply to padded parent {BODY_SENTINEL}",
+            recipients=("claude-cto",),
+            in_reply_to=good_msg.message_id,
+            created_at="2026-11-28T01:01:18.700000Z",
+            idempotency_key="corrupt-sibling-reply-to-padded-parent",
+        )
         bad_utf8_msg = service.publish_message(
             sender="operator",
             body=f"bad utf8 {BODY_SENTINEL}",
@@ -707,6 +738,32 @@ def test_corrupt_row_emits_typed_error_while_sibling_rows_still_print(
             "UPDATE comms_messages SET in_reply_to = X'626164' WHERE message_id = ?",
             (bad_blob_reply_parent_msg.message_id,),
         )
+        # Padded message IDs must never alias onto the stripped row inside AuthorityService.get_message (R2-F2).
+        padded_delivery_mid = f" {bad_blob_sender_msg.message_id} "
+        padded_reply_mid = f" {good_msg.message_id} "
+        padded_parent_mid = f" {padded_parent_msg.message_id} "
+        conn.execute(
+            "UPDATE authority_deliveries SET message_id = ? WHERE delivery_id = ?",
+            (padded_delivery_mid, padded_delivery_msg.delivery_ids[0]),
+        )
+        conn.execute(
+            "UPDATE comms_messages SET message_id = ? WHERE message_id = ?",
+            (padded_reply_mid, padded_reply_id_msg.message_id),
+        )
+        conn.execute(
+            "INSERT INTO comms_messages (message_id, conversation_id, in_reply_to, kind, sender, recipient, body_inline, body_artifact_id, content_sha256, metadata_json, created_at) "
+            "SELECT ?, conversation_id, in_reply_to, kind, sender, recipient, body_inline, body_artifact_id, content_sha256, metadata_json, created_at "
+            "FROM comms_messages WHERE message_id = ?",
+            (padded_parent_mid, padded_parent_msg.message_id),
+        )
+        conn.execute(
+            "UPDATE authority_deliveries SET message_id = ? WHERE delivery_id = ?",
+            (padded_parent_mid, padded_parent_msg.delivery_ids[0]),
+        )
+        conn.execute(
+            "UPDATE comms_messages SET in_reply_to = ? WHERE message_id = ?",
+            (padded_parent_mid, reply_to_padded_parent_msg.message_id),
+        )
         conn.execute(
             "UPDATE authority_message_metadata SET provenance_json = CAST(X'80' AS TEXT) WHERE message_id = ?",
             (bad_utf8_msg.message_id,),
@@ -729,9 +786,9 @@ def test_corrupt_row_emits_typed_error_while_sibling_rows_still_print(
     expected_good_reply = _expected_message_dict(plane, good_reply.message_id)
 
     payload = _run_exchange(capsys, plane, recipient="codex")
-    assert payload["delivery_count"] == 13
-    assert payload["reply_count"] == 3
-    assert payload["error_count"] == 14
+    assert payload["delivery_count"] == 15
+    assert payload["reply_count"] == 5
+    assert payload["error_count"] == 18
 
     by_mid = {row["message_id"]: row for row in payload["deliveries"]}
     assert by_mid[good_msg.message_id]["ok"] is True
@@ -768,6 +825,10 @@ def test_corrupt_row_emits_typed_error_while_sibling_rows_still_print(
         assert by_mid[blob_msg.message_id]["error"] == "message_row_corrupt"
         assert by_mid[blob_msg.message_id]["message"] is None
 
+    assert by_mid[padded_delivery_mid]["ok"] is False
+    assert by_mid[padded_delivery_mid]["error"] == "message_row_corrupt"
+    assert by_mid[padded_delivery_mid]["message"] is None
+
     assert by_mid[bad_utf8_msg.message_id]["ok"] is False
     assert by_mid[bad_utf8_msg.message_id]["error"] == "provenance_corrupt"
     assert by_mid[bad_utf8_msg.message_id]["message"] is None
@@ -792,6 +853,14 @@ def test_corrupt_row_emits_typed_error_while_sibling_rows_still_print(
     assert replies_by_mid[bad_blob_reply_parent_msg.message_id]["reply_link_status"] == "corrupt_reply"
     assert replies_by_mid[bad_blob_reply_parent_msg.message_id]["error"] == "message_row_corrupt"
     assert replies_by_mid[bad_blob_reply_parent_msg.message_id]["message"] is None
+    # Padded reply message_id and padded parent in_reply_to never alias onto stripped messages (R2-F2).
+    assert replies_by_mid[padded_reply_mid]["ok"] is False
+    assert replies_by_mid[padded_reply_mid]["reply_link_status"] == "corrupt_reply"
+    assert replies_by_mid[padded_reply_mid]["error"] == "message_row_corrupt"
+    assert replies_by_mid[padded_reply_mid]["message"] is None
+    assert replies_by_mid[reply_to_padded_parent_msg.message_id]["ok"] is False
+    assert replies_by_mid[reply_to_padded_parent_msg.message_id]["reply_link_status"] == "unreadable_parent"
+    assert replies_by_mid[reply_to_padded_parent_msg.message_id]["error"] == "message_row_corrupt"
 
     # Boundary refusals still fail closed with typed JSON errors and exit 3 (F1, F9, R1-F1).
     bad_since = _run_exchange(capsys, plane, recipient="codex", since="not-a-date", expected_rc=EXIT_ERROR)
