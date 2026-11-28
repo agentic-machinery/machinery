@@ -184,6 +184,8 @@ if args[:2] == ["journal", "add"]:
     assert len(args) == 12 and len(args[9]) <= 2000
     assert os.environ["LU_INBOX_WORKER"] == "devops"
     target, key, body = "journal", args[11], args[7] + "\\n" + args[9]
+    if os.environ.get("DIGEST_FAKE_JOURNAL_FAIL"):
+        sys.exit(1)
 else:
     assert args[:12] == [
         "channel", "publish", "cto", "-", "--sender", "devops",
@@ -219,7 +221,8 @@ if target == "fleet" and os.environ.get("DIGEST_FAKE_FLEET_FAIL") == "after_writ
 def _publish(directory: Path, day: str = _DAY) -> subprocess.CompletedProcess[str]:
     env = {
         name: os.environ[name] for name in (
-            "PATH", "DIGEST_FIXTURE", "DIGEST_FIXTURE_EXIT", "DIGEST_FAKE_FLEET_FAIL", "LU_HOST_CONTEXT",
+            "PATH", "DIGEST_FIXTURE", "DIGEST_FIXTURE_EXIT", "DIGEST_FAKE_FLEET_FAIL",
+            "DIGEST_FAKE_JOURNAL_FAIL", "LU_HOST_CONTEXT",
             "LU_DRIVER_STATE_CLI", "LU_ERROR_DIGEST_FLEET_CLI",
         ) if name in os.environ
     }
@@ -260,6 +263,23 @@ def test_second_run_same_day_adds_no_entry_or_message(journal, destinations, mon
     print(f"run 1: +{len(notes)} journal entry, +{len(proposals)} Fleet proposal")
     print(f"run 2: +{len(destinations('journal')) - len(notes)} journal entries, "
           f"+{len(destinations('fleet')) - len(proposals)} Fleet proposals")
+
+    next_day = "2025-02-02"
+    journal([_entry(PRIORITY="4", MESSAGE="request stalled", __REALTIME_TIMESTAMP=str(_START + 86_400_000_000))])
+    monkeypatch.setenv("DIGEST_FAKE_JOURNAL_FAIL", "1")
+    failed = _publish(directory, next_day)
+    assert failed.returncode == 1
+    assert "journal write: unavailable (write_refused)" in failed.stderr
+    assert destinations("journal") == notes
+    next_key = f"error-digest:{next_day}"
+    proposals = destinations("fleet")
+    assert list(proposals) == [key, next_key]
+
+    monkeypatch.delenv("DIGEST_FAKE_JOURNAL_FAIL")
+    recovered = _publish(directory, next_day)
+    assert recovered.returncode == 0, recovered.stderr
+    assert "1 warnings, 1 kinds (1 new)" in destinations("journal")[next_key]
+    assert destinations("fleet") == proposals
 
 
 def test_failed_publish_leaves_ledger_unchanged(journal, destinations, monkeypatch):

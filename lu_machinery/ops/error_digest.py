@@ -712,17 +712,22 @@ def _collect_for_publish(
             if current in due:
                 _post_journal(cli, current, f"Error digest {current}: journal partial", str(exc), sender, deadline)
             raise
-        new_count = 0
+        report_day = current.isoformat()
+        new_sigs = set()
         for kind in report["kinds"]:
             sig = kind["sig"]
-            if sig in ledger:
+            if known := ledger.get(sig):
+                # A Fleet success can precede a failed journal write. The
+                # ledger preserves the original day for the retried note.
+                if known["first_seen"] == report_day:
+                    new_sigs.add(sig)
                 continue
             if sig in candidates:
                 candidates[sig]["count"] += kind["count"]
             else:
-                candidates[sig] = {**kind, "first_seen": current.isoformat()}
-                new_count += 1
-        count = None if ledger_error else new_count
+                candidates[sig] = {**kind, "first_seen": report_day}
+                new_sigs.add(sig)
+        count = None if ledger_error else len(new_sigs)
         if current in due and current != day:
             banner = "\n".join(filter(None, (ledger_error, _unknown_notes(state, current))))
             headline, body = _journal_summary(report, count, banner)
