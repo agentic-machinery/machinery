@@ -422,9 +422,10 @@ On 2026-11-19 over 30 days (backfilled copy): GPT-6.1 Sol 0.949 (237 settled fin
 the author labels each P0-P2 finding of that review (every finding that can block it) with
 `record_cf_verdict finding-outcome --task-id <review> --pr <N> --finding <id> --label <label> [--evidence '<line>']`:
 `fixed` (a real error, changed), `wrong` (the code was already correct), `invented` (it cites a file, line,
-symbol or behaviour that does not exist), `out_of_scope` or `duplicate`. Every label except `fixed` needs one line
-of evidence. The verb refuses a finding that is not a P0-P2 finding of the review's structured reply, a review
-with no published `CHANGES_REQUESTED` verdict on that PR at its reviewed head at or after its start in the
+symbol or behaviour that does not exist), `no_live_trigger` (the cited code exists, but a guard, caller or
+configuration keeps its trigger from occurring on the real system; the evidence names it), `out_of_scope` or
+`duplicate`. Every label except `fixed` needs one line of evidence. The verb refuses a finding that is not a P0-P2
+finding of the review's structured reply, a review with no published `CHANGES_REQUESTED` verdict on that PR at its reviewed head at or after its start in the
 publication ledger, and a review task id that names more than one run record in the task store (a task id can be
 dispatched again; a label line names the task id, not the run). The reply, the run census and the label's time
 are read under the task-store lock that archive and restore moves take. Each label line stores the labelled
@@ -450,8 +451,18 @@ as its label; a contest for another run of a reused task id never suppresses an 
 written without `reviewer_model` or run binding (`head` and `started_at`) are accepted as valid lines (legacy
 labels remaining conflict-protected on write), counted in `coverage.finding_outcomes.unattributed_labels` and
 `coverage.finding_outcomes.unbound_contests`, and attributed to no reviewer. An unreadable fleet registry counts no label
-(`coverage.finding_outcomes.registry_unreadable`). `real_precision` is `fixed / (fixed + wrong + invented)` with
-its Wilson interval; a label is the author's word unless a later review contested it.
+(`coverage.finding_outcomes.registry_unreadable`). `real_precision` is
+`fixed / (fixed + wrong + invented + no_live_trigger)` with its Wilson interval; a label is the author's word
+unless a later review contested it. The schema stays `review-finding-outcome.v1`. A label this release does not know
+still holds its finding (`coverage.finding_outcomes.unknown_labels`, attributed to no reviewer), so another label
+is refused. `no_live_trigger` is outside the vocabulary of release 0.1.84, whose conflict check would otherwise
+skip the line and append a second label. For every label outside that vocabulary the writer also appends a legacy
+occupying line bound to that run's `head` and `started_at` (`duplicate`, no reviewer, the SHA-256 of the phrase
+`prior-release finding-outcome hold`). That line is not an outcome: this release skips it. 0.1.84 refuses a
+different label for that run and attributes none, and this release keeps attributing the original label. A line
+without the run binding would share one legacy key with every earlier line for the finding, and a later run would
+not be protected. A second run-bound label already in the
+file does not replace the first; it counts in `coverage.finding_outcomes.conflicting_labels`.
 
 Both line kinds go to `batch_state/model-stats/finding-outcomes.jsonl` (schema `review-finding-outcome.v1`)
 under the rows lock; the recorder is its one writer. It keeps the evidence only as its SHA-256, never the text: the

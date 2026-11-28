@@ -24,11 +24,16 @@ FINDING_OUTCOME_LABELS: dict[str, str] = {
     "fixed": "a real error; the author changed the code",
     "wrong": "the code was already correct",
     "invented": "the finding cites a file, line, symbol or behaviour that does not exist",
+    "no_live_trigger": "the cited code exists, but the guard, caller or configuration the evidence names keeps its "
+                       "trigger from occurring on the real system",
     "out_of_scope": "outside the change's frozen obligation",
     "duplicate": "another finding of the same review names the same defect",
 }
 # The labels an author must back with one line of evidence. A fix shows in the next head's diff.
 EVIDENCED_OUTCOME_LABELS = frozenset(FINDING_OUTCOME_LABELS) - {"fixed"}
+# Labels the finding-outcome writer in release 0.1.84 admits. A label outside this set is invisible to that
+# writer's conflict check. Do not add a new label here: the writer stores a separate occupying line for it.
+PRIOR_RELEASE_OUTCOME_LABELS = frozenset({"fixed", "wrong", "invented", "out_of_scope", "duplicate"})
 
 
 class FindingsLedgerError(RuntimeError):
