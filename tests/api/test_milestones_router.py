@@ -992,3 +992,64 @@ try {{
 }}
 """
     _run_milestones_node(body)
+    # Full runner load + 1s tick boundary check: no separate #milestones-age label competes with the
+    # dashboard's captured freshness strip, so the visible label, summary counts, and chips agree.
+    page = Path(milestones.__file__).with_name("dashboards").joinpath("milestones.html").read_text()
+    assert 'id="milestones-age"' not in page
+    dashboards = Path(milestones.__file__).with_name("dashboards")
+    full_script = page.split('<script src="/machinery.js"></script>', 1)[1].split("<script>", 1)[1].split("runner.start();", 1)[0]
+    runner_probe = (
+        'const assert = require("node:assert/strict");\n'
+        'const els = {};\n'
+        'global.document = {querySelectorAll: () => [], querySelector: () => null, '
+        'getElementById: id => id === "milestones-age" ? null : (els[id] ??= {innerHTML: "", textContent: "", hidden: false})};\n'
+        f'global.Machinery = require({json.dumps(str(dashboards / "machinery.js"))});\n'
+        + full_script
+        + r"""
+(async () => {
+  const now = Date.parse("2030-01-10T00:00:00Z");
+  const mData = {status: "ok", age_seconds: 419.9, stale: false, repositories: [{
+    repository: "fixture/machinery", private: false, status: "ok", stale: false, age_seconds: 419.9,
+    milestones: [{number: 1, title: "v0.4.0", url: "https://github.com/fixture/machinery/milestone/1",
+      due_on: "2030-01-05T00:00:00Z", open_issues: 1, closed_issues: 0, issues_status: "ok",
+      issues: [{number: 10, title: "T", url: "https://github.com/fixture/machinery/issues/10", labels: []}]}]
+  }]};
+  const pData = {issues: {status: "ok", age_s: 10, workers: "ok",
+    coverage: {repositories_read: 1, repositories_total: 1, open_issues: 1, dependency_unknown: 0, private_open_issues: 0},
+    blockers: [], ready: [], ready_now: [],
+    blocked: [{ref: "fixture/machinery#10", blocked_by: ["fixture/machinery#1"], private_blockers: 0}]}};
+  let mono = 1000.0;
+  const stamps = [1000.0, 1099.5, 1099.5, 1100.1, 1100.1];
+  let idx = 0;
+  const origPerf = performance.now.bind(performance);
+  performance.now = () => (idx < stamps.length ? stamps[idx++] : mono);
+  global.fetch = async () => ({
+    ok: true, status: 200,
+    headers: {get: k => ({"X-Snapshot-Age-S": "419.9", "X-Snapshot-Stale-After-S": "420", "X-Snapshot-State": "fresh"}[k] ?? null)},
+    text: async () => JSON.stringify(mData),
+  });
+  try {
+    runner.latest.planning = pData;
+    latestPlanningReading = {data: pData, receivedAt: now, receivedMono: 1000.0};
+    await runner.refreshAll();
+    const loadContent = els["milestones-content"].innerHTML;
+    const loadChips = els["chips"].innerHTML;
+    assert.equal(/STALE/.test(loadContent), /open \(stale\)/.test(loadChips), "load: freshness strip and chips agree");
+    assert.equal(/STALE/.test(loadContent), /unknown<\/b> blocked/.test(loadChips), "load: freshness strip and blocked chip agree");
+    // Simulate 1s runner tick: updatePanelAge + onTick across expiry boundary.
+    mono = 1100.2;
+    Machinery.updatePanelAge(PANELS[0], now);
+    PANELS[0].onTick(PANELS[0], runner.latest, () => {}, now);
+    const tickContent = els["milestones-content"].innerHTML;
+    const tickChips = els["chips"].innerHTML;
+    assert.match(tickContent, /STALE/, "tick flips freshness strip to STALE");
+    assert.match(tickChips, /open \(stale\)/, "tick flips open chip to stale");
+    assert.match(tickChips, /<b>unknown<\/b> blocked/, "tick flips blocked chip to unknown");
+    assert.doesNotMatch(tickContent, /<td[^>]*>1<\/td>/, "tick withholds numeric summary counts");
+  } finally {
+    performance.now = origPerf;
+  }
+})().catch(err => { console.error(err); process.exit(1); });
+"""
+    )
+    subprocess.run(["node", "-e", runner_probe], capture_output=True, text=True, check=True, timeout=10)
