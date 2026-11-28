@@ -536,10 +536,15 @@ before the upgrade. The cutover is complete only when each of them is cleared:
 - a held `dispatch-turn` lease whose turn record keeps `turn_lease`: the recipe above, once the
   lease is `expired`;
 - an unexpired held turn lease, or one with no turn record (its claim answer was lost): the
-  cutover stays blocked until the operator force-releases it with the attributed
-  `session_supervisor release --force` on the Monitor host, with dispatch stopped and no driver
-  launching on that stream, so no successor can claim it between the check and the release (the
-  exclusion the warning below requires for unfenced `--force`).
+  cutover stays blocked until the operator force-releases it on the Monitor host under a claim
+  exclusion. `release --force` closes the stream's current lease by stream id alone, and stopping
+  dispatch or driver launches does not stop Monitor's claim route, which any loopback caller can
+  reach. So: stop the Monitor API service (or otherwise verifiably block every claim); with that
+  exclusion in place, confirm in the authoritative store that the stream's lease is still the
+  inventoried one (`.venv/bin/python -m lu_machinery.session_streams dump --stream epic:<N>`: the
+  same `generation` and `fencing_token`, not released); run the attributed
+  `session_supervisor release --force`, which writes Monitor's lease store directly; and only
+  then start the Monitor API service again.
 
 Do **not** run the exact-envelope recipe on an `active` (unexpired) lease, and do **not**
 use `session_supervisor release --force` for `dispatch-turn` lease recovery while
