@@ -117,7 +117,7 @@ guarded remover.
   and referencing PRs. List the open PRs for the same issue, or record that a successful lookup
   found none. Explain how the brief relates to any overlapping work.
 - Read the provider's full docs (`llms-full.txt` or equivalent) before the first paid call and put its request and response rules in the brief.
-- Binding facts and rulings for a worker go in its brief or in a successor task; a message to a live worker is only an answer to a question it asked, because workers may never read other mid-task messages.
+- Binding facts and rulings for a worker go in its brief or in a successor task, unless they answer a question it asked; a message to a live worker is only such an answer, because workers may never read other mid-task messages.
 - Get a PR's branch with `gh pr view <PR> --json headRefName` in the same script that writes the brief.
 
 Record each new in-flight task with `lu-driver-state add --lane cto --kind inflight`, its
