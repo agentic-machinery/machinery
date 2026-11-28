@@ -62,7 +62,7 @@ from .monitor_context import MonitorContext, get_ctx
 from .project_state_store import REPORT_TTL_SECONDS, get_freshest_lane_usage
 from .resilience import request_timeout_s
 from .rules_router import rules_hash
-from .runtime_router import _public_subscriptions, summarize_runtime_usage
+from .runtime_router import _public_subscriptions, local_body_read_refusal_response, summarize_runtime_usage
 from .session_router import session_hash
 from .state_helpers import (
     cache_get_or_compute,
@@ -2652,6 +2652,7 @@ def _public_routing_budget(raw: object, *, subscription_age_s: float | None = No
 
 @router.get("/routing-budget")
 async def routing_budget(
+    request: Request,
     fresh_codexbar: bool = Query(False),
     transport: Literal["dispatch", "acp"] = Query("dispatch"),
     ctx: MonitorContext = Depends(get_ctx),
@@ -2664,8 +2665,13 @@ async def routing_budget(
     callers that need a blocking probe use
     ``compute_routing_budget(fresh_codexbar=True)`` directly.
     ``?include_subscriptions=true`` adds the aged snapshot used by the Subscriptions page.
+    The refresh starts provider probes, so only a caller the shared local
+    guard accepts may ask for it; any other caller gets that guard's 403.
     """
     if fresh_codexbar:
+        refusal = local_body_read_refusal_response(request)
+        if refusal is not None:
+            return refusal
         trigger_background_refresh()
     cache_key = _ctx_cache_key(ctx, "routing-budget", transport, int(fresh_codexbar))
     # Directory checks are cheap enough for warm reads. All-file validation
