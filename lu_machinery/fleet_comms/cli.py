@@ -1619,7 +1619,11 @@ def build_parser() -> argparse.ArgumentParser:
     channel_publish.add_argument("--in-reply-to")
     channel_publish.add_argument("--correlation-id")
     channel_publish.add_argument("--deadline-at")
-    channel_publish.add_argument("--idempotency-key", required=True)
+    channel_publish.add_argument(
+        "--idempotency-key", required=True,
+        help="Retry key: resending the same message under it returns the original receipt, even after the "
+             "channel context or subscribers changed; a different message under it exits 3",
+    )
     channel_publish.add_argument("--root")
     channel_publish.set_defaults(func=cmd_channel_publish)
 

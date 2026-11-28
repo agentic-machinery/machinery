@@ -296,33 +296,35 @@ def test_failed_publish_leaves_ledger_unchanged(journal, destinations, monkeypat
     assert ledger.read_bytes() == previous
     assert destinations("fleet") == {}
     key = f"error-digest:{_DAY}"
-    state = directory / ".error-digest-publish.v1.json"
-    audit = json.loads(state.read_bytes())
-    assert audit["attempt"] is None
-    body_sha = audit["delivery_unknown"][key]
-    assert f"delivery_unknown for {_DAY} attempt 0, body SHA-256 {body_sha}" in destinations("journal")[key]
+    state = directory / ".error-digest-publish.v2.json"
+    attempt = json.loads(state.read_bytes())["attempt"]
+    assert attempt["key"] == key
+    body_sha = hashlib.sha256(attempt["body"].encode()).hexdigest()
+    assert f"Fleet proposal for {_DAY} not confirmed, body SHA-256 {body_sha}" in destinations("journal")[key]
 
-    # Ambiguous completion after a later publish must still leave the kind
-    # ledger unchanged. Both days' kinds remain eligible under a fresh key.
+    # An ambiguous completion on a later run must still leave the kind ledger
+    # unchanged. The pending proposal is resent under its own key, never a fresh one.
     next_day = "2025-02-02"
     journal([_entry(PRIORITY="3", MESSAGE="new failure", __REALTIME_TIMESTAMP=str(_START + 86_400_000_000))])
     monkeypatch.setenv("DIGEST_FAKE_FLEET_FAIL", "after_write")
     ambiguous = _publish(directory, next_day)
     assert ambiguous.returncode == 1
     assert ledger.read_bytes() == previous
-    ambiguous_key = f"error-digest:{next_day}:1"
     fleet = destinations("fleet")
-    assert list(fleet) == [ambiguous_key]
-    audit = json.loads(state.read_bytes())
-    assert audit["delivery_unknown"][ambiguous_key] == hashlib.sha256(fleet[ambiguous_key].encode()).hexdigest()
+    assert fleet == {key: attempt["body"]}
+    assert json.loads(state.read_bytes())["attempt"] == attempt
 
     monkeypatch.delenv("DIGEST_FAKE_FLEET_FAIL")
     next_run = _publish(directory, next_day)
     assert next_run.returncode == 0, next_run.stderr
-    retry_key = f"error-digest:{next_day}:2"
-    assert sorted(destinations("fleet")) == [ambiguous_key, retry_key]
-    assert destinations("fleet")[retry_key] == fleet[ambiguous_key]
+    next_key = f"error-digest:{next_day}"
+    proposals = destinations("fleet")
+    assert sorted(proposals) == [key, next_key]
+    assert proposals[key] == fleet[key]
     kind = digest.signature("journal", "writer.service", "error", "worker failed")
     new_kind = digest.signature("journal", "writer.service", "error", "new failure")
-    assert set(json.loads(ledger.read_bytes())) == {kind, new_kind}
-    assert sorted(destinations("journal")) == [key, f"error-digest:{next_day}"]
+    assert new_kind in proposals[next_key] and kind not in proposals[next_key]
+    rows = json.loads(ledger.read_bytes())
+    assert {sig: row["proposal_day"] for sig, row in rows.items()} == {kind: _DAY, new_kind: next_day}
+    assert json.loads(state.read_bytes()) == {"attempt": None}
+    assert sorted(destinations("journal")) == [key, next_key]
