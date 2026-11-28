@@ -300,11 +300,12 @@ def test_delivery_cli_help(operation):
 
 
 def test_delivery_cli_subprocess_claim_ack_and_usage(plane):
-    message = publish(plane)
+    # The child runs the real roster, where only a registered name (not a placeholder seat) is claimable.
+    message = publish(plane, recipient="claude-cto")
     command = [sys.executable, "-m", "lu_machinery.fleet_comms", "deliveries"]
     env = {**os.environ, "FLEET_COMMS_ROOT": str(plane.parent / "wrong-root")}
     result = subprocess.run(
-        [*command, "claim", "--recipient", "codex", "--worker-id", "seat-1", "--root", str(plane)],
+        [*command, "claim", "--recipient", "claude-cto", "--worker-id", "seat-1", "--root", str(plane)],
         env=env, capture_output=True, text=True, check=False, timeout=30,
     )
     assert result.returncode == EXIT_OK
