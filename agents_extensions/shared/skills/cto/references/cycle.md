@@ -105,6 +105,7 @@ never fine.
    attention item; before calling a dispatch dead check open PRs and its worktree for
    unpushed work; check the worktree disposition after terminal status ([recipes](recipes.md#worktree-disposition-before-re-dispatch)).
    List every task result or lane message awaiting a CTO grant or approval, with its age.
+   A dispatch hold names its reason and expiry; re-check it every cycle and lift it the moment the reason no longer holds.
    Never hold work back to save allowance. Each cycle, rank pools by required burn,
    the percent left divided by hours until the reset or an earlier drain deadline.
    Fill free worker slots from the top operator order's critical path first; when that path is serialized behind one change, put a worker on removing the serialization before starting other work.

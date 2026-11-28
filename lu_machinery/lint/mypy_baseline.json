@@ -3694,11 +3694,6 @@
     },
     {
       "path": "lu_machinery/driver_state.py",
-      "code": "index",
-      "message": "Value of type \"None | list[int]\" is not indexable"
-    },
-    {
-      "path": "lu_machinery/driver_state.py",
       "code": "operator",
       "message": "Unsupported operand types for < (\"int\" and \"None\")"
     },
