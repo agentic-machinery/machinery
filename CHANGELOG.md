@@ -9,6 +9,48 @@ this file.
 
 ## [Unreleased]
 
+<a id="v0.1.85"></a>
+## [0.1.85] - 2026-11-28
+
+### Added
+
+- Add read-only fleet exchange command (supersedes #1582) ([#1587](https://github.com/agentic-machinery/machinery/pull/1587))
+- Admit Cursor Grok to critical review ([#1605](https://github.com/agentic-machinery/machinery/pull/1605))
+- Report eligible_bytes in task_log_retention ([#1616](https://github.com/agentic-machinery/machinery/pull/1616))
+- Restore settlement events in a bounded public/private log ([#1620](https://github.com/agentic-machinery/machinery/pull/1620))
+- Report-only per-model Ruff attempts with settlement attribution ([#1621](https://github.com/agentic-machinery/machinery/pull/1621))
+
+### Changed
+
+- Five CTO skill lines with the supersession check as a rule (supersedes #1593 and #1590) ([#1595](https://github.com/agentic-machinery/machinery/pull/1595))
+- Let eggbot open, fold and drop issues ([#1604](https://github.com/agentic-machinery/machinery/pull/1604))
+- Resolve the reviewer before adding an author family to a branch ([#1600](https://github.com/agentic-machinery/machinery/pull/1600))
+- Stage SessionStart input before launch ([#1608](https://github.com/agentic-machinery/machinery/pull/1608))
+- Pin fetched base SHAs before range-diff and git log ([#1609](https://github.com/agentic-machinery/machinery/pull/1609))
+- Five CTO-seat operating rules from today's mistakes ([#1611](https://github.com/agentic-machinery/machinery/pull/1611))
+- Drain claude-epics as ordinary consumer in CTO-only mode ([#1634](https://github.com/agentic-machinery/machinery/pull/1634))
+
+### Fixed
+
+- Let an unknown outcome label keep its finding's key ([#1599](https://github.com/agentic-machinery/machinery/pull/1599))
+- A crashed publisher's same-key retry returns its original receipt (supersedes #1591) ([#1597](https://github.com/agentic-machinery/machinery/pull/1597))
+- Isolate launcher processes from pytest workers ([#1601](https://github.com/agentic-machinery/machinery/pull/1601))
+- Accept a half-millisecond routing age above the scan ([#1602](https://github.com/agentic-machinery/machinery/pull/1602))
+- Validate the product before readying adoption ([#1594](https://github.com/agentic-machinery/machinery/pull/1594))
+- Cache dry-run launcher sandboxes and trim redundant calls ([#1606](https://github.com/agentic-machinery/machinery/pull/1606))
+- Run TruffleHog with --no-verification ([#1612](https://github.com/agentic-machinery/machinery/pull/1612))
+- Send an unclaimed launcher expiry notice only to the CTO ([#1613](https://github.com/agentic-machinery/machinery/pull/1613))
+- Refuse cross-origin browser requests ([#1617](https://github.com/agentic-machinery/machinery/pull/1617))
+- Refuse lease force release over the Monitor HTTP API ([#1619](https://github.com/agentic-machinery/machinery/pull/1619))
+- Build the last two store paths from state_paths ([#1623](https://github.com/agentic-machinery/machinery/pull/1623))
+- Use host binding product Python for data-tier subprocesses ([#1625](https://github.com/agentic-machinery/machinery/pull/1625))
+- Provide device nodes to product runtime checks ([#1624](https://github.com/agentic-machinery/machinery/pull/1624))
+- Stop counting settlement cleanup as degraded fleet health ([#1628](https://github.com/agentic-machinery/machinery/pull/1628))
+- Allow code-scanning-dismiss for approved open-PR-only alerts (#1626) ([#1627](https://github.com/agentic-machinery/machinery/pull/1627))
+- Run delivery recipes with the bound machinery interpreter ([#1631](https://github.com/agentic-machinery/machinery/pull/1631))
+- Let sandboxed product checks use isolated scratch ([#1632](https://github.com/agentic-machinery/machinery/pull/1632))
+- Start the shared relay using the bound product Python ([#1630](https://github.com/agentic-machinery/machinery/pull/1630))
+
 <a id="v0.1.84"></a>
 ## [0.1.84] - 2026-11-28
 
@@ -1923,7 +1965,8 @@ First release: the machinery extracted from learn-ukrainian as the installable `
 - Rollover confirms replacement bindings without a self-answered quiz. ([#65](https://github.com/learn-ukrainian/machinery/pull/65))
 - Deploy derives release identity from packaged bytes. ([#145](https://github.com/learn-ukrainian/machinery/pull/145))
 
-[Unreleased]: https://github.com/agentic-machinery/machinery/compare/v0.1.84...HEAD
+[Unreleased]: https://github.com/agentic-machinery/machinery/compare/v0.1.85...HEAD
+[0.1.85]: https://github.com/agentic-machinery/machinery/compare/v0.1.84...v0.1.85
 [0.1.84]: https://github.com/agentic-machinery/machinery/compare/v0.1.83...v0.1.84
 [0.1.83]: https://github.com/agentic-machinery/machinery/compare/v0.1.82...v0.1.83
 [0.1.82]: https://github.com/agentic-machinery/machinery/compare/v0.1.79...v0.1.82
