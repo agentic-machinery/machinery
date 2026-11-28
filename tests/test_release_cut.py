@@ -870,6 +870,123 @@ def test_consumer_collection_names_the_candidate_interpreter(monkeypatch, tmp_pa
     assert "LU_PYTHON" not in collected[0]
 
 
+def _simulate_consumer_adoption(monkeypatch, tmp_path, failing_check=None):
+    """Run the cut's PR lifecycle against a fixture checkout and recorded external calls."""
+    _host(monkeypatch, tmp_path, Path(sys.executable))
+    monkeypatch.delenv("LEARN_UKRAINIAN_DISPATCH_TASK_ID", raising=False)
+    work = tmp_path / "work"
+    candidate = work / "accept/bin/python"
+    product = work / "product"
+    hook_test = "tests/test_fixture_hooks.py"
+    calls = []
+
+    def preflight(cut):
+        _init_repo(product)
+        (product / "tests").mkdir()
+        (product / hook_test).write_text("def test_hook(): pass\n")
+        pin = work / "src/.github/workflows/product-consumer.pin"
+        pin.parent.mkdir(parents=True)
+        pin.write_text(f"commit {HEAD}\ntest {hook_test}\n")
+        cut.version = "0.1.22"
+        _stub_adopt_input_refresh(cut, monkeypatch)
+        return decide(), TITLES, cut.version
+
+    def build(_cut, _version):
+        sums = work / "SHA256SUMS"
+        sums.write_text("fixture checksums\n")
+        return {"sums": sums}
+
+    def wheelhouse(_cut, _files, _version):
+        lock = work / "consumer.lock"
+        lock.write_text("lu-machinery==0.1.22\n")
+        return lock
+
+    def publish(cut, _files, notes):
+        cut.tag_pushed = True
+        cut.notes = notes
+
+    def publisher_call(_cut, verb, *args):
+        content = next(
+            (Path(args[args.index(flag) + 1]).read_text() for flag in ("--body-file", "--notes-file") if flag in args),
+            "",
+        )
+        calls.append((verb, args, content))
+        return "https://github.com/example/product/pull/42\n"
+
+    real_run = Cut.run
+
+    def run(cut, argv, **kwargs):
+        command = [str(part) for part in argv]
+        if command[:3] == [str(candidate), "-m", "pytest"]:
+            if "--collect-only" in command:
+                assert Path(kwargs["env"]["LU_STATE_ROOT"]).is_dir()
+                return subprocess.CompletedProcess(command, 0, "1 test collected\n", "")
+            assert hook_test in command
+            check = "product key tests"
+        elif command[:3] == ["fixture-node", "fixture-npm", "run"]:
+            assert command[-1] == "agents:deploy"
+            check = "Verify Agent Deployment"
+        elif command[:2] == ["gh", "api"]:
+            return subprocess.CompletedProcess(command, 0, "v0.1.22\n", "")
+        elif command[:2] == ["git", "-C"] and "push" in command:
+            return subprocess.CompletedProcess(command, 0, "", "")
+        else:
+            return real_run(cut, argv, **kwargs)
+        assert kwargs["cwd"] == product
+        assert kwargs["env"]["LEARN_UKRAINIAN_PYTHON"] == str(candidate)
+        assert "LU_STATE_ROOT" not in kwargs["env"]
+        assert host_context.CONTEXT_ENV not in kwargs["env"]
+        assert 0 < kwargs["timeout"] <= 300
+        assert kwargs["kill_group"] is True
+        return real_run(cut, [sys.executable, "-I", "-c", f"raise SystemExit({int(check == failing_check)})"], **kwargs)
+
+    monkeypatch.setattr(Cut, "preflight", preflight)
+    monkeypatch.setattr(Cut, "build", build)
+    monkeypatch.setattr(Cut, "wheelhouse", wheelhouse)
+    monkeypatch.setattr(Cut, "install", lambda *_: candidate)
+    monkeypatch.setattr(Cut, "publish", publish)
+    monkeypatch.setattr(Cut, "publisher", publisher_call)
+    monkeypatch.setattr(Cut, "run", run)
+    monkeypatch.setattr(Cut, "_consumer_interpreter", lambda _cut, python, _product: python)
+    monkeypatch.setattr(Cut, "node_provision", lambda *_: {
+        "prefix": str(work / "node"), "node": "fixture-node", "npm": "fixture-npm",
+        "node_version": "22", "npm_version": "10",
+    })
+    for step in ("node_refusals", "node_isolation", "resources"):
+        monkeypatch.setattr(Cut, step, lambda *_: None)
+    monkeypatch.setattr(Cut, "contract_canary", lambda *_: subprocess.CompletedProcess([], 0, "code: PASS", ""))
+    monkeypatch.setattr(Cut, "remote_state", lambda *_: (True, "prerelease", [42]))
+    monkeypatch.setattr(Cut, "post_release", lambda *_a, **_k: 43)
+    result = main(["cut", "--no-alert", "--work", str(work), "--x-agent", "claude/claude-opus-5-5"])
+    return result, calls
+
+
+def test_failing_consumer_check_keeps_adopt_pr_draft(monkeypatch, tmp_path):
+    """Defect class: a cut readies an adoption draft after a consumer runtime failure."""
+    for failed_check in ("product key tests", "Verify Agent Deployment"):
+        fixture = tmp_path / failed_check
+        fixture.mkdir()
+        with monkeypatch.context() as patch:
+            result, calls = _simulate_consumer_adoption(patch, fixture, failed_check)
+        assert result == 1
+        assert [verb for verb, _, _ in calls] == ["pr-create", "pr-edit", "release-edit", "pr-close"]
+        assert "--draft" in calls[0][1]
+        assert "--number" in calls[1][1] and calls[1][1][calls[1][1].index("--number") + 1] == "42"
+        assert failed_check in calls[1][2]
+        assert "remains a draft" in calls[1][2]
+        assert "**Withdrawn:**" in calls[2][2]
+        assert calls[3][1][-2:] == ("--number", "42")
+
+
+def test_passing_consumer_check_marks_adopt_pr_ready(monkeypatch, tmp_path):
+    result, calls = _simulate_consumer_adoption(monkeypatch, tmp_path)
+    assert result == 0
+    assert [verb for verb, _, _ in calls] == ["pr-create", "release-edit", "pr-ready"]
+    assert "--draft" in calls[0][1]
+    assert "--no-prerelease" in calls[1][1]
+    assert calls[2][1][-2:] == ("--number", "42")
+
+
 @pytest.fixture
 def group_writable_umask():
     """The host's umask: 0002, under which the first 0.1.23 dry run wrote a 664 .nvmrc."""
@@ -1040,8 +1157,10 @@ def test_success_reaps_only_rebuildable_scratch_and_failure_preserves_it(monkeyp
         for step in ("publish", "open_adopt_pr", "node_refusals", "node_isolation", "resources", "alert_cto", "promote"):
             monkeypatch.setattr(cut, step, lambda *_a: None)
         monkeypatch.setattr(cut, "node_provision", lambda *_: {
-            "prefix": str(work / "accept/node"), "node_version": "22", "npm_version": "10"})
-        monkeypatch.setattr(cut, "consumer_collection", lambda *_: "1 test collected")
+            "prefix": str(work / "accept/node"), "node": "node", "npm": "npm",
+            "node_version": "22", "npm_version": "10",
+        })
+        monkeypatch.setattr(cut, "consumer_collection", lambda *_a, **_k: "1 test collected")
         monkeypatch.setattr(cut, "contract_canary", lambda: subprocess.CompletedProcess([], 0, "code: PASS", ""))
         monkeypatch.setattr(cut, "post_release", lambda *_: 1)
 

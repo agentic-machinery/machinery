@@ -5,10 +5,11 @@ implementation. One run tags main's HEAD (there is no release PR), builds once,
 installs the wheelhouse into a clean environment, publishes a GitHub pre-release,
 opens the product's draft adopt PR, runs acceptance, then promotes the release,
 marks the adopt PR ready and opens the post-release PR that records the
-changelog and moves main to the next version. Any failure stops the run and
-alerts ``claude-cto`` through Fleet Comms. Published files are never replaced
-and a tag is never moved: a failed pre-release is marked withdrawn and the next
-version replaces it.
+changelog and moves main to the next version. A failed product check leaves
+the adoption PR in draft status and names the failed check before rollback
+closes it. Any failure stops the run and alerts ``claude-cto`` through Fleet
+Comms. Published files are never replaced and a tag is never moved: a failed
+pre-release is marked withdrawn and the next version replaces it.
 """
 from __future__ import annotations
 
@@ -21,6 +22,7 @@ import os
 import re
 import shlex
 import shutil
+import signal
 import stat
 import subprocess
 import sys
@@ -31,6 +33,7 @@ import threading
 import time
 import tomllib
 from collections.abc import Callable, Iterable, Mapping, Sequence
+from contextlib import suppress
 from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
@@ -105,6 +108,10 @@ _RUN_ADOPTION_SNAPSHOT = textwrap.dedent("""\
 
 class CutError(Exception):
     """A refused precondition or a failed step; the message names the cause."""
+
+
+class ConsumerCheckError(CutError):
+    """The candidate failed product validation, which is recorded on the adoption draft."""
 
 
 def _validate_release_milestone(value: object, *, repo_label: str) -> str:
@@ -677,17 +684,34 @@ class Cut:
 
     def run(
         self, argv: Sequence[str | Path], *, cwd: Path | None = None, env: Mapping[str, str] | None = None,
-        timeout: int = 1800, check: bool = True, stdin: bytes | None = None,
+        timeout: int = 1800, check: bool = True, stdin: bytes | None = None, kill_group: bool = False,
     ) -> subprocess.CompletedProcess[str]:
         command = [str(part) for part in argv]
+        child_env = dict(env) if env is not None else self.env()
+        input_text = stdin.decode() if stdin is not None else None
         with (self.work / "cut.log").open("a", encoding="utf-8") as handle:
             handle.write(f"$ {shlex.join(command)}\n")
             # An argv list built in this module from fixed verbs and checked values; no shell runs.
-            result = subprocess.run(  # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit
-                command, cwd=cwd or self.work, env=dict(env) if env is not None else self.env(),
-                input=stdin.decode() if stdin is not None else None, capture_output=True, text=True,
-                timeout=timeout, check=False,
-            )
+            if kill_group:
+                with subprocess.Popen(  # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit
+                    command, cwd=cwd or self.work, env=child_env, text=True, start_new_session=True,
+                    stdin=subprocess.PIPE if input_text is not None else None,
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                ) as child:
+                    try:
+                        stdout, stderr = child.communicate(input=input_text, timeout=timeout)
+                    except BaseException:
+                        # The unreaped leader holds the process group ID, even if npm has already exited.
+                        if child.returncode is None:
+                            with suppress(ProcessLookupError):
+                                os.killpg(child.pid, signal.SIGKILL)
+                        raise
+                    result = subprocess.CompletedProcess(command, child.returncode, stdout, stderr)
+            else:
+                result = subprocess.run(  # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit
+                    command, cwd=cwd or self.work, env=child_env, input=input_text,
+                    capture_output=True, text=True, timeout=timeout, check=False,
+                )
             handle.write(result.stdout + result.stderr + f"(exit {result.returncode})\n")
         if check and result.returncode:
             tail = (result.stderr or result.stdout).strip().splitlines()[-15:]
@@ -1360,25 +1384,75 @@ class Cut:
             raise CutError(f"overlay resolved lu-machinery {shown}, not the candidate")
         return python
 
-    def consumer_collection(self, python: Path, product: Path) -> str:
-        """Collect the product's tests with the candidate first and the product venv's packages after it (R5)."""
+    def consumer_collection(
+        self, python: Path, product: Path, *, node_tools: tuple[str, str] | None = None,
+    ) -> str:
+        """Collect product tests and, during a cut, exercise the product with the same candidate overlay."""
         self.step = "consumer test collection"
-        python = self._consumer_interpreter(python, product)
-        # Collection imports the candidate's Monitor. Give it a disposable state
-        # directory and select the candidate interpreter independently of the host.
-        with tempfile.TemporaryDirectory(prefix="consumer-state-", dir=self.work) as scratch:
-            result = self.run(
-                [python, "-m", "pytest", "--collect-only", "-q", "tests"],
-                cwd=product,
-                timeout=1800,
-                env=self._consumer_env(Path(scratch), python, product),
-                check=False,
-            )
-        summary = (result.stdout.strip().splitlines() or ["no output"])[-1]
-        if result.returncode:
-            raise CutError(f"product test collection failed (exit {result.returncode}): {summary}")
-        self.say(f"product collection at {self.git(product, 'rev-parse', 'HEAD')[:12]}: {summary}")
+        try:
+            python = self._consumer_interpreter(python, product)
+            with tempfile.TemporaryDirectory(prefix="consumer-state-", dir=self.work) as scratch:
+                result = self.run(
+                    [python, "-m", "pytest", "--collect-only", "-q", "tests"],
+                    cwd=product, timeout=1800, env=self._consumer_env(Path(scratch), python, product), check=False,
+                )
+            summary = (result.stdout.strip().splitlines() or ["no output"])[-1]
+            if result.returncode:
+                raise CutError(f"product test collection failed (exit {result.returncode}): {summary}")
+            self.say(f"product collection at {self.git(product, 'rev-parse', 'HEAD')[:12]}: {summary}")
+            if node_tools is not None:
+                self.consumer_checks(python, product, node_tools)
+        except (CutError, OSError, subprocess.SubprocessError, ValueError) as exc:
+            if node_tools is None:
+                raise
+            raise ConsumerCheckError(str(exc)) from exc
         return summary
+
+    def consumer_checks(
+        self, python: Path, product: Path, node_tools: tuple[str, str],
+    ) -> None:
+        """Run the installed-wheel CI test selection and the product's deployment entry point."""
+        self.step = "product key tests"
+        pin = self.work / "src/.github/workflows/product-consumer.pin"
+        tests = []
+        for line in pin.read_text(encoding="utf-8").splitlines():
+            if not line or line.startswith(("#", "commit ")):
+                continue
+            if re.fullmatch(r"test tests/[A-Za-z0-9_/-]+\.py", line) is None:
+                raise CutError("product-consumer.pin contains an invalid test path")
+            tests.append(line.removeprefix("test "))
+        if not tests:
+            raise CutError("product-consumer.pin names no key test")
+        # Product CI starts without a state binding. The collection binding would
+        # hide a candidate that needs a state root before the test fixtures set one.
+        env = self.scratch_env(
+            LU_PRODUCT_ROOT=str(product),
+            LEARN_UKRAINIAN_PRIMARY_REPO_ROOT=str(product),
+            LEARN_UKRAINIAN_PYTHON=str(python),
+        )
+        result = self.run(
+            [python, "-m", "pytest", "-q", "--maxfail=1", *tests],
+            cwd=product, env=env, timeout=300, check=False, kill_group=True,
+        )
+        if result.returncode:
+            raise CutError(f"product key tests failed (exit {result.returncode}); see cut.log")
+        self.say("product key tests passed with the candidate wheel")
+
+        self.step = "Verify Agent Deployment"
+        node, npm = node_tools
+        deploy_env = {
+            **env,
+            "PATH": f"{python.parent}:{Path(node).parent}:{env['PATH']}",
+            "npm_config_offline": "true",
+            "npm_config_cache": str(self.work / "npm-cache"),
+        }
+        result = self.run(
+            [node, npm, "run", "--silent", "--if-present=false", "--script-shell=/bin/sh", "agents:deploy"],
+            cwd=product, env=deploy_env, timeout=300, check=False, kill_group=True,
+        )
+        if result.returncode:
+            raise CutError(f"agents:deploy failed (exit {result.returncode}); see cut.log")
+        self.say("Verify Agent Deployment entry point passed with the candidate wheel")
 
     def contract_canary(self) -> subprocess.CompletedProcess[str]:
         """The candidate's canary orchestration and sealed candidate receipt gate."""
@@ -1702,7 +1776,7 @@ def execute(cut: Cut) -> int:
         cut.node_refusals(python.parent.parent, info)
         cut.node_isolation(python, info)
         cut.resources(python)
-        collected = cut.consumer_collection(python, product)
+        collected = cut.consumer_collection(python, product, node_tools=(info["node"], info["npm"]))
     finally:
         thread.join()
     cut.step = "contract canary"
@@ -1731,7 +1805,8 @@ def execute(cut: Cut) -> int:
         "(react-native-b4a positive control included).\n"
         "- Every module imports from the installed wheel; agent deployer apply and `--check` pass on a scratch "
         "consumer.\n"
-        f"- Product test collection from a fresh `main` with the candidate first: {collected}.\n"
+        f"- Product test collection with the candidate first: {collected}.\n"
+        "- Product key tests and the Verify Agent Deployment entry point passed with the candidate wheel.\n"
         f"- Review-contract canary at `{cut.head}`: {'; '.join(table)}; receipt check passed."
     )
     cut.promote(release_body(cut, section, files, consumer_lock, ci, acceptance))
@@ -1969,6 +2044,20 @@ def _run(args: argparse.Namespace) -> int:
         cause = f"{failed_step}: {exc}"
         cut.say(f"FAILED at {cause}")
         if cut.tag_pushed and not cut.dry_run:
+            if isinstance(exc, ConsumerCheckError) and cut.adopt_pr is not None:
+                try:
+                    body = work / "adopt-body.md"
+                    body.write_text(
+                        body.read_text(encoding="utf-8")
+                        + f"\nRelease acceptance failed at **{failed_step}**. This PR remains a draft.\n",
+                        encoding="utf-8",
+                    )
+                    cut.publisher("pr-edit", "--repo", cut.product_repo, "--number", str(cut.adopt_pr),
+                                  "--body-file", str(body))
+                except (CutError, OSError, subprocess.SubprocessError, ValueError) as error:
+                    detail = f"could not update adoption draft #{cut.adopt_pr}: {error}"
+                    cut.say(detail)
+                    cause += f"; {detail}"
             try:
                 cleanup = cut.clean_up(failed_step)
             except (CutError, OSError, subprocess.SubprocessError, ValueError, KeyError) as error:
