@@ -969,10 +969,11 @@ let latestMilestoneTimeKey = "";
 let initialMilestonesSettled = false;
 let initialPlanningSettled = false;
 // fragmentLocked stops data repaints from re-aligning once the page settles or the reader gives
-// input. readerInput and alignedScrollY tell whether the reader has moved away from the anchor.
+// input; readerScrolled records that the reader scrolled away, after which a header height change
+// no longer re-aligns the anchor (until the next hash change).
 let fragmentLocked = false;
-let readerInput = false;
-let alignedScrollY = null;
+let readerScrolled = false;
+let pointerPressed = false;
 let lastStickyOffset = null;
 let fragmentRafId = null;
 
@@ -997,20 +998,7 @@ function alignFragmentNow(force = false) {
   if (typeof target.scrollIntoView === "function") {
     target.scrollIntoView({block: "start"});
   }
-  alignedScrollY = typeof window === "object" && window && Number.isFinite(window.scrollY) ? window.scrollY : null;
   return true;
-}
-
-// The reader has moved away only after input that left the page somewhere other than the last
-// alignment put it. A click leaves the position unchanged; layout (scroll anchoring, a taller
-// viewport clamping the end of the page) moves it without input.
-function readerMovedAway() {
-  if (!readerInput) return false;
-  if (alignedScrollY === null || typeof window !== "object" || !window || !Number.isFinite(window.scrollY)) return true;
-  const root = typeof document === "object" && document ? document.scrollingElement : null;
-  const maxY = root && Number.isFinite(root.scrollHeight) ? root.scrollHeight - window.innerHeight : Infinity;
-  if (alignedScrollY > maxY + 1 && window.scrollY >= maxY - 1) return false;
-  return Math.abs(window.scrollY - alignedScrollY) > 1;
 }
 
 function scheduleFragmentAlignment() {
@@ -1164,7 +1152,7 @@ function updateStickyOffset(fromAlign = false) {
   lastStickyOffset = offset;
   // A header height change (resize, sticky again) moves the anchor under it; keep the anchor in view
   // unless the reader has moved away from it.
-  if (!fromAlign && changed && currentHashId() && !readerMovedAway()) {
+  if (!fromAlign && changed && currentHashId() && !readerScrolled) {
     if (fragmentLocked) alignFragmentNow(true);
     else scheduleFragmentAlignment();
   }
@@ -1213,18 +1201,26 @@ if (typeof ResizeObserver === "function" && typeof document === "object" && docu
 }
 if (typeof window === "object" && window && typeof window.addEventListener === "function") {
   window.addEventListener("resize", onHeaderResize);
-  const lockOnUserScroll = () => { fragmentLocked = true; readerInput = true; };
-  window.addEventListener("wheel", lockOnUserScroll, {passive: true});
-  window.addEventListener("touchstart", lockOnUserScroll, {passive: true});
-  window.addEventListener("pointerdown", lockOnUserScroll, {passive: true});
+  // Any input locks the fragment against data repaints. Only scrolling input marks the reader as
+  // scrolled away: a click or tap moves nothing, while a scrollbar or selection drag scrolls with a
+  // pointer pressed. Layout scrolls (anchoring, an end-of-page clamp) come with no input at all.
+  const lockFragment = () => { fragmentLocked = true; };
+  const markReaderScroll = () => { fragmentLocked = true; readerScrolled = true; };
+  window.addEventListener("wheel", markReaderScroll, {passive: true});
+  window.addEventListener("touchmove", markReaderScroll, {passive: true});
+  window.addEventListener("touchstart", lockFragment, {passive: true});
+  window.addEventListener("pointerdown", () => { pointerPressed = true; lockFragment(); }, {passive: true});
+  window.addEventListener("pointerup", () => { pointerPressed = false; }, {passive: true});
+  window.addEventListener("pointercancel", () => { pointerPressed = false; }, {passive: true});
+  window.addEventListener("scroll", () => { if (pointerPressed) markReaderScroll(); }, {passive: true});
   window.addEventListener("keydown", event => {
     if (["ArrowDown", "ArrowUp", "PageDown", "PageUp", "Home", "End", " "].includes(event.key)) {
-      lockOnUserScroll();
+      markReaderScroll();
     }
   });
   window.addEventListener("hashchange", () => {
     fragmentLocked = false;
-    readerInput = false;
+    readerScrolled = false;
     scheduleFragmentAlignment();
   });
 }
