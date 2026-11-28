@@ -1270,6 +1270,7 @@ def test_launcher_passes_single_system_prompt_with_core_then_role(tmp_path: Path
     role_file = tmp_path / "role.txt"
     role_file.write_text(role, encoding="utf-8")
     argv_file = tmp_path / "argv"
+    cto_core_bytes = 0
     cto = ("start-claude-cto.sh", "--epic", "epics", "--model", "claude-opus-5-5", "KICK", "--")
     for args, flag in (
         ((*cto, "--dangerously-skip-permissions", "--append-system-prompt", role), b"--append-system-prompt"),
@@ -1280,6 +1281,7 @@ def test_launcher_passes_single_system_prompt_with_core_then_role(tmp_path: Path
         result = run_launcher(*args, env={"LAUNCHER_DRY_RUN_ARGV_FILE": str(argv_file)})
         assert result.returncode == 0, result.stdout + result.stderr
         core_bytes = int(re.search(r"launcher: rules core seat=\S+ bytes=(\d+)", result.stdout).group(1))
+        cto_core_bytes = core_bytes if args[0] == "start-claude-cto.sh" else cto_core_bytes
         argv = argv_file.read_bytes().removesuffix(b"\0").split(b"\0")
         additions = [arg for arg in argv if arg.startswith(b"--append-system-prompt")]
         assert argv[0] == b"claude" and len(additions) == 1, (args, [arg[:40] for arg in additions])
@@ -1303,6 +1305,8 @@ def test_launcher_passes_single_system_prompt_with_core_then_role(tmp_path: Path
         (("--append-system-prompt", role, "--", "question"), "literal --"),
         (("--append-system-prompt",), "requires a value"),
         (("--append-system-prompt", "x" * 100_000), "argument limit"),
+        # The joined slot reaches the per-argument limit only with its flag prefix.
+        (("--append-system-prompt=" + "x" * (os.sysconf("SC_PAGE_SIZE") * 32 - 25 - cto_core_bytes),), "argument limit"),
     ):
         argv_file.unlink(missing_ok=True)
         result = run_launcher(*cto, *extra, env={"LAUNCHER_DRY_RUN_ARGV_FILE": str(argv_file)})

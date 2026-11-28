@@ -349,9 +349,10 @@ launcher_claude_system_prompt() {
       value="${arg#*=}"
     fi
     if [ -n "${LC_RULES_CORE:-}" ]; then value="$LC_RULES_CORE"$'\n\n'"$value"; fi
+    if [ "$arg" != --append-system-prompt ]; then value="--append-system-prompt=$value"; fi
   fi
   if [ -n "$value" ]; then
-    # MAX_ARG_STRLEN: 32 pages per argument, its terminating NUL included.
+    # MAX_ARG_STRLEN: 32 pages per argument (the whole argv slot), its NUL included.
     limit="$(getconf PAGESIZE)" && bytes="$(printf '%s' "$value" | wc -c)" || {
       launcher_error "refusing to launch: cannot measure the system-prompt addition."
       exit 2
@@ -363,10 +364,8 @@ launcher_claude_system_prompt() {
   fi
   if [ "$found" -lt 0 ]; then
     if [ -n "$value" ]; then LC_CLAUDE_SYSTEM_PROMPT_ARGS=(--append-system-prompt "$value"); fi
-  elif [ "$arg" = --append-system-prompt ]; then
-    LC_FORWARD_ARGS[found]="$value"
   else
-    LC_FORWARD_ARGS[found]="--append-system-prompt=$value"
+    LC_FORWARD_ARGS[found]="$value"
   fi
   LC_CLAUDE_SYSTEM_PROMPT_READY=1
 }
