@@ -23,10 +23,12 @@ import math
 import os
 import re
 import urllib.request
+from collections.abc import Iterator
 from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Literal
+from stat import S_ISREG
+from typing import Any, Literal, TypeGuard
 
 from lu_machinery.common import json_depth
 from lu_machinery.common.jsonl import jsonl_lines
@@ -322,6 +324,50 @@ def pool_exhausted(message: str) -> bool:
             or (re.search(r"\bbilling\b", text) is not None and re.search(r"\b429\b", text) is not None))
 
 
+def is_provider_error_event(agent: object, event: object) -> TypeGuard[dict[str, Any]]:
+    """Recognize provider error envelopes without inspecting assistant or tool text."""
+    if not isinstance(event, dict):
+        return False
+    kind = event.get("type")
+    return ((agent == "codex" and kind == "turn.failed")
+            or (agent == "claude" and (kind == "error" or (kind == "result" and event.get("is_error") is True))))
+
+
+def provider_error_events(record: dict) -> Iterator[dict[str, Any]]:
+    """Yield typed provider errors from at most the last MiB of a task's stdout."""
+    from lu_machinery.dispatcher.store import record_path
+
+    agent = record.get("agent")
+    if agent not in ("codex", "claude"):
+        return
+    limit = 1024 * 1024
+    task_id = record["task_id"]
+    path = record_path(task_id).parent / "logs" / f"{task_id}.stdout.log"
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+        with os.fdopen(descriptor, "rb") as stream:
+            info = os.fstat(stream.fileno())
+            if not S_ISREG(info.st_mode):
+                raise ValueError("provider_log_not_regular")
+            start = max(0, info.st_size - limit)
+            at_line_start = True
+            if start:
+                stream.seek(start - 1)
+                at_line_start = stream.read(1) == b"\n"
+            tail = stream.read(limit)
+    except FileNotFoundError:
+        return  # Tasks that never started have no provider log.
+    if not at_line_start:
+        tail = tail.partition(b"\n")[2]
+    for line in jsonl_lines(tail.decode("utf-8", errors="replace")):
+        try:
+            event = json_depth.loads(line, max_depth=512)
+        except (ValueError, RecursionError):
+            continue
+        if is_provider_error_event(agent, event):
+            yield event
+
+
 def _provider_exhausted(record: dict) -> bool:
     message = str(record.get("error") or "")
     # A Codex exit-status error contains untrusted stderr after the prefix.
@@ -332,27 +378,9 @@ def _provider_exhausted(record: dict) -> bool:
         return True
     # Existing parsers can retain only a generic failure. Inspect provider error
     # events, never assistant/tool text or a whole transcript substring search.
-    from lu_machinery.dispatcher.store import record_path
-
     try:
-        path = record_path(record["task_id"]).parent / "logs" / f"{record['task_id']}.stdout.log"
-        with path.open("rb") as stream:
-            start = max(0, path.stat().st_size - 1024 * 1024)
-            stream.seek(start)
-            if start:
-                stream.readline()  # discard a partial JSON line
-            lines = jsonl_lines(stream.read(1024 * 1024).decode("utf-8", errors="replace"))
-        for line in lines:
-            try:
-                event = json_depth.loads(line, max_depth=512)
-            except ValueError:
-                continue
-            if not isinstance(event, dict):
-                continue
-            provider_error = ((record["agent"] == "codex" and event.get("type") == "turn.failed")
-                              or (record["agent"] == "claude" and (event.get("type") == "error"
-                                  or (event.get("type") == "result" and event.get("is_error") is True))))
-            if provider_error and pool_exhausted(json.dumps({k: event.get(k) for k in
+        for event in provider_error_events(record):
+            if pool_exhausted(json.dumps({k: event.get(k) for k in
                     ("error", "errors", "result", "message", "api_error_status")})):
                 return True
     except (OSError, ValueError, KeyError, TypeError):
