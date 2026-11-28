@@ -114,6 +114,25 @@ def test_monitor_cross_origin_preflight_has_no_cors_headers(tmp_path: Path) -> N
     assert not any(name.startswith("access-control-allow-") for name in response.headers)
 
 
+def test_monitor_browser_requests_require_an_accepted_host(tmp_path: Path, monkeypatch) -> None:
+    """Defect class: a browser request reaches the API through an unlisted authority."""
+    allowed_host = "monitor.example"
+    unlisted_host = "unlisted.example"
+    monkeypatch.setenv("LU_MONITOR_ALLOWED_HOSTS", allowed_host)
+    client = _loopback_client(create_app(fixture_context(tmp_path), product=EMPTY))
+    path = "/api/health"
+    for metadata in (
+        {"Origin": f"http://{unlisted_host}"},
+        {"Sec-Fetch-Site": "same-origin"},
+        {"Sec-Fetch-Mode": "navigate"},
+    ):
+        denied = client.get(path, headers={"Host": unlisted_host, **metadata})
+        assert denied.status_code == 403
+        assert denied.json() == {"detail": "Forbidden", "reason": "invalid_host"}
+    assert client.get(path, headers={"Host": unlisted_host}).status_code == 200
+    assert client.get(path, headers={"Host": allowed_host, "Origin": f"http://{allowed_host}"}).status_code == 200
+
+
 def _seed_conversation(
     root: Path,
     *,

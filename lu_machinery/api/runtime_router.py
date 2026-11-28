@@ -1616,11 +1616,9 @@ def _bound_acp_listener(request: Request) -> tuple[str, int] | None:
     return authority_host, raw_port
 
 
-def browser_request_access_refusal(request: Request) -> str | None:
-    """Reject cross-origin browser requests while permitting tools without browser headers."""
+def _browser_header_access_refusal(request: Request, hosts: list[str]) -> str | None:
     origins = request.headers.getlist("origin")
     if origins:
-        hosts = request.headers.getlist("host")
         scheme = request.scope.get("scheme")
         if len(origins) != 1 or len(hosts) != 1 or scheme not in {"http", "https"}:
             return "invalid_origin"
@@ -1630,6 +1628,30 @@ def browser_request_access_refusal(request: Request) -> str | None:
     if fetch_sites and (len(fetch_sites) != 1 or fetch_sites[0] not in _ALLOWED_FETCH_SITES):
         return "cross_site_request"
     return None
+
+
+def _monitor_host_access_refusal(hosts: list[str], listener: tuple[str, int]) -> str | None:
+    configured_hosts = _configured_allowed_body_read_hosts()
+    if configured_hosts is None:
+        return "invalid_allowed_hosts_config"
+    allowed_hosts = _loopback_allowed_hosts(*listener) | configured_hosts
+    if len(hosts) != 1 or hosts[0] not in allowed_hosts:
+        return "invalid_host"
+    return None
+
+
+def browser_request_access_refusal(request: Request) -> str | None:
+    """Check browser headers against the Monitor's accepted authorities."""
+    headers = request.headers
+    if "origin" not in headers and not any(name.startswith("sec-fetch-") for name in headers):
+        return None
+    hosts = headers.getlist("host")
+    if refusal := _browser_header_access_refusal(request, hosts):
+        return refusal
+    listener = _bound_acp_listener(request)
+    if listener is None:
+        return "invalid_listener"
+    return _monitor_host_access_refusal(hosts, listener)
 
 
 def local_body_read_access_refusal(request: Request) -> str | None:
@@ -1650,8 +1672,6 @@ def local_body_read_access_refusal(request: Request) -> str | None:
     listener = _bound_acp_listener(request)
     if listener is None:
         return "invalid_listener"
-    listener_host, listener_port = listener
-
     hosts: list[str] = []
     for raw_name, raw_value in request.headers.raw:
         name = raw_name.decode("latin-1").strip().lower()
@@ -1675,13 +1695,7 @@ def local_body_read_access_refusal(request: Request) -> str | None:
 
     if request.scope.get("scheme") != "http":
         return "invalid_scheme"
-    configured_hosts = _configured_allowed_body_read_hosts()
-    if configured_hosts is None:
-        return "invalid_allowed_hosts_config"
-    allowed_hosts = _loopback_allowed_hosts(listener_host, listener_port) | configured_hosts
-    if len(hosts) != 1 or hosts[0] not in allowed_hosts:
-        return "invalid_host"
-    return browser_request_access_refusal(request)
+    return _monitor_host_access_refusal(hosts, listener) or _browser_header_access_refusal(request, hosts)
 
 
 def local_body_read_refusal_response(request: Request) -> JSONResponse | None:
