@@ -131,11 +131,13 @@ def test_invalid_traceparent_is_refused_at_every_boundary(batch_state: Path, mon
     monkeypatch.setenv("TRACEPARENT", f"00-{TRACE['trace_id']}-{TRACE['span_id']}-01")
     for record, options in (({"trace_id": "xyz", "span_id": TRACE["span_id"]}, dict(TRACE)),  # malformed copy
                             (dict(TRACE), dict(OTHER)), (dict(TRACE), {}), ({"trace_id": TRACE["trace_id"]}, {})):
-        assert "trace_context_invalid" in (emit.task_trace_refusal(record, options, {"TRACEPARENT": ""}) or "")
+        assert "trace_context_invalid" in (emit.task_trace_refusal(record, options, {}) or "")
         assert "trace_context_invalid" in (emit.task_trace_refusal(record, options, dict(os.environ))
                                            or "")
     assert emit.task_trace_refusal(dict(TRACE), dict(TRACE), {"TRACEPARENT": supervisor["TRACEPARENT"]}) is None
     assert emit.task_trace_refusal({}, {}, {}) is None  # a task dispatched before traces existed
+    assert emit.task_trace_refusal(dict(TRACE), dict(TRACE), {}) is None  # no context passed on: absent, never wrong
+    assert emit.task_trace_refusal(dict(TRACE), dict(TRACE), {"TRACEPARENT": value}) is not None
     with pytest.raises(ValueError, match="trace_context_invalid"):
         environment._trace_env({"trace_id": TRACE["trace_id"], "span_id": value})
 

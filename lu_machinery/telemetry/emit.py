@@ -1008,19 +1008,20 @@ def merge_group_event(*, repo: str, visibility: str, run: Mapping[str, Any], job
 def task_trace_refusal(record: Mapping[str, Any], options: object, environ: Mapping[str, str]) -> str | None:
     """Why a supervisor must not launch this task's provider, or None (one check before every launch path).
 
-    The record's trace and the options' copy must agree: both absent (a task dispatched before traces existed,
-    whose supervisor then carries no TRACEPARENT), or both a valid identical pair, with the supervisor's
-    TRACEPARENT naming exactly that span. Partial, malformed or conflicting identity refuses.
+    The record's trace and the options' copy (which ``child_env`` turns into the provider's TRACEPARENT) must agree:
+    both absent (a task dispatched before traces existed) or both the same valid pair. Partial, malformed or
+    conflicting identity refuses. A TRACEPARENT in ``environ`` must name exactly that span, and a task with no
+    identity carries none; an absent one passes on no context (absent, never wrong).
     """
     copies = (record, options if isinstance(options, Mapping) else {})
     present = [any(name in copy for name in ("trace_id", "span_id")) for copy in copies]
-    if not any(present):
-        if TRACEPARENT_ENV in environ:
-            return "trace_context_invalid: TRACEPARENT set for a task with no trace identity"
-        return None
     pairs = [trace_of(copy) for copy in copies]
-    if not all(present) or None in pairs or pairs[0] != pairs[1]:
+    if any(present) and (not all(present) or None in pairs or pairs[0] != pairs[1]):
         return "trace_context_invalid: the task's trace identity is partial, malformed or inconsistent"
+    if TRACEPARENT_ENV not in environ:
+        return None
+    if not any(present):
+        return "trace_context_invalid: TRACEPARENT set for a task with no trace identity"
     try:
         check_traceparent(environ, record)
     except ValueError as exc:
