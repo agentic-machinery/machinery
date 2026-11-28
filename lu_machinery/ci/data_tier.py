@@ -32,7 +32,7 @@ from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, cast, get_args
 from urllib.parse import urlsplit
 
-from lu_machinery import state_paths
+from lu_machinery import host_context, state_paths
 from lu_machinery.ci._location import module_name
 from lu_machinery.common import github_client, json_depth, test_slots
 from lu_machinery.common.repo_root import (
@@ -152,6 +152,42 @@ def primary_checkout() -> Path:
     if not (primary / ".git").is_dir():
         raise DataTierError("Git common directory does not identify a primary checkout")
     return primary
+
+
+def product_python(primary: Path) -> Path:
+    """Interpreter for product-side subprocesses, preferring a validated host binding.
+
+    When a host binding exists, return ``products[default_product].python`` even when
+    ``LU_PYTHON`` points at the machinery runtime, and fail closed on any invalid
+    binding or checkout mismatch. Without a host binding, preserve ``project_interpreter(primary)``.
+    """
+    try:
+        context = host_context.load_host_context(role="all")
+    except host_context.HostContextError as error:
+        if error.code == "missing_context" and host_context.CONTEXT_ENV not in os.environ:
+            context = None
+        else:
+            raise DataTierError(f"host context invalid ({error.code}): {error}") from error
+    if context is not None:
+        if not isinstance(context, host_context.HostContext):
+            raise DataTierError("host context requires a full host binding")
+        bound_product = context.products[context.default_product]
+        bound_repo = context.repos[bound_product.repo]
+        try:
+            resolved_primary = primary.resolve(strict=True)
+        except (OSError, RuntimeError) as error:
+            raise DataTierError("product checkout cannot be resolved") from error
+        if resolved_primary != bound_repo:
+            raise DataTierError("product checkout disagrees with host binding")
+        interpreter = bound_product.python
+    else:
+        try:
+            interpreter = project_interpreter(primary)
+        except FileNotFoundError as error:
+            raise DataTierError("shared project interpreter unavailable") from error
+    if not interpreter.is_file():
+        raise DataTierError("shared project interpreter unavailable")
+    return interpreter
 
 
 def _product_json(checkout: Path, relative: PurePosixPath) -> tuple[dict, str]:
@@ -1058,12 +1094,7 @@ def run(args: argparse.Namespace) -> int:
         child_dir = output_dir / f"{run_key}.child"
         child_dir.mkdir(mode=0o700)
         require_memory()
-        try:
-            project_python = project_interpreter(primary)
-        except FileNotFoundError as error:
-            raise DataTierError("shared project interpreter unavailable") from error
-        if not project_python.is_file():
-            raise DataTierError("shared project interpreter unavailable")
+        project_python = product_python(primary)
         prune_stale_worktrees(primary)
         checkout = make_test_worktree(primary)
         summary["main_sha"] = command(["git", "rev-parse", "HEAD"], cwd=checkout).stdout.strip()

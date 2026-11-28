@@ -8,7 +8,9 @@ import sqlite3
 import stat
 import subprocess
 import sys
+import sysconfig
 import time
+import venv
 import xml.etree.ElementTree as ET
 from collections.abc import Iterator
 from pathlib import Path
@@ -16,9 +18,11 @@ from types import SimpleNamespace
 
 import pytest
 
+from lu_machinery import host_context
 from lu_machinery.ci import data_tier
 from lu_machinery.common import scratch
 from tests.helpers.product_tree import configured_roots as configured_roots
+from tests.host_context.conftest import build_host_layout
 
 
 def test_selection_and_known_failures_come_from_the_tested_checkout_without_fallback(tmp_path):
@@ -1275,6 +1279,192 @@ def test_xml_text_escapes_only_xml10_forbidden_codepoints_in_bounded_time() -> N
     assert elapsed < 0.5, f"_xml_text took {elapsed:.3f}s on {len(large)}-char input"
     assert "\x00" not in sanitized
     assert sanitized.count("\\u0000") == 50_000
+
+
+def _build_fixture_venv(root: Path, version: str) -> Path:
+    """Create a minimal venv whose interpreter passes host_context's isolated machinery probe."""
+    venv.EnvBuilder(symlinks=True).create(root)
+    python = root / "bin" / "python"
+    site = root / "lib" / f"python{sys.version_info.major}.{sys.version_info.minor}" / "site-packages"
+    source = Path(host_context.__file__).resolve().parent
+    (site / "lu_machinery").symlink_to(source, target_is_directory=True)
+    (site / "fixture-deps.pth").write_text(sysconfig.get_path("purelib") + "\n", encoding="utf-8")
+    metadata = site / f"lu_machinery-{version}.dist-info"
+    metadata.mkdir()
+    (metadata / "METADATA").write_text(f"Name: lu-machinery\nVersion: {version}\n", encoding="utf-8")
+    return python
+
+
+def _stub_product_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> tuple[list[list[str]], list[list[str]]]:
+    """Stub host-boundary runner steps and record argv for bulk_status and pytest-child."""
+    checkout = tmp_path / "tested-checkout"
+    checkout.mkdir(exist_ok=True)
+    for name, value in _DATA_TIER_INPUTS.items():
+        path = checkout / "scripts/ci" / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(value, encoding="utf-8")
+    _plant_selection_tree(checkout)
+
+    bulk_argvs: list[list[str]] = []
+    child_argvs: list[list[str]] = []
+    real_run = subprocess.run
+
+    def intercept_bulk(argv: list[str], *args: object, **kwargs: object) -> subprocess.CompletedProcess:
+        if len(argv) >= 4 and argv[1:4] == ["-I", "-m", "lu_machinery.storage"]:
+            bulk_argvs.append(list(argv))
+            return subprocess.CompletedProcess(
+                argv, 0, stdout=json.dumps({"bulk_root": {"available": False, "reason": "fixture"}}), stderr=""
+            )
+        return real_run(argv, *args, **kwargs)  # type: ignore[arg-type]
+
+    def intercept_child(argv: list[str], **kwargs: object) -> int:
+        child_argvs.append(list(argv))
+        Path(argv[argv.index("--junit") + 1]).write_text('<testsuite><testcase name="test_ok"/></testsuite>')
+        return 0
+
+    monkeypatch.setattr(data_tier, "require_memory", lambda: None)
+    monkeypatch.setattr(data_tier, "prune_stale_worktrees", lambda _primary: None)
+    monkeypatch.setattr(data_tier, "make_test_worktree", lambda _primary: checkout)
+    monkeypatch.setattr(data_tier, "command", lambda *_args, **_kwargs: SimpleNamespace(stdout="a" * 40))
+    monkeypatch.setattr(data_tier, "bind_stores", lambda _primary: ({}, [], {}, []))
+    monkeypatch.setattr(data_tier, "exposed_data", lambda *_args: [])
+    monkeypatch.setattr(data_tier, "link_atlas", lambda *_args: None)
+    monkeypatch.setattr(data_tier, "read_only_namespace", lambda *_args: [])
+    monkeypatch.setattr(data_tier.test_slots, "enabled", lambda: False)
+    monkeypatch.setattr(data_tier, "stop_scope", lambda _unit: None)
+    monkeypatch.setattr(data_tier, "discard_run_output", lambda _checkout: {"files": 0, "bytes": 0})
+    monkeypatch.setattr(data_tier, "remove_test_worktree", lambda *_args: None)
+    monkeypatch.setattr(data_tier.subprocess, "run", intercept_bulk)
+    monkeypatch.setattr(data_tier, "run_process_group", intercept_child)
+    return bulk_argvs, child_argvs
+
+
+def _clear_legacy_host_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Remove ambient legacy root variables so tests assert only their own fixture env."""
+    for name in (
+        "LU_STATE_ROOT",
+        "LEARN_UKRAINIAN_STATE_ROOT",
+        "LU_TASKS_DIR",
+        "LEARN_UKRAINIAN_BATCH_STATE_DIR",
+        "FLEET_COMMS_ROOT",
+        "LEARN_UKRAINIAN_OWNERSHIP_LEDGER",
+        "LU_GITHUB_CACHE_DIR",
+        "LU_GITHUB_SLUG",
+        "LEARN_UKRAINIAN_GITHUB_SLUG",
+        "LU_PRIMARY_REPO_ROOT",
+        "LEARN_UKRAINIAN_PRIMARY_REPO_ROOT",
+        "LU_PRODUCT_ROOT",
+        "LEARN_UK_REPO_ROOT",
+        "LU_PYTHON",
+        "LEARN_UKRAINIAN_PYTHON",
+        "LEARN_UKRAINIAN_INFRA_PRIVATE_ROOT",
+        "LU_FLEET_REPO_SELECTOR_FILE",
+        "LU_PROFILE_PATH",
+        "LU_REPOS_ROOT",
+        "MONITOR_PROJECT_STATE_URL",
+        "LU_MONITOR_LOOPBACK",
+        "MONITOR_API_BASE_URL",
+        "MONITOR_API_URL",
+        "AB_MONITOR_URL",
+        "MONITOR_API_URLS",
+        "AB_MONITOR_URLS",
+        "MONITOR_BASE_URLS",
+        "DELEGATE_MONITOR_API",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+
+def test_product_processes_use_binding_product_python_over_lu_python(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Defect class: product pytest child runs on the machinery runtime when LU_PYTHON overrides project_interpreter."""
+    _clear_legacy_host_env(monkeypatch)
+    layout = build_host_layout(tmp_path)
+    product_python = _build_fixture_venv(tmp_path / "product-venv", layout.data["runtime"]["lu_machinery"])
+    assert product_python != layout.python
+    layout.data["products"]["public"]["python"] = str(product_python)
+    layout.write()
+
+    monkeypatch.setenv(host_context.CONTEXT_ENV, str(layout.file))
+    monkeypatch.setenv("LU_PYTHON", str(layout.python))
+    monkeypatch.setenv("LU_PRODUCT_ROOT", layout.data["repos"]["public"])
+
+    bulk_argvs, child_argvs = _stub_product_run(tmp_path, monkeypatch)
+    assert data_tier.run(SimpleNamespace(only=None, no_report=True)) == 0
+    assert len(bulk_argvs) == 1
+    assert bulk_argvs[0][0] == str(product_python)
+    assert bulk_argvs[0][0] != str(layout.python)
+    assert len(child_argvs) == 1
+    module_index = child_argvs[0].index("lu_machinery.ci.data_tier")
+    assert child_argvs[0][module_index - 3 : module_index + 2] == [
+        str(product_python),
+        "-I",
+        "-m",
+        "lu_machinery.ci.data_tier",
+        "pytest-child",
+    ]
+
+    # Fail closed on an explicit but invalid binding rather than silently falling back to LU_PYTHON.
+    other_checkout = tmp_path / "other-product"
+    (other_checkout / ".git").mkdir(parents=True)
+    with pytest.raises(data_tier.DataTierError, match="disagrees with host binding"):
+        data_tier.product_python(other_checkout)
+
+    layout.file.unlink()
+    with pytest.raises(data_tier.DataTierError, match="missing_context"):
+        data_tier.product_python(Path(layout.data["repos"]["public"]))
+
+
+def test_no_binding_keeps_project_interpreter_choice(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Control case: without a host binding, data-tier keeps project_interpreter(primary) semantics."""
+    _clear_legacy_host_env(monkeypatch)
+    monkeypatch.delenv(host_context.CONTEXT_ENV, raising=False)
+    monkeypatch.setattr(host_context, "DEFAULT_PATH", tmp_path / "absent-host.v1.json")
+
+    primary = tmp_path / "primary-product"
+    (primary / ".git").mkdir(parents=True)
+    primary_python = primary / ".venv" / "bin" / "python"
+    primary_python.parent.mkdir(parents=True)
+    primary_python.write_text("#!/bin/sh\n", encoding="utf-8")
+    primary_python.chmod(0o755)
+    override_python = tmp_path / "override-python"
+    override_python.write_text("#!/bin/sh\n", encoding="utf-8")
+    override_python.chmod(0o755)
+    state = tmp_path / "state"
+    state.mkdir(mode=0o700)
+
+    monkeypatch.setenv("LU_PRODUCT_ROOT", str(primary))
+    monkeypatch.setenv("LU_STATE_ROOT", str(state))
+
+    # Case 1: LU_PYTHON unset -> primary/.venv/bin/python.
+    bulk_argvs, child_argvs = _stub_product_run(tmp_path, monkeypatch)
+    assert data_tier.run(SimpleNamespace(only=None, no_report=True)) == 0
+    assert bulk_argvs[-1][0] == str(primary_python)
+    module_index = child_argvs[-1].index("lu_machinery.ci.data_tier")
+    assert child_argvs[-1][module_index - 3 : module_index + 2] == [
+        str(primary_python),
+        "-I",
+        "-m",
+        "lu_machinery.ci.data_tier",
+        "pytest-child",
+    ]
+
+    # Case 2: LU_PYTHON set with no binding -> project_interpreter honours LU_PYTHON as before.
+    monkeypatch.setenv("LU_PYTHON", str(override_python))
+    assert data_tier.run(SimpleNamespace(only=None, no_report=True)) == 0
+    assert bulk_argvs[-1][0] == str(override_python)
+    module_index = child_argvs[-1].index("lu_machinery.ci.data_tier")
+    assert child_argvs[-1][module_index - 3 : module_index + 2] == [
+        str(override_python),
+        "-I",
+        "-m",
+        "lu_machinery.ci.data_tier",
+        "pytest-child",
+    ]
 
 
 
