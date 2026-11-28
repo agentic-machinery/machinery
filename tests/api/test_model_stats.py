@@ -2195,9 +2195,9 @@ def _prior_release_rows(tmp_path: Path):
     """The finding-outcome writer from release 0.1.84, with that release's label vocabulary."""
     import importlib.util
 
-    root = Path(__file__).resolve().parents[2]
+    root = Path(__file__).parents[2]
     source = subprocess.check_output(
-        ["git", "show", f"{_PRIOR_RELEASE_ROWS}:lu_machinery/api/model_stats_rows.py"], cwd=root)
+        ["git", "show", f"{_PRIOR_RELEASE_ROWS}:lu_machinery/api/model_stats_rows.py"], cwd=root, timeout=30)
     blob = tmp_path / "model_stats_rows_0184.py"
     blob.write_bytes(source)
     spec = importlib.util.spec_from_file_location("model_stats_rows_0184", blob)
