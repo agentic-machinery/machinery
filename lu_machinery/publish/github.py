@@ -3827,6 +3827,96 @@ def _dismiss_sarif_result(document, number):
     return matches[0]
 
 
+class _DismissalRefused(ValueError):
+    """Fail-closed dismissal refusal carrying a fixed, OPSEC-safe reason."""
+
+
+def _verify_open_pr_cross_family_approval(comments, head_sha, verdict_login):
+    """Require a recorded, unedited exact-head cross-family APPROVE from ``verdict_login``."""
+    from lu_machinery.identity import _VALID_CONCRETE_FAMILIES
+    from lu_machinery.orchestration.integration_sweep import (
+        TRUSTED_ASSOCIATIONS,
+        _author_login,
+        _edited,
+        _field,
+        is_second_review,
+        is_ukrainian_review,
+        lookup_verdict,
+        model_family,
+        parse_marker,
+        reviews_of_record,
+    )
+    from lu_machinery.review.ukrainian_seats import attested_author_families
+
+    if not isinstance(comments, list) or not all(isinstance(item, dict) for item in comments):
+        raise _DismissalRefused("PR review comments are unreadable")
+    verdict = lookup_verdict(comments, head_sha, verdict_login, learner_content=False, low_tier=False)
+    if verdict.state != "APPROVED":
+        raise _DismissalRefused("open PR head has no recorded exact-head cross-family approval")
+    if verdict.review_mode != "cross_family":
+        raise _DismissalRefused("open PR approval is not a cross-family review")
+    if not verdict.model or not verdict.family or model_family(verdict.model) != verdict.family:
+        raise _DismissalRefused("open PR reviewer identity is unverified")
+    verified_cross_family = False
+    for comment in comments:
+        body = comment.get("body")
+        if not isinstance(body, str) or CF_VERDICT_MARKER_PREFIX not in body:
+            continue
+        if _author_login(comment) != verdict_login:
+            continue
+        if _field(comment, "author_association", "authorAssociation") not in TRUSTED_ASSOCIATIONS:
+            continue
+        if _edited(comment):
+            continue
+        marker = parse_marker(body)
+        if marker is None or marker["sha"] != head_sha or marker["verdict"] != "APPROVED":
+            continue
+        if marker.get("review_mode", "cross_family") != "cross_family":
+            continue
+        if is_second_review(marker) or is_ukrainian_review(marker) or not reviews_of_record(marker["model"], recorded=True):
+            continue
+        if model_family(marker["model"]) != marker["family"]:
+            continue
+        authors = set(attested_author_families([marker]))
+        declared_families = marker.get("author_families")
+        if declared_families is not None:
+            authors.update(declared_families)
+        if not authors or not authors <= _VALID_CONCRETE_FAMILIES:
+            continue
+        if marker.get("review_pair"):
+            if authors == frozenset(marker["review_pair"].split("_")):
+                verified_cross_family = True
+                break
+        elif marker["family"] not in authors:
+            verified_cross_family = True
+            break
+    if not verified_cross_family:
+        raise _DismissalRefused("open PR approval does not prove a cross-family review outside the author's family")
+
+
+def _open_pr_instance_matches_head(get, instance, head_sha, commit_cache):
+    """Verify an open-PR alert instance's analyzed commit binds to the exact approved PR head."""
+    commit_sha = instance.get("commit_sha")
+    if not isinstance(commit_sha, str) or not re.fullmatch(r"[0-9a-f]{40}", commit_sha):
+        raise _DismissalRefused("alert instance commit is invalid")
+    if commit_sha == head_sha:
+        return
+    if commit_sha not in commit_cache:
+        commit = get(f"commits/{commit_sha}")
+        if not isinstance(commit, dict) or commit.get("sha") != commit_sha:
+            raise _DismissalRefused("alert instance commit is unreadable")
+        parents = commit.get("parents")
+        if (
+            not isinstance(parents, list)
+            or len(parents) != 2
+            or not all(isinstance(parent, dict) and isinstance(parent.get("sha"), str) for parent in parents)
+        ):
+            raise _DismissalRefused("alert instance commit is not a PR merge commit")
+        commit_cache[commit_sha] = parents[1]["sha"]
+    if commit_cache[commit_sha] != head_sha:
+        raise _DismissalRefused("alert instance analysis does not match the approved PR head")
+
+
 def _dismiss_preflight(fields, gh_repo, dest, runner, cwd, environment, *, temp=None, raw_graphql=False):
     from html.parser import HTMLParser
 
@@ -3927,48 +4017,96 @@ def _dismiss_preflight(fields, gh_repo, dest, runner, cwd, environment, *, temp=
 
     pr_number = prs.pop()
     pr = get(f"pulls/{pr_number}")
-    merge = pr["merge_commit_sha"]
-    if pr.get("merged") is not True or not re.fullmatch(PATTERNS["sha"], merge):
-        raise ValueError("PR is not merged")
-    merge_cutoff = (
-        _parse_utc_timestamp(pr["merged_at"]) - _DISMISS_ANALYSIS_CLOCK_SKEW
-        if "merged_at" in pr else None
-    )
-    if pr["html_url"] not in _repository_urls(gh_repo, f"pull/{pr_number}"):
-        raise ValueError("PR identity changed")
+    if not isinstance(pr, dict):
+        raise _DismissalRefused("linked PR is unreadable")
+    if pr.get("html_url") not in _repository_urls(gh_repo, f"pull/{pr_number}"):
+        raise _DismissalRefused("linked PR identity changed")
+    if "number" in pr and (type(pr["number"]) is not int or pr["number"] != pr_number):
+        raise _DismissalRefused("linked PR identity changed")
+    merged_pr = pr.get("merged") is True
+    merge = None
+    merge_cutoff = None
+    head_sha = None
+    if merged_pr:
+        merge = pr["merge_commit_sha"]
+        if not isinstance(merge, str) or not re.fullmatch(PATTERNS["sha"], merge):
+            raise _DismissalRefused("merged PR has no valid merge commit SHA")
+        merge_cutoff = (
+            _parse_utc_timestamp(pr["merged_at"]) - _DISMISS_ANALYSIS_CLOCK_SKEW
+            if "merged_at" in pr else None
+        )
+        triage_ref = merge
+    else:
+        if pr.get("merged") is not False or pr.get("state") != "open":
+            raise _DismissalRefused("linked PR is neither merged nor open")
+        if "draft" in pr and pr["draft"] is not False:
+            raise _DismissalRefused("draft PR cannot authorize dismissal")
+        head = pr.get("head")
+        head_sha = head.get("sha") if isinstance(head, dict) else None
+        if not isinstance(head_sha, str) or not re.fullmatch(r"[0-9a-f]{40}", head_sha):
+            raise _DismissalRefused("open PR head SHA is unreadable")
+        triage_ref = head_sha
+    base = pr.get("base")
+    base_ref = base.get("ref") if isinstance(base, dict) else None
+    if not isinstance(base_ref, str) or not re.fullmatch(PATTERNS["ref"], base_ref):
+        raise _DismissalRefused("invalid triage branch")
     files = get(f"pulls/{pr_number}/files?per_page=100", pages=True)
+    if not merged_pr:
+        from lu_machinery.orchestration.integration_sweep import PR_FILES_LIMIT
+
+        if not isinstance(files, list) or len(files) >= PR_FILES_LIMIT:
+            raise _DismissalRefused("open PR file list is truncated or unreadable")
     triage_files = [item for item in files if item.get("filename") == _DISMISS_TRIAGE_PATH and item.get("status") in {"added", "modified"}]
     if len(triage_files) != 1:
-        raise ValueError("PR does not contain triage")
-    triage = get(f"contents/{_DISMISS_TRIAGE_PATH}?ref={merge}", raw=True)
+        raise _DismissalRefused("linked PR does not contain triage")
+    triage = get(f"contents/{_DISMISS_TRIAGE_PATH}?ref={triage_ref}", raw=True)
     rows = [line.split("|")[1:-1] for line in triage.splitlines() if line.startswith("|") and line.endswith("|")]
     rows = [row for row in rows if len(row) == 4 and row[0].strip() == str(number)]
     if len(rows) != 1 or not rows[0][3].strip():
-        raise ValueError("triage does not cover this alert")
+        raise _DismissalRefused("triage does not cover this alert")
     row = rows[0]
     triage_line = "|" + "|".join(row) + "|"
-    patch = triage_files[0].get("patch", "").splitlines()
+    patch = (triage_files[0].get("patch") or "").splitlines()
     if "+" + triage_line not in patch or "-" + triage_line in patch:
-        raise ValueError("PR did not review this triage row")
-    base_ref = pr["base"]["ref"]
-    if not re.fullmatch(PATTERNS["ref"], base_ref):
-        raise ValueError("invalid triage branch")
-    head_endpoint = f"git/ref/heads/{quote(base_ref, safe='')}"
-    head_reference = get(head_endpoint)
-    if head_reference["ref"] != f"refs/heads/{base_ref}" or head_reference["object"]["type"] != "commit":
-        raise ValueError("unknown current triage branch")
-    current_head = head_reference["object"]["sha"]
-    if not re.fullmatch(PATTERNS["sha"], current_head):
-        raise ValueError("unknown current triage head")
-    current_triage = (
-        triage
-        if current_head.lower() == merge.lower()
-        else get(f"contents/{_DISMISS_TRIAGE_PATH}?ref={current_head}", raw=True)
-    )
-    current_rows = [line for line in current_triage.splitlines() if "|" in line
-                    and line.strip().removeprefix("|").split("|", 1)[0].strip() == str(number)]
-    if current_rows != [triage_line]:
-        raise ValueError("triage has been superseded")
+        raise _DismissalRefused("linked PR did not review this triage row")
+    head_endpoint = None
+    head_reference = None
+    comments = None
+    if merged_pr:
+        head_endpoint = f"git/ref/heads/{quote(base_ref, safe='')}"
+        head_reference = get(head_endpoint)
+        if head_reference["ref"] != f"refs/heads/{base_ref}" or head_reference["object"]["type"] != "commit":
+            raise _DismissalRefused("unknown current triage branch")
+        current_head = head_reference["object"]["sha"]
+        if not re.fullmatch(PATTERNS["sha"], current_head):
+            raise _DismissalRefused("unknown current triage head")
+        current_triage = (
+            triage
+            if current_head.lower() == merge.lower()
+            else get(f"contents/{_DISMISS_TRIAGE_PATH}?ref={current_head}", raw=True)
+        )
+        current_rows = [line for line in current_triage.splitlines() if "|" in line
+                        and line.strip().removeprefix("|").split("|", 1)[0].strip() == str(number)]
+        if current_rows != [triage_line]:
+            raise _DismissalRefused("triage has been superseded")
+    else:
+        head_rows = [line for line in triage.splitlines() if "|" in line
+                     and line.strip().removeprefix("|").split("|", 1)[0].strip() == str(number)]
+        if head_rows != [triage_line]:
+            raise _DismissalRefused("triage row is duplicated or malformed on the open PR head")
+        entry = _fleet_catalog_entry(dest, environment)
+        configured_login = entry[1].get("verdict_recorder_login") if entry else None
+        if configured_login is not None and (
+            not isinstance(configured_login, str) or not re.fullmatch(r"\S+", configured_login)
+        ):
+            raise _DismissalRefused("verdict recorder login configuration is invalid")
+        identity = _dismiss_get(runner, "user", cwd, environment, raw_http=raw_graphql)
+        login = identity.get("login") if isinstance(identity, dict) else None
+        if not isinstance(login, str) or not re.fullmatch(r"\S+", login):
+            raise _DismissalRefused("authenticated login is unavailable")
+        verdict_login = configured_login or login
+        comments = get(f"issues/{pr_number}/comments?per_page=100", pages=True)
+        _verify_open_pr_cross_family_approval(comments, head_sha, verdict_login)
     disposition = row[3].strip().lower()
     if fields["reason"] == "won't fix":
         justified = disposition.startswith("won't fix.")
@@ -3977,23 +4115,37 @@ def _dismiss_preflight(fields, gh_repo, dest, runner, cwd, environment, *, temp=
         if fields["reason"] == "used in tests":
             justified = justified and row[2].strip().startswith("`tests/")
     if not justified:
-        raise ValueError("reason does not match written triage")
+        raise _DismissalRefused("reason does not match written triage")
     alert = get(f"code-scanning/alerts/{number}")
-    if type(alert.get("number")) is not int or alert["number"] != number or alert.get("state") != "open":
-        raise ValueError("alert identity or state changed")
+    if not isinstance(alert, dict) or type(alert.get("number")) is not int or alert["number"] != number:
+        raise _DismissalRefused("alert identity or state changed")
+    if merged_pr:
+        if alert.get("state") != "open":
+            raise _DismissalRefused("alert identity or state changed")
+    else:
+        if (
+            alert.get("state") not in {"open", None}
+            or alert.get("dismissed_at") is not None
+            or alert.get("fixed_at") is not None
+        ):
+            raise _DismissalRefused("alert is already dismissed, fixed, or in an unknown state")
     if row[1].strip() != f"`{alert['rule']['id']}`":
-        raise ValueError("rule changed")
+        raise _DismissalRefused("rule changed")
     tool_query = ""
     if "tool" in alert:
         tool = alert["tool"]
         tool_name = tool.get("name") if isinstance(tool, dict) else None
         if not isinstance(tool_name, str) or not tool_name.strip() or any(ord(c) < 32 or ord(c) == 127 for c in tool_name):
-            raise ValueError("invalid alert tool")
+            raise _DismissalRefused("invalid alert tool")
         tool_query = f"&tool_name={quote(tool_name, safe='')}"
     get_instances = get(f"code-scanning/alerts/{number}/instances?per_page=100", pages=True)
+    if not isinstance(get_instances, list) or any(
+        not isinstance(item, dict) or not isinstance(item.get("state"), str) for item in get_instances
+    ):
+        raise _DismissalRefused("alert instances are unreadable")
     instances = [item for item in get_instances if item["state"] == "open"]
     if not instances:
-        raise ValueError("no open instances")
+        raise _DismissalRefused("no open instances")
     analyses, results = {}, {}
 
     def match_analysis(rows, sha, instance):
@@ -4125,41 +4277,109 @@ def _dismiss_preflight(fields, gh_repo, dest, runner, cwd, environment, *, temp=
                     states[n] = (state, merged)
         return states
 
-    baseline_ref = f"refs/heads/{base_ref}"
-    if not any(instance["ref"] == baseline_ref for instance in instances):
-        raise ValueError("no open triage-branch instance")
-    pull_instance_nums = sorted({
+    if merged_pr:
+        baseline_ref = f"refs/heads/{base_ref}"
+        if not any(instance.get("ref") == baseline_ref for instance in instances):
+            raise _DismissalRefused("no open triage-branch instance")
+        pull_instance_nums = sorted({
+            int(match[1])
+            for instance in instances
+            if isinstance(instance.get("ref"), str)
+            and (match := re.fullmatch(r"refs/pull/([1-9][0-9]*)/merge", instance["ref"]))
+        })
+        pr_states = pull_states(pull_instance_nums) if pull_instance_nums else {}
+        skipped_prs = {}
+        for instance in instances:
+            instance_ref = instance.get("ref")
+            if not isinstance(instance_ref, str):
+                raise _DismissalRefused("alert instance ref is unreadable")
+            if match := re.fullmatch(r"refs/pull/([1-9][0-9]*)/merge", instance_ref):
+                pr_num = int(match[1])
+                state, merged = pr_states[pr_num]
+                if state in {"CLOSED", "MERGED"} or merged:
+                    skipped_prs[pr_num] = (state, merged)
+                    continue
+            location = instance["location"]
+            if (row[2].strip() != f"`{location['path']}:{location['start_line']}`"
+                    or not instance.get("message", {}).get("text")):
+                raise _DismissalRefused("location or flow unknown or changed")
+            before = evidence(baseline_ref, merge, instance, not_before=merge_cutoff)
+            current = evidence(instance_ref, instance["commit_sha"], instance)
+            if before != current or current["result"]["ruleId"] != alert["rule"]["id"]:
+                raise _DismissalRefused("rule, location or flow changed")
+            physical = current["result"]["locations"][0]["physicalLocation"]
+            if (physical["artifactLocation"]["uri"] != location["path"]
+                    or physical["region"]["startLine"] != location["start_line"]):
+                raise _DismissalRefused("instance does not match SARIF")
+        # Close the evidence/read race before the one write, without retrying.
+        if (get(f"code-scanning/alerts/{number}") != alert
+                or get(f"code-scanning/alerts/{number}/instances?per_page=100", pages=True) != get_instances
+                or get(head_endpoint) != head_reference
+                or (skipped_prs and pull_states(skipped_prs) != skipped_prs)):
+            raise _DismissalRefused("alert or triage evidence changed during preflight")
+        return alert
+
+    pr_merge_ref = f"refs/pull/{pr_number}/merge"
+    other_pull_nums = sorted({
         int(match[1])
         for instance in instances
-        if (match := re.fullmatch(r"refs/pull/([1-9][0-9]*)/merge", instance["ref"]))
+        if isinstance(instance.get("ref"), str)
+        and (match := re.fullmatch(r"refs/pull/([1-9][0-9]*)/merge", instance["ref"]))
+        and int(match[1]) != pr_number
     })
-    pr_states = pull_states(pull_instance_nums) if pull_instance_nums else {}
+    pr_states = pull_states(other_pull_nums) if other_pull_nums else {}
     skipped_prs = {}
+    pr_instances = []
     for instance in instances:
-        if match := re.fullmatch(r"refs/pull/([1-9][0-9]*)/merge", instance["ref"]):
+        instance_ref = instance.get("ref")
+        if not isinstance(instance_ref, str):
+            raise _DismissalRefused("alert instance ref is unreadable")
+        if instance_ref == pr_merge_ref:
+            pr_instances.append(instance)
+            continue
+        if match := re.fullmatch(r"refs/pull/([1-9][0-9]*)/merge", instance_ref):
             pr_num = int(match[1])
             state, merged = pr_states[pr_num]
             if state in {"CLOSED", "MERGED"} or merged:
                 skipped_prs[pr_num] = (state, merged)
                 continue
+            raise _DismissalRefused("alert has an open instance on another open PR")
+        raise _DismissalRefused("default-branch or non-PR alert requires a merged triage PR")
+    if not pr_instances:
+        raise _DismissalRefused("alert has no open instance on the linked open PR")
+    commit_cache = {}
+    for instance in pr_instances:
         location = instance["location"]
         if (row[2].strip() != f"`{location['path']}:{location['start_line']}`"
                 or not instance.get("message", {}).get("text")):
-            raise ValueError("location or flow unknown or changed")
-        before = evidence(baseline_ref, merge, instance, not_before=merge_cutoff)
+            raise _DismissalRefused("location or flow unknown or changed")
+        _open_pr_instance_matches_head(get, instance, head_sha, commit_cache)
         current = evidence(instance["ref"], instance["commit_sha"], instance)
-        if before != current or current["result"]["ruleId"] != alert["rule"]["id"]:
-            raise ValueError("rule, location or flow changed")
+        if current["result"]["ruleId"] != alert["rule"]["id"]:
+            raise _DismissalRefused("rule, location or flow changed")
         physical = current["result"]["locations"][0]["physicalLocation"]
         if (physical["artifactLocation"]["uri"] != location["path"]
                 or physical["region"]["startLine"] != location["start_line"]):
-            raise ValueError("instance does not match SARIF")
+            raise _DismissalRefused("instance does not match SARIF")
     # Close the evidence/read race before the one write, without retrying.
-    if (get(f"code-scanning/alerts/{number}") != alert
-            or get(f"code-scanning/alerts/{number}/instances?per_page=100", pages=True) != get_instances
-            or get(head_endpoint) != head_reference
-            or (skipped_prs and pull_states(skipped_prs) != skipped_prs)):
-        raise ValueError("alert or triage evidence changed during preflight")
+    fresh_pr = get(f"pulls/{pr_number}")
+    if (
+        get(f"code-scanning/alerts/{number}") != alert
+        or get(f"code-scanning/alerts/{number}/instances?per_page=100", pages=True) != get_instances
+        or not isinstance(fresh_pr, dict)
+        or fresh_pr.get("state") != "open"
+        or fresh_pr.get("merged") is not False
+        or ("draft" in fresh_pr and fresh_pr["draft"] is not False)
+        or ("number" in fresh_pr and (type(fresh_pr["number"]) is not int or fresh_pr["number"] != pr_number))
+        or fresh_pr.get("html_url") != pr["html_url"]
+        or not isinstance(fresh_pr.get("head"), dict)
+        or fresh_pr["head"].get("sha") != head_sha
+        or not isinstance(fresh_pr.get("base"), dict)
+        or fresh_pr["base"].get("ref") != base_ref
+        or get(f"issues/{pr_number}/comments?per_page=100", pages=True) != comments
+        or (skipped_prs and pull_states(skipped_prs) != skipped_prs)
+    ):
+        raise _DismissalRefused("alert, PR head, or review evidence changed during preflight")
     return alert
 
 
@@ -4170,8 +4390,12 @@ def _publish_code_scanning_dismiss(
         _dismiss_preflight(fields, gh_repo, dest, runner, cwd, environment, temp=temp, raw_graphql=raw_graphql)
     except github_client.GitHubRateLimited:
         raise
+    except _DismissalRefused as exc:
+        raise gate.PublishBlocked(f"DISMISSAL_TRIAGE_REFUSED: {exc}; nothing was sent.") from None
     except Exception:
-        raise gate.PublishBlocked("DISMISSAL_TRIAGE_REFUSED: merged triage or unchanged rule, location and flow evidence unavailable; nothing was sent.") from None
+        raise gate.PublishBlocked(
+            "DISMISSAL_TRIAGE_REFUSED: reviewed triage or unchanged rule, location and flow evidence unavailable; nothing was sent."
+        ) from None
     endpoint = f"repos/{gh_repo}/code-scanning/alerts/{fields['number']}"
     payload = {"state": "dismissed", "dismissed_reason": fields["reason"], "dismissed_comment": fields["comment"]}
     frozen = temp / "request.json"
@@ -5250,9 +5474,10 @@ def _parse_args(argv):
             )
             sub.formatter_class = argparse.RawDescriptionHelpFormatter
             sub.epilog = (
-                "The merged same-repository PR linked in the comment must change "
-                "docs/runbooks/secret-scanning.md and contain this alert's triage row.\n"
-                "Rule, location and SARIF flow evidence must match the analysis at that merge, across open branches.\n"
+                "The same-repository PR linked in the comment must change "
+                "docs/runbooks/secret-scanning.md and add or revise this alert's triage row.\n"
+                "Default-branch alerts require a merged PR with matching rule, location and SARIF flow evidence across open branches.\n"
+                "Open-PR-only alerts admit that open PR once its exact head carries a recorded cross-family APPROVE.\n"
                 "Example:\n"
                 f"  .venv/bin/python -m {_PUBLISHER} code-scanning-dismiss --repo unit/public --number 1 "
                 "--reason 'false positive' --comment 'Alert #1 stores public metadata. https://github.com/unit/public/pull/2'\n"
@@ -5670,7 +5895,10 @@ def _parse_args(argv):
                     "repo": "Repository owner/name, e.g. unit/public; defaults to GH_REPO or origin",
                     "number": "Required positive alert number, e.g. 1; no default",
                     "reason": "Required reviewed dismissal reason; separate from issue-close reasons",
-                    "comment": "Required explanation identifying Alert #N and linking one same-repository merged PR; scanned verbatim",
+                    "comment": (
+                        "Required explanation identifying Alert #N and linking one same-repository merged PR "
+                        "(or exact-head approved open PR for an open-PR-only alert); scanned verbatim"
+                    ),
                 }[key]
             if verb in {"code-scanning-analysis-delete", "branch-delete"}:
                 kwargs["action"] = StoreOnce

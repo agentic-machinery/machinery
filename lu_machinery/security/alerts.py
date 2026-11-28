@@ -1992,9 +1992,10 @@ def _render_brief_markdown(
         "number is refused."
     )
     preflight_seat = (
-        "- Workers and reviewers cannot run `code-scanning-dismiss`; after the triage PR merges, an "
-        "interactive seat runs `code-scanning-dismiss` citing `Alert #N`, a prose explanation, and the "
-        "single canonical same-repository merged PR URL."
+        "- Workers and reviewers cannot run `code-scanning-dismiss`; an interactive seat runs "
+        "`code-scanning-dismiss` citing `Alert #N`, a prose explanation, and one canonical same-repository "
+        "PR URL (the merged triage PR for default-branch alerts, or the exact-head cross-family-approved "
+        "open PR when the alert's active open instances exist only on that open PR)."
     )
 
     lines.extend(
