@@ -82,6 +82,58 @@ def claim(capsys, *, worker="seat-1", recipient="codex", expected=EXIT_OK):
     )
 
 
+def test_expire_stale_preserves_fresh_historical_alias_delivery(plane, capsys, monkeypatch):
+    """Defect class: expire-stale expires a fresh delivery to a historical alias."""
+    from lu_machinery.fleet_comms import authority
+
+    load_roster = authority._load_roster
+
+    def roster():
+        names, complete = load_roster()
+        return names - {"cursor"}, complete
+
+    # The fixture registers bare providers for other delivery tests.
+    monkeypatch.setattr(authority, "_load_roster", roster)
+    alias = "cursor-monitor"
+    unregistered = "unregistered-fixture-recipient"
+    delivery_ids = {}
+    with AuthorityService(root=plane) as service, service._write_transaction():
+        for recipient in (alias, unregistered):
+            message = service._publish_message_tx(
+                sender="operator", body="historical fixture", channel=None, targets=None, kind="message",
+                imported_recipients=(recipient,), imported_source="test-legacy",
+                idempotency_key=f"legacy-{recipient}",
+            )
+            delivery_ids[recipient] = message.delivery_ids[0]
+
+    assert invoke(capsys, "pending", "--recipient", alias)["count"] == 1
+    for name in ("cursor", unregistered):
+        assert invoke(capsys, "pending", "--recipient", name, expected=EXIT_ERROR)["reason"] == (
+            "recipient_not_registered"
+        )
+
+    dry = invoke(capsys, "expire-stale")
+    assert dry["unreadable_expired"] is None
+    for delivery_id in delivery_ids.values():
+        assert invoke(capsys, "status", delivery_id)["state"] == "queued"
+
+    applied = invoke(capsys, "expire-stale", "--apply")
+    assert invoke(capsys, "status", delivery_ids[alias])["state"] == "queued"
+    assert invoke(capsys, "status", delivery_ids[unregistered])["state"] == "expired"
+    assert dry["matched"] == applied["expired"] == 0
+    expected_unreadable = {
+        "deliveries": 1,
+        "recipient_not_registered": 1,
+        "recipient_settled": 0,
+        "subscriptions": 0,
+        "roster_complete": True,
+    }
+    assert dry["unreadable"] == applied["unreadable_expired"] == expected_unreadable
+    assert invoke(capsys, "pending", "--recipient", alias)["count"] == 1
+    assert claim(capsys, recipient=alias)["delivery_id"] == delivery_ids[alias]
+    assert claim(capsys, recipient=unregistered, expected=EXIT_ERROR)["error"] == "recipient_not_registered"
+
+
 @pytest.mark.parametrize("operation", ["receive", "claim"])
 def test_receive_and_claim_on_empty_inbox_exit_zero_with_null_delivery(plane, capsys, operation):
     """Defect class: a normal empty answer exits non-zero, so every idle inbox check reads as a failed command."""

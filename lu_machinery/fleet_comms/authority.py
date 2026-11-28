@@ -399,20 +399,55 @@ def _task_standing(name: str) -> Literal["live", "settled", "unknown"] | None:
     return "unknown"
 
 
-def _recipient_standing(name: str, registered: frozenset[str], complete: bool) -> RecipientStanding:
+@dataclass(frozen=True, slots=True)
+class _RecipientRoster:
+    """Roster and file identities shared by a batch of standing decisions."""
+
+    registered: frozenset[str]
+    complete: bool
+    sources: tuple[Path | None, ...]
+    identity: tuple[object, ...]
+
+
+def _load_recipient_roster() -> _RecipientRoster:
+    sources = _roster_sources()
+    identity = _roster_identity(sources)
+    registered, complete = _load_roster()
+    return _RecipientRoster(registered, complete, sources, identity)
+
+
+def _recipient_standing(name: str, roster: _RecipientRoster) -> RecipientStanding:
     """Whether a drain will read ``name``: the one classifier every admission and removal path uses.
 
-    A stored session-CTO name stays readable by its session. ``not_registered``
-    and ``settled_task`` both need a complete roster (an incomplete one may hold
-    the same name as a registered slot); ``settled_task`` also needs a known
-    terminal status.
+    Registered names and dedicated supervisory and session inboxes already
+    have a drain. For other names, a verified alias is readable under its
+    stored name, even if its bare provider has no registered inbox. An
+    unreadable or changed alias source leaves these names unverified.
+
+    ``not_registered`` and ``settled_task`` both need a complete roster (an
+    incomplete one may hold the same name as a registered slot).
+    ``settled_task`` also needs a known terminal status.
     """
-    if name in registered or is_session_cto_recipient(name) or _SUPERVISORY_RECIPIENT_RE.fullmatch(name):
+    if name in roster.registered or is_session_cto_recipient(name) or _SUPERVISORY_RECIPIENT_RE.fullmatch(name):
+        return "registered"
+
+    from lu_machinery.agent_identity import resolve_recipient_alias
+
+    assignments = roster.sources[0]
+    if assignments is None:
+        return "unknown"
+    try:
+        resolved = resolve_recipient_alias(name, assignments_path=assignments, strict=True)
+    except Exception:
+        return "unknown"
+    if _roster_sources() != roster.sources or _roster_identity(roster.sources) != roster.identity:
+        return "unknown"
+    if resolved != name:
         return "registered"
     task = _task_standing(name)
     if task == "live":
         return "live_task"
-    if task == "unknown" or not complete:
+    if task == "unknown" or not roster.complete:
         return "unknown"
     if task == "settled":
         return "settled_task"
@@ -425,9 +460,9 @@ def _require_readable_recipients(names: Iterable[str]) -> None:
     A recipient whose standing is unknown (damaged task record, incomplete
     roster) is admitted and logged: doubt never drops mail.
     """
-    registered, complete = _load_roster()
+    roster = _load_recipient_roster()
     for name in names:
-        standing = _recipient_standing(name, registered, complete)
+        standing = _recipient_standing(name, roster)
         if standing in {"registered", "live_task"}:
             continue
         if standing == "unknown":
@@ -616,29 +651,11 @@ def pending_delivery_snapshot(recipient: str, *, root: Path | None = None, limit
         recipient = _nonempty(recipient, field="recipient")
         _admit_recipients((recipient,), mode=BRIDGE_MODE, claiming=True)
         assert_component_supported(StoreId.FLEET_COMMS, "authority_service")
-        from lu_machinery.agent_identity import resolve_recipient_alias
-
-        # A historical alias names no roster seat; only a canonical name has a standing to check.
-        # An alias that cannot be told from a canonical name (roster unreadable, or changed while the
-        # alias was read) is unverified, never refused.
-        sources = _roster_sources()
-        before = _roster_identity(sources)
-        roster = _load_roster()
-        if sources[0] is None:
+        standing = _recipient_standing(recipient, _load_recipient_roster())
+        if standing in {"not_registered", "settled_task"}:
+            return {**unknown, "reason": AuthorityRecipientRefused(recipient, standing).cause}
+        if standing == "unknown":
             return {**unknown, "reason": "recipient_standing_unverified"}
-        try:
-            # The file the snapshot read, never a path resolved again from the profile.
-            canonical = resolve_recipient_alias(recipient, assignments_path=sources[0], strict=True) == recipient
-        except Exception:
-            return {**unknown, "reason": "recipient_standing_unverified"}
-        if _roster_sources() != sources or _roster_identity(sources) != before:  # changed (even and back) meanwhile
-            return {**unknown, "reason": "recipient_standing_unverified"}
-        if canonical:
-            standing = _recipient_standing(recipient, *roster)
-            if standing in {"not_registered", "settled_task"}:
-                return {**unknown, "reason": AuthorityRecipientRefused(recipient, standing).cause}
-            if standing == "unknown":
-                return {**unknown, "reason": "recipient_standing_unverified"}
         plane_root = root
         override = os.environ.get("FLEET_COMMS_ROOT") if root is None else None
         if (override and not Path(override).is_absolute()) or (plane_root is not None and not plane_root.is_absolute()):
@@ -1936,7 +1953,7 @@ class AuthorityService:
         Nothing is counted while the roster is incomplete (``roster_complete``
         is then false), and no name of unknown standing is counted.
         """
-        roster = _load_roster()  # one roster version for every decision and the reported flag
+        roster = _load_recipient_roster()
         counts = {RECIPIENT_NOT_REGISTERED_REASON: 0, RECIPIENT_SETTLED_REASON: 0}
         for _row, reason in self._unreadable_deliveries_tx(roster, settled_only=False):
             counts[reason] += 1
@@ -1944,7 +1961,7 @@ class AuthorityService:
             "deliveries": sum(counts.values()),
             **counts,
             "subscriptions": len(self._unreadable_subscriptions_tx(roster, settled_only=False)),
-            "roster_complete": roster[1],
+            "roster_complete": roster.complete,
         }
 
     def expire_unreadable(self, *, now: str | None = None) -> dict[str, int]:
@@ -1961,7 +1978,7 @@ class AuthorityService:
         """
         now_value = self._now_string(now)
         with self._write_transaction():
-            roster = _load_roster()  # read under the write lock: one version for every decision and the flag
+            roster = _load_recipient_roster()
             ended = len(self._unreadable_subscriptions_tx(roster, settled_only=False))
             expired: dict[str, list[str]] = {RECIPIENT_NOT_REGISTERED_REASON: [], RECIPIENT_SETTLED_REASON: []}
             for row, reason in self._unreadable_deliveries_tx(roster, settled_only=False):
@@ -1987,17 +2004,17 @@ class AuthorityService:
         counts = {reason: len(ids) for reason, ids in expired.items()}
         return {
             "deliveries": sum(counts.values()), **counts, "subscriptions": ended,
-            "roster_complete": roster[1],
+            "roster_complete": roster.complete,
         }
 
     def _unreadable_deliveries_tx(
-        self, roster: tuple[frozenset[str], bool], *, settled_only: bool,
+        self, roster: _RecipientRoster, *, settled_only: bool,
     ) -> list[tuple[sqlite3.Row, str]]:
         """Queued or running deliveries whose recipient is a settled task (or, unless ``settled_only``, unregistered).
 
         Empty while the roster is incomplete: no removal on doubt (#594).
         """
-        if not roster[1]:
+        if not roster.complete:
             return []
         rows: list[tuple[sqlite3.Row, str]] = []
         recipients = self._conn.execute(
@@ -2019,8 +2036,8 @@ class AuthorityService:
             )
         return rows
 
-    def _unreadable_subscriptions_tx(self, roster: tuple[frozenset[str], bool], *, settled_only: bool) -> list[str]:
-        if not roster[1]:
+    def _unreadable_subscriptions_tx(self, roster: _RecipientRoster, *, settled_only: bool) -> list[str]:
+        if not roster.complete:
             return []
         names = self._conn.execute(
             "SELECT DISTINCT recipient FROM authority_channel_subscribers ORDER BY recipient"
@@ -2031,15 +2048,15 @@ class AuthorityService:
             if self._unreadable_reason(str(item["recipient"]), roster, settled_only=settled_only) is not None
         ]
 
-    def _end_unreadable_subscriptions_tx(self, roster: tuple[frozenset[str], bool], *, settled_only: bool) -> int:
+    def _end_unreadable_subscriptions_tx(self, roster: _RecipientRoster, *, settled_only: bool) -> int:
         return sum(
             self._end_subscriptions_tx(name)
             for name in self._unreadable_subscriptions_tx(roster, settled_only=settled_only)
         )
 
     @staticmethod
-    def _unreadable_reason(name: str, roster: tuple[frozenset[str], bool], *, settled_only: bool) -> str | None:
-        standing = _recipient_standing(name, *roster)
+    def _unreadable_reason(name: str, roster: _RecipientRoster, *, settled_only: bool) -> str | None:
+        standing = _recipient_standing(name, roster)
         if standing == "settled_task":
             return RECIPIENT_SETTLED_REASON
         if standing == "not_registered" and not settled_only:
@@ -2431,12 +2448,12 @@ class AuthorityService:
         its delivery, and while the roster is incomplete no subscription is
         ended at all (fail closed: nothing is ended on doubt).
         """
-        registered, complete = _load_roster()
-        if not complete:
+        roster = _load_recipient_roster()
+        if not roster.complete:
             return tuple(names)
         kept: list[str] = []
         for name in names:
-            standing = _recipient_standing(name, registered, complete)
+            standing = _recipient_standing(name, roster)
             if standing in {"settled_task", "not_registered"}:
                 self._end_subscriptions_tx(name, channel_id=str(channel_row["channel_id"]))
                 continue
@@ -2634,7 +2651,7 @@ class AuthorityService:
         if cleanup_expired:
             self._notify_cleanup_expiry_summary_tx(cleanup_expired)
         if cleanup_ids is None:
-            roster = _load_roster()
+            roster = _load_recipient_roster()
             for row, reason in self._unreadable_deliveries_tx(roster, settled_only=True):
                 if self._stored_kimi_delivery(row):
                     continue
@@ -2851,9 +2868,7 @@ class AuthorityService:
         recipient = str(row["recipient"])
         if session_via_durable_cto and is_session_cto_recipient(recipient):
             parties: tuple[str, ...] = (DURABLE_CTO_RECIPIENT,)
-        elif is_session_cto_recipient(recipient) or _recipient_standing(
-            recipient, *_load_roster()
-        ) in {"registered", "live_task"}:
+        elif _recipient_standing(recipient, _load_recipient_roster()) in {"registered", "live_task"}:
             parties = (recipient, DURABLE_CTO_RECIPIENT)
         else:
             parties = (DURABLE_CTO_RECIPIENT,)
