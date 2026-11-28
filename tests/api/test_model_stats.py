@@ -2187,23 +2187,86 @@ def test_no_live_trigger_counts_in_precision_denominator_not_numerator(tmp_path)
     assert row["real_precision_ci"] == stats._wilson(1, 2)
 
 
+# tag v0.1.84. The changed-test job fetches full history, so this commit is in the checkout without the tag ref.
+_PRIOR_RELEASE_ROWS = "0152786d592213efee20cd453e9a147f62398253"
+
+
+def _prior_release_rows(tmp_path: Path):
+    """The finding-outcome writer from release 0.1.84, with that release's label vocabulary."""
+    import importlib.util
+
+    root = Path(__file__).resolve().parents[2]
+    source = subprocess.check_output(
+        ["git", "show", f"{_PRIOR_RELEASE_ROWS}:lu_machinery/api/model_stats_rows.py"], cwd=root)
+    blob = tmp_path / "model_stats_rows_0184.py"
+    blob.write_bytes(source)
+    spec = importlib.util.spec_from_file_location("model_stats_rows_0184", blob)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    module.FINDING_OUTCOME_LABELS = {
+        "fixed": "a real error; the author changed the code",
+        "wrong": "the code was already correct",
+        "invented": "the finding cites a file, line, symbol or behaviour that does not exist",
+        "out_of_scope": "outside the change's frozen obligation",
+        "duplicate": "another finding of the same review names the same defect",
+    }
+    return module
+
+
+def _prior_release_fixed(old, batch_state: Path, finding_id: str, *, head: str, started_at: str) -> None:
+    """What release 0.1.84 does with a ``fixed`` label for one run."""
+    old.record_finding_outcomes(batch_state, [old.finding_outcome(
+        kind="label", task_id="o1-review", repository="learn-ukrainian/machinery", pr=1,
+        finding_id=finding_id, head=head, started_at=started_at, reviewer_model="claude-opus-5-5",
+        label="fixed", recorded_by="author-task", recorded_at=_at(0.25))])
+
+
 def test_rollback_and_roll_forward_keep_one_label_for_one_finding(tmp_path):
     """Defect class: rolling a finding-outcome label back to a writer whose vocabulary does not include it appends a
     second label for that finding, and rolling forward shows the other label.
 
     Release 0.1.84 admits only ``fixed``, ``wrong``, ``invented``, ``out_of_scope`` and ``duplicate``. A
-    ``no_live_trigger`` line is invisible to that writer's conflict check, so it appends ``fixed``; its reader
-    attributes ``fixed``; this release's reader then attributes ``no_live_trigger`` and drops the ``fixed`` line.
+    ``no_live_trigger`` line is invisible to that writer's conflict check. An occupying line that is not bound to
+    the run shares one legacy key with every earlier line for that finding, so a later run of the same task and
+    finding appends ``fixed`` and that reader attributes it.
     """
     prior = frozenset({"fixed", "wrong", "invented", "out_of_scope", "duplicate"})
     batch_state, _ = _state(tmp_path)
     assert _label(batch_state, "o1-review", 1, "F1", "no_live_trigger",
                   "only main() calls it, after the guard") == 1
     path = batch_state / rows.ROWS_DIR / rows.OUTCOMES_FILE
+    # An earlier unbound compatibility row, and an earlier legacy label, both recorded before a later run of the
+    # same task and finding. The later run has to keep its own label when rolled back.
+    later = _at(0.5)
+    earlier = {
+        "schema": rows.OUTCOME_SCHEMA, "kind": "label", "task_id": "o1-review",
+        "repository": "learn-ukrainian/machinery", "pr": 1, "recorded_by": "author-task", "recorded_at": _at(3),
+    }
+    planted = [
+        {**earlier, "finding_id": "F2", "label": "duplicate",
+         "evidence_sha256": hashlib.sha256(b"prior-release finding-outcome hold").hexdigest()},
+        {**earlier, "finding_id": "F3", "label": "fixed", "evidence_sha256": None},
+    ]
+    with path.open("ab") as stream:
+        stream.write(b"".join(json.dumps(line).encode() + b"\n" for line in planted))
+    evidence = "only main() calls it, after the guard"
+    assert _label(batch_state, "o1-review", 1, "F2", "no_live_trigger", evidence,
+                  head=_HEAD_B, started_at=later, recorded_at=_at(0.25)) == 1
+    assert _label(batch_state, "o1-review", 1, "F3", "no_live_trigger", evidence,
+                  head=_HEAD_B, started_at=later, recorded_at=_at(0.25)) == 1
+    old = _prior_release_rows(tmp_path)
+    for finding_id in ("F1", "F2", "F3"):
+        head, started = (_HEAD_A, _START_A) if finding_id == "F1" else (_HEAD_B, later)
+        with pytest.raises(old.OutcomeConflict):
+            _prior_release_fixed(old, batch_state, finding_id, head=head, started_at=started)
+    assert [json.loads(line)["finding_id"] for line in path.read_bytes().splitlines()
+            if json.loads(line).get("label") == "fixed" and json.loads(line).get("head") == _HEAD_B] == []
     finding = [json.loads(line) for line in path.read_bytes().splitlines()
                if json.loads(line).get("finding_id") == "F1"]
     visible = [line for line in finding if line.get("kind") == "label" and line.get("label") in prior
-               and "head" not in line and "reviewer_model" not in line]
+               and line.get("head") == _HEAD_A and line.get("started_at") == _START_A
+               and "reviewer_model" not in line]
     assert len(visible) == 1
     assert rows.timestamp(visible[0]["recorded_at"]) >= rows.timestamp(_START_A)
     assert visible[0]["label"] != "fixed"
@@ -2212,10 +2275,13 @@ def test_rollback_and_roll_forward_keep_one_label_for_one_finding(tmp_path):
     finding = [json.loads(line) for line in path.read_bytes().splitlines()
                if json.loads(line).get("finding_id") == "F1"]
     assert [line["label"] for line in finding if line.get("label") == "fixed"] == []
-    key = ("o1-review", rows.repository_identity("learn-ukrainian/machinery"), 1, "F1", _HEAD_A,
-           rows.timestamp(_START_A))
+    repo = rows.repository_identity("learn-ukrainian/machinery")
+    key = ("o1-review", repo, 1, "F1", _HEAD_A, rows.timestamp(_START_A))
     labels, _, counts = rows.read_finding_outcomes(batch_state)
     assert labels[key][1] == "no_live_trigger"
+    later_key = ("o1-review", repo, 1, "F2", _HEAD_B, rows.timestamp(later))
+    assert labels[later_key][1] == "no_live_trigger"
+    assert labels[("o1-review", repo, 1, "F3", _HEAD_B, rows.timestamp(later))][1] == "no_live_trigger"
     assert counts.get("conflicting_labels", 0) == 0
     # A second run-bound label, the line 0.1.84 appends when it cannot see the new one. Roll-forward keeps the
     # original label and counts the extra line instead of switching to it.

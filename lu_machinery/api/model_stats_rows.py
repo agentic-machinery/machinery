@@ -1202,14 +1202,15 @@ _PRIOR_HOLD_EVIDENCE = hashlib.sha256(b"prior-release finding-outcome hold").hex
 
 
 def _is_prior_hold(entry: Mapping[str, Any]) -> bool:
-    """A legacy line this writer stores so release 0.1.84's conflict check can see a newer label.
+    """A line this writer stores so release 0.1.84's conflict check can see a newer label.
 
-    It is not an outcome. 0.1.84 admits ``duplicate`` and ignores a line with no reviewer, so it refuses a
-    different label and attributes none. This release skips the line.
+    It is not an outcome. 0.1.84 admits ``duplicate`` and attributes nothing without a reviewer, so a line bound
+    to the run's head and start refuses a different label for that run and is shown to nobody. This release
+    skips the line, including one written without that binding.
     """
     return (entry.get("kind") == "label" and entry.get("label") == _PRIOR_HOLD_LABEL
             and entry.get("evidence_sha256") == _PRIOR_HOLD_EVIDENCE
-            and "head" not in entry and _OUTCOME_REVIEWER_MODEL not in entry)
+            and _OUTCOME_REVIEWER_MODEL not in entry)
 
 
 def _prior_hold(snapshot: Mapping[str, Any]) -> dict[str, Any] | None:
@@ -1221,6 +1222,7 @@ def _prior_hold(snapshot: Mapping[str, Any]) -> dict[str, Any] | None:
     hold: dict[str, Any] = {
         "schema": OUTCOME_SCHEMA, "kind": "label", "task_id": snapshot["task_id"],
         "repository": snapshot["repository"], "pr": snapshot["pr"], "finding_id": snapshot["finding_id"],
+        "head": snapshot["head"], "started_at": snapshot["started_at"],
         "label": _PRIOR_HOLD_LABEL, "evidence_sha256": _PRIOR_HOLD_EVIDENCE,
         "recorded_by": snapshot["recorded_by"],
         "recorded_at": snapshot["recorded_at"] if recorded >= started else snapshot["started_at"],
@@ -1263,10 +1265,12 @@ def record_finding_outcomes(batch_state_dir: Path, entries: Iterable[Mapping[str
 
     A label line is one per (review task, repository, PR, finding, head, started_at), the repository by its identity
     across a transfer: the same label again adds nothing and keeps the first line and its evidence, and another label
-    raises OutcomeConflict before anything is written. A label that release 0.1.84 does not admit also appends a legacy
-    occupying line that writer can see, so a rollback cannot append a different label; the line is not an outcome.
-    Every newly written line must carry ``head`` and
-    ``started_at`` (and ``reviewer_model`` on labels); existing legacy lines without them are still read so legacy
+    raises OutcomeConflict before anything is written. A label that release 0.1.84 does not admit also appends an
+    occupying line bound to that same head and start, with no reviewer. That writer then refuses a different label
+    for the run and attributes none; the line is not an outcome. An unbound line would share one legacy key across
+    runs, so a later run of the same finding would not be protected.
+    Every newly written outcome carries ``head`` and ``started_at`` (and ``reviewer_model`` on labels). The occupying
+    line carries the same run binding and no reviewer. Existing legacy lines without them are still read so legacy
     labels remain conflict-protected. A contest line is one per (review task, repository, PR, finding, contesting
     task, head, started_at). Every entry is checked from the exact JSON bytes that will be written: one malformed
     entry raises ValueError and writes nothing. TimeoutError when ``wait_s`` passes first; OSError when the ledger

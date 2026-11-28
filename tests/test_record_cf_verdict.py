@@ -1301,7 +1301,8 @@ def test_finding_outcome_verb_refuses_unpublished_unknown_or_nonblocking_finding
     outcomes = _outcomes(tmp_path)
     assert outcomes[-1]["label"] == "no_live_trigger"
     hold = outcomes[-2]
-    assert hold["label"] == "duplicate" and "head" not in hold and "reviewer_model" not in hold
+    assert hold["label"] == "duplicate" and "reviewer_model" not in hold
+    assert hold["head"] == outcomes[-1]["head"] and hold["started_at"] == outcomes[-1]["started_at"]
     assert hold["finding_id"] == "F2" and hold["task_id"] == "review-grok"
     # A reply with no structured findings takes no label.
     write_task(tasks, task_id="review-text", reply="VERDICT: CHANGES_REQUESTED\nOrdinary reviewer text.\n")

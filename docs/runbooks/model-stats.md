@@ -444,9 +444,11 @@ unless a later review contested it. The schema stays `review-finding-outcome.v1`
 still holds its finding (`coverage.finding_outcomes.unknown_labels`, attributed to no reviewer), so another label
 is refused. `no_live_trigger` is outside the vocabulary of release 0.1.84, whose conflict check would otherwise
 skip the line and append a second label. For every label outside that vocabulary the writer also appends a legacy
-occupying line (`duplicate`, no reviewer and no head, the SHA-256 of the phrase `prior-release finding-outcome
-hold`). That line is not an outcome: this release skips it. 0.1.84 refuses a different label for the finding and
-attributes none, and this release keeps attributing the original label. A second run-bound label already in the
+occupying line bound to that run's `head` and `started_at` (`duplicate`, no reviewer, the SHA-256 of the phrase
+`prior-release finding-outcome hold`). That line is not an outcome: this release skips it. 0.1.84 refuses a
+different label for that run and attributes none, and this release keeps attributing the original label. A line
+without the run binding would share one legacy key with every earlier line for the finding, and a later run would
+not be protected. A second run-bound label already in the
 file does not replace the first; it counts in `coverage.finding_outcomes.conflicting_labels`.
 
 Both line kinds go to `batch_state/model-stats/finding-outcomes.jsonl` (schema `review-finding-outcome.v1`)
