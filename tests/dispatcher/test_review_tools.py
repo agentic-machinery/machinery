@@ -8,16 +8,15 @@ import json
 import os
 import shutil
 import subprocess
+
 import pytest
+
 from lu_machinery.agent_runtime.attempt_network import canonical_host
 from lu_machinery.dispatcher import agy_sandbox
 from lu_machinery.orchestration.fleet_repos import load_fleet_repos
-from tests.dispatcher.test_providers_b import _bwrap_usable, _launch, _linked_worktree
+from tests.dispatcher.test_providers_b import _bind_agy_test_host, _bwrap_usable, _launch, _linked_worktree
 from tests.helpers.product_tree import configured_roots  # noqa: F401
-
-
-
-
+from tests.host_context.conftest import build_host_layout
 
 
 def test_review_checkout_exposes_project_interpreter(tmp_path):
@@ -110,8 +109,11 @@ _CASES = {
 
 @pytest.mark.skipif(not _bwrap_usable(), reason="needs a usable unprivileged bubblewrap")
 @pytest.mark.parametrize("case", sorted(_CASES))
-def test_review_boundary_refuses_bypass_classes_and_keeps_execution(tmp_path, case):
+def test_review_boundary_refuses_bypass_classes_and_keeps_execution(
+    tmp_path, case, monkeypatch, configured_roots,  # noqa: F811
+):
     """Defect: a review interpreter publishes, writes the primary checkout or reaches a private address."""
+    _bind_agy_test_host(monkeypatch, build_host_layout(tmp_path / "host"), configured_roots.product)
     worktree, _head = _linked_worktree(tmp_path)
     granted, template = _CASES[case]
     primary = tmp_path / "repo"
@@ -155,7 +157,9 @@ pytestmark = pytest.mark.usefixtures("configured_roots")
 @pytest.mark.skipif(shutil.which("gh") is None or shutil.which("curl") is None, reason="needs gh and curl on the host")
 @pytest.mark.live_network
 @pytest.mark.live_github
-def test_sandbox_reaches_public_hosts_and_github_while_filesystem_boundary_holds(tmp_path):
+def test_sandbox_reaches_public_hosts_and_github_while_filesystem_boundary_holds(
+    tmp_path, monkeypatch, configured_roots,  # noqa: F811
+):
     """Defect class: sandbox egress blocks non-provider hosts or GitHub, or opening it loosens the filesystem boundary.
 
     Operator decision 2026-11-10: sandboxed agents reach the internet and GitHub. The AGY boundary must reach a
@@ -163,6 +167,7 @@ def test_sandbox_reaches_public_hosts_and_github_while_filesystem_boundary_holds
     unwritable, host credentials stay unreadable and the relay still refuses another host. The issue read
     itself is asserted where the host's gh has a login; without one (a CI runner) the relay must still run gh.
     """
+    _bind_agy_test_host(monkeypatch, build_host_layout(tmp_path / "host"), configured_roots.product)
     worktree, head = _linked_worktree(tmp_path)
     primary, home = tmp_path / "repo", os.path.expanduser("~")
     # Compare the actual read under the relay's host environment. An auth-status probe under the
