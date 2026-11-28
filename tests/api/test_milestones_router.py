@@ -573,6 +573,26 @@ assert.match(missedHtml, /no planning verdict; blocker count is incomplete/);
 const missedChips = renderMilestoneChips({{milestones: data, planning: missedPlanning}}, now);
 assert.match(missedChips, /<b>\\?<\\/b> blocked \\(partial\\)/);
 
+// F1 sibling: even when Planning status is "ok" with 0 dependency_unknown, an open milestone issue
+// missing from Planning withholds the fleet 0 blocked chip (shows ? blocked (incomplete), never 0).
+const okEmptyPlanning = {{
+  issues: {{
+    status: "ok",
+    age_s: 60,
+    workers: "ok",
+    coverage: {{repositories_read: 2, repositories_total: 2, open_issues: 0, dependency_unknown: 0, private_open_issues: 0}},
+    blockers: [],
+    ready: [],
+    ready_now: [],
+    blocked: [],
+  }},
+}};
+const okMissedHtml = renderMilestones(data, okEmptyPlanning, now);
+assert.equal(summaryCellsFor(okMissedHtml, "v0.4.0")[1], "unknown");
+const okMissedChips = renderMilestoneChips({{milestones: data, planning: okEmptyPlanning}}, now);
+assert.match(okMissedChips, /<b>\\?<\\/b> blocked \\(incomplete\\)/);
+assert.doesNotMatch(okMissedChips, /<b>0<\\/b> blocked/);
+
 const twoIssueData = JSON.parse(JSON.stringify(data));
 twoIssueData.repositories[0].milestones[0].issues.push({{
   number: 11,
@@ -583,7 +603,7 @@ twoIssueData.repositories[0].milestones[0].issues.push({{
 const observedHtml = renderMilestones(twoIssueData, partialPlanning, now);
 assert.equal(summaryCellsFor(observedHtml, "v0.4.0")[1], "1 observed");
 
-// F2: Unmatched blockers are classified outside open milestones ONLY when repo milestone & issue coverage is complete.
+// F2: Unmatched blockers are classified outside open milestones ONLY when repo milestone & issue coverage is complete and fresh.
 const completeWithOutside = {{
   issues: {{
     status: "ok", age_s: 30, workers: "ok",
@@ -597,6 +617,22 @@ const completeWithOutside = {{
 const outsideHtml = renderMilestones(data, completeWithOutside, now);
 assert.match(outsideHtml, /Blocked issues outside open milestones \\(1\\)/);
 assert.doesNotMatch(outsideHtml, /milestone membership unknown/);
+
+// F2 expiry: once the milestone reading's elapsed age crosses the 420s freshness bound,
+// unmatched blockers immediately move from outside-open-milestones to milestone-membership-unknown.
+const freshReading = {{
+  data,
+  ageHeader: "419.5",
+  boundHeader: "420",
+  state: "fresh",
+  receivedAt: now,
+}};
+const beforeExpiryHtml = renderMilestones(data, completeWithOutside, now + 200, null, freshReading);
+assert.match(beforeExpiryHtml, /Blocked issues outside open milestones \\(1\\)/);
+const afterExpiryHtml = renderMilestones(data, completeWithOutside, now + 1000, null, freshReading);
+assert.doesNotMatch(afterExpiryHtml, /Blocked issues outside open milestones/);
+assert.match(afterExpiryHtml, /Blocked issues \\(milestone membership unknown: 1\\)/);
+assert.match(afterExpiryHtml, /STALE/);
 
 const partialListData = JSON.parse(JSON.stringify(data));
 partialListData.repositories[0].milestones[0].issues_status = "partial";
