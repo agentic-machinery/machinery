@@ -734,6 +734,14 @@ def test_held_turn_lease_surfaces_one_cto_alert_and_refuses_ttl_takeover_advice(
     assert (claimed_rows["turn-own"]["reason"], claimed_rows["turn-own"]["run_nonce"]) == ("terminal_turn:done", "6" * 32)
     assert (claimed_rows["turn-replaced"]["reason"], claimed_rows["turn-replaced"]["run_nonce"]) == (
         "turn_record_superseded", None)
+    # The alert's idempotency key is fixed per lease, so its body never carries the record-derived nonce:
+    # a matching record that ages out (nonce gone) re-routes to the same message instead of a conflict.
+    with AuthorityService(root=host.tmp_path / "fleet-aged") as service:
+        first = mod.route(claimed_report, cycle=1, service=service)
+        aged = copy.deepcopy(claimed_report)
+        for row in aged["rows"]:
+            row["run_nonce"] = None
+        assert mod.route(aged, cycle=2, service=service) == first
     for task_id in ("turn-own", "turn-replaced"):
         (host.tasks / f"{task_id}.json").unlink()
 

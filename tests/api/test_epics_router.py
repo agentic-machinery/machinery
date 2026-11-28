@@ -304,9 +304,17 @@ def test_status_never_lets_a_reader_rebuild_and_use_the_holders_lease(tmp_path: 
     claimed = _claim(client)["lease"]
     assert claimed["session_id"] == "api-session"  # the claimer's own reply keeps the envelope it chose
     assert claimed["lease_digest"] == envelope_digest(claimed)
+    # The holder writes an entry, so status and listing also publish entries the holder's session wrote.
+    written = client.post(
+        "/api/epics/v1/epic:7178/handoff",
+        json={**claimed, "type": "state", "body": "working", "idempotency_key": "holder-1"},
+    )
+    assert written.status_code == 200 and written.json()["entry"]["session_id"] == "[redacted]"
 
-    status = client.get("/api/epics/v1/epic:7178").json()["lease"]
+    status_body = client.get("/api/epics/v1/epic:7178").json()
+    status = status_body["lease"]
     listed = next(row for row in client.get("/api/epics/v1").json()["streams"] if row["stream_id"] == "epic:7178")
+    assert status_body["digest"]["recent"][-1]["body"] == "working" and listed["last_state"]["body"] == "working"
     competing = client.post(
         "/api/epics/v1/epic:7178/claim",
         json={"session_id": "s2", "lease_id": "l2", "lineage_id": "x", "agent": "gemini", "harness": "agy",
@@ -317,7 +325,7 @@ def test_status_never_lets_a_reader_rebuild_and_use_the_holders_lease(tmp_path: 
         _assert_no_holder_secrets(lease)
         assert lease["lease_digest"] == claimed["lease_digest"]
         assert (lease["generation"], lease["fencing_token"]) == (claimed["generation"], claimed["fencing_token"])
-    for body in (json.dumps(status), json.dumps(listed), competing.text):
+    for body in (json.dumps(status_body), json.dumps(listed), competing.text):
         assert not any(secret in body for secret in _HOLDER_SECRETS), body
 
     # The strongest reader: it also knows the holder's instance id and pid from elsewhere and guesses the ids.
@@ -693,6 +701,7 @@ def test_epics_graph_store_lease_and_decision_passthrough(tmp_path: Path, monkey
     assert epic_7919["lease"] is not None
     _assert_no_holder_secrets(epic_7919["lease"])
     assert epic_7919["lease"]["lease_digest"] == lease["lease_digest"]
+    assert not any(secret in json.dumps(epic_7919) for secret in _HOLDER_SECRETS)  # entries included
     assert epic_7919["last_state"]["body"] == "working on graph"
     assert epic_7919["last_decision"]["body"] == "design approved"
 

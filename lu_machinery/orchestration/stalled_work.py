@@ -621,13 +621,14 @@ def route(report: dict[str, Any], *, cycle: int, service: AuthorityService) -> l
             str(r.get("stream_id")), str(r.get("lease_digest")), str(r.get("generation")), str(r.get("task_id"))
         ),
     ):
+        # Only stable public lease fields: the key stays fixed for the lease, so the body must too. The row's
+        # run_nonce comes from a matching turn record, which can appear or age out between cycles.
         identity = {
             "kind": "held_turn_lease",
             "stream_id": row.get("stream_id"),
             "lease_digest": row.get("lease_digest"),
             "generation": row.get("generation"),
             "task_id": row.get("task_id"),
-            "run_nonce": row.get("run_nonce"),
         }
         payload = json.dumps(identity, sort_keys=True, separators=(",", ":"))
         stream_key = str(row.get("stream_id") or "unknown")

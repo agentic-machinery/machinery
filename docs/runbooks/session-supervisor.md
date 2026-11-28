@@ -523,6 +523,13 @@ print(f"released {stream_id} task_id={tid} lease_digest={expected}")
 ' epic:<N> <task-id> <run-nonce>
 ```
 
+**Upgrade cutover (machinery-infra#1659).** Before this release, lease status published every
+holder's envelope, and dispatch turns derived their lease ids from a published run nonce, so a
+lease claimed before the upgrade may be known to other local readers. After the upgrade window
+restarts Monitor, relaunch every driver so each holds a lease claimed after the upgrade, and
+confirm with the runbook recipe that no dispatch-turn lease claimed before the upgrade is still
+held (release it through the recipe if one is).
+
 Do **not** run the exact-envelope recipe on an `active` (unexpired) lease, and do **not**
 use `session_supervisor release --force` for `dispatch-turn` lease recovery while
 `release --force` is scoped only by `stream_id` and not fenced to a specific `lease_id`

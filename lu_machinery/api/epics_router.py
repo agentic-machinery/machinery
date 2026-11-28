@@ -452,11 +452,15 @@ def _digest_response(digest: StreamDigest) -> dict[str, Any]:
 
 
 def _safe_entry(payload: dict[str, Any]) -> dict[str, Any]:
-    """Never echo legacy unsafe text or URI references through the remote API."""
+    """Never echo legacy unsafe text or URI references through the remote API.
+
+    The writer's ``session_id`` is part of its lease envelope, so no published entry carries it
+    (machinery-infra#1659); the entry keeps its id, author agent and harness.
+    """
     safe = {
         **payload,
         "stream": _response_stream(payload.get("stream")),
-        "session_id": _response_token(payload.get("session_id")),
+        "session_id": "[redacted]",
         "agent": _response_token(payload.get("agent")),
         "harness": _response_token(payload.get("harness")),
         "idempotency_key": _response_token(payload.get("idempotency_key")),

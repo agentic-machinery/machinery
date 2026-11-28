@@ -23,6 +23,7 @@ from lu_machinery.agent_runtime.accounting import recorded_model_accounting_fiel
 from lu_machinery.agent_runtime.codex_accounts import CODEX_ACCOUNT_ALIASES, CODEX_ACCOUNT_LABELS, DEFAULT_CODEX_ACCOUNT
 from lu_machinery.common import json_depth
 from lu_machinery.common.task_store_paths import read_cached_task_record
+from lu_machinery.dispatcher.host_admission import TURN_LEASE_KEY
 from lu_machinery.dispatcher.ownership import effective_scope
 from lu_machinery.lib.readonly_sqlite import SQLiteConnection
 from lu_machinery.orchestration.fleet_repos import parse_ascii_positive_int
@@ -923,8 +924,13 @@ def list_delegate_tasks(
 
 
 def _public_task_metadata(task: dict[str, Any]) -> dict[str, Any]:
-    """Keep accounting facts; selectors and substitution diagnostics are private."""
-    return {key: value for key, value in task.items() if key not in {"substitution", "requested_selector"}}
+    """Keep accounting facts; selectors and substitution diagnostics are private.
+
+    A dispatch turn's lease envelope (``TURN_LEASE_KEY``) is the proof of holding its stream lease: any loopback
+    reader of this route could renew or release that lease with it (machinery-infra#1659). The record keeps it.
+    """
+    private = {"substitution", "requested_selector", TURN_LEASE_KEY}
+    return {key: value for key, value in task.items() if key not in private}
 
 
 def get_delegate_task_detail(
