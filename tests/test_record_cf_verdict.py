@@ -3874,13 +3874,14 @@ _SNIPPET = '{"overall": {"review_complete": true}}'
 @pytest.mark.parametrize("prior", [
     "prose", "missing", "false", "true", "prose-then-true", "inline-code", "python-fence", "unversioned-json-fence",
     "indented", "html-code", "html-comment", "quoted-v1", "multiline-code-v1", "html-wrapped-v1", "false-plus-example",
+    "escaped-key-in-code", "image-code", "link-title", "schema-invalid-true",
 ])
 def test_format_correction_never_sets_review_complete(prior):
     """Defect class: format-only retry upgrades completion.
 
     The correction lock keeps the original attestation: a reply that did not attest JSON ``true`` (a prose
-    approval, a missing or false value, an attestation only quoted, shown as code or HTML, unversioned, or
-    beside another copy) never gains it, and one whose one top-level findings object did keeps it.
+    approval, a missing or false value, or an object beside prose, quoted, shown as code or HTML, or
+    unversioned) never gains it. Only a reply the strict reader reads as one findings object keeps it.
     """
     from lu_machinery.review.review_contract import canonical_receipt_payload, decision_lock, same_decision
 
@@ -3903,9 +3904,15 @@ def test_format_correction_never_sets_review_complete(prior):
         "multiline-code-v1": "Verified.\n``\n" + v1 + "\n``",
         "html-wrapped-v1": "Verified.\n<code>\n" + v1 + "\n</code>",
         "false-plus-example": json.dumps(_completion(attested_payload(attestation=None), False)) + f"\n\nSee `{_SNIPPET}`.",
+        "escaped-key-in-code": "Checked review_complete.\n``\n" + v1.replace("review_complete", "review\\u005fcomplete") + "\n``",
+        "image-code": "Verified.\n![``\n" + v1 + "\n``](x.png)",
+        "link-title": "Verified [x](https://example.invalid '\n" + v1 + "\n')",
+        # A schema-invalid object (no confidence) the strict reader still reads keeps its attestation.
+        "schema-invalid-true": json.dumps({**attested, "overall": {
+            key: value for key, value in attested["overall"].items() if key != "confidence"}}),
     }[prior]
     lock = decision_lock(raw)
-    keeps = prior in {"true", "prose-then-true"}
+    keeps = prior in {"true", "schema-invalid-true"}
     assert same_decision(lock, attested) is keeps
     if keeps:
         assert same_decision(lock, _completion(attested_payload(attestation=None), ...)) is False

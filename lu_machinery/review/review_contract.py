@@ -488,37 +488,18 @@ def decision_lock(raw: str) -> dict[str, Any]:
 
 
 def _locked_attestation(raw: str) -> bool:
-    """Whether the reply itself attests completion, read as the verdict readers read its findings object.
+    """Whether the reply itself attests completion, read by the strict reader and nothing else.
 
-    True only when the reply has exactly one top-level ``code-review-findings.v1`` object, it carries JSON
-    ``true`` at ``overall.review_complete``, the key appears nowhere else in the raw text and not inside code,
-    and the reply holds no raw HTML (which can show any text as code or hide it). Any other copy (code, a
-    quotation, HTML, a comment, an escape) makes the attestation ambiguous, so it is not locked.
+    True only when ``parse_reviewer_json`` reads the reply (bare JSON, one whole closed fence or the
+    review-loop envelope) as a ``code-review-findings.v1`` object with JSON ``true`` at
+    ``overall.review_complete``. An object anywhere else in the reply, in prose, code, a quotation or HTML,
+    attests nothing, so a correction of such a reply never carries completion.
     """
-    from markdown_it import MarkdownIt
-
-    from lu_machinery.review.verdict_parser import _FINDINGS_ENVELOPE_KEYS, _top_level_json_values
-
-    candidates = [
-        value for value in _top_level_json_values(raw)
-        if isinstance(value, dict) and _FINDINGS_ENVELOPE_KEYS & value.keys()
-    ]
-    if not (
-        len(candidates) == 1
-        and candidates[0].get("schema_version") == SCHEMA_VERSION
-        and attests_completion(candidates[0])
-        and raw.count("review_complete") == 1
-    ):
+    try:
+        payload = parse_reviewer_json(raw)
+    except ContractError:
         return False
-    for token in MarkdownIt("commonmark").parse(raw):
-        for item in (token, *(token.children or ())):
-            if item.type in {"html_inline", "html_block"}:
-                return False
-            shown_as_code = item.type in {"code_inline", "code_block"} or (
-                item.type == "fence" and item.info.strip() not in {"", "json"})
-            if shown_as_code and "review_complete" in item.content:
-                return False
-    return True
+    return payload.get("schema_version") == SCHEMA_VERSION and attests_completion(payload)
 
 
 def same_decision(lock: Mapping[str, Any], payload: Mapping[str, Any]) -> bool:
