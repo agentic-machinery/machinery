@@ -33,6 +33,16 @@ def priority_for_level(level: int) -> int:
     return _DEBUG
 
 
+def _journal_text(text: str) -> str:
+    """Text journald can store: no raw NUL, no unpaired surrogate.
+
+    A Linux filename that is not UTF-8 arrives as a Python surrogate escape.
+    Strict UTF-8 encoding would raise and drop the record.
+    """
+    text = text.replace("\x00", "\\x00")
+    return text.encode("utf-8", errors="backslashreplace").decode("utf-8")
+
+
 def _chunks(payload: str, priority: int) -> list[str]:
     """Prefix one logical line, splitting so each raw line stays within LineMax."""
     limit = _LINE_MAX - _PREFIX_BYTES
@@ -63,15 +73,16 @@ def prefix_lines(text: str, priority: int) -> str:
     """Prefix the first line with ``<priority>`` and each later line with ``<7>``.
 
     ``priority`` must be an integer 0 through 7. A bool is refused: it is an int
-    subclass, and ``True`` would otherwise become priority 1. NUL bytes are
-    escaped and a line longer than journald's default LineMax is split, so
-    every entry journald creates still starts with a prefix we chose.
+    subclass, and ``True`` would otherwise become priority 1. NUL bytes and
+    unpaired surrogates are escaped, and a line longer than journald's default
+    LineMax is split, so every entry journald creates still starts with a
+    prefix we chose.
     """
     if type(priority) is not int or not 0 <= priority <= 7:
         raise ValueError(f"journal priority must be an integer 0..7, got {priority!r}")
     keep_newline = text.endswith("\n")
     body = text[:-1] if keep_newline else text
-    body = body.replace("\x00", "\\x00")
+    body = _journal_text(body)
     lines = body.split("\n")
     prefixed_lines: list[str] = []
     for index, line in enumerate(lines):

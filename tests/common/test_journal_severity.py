@@ -66,3 +66,14 @@ def test_multiline_record_counts_once():
     assert long_lines[0].startswith("<3>")
     assert all(line.startswith("<7>") for line in long_lines[1:])
     assert all(len(line.encode()) <= 48 * 1024 for line in long_lines)
+
+    # A non-UTF-8 filename arrives as a surrogate. Strict encoding would drop the record.
+    surrogate = formatter.format(
+        logging.LogRecord("api.test", logging.WARNING, __file__, 1, "plan \udc80.json unreadable", (), None)
+    )
+    surrogate.encode("utf-8")
+    assert "\udc80" not in surrogate
+    assert "\\udc80" in surrogate
+    surrogate_lines = surrogate.split("\n")
+    assert len(surrogate_lines) == 1
+    assert surrogate_lines[0].startswith("<4>")
