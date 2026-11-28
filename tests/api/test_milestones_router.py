@@ -424,9 +424,9 @@ assert.match(html, /Private issue/);
 assert.match(html, /<h2 id="ready-now">Ready now<\\/h2>/);
 
 // Header chips lead with blocked and overdue, then ready now and open.
-assert.match(chips, /<b>2<\\/b> blocked/);
-assert.match(chips, /<b>2<\\/b> overdue/);
-assert.match(chips, /<b>2<\\/b> ready now/);
+assert.match(chips, /<b>2<\\/b> blocked \\(public\\)/);
+assert.match(chips, /<b>2<\\/b> overdue \\(public\\)/);
+assert.match(chips, /<b>2<\\/b> ready now \\(public\\)/);
 assert.match(chips, /<b>6<\\/b> open/);
 assert.ok(chips.indexOf("blocked") < chips.indexOf("overdue"));
 assert.ok(chips.indexOf("overdue") < chips.indexOf("open"));
@@ -602,7 +602,9 @@ twoIssueData.repositories[0].milestones[0].issues.push({{
   labels: [],
 }});
 const observedHtml = renderMilestones(twoIssueData, partialPlanning, now);
-assert.equal(summaryCellsFor(observedHtml, "v0.4.0")[1], "1 observed");
+assert.equal(summaryCellsFor(observedHtml, "v0.4.0")[1], "unknown", "a partial count is never shown as observed");
+assert.match(observedHtml, /<h4>Blocked \\(count unknown\\)<\\/h4>/);
+assert.match(observedHtml, /<h4>Other open \\(count unknown\\)<\\/h4>/);
 
 // F2: Unmatched blockers are classified outside open milestones ONLY when repo milestone & issue coverage is complete and fresh.
 const completeWithOutside = {{
@@ -770,8 +772,10 @@ emptyCardData.repositories[0].milestones[0].issues = [];
 emptyCardData.repositories[0].milestones[0].open_issues = 0;
 const emptyCardReading = {{data: emptyCardData, ageHeader: "60", boundHeader: "420", state: "fresh", receivedAt: now}};
 const emptyCardExpired = renderMilestones(emptyCardData, okPlanning, now + 400000, null, emptyCardReading);
-assert.match(emptyCardExpired, /No open issues in the last known snapshot\\./);
-assert.match(emptyCardExpired, /8 of 8 closed \\(last known\\)/);
+assert.match(emptyCardExpired, /Open issues unknown: the milestone snapshot is stale\\./);
+assert.match(emptyCardExpired, /<p class="milestone-counts">unknown<\\/p>/);
+assert.doesNotMatch(emptyCardExpired, /8 of 8 closed/);
+assert.deepEqual(summaryCellsFor(emptyCardExpired, "v0.4.0").slice(1, 6), ["unknown", "unknown", "unknown", "unknown", "unknown"]);
 assert.doesNotMatch(emptyCardExpired, /<p class="muted">No open issues\\.<\\/p>/);
 
 // A live Planning match never stays under expired membership: fresh, the blocked issue sits in its
@@ -790,9 +794,9 @@ assert.equal(summaryCellsFor(matchExpiredHtml, "v0.4.0")[1], "unknown");
 assert.doesNotMatch(matchExpiredHtml, /<h4>Blocked \\(1\\)<\\/h4>/);
 assert.match(matchExpiredHtml, /milestone snapshot is stale; issues below are last known/);
 assert.match(matchExpiredHtml, /Blocked issues \\(milestone membership unknown: 2\\)/);
-assert.match(matchExpiredHtml, /<caption class="warn">Last known values: the milestone snapshot is STALE\\.<\\/caption>/);
+assert.match(matchExpiredHtml, /<caption class="warn">Last known milestones: the milestone snapshot is STALE, so their counts and due dates are unknown\\.<\\/caption>/);
 const matchExpiredChips = renderMilestoneChips({{milestones: data, planning: matchedPlanning}}, now + 400000, null, matchReading);
-assert.match(matchExpiredChips, /<b>2<\\/b> blocked \\(incomplete\\)/);
+assert.match(matchExpiredChips, /<b>unknown<\\/b> blocked \\(incomplete\\)/, "a positive count over a coverage gap is unknown");
 assert.match(matchExpiredChips, /<b>unknown<\\/b> ready now \\(incomplete\\)/);
 assert.match(matchExpiredChips, /<b>unknown<\\/b> open \\(stale\\)/);
 // A fresh partial snapshot keeps the positive match from its fresh repository.
@@ -804,5 +808,50 @@ const matchPartialHtml = renderMilestones(partialSnapshot, matchedPlanning, now,
 assert.match(matchPartialHtml, /<h4>Blocked \\(1\\)<\\/h4>/);
 assert.doesNotMatch(matchPartialHtml, /milestone membership unknown/);
 assert.match(matchPartialHtml, /Blocked issues outside open milestones \\(1\\)/);
+
+// #1573-r3-F1: an unknown or partial issue list beside a cached zero open count never reads 0 blocked,
+// even when Planning blocks an issue of that milestone.
+const blocksTen = JSON.parse(JSON.stringify(okPlanning));
+blocksTen.issues.blocked = [{{ref: "fixture/machinery#10", blocked_by: ["fixture/machinery#1"], private_blockers: 0}}];
+for (const listState of ["unknown", "partial"]) {{
+  const cachedZero = JSON.parse(JSON.stringify(data));
+  Object.assign(cachedZero.repositories[0].milestones[0], {{issues_status: listState, open_issues: 0, issues: []}});
+  assert.equal(summaryCellsFor(renderMilestones(cachedZero, blocksTen, now), "v0.4.0")[1], "unknown", listState);
+}}
+
+// An unreadable due date is unknown, never "no due date" with 0 overdue; a mixed public and private
+// snapshot scopes the overdue count to public milestones.
+const badDue = JSON.parse(JSON.stringify(data));
+badDue.repositories[0].milestones[0].due_on = "not-a-date";
+const badDueCells = summaryCellsFor(renderMilestones(badDue, okPlanning, now), "v0.4.0");
+assert.equal(badDueCells[2], "unknown");
+assert.equal(badDueCells[3], "unknown");
+assert.match(renderMilestoneChips({{milestones: badDue, planning: okPlanning}}, now), /<b>unknown<\\/b> overdue \\(public, incomplete\\)/);
+assert.match(renderMilestoneChips({{milestones: data, planning: okPlanning}}, now), /<b>0<\\/b> overdue \\(public\\)/);
+
+// Partial Planning: no partial number anywhere. Chips, rankings, card counts, disclosure counts and
+// coverage notes read unknown or carry no number; empty lists do not claim none.
+const partialRich = JSON.parse(JSON.stringify(completeWithOutside));
+Object.assign(partialRich.issues, {{
+  status: "partial", workers: "partial",
+  coverage: {{repositories_read: 1, repositories_total: 2, open_issues: 3, dependency_unknown: 2,
+    private_open_issues: 0, path_conflicts: 3, scope_unknown: 4}},
+  blockers: [{{ref: "fixture/machinery#1", direct: 1, total: 1}}],
+}});
+const partialRichHtml = renderMilestones(data, partialRich, now);
+const partialRichChips = renderMilestoneChips({{milestones: data, planning: partialRich}}, now);
+assert.match(partialRichChips, /<b>unknown<\\/b> blocked \\(partial\\)/, "a positive partial count is unknown");
+assert.match(partialRichHtml, /unblocks unknown \\(direct unknown\\)/);
+assert.match(partialRichHtml, /Blocked issues outside open milestones \\(count unknown\\)/);
+assert.match(partialRichHtml, /<h4>Ready now \\(count unknown\\)<\\/h4>/);
+assert.match(partialRichHtml, /Some open issues have unresolved dependencies\\./);
+assert.match(partialRichHtml, /Some ready cards overlap a live worker\\. Some ready cards have no comparable scope paths\\./);
+assert.doesNotMatch(partialRichHtml, /\\b[234] (open issues have|ready cards)/);
+const partialEmpty = JSON.parse(JSON.stringify(partialRich));
+Object.assign(partialEmpty.issues, {{blockers: [], ready_now: []}});
+const partialEmptyHtml = renderMilestones(data, partialEmpty, now);
+assert.match(partialEmptyHtml, /No ranked blockers in the repositories read; the rest are unknown\\./);
+assert.match(partialEmptyHtml, /No ready-now issues in the results read; the rest are unknown\\./);
+assert.doesNotMatch(partialEmptyHtml, /in the current snapshot\\./);
 """
     _run_milestones_node(body)
