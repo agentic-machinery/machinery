@@ -5,12 +5,17 @@ import os
 import shutil
 import subprocess
 import sys
+import venv
 from dataclasses import replace
+from functools import partial
 from pathlib import Path
+
 import pytest
+
+from lu_machinery import host_context
 from lu_machinery.agent_runtime.adapters.codex import _sources_read_only_flags
-from lu_machinery.agent_runtime.sources_read_only import sources_tool_sets
-from lu_machinery.common.repo_root import product_root
+from lu_machinery.agent_runtime.sources_read_only import SERVER_RELATIVE_PATH, sources_tool_sets
+from lu_machinery.common.repo_root import machinery_root, product_root
 from lu_machinery.dispatcher import agy_sandbox, runtime_context, write_boundary
 from lu_machinery.dispatcher.providers import PROVIDERS, load
 from lu_machinery.dispatcher.runtime_context import read_roots
@@ -18,11 +23,7 @@ from lu_machinery.dispatcher.types import ParsedResult, TaskSpec
 from lu_machinery.lib import rules_core
 from tests.agent_runtime.product_roots import agent_runtime_roots  # noqa: F401
 from tests.helpers.product_tree import configured_roots  # noqa: F401
-from lu_machinery.common.repo_root import machinery_root
-
-
-
-
+from tests.host_context.conftest import build_host_layout, installed_hook_env
 
 
 @pytest.mark.parametrize("provider", PROVIDERS)
@@ -967,7 +968,7 @@ def test_agy_typed_failure_classifications_hold(started, error, stderr, expected
 
 _RELAY_SERVER = """import json, sys, time
 from pathlib import Path
-seen = Path(sys.argv[1])
+seen = Path(__file__).with_name("seen.jsonl")
 
 def send(message):
     sys.stdout.write(json.dumps(message) + "\\n")
@@ -1001,17 +1002,90 @@ def _relay_exchange(connection, reader, message):
     return json.loads(reader.readline())
 
 
-def test_agy_sources_relay_forwards_only_read_only_tools_and_counts_matched_results(tmp_path):
+@pytest.fixture
+def relay_layout(tmp_path, monkeypatch):
+    layout = build_host_layout(tmp_path)
+    product = Path(layout.data["repos"]["public"])
+    server = product / SERVER_RELATIVE_PATH
+    server.parent.mkdir(parents=True)
+    monkeypatch.setenv("LU_PRODUCT_ROOT", str(product))
+    # The test runner injects unrelated legacy root assertions. Validate the fixture's own environment.
+    monkeypatch.setattr(host_context, "load_host_context", partial(host_context.load_host_context, env=layout.env))
+    return layout, server
+
+
+def _bind_agy_test_host(monkeypatch, layout, fixture_product):
+    """Give the real sandbox subprocess a validated, fixture-owned product checkout."""
+    env = installed_hook_env(layout)
+    server = Path(env["LU_PRODUCT_ROOT"]) / SERVER_RELATIVE_PATH
+    server.parent.mkdir(parents=True)
+    shutil.copyfile(fixture_product / SERVER_RELATIVE_PATH, server)
+    Path(env["LU_TASKS_DIR"]).mkdir(parents=True, exist_ok=True)
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+
+
+def test_sources_relay_starts_with_binding_product_python(tmp_path, relay_layout):
+    """Defect class: the relay launches on an interpreter without the product's dependencies."""
+    import socket
+
+    layout, server = relay_layout
+    product_env = tmp_path / "product-env"
+    venv.EnvBuilder(symlinks=True).create(product_env)
+    product_python = product_env / "bin/python"
+    runtime_site = next(layout.python.parents[1].glob("lib/python*/site-packages"))
+    product_site = product_env / runtime_site.relative_to(layout.python.parents[1])
+    (product_site / "machinery.pth").write_text(str(runtime_site) + "\n", encoding="utf-8")
+    (product_site / "fixture_sources_dependency.py").touch()
+    layout.data["products"]["public"]["python"] = str(product_python)
+    layout.write()
+    server.write_text("import fixture_sources_dependency\n" + _RELAY_SERVER, encoding="utf-8")
+
+    relay = agy_sandbox.SourcesRelay(tmp_path / "sources.sock", frozenset({"reader"}), {})
+    try:
+        directory = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+        with socket.socket(socket.AF_UNIX) as connection, connection.makefile("rb") as reader:
+            connection.settimeout(5)
+            try:
+                connection.connect(f"/proc/self/fd/{directory}/sources.sock")
+            finally:
+                os.close(directory)
+            connection.sendall(b'{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"reader"}}\n')
+            reply = reader.readline()
+            assert reply, relay.evidence()
+            assert json.loads(reply) == {"jsonrpc": "2.0", "id": 1, "result": {"content": [], "isError": False}}
+        assert relay.evidence()["tools"] == {"reader": 1}
+        assert relay.evidence()["start_failures"] == []
+    finally:
+        relay.cleanup()
+
+
+def test_sources_relay_refuses_invalid_binding(tmp_path, monkeypatch, relay_layout):
+    """A mismatched checkout or invalid interpreter is refused before the relay opens its socket."""
+    layout, _server = relay_layout
+    endpoint = tmp_path / "sources.sock"
+    with monkeypatch.context() as patch:
+        patch.setenv("LU_PRODUCT_ROOT", str(tmp_path))
+        with pytest.raises(agy_sandbox.Refused, match="sources_checkout_mismatch"):
+            agy_sandbox.SourcesRelay(endpoint, frozenset(), {})
+    layout.data["products"]["public"]["python"] = str(tmp_path / "missing-python")
+    layout.write()
+    with pytest.raises(agy_sandbox.Refused, match="sources_host_binding_invalid: invalid_interpreter"):
+        agy_sandbox.SourcesRelay(endpoint, frozenset(), {})
+    assert not endpoint.exists()
+
+
+def test_agy_sources_relay_forwards_only_read_only_tools_and_counts_matched_results(tmp_path, relay_layout):
     """C-3027: writers, unknown methods, batches and reused ids never reach the server; only matched results count."""
     import socket
 
     from lu_machinery.dispatcher.agy_sandbox import SourcesRelay
 
-    server, seen = tmp_path / "server.py", tmp_path / "seen.jsonl"
+    _layout, server = relay_layout
+    seen = server.with_name("seen.jsonl")
     server.write_text(_RELAY_SERVER)
     relay = SourcesRelay(tmp_path / "sources.sock", frozenset({"reader", "failing", "slow", "contentless"}),
                          dict(os.environ))
-    relay.server = [sys.executable, str(server), str(seen)]
     try:
         directory = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
         with socket.socket(socket.AF_UNIX) as connection:
@@ -1052,16 +1126,15 @@ def test_agy_sources_relay_forwards_only_read_only_tools_and_counts_matched_resu
                                             "tools/call:writer": 1}}
 
 
-def test_agy_sources_relay_import_failure_records_startup_exit(tmp_path):
+def test_agy_sources_relay_import_failure_records_startup_exit(tmp_path, relay_layout):
     """An import-time server exit must not leave an empty Sources failure receipt (#569)."""
     import socket
 
     from lu_machinery.dispatcher.agy_sandbox import SourcesRelay
 
-    server = tmp_path / "server.py"
+    _layout, server = relay_layout
     server.write_text("import missing_sources_runtime_package\n")
     relay = SourcesRelay(tmp_path / "sources.sock", frozenset(), dict(os.environ))
-    relay.server = [sys.executable, "-I", str(server)]
     try:
         directory = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
         with socket.socket(socket.AF_UNIX) as connection:
@@ -1083,7 +1156,6 @@ def test_agy_sources_relay_import_failure_records_startup_exit(tmp_path):
     # A healthy stdio server exits when its client closes stdin; that is not startup failure.
     server.write_text("import sys\nsys.stderr.write('INFO server ready\\n')\nsys.stdin.read()\n")
     relay = SourcesRelay(tmp_path / "healthy.sock", frozenset(), dict(os.environ))
-    relay.server = [sys.executable, "-I", str(server)]
     try:
         directory = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
         try:
@@ -1103,7 +1175,6 @@ def test_agy_sources_relay_import_failure_records_startup_exit(tmp_path):
 
     server.write_text("raise RuntimeError('token=example-secret')\n")
     relay = SourcesRelay(tmp_path / "bounded.sock", frozenset(), dict(os.environ))
-    relay.server = [sys.executable, "-I", str(server)]
     try:
         directory = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
         try:
@@ -1311,13 +1382,16 @@ def test_agy_read_only_launcher_refuses_without_bubblewrap_and_never_runs_agy(tm
 
 @pytest.mark.skipif(not _bwrap_usable(), reason="needs a usable unprivileged bubblewrap")
 @pytest.mark.parametrize("has_databases", [False, True])
-def test_agy_read_only_boundary_holds_the_worktree_and_kills_every_descendant(tmp_path, has_databases):
+def test_agy_read_only_boundary_holds_the_worktree_and_kills_every_descendant(
+    tmp_path, has_databases, monkeypatch, configured_roots,  # noqa: F811
+):
     """C-3027: inside the boundary the worktree, Git metadata and database target refuse writes; a killed
     launcher takes the whole sandbox with it."""
     import shlex
     import signal
     import time
 
+    _bind_agy_test_host(monkeypatch, build_host_layout(tmp_path / "host"), configured_roots.product)
     worktree, head = _linked_worktree(tmp_path)
     if not has_databases:
         for name in ("sources.db", "vesum.db"):

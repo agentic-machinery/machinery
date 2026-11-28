@@ -65,7 +65,13 @@ from typing import TYPE_CHECKING
 
 from lu_machinery import host_context
 from lu_machinery.common import json_depth
-from lu_machinery.common.repo_root import configured_interpreter, machinery_path, main_checkout_root, product_root
+from lu_machinery.common.repo_root import (
+    ProductRootError,
+    configured_interpreter,
+    machinery_path,
+    main_checkout_root,
+    product_root,
+)
 from lu_machinery.common.scratch import ensure_scratch_root
 
 if TYPE_CHECKING:
@@ -609,7 +615,20 @@ class SourcesRelay:
     def __init__(self, endpoint: Path, readers: frozenset[str], env: dict[str, str]):
         from lu_machinery.agent_runtime.sources_read_only import SERVER_RELATIVE_PATH
 
-        self.server = [sys.executable, "-I", str(product_root() / SERVER_RELATIVE_PATH)]
+        try:
+            binding = host_context.load_host_context()
+        except host_context.HostContextError as exc:
+            raise Refused(f"sources_host_binding_invalid: {exc.code}") from exc
+        if not isinstance(binding, host_context.HostContext):
+            raise Refused("sources_host_binding_invalid: full host binding required")
+        try:
+            self.checkout = product_root()
+        except ProductRootError as exc:
+            raise Refused("sources_checkout_unavailable: trusted Sources checkout is unavailable") from exc
+        product = binding.products[binding.default_product]
+        if binding.repos[product.repo] != self.checkout:
+            raise Refused("sources_checkout_mismatch: bound product and trusted Sources checkout differ")
+        self.server = [str(product.python), "-I", str(self.checkout / SERVER_RELATIVE_PATH)]
         self.readers, self.env = readers, env
         self.completed = self.failed = 0
         self.tools: dict[str, int] = {}
@@ -655,7 +674,7 @@ class SourcesRelay:
                 connection.close()
                 return
             # Same process group as the launcher, so a killed task takes its servers with it.
-            process = subprocess.Popen(self.server, cwd=product_root(), env=self.env, stdin=subprocess.PIPE,
+            process = subprocess.Popen(self.server, cwd=self.checkout, env=self.env, stdin=subprocess.PIPE,
                                        stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             self.processes.append(process)
         # Drain all stderr without retaining unbounded output or blocking the server on a full pipe.
