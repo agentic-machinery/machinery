@@ -13,7 +13,7 @@
   <div class="header-top">
     <div class="title">
       <h1>Milestones</h1>
-      <p class="purpose">Open milestones, due state, progress, blockers, and ready issues across fleet repositories.</p>
+      <p class="purpose">Open milestones, blocked and overdue work, due state, and ready issues across fleet repositories.</p>
     </div>
     <div class="header-utils">
       <nav class="sites" id="machinery-sites" aria-label="Sites"></nav>
@@ -90,6 +90,14 @@ function issueJoinKey(repoSlug, number) {
   return `${repoSlug.toLowerCase()}#${number}`;
 }
 
+function closedCountText(openCount, closedCount) {
+  if (openCount !== null && closedCount !== null) {
+    return `${closedCount} of ${openCount + closedCount} closed`;
+  }
+  if (closedCount !== null) return `${closedCount} closed (total unknown)`;
+  return "unknown";
+}
+
 function planningAgeSeconds(planning, reading = null, now = Date.now()) {
   const issues = planning && typeof planning === "object" ? planning.issues : null;
   const baseAge = issues && isFiniteNonNeg(issues.age_s) ? issues.age_s : null;
@@ -127,13 +135,11 @@ function analyzePlanning(planning, reading = null, now = Date.now()) {
   const issues = planning.issues;
   const rawStatus = typeof issues.status === "string" ? issues.status : "unknown";
   const ageS = planningAgeSeconds(planning, reading, now);
-  const brokenClock = reading !== null && issues.age_s !== undefined && ageS === null;
-  const invalidAge = issues.age_s !== undefined && !isFiniteNonNeg(issues.age_s);
   const expired = ageS !== null && ageS > PLANNING_STALE_AFTER_S;
+  // Fail closed: ok/partial require a finite non-negative age_s within the freshness bound.
   const status = rawStatus === "pending" ? "pending"
     : (rawStatus === "stale" || expired) ? "stale"
-    : (brokenClock || invalidAge) ? "unknown"
-    : (rawStatus === "ok" || rawStatus === "partial") ? rawStatus
+    : ((rawStatus === "ok" || rawStatus === "partial") && ageS !== null) ? rawStatus
     : "unknown";
   const usable = status === "ok" || status === "partial";
   const coverage = issues.coverage && typeof issues.coverage === "object" ? issues.coverage : {};
@@ -142,6 +148,7 @@ function analyzePlanning(planning, reading = null, now = Date.now()) {
   const readyByRef = new Map();
   const readyNowSet = new Set();
   const blockedList = usable && Array.isArray(issues.blocked) ? issues.blocked : [];
+  const readyNow = usable && workers !== "unknown" && Array.isArray(issues.ready_now) ? issues.ready_now : [];
   if (usable) {
     for (const row of blockedList) {
       if (!row || typeof row.ref !== "string") continue;
@@ -155,7 +162,7 @@ function analyzePlanning(planning, reading = null, now = Date.now()) {
       if (!row || typeof row.ref !== "string") continue;
       readyByRef.set(row.ref.toLowerCase(), typeof row.path_status === "string" ? row.path_status : "ready");
     }
-    for (const row of Array.isArray(issues.ready_now) ? issues.ready_now : []) {
+    for (const row of readyNow) {
       if (!row || typeof row.ref !== "string") continue;
       readyNowSet.add(row.ref.toLowerCase());
     }
@@ -178,7 +185,7 @@ function analyzePlanning(planning, reading = null, now = Date.now()) {
     readyByRef,
     readyNowSet,
     blockers: usable && Array.isArray(issues.blockers) ? issues.blockers : [],
-    readyNow: usable && workers !== "unknown" && Array.isArray(issues.ready_now) ? issues.ready_now : [],
+    readyNow,
     blockedList,
     partialNote,
   };
@@ -203,7 +210,10 @@ function anchorSlug(label) {
   return cleaned || "repo";
 }
 
-function dueDisplay(dueOn, now) {
+function dueDisplay(dueOn, now, isPrivate = false) {
+  if (isPrivate) {
+    return {bucket: 2, dueMs: null, overdue: false, label: "withheld", tone: "muted", detail: "due date withheld"};
+  }
   const dueDate = toDate(dueOn);
   if (!dueDate) return {bucket: 2, dueMs: null, overdue: false, label: "—", tone: "muted", detail: "no due date"};
   const dueMs = dueDate.getTime();
@@ -227,25 +237,9 @@ function dueDisplay(dueOn, now) {
   };
 }
 
-function formatPercent(value) {
-  if (typeof value !== "number" || !Number.isFinite(value)) return null;
-  const clamped = Math.max(0, Math.min(100, value));
-  return Math.round(clamped * 10) / 10;
-}
-
-function progressMarkup(item, titlePlain, compact = false) {
-  const open = isNonNegInt(item.open_issues) ? item.open_issues : null;
-  const closed = isNonNegInt(item.closed_issues) ? item.closed_issues : null;
-  const total = open !== null && closed !== null ? open + closed : null;
-  const pct = formatPercent(item.percent_complete);
-  const pctText = pct !== null ? `${pct}%` : "unknown";
-  const countsText = total !== null
-    ? (compact ? `${closed}/${total} (${pctText})` : `${closed} of ${total} closed (${pctText})`)
-    : `${pctText} complete`;
-  const bar = pct !== null
-    ? `<progress class="ms-progress" max="100" value="${pct}" aria-label="${escapeHtml(titlePlain)} completion">${escapeHtml(pctText)}</progress>`
-    : "";
-  return `<span class="milestone-progress">${bar}<span>${escapeHtml(countsText)}</span></span>`;
+function isIssueReadyNow(enriched, plan) {
+  if (!plan.usable || plan.workers === "unknown") return false;
+  return enriched.readyStatus === "ready_now" || (Boolean(enriched.key) && plan.readyNowSet.has(enriched.key));
 }
 
 function collectMilestones(data, plan, now) {
@@ -271,8 +265,7 @@ function collectMilestones(data, plan, now) {
     for (const [index, item] of milestones.entries()) {
       if (!item || typeof item !== "object") continue;
       const titlePlain = isPrivate ? "Private milestone" : String(item.title || "(untitled milestone)");
-      const due = isPrivate ? dueDisplay(null, now) : dueDisplay(item.due_on, now);
-      const pct = formatPercent(item.percent_complete);
+      const due = dueDisplay(item.due_on, now, isPrivate);
       const number = !isPrivate && Number.isInteger(item.number) && item.number > 0 ? item.number : null;
       let anchorId = null;
       if (!isPrivate) {
@@ -304,7 +297,7 @@ function collectMilestones(data, plan, now) {
 
       // Blocked count cell: fail closed!
       // Private -> always "withheld".
-      // Planning unusable (unknown/stale/pending/errored) -> always "unknown", never 0.
+      // Planning unusable (unknown/stale/pending/errored/missing age) -> always "unknown", never 0.
       // Incomplete issue list with open issues -> "unknown" if 0 observed, else "<n> (partial)".
       let blockedCell;
       let blockedCountKnown = null;
@@ -327,6 +320,18 @@ function collectMilestones(data, plan, now) {
         };
       }
 
+      // Overdue open-issue count cell: fail closed for private milestones (due_on is withheld).
+      let overdueCell;
+      if (isPrivate) {
+        overdueCell = {text: "withheld", tone: "muted"};
+      } else if (due.overdue) {
+        overdueCell = openCount === null
+          ? {text: "?", tone: "warn"}
+          : {text: String(openCount), tone: openCount > 0 ? "bad" : ""};
+      } else {
+        overdueCell = {text: "0", tone: ""};
+      }
+
       entries.push({
         isPrivate,
         repoSlug: isPrivate ? null : (typeof repo.repository === "string" ? repo.repository : null),
@@ -337,13 +342,13 @@ function collectMilestones(data, plan, now) {
         titlePlain,
         description: isPrivate ? "" : String(item.description_first_line || ""),
         due,
-        pct,
         openCount,
         closedCount,
         issuesStatus,
         blockedIssues,
         unblockedIssues,
         blockedCell,
+        overdueCell,
         blockedCountKnown,
         item,
       });
@@ -353,9 +358,15 @@ function collectMilestones(data, plan, now) {
   entries.sort((a, b) => {
     if (a.due.bucket !== b.due.bucket) return a.due.bucket - b.due.bucket;
     if (a.due.bucket < 2 && a.due.dueMs !== b.due.dueMs) return a.due.dueMs - b.due.dueMs;
-    const aPct = a.pct === null ? -1 : a.pct;
-    const bPct = b.pct === null ? -1 : b.pct;
-    if (aPct !== bPct) return bPct - aPct;
+    const aBlocked = a.blockedCountKnown && a.blockedCountKnown > 0 ? a.blockedCountKnown : 0;
+    const bBlocked = b.blockedCountKnown && b.blockedCountKnown > 0 ? b.blockedCountKnown : 0;
+    if (aBlocked !== bBlocked) return bBlocked - aBlocked;
+    const aOpen = a.openCount === null ? -1 : a.openCount;
+    const bOpen = b.openCount === null ? -1 : b.openCount;
+    if (aOpen !== bOpen) return bOpen - aOpen;
+    const aClosed = a.closedCount === null ? -1 : a.closedCount;
+    const bClosed = b.closedCount === null ? -1 : b.closedCount;
+    if (aClosed !== bClosed) return bClosed - aClosed;
     return a.repoLabel.localeCompare(b.repoLabel)
       || a.titlePlain.localeCompare(b.titlePlain)
       || (a.number ?? 0) - (b.number ?? 0);
@@ -364,13 +375,17 @@ function collectMilestones(data, plan, now) {
   return {entries, repoProblems, repos};
 }
 
-function readyStatusBadge(readyStatus, plan) {
-  if (!plan.usable) return "";
-  if (readyStatus === "ready_now") return '<span class="ms-badge ok">Ready now</span>';
+function readyStatusBadge(enriched, plan) {
+  if (!plan.usable) return '<span class="warn">unknown</span>';
+  if (isIssueReadyNow(enriched, plan)) return '<span class="ms-badge ok">Ready now</span>';
+  const readyStatus = enriched.readyStatus;
+  if (readyStatus === "ready_now" && plan.workers === "unknown") {
+    return '<span class="ms-badge warn">Ready · worker paths unknown</span>';
+  }
   if (readyStatus === "path_conflicts") return '<span class="ms-badge warn">Path conflict</span>';
   if (readyStatus === "scope_unknown") return '<span class="ms-badge muted">Scope unknown</span>';
   if (readyStatus === "worker_scope_unknown") return '<span class="ms-badge warn">Ready · worker paths unknown</span>';
-  if (readyStatus) return `<span class="ms-badge ok">Ready</span>`;
+  if (readyStatus) return '<span class="ms-badge ok">Ready</span>';
   return plan.status === "partial"
     ? '<span class="ms-badge muted">Status unknown (partial)</span>'
     : '<span class="ms-badge muted">Deps unknown</span>';
@@ -390,6 +405,15 @@ function renderIssueTitleLink(issue) {
     : escapeHtml(label);
 }
 
+function renderIssueStatusTable(items, plan) {
+  const rows = items.map(enriched => [
+    td(renderIssueTitleLink(enriched.issue)),
+    td(readyStatusBadge(enriched, plan)),
+    td(renderIssueLabels(enriched.issue.labels)),
+  ]);
+  return renderTable(["Issue", "Status", "Labels"], rows);
+}
+
 function renderMilestoneCard(entry, plan) {
   const closedUrl = milestoneClosedUrl(entry.repoSlug, entry.number);
   const closedLink = closedUrl
@@ -402,7 +426,7 @@ function renderMilestoneCard(entry, plan) {
     `<h3>${escapeHtml(entry.titlePlain)} <span class="muted">· ${escapeHtml(entry.repoLabel)} · </span><span${dueClass}>${escapeHtml(entry.due.detail)}</span></h3>`,
     closedLink,
     `</div>`,
-    `<div class="milestone-progress-row">${progressMarkup(entry.item, entry.titlePlain, false)}</div>`,
+    `<p class="milestone-counts">${escapeHtml(closedCountText(entry.openCount, entry.closedCount))}</p>`,
   ];
   if (entry.description) {
     parts.push(`<p class="muted">${escapeHtml(entry.description)}</p>`);
@@ -414,9 +438,13 @@ function renderMilestoneCard(entry, plan) {
     const why = plan.status === "stale" ? "planning snapshot is stale"
       : plan.status === "pending" ? "planning data is still loading"
       : "planning data is unavailable";
-    parts.push(`<p class="warn">Blocker status unknown (${escapeHtml(why)}).</p>`);
+    parts.push(`<p class="warn">Blocker and ready-now status unknown (${escapeHtml(why)}).</p>`);
+  } else if (plan.workers === "unknown") {
+    parts.push('<p class="warn">Worker paths are unavailable; ready-now status is withheld.</p>');
   }
 
+  // Order inside each milestone: Blocked (with blockers), Overdue, Ready now, then the rest.
+  // (Needs-the-owner is omitted because no existing label or card field marks an owner decision.)
   if (plan.usable && entry.blockedIssues.length) {
     const rows = entry.blockedIssues.map(({issue, blockerInfo}) => {
       const depLinks = blockerInfo.blocked_by.map(ref => issueRefLink(ref, entry.repoSlug));
@@ -437,14 +465,30 @@ function renderMilestoneCard(entry, plan) {
   }
 
   if (entry.unblockedIssues.length) {
-    const heading = plan.usable ? `Open (${entry.unblockedIssues.length})` : `Open issues (${entry.unblockedIssues.length})`;
-    const rows = entry.unblockedIssues.map(({issue, readyStatus}) => [
-      td(renderIssueTitleLink(issue)),
-      td(plan.usable ? readyStatusBadge(readyStatus, plan) : '<span class="warn">unknown</span>'),
-      td(renderIssueLabels(issue.labels)),
-    ]);
-    parts.push(`<h4>${heading}</h4>`);
-    parts.push(renderTable(["Issue", "Status", "Labels"], rows));
+    if (entry.due.overdue) {
+      const readyFirst = [
+        ...entry.unblockedIssues.filter(item => isIssueReadyNow(item, plan)),
+        ...entry.unblockedIssues.filter(item => !isIssueReadyNow(item, plan)),
+      ];
+      parts.push(`<h4>Overdue (${readyFirst.length})</h4>`);
+      parts.push(renderIssueStatusTable(readyFirst, plan));
+    } else {
+      const readyNowIssues = entry.unblockedIssues.filter(item => isIssueReadyNow(item, plan));
+      const otherOpenIssues = entry.unblockedIssues.filter(item => !isIssueReadyNow(item, plan));
+      if (readyNowIssues.length) {
+        parts.push(`<h4>Ready now (${readyNowIssues.length})</h4>`);
+        parts.push(renderIssueStatusTable(readyNowIssues, plan));
+      }
+      if (otherOpenIssues.length) {
+        const heading = !plan.usable
+          ? `Open issues (${otherOpenIssues.length})`
+          : (entry.blockedIssues.length || readyNowIssues.length)
+            ? `Other open (${otherOpenIssues.length})`
+            : `Open (${otherOpenIssues.length})`;
+        parts.push(`<h4>${heading}</h4>`);
+        parts.push(renderIssueStatusTable(otherOpenIssues, plan));
+      }
+    }
   } else if (entry.issuesStatus === "ok" && !entry.blockedIssues.length) {
     parts.push('<p class="muted">No open issues.</p>');
   }
@@ -545,7 +589,7 @@ function renderFreshnessStrip(data, plan) {
     notes.push(`${plan.coverage.dependency_unknown} open issues have unresolved dependencies.`);
   }
   if (plan.coverage.private_open_issues) notes.push("Private issue details are withheld.");
-  notes.push("Private repositories show counts only.");
+  notes.push("Private repositories show counts only; titles, due dates, and blockers are withheld.");
   return `<p class="${warn ? "warn" : "muted"}">${escapeHtml(notes.join(" "))}</p>`;
 }
 
@@ -578,15 +622,15 @@ function renderMilestones(data, planning = null, now = Date.now(), planningReadi
         : td(`<a href="#${escapeHtml(entry.anchorId)}">${escapeHtml(entry.titlePlain)}</a>`);
       return [
         nameCell,
-        text(entry.repoLabel, entry.isPrivate ? "muted" : ""),
-        text(entry.due.label, entry.due.tone),
-        td(progressMarkup(entry.item, entry.titlePlain, true)),
-        text(entry.openCount === null ? "?" : String(entry.openCount), "num"),
-        text(entry.closedCount === null ? "?" : String(entry.closedCount), "num"),
         text(entry.blockedCell.text, `num${entry.blockedCell.tone ? ` ${entry.blockedCell.tone}` : ""}`),
+        text(entry.overdueCell.text, `num${entry.overdueCell.tone ? ` ${entry.overdueCell.tone}` : ""}`),
+        text(entry.due.label, entry.due.tone),
+        text(entry.openCount === null ? "?" : String(entry.openCount), "num"),
+        text(closedCountText(entry.openCount, entry.closedCount)),
+        text(entry.repoLabel, entry.isPrivate ? "muted" : ""),
       ];
     });
-    out.push(renderTable(["Milestone", "Repo", "Due", "Progress", "Open", "Closed", "Blocked"], summaryRows, [4, 5, 6]));
+    out.push(renderTable(["Milestone", "Blocked", "Overdue", "Due", "Open", "Closed", "Repo"], summaryRows, [1, 2, 4]));
 
     const publicEntries = entries.filter(entry => !entry.isPrivate);
     if (publicEntries.length) {
@@ -616,30 +660,45 @@ function renderMilestoneChips(latest, now = Date.now(), planningReading = null) 
   const {entries, repoProblems, repos} = collectMilestones(data, plan, now);
   const allReposFailed = !repos.length || repos.every(repo => !repo || (repo.status !== "ok" && repo.status !== "partial"));
   const out = [];
-  if (allReposFailed) {
-    out.push(chip("#milestones", "?", "open milestones unknown", "warn"));
-  } else {
-    const partial = repoProblems.length > 0;
-    out.push(chip("#milestones", entries.length, partial ? "open observed" : "open", partial ? "warn" : ""));
-    const overdue = entries.filter(entry => entry.due.overdue).length;
-    out.push(chip("#milestones", overdue, "overdue", overdue > 0 ? "bad" : partial ? "warn" : ""));
-  }
 
   if (!plan.usable) {
     out.push(chip("#top-blockers", "?", "blocked", "warn"));
-    out.push(chip("#ready-now", "?", "ready now", "warn"));
   } else {
     const blockedTotal = plan.blockedList.length;
     const isPartial = plan.status === "partial";
     out.push(chip("#top-blockers", blockedTotal, isPartial ? "blocked (partial)" : "blocked",
       blockedTotal > 0 ? "bad" : isPartial ? "warn" : ""));
-    if (plan.workers === "unknown") {
+  }
+
+  if (allReposFailed) {
+    out.push(chip("#milestones", "?", "open milestones unknown", "warn"));
+  } else {
+    const partial = repoProblems.length > 0;
+    const allPrivate = entries.length > 0 && entries.every(entry => entry.isPrivate);
+    if (allPrivate) {
+      out.push(chip("#milestones", "withheld", "overdue", ""));
+    } else {
+      const overdue = entries.filter(entry => entry.due.overdue).length;
+      out.push(chip("#milestones", overdue, partial ? "overdue observed" : "overdue",
+        overdue > 0 ? "bad" : partial ? "warn" : ""));
+    }
+    if (!plan.usable || plan.workers === "unknown") {
       out.push(chip("#ready-now", "?", "ready now", "warn"));
     } else {
-      const readyLabel = isPartial || plan.workers === "partial" ? "ready now (partial)" : "ready now";
-      out.push(chip("#ready-now", plan.readyNow.length, readyLabel,
-        isPartial || plan.workers === "partial" ? "warn" : plan.readyNow.length > 0 ? "info" : ""));
+      const isPartial = plan.status === "partial" || plan.workers === "partial";
+      out.push(chip("#ready-now", plan.readyNow.length, isPartial ? "ready now (partial)" : "ready now",
+        isPartial ? "warn" : plan.readyNow.length > 0 ? "info" : ""));
     }
+    out.push(chip("#milestones", entries.length, partial ? "open observed" : "open", partial ? "warn" : ""));
+    return out.join("");
+  }
+
+  if (!plan.usable || plan.workers === "unknown") {
+    out.push(chip("#ready-now", "?", "ready now", "warn"));
+  } else {
+    const isPartial = plan.status === "partial" || plan.workers === "partial";
+    out.push(chip("#ready-now", plan.readyNow.length, isPartial ? "ready now (partial)" : "ready now",
+      isPartial ? "warn" : plan.readyNow.length > 0 ? "info" : ""));
   }
   return out.join("");
 }
@@ -658,7 +717,8 @@ function repaintMilestones(now = Date.now()) {
   if (box) box.innerHTML = renderMilestoneChips(runner.latest, now, latestPlanningReading);
 }
 
-function enrichPlanning() {
+function enrichPlanning(isRetry = false) {
+  if (!isRetry) planningRetries = 0;
   const gen = ++planningGeneration;
   fetchJson(PLANNING_URL).then(reading => {
     if (gen !== planningGeneration) return;
@@ -668,7 +728,7 @@ function enrichPlanning() {
     repaintMilestones(now);
     if (reading.data?.issues?.status === "pending" && planningRetries < Machinery.RETRY_LIMIT) {
       planningRetries += 1;
-      setTimeout(() => { if (gen === planningGeneration) enrichPlanning(); }, 3000);
+      setTimeout(() => { if (gen === planningGeneration) enrichPlanning(true); }, 3000);
     } else {
       planningRetries = 0;
     }
@@ -683,7 +743,7 @@ function enrichPlanning() {
 function expirePlanningIfStale(_panel, _latest, _updateChips, now = Date.now()) {
   if (!runner.latest.planning || !latestPlanningReading) return;
   const ageS = planningAgeSeconds(runner.latest.planning, latestPlanningReading, now);
-  if (ageS !== null && ageS > PLANNING_STALE_AFTER_S && !latestPlanningReading._expiredPainted) {
+  if ((ageS === null || ageS > PLANNING_STALE_AFTER_S) && !latestPlanningReading._expiredPainted) {
     latestPlanningReading._expiredPainted = true;
     repaintMilestones(now);
   }
@@ -703,7 +763,7 @@ const PANELS = [{
   label: "Milestones",
   urls: ["/api/milestones"],
   render: data => renderMilestones(data, runner.latest.planning ?? null, Date.now(), latestPlanningReading),
-  onData: () => enrichPlanning(),
+  onData: () => enrichPlanning(false),
   onTick: expirePlanningIfStale,
   onError: latest => { planningGeneration += 1; latest.planning = null; latestPlanningReading = null; },
   retry: data => data?.status === "pending",

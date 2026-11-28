@@ -466,22 +466,9 @@ table.subs th[colspan] { padding-top: 8px; color: var(--fg); }
   white-space: nowrap;
 }
 
-.milestone-progress-row {
+.milestone-counts {
   margin: 6px 0;
-}
-
-.milestone-progress {
-  display: inline-flex;
-  flex-wrap: wrap;
-  gap: 6px;
-  align-items: center;
   font-variant-numeric: tabular-nums;
-}
-
-progress.ms-progress {
-  width: 72px;
-  height: 10px;
-  vertical-align: middle;
 }
 
 .ms-badge {

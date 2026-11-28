@@ -907,7 +907,7 @@ PAGE_CONTRACTS: tuple[PageContract, ...] = (
     PageContract(
         "milestones.html",
         "/milestones",
-        "Milestones and progress: at-a-glance due state, completion progress, open/closed/blocked counts, blocked issues first, top blockers, and ready-now cards across every registered fleet repository, with private repositories redacted to counts only and blockers withheld.",
+        "Milestones: at-a-glance blocked and overdue counts, due state, plain-text open/closed counts, blocked issues with blockers first, overdue, ready-now, and top blockers across every registered fleet repository, with private repositories showing counts only and titles, due dates, and blockers withheld.",
         "GET /api/milestones and GET /api/fleet/model-stats/planning.",
         "HTTP reads every 30 seconds against the 300-second shared GitHub milestones cache (420-second display bound) and the 300-second planning issue snapshot (420-second bound); unknown, stale, or errored planning shows unknown, never zero.",
         ("humans", "operators"),

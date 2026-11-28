@@ -1212,17 +1212,22 @@ async function loadPools(allowance, generation) {
 }
 function renderPlanning(data) {
   const pools = Array.isArray(data?.capacity) ? data.capacity : [];
-  const pct = value => typeof value === "number" ? `${num(value, 1)}%` : "Unknown";
-  const pace = value => typeof value === "number" ? `${num(value, 2)}%/h` : "Unknown";
+  const pct = value => typeof value === "number" && Number.isFinite(value) ? `${num(value, 1)}%` : "Unknown";
+  const pace = value => typeof value === "number" && Number.isFinite(value) ? `${num(value, 2)}%/h` : "Unknown";
   $("planning-coverage").textContent = pools.length ? "" : "Capacity forecast is loading.";
-  $("planning-pools").innerHTML = pools.length
-    ? table(["Pool", "Remaining", "Reset (UTC)", "Burn", "Burn needed", "Unused at reset",
-        "Additional workers", "Measured writes"], pools.map(row =>
+  if (pools.length) {
+    $("planning-pools").innerHTML = table(
+      ["Pool", "Remaining", "Reset (UTC)", "Burn", "Burn needed", "Unused at reset",
+        "Additional workers", "Measured writes"],
+      pools.map(row =>
         `<tr><td>${esc(row.pool)}</td>${cell(pct(row.remaining_pct))}<td>${esc(row.reset_at || "Unknown")}</td>` +
         `${cell(pace(row.burn_pct_per_hour))}${cell(pace(row.sustainable_pct_per_hour))}` +
         `${cell(pct(row.unused_pct))}${cell(row.workers_needed ?? "Unknown")}${cell(row.worker_samples ?? "Unknown")}</tr>`),
-        [0, 2])
-    : '<p class="muted">Capacity forecast is loading.</p>';
+      [0, 2],
+    );
+  } else {
+    $("planning-pools").replaceChildren();
+  }
   updateTableScroll();
 }
 async function loadPlanning() {
