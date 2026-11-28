@@ -3,12 +3,17 @@
 Exposes typed JSON rows for deliveries addressed to one recipient since a UTC
 timestamp and the messages replying to those deliveries. Every row is normalized
 through ``AuthorityService._delivery_from_row`` and ``AuthorityService.get_message``
-against a read-only ``ArtifactStore`` snapshot: no writes, no migrations, no
-claims, no lease changes, and no message body content.
+against ``ArtifactStore.open_readonly`` (``mode=ro`` plus ``PRAGMA query_only=ON``),
+matching every other Fleet Comms read command: no database writes, no migrations,
+no claims, no lease changes, and no message body content. SQLite may create its
+standard WAL coordination files (``-shm``/``-wal``) beside the store on an idle WAL
+database, and a store directory the caller cannot write fails closed with a typed
+error rather than returning a partial result.
 """
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from dataclasses import asdict
 from datetime import datetime
@@ -26,7 +31,6 @@ from lu_machinery.fleet_comms.authority import (
     AuthorityMessage,
     AuthorityService,
     AuthorityServiceError,
-    _iso,
     _nonempty,
     _parse_iso,
 )
@@ -42,6 +46,11 @@ from lu_machinery.lib.readonly_sqlite import SQLiteConnection
 _VALID_DELIVERY_STATES = frozenset(
     {"queued", "running", "acknowledged", "failed", "expired", "dead_lettered"}
 )
+_OPTIONAL_DELIVERY_TEXT_FIELDS = (
+    "lease_owner",
+    "acknowledgment_artifact_id",
+    "terminal_sha256",
+)
 _SQL_IN_CHUNK_SIZE = 200
 _SORT_LAST = (1, "")
 
@@ -54,6 +63,28 @@ class ExchangeRowsError(RuntimeError):
         super().__init__(code)
 
 
+class _UndecodableText:
+    """Sentinel returned by SQLite ``text_factory`` when a TEXT cell holds invalid UTF-8."""
+
+    __slots__ = ()
+
+    def __str__(self) -> str:
+        raise ValueError("undecodable_utf8_text")
+
+    def __repr__(self) -> str:
+        return "<undecodable-utf8>"
+
+
+_UNDECODABLE_TEXT = _UndecodableText()
+
+
+def _safe_text_factory(raw: bytes) -> str | _UndecodableText:
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return _UNDECODABLE_TEXT
+
+
 def _as_nonempty_str(value: Any, *, error_code: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise AuthorityServiceError(error_code)
@@ -63,7 +94,10 @@ def _as_nonempty_str(value: Any, *, error_code: str) -> str:
 def _parse_required_iso(value: Any, *, field: str) -> datetime:
     if not isinstance(value, str) or not value.strip():
         raise AuthorityServiceError(f"invalid_{field}")
-    return _parse_iso(value, field=field)
+    try:
+        return _parse_iso(value, field=field)
+    except OverflowError as exc:
+        raise AuthorityServiceError(f"invalid_{field}") from exc
 
 
 def _parse_optional_iso(value: Any, *, field: str) -> datetime | None:
@@ -78,6 +112,13 @@ def _require_nonneg_int(value: Any) -> int:
     return value
 
 
+def _require_strict_json(value: Any, *, error_code: str) -> None:
+    try:
+        json.dumps(value, allow_nan=False)
+    except (TypeError, ValueError) as exc:
+        raise AuthorityServiceError(error_code) from exc
+
+
 def _message_to_dict(message: AuthorityMessage) -> dict[str, Any]:
     _as_nonempty_str(message.message_id, error_code="message_row_corrupt")
     _as_nonempty_str(message.conversation_id, error_code="message_row_corrupt")
@@ -86,8 +127,11 @@ def _message_to_dict(message: AuthorityMessage) -> dict[str, Any]:
     _as_nonempty_str(message.kind, error_code="message_row_corrupt")
     _as_nonempty_str(message.body_artifact_id, error_code="message_body_artifact_missing")
     _parse_required_iso(message.created_at, field="created_at")
+    _require_strict_json(message.context_revisions, error_code="context_revisions_corrupt")
+    _require_strict_json(message.provenance, error_code="provenance_corrupt")
     payload = asdict(message)
     payload["delivery_ids"] = list(message.delivery_ids)
+    _require_strict_json(payload, error_code="message_row_corrupt")
     return payload
 
 
@@ -124,16 +168,22 @@ def _normalize_delivery_row(
         raise AuthorityServiceError("invalid_delivery_state")
     _require_nonneg_int(row["fence_token"])
     _require_nonneg_int(row["attempt_count"])
+    for column in _OPTIONAL_DELIVERY_TEXT_FIELDS:
+        value = row[column]
+        if value is not None and not isinstance(value, str):
+            raise AuthorityServiceError("delivery_row_corrupt")
+    created_dt = _parse_required_iso(row["created_at"], field="created_at")
+    _parse_required_iso(row["updated_at"], field="updated_at")
+    _parse_optional_iso(row["deadline_at"], field="deadline_at")
+    _parse_optional_iso(row["lease_expires_at"], field="lease_expires_at")
+    _parse_optional_iso(row["completed_at"], field="completed_at")
     try:
         delivery = service._delivery_from_row(row)
     except (TypeError, ValueError, KeyError) as exc:
         raise AuthorityServiceError("delivery_row_corrupt") from exc
-    created_dt = _parse_required_iso(delivery.created_at, field="created_at")
-    _parse_required_iso(delivery.updated_at, field="updated_at")
-    _parse_optional_iso(delivery.deadline_at, field="deadline_at")
-    _parse_optional_iso(delivery.lease_expires_at, field="lease_expires_at")
-    _parse_optional_iso(delivery.completed_at, field="completed_at")
-    return asdict(delivery), created_dt
+    payload = asdict(delivery)
+    _require_strict_json(payload, error_code="delivery_row_corrupt")
+    return payload, created_dt
 
 
 def _delivery_lifecycle(
@@ -196,6 +246,44 @@ def _chunked(values: list[str], size: int = _SQL_IN_CHUNK_SIZE) -> list[list[str
     return [values[index : index + size] for index in range(0, len(values), size)]
 
 
+def _raw_str_or_none(value: Any) -> str | None:
+    return value if isinstance(value, str) else None
+
+
+def _record_raw_conversation(
+    conn: SQLiteConnection,
+    message_id: str,
+    selected_conversations: set[str],
+) -> None:
+    row = conn.execute(
+        "SELECT conversation_id FROM comms_messages WHERE message_id = ?",
+        (message_id,),
+    ).fetchone()
+    if row is not None and isinstance(row["conversation_id"], str) and row["conversation_id"].strip():
+        selected_conversations.add(row["conversation_id"])
+
+
+def _lookup_parent_in_comms(
+    conn: SQLiteConnection,
+    cache: dict[str, tuple[bool, str | None]],
+    parent_id: str,
+) -> tuple[bool, str | None]:
+    cached = cache.get(parent_id)
+    if cached is not None:
+        return cached
+    row = conn.execute(
+        "SELECT conversation_id FROM comms_messages WHERE message_id = ?",
+        (parent_id,),
+    ).fetchone()
+    if row is None:
+        result: tuple[bool, str | None] = (False, None)
+    else:
+        raw_conv = _raw_str_or_none(row["conversation_id"])
+        result = (True, raw_conv if raw_conv and raw_conv.strip() else None)
+    cache[parent_id] = result
+    return result
+
+
 def _candidate_reply_rows(
     conn: SQLiteConnection,
     *,
@@ -204,23 +292,22 @@ def _candidate_reply_rows(
     conversation_ids: list[str],
 ) -> list[sqlite3.Row]:
     """Collect candidate reply metadata rows without ever selecting message body columns."""
-    seen: set[str] = set()
+    seen_rowids: set[int] = set()
     rows: list[sqlite3.Row] = []
 
     def _collect(fetched: list[sqlite3.Row]) -> None:
         for row in fetched:
-            mid = row["message_id"]
-            key = str(mid) if mid is not None else ""
-            if key in seen:
+            rowid = int(row["rowid"])
+            if rowid in seen_rowids:
                 continue
-            seen.add(key)
+            seen_rowids.add(rowid)
             rows.append(row)
 
     for chunk in _chunked(sorted(delivery_message_ids)):
         placeholders = ", ".join("?" for _ in chunk)
         _collect(
             conn.execute(
-                f"""SELECT message_id, conversation_id, in_reply_to, sender, created_at
+                f"""SELECT rowid, message_id, conversation_id, in_reply_to, sender, created_at
                     FROM comms_messages
                     WHERE in_reply_to IN ({placeholders})
                     ORDER BY created_at ASC, message_id ASC""",
@@ -232,7 +319,7 @@ def _candidate_reply_rows(
         placeholders = ", ".join("?" for _ in chunk)
         _collect(
             conn.execute(
-                f"""SELECT message_id, conversation_id, in_reply_to, sender, created_at
+                f"""SELECT rowid, message_id, conversation_id, in_reply_to, sender, created_at
                     FROM comms_messages
                     WHERE in_reply_to IS NOT NULL AND conversation_id IN ({placeholders})
                     ORDER BY created_at ASC, message_id ASC""",
@@ -242,7 +329,7 @@ def _candidate_reply_rows(
 
     _collect(
         conn.execute(
-            """SELECT message_id, conversation_id, in_reply_to, sender, created_at
+            """SELECT rowid, message_id, conversation_id, in_reply_to, sender, created_at
                FROM comms_messages
                WHERE in_reply_to IS NOT NULL AND sender = ?
                ORDER BY created_at ASC, message_id ASC""",
@@ -250,10 +337,6 @@ def _candidate_reply_rows(
         ).fetchall()
     )
     return rows
-
-
-def _raw_str_or_none(value: Any) -> str | None:
-    return value if isinstance(value, str) else None
 
 
 def read_exchange_rows(
@@ -264,19 +347,16 @@ def read_exchange_rows(
 ) -> dict[str, Any]:
     """Read typed delivery and reply rows for ``recipient`` since UTC ``since``.
 
-    Opens the Fleet Comms SQLite store strictly read-only without running
-    migrations, claiming deliveries, or reading message body content.
+    Opens the Fleet Comms SQLite store read-only via ``ArtifactStore.open_readonly``
+    (matching the existing Fleet Comms read commands): no database writes, no
+    migrations, no claims, no lease changes, and no message body content.
     """
     try:
         recipient_name = _nonempty(recipient, field="recipient")
         since_dt = _parse_required_iso(since, field="since")
     except AuthorityServiceError as exc:
         raise ExchangeRowsError(str(exc)) from exc
-    since_iso = (
-        since_dt.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
-        if since_dt.microsecond
-        else _iso(since_dt)
-    )
+    since_iso = since_dt.isoformat().replace("+00:00", "Z")
 
     try:
         assert_component_supported(StoreId.FLEET_COMMS, "authority_service")
@@ -301,6 +381,12 @@ def read_exchange_rows(
                 conn.setlimit(sqlite3.SQLITE_LIMIT_ATTACHED, 0)
             conn.execute("PRAGMA query_only = ON")
             service = AuthorityService(store=store)
+            previous_text_factory: Any = None
+            installed_text_factory = False
+            if isinstance(conn, sqlite3.Connection):
+                previous_text_factory = conn.text_factory
+                conn.text_factory = _safe_text_factory
+                installed_text_factory = True
             conn.execute("BEGIN")
             try:
                 return _collect_exchange_payload(
@@ -313,6 +399,8 @@ def read_exchange_rows(
             finally:
                 if conn.in_transaction:
                     conn.rollback()
+                if installed_text_factory and isinstance(conn, sqlite3.Connection):
+                    conn.text_factory = previous_text_factory
     except AuthorityServiceError as exc:
         raise ExchangeRowsError(str(exc)) from exc
     except ControlPlaneUnsupportedComponentError as exc:
@@ -330,6 +418,7 @@ def _collect_exchange_payload(
     since_iso: str,
 ) -> dict[str, Any]:
     message_cache: dict[str, tuple[dict[str, Any] | None, str | None]] = {}
+    parent_comms_cache: dict[str, tuple[bool, str | None]] = {}
     delivery_rows_raw = conn.execute(
         """SELECT * FROM authority_deliveries
            WHERE recipient = ?
@@ -364,8 +453,11 @@ def _collect_exchange_payload(
                 "message": None,
             }
             deliveries.append((_sort_key_for_iso(raw["created_at"]), raw_delivery_id or "", row_payload))
-            if raw_message_id and raw_delivery_id:
-                delivery_ids_by_message.setdefault(raw_message_id, []).append(raw_delivery_id)
+            if raw_message_id and raw_message_id.strip():
+                bucket = delivery_ids_by_message.setdefault(raw_message_id, [])
+                if raw_delivery_id and raw_delivery_id.strip():
+                    bucket.append(raw_delivery_id)
+                _record_raw_conversation(conn, raw_message_id, selected_conversations)
             continue
 
         if created_dt < since_dt:
@@ -380,12 +472,7 @@ def _collect_exchange_payload(
         if message_dict is not None:
             selected_conversations.add(str(message_dict["conversation_id"]))
         else:
-            conv_row = conn.execute(
-                "SELECT conversation_id FROM comms_messages WHERE message_id = ?",
-                (message_id,),
-            ).fetchone()
-            if conv_row is not None and isinstance(conv_row["conversation_id"], str) and conv_row["conversation_id"].strip():
-                selected_conversations.add(str(conv_row["conversation_id"]))
+            _record_raw_conversation(conn, message_id, selected_conversations)
 
         row_error = message_error or lifecycle_error
         row_payload = {
@@ -411,7 +498,7 @@ def _collect_exchange_payload(
 
     replies: list[tuple[tuple[int, str], str, dict[str, Any]]] = []
     for raw_reply in reply_candidates:
-        raw_mid = _raw_str_or_none(raw_reply["message_id"]) or ""
+        raw_mid = _raw_str_or_none(raw_reply["message_id"])
         raw_parent = _raw_str_or_none(raw_reply["in_reply_to"])
         raw_conv = _raw_str_or_none(raw_reply["conversation_id"])
         raw_sender = _raw_str_or_none(raw_reply["sender"])
@@ -421,22 +508,33 @@ def _collect_exchange_payload(
             parsed_reply_created = _try_parse_created_at(raw_reply["created_at"])
             if parsed_reply_created is not None and parsed_reply_created < since_dt:
                 continue
+            # Exclude replies whose known parent exists in comms_messages outside the
+            # selected deliveries (e.g., another recipient's message or pre-window delivery).
+            if raw_parent is not None and _lookup_parent_in_comms(conn, parent_comms_cache, raw_parent)[0]:
+                continue
+            if raw_sender != recipient_name and (raw_conv is None or raw_conv not in selected_conversations):
+                continue
 
         parent_delivery_ids = sorted(delivery_ids_by_message.get(raw_parent or "", []))
-        reply_dict, reply_error = _read_message_cached(service, message_cache, raw_mid)
+        reply_dict: dict[str, Any] | None
+        reply_error: str | None
+        if raw_mid is None or not raw_mid.strip():
+            reply_dict, reply_error = None, "message_row_corrupt"
+        else:
+            reply_dict, reply_error = _read_message_cached(service, message_cache, raw_mid)
         if reply_error is not None:
             reply_payload: dict[str, Any] = {
                 "ok": False,
                 "error": reply_error,
                 "reply_link_status": "corrupt_reply",
-                "message_id": raw_mid or None,
+                "message_id": raw_mid,
                 "in_reply_to": raw_parent,
                 "conversation_id": raw_conv,
                 "parent_conversation_id": None,
                 "parent_delivery_ids": parent_delivery_ids,
                 "message": None,
             }
-            replies.append((_sort_key_for_iso(raw_reply["created_at"]), raw_mid, reply_payload))
+            replies.append((_sort_key_for_iso(raw_reply["created_at"]), raw_mid or "", reply_payload))
             continue
 
         assert reply_dict is not None
@@ -454,39 +552,28 @@ def _collect_exchange_payload(
             link_error = "reply_self_reference"
             parent_conv = reply_conv
         else:
-            parent_dict, parent_error = _read_message_cached(service, message_cache, parent_id)
-            if parent_dict is not None:
-                parent_conv = str(parent_dict["conversation_id"])
-                if reply_conv == parent_conv:
-                    if not is_direct_reply:
-                        # Valid reply to a message outside the selected deliveries window.
-                        continue
-                    link_status = "valid"
-                    link_error = None
-                else:
-                    link_status = "other_conversation"
-                    link_error = "reply_thread_mismatch"
-            elif parent_error == "message_not_found":
+            parent_exists, raw_parent_conv = _lookup_parent_in_comms(conn, parent_comms_cache, parent_id)
+            if not parent_exists:
                 link_status = "missing_parent"
                 link_error = "reply_parent_not_found"
+            elif raw_parent_conv is not None and raw_parent_conv != reply_conv:
+                link_status = "other_conversation"
+                link_error = "reply_thread_mismatch"
+                parent_conv = raw_parent_conv
             else:
-                # Parent exists with metadata, but Fleet refused to read it.
-                link_status = "unreadable_parent"
-                link_error = parent_error
-                parent_row = conn.execute(
-                    "SELECT conversation_id FROM comms_messages WHERE message_id = ?",
-                    (parent_id,),
-                ).fetchone()
-                if parent_row is not None and isinstance(parent_row["conversation_id"], str):
-                    parent_conv = parent_row["conversation_id"]
-
-        # Non-direct candidate with an error belongs only if sent by recipient or in a selected conversation.
-        if (
-            not is_direct_reply
-            and raw_sender != recipient_name
-            and reply_conv not in selected_conversations
-        ):
-            continue
+                parent_dict, parent_error = _read_message_cached(service, message_cache, parent_id)
+                if parent_dict is not None:
+                    parent_conv = str(parent_dict["conversation_id"])
+                    if reply_conv == parent_conv:
+                        link_status = "valid"
+                        link_error = None
+                    else:
+                        link_status = "other_conversation"
+                        link_error = "reply_thread_mismatch"
+                else:
+                    link_status = "unreadable_parent"
+                    link_error = parent_error
+                    parent_conv = raw_parent_conv
 
         reply_payload = {
             "ok": link_error is None,
@@ -531,3 +618,8 @@ def exchange_error_payload(code: str) -> dict[str, Any]:
         "source": "authority",
         "error": code,
     }
+
+
+def dump_exchange_json(payload: dict[str, Any]) -> str:
+    """Serialize an exchange response strictly per RFC 8259 (rejecting NaN/Infinity)."""
+    return json.dumps(payload, indent=2, sort_keys=True, allow_nan=False) + "\n"

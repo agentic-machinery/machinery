@@ -434,6 +434,7 @@ def cmd_fleet_exchange(args: argparse.Namespace) -> int:
     """Read body-free delivery and reply rows for one recipient since a UTC timestamp."""
     from lu_machinery.fleet_comms.exchange_rows import (
         ExchangeRowsError,
+        dump_exchange_json,
         exchange_error_payload,
         read_exchange_rows,
     )
@@ -441,9 +442,9 @@ def cmd_fleet_exchange(args: argparse.Namespace) -> int:
     try:
         payload = read_exchange_rows(args.recipient, args.since, root=_authority_root(args))
     except ExchangeRowsError as exc:
-        sys.stdout.write(_json_dump(exchange_error_payload(exc.code)))
+        sys.stdout.write(dump_exchange_json(exchange_error_payload(exc.code)))
         return EXIT_ERROR
-    sys.stdout.write(_json_dump(payload))
+    sys.stdout.write(dump_exchange_json(payload))
     return EXIT_OK
 
 
@@ -1432,8 +1433,11 @@ def build_parser() -> argparse.ArgumentParser:
             f"  <project python> -I -m {_PACKAGE} fleet exchange --recipient claude-cto --since 2026-11-28T00:00:00Z\n"
             f"  <project python> -I -m {_PACKAGE} fleet exchange --recipient bot-slot --since 2026-11-28T00:00:00Z --root /path/to/plane\n"
             "Outputs: JSON on stdout with deliveries, replies, counts, and per-row ok/error codes;\n"
-            "  content_included is always false. Opens the authority store strictly read-only\n"
-            "  (no writes, no migrations, no claims, no lease changes).\n"
+            "  content_included is always false. Opens the authority store read-only via\n"
+            "  ArtifactStore.open_readonly (mode=ro + PRAGMA query_only=ON), matching the other\n"
+            "  Fleet Comms read commands: no database writes, migrations, claims, or lease changes.\n"
+            "  SQLite may create standard WAL coordination files (-shm/-wal) beside the store;\n"
+            "  a store directory the caller cannot write fails closed with a typed error.\n"
             "Exit codes: 0 = report produced (inspect per-row ok/error and error_count),\n"
             "  2 = usage error, 3 = invalid --recipient/--since or store/schema unavailable.\n"
             f"Related: {_PACKAGE}.exchange_rows; {_PACKAGE}.authority.AuthorityService; deliveries pending."

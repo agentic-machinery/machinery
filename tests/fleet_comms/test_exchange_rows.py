@@ -25,6 +25,10 @@ BODY_SENTINEL = "confidential exchange body sentinel"
 SINCE_TS = "2026-11-28T00:00:00Z"
 
 
+def _reject_non_finite(token: str) -> Any:
+    raise ValueError(f"non-finite JSON token: {token}")
+
+
 @pytest.fixture
 def plane(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     root = tmp_path / "plane"
@@ -68,7 +72,8 @@ def _run_exchange(
     assert rc == expected_rc, f"rc={rc}, stdout={output.out!r}, stderr={output.err!r}"
     assert output.err == ""
     assert BODY_SENTINEL not in output.out
-    payload = json.loads(output.out)
+    payload = json.loads(output.out, parse_constant=_reject_non_finite)
+    assert isinstance(payload, dict)
     assert payload["content_included"] is False
     assert payload["read_only"] is True
     return payload
@@ -298,7 +303,7 @@ def test_dead_lettered_delivery_reports_exhausted_attempts_and_dlq_metadata(
 def test_valid_reply_matches_get_message_and_links_to_parent_delivery(
     plane: Path, capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """Defect class: valid reply fails to join to delivery message or diverges from get_message."""
+    """Defect class: valid reply fails to join to delivery message or leaks replies to out-of-scope parents."""
     with AuthorityService(root=plane) as service:
         parent = service.publish_message(
             sender="operator",
@@ -315,7 +320,8 @@ def test_valid_reply_matches_get_message_and_links_to_parent_delivery(
             created_at="2026-11-28T01:02:00Z",
             idempotency_key="reply-valid-child",
         )
-        # Unrelated reply to an older message before --since must not leak into this window.
+        # Unrelated replies to pre-window or other-recipient parents must stay out of scope
+        # even when those out-of-scope replies have link mismatches or corrupt provenance (F4).
         old_parent = service.publish_message(
             sender="operator",
             body=f"old parent {BODY_SENTINEL}",
@@ -331,6 +337,44 @@ def test_valid_reply_matches_get_message_and_links_to_parent_delivery(
             created_at="2026-11-28T01:03:00Z",
             idempotency_key="reply-old-child",
         )
+        other_recipient_parent = service.publish_message(
+            sender="operator",
+            body=f"other recipient parent {BODY_SENTINEL}",
+            recipients=("claude",),
+            created_at="2026-11-28T01:00:30Z",
+            idempotency_key="reply-other-recipient-parent",
+        )
+        out_of_scope_mismatch = service.publish_message(
+            sender="codex",
+            body=f"out of scope mismatch {BODY_SENTINEL}",
+            recipients=("claude-cto",),
+            created_at="2026-11-28T01:04:00Z",
+            idempotency_key="reply-out-of-scope-mismatch",
+        )
+        out_of_scope_corrupt = service.publish_message(
+            sender="codex",
+            body=f"out of scope corrupt {BODY_SENTINEL}",
+            recipients=("claude-cto",),
+            in_reply_to=other_recipient_parent.message_id,
+            created_at="2026-11-28T01:05:00Z",
+            idempotency_key="reply-out-of-scope-corrupt",
+        )
+
+    conn = sqlite3.connect(str(plane / "comms.sqlite3"))
+    try:
+        conn.execute("DROP TRIGGER IF EXISTS authority_comms_message_immutable_update")
+        conn.execute("DROP TRIGGER IF EXISTS authority_message_metadata_immutable_update")
+        conn.execute(
+            "UPDATE comms_messages SET in_reply_to = ? WHERE message_id = ?",
+            (other_recipient_parent.message_id, out_of_scope_mismatch.message_id),
+        )
+        conn.execute(
+            "UPDATE authority_message_metadata SET provenance_json = ? WHERE message_id = ?",
+            ("{corrupt", out_of_scope_corrupt.message_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
 
     expected_reply = _expected_message_dict(plane, reply.message_id)
     payload = _run_exchange(capsys, plane, recipient="codex")
@@ -353,7 +397,7 @@ def test_valid_reply_matches_get_message_and_links_to_parent_delivery(
 def test_reply_with_missing_parent_emits_typed_reply_parent_not_found_error(
     plane: Path, capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """Defect class: orphan reply with missing parent crashes or is silently dropped instead of typed error."""
+    """Defect class: orphan reply with missing parent crashes or drops when delivery fails normalization."""
     missing_parent_id = "message_" + ("0" * 32)
     with AuthorityService(root=plane) as service:
         parent = service.publish_message(
@@ -364,7 +408,7 @@ def test_reply_with_missing_parent_emits_typed_reply_parent_not_found_error(
             idempotency_key="missing-parent-base",
         )
         orphan = service.publish_message(
-            sender="codex",
+            sender="claude",
             body=f"orphan {BODY_SENTINEL}",
             recipients=("claude-cto",),
             conversation_id=parent.conversation_id,
@@ -372,7 +416,8 @@ def test_reply_with_missing_parent_emits_typed_reply_parent_not_found_error(
             idempotency_key="missing-parent-orphan",
         )
 
-    # Point orphan.in_reply_to at a nonexistent parent while bypassing immutability/FK guards in fixture.
+    # Point orphan.in_reply_to at a nonexistent parent, and corrupt delivery attempt_count
+    # to prove the delivery's conversation is still retained for orphan reply discovery (F5).
     conn = sqlite3.connect(str(plane / "comms.sqlite3"))
     try:
         conn.execute("PRAGMA foreign_keys = OFF")
@@ -381,6 +426,10 @@ def test_reply_with_missing_parent_emits_typed_reply_parent_not_found_error(
             "UPDATE comms_messages SET in_reply_to = ? WHERE message_id = ?",
             (missing_parent_id, orphan.message_id),
         )
+        conn.execute(
+            "UPDATE authority_deliveries SET attempt_count = 'bad' WHERE delivery_id = ?",
+            (parent.delivery_ids[0],),
+        )
         conn.commit()
     finally:
         conn.close()
@@ -388,8 +437,10 @@ def test_reply_with_missing_parent_emits_typed_reply_parent_not_found_error(
     expected_orphan = _expected_message_dict(plane, orphan.message_id)
     payload = _run_exchange(capsys, plane, recipient="codex")
     assert payload["delivery_count"] == 1
+    assert payload["deliveries"][0]["ok"] is False
+    assert payload["deliveries"][0]["error"] == "delivery_row_corrupt"
     assert payload["reply_count"] == 1
-    assert payload["error_count"] == 1
+    assert payload["error_count"] == 2
 
     row = payload["replies"][0]
     assert row["ok"] is False
@@ -404,7 +455,7 @@ def test_reply_with_missing_parent_emits_typed_reply_parent_not_found_error(
 def test_reply_in_other_conversation_emits_typed_reply_thread_mismatch_error(
     plane: Path, capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """Defect class: cross-conversation reply passes as valid instead of emitting reply_thread_mismatch."""
+    """Defect class: cross-conversation reply passes as valid or loses mismatch diagnosis on corrupt parent metadata."""
     with AuthorityService(root=plane) as service:
         parent = service.publish_message(
             sender="operator",
@@ -422,12 +473,19 @@ def test_reply_in_other_conversation_emits_typed_reply_thread_mismatch_error(
         )
         assert other_conv_seed.conversation_id != parent.conversation_id
 
+    # Corrupt parent provenance as well: conversation mismatch must still be reported as
+    # reply_thread_mismatch rather than masked by unreadable_parent (F6).
     conn = sqlite3.connect(str(plane / "comms.sqlite3"))
     try:
         conn.execute("DROP TRIGGER IF EXISTS authority_comms_message_immutable_update")
+        conn.execute("DROP TRIGGER IF EXISTS authority_message_metadata_immutable_update")
         conn.execute(
             "UPDATE comms_messages SET in_reply_to = ? WHERE message_id = ?",
             (parent.message_id, other_conv_seed.message_id),
+        )
+        conn.execute(
+            "UPDATE authority_message_metadata SET provenance_json = ? WHERE message_id = ?",
+            ("{bad-parent-json", parent.message_id),
         )
         conn.commit()
     finally:
@@ -436,8 +494,10 @@ def test_reply_in_other_conversation_emits_typed_reply_thread_mismatch_error(
     expected_reply = _expected_message_dict(plane, other_conv_seed.message_id)
     payload = _run_exchange(capsys, plane, recipient="codex")
     assert payload["delivery_count"] == 1
+    assert payload["deliveries"][0]["ok"] is False
+    assert payload["deliveries"][0]["error"] == "provenance_corrupt"
     assert payload["reply_count"] == 1
-    assert payload["error_count"] == 1
+    assert payload["error_count"] == 2
 
     row = payload["replies"][0]
     assert row["ok"] is False
@@ -454,7 +514,7 @@ def test_reply_in_other_conversation_emits_typed_reply_thread_mismatch_error(
 def test_corrupt_row_emits_typed_error_while_sibling_rows_still_print(
     plane: Path, capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """Defect class: one corrupt row aborts the batch instead of typing its error while siblings print."""
+    """Defect class: corrupt metadata, overflow timestamps, invalid UTF-8, or NaN aborts the batch."""
     with AuthorityService(root=plane) as service:
         good_msg = service.publish_message(
             sender="operator",
@@ -463,12 +523,48 @@ def test_corrupt_row_emits_typed_error_while_sibling_rows_still_print(
             created_at="2026-11-28T01:00:00Z",
             idempotency_key="corrupt-sibling-good",
         )
-        bad_msg = service.publish_message(
+        bad_json_msg = service.publish_message(
             sender="operator",
-            body=f"bad {BODY_SENTINEL}",
+            body=f"bad json {BODY_SENTINEL}",
             recipients=("codex",),
             created_at="2026-11-28T01:01:00Z",
-            idempotency_key="corrupt-sibling-bad",
+            idempotency_key="corrupt-sibling-bad-json",
+        )
+        bad_nan_msg = service.publish_message(
+            sender="operator",
+            body=f"bad nan {BODY_SENTINEL}",
+            recipients=("codex",),
+            created_at="2026-11-28T01:01:10Z",
+            idempotency_key="corrupt-sibling-bad-nan",
+        )
+        bad_utf8_msg = service.publish_message(
+            sender="operator",
+            body=f"bad utf8 {BODY_SENTINEL}",
+            recipients=("codex",),
+            created_at="2026-11-28T01:01:20Z",
+            idempotency_key="corrupt-sibling-bad-utf8",
+        )
+        bad_overflow_msg = service.publish_message(
+            sender="operator",
+            body=f"bad overflow {BODY_SENTINEL}",
+            recipients=("codex",),
+            created_at="2026-11-28T01:01:30Z",
+            idempotency_key="corrupt-sibling-bad-overflow",
+        )
+        missing_meta_parent = service.publish_message(
+            sender="operator",
+            body=f"missing meta {BODY_SENTINEL}",
+            recipients=("codex",),
+            created_at="2026-11-28T01:01:40Z",
+            idempotency_key="corrupt-sibling-missing-meta",
+        )
+        reply_to_missing_meta = service.publish_message(
+            sender="codex",
+            body=f"reply to missing meta {BODY_SENTINEL}",
+            recipients=("claude-cto",),
+            in_reply_to=missing_meta_parent.message_id,
+            created_at="2026-11-28T01:01:50Z",
+            idempotency_key="corrupt-sibling-reply-missing-meta",
         )
         good_reply = service.publish_message(
             sender="codex",
@@ -479,13 +575,29 @@ def test_corrupt_row_emits_typed_error_while_sibling_rows_still_print(
             idempotency_key="corrupt-sibling-good-reply",
         )
 
-    # Corrupt bad_msg's provenance_json so AuthorityService.get_message refuses it with provenance_corrupt.
     conn = sqlite3.connect(str(plane / "comms.sqlite3"))
     try:
         conn.execute("DROP TRIGGER IF EXISTS authority_message_metadata_immutable_update")
+        conn.execute("DROP TRIGGER IF EXISTS authority_message_metadata_immutable_delete")
         conn.execute(
             "UPDATE authority_message_metadata SET provenance_json = ? WHERE message_id = ?",
-            ("{not-valid-json", bad_msg.message_id),
+            ("{not-valid-json", bad_json_msg.message_id),
+        )
+        conn.execute(
+            "UPDATE authority_message_metadata SET provenance_json = ? WHERE message_id = ?",
+            ('{"score": NaN}', bad_nan_msg.message_id),
+        )
+        conn.execute(
+            "UPDATE authority_message_metadata SET provenance_json = CAST(X'80' AS TEXT) WHERE message_id = ?",
+            (bad_utf8_msg.message_id,),
+        )
+        conn.execute(
+            "UPDATE authority_deliveries SET updated_at = ? WHERE delivery_id = ?",
+            ("9999-12-31T23:59:59-01:00", bad_overflow_msg.delivery_ids[0]),
+        )
+        conn.execute(
+            "DELETE FROM authority_message_metadata WHERE message_id = ?",
+            (missing_meta_parent.message_id,),
         )
         conn.commit()
     finally:
@@ -493,34 +605,55 @@ def test_corrupt_row_emits_typed_error_while_sibling_rows_still_print(
 
     expected_good_delivery = _expected_delivery_dict(plane, good_msg.delivery_ids[0])
     expected_good_message = _expected_message_dict(plane, good_msg.message_id)
-    expected_bad_delivery = _expected_delivery_dict(plane, bad_msg.delivery_ids[0])
+    expected_bad_delivery = _expected_delivery_dict(plane, bad_json_msg.delivery_ids[0])
     expected_good_reply = _expected_message_dict(plane, good_reply.message_id)
 
     payload = _run_exchange(capsys, plane, recipient="codex")
-    assert payload["delivery_count"] == 2
-    assert payload["reply_count"] == 1
-    assert payload["error_count"] == 1
+    assert payload["delivery_count"] == 6
+    assert payload["reply_count"] == 2
+    assert payload["error_count"] == 6
 
     by_mid = {row["message_id"]: row for row in payload["deliveries"]}
-    good_row = by_mid[good_msg.message_id]
-    bad_row = by_mid[bad_msg.message_id]
+    assert by_mid[good_msg.message_id]["ok"] is True
+    assert by_mid[good_msg.message_id]["delivery"] == expected_good_delivery
+    assert by_mid[good_msg.message_id]["message"] == expected_good_message
 
-    assert good_row["ok"] is True
-    assert good_row["error"] is None
-    assert good_row["delivery"] == expected_good_delivery
-    assert good_row["message"] == expected_good_message
+    assert by_mid[bad_json_msg.message_id]["ok"] is False
+    assert by_mid[bad_json_msg.message_id]["error"] == "provenance_corrupt"
+    assert by_mid[bad_json_msg.message_id]["delivery"] == expected_bad_delivery
+    assert by_mid[bad_json_msg.message_id]["message"] is None
 
-    assert bad_row["ok"] is False
-    assert bad_row["error"] == "provenance_corrupt"
-    assert bad_row["delivery"] == expected_bad_delivery
-    assert bad_row["message"] is None
+    assert by_mid[bad_nan_msg.message_id]["ok"] is False
+    assert by_mid[bad_nan_msg.message_id]["error"] == "provenance_corrupt"
+    assert by_mid[bad_nan_msg.message_id]["message"] is None
 
-    assert payload["replies"][0]["ok"] is True
-    assert payload["replies"][0]["message"] == expected_good_reply
+    assert by_mid[bad_utf8_msg.message_id]["ok"] is False
+    assert by_mid[bad_utf8_msg.message_id]["error"] == "message_row_corrupt"
+    assert by_mid[bad_utf8_msg.message_id]["message"] is None
 
-    # Boundary refusals still fail closed with typed JSON errors and exit 3.
+    assert by_mid[bad_overflow_msg.message_id]["ok"] is False
+    assert by_mid[bad_overflow_msg.message_id]["error"] == "invalid_updated_at"
+    assert by_mid[bad_overflow_msg.message_id]["delivery"] is None
+
+    assert by_mid[missing_meta_parent.message_id]["ok"] is False
+    assert by_mid[missing_meta_parent.message_id]["error"] == "message_not_found"
+
+    replies_by_mid = {row["message_id"]: row for row in payload["replies"]}
+    assert replies_by_mid[good_reply.message_id]["ok"] is True
+    assert replies_by_mid[good_reply.message_id]["message"] == expected_good_reply
+    # Existing parent missing metadata reports unreadable_parent (message_not_found), not missing_parent (F6).
+    assert replies_by_mid[reply_to_missing_meta.message_id]["ok"] is False
+    assert replies_by_mid[reply_to_missing_meta.message_id]["reply_link_status"] == "unreadable_parent"
+    assert replies_by_mid[reply_to_missing_meta.message_id]["error"] == "message_not_found"
+    assert replies_by_mid[reply_to_missing_meta.message_id]["parent_conversation_id"] == missing_meta_parent.conversation_id
+
+    # Boundary refusals still fail closed with typed JSON errors and exit 3 (including UTC overflow, F1).
     bad_since = _run_exchange(capsys, plane, recipient="codex", since="not-a-date", expected_rc=EXIT_ERROR)
     assert bad_since["error"] == "invalid_since"
+    overflow_since = _run_exchange(
+        capsys, plane, recipient="codex", since="9999-12-31T23:59:59-01:00", expected_rc=EXIT_ERROR,
+    )
+    assert overflow_since["error"] == "invalid_since"
     missing_store = _run_exchange(
         capsys, plane.parent / "absent-plane", recipient="codex", expected_rc=EXIT_ERROR,
     )
