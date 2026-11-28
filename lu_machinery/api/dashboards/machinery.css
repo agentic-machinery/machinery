@@ -437,7 +437,6 @@ table.subs th[colspan] { padding-top: 8px; color: var(--fg); }
   border-radius: 8px;
   padding: 10px 12px;
   margin: 10px 0;
-  scroll-margin-top: var(--sticky-offset, 96px);
 }
 
 .milestone-head {
@@ -491,18 +490,10 @@ table.subs th[colspan] { padding-top: 8px; color: var(--fg); }
 #ready-now,
 #other-blocked,
 #unknown-milestone-blocked {
-  scroll-margin-top: var(--sticky-offset, 96px);
   margin-top: 14px;
 }
 
 @media (max-width: 640px) {
-  .milestone-card,
-  #top-blockers,
-  #ready-now,
-  #other-blocked,
-  #unknown-milestone-blocked {
-    scroll-margin-top: 12px;
-  }
   header { padding: 8px 10px; }
   main { padding: 10px; gap: 10px; }
   section { padding: 8px 10px; }

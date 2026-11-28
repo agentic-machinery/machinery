@@ -518,8 +518,8 @@ for (const [name, planning] of unusableCases) {{
   assert.equal(privCells[1], "withheld", `${{name}}: private blocked must be withheld`);
   assert.equal(privCells[2], "withheld", `${{name}}: private overdue must be withheld, never 0`);
   const chips = renderMilestoneChips({{milestones: data, planning}}, now);
-  assert.match(chips, /<b>\\?<\\/b> blocked/, `${{name}}: blocked chip must be ?`);
-  assert.match(chips, /<b>\\?<\\/b> ready now/, `${{name}}: ready now chip must be ?`);
+  assert.match(chips, /<b>unknown<\\/b> blocked/, `${{name}}: blocked chip must be unknown`);
+  assert.match(chips, /<b>unknown<\\/b> ready now/, `${{name}}: ready now chip must be unknown`);
 }}
 
 // All-private snapshot: overdue chip fails closed as withheld, never 0.
@@ -550,7 +550,7 @@ assert.equal(summaryCellsFor(partialHtml, "Private milestone")[1], "withheld");
 assert.equal(summaryCellsFor(partialHtml, "Private milestone")[2], "withheld");
 // Workers unknown -> ready-now fails closed (never 0 ready now).
 const partialChips = renderMilestoneChips({{milestones: data, planning: partialPlanning}}, now);
-assert.match(partialChips, /<b>\\?<\\/b> ready now/);
+assert.match(partialChips, /<b>unknown<\\/b> ready now/);
 assert.match(partialHtml, /Worker paths are unavailable; ready-now results are withheld/);
 
 // F1: When planning misses a milestone issue (unaccounted in both blocked and ready),
@@ -571,10 +571,11 @@ const missedHtml = renderMilestones(data, missedPlanning, now);
 assert.equal(summaryCellsFor(missedHtml, "v0.4.0")[1], "unknown", "unaccounted milestone issue must never report 0 blocked");
 assert.match(missedHtml, /no planning verdict; blocker count is incomplete/);
 const missedChips = renderMilestoneChips({{milestones: data, planning: missedPlanning}}, now);
-assert.match(missedChips, /<b>\\?<\\/b> blocked \\(partial\\)/);
+assert.match(missedChips, /<b>unknown<\\/b> blocked \\(partial\\)/);
+assert.match(missedChips, /<b>unknown<\\/b> ready now \\(partial\\)/, "partial planning with an unaccounted issue never reports 0 ready now");
 
 // F1 sibling: even when Planning status is "ok" with 0 dependency_unknown, an open milestone issue
-// missing from Planning withholds the fleet 0 blocked chip (shows ? blocked (incomplete), never 0).
+// missing from Planning withholds the fleet 0 blocked chip (shows unknown blocked (incomplete), never 0).
 const okEmptyPlanning = {{
   issues: {{
     status: "ok",
@@ -590,7 +591,7 @@ const okEmptyPlanning = {{
 const okMissedHtml = renderMilestones(data, okEmptyPlanning, now);
 assert.equal(summaryCellsFor(okMissedHtml, "v0.4.0")[1], "unknown");
 const okMissedChips = renderMilestoneChips({{milestones: data, planning: okEmptyPlanning}}, now);
-assert.match(okMissedChips, /<b>\\?<\\/b> blocked \\(incomplete\\)/);
+assert.match(okMissedChips, /<b>unknown<\\/b> blocked \\(incomplete\\)/);
 assert.doesNotMatch(okMissedChips, /<b>0<\\/b> blocked/);
 
 const twoIssueData = JSON.parse(JSON.stringify(data));
@@ -665,5 +666,56 @@ const okPlanning = {{
 const incompleteHtml = renderMilestones(incompleteData, okPlanning, now);
 assert.equal(summaryCellsFor(incompleteHtml, "v0.4.0")[1], "unknown");
 assert.match(incompleteHtml, /Open issue list is incomplete or unavailable/);
+// The header takes the same incomplete issue list as the card: never 0 blocked or 0 ready now.
+const incompleteChips = renderMilestoneChips({{milestones: incompleteData, planning: okPlanning}}, now);
+assert.match(incompleteChips, /<b>unknown<\\/b> blocked \\(incomplete\\)/);
+assert.match(incompleteChips, /<b>unknown<\\/b> ready now \\(incomplete\\)/);
+assert.doesNotMatch(incompleteChips, /<b>0<\\/b> (blocked|ready now)/);
+
+// A missing open count reads unknown in the Open and Overdue cells, never 0 or "?".
+const noCountData = JSON.parse(JSON.stringify(data));
+noCountData.repositories[0].milestones[0].open_issues = null;
+noCountData.repositories[0].milestones[0].due_on = "2030-01-05T00:00:00Z";
+const noCountCells = summaryCellsFor(renderMilestones(noCountData, okPlanning, now), "v0.4.0");
+assert.equal(noCountCells[2], "unknown");
+assert.equal(noCountCells[4], "unknown");
+
+// F2: a fresh partial snapshot (one complete public repo, one failed repo, X-Snapshot-State
+// "unavailable") keeps the complete repo's membership and is never labelled STALE.
+const partialSnapshot = JSON.parse(JSON.stringify(data));
+partialSnapshot.status = "partial";
+partialSnapshot.age_seconds = 30.0;
+partialSnapshot.repositories.push({{
+  repository: "fixture/broken", private: false, status: "unknown", reason: "github_unavailable",
+  stale: false, age_seconds: 30.0, milestones: [],
+}});
+const partialReading = {{
+  data: partialSnapshot, ageHeader: "30.000", boundHeader: "420", state: "unavailable", receivedAt: now,
+}};
+const partialSnapshotHtml = renderMilestones(partialSnapshot, completeWithOutside, now, null, partialReading);
+assert.match(partialSnapshotHtml, /Blocked issues outside open milestones \\(1\\)/);
+assert.doesNotMatch(partialSnapshotHtml, /milestone membership unknown/);
+assert.doesNotMatch(partialSnapshotHtml, /STALE/);
+assert.match(partialSnapshotHtml, /data 30s \\(partial\\)/);
+assert.match(partialSnapshotHtml, /broken: github unavailable/);
+// The failed repo's blocker still has unknown membership; the snapshot expires on elapsed age only.
+const brokenBlocker = JSON.parse(JSON.stringify(completeWithOutside));
+brokenBlocker.issues.blocked.push({{ref: "fixture/broken#5", blocked_by: ["fixture/broken#4"], private_blockers: 0}});
+const mixedHtml = renderMilestones(partialSnapshot, brokenBlocker, now, null, partialReading);
+assert.match(mixedHtml, /Blocked issues outside open milestones \\(1\\)/);
+assert.match(mixedHtml, /Blocked issues \\(milestone membership unknown: 1\\)/);
+const expiredPartialHtml = renderMilestones(partialSnapshot, completeWithOutside, now + 391000, null, partialReading);
+assert.match(expiredPartialHtml, /STALE/);
+assert.match(expiredPartialHtml, /Blocked issues \\(milestone membership unknown: 1\\)/);
+// Partial repo coverage makes the overdue and open chips unknown at 0, never "0 observed".
+const partialNoneOverdue = JSON.parse(JSON.stringify(partialSnapshot));
+partialNoneOverdue.repositories = [partialNoneOverdue.repositories[2]];
+partialNoneOverdue.repositories.unshift({{
+  repository: "fixture/machinery", private: false, status: "ok", stale: false, age_seconds: 30.0, milestones: [],
+}});
+const partialChipsOverdue = renderMilestoneChips({{milestones: partialNoneOverdue, planning: completeWithOutside}}, now);
+assert.match(partialChipsOverdue, /<b>unknown<\\/b> overdue \\(partial\\)/);
+assert.match(partialChipsOverdue, /<b>unknown<\\/b> open \\(partial\\)/);
+assert.doesNotMatch(partialChipsOverdue, /<b>0<\\/b> (overdue|open)/);
 """
     _run_milestones_node(body)
