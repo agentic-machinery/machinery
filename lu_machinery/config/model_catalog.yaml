@@ -1467,9 +1467,8 @@ review_ladders:
   # Hard filters precede last-resort preference, then suitability and quality.
   # REVIEW-ROTATION-GROK-1127 (operator 2026-11-27): at low, medium and high
   # risk, Sol, Opus, Neon and pinned Cursor Grok (grok-4.7-high) are one equal
-  # group; critical holds Sol, Opus and Neon only. The resolver picks the
-  # eligible seat with the fewest recent reviews of record (ties broken by
-  # catalog order).
+  # group; critical holds Sol, Opus and Neon only. Reviewer order follows the
+  # review rotation rule at the top of agents_extensions/shared/rules/model-assignment.md.
   # No Claude model reviews through Cursor (D-129, #10464).
   # Unsubscribed models have no review candidates. Fable holds no review role (#9583).
   critical:

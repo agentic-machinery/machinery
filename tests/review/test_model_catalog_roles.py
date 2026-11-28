@@ -682,7 +682,7 @@ def test_recent_review_counts_reads_published_code_infra_records_and_fails_close
     ]
     rows = [
         make_row(task_id="t-sol", role="review", model=CURRENT_SOL, **{"class": "infra/critical"}, pr=1, pinned_head=sha_sol),
-        # F3: damaged later row missing tokens must be rejected by canonical _well_formed, preserving Sol credit.
+        # F3: damaged later row missing its labels must be rejected by _persisted_row_shape, preserving Sol credit.
         {"schema": "model-stats-row.v1", "task_id": "t-sol", "role": "review", "model": "grok-4.7", "class": "infra/critical", "repo": "machinery", "pr": 1, "pinned_head": sha_sol},
         # Branch-only review row (pr: None) still matches matching repo + head.
         make_row(task_id="t-grok", role="review", model="grok-4.7", **{"class": "code/high"}, pr=None, pinned_head=sha_grok),
@@ -890,3 +890,56 @@ def test_recent_review_counts_skips_oversized_ledger_lines_and_keeps_reading(tmp
     with (stats / "rows.jsonl").open("a", encoding="utf-8") as handle:
         handle.write("x" * (limit + 10))
     assert reviewer_resolver.read_recent_review_counts(tmp_path, window_days=7, now=now) == {CURRENT_SOL: 1}
+
+
+def test_rotation_counts_need_no_catalog_lookup(tmp_path, monkeypatch):
+    """Defect class: a model or fleet catalog read failure changing review credit."""
+    from datetime import UTC, datetime
+
+    from lu_machinery.api import model_stats_rows
+    from lu_machinery.review import model_catalog, reviewer_resolver
+
+    stats = tmp_path / "model-stats"
+    stats.mkdir()
+    grok_head = "b" * 40
+    publications = [
+        {"schema": "review-publication.v1", "task_id": task, "repository": "agentic-machinery/machinery",
+         "pr": pr, "head": head, "verdict": "APPROVED", "published_at": "2026-11-26T12:00:00Z"}
+        for task, pr, head in (("t-sol", 1, _ROTATION_SHA), ("t-grok", 2, grok_head))
+    ]
+    # The writer stores the recorded spelling when its own catalog read fails (``model_id``).
+    grok_row = {**_ROTATION_VALID_ROW, "task_id": "t-grok", "harness": "cursor", "model": "grok-4.7-high",
+                "pr": 2, "pinned_head": grok_head}
+    (stats / "publications.jsonl").write_text("".join(json.dumps(p) + "\n" for p in publications), encoding="utf-8")
+    (stats / "rows.jsonl").write_text(
+        json.dumps(_ROTATION_VALID_ROW) + "\n" + json.dumps(grok_row) + "\n", encoding="utf-8"
+    )
+    now = datetime(2026, 11, 27, 16, 0, tzinfo=UTC)
+    expected = {CURRENT_SOL: 1, "grok-4.7-high": 1}
+    assert reviewer_resolver.read_recent_review_counts(tmp_path, window_days=7, now=now) == expected
+
+    calls: list[str] = []
+
+    def unreadable(name):
+        def read(*_args, **_kwargs):
+            calls.append(name)
+            raise OSError(f"{name} unreadable")
+
+        return read
+
+    with monkeypatch.context() as patched:
+        for module, name in (
+            (model_stats_rows, "load_model_catalog"),
+            (model_stats_rows, "model_catalog_reading"),
+            (model_stats_rows, "load_fleet_repos"),
+            (model_stats_rows, "fleet_catalog"),
+            (model_stats_rows, "_fleet_repo_visibility"),
+            (model_stats_rows, "_public_data_classes"),
+            (model_catalog, "load_model_catalog"),
+            (reviewer_resolver, "load_model_catalog"),
+        ):
+            patched.setattr(module, name, unreadable(name))
+        assert reviewer_resolver.read_recent_review_counts(tmp_path, window_days=7, now=now) == expected
+    assert calls == []
+    # The resolver maps the stored labels onto its own candidates, so the raw spelling credits Grok.
+    assert reviewer_resolver._normalize_recent_review_counts(expected) == {CURRENT_SOL: 1, "grok-4.7": 1}

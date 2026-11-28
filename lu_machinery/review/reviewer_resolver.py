@@ -13,13 +13,10 @@ the observed Codex account. Claude retains its existing account cap protection.
 The model inventory, candidate routes, and risk ladders are loaded from the
 versioned ``scripts/config/model_catalog.yaml`` catalog at import time
 (``REVIEW_CANDIDATES`` / ``REVIEW_LADDERS`` via ``_catalog_candidate`` /
-``_catalog_ladder``). Policy changes belong in YAML. At low, medium and high risk,
-Sol, Opus, Neon and runtime-attested Cursor Grok (``grok-4.7-high``) are one equal
-code/infra group; critical, including security paths raised to critical, holds
-Sol, Opus and Neon only (REVIEW-ROTATION-GROK-1127). At every risk the resolver
-picks, among the best-fitting eligible seats, the one with the fewest recent
-reviews of record (``read_recent_review_counts``), breaking ties by catalog
-order. Fable holds no review role (#9583).
+``_catalog_ladder``). Policy changes belong in YAML. Reviewer order follows the
+review rotation rule at the top of ``agents_extensions/shared/rules/model-assignment.md``
+(REVIEW-ROTATION-GROK-1127); ``read_recent_review_counts`` supplies its recent-review
+counts. Fable holds no review role (#9583).
 A formal review at high or critical risk is performed only by the models
 ``review_scheduler.risk_reviewer_models`` lists; that is an
 eligibility gate, so it binds explicit pins and custom ladders too.
@@ -141,13 +138,14 @@ def _load_ledger_line(line: bytes) -> Any:
 def _persisted_row_shape(row: Mapping[str, object]) -> bool:
     """Whether a row is a settled code/infra review row as ``model_stats_rows.summary_row`` persists it.
 
-    Every label must already be in the form the writer stores: what the canonical sanitiser
-    keeps, with the model and author model already their own ``model_id`` and the effort
-    lowercase, as ``effective_effort`` writes it. The role is ``review``; the class is
-    ``profile/risk`` with a code/infra profile and a supported risk, or the ``unknown`` risk
-    the writer records when a task named none; the PR is absent or a positive integer; the
-    status is settled. The caller applies this before supersession, so a row that fails it is
-    skipped and can never replace an earlier valid row.
+    Only the stored fields are read, never a catalog, so a catalog that cannot be read can
+    never change which rows count. Every label must already be in the form the writer stores:
+    what the canonical sanitiser keeps, with the effort lowercase, as ``effective_effort``
+    writes it on every path. The role is ``review``; the class is ``profile/risk`` with a
+    code/infra profile and a supported risk, or the ``unknown`` risk the writer records when a
+    task named none; the PR is absent or a positive integer; the pinned head is absent or a
+    commit SHA; the status is settled. The caller applies this before supersession, so a row that fails it
+    is skipped and can never replace an earlier valid row.
     """
     from lu_machinery.api import model_stats_rows
 
@@ -160,14 +158,13 @@ def _persisted_row_shape(row: Mapping[str, object]) -> bool:
         row.get(name) is None or (type(row[name]) is str and sanitised[name] == row[name]) for name in optional_labels
     ):
         return False
-    pr, author = row.get("pr"), row.get("author_model")
+    pr = row.get("pr")
     return (
-        model_stats_rows.model_id(row["model"]) == row["model"]
-        and (author is None or model_stats_rows.model_id(author) == author)
-        and row["effort"] == str(row["effort"]).lower()
+        row["effort"] == str(row["effort"]).lower()
         and row["role"] == "review"
         and row["class"] in _CODE_INFRA_REVIEW_CLASSES
         and (pr is None or (type(pr) is int and pr > 0))
+        and (row.get("pinned_head") is None or model_stats_rows._sha(row["pinned_head"]))
         and row["status"] not in model_stats_rows.ACTIVE
     )
 
@@ -194,14 +191,17 @@ def read_recent_review_counts(
     window_days: int = RECENT_REVIEW_WINDOW_DAYS,
     now: datetime | None = None,
 ) -> dict[str, int]:
-    """Count recent published code/infra reviews of record per canonical model id.
+    """Count recent published code/infra reviews of record per stored model label.
 
     Reads ``<batch_state>/model-stats/publications.jsonl`` (the published-verdict
-    ledger written by ``record_cf_verdict``) joined with ``rows.jsonl`` over the
-    trailing ``window_days`` ``[now - window_days, now]`` using the canonical
-    ``model_stats_rows`` validators and target-identity rules (repository, head
-    SHA, and PR when named on the latest valid row). Missing or unsafe state
-    paths fail closed to ``{}``.
+    ledger written by ``record_cf_verdict``) over the trailing ``window_days``
+    ``[now - window_days, now]`` and joins each publication to the latest valid
+    ``rows.jsonl`` row of the same task id, at the row's pinned head and, when the
+    row names one, its PR. The counts depend on those two files alone: no model or
+    fleet catalog is read, so a catalog read failure never changes review credit.
+    Keys are the model labels the writer stored (``summary_row`` writes the catalog
+    id at record time); ``resolve_reviewer`` maps them onto its candidates. Missing
+    or unsafe state paths fail closed to ``{}``.
     """
     if isinstance(window_days, bool) or not isinstance(window_days, int) or window_days < 1:
         raise ValueError("window_days must be a positive integer")
@@ -223,9 +223,6 @@ def read_recent_review_counts(
         return {}
 
     try:
-        repo_keys = model_stats_rows.repository_keys(model_stats_rows.fleet_catalog())
-        if not repo_keys:
-            return {}
         reference_now = (
             (now.astimezone(UTC) if now.tzinfo else now.replace(tzinfo=UTC))
             if now is not None
@@ -236,10 +233,11 @@ def read_recent_review_counts(
         pubs_fd = _open_regular_in_dir(dir_fd, model_stats_rows.PUBLICATIONS_FILE)
         if pubs_fd is None:
             return {}
-        pubs_by_task: dict[str, list[tuple[datetime, int, str, int, str]]] = {}
+        # Each task's in-window published targets, as (PR, head).
+        published: dict[str, set[tuple[int, str]]] = {}
         try:
             with os.fdopen(pubs_fd, "rb") as stream:
-                for line_index, line in enumerate(_bounded_ledger_lines(stream)):
+                for line in _bounded_ledger_lines(stream):
                     try:
                         entry = _load_ledger_line(line)
                     except (ValueError, RecursionError):
@@ -251,16 +249,14 @@ def read_recent_review_counts(
                     # future-dated publication can never hide an in-window publication.
                     if published_at is None or not (cutoff <= published_at <= reference_now):
                         continue
-                    pubs_by_task.setdefault(entry["task_id"], []).append(
-                        (published_at, line_index, entry["repository"].lower(), entry["pr"], entry["head"])
-                    )
+                    published.setdefault(entry["task_id"], set()).add((entry["pr"], entry["head"]))
         except OSError:
             return {}
 
         rows_fd = _open_regular_in_dir(dir_fd, model_stats_rows.ROWS_FILE)
         if rows_fd is None:
             return {}
-        if not pubs_by_task:
+        if not published:
             os.close(rows_fd)
             return {}
 
@@ -277,9 +273,8 @@ def read_recent_review_counts(
                     tid = row.get("task_id")
                     if (
                         not isinstance(tid, str)
-                        or tid not in pubs_by_task
+                        or tid not in published
                         or not model_stats_rows.valid_task_id(tid)
-                        or not model_stats_rows._well_formed(row)
                         or not _persisted_row_shape(row)
                     ):
                         continue
@@ -292,30 +287,12 @@ def read_recent_review_counts(
     finally:
         os.close(dir_fd)
 
-    counts_counter: Counter[str] = Counter()
+    counts: Counter[str] = Counter()
     for tid, row in latest_rows.items():
-        pinned_head = row.get("pinned_head")
-        if not isinstance(pinned_head, str):
-            continue
-        row_repo = row["repo"]
-        row_pr = row.get("pr")
-        entries = sorted(pubs_by_task[tid], key=lambda item: (item[0], item[1]), reverse=True)
-        matched = next(
-            (
-                entry
-                for entry in entries
-                if entry[4] == pinned_head
-                and repo_keys.get(entry[2]) == row_repo
-                and row_pr in (None, entry[3])
-            ),
-            None,
-        )
-        if matched is None:
-            continue
-        model = str(row["model"])  # a persisted model label, checked by _persisted_row_shape
-        counts_counter[resolve_catalog_model_id(model, _MODEL_CATALOG) or model] += 1
-
-    return dict(counts_counter)
+        row_pr, pinned_head = row.get("pr"), row.get("pinned_head")
+        if any(head == pinned_head and row_pr in (None, pr) for pr, head in published[tid]):
+            counts[str(row["model"])] += 1  # a stored model label, checked by _persisted_row_shape
+    return dict(counts)
 
 
 def _normalize_recent_review_counts(counts: Mapping[str, int]) -> dict[str, int]:
@@ -1716,8 +1693,8 @@ def resolve_reviewer(
     """
     if review_mode not in {"cross_family", "red_team"}:
         raise ValueError("unsupported review mode")
-    review_counts = (
-        _normalize_recent_review_counts(recent_review_counts)
+    review_counts = _normalize_recent_review_counts(
+        recent_review_counts
         if recent_review_counts is not None
         else ({} if inputs.structural else read_recent_review_counts())
     )
