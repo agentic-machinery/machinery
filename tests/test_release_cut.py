@@ -878,6 +878,15 @@ def _simulate_consumer_adoption(monkeypatch, tmp_path, failing_check=None):
     candidate = work / "accept/bin/python"
     product = work / "product"
     hook_test = "tests/test_fixture_hooks.py"
+    sandbox = tmp_path / "bin/bwrap"
+    sandbox.parent.mkdir()
+    sandbox.write_text("#!/bin/sh\nexit 125\n")
+    sandbox.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{sandbox.parent}:{os.environ['PATH']}")
+    context_file = tmp_path / "default-context/host.v1.json"
+    context_file.parent.mkdir()
+    context_file.write_text("{}")
+    monkeypatch.setattr(host_context, "DEFAULT_PATH", context_file)
     calls = []
 
     def preflight(cut):
@@ -917,21 +926,28 @@ def _simulate_consumer_adoption(monkeypatch, tmp_path, failing_check=None):
 
     def run(cut, argv, **kwargs):
         command = [str(part) for part in argv]
-        if command[:3] == [str(candidate), "-m", "pytest"]:
-            if "--collect-only" in command:
-                assert Path(kwargs["env"]["LU_STATE_ROOT"]).is_dir()
-                return subprocess.CompletedProcess(command, 0, "1 test collected\n", "")
-            assert hook_test in command
-            check = "product key tests"
-        elif command[:3] == ["fixture-node", "fixture-npm", "run"]:
-            assert command[-1] == "agents:deploy"
-            check = "Verify Agent Deployment"
-        elif command[:2] == ["gh", "api"]:
+        if command[:4] == [str(candidate), "-m", "pytest", "--collect-only"]:
+            assert Path(kwargs["env"]["LU_STATE_ROOT"]).is_dir()
+            return subprocess.CompletedProcess(command, 0, "1 test collected\n", "")
+        if command[:2] == ["gh", "api"]:
             return subprocess.CompletedProcess(command, 0, "v0.1.22\n", "")
-        elif command[:2] == ["git", "-C"] and "push" in command:
+        if command[:2] == ["git", "-C"] and "push" in command:
             return subprocess.CompletedProcess(command, 0, "", "")
-        else:
+        if command[0] != str(sandbox):
             return real_run(cut, argv, **kwargs)
+        delimiter = command.index("--")
+        assert command[:delimiter] == [
+            str(sandbox), "--die-with-parent", "--ro-bind", "/", "/", "--bind", str(work), str(work),
+            "--tmpfs", str(context_file.parent), "--remount-ro", str(context_file.parent),
+        ]
+        consumer = command[delimiter + 1:]
+        if consumer[:3] == [str(candidate), "-m", "pytest"]:
+            assert hook_test in consumer
+            check = "product key tests"
+        else:
+            assert consumer[:3] == ["fixture-node", "fixture-npm", "run"]
+            assert consumer[-1] == "agents:deploy"
+            check = "Verify Agent Deployment"
         assert kwargs["cwd"] == product
         assert kwargs["env"]["LEARN_UKRAINIAN_PYTHON"] == str(candidate)
         assert "LU_STATE_ROOT" not in kwargs["env"]

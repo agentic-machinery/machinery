@@ -706,7 +706,10 @@ class Cut:
                             with suppress(ProcessLookupError):
                                 os.killpg(child.pid, signal.SIGKILL)
                         raise
-                    result = subprocess.CompletedProcess(command, child.returncode, stdout, stderr)
+                    # This constructor stores the captured output and exit status.
+                    result = subprocess.CompletedProcess(  # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit
+                        command, child.returncode, stdout, stderr,
+                    )
             else:
                 result = subprocess.run(  # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit
                     command, cwd=cwd or self.work, env=child_env, input=input_text,
@@ -1423,6 +1426,14 @@ class Cut:
             tests.append(line.removeprefix("test "))
         if not tests:
             raise CutError("product-consumer.pin names no key test")
+        self.step = "product runtime sandbox"
+        bwrap = shutil.which("bwrap")
+        if bwrap is None:
+            raise CutError("product runtime sandbox requires bubblewrap")
+        boundary: list[str | Path] = ["--die-with-parent", "--ro-bind", "/", "/", "--bind", self.work, self.work]
+        default_context_dir = host_context.DEFAULT_PATH.parent
+        if default_context_dir.exists():
+            boundary += ["--tmpfs", default_context_dir, "--remount-ro", default_context_dir]
         # Product CI starts without a state binding. The collection binding would
         # hide a candidate that needs a state root before the test fixtures set one.
         env = self.scratch_env(
@@ -1430,15 +1441,6 @@ class Cut:
             LEARN_UKRAINIAN_PRIMARY_REPO_ROOT=str(product),
             LEARN_UKRAINIAN_PYTHON=str(python),
         )
-        result = self.run(
-            [python, "-m", "pytest", "-q", "--maxfail=1", *tests],
-            cwd=product, env=env, timeout=300, check=False, kill_group=True,
-        )
-        if result.returncode:
-            raise CutError(f"product key tests failed (exit {result.returncode}); see cut.log")
-        self.say("product key tests passed with the candidate wheel")
-
-        self.step = "Verify Agent Deployment"
         node, npm = node_tools
         deploy_env = {
             **env,
@@ -1446,13 +1448,21 @@ class Cut:
             "npm_config_offline": "true",
             "npm_config_cache": str(self.work / "npm-cache"),
         }
-        result = self.run(
-            [node, npm, "run", "--silent", "--if-present=false", "--script-shell=/bin/sh", "agents:deploy"],
-            cwd=product, env=deploy_env, timeout=300, check=False, kill_group=True,
+        commands = (
+            ("product key tests", [python, "-m", "pytest", "-q", "--maxfail=1", *tests], env),
+            ("Verify Agent Deployment",
+             [node, npm, "run", "--silent", "--if-present=false", "--script-shell=/bin/sh", "agents:deploy"], deploy_env),
         )
-        if result.returncode:
-            raise CutError(f"agents:deploy failed (exit {result.returncode}); see cut.log")
-        self.say("Verify Agent Deployment entry point passed with the candidate wheel")
+        for name, argv, command_env in commands:
+            self.step = name
+            result = self.run(
+                [Path(bwrap).absolute(), *boundary, "--", *argv],
+                cwd=product, env=command_env, timeout=300, check=False, kill_group=True,
+            )
+            if result.returncode:
+                failure = "product runtime sandbox could not start" if result.stderr.startswith("bwrap:") else f"{name} failed"
+                raise CutError(f"{failure} (exit {result.returncode}); see cut.log")
+            self.say(f"{name} passed with the candidate wheel")
 
     def contract_canary(self) -> subprocess.CompletedProcess[str]:
         """The candidate's canary orchestration and sealed candidate receipt gate."""
