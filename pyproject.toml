@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "lu-machinery"
-version = "0.1.86"
+version = "0.1.87"
 description = "Shared agent orchestration and development tooling"
 requires-python = ">=3.14"
 # Core commands also read routing and verification helpers from the API package.
