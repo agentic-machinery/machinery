@@ -21,6 +21,7 @@ from typing import Any
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from lu_machinery.common import github_client, json_depth
+from lu_machinery.common.journal_severity import prefix_lines
 from lu_machinery.common.repo_root import MachineryConfigError, state_root
 from lu_machinery.common.task_store_paths import tasks_dir as default_tasks_dir
 from lu_machinery.fleet.ignored_task_output import succession_streams
@@ -815,6 +816,18 @@ def tick(args, *, now: datetime) -> dict[str, Any]:
         return report
 
 
+def _stdout_priority(line: str) -> int:
+    """sd-daemon priority for one keeper line.
+
+    Cleared errors and row-count notes are info. Error lines, hourly summaries,
+    and any unrecognised line are errors, so a new message cannot be stored at
+    info and disappear from a priority count.
+    """
+    if line.startswith(("stalled-work: cleared:", "stalled-work: rows=")):
+        return 6
+    return 3
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Report committed dispatch work stalled before landing.\nUse for supervision, never for branch or task-record repair.",
@@ -825,6 +838,8 @@ def main(argv: list[str] | None = None) -> int:
   .venv/bin/python -m {_MODULE} stalled --tick
 Outputs: JSON on stdout. --tick prints nothing on a cadence skip or an unchanged clean report;
 it prints each new or changed error at once, repeats a summary once an hour, and still exits 1.
+--tick prefixes each line with its sd-daemon priority: <3> for an error or summary, <6> for a
+cleared line or row count. A continuation line is <7>, so one record is one journal entry.
 Git reads remote heads without fetching scan refs or changing task records or dispatch branches.
 Exit codes: 0 complete or cadence skip; 1 incomplete evidence; 2 invalid usage/config.
 Related: #11212; docs/runbooks/stalled-work.md; stale_task_records.py
@@ -882,7 +897,7 @@ Related: #11212; docs/runbooks/stalled-work.md; stale_task_records.py
                 args.journal_lines = [f"stalled-work: error: {report['errors'][0]}"]
     if args.tick:
         for line in args.journal_lines:
-            print(line)
+            print(prefix_lines(line, _stdout_priority(line)))
     else:
         print(json.dumps(report, indent=2, sort_keys=True))
     return 1 if report.get("errors") else 0
