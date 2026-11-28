@@ -154,6 +154,8 @@ def run(spec: Any, record: dict, prompt: str, deadlines: tuple[float, int, int])
             raise ValueError("review_render_record_stale: prompt changed after admission; re-render")
         if access == "full":
             verify_full_review_tree(manifest, workspace)
+        if (refusal := _trace_context_refusal(record)) is not None:
+            raise ValueError(refusal)  # before the claim, like the account below: the attempt id stays unspent
         _bind_codex_account(spec)  # before the claim, so a refused account leaves the attempt id unspent
         store.check_review_attempt(binding, claim=True, owner=record["task_id"])
         plan = prepare_review_attempt(
@@ -309,3 +311,22 @@ def _ledger_count(ledger: Any, path: Path) -> int | None:
         return len(ledger.records(path))
     except (OSError, ValueError, ledger.LedgerError):
         return None
+
+
+def _trace_context_refusal(record: dict) -> str | None:
+    """Why this supervisor's ``TRACEPARENT`` must not reach ``runner.invoke``, or None (TRACETEL-1128 Slice 3).
+
+    A traced attempt's supervisor environment names exactly its own span (``worker._supervisor_trace_env``); a
+    missing, malformed or foreign one refuses. An attempt with no trace identity may carry no TRACEPARENT either.
+    """
+    from lu_machinery.telemetry import emit
+
+    trace = emit.trace_of(record)
+    try:
+        if trace is not None:
+            emit.check_traceparent(os.environ, trace)
+        elif emit.TRACEPARENT_ENV in os.environ:
+            return "trace_context_invalid: TRACEPARENT set for an attempt with no trace identity"
+    except ValueError as exc:
+        return str(exc)
+    return None

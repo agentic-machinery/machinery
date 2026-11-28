@@ -587,7 +587,7 @@ def start(spec: TaskSpec, record: dict, prompt: bytes, hard_timeout: float, *, p
                     [sys.executable, "-I", "-m", "lu_machinery.dispatcher.worker", str(path)],
                     task_id=spec.task_id, run_nonce=record["run_nonce"], cwd=state_root(),
                     stderr=err, stderr_log=stderr_path,
-                    env={**os.environ,
+                    env={**_supervisor_trace_env(record),
                          "LEARN_UKRAINIAN_DISPATCH_TASK_ID": spec.task_id,
                          "LEARN_UKRAINIAN_DISPATCH_AGENT": spec.agent},
                     **({} if scope_limits is None else {"scope_limits": scope_limits}),
@@ -2129,6 +2129,20 @@ def _provider_setup_refused(exc: BaseException) -> str:
         if _SETUP_REFUSAL_CODE.fullmatch(token) and ".." not in token:
             return f"provider_setup_refused: {token} ({name})"
     return f"provider_setup_refused: {name}"
+
+
+def _supervisor_trace_env(record: dict) -> dict[str, str]:
+    """The dispatcher's environment for the supervisor, whose ``TRACEPARENT`` names this task's span.
+
+    An inherited ``TRACEPARENT`` never passes through: the dispatcher validated it when it joined that trace, and the
+    supervisor's own is this task's (TRACETEL-1128 Slice 3). A record with no trace identity gets none.
+    """
+    from lu_machinery.telemetry import emit
+
+    env = {name: value for name, value in os.environ.items() if name != emit.TRACEPARENT_ENV}
+    if emit.trace_of(record) is not None:
+        env[emit.TRACEPARENT_ENV] = emit.traceparent(record)
+    return env
 
 
 def _provider_env(spec: TaskSpec) -> dict[str, str]:

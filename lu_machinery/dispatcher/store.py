@@ -492,8 +492,13 @@ def record_admission_refusal(
     hold: dict | None = None,
     detail: str | None = None,
     admission: dict | None = None,
+    trace: dict | None = None,
 ) -> None:
-    """Record the refusal without consuming the requested id or losing an attributed worktree."""
+    """Record the refusal without consuming the requested id or losing an attributed worktree.
+
+    Both paths carry the attempt's trace identity: the dispatch's own (``trace``), else its hold's, else a new one,
+    so no refusal record is untraceable (TRACETEL-1128 Slice 3).
+    """
     when = now()
     refusal_id = uuid.uuid4().hex
     record = {name: metadata.get(name) for name in (
@@ -507,6 +512,7 @@ def record_admission_refusal(
         review_profile=metadata.get("review_profile"), review_risk=metadata.get("risk"),
         review_author_model=metadata.get("review_author_model"),
     )
+    record.update(_refusal_trace(trace, hold))
     if admission is not None:
         record["admission"] = admission
     elif hold is not None and isinstance(hold.get("admission"), dict):
@@ -529,6 +535,19 @@ def record_admission_refusal(
                 return
     # With no tree, reserve() releases its hold as before. The refused attempt has its own id.
     _write(record_path(refusal_id), record, exclusive=True)
+
+
+def _refusal_trace(trace: dict | None, hold: dict | None) -> dict:
+    """The trace fields a refusal record carries: a valid given trace, else the hold's, else a new root trace."""
+    from lu_machinery.telemetry import emit
+
+    for source in (trace, hold):
+        if isinstance(source, dict) and (valid := emit.trace_of(source)) is not None:
+            parent = source.get("parent_span_id")
+            if emit.valid_span_id(parent):
+                valid["parent_span_id"] = str(parent)
+            return valid
+    return emit.mint_trace()
 
 
 def _worktree_may_exist(path: str | None) -> bool:
