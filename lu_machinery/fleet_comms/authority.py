@@ -477,7 +477,7 @@ def _safe_json_mapping(value: Mapping[str, Any] | None) -> dict[str, Any]:
         return {}
     try:
         encoded = _canonical_json(dict(value))
-        loaded = json_depth.loads(encoded, max_depth=512)
+        loaded = loads_strict_json(encoded, max_depth=512)
     except (TypeError, ValueError) as exc:
         raise AuthorityServiceError("metadata_must_be_json_serializable") from exc
     if not isinstance(loaded, dict):  # pragma: no cover - dict(value) guarantees this
