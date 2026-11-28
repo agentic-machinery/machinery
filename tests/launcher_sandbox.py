@@ -16,6 +16,8 @@ the bridge cannot silently break the launcher sandboxes again.
 
 from __future__ import annotations
 
+import atexit
+import copy
 import functools
 import importlib.util
 import json
@@ -28,11 +30,12 @@ import tempfile
 from collections.abc import Mapping
 from pathlib import Path
 
+from lu_machinery import host_context
 from lu_machinery.common.repo_root import machinery_path, machinery_root
 from lu_machinery.common.scratch import ensure_scratch_root
 from tests.helpers import machinery_module, machinery_package, product_checkout
 from tests.helpers.monitor import UNREACHABLE_MONITOR_URL, UNREACHABLE_TOOL_TIMING_URL
-from tests.host_context.conftest import build_host_layout
+from tests.host_context.conftest import HostLayout, build_host_layout
 from tests.host_context.conftest import git as fixture_git
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -262,31 +265,60 @@ def bind_driver_protocol_fixture(root: Path, runtime: Path, *, state: Path | Non
         )
 
 
+_HOST_LAYOUT_TEMPLATES: dict[tuple[str, str, str], tuple[Path, HostLayout]] = {}
+
+
+def _cached_host_layout_template() -> HostLayout:
+    """Build the immutable host-layout pieces (venv, machinery git repo, selector) once per process."""
+    base = tempfile.gettempdir()
+    key = (base, str(Path(sys.executable).resolve()), str(machinery_root().resolve()))
+    cached = _HOST_LAYOUT_TEMPLATES.get(key)
+    if cached is not None:
+        template_dir, template = cached
+        if (
+            template_dir.is_dir()
+            and template.python.exists()
+            and (Path(template.data["repos"]["machinery"]) / ".git").exists()
+        ):
+            return template
+    template_dir = Path(tempfile.mkdtemp(prefix="host-binding-template-", dir=base))
+    atexit.register(shutil.rmtree, template_dir, ignore_errors=True)
+    template = build_host_layout(template_dir)
+    _HOST_LAYOUT_TEMPLATES[key] = (template_dir, template)
+    return template
+
+
 def bind_launcher_environment(
     product: Path, env: dict[str, str], *, overrides: Mapping[str, str] | None = None,
 ) -> dict[str, str]:
     """Give a synthetic launcher checkout a full binding and detached state."""
     if "LU_HOST_CONTEXT" in env:
         return env
+    template = _cached_host_layout_template()
     layout_dir = Path(tempfile.mkdtemp(prefix="host-binding-", dir=env.get("TMPDIR") or ensure_scratch_root()))
-    layout = build_host_layout(layout_dir)
     origin = subprocess.run(
         ["git", "-C", str(product), "config", "--get", "remote.origin.url"],
         capture_output=True, check=False, timeout=10, env={"PATH": os.defpath},
     )
     if origin.returncode == 1:
         fixture_git(product, "remote", "add", "origin", "https://github.com/learn-ukrainian/learn-ukrainian.github.io.git")
-    layout.data["repos"]["public"] = str(product)
-    state = Path(env.get("LU_STATE_ROOT", layout.data["state_root"]))
-    layout.data["state_root"] = str(state)
-    layout.data["monitor_url"] = env.get("LU_MONITOR_LOOPBACK", layout.data["monitor_url"])
-    layout.write()
-    bound = {**env, **layout.env}
+    data = copy.deepcopy(template.data)
+    data["repos"]["public"] = str(product)
+    if "LU_STATE_ROOT" in env:
+        state = Path(env["LU_STATE_ROOT"])
+    else:
+        state = layout_dir / "state"
+        state.mkdir(mode=0o700)
+    data["state_root"] = str(state)
+    data["monitor_url"] = env.get("LU_MONITOR_LOOPBACK", data["monitor_url"])
+    host_file = layout_dir / "host.v1.json"
+    host_file.write_text(json.dumps(data), encoding="utf-8")
+    bound = {**env, host_context.CONTEXT_ENV: str(host_file)}
     for key in ("FLEET_COMMS_ROOT", "LU_TASKS_DIR", "LU_GITHUB_CACHE_DIR"):
         if key not in (overrides or {}):
             bound.pop(key, None)
     if "LU_PYTHON" not in (overrides or {}):
-        bound["LU_PYTHON"] = str(layout.python)
+        bound["LU_PYTHON"] = str(template.python)
     return bound
 
 
