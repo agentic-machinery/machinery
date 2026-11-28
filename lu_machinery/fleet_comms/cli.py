@@ -430,6 +430,23 @@ def cmd_fleet_help(_args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def cmd_fleet_exchange(args: argparse.Namespace) -> int:
+    """Read body-free delivery and reply rows for one recipient since a UTC timestamp."""
+    from lu_machinery.fleet_comms.exchange_rows import (
+        ExchangeRowsError,
+        exchange_error_payload,
+        read_exchange_rows,
+    )
+
+    try:
+        payload = read_exchange_rows(args.recipient, args.since, root=_authority_root(args))
+    except ExchangeRowsError as exc:
+        sys.stdout.write(_json_dump(exchange_error_payload(exc.code)))
+        return EXIT_ERROR
+    sys.stdout.write(_json_dump(payload))
+    return EXIT_OK
+
+
 def _resolve_plane_db(args: argparse.Namespace) -> Path:
     root = Path(args.root).expanduser() if getattr(args, "root", None) else default_plane_root()
     return validate_plane_root(root) / "comms.sqlite3"
@@ -1401,6 +1418,44 @@ def build_parser() -> argparse.ArgumentParser:
 
     fleet_help = fleet_sub.add_parser("help", help="Map Truth and Eyes")
     fleet_help.set_defaults(func=cmd_fleet_help)
+
+    fleet_exchange = fleet_sub.add_parser(
+        "exchange",
+        help="Read body-free delivery and reply rows for one recipient since a UTC timestamp",
+        description=(
+            "Return typed delivery and reply rows for one recipient since a UTC timestamp,\n"
+            "normalized through AuthorityService without writes, claims, or message bodies.\n"
+            "Use for host checks and read-only delivery/reply inspection; never to claim or ack."
+        ),
+        epilog=(
+            "Examples:\n"
+            f"  <project python> -I -m {_PACKAGE} fleet exchange --recipient claude-cto --since 2026-11-28T00:00:00Z\n"
+            f"  <project python> -I -m {_PACKAGE} fleet exchange --recipient bot-slot --since 2026-11-28T00:00:00Z --root /path/to/plane\n"
+            "Outputs: JSON on stdout with deliveries, replies, counts, and per-row ok/error codes;\n"
+            "  content_included is always false. Opens the authority store strictly read-only\n"
+            "  (no writes, no migrations, no claims, no lease changes).\n"
+            "Exit codes: 0 = report produced (inspect per-row ok/error and error_count),\n"
+            "  2 = usage error, 3 = invalid --recipient/--since or store/schema unavailable.\n"
+            f"Related: {_PACKAGE}.exchange_rows; {_PACKAGE}.authority.AuthorityService; deliveries pending."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    fleet_exchange.add_argument(
+        "--recipient",
+        required=True,
+        help="Exact recipient identity whose deliveries and replies to read, e.g. claude-cto",
+    )
+    fleet_exchange.add_argument(
+        "--since",
+        required=True,
+        help="Inclusive UTC ISO-8601 lower bound for delivery created_at, e.g. 2026-11-28T00:00:00Z",
+    )
+    fleet_exchange.add_argument(
+        "--root",
+        default=None,
+        help="Authority plane storage root (default: FLEET_COMMS_ROOT or shared plane root)",
+    )
+    fleet_exchange.set_defaults(func=cmd_fleet_exchange)
 
     formal = sub.add_parser(
         "formal-job",
