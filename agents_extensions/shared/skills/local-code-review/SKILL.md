@@ -29,8 +29,8 @@ Post the verdict as a PR comment bound to the reviewed head SHA, not as an
 approval review. The comment must still come from an independent cross-family
 reviewer (any qualified non-author reviewer at the review policy's Low tier); a shared posting identity does not establish independence. See
 `workflow.md` § Merge policy.
-Resolve `PRIMARY_REPO` and `PY` with the [review-loop setup](../review-loop/SKILL.md#review-loop)
-so the recorder uses current primary-checkout rules on older branches too.
+Resolve `PY` with the [review-loop setup](../review-loop/SKILL.md#review-loop)
+so the bound runtime's recorder applies on older branches too.
 
 Red-team exception (`workflow.md` § Merge policy), for code review only:
 only when no eligible outside-family reviewer exists, resolve with

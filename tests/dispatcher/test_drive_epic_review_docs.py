@@ -35,13 +35,15 @@ REPO_ROOT = REFERENCE.parents[5]
 HEAD = "a" * 40
 NONCE = "run-nonce-fixture"
 
-# The five delivery recipes. A target checkout's .venv is not the machinery runtime.
+# Delivery recipes. A target checkout's .venv is not the machinery runtime.
 _DELIVERY_RECIPE_SITES = (
     "agents_extensions/shared/skills/review-loop/SKILL.md",
     "agents_extensions/shared/skills/full-send/SKILL.md",
     "agents_extensions/shared/skills/full-stop/SKILL.md",
     "agents_extensions/shared/skills/full-send/references/delivery.md",
     "agents_extensions/shared/skills/drive-epic/references/review-merge-cleanup.md",
+    "agents_extensions/shared/skills/takeover/SKILL.md",
+    "agents_extensions/shared/skills/pr-comments/SKILL.md",
 )
 
 

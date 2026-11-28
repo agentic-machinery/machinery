@@ -193,9 +193,9 @@ with `review-loop` for review rounds and the budget.
    sets: cross-family, except any qualified non-author reviewer at Low tier.
 2. Open the PR if it is not already open, then run `"$PY" -m lu_machinery.review.record_cf_verdict` to bind the completed
    review, reviewed head, and author qualification in a **PR comment bound to the head SHA**,
-   with reviewer model/family/harness provenance. Resolve `PRIMARY_REPO` and `PY` with the
-   [review-loop setup](../skills/review-loop/SKILL.md#review-loop) to use current recorder rules
-   regardless of the caller's branch age. GitHub rejects API approval reviews
+   with reviewer model/family/harness provenance. Resolve `PY` with the
+   [review-loop setup](../skills/review-loop/SKILL.md#review-loop) so the bound runtime's
+   recorder applies regardless of the caller's branch age. GitHub rejects API approval reviews
    from the shared bot identity when it also authored the PR; do not use
    `gh pr review --approve` for this publication. The comment records independent
    cross-family review, not self-approval. Require the **PR CI Gate green**
