@@ -125,6 +125,7 @@ from lu_machinery.review.review_contract import (
     ContractError,
     ItemChunk,
     captured_sources_events,
+    declares_incomplete_explanation,
     item_judgments_verdict,
     judge_item_reply,
     load_frozen_item_packet,
@@ -277,10 +278,19 @@ def _review_verdict_and_count(reply: str) -> tuple[str, int | Literal["unknown"]
             raise RecordError(f"structured review verdict or findings invalid: {exc}") from None
         except ReviewPublicationError:
             raise RecordError("structured review verdict or findings invalid") from None
-        if declares_incomplete_review(reply):
+        # The decoded object is read, so leading whitespace that Markdown makes a code block hides nothing.
+        if declares_incomplete_review(reply, findings_payloads=(payload,)) or declares_incomplete_explanation(payload):
             raise RecordError("inconclusive: reviewer declares an incomplete review")
         return verdict, len(evidence.findings) if evidence is not None else "unknown"
-    return normalize_verdict(reply), "unknown"
+    verdict = normalize_verdict(reply)
+    # A whole json fence or the review-loop envelope: its explanation is read line by line too.
+    try:
+        whole = parse_reviewer_json(reply)
+    except ContractError:
+        whole = None
+    if whole is not None and declares_incomplete_explanation(whole):
+        raise RecordError("inconclusive: reviewer declares an incomplete review")
+    return verdict, "unknown"
 
 
 _SECURITY_VERDICT = re.compile(r"(?i)\*{0,2}security(?:[_\- ]+)verdict\*{0,2}\s*[:\u2014\u2013\-=]?\s*")
