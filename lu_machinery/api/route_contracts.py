@@ -659,7 +659,7 @@ ROUTE_CONTRACTS: tuple[RouteContract, ...] = (
         "Issue snapshots refresh on demand every 300 seconds and are stale after 420 seconds. "
         "The live-worker snapshot must be at most 10 seconds old to show ready-now entries. "
         "Meter reads refresh every 30 seconds. Unmeasured forecasts are unknown.",
-        ("model-stats.html", "operators"),
+        ("milestones.html", "model-stats.html", "operators"),
         "Private issue identities, issue text and worker paths stay internal. Private blockers have anonymous ranks. "
         "Ready-now requires an explicit path list in the card's scope. Files may use an extension and directories "
         "may use a trailing slash. The ./ prefix explicitly marks a repository-relative path.",
@@ -907,11 +907,11 @@ PAGE_CONTRACTS: tuple[PageContract, ...] = (
     PageContract(
         "milestones.html",
         "/milestones",
-        "Milestones and progress: open milestones and issue progress across every registered fleet repository, with private repositories redacted to counts only.",
-        "GET /api/milestones.",
-        "HTTP reads every 30 seconds against the 300-second shared GitHub milestones cache (420-second display bound).",
+        "Milestones: at-a-glance blocked and overdue counts, due state, plain-text open/closed counts, blocked issues with blockers first, overdue, ready-now, and top blockers across every registered fleet repository, with private repositories showing counts only and titles, due dates, and blockers withheld.",
+        "GET /api/milestones and GET /api/fleet/model-stats/planning.",
+        "HTTP reads every 30 seconds against the 300-second shared GitHub milestones cache (420-second display bound) and the 300-second planning issue snapshot (420-second bound); unknown, stale, or errored planning shows unknown, never zero.",
         ("humans", "operators"),
-        "Dedicated area page for fleet milestones.",
+        "Dedicated area page for fleet milestones and issue planning.",
         "medium if a stale or partial collection is mistaken for complete live progress",
         "keep",
         label="Milestones",
